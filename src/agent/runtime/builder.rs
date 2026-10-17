@@ -5,12 +5,11 @@ use super::*;
 pub struct HarnessBuilder {
     workspace: PathBuf,
     session_root: Option<PathBuf>,
-    catalog: CatalogSource,
+    catalog: Assembled,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
     mcp: BTreeMap<String, McpServerConfig>,
-    instructions: Vec<String>,
     max_child_depth: usize,
     coalescing: wait::Coalescing,
     capabilities: CapabilitySet,
@@ -28,39 +27,12 @@ pub(crate) struct ModelEntry {
 
 /// The models and modes a harness serves, with what a new session starts from.
 /// The defaults are members.
-pub(crate) struct Catalog {
-    pub(crate) models: indexmap::IndexMap<ModelRef, ModelEntry>,
-    pub(crate) default_model: ModelRef,
-    pub(crate) modes: indexmap::IndexMap<ModeName, Mode>,
+struct Catalog {
+    models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    default_model: ModelRef,
+    modes: indexmap::IndexMap<ModeName, Mode>,
     /// The mode a new session starts in; none without modes.
-    pub(crate) mode: Option<ModeName>,
-}
-
-/// A catalog admitted with the configuration is proven; one assembled through
-/// the setters is checked by `build`. Any catalog setter makes it the latter.
-enum CatalogSource {
-    Admitted(Catalog),
-    Assembled(Assembled),
-}
-
-impl Default for CatalogSource {
-    fn default() -> Self {
-        Self::Assembled(Assembled::default())
-    }
-}
-
-impl CatalogSource {
-    fn assembled(self) -> Assembled {
-        match self {
-            Self::Admitted(catalog) => Assembled {
-                models: catalog.models,
-                default_model: Some(catalog.default_model),
-                modes: catalog.modes,
-                mode: catalog.mode,
-            },
-            Self::Assembled(assembled) => assembled,
-        }
-    }
+    mode: Option<ModeName>,
 }
 
 #[derive(Default)]
@@ -119,26 +91,14 @@ fn normalize_modes(modes: &mut indexmap::IndexMap<ModeName, Mode>) {
 impl HarnessBuilder {
     #[must_use]
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        Self::with_catalog(workspace, CatalogSource::default())
-    }
-
-    /// A builder over a catalog that configuration admission has already proven.
-    #[must_use]
-    pub(crate) fn admitted(workspace: impl Into<PathBuf>, mut catalog: Catalog) -> Self {
-        normalize_modes(&mut catalog.modes);
-        Self::with_catalog(workspace, CatalogSource::Admitted(catalog))
-    }
-
-    fn with_catalog(workspace: impl Into<PathBuf>, catalog: CatalogSource) -> Self {
         Self {
             workspace: workspace.into(),
             session_root: None,
-            catalog,
+            catalog: Assembled::default(),
             policy: Arc::new(AllowAll),
             questions: None,
             extra_tools: ToolRegistry::default(),
             mcp: BTreeMap::new(),
-            instructions: Vec::new(),
             max_child_depth: crate::config::DEFAULT_MAX_CHILD_DEPTH,
             coalescing: wait::Coalescing::default(),
             capabilities: CapabilitySet::default(),
@@ -149,9 +109,7 @@ impl HarnessBuilder {
     }
 
     fn assemble(mut self, edit: impl FnOnce(&mut Assembled)) -> Self {
-        let mut assembled = std::mem::take(&mut self.catalog).assembled();
-        edit(&mut assembled);
-        self.catalog = CatalogSource::Assembled(assembled);
+        edit(&mut self.catalog);
         self
     }
 
@@ -183,6 +141,12 @@ impl HarnessBuilder {
         })
     }
 
+    /// Built models, added or replacing like [`Self::provider`]'s.
+    #[must_use]
+    pub(crate) fn models(self, models: indexmap::IndexMap<ModelRef, ModelEntry>) -> Self {
+        self.assemble(|catalog| catalog.models.extend(models))
+    }
+
     #[must_use]
     pub fn default_model(self, model: ModelRef) -> Self {
         self.assemble(|catalog| catalog.default_model = Some(model))
@@ -210,12 +174,6 @@ impl HarnessBuilder {
     #[must_use]
     pub fn mcp(mut self, servers: BTreeMap<String, McpServerConfig>) -> Self {
         self.mcp = servers;
-        self
-    }
-
-    #[must_use]
-    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.instructions.push(instructions.into());
         self
     }
 
@@ -272,18 +230,16 @@ impl HarnessBuilder {
     }
 
     /// Load user instructions, then instructions from the resolved workspace
-    /// (the more local scope), then append library-supplied instructions.
+    /// (the more local scope).
     /// Instruction discovery is independent of the YAML configuration path.
     pub async fn build(self) -> Result<Harness, HarnessError> {
         let workspace = fs::canonicalize(&self.workspace).await?;
-        let catalog = match self.catalog {
-            CatalogSource::Admitted(catalog) => catalog,
-            CatalogSource::Assembled(assembled) => assembled.check()?,
-        };
+        let catalog = self.catalog.check()?;
         let session_root = self
             .session_root
             .unwrap_or_else(|| crate::config::workspace_session_root(&workspace));
-        let (mut instructions, mut warnings) = load_agent_instructions(&workspace).await?;
+        let users = crate::config::user_config_directories();
+        let (instructions, mut warnings) = load_agent_instructions(&workspace, &users).await?;
         let skills = HostSkills::discover(&workspace).await;
         warnings.extend_from_slice(skills.warnings());
         for (name, entry) in &catalog.models {
@@ -298,7 +254,6 @@ impl HarnessBuilder {
         }
         let target_definitions = self.targets.definitions()?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
-        instructions.extend(self.instructions);
         // A host handler must not restore a revoked interaction capability,
         // including authentication forwarded from remote workers.
         let sensitive_prompts = if self.capabilities.contains(Capability::Interactive) {
@@ -334,20 +289,8 @@ impl HarnessBuilder {
 const AGENT_INSTRUCTION_NAMES: [&str; 4] = ["AGENTS.md", "agents.md", "Agents.md", "AGENTS.MD"];
 
 struct AgentInstructionFile {
-    canonical_path: PathBuf,
-    #[cfg(unix)]
     identity: (u64, u64),
     text: String,
-}
-
-impl AgentInstructionFile {
-    fn same_file(&self, other: &Self) -> bool {
-        #[cfg(unix)]
-        if self.identity == other.identity {
-            return true;
-        }
-        self.canonical_path == other.canonical_path
-    }
 }
 
 fn instruction_error(path: &Path, error: std::io::Error) -> std::io::Error {
@@ -396,7 +339,6 @@ async fn read_instruction_directory(
                 Err(error) => return Err(io(error)),
             };
             // The identity comes from the handle that is read, not a later path lookup.
-            #[cfg(unix)]
             let identity = {
                 use std::os::unix::fs::MetadataExt as _;
                 let metadata = file.metadata()?;
@@ -405,12 +347,7 @@ async fn read_instruction_directory(
             let bytes = crate::fs::read_to_limit(file, limit).await.map_err(io)?;
             let text = String::from_utf8(bytes)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            Ok(Discovered::Loaded(AgentInstructionFile {
-                canonical_path: fs::canonicalize(&path).await?,
-                #[cfg(unix)]
-                identity,
-                text,
-            }))
+            Ok(Discovered::Loaded(AgentInstructionFile { identity, text }))
         }
         .await;
         return result
@@ -448,15 +385,8 @@ async fn load_user_instructions(
     Ok(None)
 }
 
-// Instruction discovery deliberately does not depend on the selected YAML config.
 /// Instruction texts, then warnings for skipped instruction files.
 async fn load_agent_instructions(
-    workspace: &Path,
-) -> Result<(Vec<String>, Vec<String>), std::io::Error> {
-    load_agent_instructions_from(workspace, &crate::config::user_config_directories()).await
-}
-
-async fn load_agent_instructions_from(
     workspace: &Path,
     user_directories: &[PathBuf],
 ) -> Result<(Vec<String>, Vec<String>), std::io::Error> {
@@ -477,7 +407,10 @@ async fn load_agent_instructions_from(
     }
     if let Some(workspace) = workspace {
         // First occurrence wins when both locations identify the same file.
-        if !user.as_ref().is_some_and(|user| user.same_file(&workspace)) {
+        if !user
+            .as_ref()
+            .is_some_and(|user| user.identity == workspace.identity)
+        {
             output.push(format!("workspace AGENTS.md:\n{}", workspace.text));
         }
     }
@@ -697,9 +630,7 @@ mod tests {
                 .iter()
                 .map(|user| root.path().join(user))
                 .collect::<Vec<_>>();
-            let loaded = load_agent_instructions_from(&workspace, &users)
-                .await
-                .unwrap();
+            let loaded = load_agent_instructions(&workspace, &users).await.unwrap();
             assert_eq!(
                 loaded,
                 (
@@ -723,11 +654,9 @@ mod tests {
                 instruction_file(&instructions, candidate, candidate);
             }
             let users = std::slice::from_ref(&instructions);
-            let user = load_agent_instructions_from(&empty, users).await.unwrap();
+            let user = load_agent_instructions(&empty, users).await.unwrap();
             assert_eq!(user.0, vec![format!("user AGENTS.md:\n{name}")]);
-            let workspace = load_agent_instructions_from(&instructions, &[])
-                .await
-                .unwrap();
+            let workspace = load_agent_instructions(&instructions, &[]).await.unwrap();
             assert_eq!(workspace.0, vec![format!("workspace AGENTS.md:\n{name}")]);
         }
     }
@@ -740,7 +669,6 @@ mod tests {
         for (case, kind) in [
             ("not-a-directory", None),
             ("utf8", Some(InvalidData)),
-            #[cfg(unix)]
             ("dangling", Some(NotFound)),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -751,7 +679,6 @@ mod tests {
                 "utf8" => instruction_file(&user, "AGENTS.md", [0xff]),
                 _ => {
                     std::fs::create_dir(&user).unwrap();
-                    #[cfg(unix)]
                     std::os::unix::fs::symlink("missing", &broken).unwrap();
                 }
             }
@@ -759,7 +686,7 @@ mod tests {
                 instruction_file(&user, "agents.md", "must not load");
             }
             // Fatal for a workspace, and for users unless another location loads.
-            let error = load_agent_instructions_from(&user, &[]).await.unwrap_err();
+            let error = load_agent_instructions(&user, &[]).await.unwrap_err();
             assert!(contains_path(&error, broken.clone()), "{case}: {error}");
             let users = [user, root.path().join("missing"), fallback.clone()];
             let error = load_user_instructions(&users, &mut Vec::new())
@@ -801,7 +728,7 @@ mod tests {
                 ),
             }
             instruction_file(&fallback, "AGENTS.md", "fallback");
-            let (loaded, warnings) = load_agent_instructions_from(&user, &[user.clone(), fallback])
+            let (loaded, warnings) = load_agent_instructions(&user, &[user.clone(), fallback])
                 .await
                 .unwrap();
             assert_eq!(loaded, vec!["user AGENTS.md:\nfallback"], "{case}");
@@ -815,7 +742,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn symlinks_and_hardlinks_to_the_same_file_are_not_repeated() {
         for hardlink in [false, true] {
@@ -830,26 +756,9 @@ mod tests {
                 std::os::unix::fs::symlink(user.join("AGENTS.md"), workspace.join("agents.md"))
                     .unwrap();
             }
-            let loaded = load_agent_instructions_from(&workspace, &[user])
-                .await
-                .unwrap();
+            let loaded = load_agent_instructions(&workspace, &[user]).await.unwrap();
             assert_eq!(loaded.0, vec!["user AGENTS.md:\nshared"]);
         }
-    }
-
-    #[tokio::test]
-    async fn library_instructions_are_appended_after_workspace_instructions() {
-        let root = tempfile::tempdir().unwrap();
-        instruction_file(root.path(), "AGENTS.md", "workspace rules");
-        let provider = Arc::new(HangingProvider);
-        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-            .instructions("library rules")
-            .build()
-            .await
-            .unwrap();
-        let expected =
-            ["workspace AGENTS.md:\nworkspace rules", "library rules"].map(str::to_owned);
-        assert!(harness.inner.instructions.ends_with(&expected));
     }
 
     #[tokio::test]
@@ -881,27 +790,18 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            use SensitivePromptKind::*;
-            for kind in [
-                Password,
-                KeyboardInteractive,
-                KeyPassphrase,
-                HostConfirmation,
-                AgentConfirmation,
-            ] {
-                let prompt = SensitivePrompt::test(kind);
-                let result = harness.inner.sensitive_prompts.prompt(prompt).await;
-                match result {
-                    Ok(_) => assert!(interactive),
-                    Err(error) => {
-                        assert!(!interactive);
-                        let found = error.to_string();
-                        assert_eq!(found, "interactive authentication is unavailable");
-                    }
+            let prompt = SensitivePrompt::test(SensitivePromptKind::Password);
+            let result = harness.inner.sensitive_prompts.prompt(prompt).await;
+            match result {
+                Ok(_) => assert!(interactive),
+                Err(error) => {
+                    assert!(!interactive);
+                    let found = error.to_string();
+                    assert_eq!(found, "interactive authentication is unavailable");
                 }
             }
             let found = calls.load(Ordering::SeqCst);
-            assert_eq!(found, if interactive { 5 } else { 0 });
+            assert_eq!(found, usize::from(interactive));
         }
     }
 }

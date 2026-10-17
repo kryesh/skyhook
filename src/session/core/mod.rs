@@ -8,11 +8,8 @@ use chrono::Utc;
 use tokio::sync::{broadcast, oneshot};
 
 use super::{
-    EventRecord, JournalFailure, RecordSeq, SessionError, SessionEvent, SessionLock, db,
-    mode_editions, request,
+    EventRecord, JournalFailure, RecordSeq, SessionError, SessionEvent, SessionLock, db, request,
 };
-#[cfg(test)]
-use super::{Held, Hold};
 use crate::{
     agent::{ObservedEvent, RuntimeEvent},
     identity::{AgentId, EventId, SessionId},
@@ -64,19 +61,6 @@ impl<T> Plan<T> {
     }
 }
 
-impl<T: 'static> Plan<T> {
-    /// Also apply `change`, after what the plan itself changes.
-    pub(crate) fn then(self, change: impl FnOnce(&mut CoreState) + Send + 'static) -> Self {
-        let live = self.live;
-        let plan = Self::new(self.entries, move |state, records| {
-            let value = live(state, records);
-            change(state);
-            value
-        });
-        plan.saving(self.outputs)
-    }
-}
-
 impl Plan<()> {
     /// Journal `entries` and nothing more.
     pub(crate) fn journal(entries: Vec<(AgentId, SessionEvent)>) -> Self {
@@ -115,8 +99,25 @@ type Work = Box<dyn FnOnce(&mut Writer) + Send>;
 /// The core thread and its queue. Dropping the last handle ends the thread
 /// once the commands already queued have run, closing the session.
 pub(super) struct Core {
-    commands: Option<std::sync::mpsc::Sender<Work>>,
+    commands: Option<tokio::sync::mpsc::UnboundedSender<Work>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Queues work on a core it neither keeps running nor ever ends: once the
+/// session's handles are gone, what it posts is dropped.
+#[derive(Clone)]
+pub(crate) struct WeakCore(tokio::sync::mpsc::WeakUnboundedSender<Work>);
+
+impl WeakCore {
+    /// Change facts the journal does not record, behind every command queued
+    /// before it, if the session is still open.
+    pub(crate) fn enqueue(&self, change: impl FnOnce(&mut CoreState) + Send + 'static) {
+        if let Some(commands) = self.0.upgrade() {
+            let work =
+                move |writer: &mut Writer| drop(guarded(writer, |writer| writer.change(change)));
+            let _ = commands.send(Box::new(work));
+        }
+    }
 }
 
 /// Updates an observer may fall behind by before it lags.
@@ -146,18 +147,20 @@ impl Core {
             encoder: db::Encoder::default(),
             committed: false,
             #[cfg(test)]
-            hold: None,
+            fail_committed: false,
         };
         // What a command drops, as an abandoned job lease, may spawn its cleanup.
         let runtime = tokio::runtime::Handle::current();
-        let (commands, queue) = std::sync::mpsc::channel::<Work>();
+        let (commands, mut queue) = tokio::sync::mpsc::unbounded_channel::<Work>();
         let thread = std::thread::Builder::new()
             .name(format!("session-{id}"))
             .spawn(move || {
-                let _runtime = runtime.enter();
-                for command in queue {
+                // Waiting on the queue is outside the runtime; its commands run inside.
+                while let Some(command) = queue.blocking_recv() {
+                    let _runtime = runtime.enter();
                     command(&mut writer);
                 }
+                let _runtime = runtime.enter();
                 // Only the session's owner closes it; a replica shares its connection.
                 if writer.lock.is_some() {
                     let _ = writer.close();
@@ -184,6 +187,11 @@ impl Core {
             drop(reply.send(guarded(writer, work)))
         }));
         result.await.unwrap_or(Err(SessionError::WriterLost))
+    }
+
+    pub(super) fn downgrade(&self) -> WeakCore {
+        let commands = self.commands.as_ref().expect("open until dropped");
+        WeakCore(commands.downgrade())
     }
 
     /// Queue `work` behind every command queued before it, without waiting for it.
@@ -219,8 +227,9 @@ pub(super) struct Writer {
     encoder: db::Encoder,
     /// Whether the running command committed, until it has applied it.
     committed: bool,
+    /// Test fault: the next commit fails once it committed.
     #[cfg(test)]
-    pub(super) hold: Option<Hold>,
+    pub(super) fail_committed: bool,
 }
 
 impl Writer {
@@ -288,8 +297,8 @@ impl Writer {
         self.committed = true;
         drop(db);
         #[cfg(test)]
-        if let Some(failed) = self.held(&records) {
-            return Err(failed);
+        if std::mem::take(&mut self.fail_committed) {
+            return Err(self.fail(SessionError::Unconfirmed(None)));
         }
         let value = self.change(|state| {
             let mut observed = self.shared.observed();
@@ -365,19 +374,6 @@ impl Writer {
         SessionError::JournalFailed(failure)
     }
 
-    #[cfg(test)]
-    fn held(&mut self, records: &[EventRecord]) -> Option<SessionError> {
-        let held = |Hold(matches, _): &mut Hold| records.iter().any(|r| matches(&r.event));
-        match self.hold.take_if(held)? {
-            Hold(_, Held::Pause(reached, resume)) => {
-                let _ = reached.send(());
-                let _ = resume.blocking_recv();
-                None
-            }
-            Hold(_, Held::Fail) => Some(self.fail(SessionError::Unconfirmed(None))),
-        }
-    }
-
     /// Validate and encode inside an open transaction, with the output it saves;
     /// any error is a definite rejection.
     fn accept(
@@ -398,9 +394,7 @@ impl Writer {
         let mut records = Vec::with_capacity(entries.len());
         // A definition that differs from its name's latest edition records a new one.
         // Appends are serialized here, so agents applying one at once record it once.
-        let mut editions: Option<
-            std::collections::HashMap<crate::tool::policy::ModeName, crate::tool::policy::Mode>,
-        > = None;
+        let mut editions = std::collections::HashMap::new();
         for (offset, (agent, mut event)) in entries.into_iter().enumerate() {
             if agent.session() != self.shared.id {
                 return Err(SessionError::WrongSession);
@@ -411,13 +405,9 @@ impl Writer {
             | SessionEvent::ModeChanged { mode, .. } = &mut event
                 && let Some(definition) = &mode.definition
             {
-                let editions = editions.get_or_insert_with(|| {
-                    let recorded = mode_editions(&state.records);
-                    recorded
-                        .map(|(name, mode)| (name.clone(), mode.clone()))
-                        .collect()
-                });
-                if editions.get(&mode.name) == Some(definition) {
+                let latest =
+                    (editions.get(&mode.name)).or_else(|| state.agents.edition(&mode.name));
+                if latest == Some(definition) {
                     mode.definition = None;
                 } else {
                     editions.insert(mode.name.clone(), definition.clone());

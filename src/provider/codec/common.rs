@@ -7,10 +7,10 @@ use crate::{
     named_enum::{NamedEnum, named_enum},
     provider::{
         ProviderError, ProviderErrorKind,
-        codec::{CodecName, ToolNames},
+        codec::{CodecName, StateRole, ToolNames},
         protocol::{
             AssistantItem, Binding, BlockRef, Completion, CutReason, ItemKind, Message,
-            ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope,
+            ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope, State,
             ToolDefinition, ToolResult, UserContent,
         },
     },
@@ -128,6 +128,47 @@ pub(crate) fn user_parts(
         .collect()
 }
 
+/// How an OpenAI protocol spells a state message.
+pub(crate) struct StateWire {
+    /// The role a system-role state takes.
+    pub system: &'static str,
+    /// The type of a text part.
+    pub text: &'static str,
+    /// A message of a role holding content parts.
+    pub message: fn(&str, Value) -> Value,
+}
+
+/// Push a state the model reads, in `role`: a message of the wire's system role, or user
+/// content joining the user message before it. The OpenAI protocols cannot hide a
+/// superseded state, so it is omitted. Returns the message and part index of its text.
+pub(crate) fn push_state(
+    role: StateRole,
+    wire: &StateWire,
+    messages: &mut Vec<Value>,
+    state: &State,
+) -> Option<(usize, usize)> {
+    if !state.is_read() {
+        return None;
+    }
+    let part = json!({"type": wire.text, "text": state.text});
+    if role == StateRole::User
+        && let Some(last) = messages.len().checked_sub(1)
+        && messages[last]["role"] == "user"
+    {
+        let content = messages[last]["content"]
+            .as_array_mut()
+            .expect("constructed array");
+        content.push(part);
+        return Some((last, content.len() - 1));
+    }
+    let role = match role {
+        StateRole::System => wire.system,
+        StateRole::User => "user",
+    };
+    messages.push((wire.message)(role, Value::Array(vec![part])));
+    Some((messages.len() - 1, 0))
+}
+
 /// System segments as the single instruction text of the OpenAI protocols.
 pub(crate) fn system_text(request: &ModelRequest) -> Option<String> {
     let segments: Vec<_> = request.system.iter().map(|s| s.text.as_str()).collect();
@@ -188,8 +229,7 @@ named_enum! {
     /// A finish reason as the families spell it, in any case.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) parsed enum StopReason {
-        Normal = "end_turn" | "stop" | "eos" | "stop_sequence" | "tool_use" | "tool_calls"
-            | "function_call",
+        Normal = "end_turn" | "stop" | "eos" | "stop_sequence" | "tool_use" | "tool_calls",
         MaxTokens = "max_tokens" | "length" | "max_output_tokens" | "model_length",
         ContextWindow = "model_context_window_exceeded",
         Aborted = "aborted" | "abort" | "cancelled" | "canceled",
@@ -329,9 +369,9 @@ pub(crate) fn own_replay<'a>(
     replay.filter(|replay| replay.provenance.format == format && replay.provenance.model == model)
 }
 
-/// Whether `model` has signed its `format` reasoning in this context. From then
-/// on only signed reasoning goes back; before that, unsigned reasoning is
-/// replayed as well. Signed replay is exactly the conversation-bound kind.
+/// Whether `model` has sealed its `format` reasoning in this context. From then
+/// on only sealed reasoning goes back; before that, unsigned reasoning is
+/// replayed as well.
 pub(crate) fn signed_context(request: &ModelRequest, format: ReplayFormat) -> bool {
     request
         .messages()
@@ -341,7 +381,7 @@ pub(crate) fn signed_context(request: &ModelRequest, format: ReplayFormat) -> bo
         })
         .flatten()
         .filter_map(|item| own_replay(item.replay(), format, request.model.as_str()))
-        .any(|replay| replay.binding == Binding::Conversation)
+        .any(is_sealed)
 }
 
 /// Whether a service bound native reasoning to the conversation before it: a
@@ -351,6 +391,15 @@ pub(crate) fn is_signed(signature: Option<&str>, data: Option<&str>) -> bool {
         .into_iter()
         .flatten()
         .any(|seal| !seal.is_empty())
+}
+
+/// Whether only the issuing service can read `replay` back: it carries a signature
+/// or encrypted state. Such replay is bound to its conversation, except encrypted
+/// Responses reasoning, which any history may carry.
+pub(crate) fn is_sealed(replay: &Replay) -> bool {
+    replay.binding == Binding::Conversation
+        || (replay.provenance.format == ReplayFormat::Responses
+            && super::responses::is_sealed(&replay.payload))
 }
 
 pub(crate) fn replay(
@@ -406,6 +455,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// Decode `frames` through the stream's end and reduce them; a decoder error
+    /// fails the test.
+    pub(crate) fn drain(
+        mut decoder: crate::provider::codec::Decoder,
+        frames: impl IntoIterator<Item = crate::provider::http::transport::SseEvent>,
+    ) -> Reduced {
+        let mut events = Vec::new();
+        for frame in frames {
+            events.extend(decoder.decode(&frame).unwrap());
+        }
+        events.extend(decoder.finish().unwrap());
+        reduce(events)
+    }
+
     /// Reduce events as the runtime does; a missing or non-final `End` is a decoder bug.
     pub(crate) fn reduce(events: impl IntoIterator<Item = ResponseEvent>) -> Reduced {
         let mut live = LiveResponse::default();
@@ -450,6 +513,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// Settles as the codecs do, recording only its settlement.
+    struct Settling {
+        settlement: Settlement,
+        tools: bool,
+    }
+
+    impl Settle for Settling {
+        fn settlement(&mut self) -> &mut Settlement {
+            &mut self.settlement
+        }
+
+        fn has_tools(&self) -> bool {
+            self.tools
+        }
+
+        fn admit(&self, _: Finish) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        fn completion(&mut self, finish: Finish) -> Result<Completion, ProviderError> {
+            finish.complete(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_first_reason_settles_and_later_ones_only_retract_tools() {
+        use Finish::{Cut, Error, Normal};
+        use Settlement::{Open, Settled};
+        let cut = Cut(CutReason::MaxTokens);
+        let overflow = Error(ProviderErrorKind::ContextWindowExceeded);
+        for (settlement, finish, tools, expected) in [
+            (Open, Normal, true, Normal),
+            (Open, overflow, true, overflow),
+            (Settled(Normal), cut, true, cut),
+            (Settled(Normal), overflow, true, Cut(CutReason::Incomplete)),
+            (Settled(Normal), cut, false, Normal),
+            (Settled(Normal), overflow, false, Normal),
+            (Settled(cut), Normal, true, cut),
+        ] {
+            let mut settling = Settling { settlement, tools };
+            settling.reason(finish).unwrap();
+            let settled = Settled(expected);
+            assert_eq!(
+                settling.settlement, settled,
+                "{settlement:?} then {finish:?}"
+            );
+        }
+        for (reason, finish) in [
+            ("STOP", Normal),
+            ("tool_calls", Normal),
+            ("eos", Normal),
+            ("stop_sequence", Normal),
+            ("length", cut),
+            ("SAFETY", Cut(CutReason::Refusal)),
+            ("canceled", Error(ProviderErrorKind::Unavailable)),
+            ("model_context_window_exceeded", overflow),
+            ("pause_turn", Cut(CutReason::Incomplete)),
+        ] {
+            assert_eq!(Finish::of(StopReason::read(reason)), finish, "{reason}");
+        }
+    }
+
     #[test]
     fn counters_accept_integral_floats_and_numeric_strings() {
         for (value, expected) in [
@@ -477,6 +602,18 @@ pub(crate) mod tests {
         replay(format, model, &scope(), payload, binding)
     }
 
+    #[test]
+    fn own_replay_requires_the_issuing_format_and_model() {
+        let own = envelope(ReplayFormat::ChatText, "model", json!({}), Binding::Free);
+        assert_eq!(
+            own_replay(Some(&own), ReplayFormat::ChatText, "model"),
+            Some(&own)
+        );
+        assert!(own_replay(Some(&own), ReplayFormat::Responses, "model").is_none());
+        assert!(own_replay(Some(&own), ReplayFormat::ChatText, "other").is_none());
+        assert!(own_replay(None, ReplayFormat::ChatText, "model").is_none());
+    }
+
     pub(crate) fn image() -> ImageRef {
         ImageRef {
             file: Some("image.png".into()),
@@ -499,15 +636,31 @@ pub(crate) mod tests {
             "future_native":{"state":"keep"}})
     }
 
+    pub(crate) fn user(text: &str) -> Message {
+        Message::User(vec![UserContent::Text { text: text.into() }])
+    }
+
+    pub(crate) fn tool_result(
+        call_id: &str,
+        name: &str,
+        result: Value,
+        images: Vec<ImageRef>,
+        is_error: bool,
+    ) -> Message {
+        Message::Tool(vec![ToolResult {
+            call_id: call_id.into(),
+            name: name.into(),
+            result,
+            images,
+            is_error,
+        }])
+    }
+
     /// Minimal request shared by codec/provider tests; cases override only the
     /// inputs relevant to the behavior under test.
     pub(crate) fn request(model: &str) -> ModelRequest {
         ModelRequest {
-            context: crate::provider::protocol::entries(vec![Message::User(vec![
-                UserContent::Text {
-                    text: "hello".into(),
-                },
-            ])]),
+            context: crate::provider::protocol::entries(vec![user("hello")]),
             max_output_tokens: std::num::NonZeroU64::new(8192),
             ..ModelRequest::test(model)
         }

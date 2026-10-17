@@ -54,13 +54,14 @@ named_enum! {
     }
 }
 
-/// How a response that completed the turn ended.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletedOutcome {
-    Answer,
-    ToolUse,
-    Cut(Truncation),
+crate::named_enum::detailed_enum! {
+    /// How a response that completed the turn ended.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    pub enum CompletedOutcome / ResponseOutcome {
+        Answer = "answer",
+        ToolUse = "tool_use",
+        Cut(Truncation) = "cut",
+    }
 }
 
 /// The model refused: the cut that fails the turn instead of completing it.
@@ -93,25 +94,8 @@ macro_rules! sequence {
         #[serde(transparent)]
         pub struct $name(u64);
 
-        /// Spelled as an integer wherever a schema names it.
-        impl schemars::JsonSchema for $name {
-            fn schema_name() -> std::borrow::Cow<'static, str> {
-                u64::schema_name()
-            }
-            fn schema_id() -> std::borrow::Cow<'static, str> {
-                u64::schema_id()
-            }
-            fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-                u64::json_schema(generator)
-            }
-            fn inline_schema() -> bool {
-                true
-            }
-        }
-
         impl $name {
             /// The number, for storage and wire formats that carry it as one.
-            #[must_use]
             pub const fn get(self) -> u64 {
                 self.0
             }
@@ -157,13 +141,11 @@ impl RecordSeq {
     }
 
     /// This record's sequence as the request it is; the caller matched the event.
-    #[must_use]
     pub const fn request(self) -> RequestSeq {
         RequestSeq(self.0)
     }
 
     /// This record's sequence as the commit it is; the caller matched the event.
-    #[must_use]
     pub const fn message(self) -> MessageSeq {
         MessageSeq(self.0)
     }
@@ -195,7 +177,6 @@ pub struct AttemptRef {
 pub struct RetryDelay(u64);
 
 impl RetryDelay {
-    #[must_use]
     pub fn millis(self) -> u64 {
         self.0
     }
@@ -223,7 +204,6 @@ pub enum AttemptFailure {
 
 impl AttemptFailure {
     /// Why the attempt failed, whether or not its request retries.
-    #[must_use]
     pub fn failure(&self) -> Failure {
         match self {
             Self::Final(failure) => failure.clone(),
@@ -242,7 +222,6 @@ pub enum CompactionFailure {
 }
 
 impl CompactionFailure {
-    #[must_use]
     pub fn request(self) -> Option<RequestSeq> {
         match self {
             Self::BeforeRequest => None,
@@ -251,7 +230,6 @@ impl CompactionFailure {
         }
     }
 
-    #[must_use]
     pub fn attempt(self) -> Option<AttemptRef> {
         match self {
             Self::Attempted(attempt) => Some(attempt),
@@ -322,7 +300,6 @@ impl ModelContext {
     }
 
     /// The history-free request these settings describe.
-    #[must_use]
     pub fn template(&self) -> ModelRequest {
         let profile = &self.profile.profile;
         ModelRequest {
@@ -368,8 +345,7 @@ pub enum SessionEvent {
     AgentStarted {
         #[serde(skip_serializing_if = "Option::is_none")]
         owner_job: Option<JobId>,
-        /// None for a tool-only agent without a model, such as a remote worker.
-        profile: Option<ProfileSnapshot>,
+        profile: ProfileSnapshot,
         available_depth: u32,
         /// The mode the agent starts in, when it has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,8 +443,6 @@ pub enum SessionEvent {
         state: JobEnd,
         #[serde(skip_serializing_if = "Option::is_none")]
         diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
         images: Vec<ImageRef>,
     },
     JobClaimed {
@@ -555,7 +529,6 @@ impl SessionEvent {
 
     /// Whether this record is the session's activity, as the session list orders
     /// by. Closing a session is not: it interrupts its agents.
-    #[must_use]
     pub fn is_activity(&self) -> bool {
         self.kind().is_activity()
     }

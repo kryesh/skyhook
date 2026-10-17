@@ -93,8 +93,6 @@ When the provider sets `auth_url`, login and token refresh use that issuer inste
 `wham/usage`, so a mirror serves both beneath one root. `auth_url` must
 use HTTPS (HTTP only on a loopback host) and carry no credentials, query, or fragment; a path prefix
 is kept. Skyhook never imports, reads, or modifies the official Codex client's credential files.
-Secure Codex credential storage currently requires Unix; other platforms fail explicitly rather than
-writing tokens without private file permissions.
 
 Credentials are kept in a `credentials/` directory next to the configuration file that defines the
 provider, as `<provider>.json`. For a provider in the user configuration that is

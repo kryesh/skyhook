@@ -81,6 +81,7 @@ impl App {
         let prepared = PreparedObservation::subscribe(observation.session.clone());
         *observation = prepared.active;
         self.snapshot = *prepared.snapshot;
+        self.hold_after_root_failure();
         self.reset_projection();
         self.load_title();
     }

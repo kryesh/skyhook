@@ -54,6 +54,7 @@ impl CommandSpec {
 
 /// Editable external DTO. Conversion into [`McpServerConfig`] is mandatory before
 /// connecting; this type cannot be passed to transport or manager startup APIs.
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawMcpServerConfig {

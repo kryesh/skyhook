@@ -74,7 +74,6 @@ pub enum HarnessError {
 
 impl HarnessError {
     /// Whether this is the failure of the session's journal, which stopped it.
-    #[must_use]
     pub fn journal_failed(&self) -> bool {
         matches!(
             self,
@@ -160,7 +159,6 @@ crate::named_enum::detailed_enum! {
 impl CompactionFault {
     /// Whether a fresh summary can succeed: the model's answer was unusable, or the
     /// todos it reconciled changed meanwhile. A broken invariant would fail again.
-    #[must_use]
     pub fn retryable(&self) -> bool {
         match self {
             Self::Truncated
@@ -178,7 +176,6 @@ impl CompactionFault {
     /// next request: a round cut short, or one a fresh summary could pass. A summary that
     /// overflowed already shrank within its round, so the next request decides instead:
     /// it fits, or its own overflow compacts.
-    #[must_use]
     pub fn keeps_need(&self) -> bool {
         match self {
             Self::Overflowed => false,

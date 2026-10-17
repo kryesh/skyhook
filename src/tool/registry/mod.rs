@@ -41,15 +41,11 @@ pub type Arguments = Map<String, Value>;
 
 pub trait OutputValue: std::fmt::Debug + Send + 'static {
     fn from_value(value: Value) -> Self;
-    fn with_diagnostic(self, diagnostic: super::diagnostic::PartialDiagnostic) -> Self;
 }
 
 impl<K: std::fmt::Debug + Send + 'static> OutputValue for super::output::Output<K> {
     fn from_value(value: Value) -> Self {
         Self::new(value)
-    }
-    fn with_diagnostic(self, diagnostic: super::diagnostic::PartialDiagnostic) -> Self {
-        self.with_diagnostic(diagnostic)
     }
 }
 
@@ -135,14 +131,17 @@ type ArgumentAdmission<C, O> =
 
 /// A call's handler input, admitted once before authorization. Its paths are
 /// resolved in place, then it becomes the invocation.
-pub(crate) struct Admitted<C, O>(Box<dyn AdmittedInput<C, O>>);
+pub(crate) type Admitted<C, O> = Box<dyn AdmittedInput<C, O>>;
 
-pub(super) trait AdmittedInput<C, O>: Send {
+pub(crate) trait AdmittedInput<C, O>: Send {
+    /// Filesystem inputs/outputs the admitted input names.
     fn paths(&mut self) -> Vec<PathArgument<'_>>;
+    /// Permissions derived from the admitted input.
     fn permissions(
         &self,
         location: &ExecutionLocation,
     ) -> Result<Vec<PermissionUse>, AdmissionError>;
+    /// Where the admitted input places its job, if not where the tool runs.
     fn job_location(&self) -> Option<JobLocation>;
     fn invoke(self: Box<Self>) -> Invocation<C, O>;
 }
@@ -151,31 +150,7 @@ pub(super) trait AdmittedInput<C, O>: Send {
 /// target, and a workspace absolute or relative to the target's.
 pub(crate) struct JobLocation {
     pub(crate) target: Option<crate::target::TargetRef>,
-    pub(crate) workspace: Option<std::path::PathBuf>,
-}
-
-impl<C, O> Admitted<C, O> {
-    pub(super) fn new(input: impl AdmittedInput<C, O> + 'static) -> Self {
-        Self(Box::new(input))
-    }
-
-    /// Filesystem inputs/outputs the admitted input names.
-    pub(crate) fn paths(&mut self) -> Vec<PathArgument<'_>> {
-        self.0.paths()
-    }
-
-    /// Permissions derived from the admitted input.
-    pub(crate) fn permissions(
-        &self,
-        location: &ExecutionLocation,
-    ) -> Result<Vec<PermissionUse>, AdmissionError> {
-        self.0.permissions(location)
-    }
-
-    /// Where the admitted input places its job, if not where the tool runs.
-    pub(crate) fn job_location(&self) -> Option<JobLocation> {
-        self.0.job_location()
-    }
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +204,9 @@ pub enum PathKind {
     Removable,
     /// An existing directory a process runs in.
     WorkingDirectory,
+    /// A directory a job runs in, which inside the authorization root need not
+    /// exist yet: a write that creates its parents may create it.
+    Workspace,
 }
 
 /// The workspace itself, as a path relative to it: what an omitted path
@@ -280,7 +258,6 @@ struct ToolExecution {
     supports_name: bool,
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
-    read_error_output: Option<fn(&super::diagnostic::Diagnostic) -> Option<Value>>,
     process_authentication: bool,
     reads_source: bool,
 }
@@ -289,7 +266,6 @@ struct ToolExecution {
 pub(crate) const SOURCE_ARGUMENT: &str = "source";
 
 impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
-    #[must_use]
     pub const fn job_role(&self) -> crate::job::JobRole {
         self.execution.job_role
     }
@@ -306,51 +282,16 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
         (self.admit)(arguments)
     }
 
-    /// The admitted input's invocation, once its paths are resolved.
-    pub(crate) fn invoke(&self, admitted: Admitted<C, O>) -> Invocation<C, O> {
-        let invocation = admitted.0.invoke();
-        let Some(convert) = self.execution.read_error_output else {
-            return invocation;
-        };
-        Invocation {
-            result_policy: invocation.result_policy(),
-            ..Invocation::new(move |context| async move {
-                invocation.call(context).await.or_else(|error| {
-                    let output = (error.is_source_filesystem_io())
-                        .then(|| convert(&error.diagnostic()))
-                        .flatten();
-                    match output {
-                        Some(output) => {
-                            Ok(O::from_value(output).with_diagnostic(error.into_facts().0))
-                        }
-                        None => Err(error),
-                    }
-                })
-            })
-        }
-    }
-
     pub(crate) fn capabilities(&self) -> Vec<Capability> {
         self.execution.capabilities.clone()
     }
 
-    #[must_use]
     pub fn name(&self) -> &str {
         &self.definition.name
     }
 
-    #[must_use]
     pub(crate) const fn placement(&self) -> ToolPlacement {
         self.execution.placement
-    }
-
-    /// Convert an error at a known source-filesystem boundary, such as path
-    /// preflight. Handler failures must first establish their source provenance.
-    pub(crate) fn read_error_output(
-        &self,
-        diagnostic: &super::diagnostic::Diagnostic,
-    ) -> Option<Value> {
-        self.execution.read_error_output?(diagnostic)
     }
 
     pub(crate) const fn accepts_input(&self) -> bool {
@@ -386,54 +327,4 @@ pub enum RegistryError {
     ReservedBackground,
     #[error("`target` is reserved for structurally targeted tools")]
     ReservedTarget,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn completed_read_errors_require_source_provenance_and_registered_policy() {
-        use crate::tool::diagnostic::{Operation, Subject};
-
-        for (opt_in, source) in [(true, true), (true, false), (false, true)] {
-            let mut options = ToolOptions::default();
-            if opt_in {
-                options = options.read_error_output(|_| Some(json!({"kind":"error"})));
-            }
-            let mut builder = CatalogBuilder::<(), ToolOutput>::default();
-            builder
-                .register_dynamic(
-                    "read",
-                    "read policy fixture",
-                    json!({"type":"object", "properties":{"path":{"type":"string"}}}),
-                    options,
-                    move |_, _| async move {
-                        // Labels describe failures; only source provenance and opt-in
-                        // authorize completed read errors, not the tool name or operation.
-                        Err(if source {
-                            ToolError::source_filesystem_io(
-                                std::io::ErrorKind::PermissionDenied.into(),
-                            )
-                            .operation(Operation::StoreImage, Subject::Label("source".into()))
-                        } else {
-                            ToolError::io(std::io::ErrorKind::PermissionDenied.into())
-                                .operation(Operation::Read, Subject::path("source"))
-                        })
-                    },
-                )
-                .unwrap();
-            let registry = builder.build();
-            let tool = registry.get("read").unwrap();
-            let arguments = json!({"path": "/resolved/source"});
-            let admitted = tool.admit(arguments.as_object().unwrap()).unwrap();
-            let result = tool.invoke(admitted).call(()).await;
-            assert_eq!(result.is_ok(), opt_in && source);
-            if let Ok(output) = result {
-                assert_eq!(output.value, json!({"kind":"error"}));
-                assert!(output.diagnostic.is_some());
-            }
-        }
-    }
 }

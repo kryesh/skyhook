@@ -66,7 +66,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::media::Attachment;
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn file_menu_preserves_non_unicode_paths_and_attaches_images() {
         use std::os::unix::ffi::OsStringExt;

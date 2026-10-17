@@ -72,34 +72,6 @@ impl SessionRuntime {
         }))
     }
 
-    /// The context `change` gives `agent` on `profile`: `system`, its mode's
-    /// prompt, and the tools its grants allow. It is projected before its
-    /// `ModeChanged` is journaled, so reasoning bound to the replaced prompt is
-    /// stripped here.
-    pub(super) fn mode_context(
-        &self,
-        agent: &AgentId,
-        profile: crate::session::ProfileSnapshot,
-        system: Vec<SystemSegment>,
-        change: &ModeChange,
-    ) -> Result<AgentContext, HarnessError> {
-        let capabilities = &change.capabilities;
-        let mut context = self.open_agent_context(agent, profile, system, capabilities, None)?;
-        context.strip_bound_reasoning();
-        Ok(context)
-    }
-
-    /// The system prompt `change` gives `agent` at `location`.
-    pub(super) async fn mode_prompt(
-        &self,
-        agent: &AgentId,
-        location: &crate::execution::ExecutionLocation,
-        change: &ModeChange,
-    ) -> Result<Vec<SystemSegment>, HarnessError> {
-        let (mode, capabilities) = (Some(&change.mode), &change.capabilities);
-        (self.system_prompt(agent, location, change.depth, mode, capabilities)).await
-    }
-
     /// The mode the root runs next: the one `requested`, else its own as configured
     /// now, or the default mode once the configuration no longer has its own.
     pub(super) fn root_mode(

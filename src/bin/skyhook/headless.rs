@@ -144,9 +144,7 @@ async fn run_input(
             session.run_script(source).await?;
         }
         InitialInput::Prompt { text, images } => {
-            let attachments = launch::read_images(workspace, &images)
-                .await
-                .map_err(OperationError::Attachment)?;
+            let attachments = launch::read_images(workspace, &images).await?;
             let selection = session.selection(None, mode.as_ref())?;
             session
                 .prompt_with_options(text, &attachments, selection)

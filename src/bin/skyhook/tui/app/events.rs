@@ -1,5 +1,5 @@
 use super::*;
-use crate::launch::LaunchError;
+use crate::launch::{AttachmentError, LaunchError};
 use skyhook::job::{Invocation, PresentedOutput};
 
 // Query presence, capture selection and preview metadata belong to core.
@@ -22,7 +22,7 @@ pub enum Work {
         id: QueuedInputId,
         generation: u64,
         revision: u64,
-        result: Result<(), skyhook::agent::HarnessError>,
+        delivered: Delivered,
     },
     Done {
         result: Result<(), crate::launch::OperationError>,
@@ -42,7 +42,7 @@ pub enum Work {
         draft: Token,
         /// Composer offset just after the `@` that opened the file picker.
         at: Option<usize>,
-        result: Result<Attachment, String>,
+        result: Result<Attachment, AttachmentError>,
     },
     Started {
         result: Result<PreparedObservation, LaunchError>,
@@ -110,8 +110,8 @@ impl App {
                 id,
                 generation,
                 revision,
-                result,
-            } => self.queue_committed(id, generation, revision, result),
+                delivered,
+            } => self.queue_committed(id, generation, revision, delivered),
             Work::Interrupted { count } => {
                 if count > 0 {
                     // Journal the status only for an interruption that happened.
@@ -127,10 +127,9 @@ impl App {
                 result,
             } => {
                 self.operation = false;
-                self.initial_input = None;
                 if let Err(error) = result {
                     self.report(&error);
-                    self.pause_queue();
+                    self.pause_queue(Paused::Stopped);
                 }
             }
             Work::Continued {
@@ -176,7 +175,7 @@ impl App {
                         }
                         self.editor.attach(attachment);
                     }
-                    Err(error) => self.toast(error),
+                    Err(error) => self.toast(error.to_string()),
                 }
             }
             Work::Toast(message) => self.toast(message),
@@ -575,11 +574,22 @@ mod tests {
     }
 
     fn capture_text(output: &skyhook::job::JobView, field: &str) -> String {
-        let captures = output.presentation().map_or(&[][..], |p| p.captures());
+        let captures = output
+            .presentation
+            .as_ref()
+            .map_or(&[][..], |p| p.captures());
         let capture = captures
             .iter()
-            .find(|capture| capture.field().as_str() == field);
-        let page = capture.and_then(|capture| capture.output()?.presentation()?.preview());
+            .find(|capture| capture.field.as_str() == field);
+        let page = capture.and_then(|capture| {
+            capture
+                .output
+                .as_ref()?
+                .presentation
+                .as_ref()?
+                .preview
+                .as_ref()
+        });
         page.map_or_else(String::new, |page| match page {
             OutputPreview::Lines(page) => page.lines().join("\n"),
             page => panic!("capture pages are text: {page:?}"),
@@ -647,7 +657,7 @@ mod tests {
         app.refresh();
         let complete = fetch_output(&mut app, job).await;
         assert!(app.outputs.query(job).is_none() && app.outputs.is_final(job, run));
-        let complete = complete.result().unwrap();
+        let complete = complete.result.unwrap();
         let result = json!({"exit_code": 1, "stdout": "live stdout\n", "stderr": "live stderr\n"});
         for field in ["exit_code", "stdout", "stderr"] {
             assert_eq!(complete[field], result[field]);
@@ -658,10 +668,13 @@ mod tests {
         query.field = Some(stderr.clone());
         app.outputs.set_query(query);
         let selected = fetch_output(&mut app, job).await;
-        let presentation = selected.presentation().unwrap();
-        assert_eq!(presentation.preview().unwrap().field(), Some(&stderr));
+        let presentation = selected.presentation.unwrap();
+        assert_eq!(
+            presentation.preview.as_ref().unwrap().field(),
+            Some(&stderr)
+        );
         let captures = presentation.captures();
-        assert!(captures.iter().all(|capture| capture.output().is_none()));
+        assert!(captures.iter().all(|capture| capture.output.is_none()));
         assert_eq!(app.outputs.query(job).unwrap().field, Some(stderr));
         session.shutdown().await.unwrap();
     }
@@ -685,7 +698,7 @@ mod tests {
         app.editor.take();
 
         // Queue without starting a session: even a queued submission consumes its draft.
-        app.paused = true;
+        app.paused = Some(Paused::Stopped);
         app.submit("submitted".into());
         let stale_then_current = |app: &mut App, stale| {
             app.dirty = false;
@@ -730,75 +743,56 @@ mod tests {
         assert!(app.prompts.is_empty());
     }
 
-    /// A press and release without movement copies nothing, even when the
-    /// streaming reply rewraps under the pointer between them.
+    /// Releasing after the streaming reply rewraps under the pointer: a press and
+    /// release without movement copies nothing, and a drag keeps the selection it made.
     #[tokio::test]
-    async fn a_stationary_click_copies_nothing_while_its_text_rewraps() {
+    async fn releasing_after_a_rewrap_copies_only_what_a_drag_selected() {
         use skyhook::provider::protocol::ItemKind;
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let text = format!("{} beta", "a".repeat(46));
-        let asked = ask(app.session().unwrap(), "question");
-        let turn = model.turn().await;
-        turn.delta("text", ItemKind::Text, &text);
-        observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
-        let screen = draw(&mut app);
-        let (x, y) = (screen.lines().enumerate())
-            .find_map(|(y, line)| Some((line.find(" beta")? + 3, y)))
-            .unwrap();
-        let cell = Rect::new(x as u16, y as u16, 1, 1);
-        app.clipboard = Some("earlier".into());
-        mouse(&mut app, cell, MouseEventKind::Down(MouseButton::Left));
-        turn.delta("text", ItemKind::Text, "gamma");
-        let grown = format!("{text}gamma");
-        observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
-        let after = draw(&mut app);
-        assert!(!after.contains("a beta"), "the word wraps:\n{after}");
-        mouse(&mut app, cell, MouseEventKind::Up(MouseButton::Left));
-        assert_eq!(app.clipboard.as_deref(), Some("earlier"));
-        assert!(app.toast.is_none());
-        assert!(
-            app.selection
-                .as_ref()
-                .is_some_and(|selection| selection.text().is_empty())
-        );
-        turn.answer(&grown);
-        bounded(asked).await.unwrap().unwrap();
-    }
-
-    /// Releasing a drag where it last moved keeps the selection the drag
-    /// made, even when the text has rewrapped under the pointer since.
-    #[tokio::test]
-    async fn releasing_a_drag_after_its_text_rewraps_keeps_the_selection() {
-        use skyhook::provider::protocol::ItemKind;
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let text = format!("{} beta", "a".repeat(46));
-        let asked = ask(app.session().unwrap(), "question");
-        let turn = model.turn().await;
-        turn.delta("text", ItemKind::Text, &text);
-        observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
-        let screen = draw(&mut app);
-        let (x, y) = (screen.lines().enumerate())
-            .find_map(|(y, line)| Some((line.find(" beta")? + 1, y)))
-            .unwrap();
-        let (start, end) = (
-            Rect::new(x as u16, y as u16, 1, 1),
-            Rect::new(x as u16 + 2, y as u16, 1, 1),
-        );
         let left = MouseButton::Left;
-        mouse(&mut app, start, MouseEventKind::Down(left));
-        mouse(&mut app, end, MouseEventKind::Drag(left));
-        turn.delta("text", ItemKind::Text, "gamma");
-        let grown = format!("{text}gamma");
-        observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
-        let after = draw(&mut app);
-        assert!(!after.contains("a beta"), "the word wraps:\n{after}");
-        let selected = |app: &App| app.selection.as_ref().map(|s| s.text().to_owned());
-        assert_eq!(selected(&app).as_deref(), Some("be"));
-        mouse(&mut app, end, MouseEventKind::Up(left));
-        assert_eq!(selected(&app).as_deref(), Some("be"));
-        assert_eq!(app.clipboard.as_deref(), Some("be"));
-        turn.answer(&grown);
-        bounded(asked).await.unwrap().unwrap();
+        for drag in [false, true] {
+            let (_root, mut app, mut model, _session) = played_fixture().await;
+            let text = format!("{} beta", "a".repeat(46));
+            let asked = ask(app.session().unwrap(), "question");
+            let turn = model.turn().await;
+            turn.delta("text", ItemKind::Text, &text);
+            observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
+            let screen = draw(&mut app);
+            let (x, y) = (screen.lines().enumerate())
+                .find_map(|(y, line)| Some((line.find(" beta")? + 1, y)))
+                .unwrap();
+            let start = Rect::new(x as u16, y as u16, 1, 1);
+            let end = if drag {
+                Rect {
+                    x: start.x + 2,
+                    ..start
+                }
+            } else {
+                start
+            };
+            app.clipboard = Some("earlier".into());
+            mouse(&mut app, start, MouseEventKind::Down(left));
+            if drag {
+                mouse(&mut app, end, MouseEventKind::Drag(left));
+            }
+            turn.delta("text", ItemKind::Text, "gamma");
+            let grown = format!("{text}gamma");
+            observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
+            let after = draw(&mut app);
+            assert!(!after.contains("a beta"), "the word wraps:\n{after}");
+            let (selected, copied) = if drag { ("be", "be") } else { ("", "earlier") };
+            let selection = |app: &App| app.selection.as_ref().map(|s| s.text().to_owned());
+            if drag {
+                assert_eq!(selection(&app).as_deref(), Some(selected));
+            }
+            mouse(&mut app, end, MouseEventKind::Up(left));
+            assert_eq!(selection(&app).as_deref(), Some(selected));
+            assert_eq!(app.clipboard.as_deref(), Some(copied));
+            if !drag {
+                assert!(app.toast.is_none());
+            }
+            turn.answer(&grown);
+            bounded(asked).await.unwrap().unwrap();
+        }
     }
 
     /// Text selected while a reply streams stays selected as its reasoning
@@ -1061,7 +1055,7 @@ mod tests {
         run_script(&mut app, "return await tool.read({path:'example.rs'});").await;
         let job = job_named(&app, "read");
         let output = fetch_output(&mut app, job).await;
-        assert!(source.starts_with(output.result().unwrap()["content"].as_str().unwrap()));
+        assert!(source.starts_with(output.result.as_ref().unwrap()["content"].as_str().unwrap()));
         let Some(Continuation::Lines {
             field,
             start,

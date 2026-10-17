@@ -1,10 +1,7 @@
 //! The conventions that vary between Responses servers.
-use crate::{
-    newtype::{Blank, nonblank, string_newtype},
-    provider::codec::{
-        BodyPath, CacheKey, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, StateRole,
-        ToolNames, path,
-    },
+use crate::provider::codec::{
+    BodyPath, BreakpointBudget, Cache, CacheControl, CacheKey, Identity, Locations, NonEmpty,
+    SchemaConstraint, StateRole, ToolNames, UnsignedReasoning, path,
 };
 
 /// Whether `instructions` is sent without system segments.
@@ -15,28 +12,14 @@ pub(crate) enum Instructions {
     RequiredEvenWhenEmpty,
 }
 
-/// Explicit-only caching is opt-in; otherwise the backend keeps its defaults.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Cache {
-    #[default]
-    Automatic,
-    Explicit,
-}
-
 crate::named_enum::named_enum! {
     /// The detail of the reasoning summaries requested, as `reasoning.summary` spells it.
-    #[derive(Clone, Copy, Debug, Default, serde::Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
     pub enum ReasoningSummary {
-        #[default]
         Auto = "auto",
         Concise = "concise",
         Detailed = "detailed",
     }
-}
-
-string_newtype! {
-    /// A service tier's wire ID. Catalogs may advertise tiers unknown to this client.
-    pub struct ServiceTier(Blank) = |value| nonblank("service_tier", value);
 }
 
 crate::named_enum::named_enum! {
@@ -54,42 +37,51 @@ pub(crate) struct Dialect {
     pub instructions: Instructions,
     /// Where `max_output` goes; none when the endpoint manages the limit.
     pub output_limit: Locations<BodyPath>,
-    /// None for a service that rejects `reasoning.summary`.
+    /// The dialect's default, which configuration may replace or withhold.
     pub reasoning_summary: Option<ReasoningSummary>,
-    pub service_tier: Option<ServiceTier>,
     pub cyber_access_program: Option<CyberAccessProgram>,
     pub cache: Cache,
-    pub effort: Effort,
+    /// Sent top level, asking the server to place breakpoints itself.
+    pub cache_control: CacheControl,
+    /// The breakpoints explicit caching marks.
+    pub breakpoints: BreakpointBudget,
+    /// Where the profile's `reasoning` goes.
+    pub effort: NonEmpty<BodyPath>,
     pub identity: Identity,
-    /// Event types that are transport metadata, not output. Unknown semantic
-    /// events still fail.
+    /// Event types that are transport metadata, not output; skipped wherever
+    /// they arrive, even after the terminal response.
     pub metadata_events: &'static [&'static str],
     pub tool_names: ToolNames,
+    pub schema: SchemaConstraint,
     pub state_role: StateRole,
+    /// Unencrypted reasoning items.
+    pub unsigned: UnsignedReasoning,
 }
 
 impl Dialect {
     /// Stateless use of the standard API: nothing stored server-side, encrypted
-    /// reasoning replayed by the client.
+    /// reasoning replayed by the client, schemas sent as written, and no summary
+    /// requested.
     pub(crate) fn stateless() -> Self {
         Self {
             instructions: Instructions::WhenPresent,
             output_limit: Locations::one(const { path("max_output_tokens") }),
-            reasoning_summary: Some(ReasoningSummary::Auto),
-            service_tier: None,
+            reasoning_summary: None,
             cyber_access_program: None,
             cache: Cache::Automatic,
-            effort: Effort {
-                path: NonEmpty::one(const { path("reasoning.effort") }),
-                levels: OPENAI_EFFORT,
-            },
+            cache_control: CacheControl::Omitted,
+            // A request makes at most four explicit cache writes.
+            breakpoints: BreakpointBudget::new(4),
+            effort: NonEmpty::one(const { path("reasoning.effort") }),
             identity: Identity {
                 cache_key: Locations::one(CacheKey::Body(const { path("prompt_cache_key") })),
                 user_id: Locations::NONE,
             },
             metadata_events: &[],
             tool_names: ToolNames::Any,
+            schema: SchemaConstraint::Grammar,
             state_role: StateRole::User,
+            unsigned: UnsignedReasoning::Replayed(()),
         }
     }
 }

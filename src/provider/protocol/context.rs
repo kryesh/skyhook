@@ -44,7 +44,6 @@ impl From<Message> for Entry {
 }
 
 impl Entry {
-    #[must_use]
     pub fn message(&self) -> Option<&Message> {
         match self {
             Self::Message(message) => Some(message),
@@ -59,7 +58,6 @@ impl Entry {
 
 impl State {
     /// Whether the model reads this state when it is sent.
-    #[must_use]
     pub fn is_read(&self) -> bool {
         self.lifetime != StateLifetime::Superseded
     }
@@ -113,15 +111,13 @@ pub(crate) fn state(text: &str, lifetime: StateLifetime) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{AssistantItem, UserContent};
+    use crate::provider::{codec::common::tests::user, protocol::AssistantItem};
 
     /// A state is sent only when a response or the end follows it; the split starts at
     /// the first current state.
     #[test]
     fn only_states_a_response_or_the_end_follows_are_sent() {
-        let user = Entry::Message(Message::User(vec![UserContent::Text {
-            text: "input".into(),
-        }]));
+        let user = Entry::Message(user("input"));
         let answer = Entry::Message(Message::Assistant(vec![AssistantItem::text("a", 0, "x")]));
         let context = [
             user.clone(),

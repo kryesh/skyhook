@@ -5,7 +5,7 @@ use crate::{
     session::Message,
 };
 
-use super::projection::{Projected, Projection, ledger, mode_boundary};
+use super::projection::project_from;
 use super::{EventRecord, ModelContext, ModelPurpose, SessionError, SessionEvent};
 use crate::session::{MessageSeq, RecordSeq, RequestSeq};
 
@@ -217,9 +217,9 @@ fn tool_exchange(assistant: &Message, tools: &[&Message]) -> Option<ToolExchange
         .collect();
     let results: Vec<_> = tools
         .iter()
-        .flat_map(|tool| match tool {
-            Message::Tool(results) => results.as_slice(),
-            _ => &[],
+        .filter_map(|tool| match tool {
+            Message::Tool(result) => Some(result),
+            _ => None,
         })
         .map(|result| (result.call_id.as_str(), result.name.as_str()))
         .collect();
@@ -252,10 +252,6 @@ pub enum ReplayError {
     Context,
     #[error("checkpoint must be a compaction of the same agent that precedes the call")]
     Checkpoint,
-    #[error("message source must precede the call and belong to the same agent")]
-    Source,
-    #[error("referenced event does not contain a conversation message")]
-    NotMessage,
     #[error("history must end at a message of the same agent's history under the checkpoint")]
     Through,
     #[error(
@@ -265,10 +261,9 @@ pub enum ReplayError {
 }
 
 /// The history a `ModelRequested` record names: its context, then its checkpoint's
-/// frontier and retained sources.
+/// retained sources.
 struct RequestHistory<'a> {
     context: &'a ModelContext,
-    frontier: Option<RecordSeq>,
     retained: &'a [MessageSeq],
 }
 
@@ -319,11 +314,7 @@ fn request_history<'a>(
     if from.is_some() && context.purpose != ModelPurpose::Compaction {
         return Err(ReplayError::From);
     }
-    Ok(RequestHistory {
-        context,
-        frontier,
-        retained,
-    })
+    Ok(RequestHistory { context, retained })
 }
 
 /// Return the model the request was issued under and the exact request at a
@@ -352,45 +343,20 @@ pub fn reconstruct_model_request(
         return Err(invalid(ReplayError::NotRequest));
     };
     let earlier = &records[..index];
-    let lookup = |source: RecordSeq| record_at(earlier, source);
-    let RequestHistory {
-        context,
-        frontier,
-        retained,
-    } = request_history(call, lookup).map_err(invalid)?;
-    let after = |bound: RecordSeq| earlier.partition_point(|record| record.sequence <= bound);
-    let start = after(frontier.unwrap_or_default());
-    let end = through.map_or(start, |through| after(through.into()).max(start));
-    let later = earlier[start..end].iter().filter(|record| {
-        record.agent == call.agent && matches!(record.event, SessionEvent::MessageCommitted { .. })
-    });
-    let sources = (retained.iter().copied())
-        .chain(later.map(|record| record.sequence.message()))
-        .map(RecordSeq::from);
-    let switched = mode_boundary(earlier, &call.agent);
-    let ledger = ledger(earlier);
-    let mut history = Projection::default();
-    for source in checkpoint.iter().copied().chain(sources) {
-        let record = lookup(source)
-            .filter(|record| record.agent == call.agent)
-            .ok_or(invalid(ReplayError::Source))?;
-        let message = match &record.event {
-            SessionEvent::MessageCommitted { message } => message,
-            SessionEvent::Compaction { checkpoint } => &checkpoint.message,
-            _ => return Err(invalid(ReplayError::NotMessage)),
-        };
-        // As in projection, the checkpoint's message and bound reasoning before it never
-        // enter a changed conversation, and a summary drops tools, which changes the
-        // conversation for all of it.
-        let changed = context.purpose == ModelPurpose::Compaction
-            || *checkpoint == Some(source)
-            || source < switched
-            || frontier.is_some_and(|last| source <= last);
-        history.messages.push(if changed {
-            Projected::unbound(source, message.clone())
-        } else {
-            Projected::bound(&ledger, earlier, source, message)
-        });
+    let RequestHistory { context, retained } =
+        request_history(call, |source| record_at(earlier, source)).map_err(invalid)?;
+    let checkpoint =
+        checkpoint.map(|checkpoint| earlier.partition_point(|record| record.sequence < checkpoint));
+    let mut history = project_from(earlier, &call.agent, checkpoint);
+    // The history ends at `through`, after its checkpoint's opening.
+    let opening = checkpoint.map_or(0, |_| 1 + retained.len());
+    let through = through.map(RecordSeq::from);
+    let kept = history.messages[opening..]
+        .partition_point(|projected| through.is_some_and(|through| projected.sequence <= through));
+    history.messages.truncate(opening + kept);
+    // A summary drops tools, which changes the conversation for all of it.
+    if context.purpose == ModelPurpose::Compaction {
+        history.unbind();
     }
     if let Some(from) = *from
         && !history.trim_from(from)
@@ -421,7 +387,7 @@ mod tests {
         provider::protocol::{
             AssistantItem, Binding, HistoryLifetime, ReplayFormat, ToolCall, ToolResult,
         },
-        session::{AttemptRef, CompactionCheckpoint, SessionStore, UserPart, tests::MemorySession},
+        session::{AttemptRef, CompactionCheckpoint, SessionStore, UserPart},
     };
     use serde_json::json;
 
@@ -434,7 +400,12 @@ mod tests {
 
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
-        let (directory, store, agent) = crate::session::tests::on_disk().await;
+        let crate::tests::TestRuntime {
+            root: directory,
+            store,
+            agent,
+            ..
+        } = crate::tests::TestRuntime::on_disk().await;
         let child = agent.child(1);
         let child_start = crate::session::tests::agent_started(directory.path());
         store.append(child.clone(), child_start).await.unwrap();
@@ -474,13 +445,13 @@ mod tests {
             reasoning,
             AssistantItem::tool_call("read-item", 1, read),
         ]);
-        let tool = Message::Tool(vec![ToolResult {
+        let tool = Message::Tool(ToolResult {
             call_id: "read-1".into(),
             name: "read".into(),
             result: json!({"ok":true}),
             images: vec![image.clone()],
             is_error: false,
-        }]);
+        });
         let append =
             async |agent: &AgentId, event| store.append(agent.clone(), event).await.unwrap();
         let mut sources = Vec::new();
@@ -530,7 +501,8 @@ mod tests {
         }
         let id = store.id();
         drop(store);
-        let (store, records) = SessionStore::open(directory.path(), id).await.unwrap();
+        let sessions = directory.path().join("sessions");
+        let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
         let (model, mut restored) =
             reconstruct_model_request(&records, call.sequence.request()).unwrap();
         assert_eq!(model.to_string(), "original-provider/test");
@@ -594,7 +566,7 @@ mod tests {
     /// Checkpoints are validated when appended, so a journal always projects.
     #[tokio::test]
     async fn invalid_compactions_are_refused() {
-        let session = MemorySession::new().await;
+        let session = crate::tests::TestRuntime::new().await;
         let (store, agent) = (&session.store, &session.agent);
         let append = async |event| store.append(agent.clone(), event).await.map(|r| r.sequence);
         let call = |id: &str, position| {
@@ -602,13 +574,13 @@ mod tests {
             AssistantItem::tool_call(format!("item-{id}"), position, call)
         };
         let result = |id: &str| {
-            Message::Tool(vec![ToolResult {
+            Message::Tool(ToolResult {
                 call_id: id.into(),
                 name: "exec".into(),
                 result: json!({}),
                 images: vec![],
                 is_error: false,
-            }])
+            })
         };
         let calls = append(committed(Message::Assistant(vec![
             call("a", 0),
@@ -746,13 +718,13 @@ mod tests {
             AssistantItem::tool_call(id, position, ToolCall::new(id, "exec", json!({})).unwrap())
         };
         let result = |id: &str| {
-            Message::Tool(vec![ToolResult {
+            Message::Tool(ToolResult {
                 call_id: id.into(),
                 name: "exec".into(),
                 result: json!({}),
                 images: vec![],
                 is_error: false,
-            }])
+            })
         };
         use CheckpointError::{IncompleteExchange, MismatchedExchange};
         for (results, trailing, retained, expected) in [

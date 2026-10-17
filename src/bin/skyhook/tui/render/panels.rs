@@ -456,7 +456,7 @@ mod tests {
     use crate::tui::app::tests::draft_fixture;
     use crossterm::event::Event;
     use skyhook::agent::Question;
-    use skyhook::remote::{SensitivePrompt, SensitivePromptKind};
+    use skyhook::remote::SensitivePromptKind;
     use tokio::sync::oneshot;
 
     fn assert_prompt_render(app: &mut App, width: u16, height: u16, answer: Option<&str>) {
@@ -546,13 +546,7 @@ mod tests {
             app.prompt(Prompt {
                 id: 1,
                 kind: PromptKind::Authentication {
-                    prompt: SensitivePrompt {
-                        kind,
-                        message: "SSH authentication".into(),
-                        target: None,
-                        origin: skyhook::target::TargetRef::Root,
-                        requester: Default::default(),
-                    },
+                    prompt: crate::interaction::tests::sensitive_prompt(kind, "SSH authentication"),
                     reply,
                 },
             });

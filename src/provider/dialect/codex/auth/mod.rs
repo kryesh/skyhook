@@ -211,7 +211,7 @@ pub(super) fn manager_at(root: &std::path::Path, issuer: &Issuer) -> AuthManager
     AuthManager::new(login_command(root, "test"), issuer.clone()).unwrap()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) use oauth::tests::mock as oauth_mock;
 
 /// A manager holding unexpired credentials from a loopback issuer, for the
@@ -235,28 +235,27 @@ pub(super) fn test_manager(directory: std::path::PathBuf) -> AuthManager {
     manager
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::oauth::tests::{mock, token_body};
     use super::store::tests::stored;
     use super::*;
     use crate::provider::dialect::{AuthStatus, LoginReason, LoginRequired};
-    use std::sync::atomic::Ordering;
 
     /// Refresh joins its path beneath the issuer's prefix.
     #[tokio::test]
     async fn independent_managers_coordinate_rotating_refresh() {
         let temp = tempfile::tempdir().unwrap();
-        let (url, count, server) = mock(vec![(200, token_body())]).await;
-        let issuer = Issuer::parse(&format!("{url}/tenant")).unwrap();
+        let server = mock(vec![(200, token_body())]).await;
+        let issuer = Issuer::parse(&format!("{}/tenant", server.root())).unwrap();
         let one = manager_at(temp.path(), &issuer);
         let two = manager_at(temp.path(), &issuer);
         let (lock, _) = one.load().await.unwrap();
         one.save(lock, stored(&issuer, 1)).await.unwrap();
         let (a, b) = tokio::join!(one.credentials(), two.credentials());
         assert!(a.unwrap().access_token == b.unwrap().access_token);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        let requests = server.await.unwrap();
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /tenant/oauth/token "));
         assert!(requests[0].contains("grant_type=refresh_token"));
         assert!(requests[0].contains("refresh_token=old-refresh"));
@@ -269,8 +268,8 @@ mod tests {
     #[tokio::test]
     async fn credentials_of_another_issuer_require_login_and_send_nothing() {
         let temp = tempfile::tempdir().unwrap();
-        let (url, count, server) = mock(vec![(200, token_body())]).await;
-        let manager = manager_at(temp.path(), &Issuer::parse(&url).unwrap());
+        let server = mock(vec![(200, token_body())]).await;
+        let manager = manager_at(temp.path(), &Issuer::parse(&server.root()).unwrap());
         let other = Issuer::parse("https://auth.example/").unwrap();
         let required = LoginRequired {
             command: login_command(temp.path(), "test"),
@@ -286,8 +285,7 @@ mod tests {
                 AuthStatus::LoginRequired(required.clone())
             );
         }
-        assert_eq!(count.load(Ordering::SeqCst), 0);
-        server.abort();
+        assert!(server.finish().await.is_empty());
     }
 
     /// A failed refresh keeps the stored credentials and never echoes the
@@ -298,8 +296,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let secret = serde_json::json!({"error":"old-refresh TOP-SECRET"});
         let replies = [400, 429, 503].map(|status| (status, secret.clone()));
-        let (url, _, server) = mock(replies.to_vec()).await;
-        let issuer = Issuer::parse(&url).unwrap();
+        let server = mock(replies.to_vec()).await;
+        let issuer = Issuer::parse(&server.root()).unwrap();
         let manager = manager_at(temp.path(), &issuer);
         let (lock, _) = manager.load().await.unwrap();
         manager.save(lock, stored(&issuer, 1)).await.unwrap();
@@ -310,7 +308,7 @@ mod tests {
             assert!(!format!("{err:?}").contains("old-refresh"));
             kinds.push(err.kind());
         }
-        server.await.unwrap();
+        assert_eq!(server.finish().await.len(), kinds.len());
         let (_, saved) = manager.load().await.unwrap();
         assert_eq!(saved.unwrap().refresh_token.as_str(), "old-refresh");
         let refused = crate::tests::RefusedPort::new();

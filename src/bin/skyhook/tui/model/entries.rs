@@ -21,8 +21,8 @@ use skyhook::identity::JobId;
 use skyhook::job::JobEnvelope;
 use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
 use skyhook::session::{
-    CompactionTrigger, EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestLedger,
-    RequestSeq, SessionEvent, Turns, UserPart,
+    CompactionTrigger, EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestSeq,
+    SessionEvent, UserPart,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -119,98 +119,6 @@ pub struct Inputs<'a> {
     pub unsaved: &'a [UnsavedStatus],
 }
 
-/// Tool results carry a call ID but no message sequence. Each pairs with a call of
-/// the agent's most recent assistant turn, consuming the call once, so an old or
-/// reused ID never claims a later result.
-#[derive(Default)]
-struct Pairing {
-    pending: HashMap<(String, String), MessageSeq>,
-    turn: Option<MessageSeq>,
-    /// A call's result, as its record and index.
-    results: HashMap<(MessageSeq, String), (RecordSeq, usize)>,
-    matched: HashSet<(RecordSeq, usize)>,
-}
-impl Pairing {
-    /// Fold one record, noting the calls it paired with a result.
-    fn observe(&mut self, record: &EventRecord, paired: &mut HashSet<Dep>) {
-        match &record.event {
-            SessionEvent::MessageCommitted {
-                message: Message::Assistant(items),
-            } => {
-                self.pending.clear();
-                self.turn = Some(record.sequence.message());
-                for call in items.iter().filter_map(|item| item.call()) {
-                    self.pending.insert(
-                        (call.id().to_owned(), call.name().to_owned()),
-                        record.sequence.message(),
-                    );
-                }
-            }
-            SessionEvent::JobCreated {
-                origin: Some(origin),
-                tool,
-                ..
-            } if self.turn.is_none_or(|turn| turn <= origin.message) => {
-                // Retained job provenance also identifies a call whose assistant
-                // message is no longer in the retained history.
-                let message = origin.message;
-                self.pending
-                    .insert((origin.call_id.clone(), tool.clone()), message);
-                self.turn = Some(message);
-            }
-            SessionEvent::MessageCommitted {
-                message: Message::Tool(results),
-            } => {
-                for (index, result) in results.iter().enumerate() {
-                    let call = (result.call_id.clone(), result.name.clone());
-                    if let Some(message) = self.pending.remove(&call) {
-                        let call = result.call_id.clone();
-                        self.results
-                            .insert((message, call.clone()), (record.sequence, index));
-                        self.matched.insert((record.sequence, index));
-                        paired.insert(Dep::Call(message, call));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn result<'a>(
-        &self,
-        snapshot: &'a ObservationSnapshot,
-        message: MessageSeq,
-        call: &str,
-    ) -> Option<&'a ToolResult> {
-        let (record, index) = *self.results.get(&(message, call.to_owned()))?;
-        match &snapshot.records.get(&record)?.event {
-            SessionEvent::MessageCommitted {
-                message: Message::Tool(results),
-            } => results.get(index),
-            _ => None,
-        }
-    }
-}
-
-/// When each assistant message's turn began, folded as the journal records turns.
-#[derive(Default)]
-struct TurnStarts {
-    turns: Turns,
-    messages: HashMap<MessageSeq, i64>,
-}
-impl TurnStarts {
-    fn observe(&mut self, record: &EventRecord, ledger: &RequestLedger) {
-        self.turns.observe(record, ledger);
-        if let SessionEvent::MessageCommitted {
-            message: Message::Assistant(_),
-        } = &record.event
-            && let Some(started) = self.turns.started(&record.agent)
-        {
-            self.messages.insert(record.sequence.message(), started);
-        }
-    }
-}
-
 /// What an update changed: entries replaced in place, and the first entry from
 /// which later entries moved.
 #[derive(Default)]
@@ -231,8 +139,6 @@ pub struct History {
     folded: usize,
     /// How many unsaved statuses, of every agent, have been folded.
     unsaved: usize,
-    pairing: Pairing,
-    turns: TurnStarts,
     segments: Vec<Segment>,
     index: HashMap<Source, usize>,
     deps: HashMap<Dep, Vec<Source>>,
@@ -254,7 +160,7 @@ impl History {
         let candidates = inputs.snapshot.jobs.keys().copied().collect();
         // Every record is folded before any segment is built: a call's segment
         // shows the result that arrives after it.
-        let places = history.fold(inputs, candidates, &mut HashSet::new());
+        let places = history.fold(inputs, candidates);
         for place in places {
             history.insert(place, inputs, &mut entries, &mut Changed::default());
         }
@@ -267,7 +173,7 @@ impl History {
         &mut self,
         inputs: Inputs<'_>,
         entries: &mut Vec<Entry>,
-        mut changed: HashSet<Dep>,
+        changed: HashSet<Dep>,
     ) -> Changed {
         let candidates = changed
             .iter()
@@ -276,7 +182,7 @@ impl History {
                 _ => None,
             })
             .collect();
-        let places = self.fold(inputs, candidates, &mut changed);
+        let places = self.fold(inputs, candidates);
         let mut result = Changed::default();
         let mut positions: Vec<_> = changed
             .iter()
@@ -297,12 +203,7 @@ impl History {
 
     /// Places of new sources: the agent's unfolded records and unsaved statuses, or
     /// its jobs among `candidates` on the Jobs tab.
-    fn fold(
-        &mut self,
-        inputs: Inputs<'_>,
-        candidates: Vec<JobId>,
-        changed: &mut HashSet<Dep>,
-    ) -> Vec<Place> {
+    fn fold(&mut self, inputs: Inputs<'_>, candidates: Vec<JobId>) -> Vec<Place> {
         let Inputs {
             snapshot,
             projection,
@@ -334,15 +235,10 @@ impl History {
             .filter_map(|sequence| snapshot.records.get(sequence))
         {
             let source = Source::Record(record.sequence);
-            match presentation.tab {
-                Tab::Conversation => {
-                    self.pairing.observe(record, changed);
-                    self.turns.observe(record, &snapshot.ledger);
-                }
-                Tab::Requests if !matches!(record.event, SessionEvent::ModelRequested { .. }) => {
-                    continue;
-                }
-                _ => {}
+            if presentation.tab == Tab::Requests
+                && !matches!(record.event, SessionEvent::ModelRequested { .. })
+            {
+                continue;
             }
             let job = match &record.event {
                 SessionEvent::JobCreated { job, origin, .. }
@@ -616,7 +512,7 @@ impl History {
                                 built.deps.extend(events.iter().filter_map(|event| {
                                     match event {
                                         JobEvent::Message(message) => Some(message.id),
-                                        JobEvent::Job(job) => job.id(),
+                                        JobEvent::Job(job) => job.id,
                                     }
                                     .map(Dep::Job)
                                 }));
@@ -651,18 +547,13 @@ impl History {
                 }
                 // Persisted runtime state is model context, not conversation.
                 Message::State(_) => {}
-                Message::Tool(results) => {
-                    for (index, result) in results.iter().enumerate() {
-                        if !self.pairing.matched.contains(&(record.sequence, index)) {
-                            let result_key = EntryKey::ToolResult {
-                                record: record.sequence,
-                                call: result.call_id.clone(),
-                            };
-                            let open = view.is_expanded(&result_key, all_details);
-                            let call = (result.name.as_str(), None, Some(result));
-                            let entry = call_entry(result_key, call, agent, projection, open);
-                            built.push(entry, None);
-                        }
+                Message::Tool(result) => {
+                    if snapshot.ledger.answered(record.sequence).is_none() {
+                        let result_key = EntryKey::ToolResult(record.sequence);
+                        let open = view.is_expanded(&result_key, all_details);
+                        let call = (result.name.as_str(), None, Some(result));
+                        let entry = call_entry(result_key, call, agent, projection, open);
+                        built.push(entry, None);
                     }
                 }
             },
@@ -690,6 +581,12 @@ impl History {
                 built.push(Entry::titled(key, title, body, Surface::Muted), None);
             }
             SessionEvent::Status { message } => built.push(status_entry(key, message), None),
+            // A failure its request's card reports is not repeated.
+            SessionEvent::AgentFailed { failure }
+                if snapshot.ledger.failed_by(record.sequence).is_none() =>
+            {
+                built.push(super::retry::failure_entry(key, failure), None);
+            }
             SessionEvent::CompactionFailed { error, .. } => {
                 let text = format!("Compaction failed; previous context retained\n{error}");
                 built.push(Entry::new(key, text, Surface::Error), None);
@@ -730,7 +627,7 @@ impl History {
                 // when that began with an earlier request.
                 if let Timing::Took { since, until } = request_timing(request) {
                     let _ = write!(footer, " · {}", span(since, until));
-                    if let Some(&turn) = self.turns.messages.get(&message)
+                    if let Some(&turn) = projection.turn_starts.get(&message)
                         && turn < since
                     {
                         let _ = write!(footer, " · turn {}", span(turn, until));
@@ -795,7 +692,7 @@ impl History {
                             call: admitted.2,
                         };
                         let open = view.is_expanded(&key, all_details);
-                        let result = self.pairing.result(snapshot, message, call.id());
+                        let result = answer(snapshot, message, call.id());
                         let call = (call.name(), Some(call.arguments()), result);
                         let entry = call_entry(key, call, agent, projection, open);
                         built.push(entry, Some(ToolGroup::Response(message)));
@@ -806,7 +703,22 @@ impl History {
     }
 }
 
-pub fn status_entry(key: EntryKey, message: &dyn std::fmt::Display) -> Entry {
+/// The result that answered `call` of the assistant message `message`.
+fn answer<'a>(
+    snapshot: &'a ObservationSnapshot,
+    message: MessageSeq,
+    call: &str,
+) -> Option<&'a ToolResult> {
+    let record = snapshot.ledger.result_of(message, call)?;
+    match &snapshot.records.get(&record)?.event {
+        SessionEvent::MessageCommitted {
+            message: Message::Tool(result),
+        } => Some(result),
+        _ => None,
+    }
+}
+
+pub(super) fn status_entry(key: EntryKey, message: &dyn std::fmt::Display) -> Entry {
     Entry::new(key, format!("Status · {message}"), Surface::Status)
 }
 
@@ -910,49 +822,39 @@ mod tests {
 
     /// A tool card follows its job by the job's exact call, so a call ID reused
     /// by a later response that fails before any job starts gets a card of its
-    /// own, whether or not the first call's message is retained.
+    /// own.
     #[tokio::test]
-    async fn admitted_results_use_exact_job_provenance_even_without_retained_calls() {
-        for retained in [false, true] {
-            let (_root, mut app, mut model, _session) = played_fixture().await;
-            let agent = app.root_agent().clone();
-            let asked = ask(app.session().unwrap(), "run");
-            let admitted = call("reused", "exec", json!({"command": ["true"]}), 0);
-            model.turn().await.end(vec![admitted]);
-            model.turn().await.end(vec![failing_call("reused")]);
-            model.turn().await.answer("done");
-            bounded(asked).await.unwrap().unwrap();
-            observe_until(&mut app, |app| {
-                count(&app.snapshot, committed(results)) == 2
+    async fn admitted_results_use_exact_job_provenance() {
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(app.session().unwrap(), "run");
+        let admitted = call("reused", "exec", json!({"command": ["true"]}), 0);
+        model.turn().await.end(vec![admitted]);
+        model.turn().await.end(vec![failing_call("reused")]);
+        model.turn().await.answer("done");
+        bounded(asked).await.unwrap().unwrap();
+        observe_until(&mut app, |app| {
+            count(&app.snapshot, committed(results)) == 2
+        })
+        .await;
+        let job = (app.snapshot.records.values())
+            .find_map(|record| match &record.event {
+                SessionEvent::JobCreated { job, .. } => Some(*job),
+                _ => None,
             })
-            .await;
-            let mut records = app.snapshot.records.values();
-            let (origin, job) = records
-                .find_map(|record| match &record.event {
-                    SessionEvent::JobCreated {
-                        job,
-                        origin: Some(origin),
-                        ..
-                    } => Some((origin.message, *job)),
-                    _ => None,
-                })
-                .unwrap();
-            if !retained {
-                app.snapshot.records.remove(&origin.into());
-            }
-            let cards: Vec<_> = render(&app.snapshot, &agent, false)
-                .into_iter()
-                .filter(|card| card.surface == Surface::Tool)
-                .collect();
-            assert_eq!(cards.len(), 2);
-            assert_eq!(cards[0].job_id(), Some(job));
-            assert_eq!(
-                (cards[1].job_id(), cards[1].text()),
-                (None, "▸ × exec · Failed")
-            );
-            assert_ne!(cards[0].key(), cards[1].key());
-            assert!(cards[1].expandable());
-        }
+            .unwrap();
+        let cards: Vec<_> = render(&app.snapshot, &agent, false)
+            .into_iter()
+            .filter(|card| card.surface == Surface::Tool)
+            .collect();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].job_id(), Some(job));
+        assert_eq!(
+            (cards[1].job_id(), cards[1].text()),
+            (None, "▸ × exec · Failed")
+        );
+        assert_ne!(cards[0].key(), cards[1].key());
+        assert!(cards[1].expandable());
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::provider::{
     ProviderError,
@@ -15,7 +15,7 @@ use crate::provider::{
         errors::{self, ErrorSignals},
         transport::{Rejection, SseEvent},
     },
-    protocol::{ContextId, ModelRequest, ResponseEvent, Scope},
+    protocol::{ContextId, ModelRequest, ResponseEvent, ResponseSchema, Scope},
 };
 use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_valid_tool_name};
 
@@ -32,8 +32,10 @@ pub(crate) use locations::Locations;
 pub(crate) use locations::set_each;
 pub use locations::{LocationsError, NonEmpty};
 pub use placement::{BodyPath, CacheKey, CacheTtl};
-pub(crate) use placement::{Identity, header, overlaps, path};
-pub use responses::{CyberAccessProgram, ReasoningSummary, ServiceTier};
+pub(crate) use placement::{
+    BreakpointBudget, Cache, CacheControl, Identity, header, overlaps, path,
+};
+pub use responses::{CyberAccessProgram, ReasoningSummary};
 
 crate::named_enum::named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -52,6 +54,29 @@ impl CodecName {
             Self::Responses => "responses",
             Self::Messages => "messages",
         }
+    }
+
+    /// The `reasoning` profile values the family accepts.
+    pub(crate) fn effort_levels(self) -> EffortLevels {
+        match self {
+            Self::ChatCompletions | Self::Responses => OPENAI_EFFORT,
+            Self::Messages => MESSAGES_EFFORT,
+        }
+    }
+
+    /// Write `effort` at each of `paths`. A journaled profile resumes on the
+    /// live entry, which may speak another family since the profile was
+    /// admitted, so the level is checked again here.
+    pub(crate) fn place_effort(
+        self,
+        paths: &NonEmpty<BodyPath>,
+        root: &mut serde_json::Map<String, Value>,
+        effort: &str,
+    ) -> Result<(), ProviderError> {
+        if !self.effort_levels().accepts(effort) {
+            return Err(InvalidRequest.error(format!("Unsupported reasoning effort: {effort}")));
+        }
+        set_each(paths.iter(), root, Value::from(effort))
     }
 }
 
@@ -79,7 +104,7 @@ crate::named_enum::named_enum! {
 
 /// An encoded request: the body and the headers the dialect places values in.
 pub(crate) struct Encoded {
-    pub body: Value,
+    pub body: serde_json::Map<String, Value>,
     pub headers: HeaderMap,
 }
 
@@ -128,10 +153,7 @@ impl Codec {
         };
         let mut headers = HeaderMap::new();
         Encoded::place_identity(&mut body, &mut headers, self.identity(), context)?;
-        Ok(Encoded {
-            body: Value::Object(body),
-            headers,
-        })
+        Ok(Encoded { body, headers })
     }
 
     /// Headers every request of this family carries under these conventions.
@@ -150,15 +172,7 @@ impl Codec {
         }
     }
 
-    pub(crate) fn effort(&self) -> &Effort {
-        match self {
-            Self::ChatCompletions(dialect) => &dialect.effort,
-            Self::Responses(dialect) => &dialect.effort,
-            Self::Messages(dialect) => &dialect.effort,
-        }
-    }
-
-    pub(crate) fn effort_mut(&mut self) -> &mut Effort {
+    pub(crate) fn effort_mut(&mut self) -> &mut NonEmpty<BodyPath> {
         match self {
             Self::ChatCompletions(dialect) => &mut dialect.effort,
             Self::Responses(dialect) => &mut dialect.effort,
@@ -182,11 +196,47 @@ impl Codec {
         }
     }
 
+    pub(crate) fn tool_names_mut(&mut self) -> &mut ToolNames {
+        match self {
+            Self::ChatCompletions(dialect) => &mut dialect.tool_names,
+            Self::Responses(dialect) => &mut dialect.tool_names,
+            Self::Messages(dialect) => &mut dialect.tool_names,
+        }
+    }
+
+    /// How a response schema is transmitted, where the family has a choice.
+    pub(crate) fn schema_mut(&mut self) -> Option<&mut SchemaConstraint> {
+        match self {
+            Self::ChatCompletions(dialect) => Some(&mut dialect.schema),
+            Self::Responses(dialect) => Some(&mut dialect.schema),
+            Self::Messages(_) => None,
+        }
+    }
+
+    /// The prompt-cache mode, where the family has a choice.
+    pub(crate) fn cache_mut(&mut self) -> Option<&mut Cache> {
+        match self {
+            Self::ChatCompletions(dialect) => Some(&mut dialect.cache),
+            Self::Responses(dialect) => Some(&mut dialect.cache),
+            Self::Messages(_) => None,
+        }
+    }
+
+    /// The prompt-cache breakpoint lifetime, where these conventions mark breakpoints.
+    pub(crate) fn cache_ttl_mut(&mut self) -> Option<&mut Option<CacheTtl>> {
+        match self {
+            Self::ChatCompletions(dialect) => dialect.cache_control.ttl_mut(),
+            Self::Responses(dialect) => dialect.cache_control.ttl_mut(),
+            Self::Messages(dialect) => Some(&mut dialect.cache_ttl),
+        }
+    }
+
     /// A rejected request's error, read with this family's vocabulary.
     pub(crate) fn error(&self, rejection: &Rejection, signals: ErrorSignals) -> ProviderError {
         let reading = match self {
-            Self::ChatCompletions(_) => openai::read::<chat_completions::Code>(&rejection.body),
-            Self::Responses(_) => openai::read::<responses::Code>(&rejection.body),
+            Self::ChatCompletions(_) | Self::Responses(_) => {
+                openai::read::<openai::Code>(&rejection.body)
+            }
             Self::Messages(_) => openai::read::<messages::Code>(&rejection.body),
         };
         errors::classify(
@@ -250,8 +300,13 @@ impl Decoder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EffortLevels(pub(crate) &'static [&'static str]);
 
-pub(crate) const OPENAI_EFFORT: EffortLevels =
+const OPENAI_EFFORT: EffortLevels =
     EffortLevels(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/// Messages thinking settings: `off` and `adaptive` select a thinking mode;
+/// the rest are `output_config.effort` levels under adaptive thinking.
+const MESSAGES_EFFORT: EffortLevels =
+    EffortLevels(&["off", "adaptive", "low", "medium", "high", "xhigh", "max"]);
 
 impl EffortLevels {
     pub(crate) fn accepts(&self, effort: &str) -> bool {
@@ -259,26 +314,43 @@ impl EffortLevels {
     }
 }
 
-/// Where the profile's `reasoning` goes, and the values accepted there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Effort {
-    pub path: NonEmpty<BodyPath>,
-    pub levels: EffortLevels,
+/// Whether a server takes back reasoning its service did not sign or encrypt, while
+/// the context holds no signed reasoning; signed reasoning goes back either way.
+/// `T` is where it goes, where the codec leaves that to the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnsignedReasoning<T = ()> {
+    Replayed(T),
+    /// The service accepts only reasoning it sealed.
+    Dropped,
 }
 
-impl Effort {
-    /// Write `effort` at the path. A journaled profile resumes on the live
-    /// entry, which may speak another family since the profile was admitted,
-    /// so the level is checked again here.
-    pub(crate) fn place(
-        &self,
-        root: &mut serde_json::Map<String, Value>,
-        effort: &str,
-    ) -> Result<(), ProviderError> {
-        if !self.levels.accepts(effort) {
-            return Err(InvalidRequest.error(format!("Unsupported reasoning effort: {effort}")));
+impl<T> UnsignedReasoning<T> {
+    pub(crate) fn replayed(&self) -> Option<&T> {
+        match self {
+            Self::Replayed(at) => Some(at),
+            Self::Dropped => None,
         }
-        set_each(self.path.iter(), root, Value::from(effort))
+    }
+}
+
+/// How a `json_schema` response format is sent; the schema always goes as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaConstraint {
+    /// Flagged `strict`, for servers that enforce a schema only on request.
+    Strict,
+    /// Unflagged: the server compiles any schema into a grammar.
+    Grammar,
+}
+
+impl SchemaConstraint {
+    /// The `name`, `schema` and, where flagged, `strict` fields of a `json_schema` format.
+    pub(crate) fn format(self, schema: &ResponseSchema) -> serde_json::Map<String, Value> {
+        let mut format = serde_json::Map::from_iter([("name".into(), json!(schema.name()))]);
+        if self == Self::Strict {
+            format.insert("strict".into(), json!(true));
+        }
+        format.insert("schema".into(), schema.schema().clone());
+        format
     }
 }
 
@@ -317,15 +389,6 @@ impl ToolNames {
     }
 }
 
-/// How a response schema is transmitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SchemaConstraint {
-    /// OpenAI strict mode: the schema is checked against its subset and sent with `strict`.
-    OpenAiStrict,
-    /// The server compiles the schema into a grammar; it is sent verbatim.
-    Grammar,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +418,8 @@ mod tests {
 
     /// Admission keeps placements clear of the listed fields, so every path an
     /// encoder writes outside its placements must be listed, down to nested
-    /// fields; a placement beside a nested listed field keeps its siblings.
+    /// fields; a placement beside a nested listed field keeps its siblings. Each
+    /// listed field is written by some dialect.
     #[test]
     fn listed_fields_cover_every_body_path_an_encoder_writes() {
         use crate::provider::protocol::{ResponseSchema, SystemSegment, ToolDefinition};
@@ -389,36 +453,43 @@ mod tests {
             description: "d".into(),
             input_schema: json!({"type":"object"}),
         }];
-        request.response_schema = Some(ResponseSchema {
-            name: "r".into(),
-            schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
-        });
+        request.response_schema = Some(
+            ResponseSchema::new(
+                "r",
+                json!({"type":"object", "properties":{}, "additionalProperties":false}),
+            )
+            .unwrap(),
+        );
         request.reasoning = Some("high".into());
-        let routed = chat_completions::Dialect {
-            routing: Some(chat_completions::Routing {
-                provider: chat_completions::ProviderPreferences {
-                    zdr: Some(true),
-                    ..Default::default()
-                },
-                fallback_models: vec!["fallback".into()],
-            }),
-            ..chat_completions::Dialect::compatible()
-        };
+        // Whether some row's body holds each listed field.
+        let mut written = std::collections::BTreeMap::<_, bool>::new();
         let nested = messages::Dialect {
             output_limit: NonEmpty::one(path("output_config.max_tokens")),
             ..messages::Dialect::standard()
         };
         for (codec, fields, placed) in [
             (
-                Codec::ChatCompletions(routed),
+                Codec::ChatCompletions(chat_completions::Dialect {
+                    cache: Cache::Explicit,
+                    ..chat_completions::Dialect::compatible()
+                }),
                 chat_completions::BODY_FIELDS,
                 &["max_completion_tokens", "reasoning_effort"][..],
             ),
             (
                 Codec::Responses(responses::Dialect {
-                    service_tier: Some("priority".parse().unwrap()),
+                    reasoning_summary: Some(responses::ReasoningSummary::Auto),
                     cyber_access_program: Some(responses::CyberAccessProgram::DaybreakBlue),
-                    cache: responses::Cache::Explicit,
+                    cache: Cache::Explicit,
+                    ..responses::Dialect::stateless()
+                }),
+                responses::BODY_FIELDS,
+                &["max_output_tokens", "reasoning.effort", "prompt_cache_key"],
+            ),
+            // Top-level `cache_control` asks for automatic caching, so explicit mode omits it.
+            (
+                Codec::Responses(responses::Dialect {
+                    cache_control: CacheControl::Sent { ttl: None },
                     ..responses::Dialect::stateless()
                 }),
                 responses::BODY_FIELDS,
@@ -435,7 +506,7 @@ mod tests {
                 &["output_config.max_tokens", "output_config.effort"],
             ),
         ] {
-            let body = codec.encode(&request, &"c".parse().unwrap()).unwrap().body;
+            let body = Value::Object(codec.encode(&request, &"c".parse().unwrap()).unwrap().body);
             let listed: Vec<_> = fields.iter().chain(placed).copied().collect();
             let name = codec.name();
             let found = unlisted("", body.as_object().unwrap(), &listed);
@@ -444,9 +515,11 @@ mod tests {
                 let held = field
                     .split('.')
                     .try_fold(&body, |value, key| value.get(key));
-                assert!(held.is_some(), "{name} lost `{field}`");
+                *written.entry((name.to_string(), field)).or_default() |= held.is_some();
             }
         }
+        let lost: Vec<_> = written.into_iter().filter(|(_, held)| !held).collect();
+        assert!(lost.is_empty(), "listed but never written: {lost:?}");
     }
 
     #[test]

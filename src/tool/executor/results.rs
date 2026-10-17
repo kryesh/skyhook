@@ -3,17 +3,19 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-enum CollectionPurpose {
+pub(super) enum CollectionPurpose {
+    /// Host collectors retain the handler's native payload.
     Native,
+    /// The public script contract is the same envelope as model calls, but
+    /// with complete captured data rather than an automatic preview.
     Public(crate::tool::ToolResultPolicy),
 }
 
 impl ToolExecutor {
     pub(super) async fn collect_model_started(&self, started: StartedExecution) -> Reported {
         let StartedExecution::Foreground(job) = started else {
-            return self
-                .collect_full_view_started(started, crate::tool::ToolResultPolicy::Value)
-                .await;
+            let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
+            return self.collect_result(started, purpose).await;
         };
         let jobs = &self.shared.jobs;
         let presented = async {
@@ -23,7 +25,7 @@ impl ToolExecutor {
                 crate::job::CancellationToken::new(),
                 self.diagnostic_viewer(),
                 crate::job::output::OutputOptions::Model {
-                    presentation: crate::job::OutputPresentation::Automatic,
+                    kind: crate::job::ViewKind::Response,
                 },
             )
             .await
@@ -49,24 +51,7 @@ impl ToolExecutor {
         }
     }
 
-    /// The public script contract is the same envelope as model calls, but with
-    /// complete captured data rather than an automatic preview. Host
-    /// collectors intentionally retain the handler's native payload.
-    pub(super) async fn collect_full_view_started(
-        &self,
-        started: StartedExecution,
-        policy: crate::tool::ToolResultPolicy,
-    ) -> Reported {
-        self.collect_result(started, CollectionPurpose::Public(policy))
-            .await
-    }
-
-    pub(crate) async fn collect_started(&self, started: StartedExecution) -> Reported {
-        self.collect_result(started, CollectionPurpose::Native)
-            .await
-    }
-
-    async fn collect_result(
+    pub(super) async fn collect_result(
         &self,
         started: StartedExecution,
         purpose: CollectionPurpose,
@@ -111,7 +96,7 @@ impl ToolExecutor {
             .into();
         }
         let result = match jobs.saved_result(&envelope).await {
-            Ok(result) => envelope.presented(result, self.diagnostic_viewer()),
+            Ok(result) => result,
             Err(error) => return Err(job_error(error)).into(),
         };
         Reported {
@@ -220,12 +205,7 @@ pub(crate) fn failure_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        job::{JobRole, JobSpec},
-        provider::protocol::AssistantItem,
-        session::Message,
-        tool::ToolRegistryBuilder,
-    };
+    use crate::{job::JobSpec, tool::ToolRegistryBuilder};
     use serde_json::json;
 
     async fn complete(runtime: &crate::tests::TestRuntime, job: JobId, value: serde_json::Value) {
@@ -368,9 +348,8 @@ mod tests {
         complete(&runtime, job, payload.clone()).await;
         let started = || StartedExecution::Background(launched.clone());
         let model = executor.collect_model_started(started()).await;
-        let script = executor
-            .collect_full_view_started(started(), crate::tool::ToolResultPolicy::Value)
-            .await;
+        let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
+        let script = executor.collect_result(started(), purpose).await;
         let (model, script) = (model.outcome.unwrap(), script.outcome.unwrap());
         assert_eq!(model.output.value, script.output.value);
         assert!(model.background && script.background);
@@ -386,58 +365,5 @@ mod tests {
             runtime.jobs.test_snapshot(job).await.unwrap().output,
             Some(payload)
         );
-    }
-
-    /// A child's final reply is its job's result: a foreground call returns it and
-    /// a background child's completion carries it, never as a separate reply.
-    #[tokio::test]
-    async fn completed_child_answers_are_their_results() {
-        for background in [false, true] {
-            let runtime = crate::tests::TestRuntime::new().await;
-            let executor = runtime.executor(ToolRegistryBuilder::default());
-            let child = runtime.agent.child(1);
-            let spec = JobSpec {
-                background,
-                role: JobRole::Agent,
-                ..JobSpec::test(runtime.agent.clone(), "delegate")
-            };
-            let job = runtime.jobs.test_running(spec).await.into_test_id();
-            let started = crate::session::tests::child_started(
-                Some(job),
-                ExecutionLocation::root(runtime.root.path().to_owned()),
-            );
-            runtime.store.append(child.clone(), started).await.unwrap();
-            let jobs = &runtime.jobs;
-            let text = "child answer";
-            let message = Message::Assistant(vec![AssistantItem::text("answer", 0, text)]);
-            jobs.commit_child_message(&child, job, message, text.into(), |_| Vec::new())
-                .await
-                .unwrap();
-            complete(&runtime, job, json!(text)).await;
-            let pending = jobs.pending_delivery(&runtime.agent).await.unwrap();
-            assert!(pending.messages().is_empty());
-            let delivered: Vec<_> = pending.envelopes().iter().map(|job| job.id).collect();
-            drop(pending);
-            let view = if background {
-                assert_eq!(delivered, [job]);
-                jobs.present_output_with(
-                    crate::job::output::OutputArgs::new(job),
-                    crate::job::CancellationToken::new(),
-                    &CapabilitySet::default(),
-                    crate::job::output::OutputOptions::Host,
-                )
-                .await
-                .unwrap()
-                .into_view()
-            } else {
-                assert!(delivered.is_empty());
-                let started = StartedExecution::Foreground(job);
-                let reported = executor.collect_model_started(started).await;
-                reported.outcome.unwrap().output.value
-            };
-            let view: crate::job::JobView = serde_json::from_value(view).unwrap();
-            assert_eq!(view.state(), JobState::Completed);
-            assert_eq!(view.result(), Some(&json!(text)));
-        }
     }
 }

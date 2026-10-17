@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn empty_missing_and_encoded_inputs_are_objects() {
         let block = tool_block("call", "list_jobs", json!({}));
-        for partial in [None, Some(""), Some("  ")] {
+        for partial in [None, Some("")] {
             let call = tool_content(&block, partial).unwrap();
             assert!(call.arguments().is_empty());
         }

@@ -1,6 +1,7 @@
 //! Shared agent and request column measurement and formatting.
 
 use super::*;
+use skyhook::session::RequestPhase;
 
 /// Numeric fields share their own right edge, not just the footer's right edge.
 /// Measure all agents, including off-screen rows, to keep columns stable on scroll.
@@ -310,11 +311,11 @@ impl RequestColumns {
             header_width.saturating_sub(gutter)
         };
         let widths = self.metadata_widths(left_width.into());
-        let status = match row.status {
-            model::RequestStatus::Completed => THEME.success,
-            model::RequestStatus::Failed => THEME.error,
-            model::RequestStatus::Interrupted | model::RequestStatus::Retrying => THEME.warning,
-            model::RequestStatus::Running => THEME.info,
+        let status = match row.phase {
+            RequestPhase::Completed { .. } => THEME.success,
+            RequestPhase::Failed { .. } => THEME.error,
+            RequestPhase::Interrupted { .. } | RequestPhase::Retrying { .. } => THEME.warning,
+            RequestPhase::Requested | RequestPhase::Open { .. } => THEME.info,
         };
         let styles = [
             Some(THEME.primary),
@@ -405,19 +406,22 @@ mod tests {
         assert!(dropped.is_sorted() && dropped[0] == 0 && dropped[3] == rows[0].len());
     }
 
-    fn request(status: model::RequestStatus, output: u64) -> model::RequestRow {
-        let timing = match status {
-            model::RequestStatus::Running => model::Timing::Since(0),
-            _ => model::Timing::Took {
-                since: 0,
-                until: 1_200,
-            },
+    const COMPLETED: RequestPhase = RequestPhase::Completed {
+        attempt: 1,
+        at: 1_200,
+        usage: None,
+    };
+
+    fn request(phase: RequestPhase, output: u64) -> model::RequestRow {
+        let timing = match phase.settled_at() {
+            None => model::Timing::Since(0),
+            Some(until) => model::Timing::Took { since: 0, until },
         };
         model::RequestRow {
             sequence: RequestSeq::default(),
             purpose: skyhook::session::ModelPurpose::Agent,
             model: "model".into(),
-            status,
+            phase,
             usage: skyhook::provider::protocol::Usage::prompted(80, 20, 0, output),
             sent: "14:02:31".into(),
             timing,
@@ -474,8 +478,8 @@ mod tests {
 
     #[test]
     fn request_rows_reserve_spinner_gutter_and_align_with_statistics_headers() {
-        let running = request(model::RequestStatus::Running, 84);
-        let completed = request(model::RequestStatus::Completed, 84);
+        let running = request(RequestPhase::Requested, 84);
+        let completed = request(COMPLETED, 84);
         let columns = RequestColumns::new([&running, &completed]);
         // The running row's counter is painted into its Time column.
         assert_eq!(columns.statistics[3], usize::from(COUNTER_WIDTH));
@@ -508,19 +512,16 @@ mod tests {
         let width = EntryGeometry::new(&entry, 80, 0).body_width;
         assert!(columns.header(width).is_none());
         let header_width = width - COUNTER_WIDTH - 1;
-        for row in [&running, &completed] {
+        for (row, status) in [(&running, "Running"), (&completed, "Completed")] {
             let text = columns.line(row, width, header_width).to_string();
-            assert!(
-                text.contains("Agent") && text.contains(row.status.label()),
-                "{text}"
-            );
+            assert!(text.contains("Agent") && text.contains(status), "{text}");
         }
 
         let row = model::RequestRow {
             sequence: RequestSeq::default(),
             purpose: skyhook::session::ModelPurpose::Compaction,
             model: "long model 界界 😀".into(),
-            status: model::RequestStatus::Running,
+            phase: RequestPhase::Requested,
             usage: Default::default(),
             sent: "Sep 28 23:59:10".into(),
             timing: model::Timing::Since(0),
@@ -557,8 +558,8 @@ mod tests {
             rows.map(|row| model::Entry::request_entry((*row).clone()))
                 .collect::<Vec<_>>()
         };
-        let short = request(model::RequestStatus::Completed, 1);
-        let mut long = request(model::RequestStatus::Completed, u64::MAX);
+        let short = request(COMPLETED, 1);
+        let mut long = request(COMPLETED, u64::MAX);
         long.model = "a very long model name".into();
         let small = entries(&[&short, &short]);
         let large = entries(&[&short, &long]);

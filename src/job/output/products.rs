@@ -1,5 +1,4 @@
-//! Canonical output query and presentation products. Wire JSON is an adapter,
-//! not an admission path for a presentation or its associated attachments.
+//! Canonical output query and presentation products.
 use super::{FieldPointer, Value};
 use crate::{
     job::{JobState, JobView},
@@ -33,15 +32,14 @@ pub enum OutputPreview {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct LinePage {
-    #[schemars(with = "FieldPointer")]
     pub(crate) field: Option<FieldPointer>,
     pub(crate) lines: PageLines,
-    #[schemars(with = "usize")]
-    pub(crate) total_lines: Option<usize>,
-    #[schemars(with = "usize", range(min = 1))]
+    /// The field's lines so far; none when its output is unavailable.
+    pub total_lines: Option<usize>,
+    #[schemars(range(min = 1))]
     pub(crate) next_start: Option<usize>,
     /// Bytes into the `next_start` line, when a long line was cut.
-    #[schemars(with = "usize", range(min = 1))]
+    #[schemars(range(min = 1))]
     pub(crate) next_offset: Option<usize>,
 }
 
@@ -58,14 +56,11 @@ pub struct OutputFields {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ElementPage {
-    #[schemars(with = "FieldPointer")]
     pub(crate) field: Option<FieldPointer>,
-    pub(crate) elements: Vec<Value>,
+    pub elements: Vec<Value>,
     pub(crate) total_elements: usize,
-    #[schemars(with = "usize")]
     pub(crate) next_index: Option<usize>,
     pub(crate) shape: Option<Value>,
-    #[schemars(with = "Vec<OutputTruncation>")]
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
 
@@ -73,14 +68,11 @@ pub struct ElementPage {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MemberPage {
-    #[schemars(with = "FieldPointer")]
     pub(crate) field: Option<FieldPointer>,
-    pub(crate) members: serde_json::Map<String, Value>,
+    pub members: serde_json::Map<String, Value>,
     pub(crate) total_members: usize,
-    #[schemars(with = "usize")]
     pub(crate) next_index: Option<usize>,
     pub(crate) shape: Option<Value>,
-    #[schemars(with = "Vec<OutputTruncation>")]
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
 
@@ -89,21 +81,18 @@ pub struct MemberPage {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MatchPage {
-    #[schemars(with = "FieldPointer")]
     pub(crate) field: Option<FieldPointer>,
-    pub(crate) matches: Vec<Match>,
+    pub matches: Vec<Match>,
     pub(crate) total_matches: usize,
-    #[schemars(with = "usize")]
     pub(crate) next_index: Option<usize>,
     pub(crate) shape: Option<Value>,
-    #[schemars(with = "Vec<OutputTruncation>")]
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct Match {
-    pub(crate) at: FieldPointer,
-    pub(crate) value: Value,
+    pub at: FieldPointer,
+    pub value: Value,
 }
 
 /// A page's source lines: consecutive for a plain read, or each with its
@@ -205,45 +194,12 @@ impl OutputPreview {
 }
 
 impl LinePage {
-    /// The field's lines so far; none when its output is unavailable.
-    pub fn total_lines(&self) -> Option<usize> {
-        self.total_lines
-    }
-
     /// The page's text, without search line numbers.
     pub fn lines(&self) -> Vec<&str> {
         match &self.lines {
             PageLines::Text(lines) => lines.iter().map(String::as_str).collect(),
             PageLines::Numbered(lines) => lines.iter().map(|line| line.text.as_str()).collect(),
         }
-    }
-}
-
-impl ElementPage {
-    pub fn elements(&self) -> &[Value] {
-        &self.elements
-    }
-}
-
-impl MemberPage {
-    pub fn members(&self) -> &serde_json::Map<String, Value> {
-        &self.members
-    }
-}
-
-impl MatchPage {
-    pub fn matches(&self) -> &[Match] {
-        &self.matches
-    }
-}
-
-impl Match {
-    pub fn at(&self) -> &FieldPointer {
-        &self.at
-    }
-
-    pub fn value(&self) -> &Value {
-        &self.value
     }
 }
 
@@ -269,7 +225,7 @@ pub enum OutputTruncation {
         #[schemars(range(min = 1))]
         next_start: usize,
         /// Bytes into the `next_start` line, when a long line was cut.
-        #[schemars(with = "usize", range(min = 1))]
+        #[schemars(range(min = 1))]
         next_offset: Option<usize>,
     },
     /// An array's leading elements, plus any `kept` ranges holding complete fields.
@@ -277,7 +233,6 @@ pub enum OutputTruncation {
         field: FieldPointer,
         shown: usize,
         total_elements: usize,
-        #[schemars(with = "Vec<[usize; 2]>")]
         kept: Option<Vec<[usize; 2]>>,
     },
     /// An object's shown members: a collection's leading ones in source order, or
@@ -286,7 +241,6 @@ pub enum OutputTruncation {
         field: FieldPointer,
         shown: usize,
         total_members: usize,
-        #[schemars(with = "Vec<[usize; 2]>")]
         kept: Option<Vec<[usize; 2]>>,
     },
     /// Further cuts within `field`, too many to list.
@@ -352,8 +306,7 @@ pub struct PresentedOutput {
     pub state: JobState,
     pub(crate) view: JobView,
     pub images: Vec<ImageRef>,
-    /// Captures absent from a whole presentation, in the descriptor's stable
-    /// order. Hydration is opt-in through `inspect_output_with_captures`.
+    /// Captures absent from a whole presentation, in the descriptor's order.
     pub(super) capture_targets: Vec<HydrationTarget>,
     /// The pending delivery a model-facing read presented.
     pub(crate) acknowledges: Option<crate::job::Delivery>,

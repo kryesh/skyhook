@@ -39,7 +39,6 @@ impl Turns {
     }
 
     /// When the agent's open turn began.
-    #[must_use]
     pub fn started(&self, agent: &AgentId) -> Option<i64> {
         self.0.get(agent).copied()
     }

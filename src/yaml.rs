@@ -136,22 +136,20 @@ impl<'de> Deserialize<'de> for StringKey {
     }
 }
 
-/// The keys of a mapping that a struct beside them does not name.
-pub(crate) trait Rest<'de> {
-    fn read<A: MapAccess<'de>>(&mut self, key: String, map: &mut A) -> Result<(), A::Error>;
-}
-
 /// Deserialize a struct from a mapping it shares: the keys `T` names are read
-/// in place, so their errors keep their path, and `rest` reads every other key.
+/// in place, so their errors keep their path, and `rest` receives every other key.
 /// A structural alternative to `#[serde(flatten)]`, which loses the path.
-pub(crate) fn split<'de, T, D>(deserializer: D, rest: &mut impl Rest<'de>) -> Result<T, D::Error>
+pub(crate) fn split<'de, T, D>(
+    deserializer: D,
+    rest: &mut Map<String, Value>,
+) -> Result<T, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
 {
-    struct Mapping<'r, R, T>(&'r mut R, std::marker::PhantomData<T>);
+    struct Mapping<'r, T>(&'r mut Map<String, Value>, std::marker::PhantomData<T>);
 
-    impl<'de, R: Rest<'de>, T: Deserialize<'de>> Visitor<'de> for Mapping<'_, R, T> {
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for Mapping<'_, T> {
         type Value = T;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -166,12 +164,12 @@ where
     deserializer.deserialize_map(Mapping(rest, std::marker::PhantomData))
 }
 
-struct Split<'r, A, R> {
+struct Split<'r, A> {
     map: A,
-    rest: &'r mut R,
+    rest: &'r mut Map<String, Value>,
 }
 
-impl<'de, A: MapAccess<'de>, R: Rest<'de>> Deserializer<'de> for Split<'_, A, R> {
+impl<'de, A: MapAccess<'de>> Deserializer<'de> for Split<'_, A> {
     type Error = A::Error;
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -198,13 +196,13 @@ impl<'de, A: MapAccess<'de>, R: Rest<'de>> Deserializer<'de> for Split<'_, A, R>
     }
 }
 
-struct Fields<'r, A, R> {
+struct Fields<'r, A> {
     map: A,
     fields: &'static [&'static str],
-    rest: &'r mut R,
+    rest: &'r mut Map<String, Value>,
 }
 
-impl<'de, A: MapAccess<'de>, R: Rest<'de>> MapAccess<'de> for Fields<'_, A, R> {
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for Fields<'_, A> {
     type Error = A::Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -215,7 +213,7 @@ impl<'de, A: MapAccess<'de>, R: Rest<'de>> MapAccess<'de> for Fields<'_, A, R> {
             if self.fields.contains(&key.as_str()) {
                 return seed.deserialize(key.into_deserializer()).map(Some);
             }
-            self.rest.read(key, &mut self.map)?;
+            self.rest.insert(key, self.map.next_value()?);
         }
         Ok(None)
     }
@@ -397,22 +395,10 @@ mod tests {
         struct Named {
             inner: Inner,
         }
-        #[derive(Default)]
-        struct Others(Vec<(String, Value)>);
-        impl<'de> Rest<'de> for Others {
-            fn read<A: MapAccess<'de>>(
-                &mut self,
-                key: String,
-                map: &mut A,
-            ) -> Result<(), A::Error> {
-                self.0.push((key, map.next_value()?));
-                Ok(())
-            }
-        }
-        struct Shared(Named, Others);
+        struct Shared(Named, Map<String, Value>);
         impl<'de> Deserialize<'de> for Shared {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let mut rest = Others::default();
+                let mut rest = Map::new();
                 let named = split(deserializer, &mut rest)?;
                 Ok(Self(named, rest))
             }
@@ -420,11 +406,7 @@ mod tests {
         let read = |text| serde_path_to_error::deserialize::<_, Shared>(from_str(text).unwrap());
         let Shared(named, rest) = read("extra: 1\ninner: {count: 2}\nmore: x\n").unwrap();
         assert_eq!(named.inner.count, 2);
-        let others = [
-            ("extra".to_owned(), json!(1)),
-            ("more".to_owned(), json!("x")),
-        ];
-        assert_eq!(rest.0, others);
+        assert_eq!(Value::Object(rest), json!({"extra": 1, "more": "x"}));
         let error = read("extra: 1\ninner: {count: two}\n").err().unwrap();
         assert_eq!(error.path().to_string(), "inner.count");
     }

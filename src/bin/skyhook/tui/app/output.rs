@@ -144,7 +144,7 @@ mod tests {
         assert!(store.complete(first, None, value("cached")));
         let (refresh, _) = store.begin(job()).unwrap();
         let cached = store.get(&job()).unwrap().as_ref().unwrap();
-        assert_eq!(cached.result().unwrap(), "cached");
+        assert_eq!(cached.result.as_ref().unwrap(), "cached");
         assert!(!store.complete(refresh, Some(run()), value("cached")));
         assert!(store.is_final(job(), run()));
         store.clear_query(job());
@@ -164,7 +164,7 @@ mod tests {
         let owner = observe_find(&mut app, |app| job_of_call(&app.snapshot, "agent-0")).await;
         observe_record(&mut app, job_finished(owner)).await;
         model.turn().await.answer("noted");
-        let result = |view: &skyhook::job::JobView| view.result().unwrap().to_string();
+        let result = |view: &skyhook::job::JobView| view.result.as_ref().unwrap().to_string();
         let run = |app: &App| app.snapshot.jobs[&owner].invocation;
         assert!(result(&fetch_output(&mut app, owner).await).contains("first run"));
         assert!(app.outputs.is_final(owner, run(&app)));

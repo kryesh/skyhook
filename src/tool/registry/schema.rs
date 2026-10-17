@@ -6,7 +6,11 @@ use serde_json::{Map, Value};
 
 use crate::tool::policy::CapabilitySet;
 
-use super::{RegistryError, envelope::BACKGROUND, options::ConditionalProperty};
+use super::{
+    RegistryError,
+    envelope::BACKGROUND,
+    options::{ConditionalProperty, SchemaOrigin},
+};
 
 /// The longest tool name every provider accepts.
 pub(crate) const MAX_TOOL_NAME_BYTES: usize = 64;
@@ -201,18 +205,18 @@ pub(super) fn optional_defaults(schema: &mut Value) {
 }
 
 pub(super) fn sanitize_schema(value: &mut Value) {
-    sanitize_schema_inner(value, false);
+    sanitize_schema_inner(value, SchemaOrigin::Native);
 }
 
 /// Strip annotations providers reject. `true` becomes `{}` because some
 /// provider-side converters (including llama.cpp) only accept the object form;
 /// `false` stays, since internal validation relies on closed-object flags.
-pub(super) fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
+pub(super) fn sanitize_schema_inner(value: &mut Value, origin: SchemaOrigin) {
     for_each_subschema(value, &mut |schema| {
         if schema.as_bool() == Some(true) {
             *schema = Value::Object(Map::new());
         } else if let Some(object) = schema.as_object_mut() {
-            if !preserve_dialect {
+            if origin == SchemaOrigin::Native {
                 object.remove("$schema");
             }
             object.remove("title");
@@ -342,7 +346,7 @@ mod tests {
         // Preserving the dialect must not change any other normalization behavior.
         let dialect = original["$schema"].clone();
         let mut preserved = original;
-        sanitize_schema_inner(&mut preserved, true);
+        sanitize_schema_inner(&mut preserved, SchemaOrigin::External);
         assert_eq!(
             preserved.as_object_mut().unwrap().remove("$schema"),
             Some(dialect)
@@ -353,9 +357,14 @@ mod tests {
     fn tool(schema: Value, options: ToolOptions) -> ToolSpec {
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register_dynamic("test", "test", schema, options, |_, _| async {
-                Ok(ToolOutput::new(Value::Null))
-            })
+            .register_schema(
+                "test",
+                "test",
+                schema,
+                options,
+                |arguments| Ok(Value::Object(arguments.clone())),
+                |_| super::super::Invocation::new(|_| async { Ok(ToolOutput::new(Value::Null)) }),
+            )
             .unwrap();
         let tool = builder.build().get("test").unwrap();
         tool.spec(&CapabilitySet::default(), AgentLevel::Root)
@@ -380,7 +389,7 @@ mod tests {
             "value": {"type": "string", "default": "example"}
         }, "required": ["value"], "unevaluatedProperties": nested});
         for (options, accepts_omission) in [
-            (ToolOptions::default().preserve_required(), false),
+            (ToolOptions::default().external_schema(), false),
             (ToolOptions::default(), true),
         ] {
             let schema = tool(schema.clone(), options).input_schema;

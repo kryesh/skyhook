@@ -1,6 +1,6 @@
 //! Output producers shared by local execution and the shim.
 use std::{
-    io::{self, Seek, Write},
+    io::{self, Write},
     num::NonZeroU64,
     sync::{Arc, Mutex, PoisonError},
 };
@@ -20,8 +20,6 @@ named_enum! {
     pub enum CaptureKind {
         Text = "text",
         Json = "json",
-        /// Transports may stream a capture before its final JSON type is known.
-        Unknown = "unknown",
     }
 }
 
@@ -92,23 +90,6 @@ pub(crate) fn complete(schema: &mut schemars::Schema) {
 /// Mark `schema` as text keeping both ends: `#[schemars(transform = ends)]` on a field.
 pub(crate) fn ends(schema: &mut schemars::Schema) {
     FieldPresentation::Ends.mark(schema);
-}
-
-/// Schema of `T` for a result presentation never shortens.
-pub(crate) struct Complete<T>(std::marker::PhantomData<T>);
-
-impl<T: schemars::JsonSchema> schemars::JsonSchema for Complete<T> {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        T::schema_name()
-    }
-    fn inline_schema() -> bool {
-        true
-    }
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let mut schema = T::json_schema(generator);
-        complete(&mut schema);
-        schema
-    }
 }
 
 /// Schema of text a finished job reads as the JSON it holds, when it holds one
@@ -458,16 +439,14 @@ impl FinishedOutput {
 }
 
 /// A handler's value and the evidence its producer owns: the captures `C` its
-/// fields stream into, its images, whether its streams ran to their end, a
-/// completed read error's facts, and the presentations its fields carry beyond
-/// those its schema declares.
+/// fields stream into, its images, whether its streams ran to their end, and the
+/// presentations its fields carry beyond those its schema declares.
 #[derive(Clone, Debug)]
 pub struct Output<C> {
     pub value: Value,
     pub images: Vec<ImageRef>,
     pub(crate) captures: Vec<C>,
     pub(crate) streams: StreamEnd,
-    pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
     pub(crate) presented: crate::job::output::Presented,
 }
 
@@ -488,19 +467,8 @@ impl<C> Output<C> {
             images: Vec::new(),
             captures: Vec::new(),
             streams: StreamEnd::Finished,
-            diagnostic: None,
             presented: crate::job::output::Presented::new(),
         }
-    }
-
-    /// Register the builtin read result's error-message slot for presentation.
-    #[must_use]
-    pub(crate) fn with_diagnostic(
-        mut self,
-        diagnostic: crate::tool::diagnostic::PartialDiagnostic,
-    ) -> Self {
-        self.diagnostic = Some(diagnostic);
-        self
     }
 
     #[must_use]
@@ -519,20 +487,6 @@ impl<C> Output<C> {
     pub(crate) fn with_presented(mut self, presented: crate::job::output::Presented) -> Self {
         self.presented = presented;
         self
-    }
-}
-
-/// Fill the facts a call's failure, or its completed read error, left unset.
-pub(crate) fn or_fallback<C>(
-    result: Result<Output<C>, crate::tool::invocation::OperationError<Output<C>>>,
-    fallback: crate::tool::diagnostic::PartialContext,
-) -> Result<Output<C>, crate::tool::invocation::OperationError<Output<C>>> {
-    match result {
-        Ok(mut output) => {
-            output.diagnostic = output.diagnostic.map(|diagnostic| diagnostic.or(fallback));
-            Ok(output)
-        }
-        Err(error) => Err(error.or(fallback)),
     }
 }
 
@@ -722,6 +676,11 @@ impl<T: CaptureTarget> Producer<T> {
         self.flush()
     }
 
+    /// The end of what has been written, buffered or not.
+    pub(crate) fn position(&self) -> u64 {
+        self.position + self.buffer.len() as u64
+    }
+
     pub(crate) fn truncate(&mut self, length: u64) -> io::Result<()> {
         self.flush()?;
         let result = if length > self.position {
@@ -749,11 +708,7 @@ impl<T: CaptureTarget> Producer<T> {
         self.close()
     }
 
-    pub(crate) fn finish_nonempty(mut self) -> io::Result<Option<T::Finished>> {
-        self.close_nonempty()
-    }
-
-    fn close_nonempty(&mut self) -> io::Result<Option<T::Finished>> {
+    pub(crate) fn close_nonempty(&mut self) -> io::Result<Option<T::Finished>> {
         self.flush()?;
         if self.position == 0 {
             self.close_discard()?;
@@ -806,21 +761,6 @@ impl<T: CaptureTarget> Write for Producer<T> {
         self.position += self.buffer.len() as u64;
         self.buffer.clear();
         Ok(())
-    }
-}
-
-impl<T: CaptureTarget> Seek for Producer<T> {
-    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
-        self.healthy()?;
-        let end = self.position + self.buffer.len() as u64;
-        match position {
-            io::SeekFrom::Start(offset) if offset == end => Ok(end),
-            io::SeekFrom::Current(0) | io::SeekFrom::End(0) => Ok(end),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "captures only append at their end",
-            )),
-        }
     }
 }
 

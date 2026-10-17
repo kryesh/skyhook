@@ -1,6 +1,6 @@
-//! Native events normalized into the decoder's semantic events. An event on a
-//! live item resolves its item and part exactly once. Never infer a tool call
-//! identity or resolve an ambiguous reference from array position.
+//! Native events dispatched onto the decoder's items. An event on a live item
+//! resolves its item and part exactly once. Never infer a tool call identity or
+//! resolve an ambiguous reference from array position.
 use super::events::Event;
 use super::native::{NativeItem, PartType, is_foreign};
 use super::*;
@@ -17,62 +17,6 @@ struct ResolvedReference {
     part: usize,
 }
 
-impl ResolvedReference {
-    fn part(self) -> (usize, usize) {
-        (self.item, self.part)
-    }
-
-    fn content(self, text: &str) -> Content {
-        let text = text.into();
-        match self.kind {
-            ItemKind::Reasoning => Content::Reasoning { text },
-            ItemKind::Text | ItemKind::ToolCall => Content::Text { text },
-        }
-    }
-}
-
-/// Only consumed fields are interpreted here. Native snapshots stay borrowed
-/// whole, including unknown vendor extensions used by replay and reconciliation.
-#[derive(Debug)]
-pub(super) enum NormalizedEvent<'a> {
-    Ignored,
-    ItemAdded {
-        index: usize,
-        wire: Option<usize>,
-        native: NativeItem<'a>,
-    },
-    ItemDone {
-        index: usize,
-        native: NativeItem<'a>,
-    },
-    /// `part` is the local `(item, position)` pair.
-    Delta {
-        part: (usize, usize),
-        text: &'a str,
-    },
-    ArgumentsDelta {
-        item: usize,
-        text: &'a str,
-    },
-    ArgumentsDone {
-        item: usize,
-        text: &'a str,
-    },
-    PartAdded {
-        part: (usize, usize),
-        text: &'a str,
-    },
-    PartEnded {
-        part: (usize, usize),
-        content: Content,
-    },
-    Terminal {
-        output: &'a [Value],
-        usage: Option<Usage>,
-        finish: Finish,
-    },
-}
-
 fn optional_index(value: &Value, key: &str) -> Result<Option<usize>, ProviderError> {
     value.get(key).map(|_| NATIVE.index(value, key)).transpose()
 }
@@ -80,33 +24,29 @@ fn optional_index(value: &Value, key: &str) -> Result<Option<usize>, ProviderErr
 fn optional_id<'a>(value: &'a Value, key: &str) -> Result<Option<&'a str>, ProviderError> {
     value
         .get(key)
-        .map(|_| {
-            let id = NATIVE.string(value, key)?;
-            if id.is_empty() {
-                Err(NATIVE.error("empty item ID"))
-            } else {
-                Ok(id)
-            }
-        })
+        .map(|_| NATIVE.string(value, key))
         .transpose()
 }
 
 impl Decoder {
-    /// Admit raw wire fields. The resulting event contains no synthetic JSON
-    /// bookkeeping for dispatch to re-read.
-    pub(super) fn normalize_event<'a>(
-        &mut self,
-        event: &'a Value,
-    ) -> Result<NormalizedEvent<'a>, ProviderError> {
+    /// Feed a native Responses event. Only consumed fields are interpreted;
+    /// native snapshots stay whole, including unknown vendor extensions used by
+    /// replay and reconciliation.
+    pub(crate) fn feed(&mut self, event: Value) -> Result<Vec<ResponseEvent>, ProviderError> {
+        if self.completed {
+            return Err(NATIVE.error("event after terminal response"));
+        }
+        let mut events = Vec::new();
+        let event = &event;
         let wire = optional_index(event, "output_index")?;
         let name = NATIVE.string(event, "type")?;
         // New event types (hosted tools, progress, ...) carry nothing we use.
         let Some(kind) = Event::parse(name) else {
-            return Ok(NormalizedEvent::Ignored);
+            return Ok(events);
         };
         let signals = self.errors;
         let failure = |native| {
-            let reading = openai::read::<Code>(native);
+            let reading = openai::read::<openai::Code>(native);
             errors::classify(None, native, reading, signals, None)
         };
         match kind {
@@ -115,42 +55,56 @@ impl Decoder {
                     .get("item")
                     .ok_or_else(|| NATIVE.error("missing item"))?;
                 if is_foreign(item) {
-                    return Ok(NormalizedEvent::Ignored);
+                    return Ok(events);
                 }
                 let native = NativeItem::parse(item)?;
                 if kind == Event::ItemAdded {
                     let index = self.vacant_index(wire)?;
-                    return Ok(NormalizedEvent::ItemAdded {
-                        index,
-                        wire,
-                        native,
-                    });
+                    self.start_item(index, wire, native.id, native.kind, Some(native.raw))?;
+                } else {
+                    let index = self.snapshot_index(native, wire, None)?;
+                    self.end(index, native, false)?;
                 }
-                let index = self.snapshot_index(native, wire, None)?;
-                Ok(NormalizedEvent::ItemDone { index, native })
-            }
-            Event::Created | Event::InProgress | Event::Queued => {
-                if !event.get("response").is_some_and(Value::is_object) {
-                    return Err(NATIVE.error("missing response object"));
-                }
-                Ok(NormalizedEvent::Ignored)
             }
             Event::TextDelta
             | Event::RefusalDelta
             | Event::ReasoningDelta
             | Event::SummaryDelta => {
-                let part = self.live_part(event, kind, wire)?.part();
+                let reference = self.live_part(event, kind, wire)?;
                 let text = NATIVE.string(event, "delta")?;
-                Ok(NormalizedEvent::Delta { part, text })
+                self.delta(reference.item, reference.part, text, &mut events)?;
             }
-            Event::ArgumentsDelta => Ok(NormalizedEvent::ArgumentsDelta {
-                item: self.live_part(event, kind, wire)?.item,
-                text: NATIVE.string(event, "delta")?,
-            }),
-            Event::ArgumentsDone => Ok(NormalizedEvent::ArgumentsDone {
-                item: self.live_part(event, kind, wire)?.item,
-                text: NATIVE.string(event, "arguments")?,
-            }),
+            Event::ArgumentsDelta => {
+                let id = self.live_part(event, kind, wire)?.item;
+                let text = NATIVE.string(event, "delta")?;
+                let item = self.items.get_mut(&id).expect("checked item");
+                let streaming = item.function_mut()?.streaming_mut()?;
+                if streaming.final_arguments.is_some() {
+                    return Err(NATIVE.error("arguments delta after done"));
+                }
+                streaming.streamed.push_str(text);
+                events.push(item.delta(0, text));
+            }
+            Event::ArgumentsDone => {
+                let id = self.live_part(event, kind, wire)?.item;
+                let text = NATIVE.string(event, "arguments")?;
+                match arguments(text) {
+                    Err(_) => {
+                        let streaming = self.streaming_function(id)?;
+                        if streaming.final_arguments.is_some() {
+                            return Err(NATIVE.error("conflicting final function arguments"));
+                        }
+                        streaming.final_arguments = Some(FinalArguments::Incomplete(text.into()));
+                    }
+                    // A placeholder `done` carries no input; the final item decides.
+                    Ok(arguments) if arguments.is_empty() => {}
+                    Ok(arguments) => {
+                        self.validate_arguments(id, &arguments)?;
+                        self.streaming_function(id)?.final_arguments =
+                            Some(FinalArguments::Object(arguments));
+                    }
+                }
+            }
             Event::TextDone | Event::RefusalDone | Event::ReasoningDone | Event::SummaryDone => {
                 let reference = self.live_part(event, kind, wire)?;
                 let text = match kind {
@@ -158,10 +112,7 @@ impl Decoder {
                     Event::RefusalDone => NATIVE.string(event, "refusal")?,
                     _ => NATIVE.string(event, "text")?,
                 };
-                Ok(NormalizedEvent::PartEnded {
-                    part: reference.part(),
-                    content: reference.content(text),
-                })
+                self.close_part(reference.item, reference.part, text.into())?;
             }
             Event::PartAdded
             | Event::PartDone
@@ -169,11 +120,15 @@ impl Decoder {
             | Event::ReasoningPartDone
             | Event::SummaryPartAdded
             | Event::SummaryPartDone => {
-                let reference = self.live_part(event, kind, wire)?;
+                let ResolvedReference {
+                    item,
+                    kind: item_kind,
+                    part: position,
+                } = self.live_part(event, kind, wire)?;
                 let part = event
                     .get("part")
                     .ok_or_else(|| NATIVE.error("missing content part"))?;
-                let text = match (reference.kind, tagged(part)) {
+                let text = match (item_kind, tagged(part)) {
                     (ItemKind::ToolCall, _) => {
                         return Err(NATIVE.error("content part on function item"));
                     }
@@ -182,27 +137,21 @@ impl Decoder {
                     (ItemKind::Text, Some(PartType::Refusal)) => NATIVE.string(part, "refusal")?,
                     (ItemKind::Text, _) => return Err(NATIVE.error("unsupported content part")),
                 };
-                Ok(if kind.is_done() {
-                    NormalizedEvent::PartEnded {
-                        part: reference.part(),
-                        content: reference.content(text),
-                    }
+                if kind.is_done() {
+                    self.close_part(item, position, text.into())?;
                 } else {
-                    NormalizedEvent::PartAdded {
-                        part: reference.part(),
-                        text,
+                    match self.part(item, position)? {
+                        Part::Streaming { text, added } if !*added && text.is_empty() => {
+                            *added = true;
+                        }
+                        _ => return Err(NATIVE.error("duplicate or late content part added")),
                     }
-                })
-            }
-            Event::Annotation => {
-                self.live_part(event, kind, wire)?;
-                NATIVE.index(event, "annotation_index")?;
-                if !event.get("annotation").is_some_and(Value::is_object) {
-                    return Err(NATIVE.error("missing annotation object"));
+                    if !text.is_empty() {
+                        self.delta(item, position, text, &mut events)?;
+                    }
                 }
-                Ok(NormalizedEvent::Ignored)
             }
-            Event::Completed | Event::Incomplete => self.normalize_terminal(event, kind),
+            Event::Completed | Event::Incomplete => self.terminal(event, kind, &mut events)?,
             // The failed response is the envelope around its `error`, which a
             // server may annotate beside it.
             Event::Failed => {
@@ -212,13 +161,21 @@ impl Decoder {
                 if response.get("error").is_none() {
                     return Err(NATIVE.error("missing response error"));
                 }
-                Err(failure(response))
+                return Err(failure(response));
             }
-            Event::Error => Err(failure(event)),
+            Event::Error => return Err(failure(event)),
             // The service gave up on the response; retrying the request is standard.
-            Event::Aborted => Err(ProviderErrorKind::Unavailable
-                .error(format!("the service ended the response with {name}"))),
+            Event::Aborted => {
+                return Err(ProviderErrorKind::Unavailable
+                    .error(format!("the service ended the response with {name}")));
+            }
         }
+        Ok(events)
+    }
+
+    fn streaming_function(&mut self, id: usize) -> Result<&mut StreamingFunction, ProviderError> {
+        let item = self.items.get_mut(&id).expect("checked item");
+        item.function_mut()?.streaming_mut()
     }
 
     /// The live item and part an event addresses.
@@ -271,7 +228,7 @@ impl Decoder {
             id
         } else if let Some(native_id) = native_id {
             let id = self.vacant_index(wire)?;
-            self.start_item(id, wire, native_id, expected, (None, None))?;
+            self.start_item(id, wire, native_id, expected, None)?;
             id
         } else if let Some(id) = wire_owner {
             if self.items[&id].kind() != expected {
@@ -349,13 +306,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lifecycle_events_require_a_response_and_failed_events_are_errors() {
-        for tag in ["response.queued", "response.in_progress"] {
-            let mut decoder = decoder();
-            let event = json!({"type":tag, "response":{"x-vendor":true}});
-            assert!(decoder.feed(event).unwrap().is_empty());
-            assert!(decoder.feed(json!({"type":tag})).is_err());
-        }
+    fn failed_events_are_errors() {
         let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
         let error = decoder().feed(failed).unwrap_err();
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
@@ -560,28 +511,6 @@ mod tests {
         let mut events = prefix();
         events.push(completed(vec![final_item.clone()]));
         assert!(assemble(events).is_err());
-    }
-
-    #[test]
-    fn normalized_references_distinguish_local_wire_and_reasoning_positions() {
-        let mut decoder = decoder();
-        decoder
-            .feed(unindexed_added(json!({"id":"first","type":"message"})))
-            .unwrap();
-        decoder
-            .feed(added(0, json!({"id":"second","type":"reasoning"})))
-            .unwrap();
-        for (tag, key, position) in [
-            ("response.reasoning_text.delta", "content_index", 7),
-            ("response.reasoning_summary_text.delta", "summary_index", 6),
-        ] {
-            let mut event = json!({"type":tag,"item_id":"second","output_index":0,"delta":"text"});
-            event[key] = json!(3);
-            match decoder.normalize_event(&event).unwrap() {
-                NormalizedEvent::Delta { part, .. } => assert_eq!(part, (1, position)),
-                other => panic!("unexpected semantic event: {other:?}"),
-            }
-        }
     }
 
     #[test]

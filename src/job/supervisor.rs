@@ -1,20 +1,13 @@
 //! Consuming startup obligations and one completion owner for every worker.
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    marker::PhantomData,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{future::Future, marker::PhantomData};
 
 use tokio::{
     sync::{mpsc, oneshot},
     task::{AbortHandle, JoinHandle},
 };
 
-use super::{
-    AgentId, CancellationToken, JobError, JobId, JobManager, JobOutcome, JobTransition, Run,
-};
+use super::{CancellationToken, JobError, JobId, JobManager, JobOutcome, JobTransition, Run};
 use crate::tool::ToolError;
 
 /// The stages a job lease passes through before its worker starts.
@@ -232,40 +225,12 @@ pub(super) fn spawn_completion(
 pub(crate) struct Supervisor {
     tasks: tokio_util::task::TaskTracker,
     root: CancellationToken,
-    /// Each running agent's current turn, which an interrupt cancels. Taken
-    /// after the core's state, never before it.
-    turns: Arc<Mutex<HashMap<AgentId, CancellationToken>>>,
 }
 
 impl Supervisor {
     pub(crate) fn new(root: CancellationToken) -> Self {
         let tasks = tokio_util::task::TaskTracker::new();
-        Self {
-            tasks,
-            root,
-            turns: Default::default(),
-        }
-    }
-
-    fn turns(&self) -> std::sync::MutexGuard<'_, HashMap<AgentId, CancellationToken>> {
-        self.turns.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The token of `agent`'s turn beginning now.
-    pub(crate) fn begin_turn(&self, agent: &AgentId) -> CancellationToken {
-        let token = self.token();
-        self.turns().insert(agent.clone(), token.clone());
-        token
-    }
-
-    /// Stop `agent`'s current turn.
-    pub(crate) fn cancel_turn(&self, agent: &AgentId) {
-        self.turns().get(agent).map(CancellationToken::cancel);
-    }
-
-    /// What forgets `agent`'s turns once dropped, however its loop ends.
-    pub(crate) fn turns_of(&self, agent: &AgentId) -> Turns {
-        Turns(self.clone(), agent.clone())
+        Self { tasks, root }
     }
 
     /// Run `task` until it ends, or until the root's cancellation drops it where
@@ -292,15 +257,6 @@ impl Supervisor {
         self.tasks.close();
         self.tasks.wait().await;
         self.tasks.reopen();
-    }
-}
-
-/// Forgets an agent's turns once its loop is gone.
-pub(crate) struct Turns(Supervisor, AgentId);
-
-impl Drop for Turns {
-    fn drop(&mut self) {
-        self.0.turns().remove(&self.1);
     }
 }
 

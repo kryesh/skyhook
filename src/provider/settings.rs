@@ -128,12 +128,12 @@ impl<T> Nullable<T> {
     }
 
     /// The value sent: `default` unless another value or nothing is chosen.
-    pub fn or(&self, default: T) -> Option<T>
+    pub fn or(&self, default: Option<T>) -> Option<T>
     where
         T: Clone,
     {
         match self {
-            Self::Default => Some(default),
+            Self::Default => default,
             Self::Null => None,
             Self::Value(value) => Some(value.clone()),
         }
@@ -285,13 +285,16 @@ mod tests {
     fn left_out_keeps_the_default_null_sends_nothing_and_values_replace_it() {
         let read = |yaml: &str| Example::resolve(&crate::yaml::parse(yaml).unwrap()).unwrap();
         let left_out = read("name: n");
-        assert_eq!(left_out.level.or("auto".into()), Some("auto".into()));
+        assert_eq!(left_out.level.or(Some("auto".into())), Some("auto".into()));
         assert_eq!(left_out.role, None);
         let chosen = read("name: n\nlevel: detailed\nrole: user");
-        assert_eq!(chosen.level.or("auto".into()), Some("detailed".into()));
+        assert_eq!(
+            chosen.level.or(Some("auto".into())),
+            Some("detailed".into())
+        );
         assert_eq!(chosen.role.as_deref(), Some("user"));
         let null = read("name: n\nlevel: null");
-        assert_eq!(null.level.or("auto".into()), None);
+        assert_eq!(null.level.or(Some("auto".into())), None);
         assert!(crate::yaml::parse::<ExamplePatch>("role: null").is_err());
         let lower: ExamplePatch = crate::yaml::parse("level: null").unwrap();
         let higher: ExamplePatch = crate::yaml::parse("level: concise").unwrap();

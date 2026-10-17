@@ -253,14 +253,6 @@ async fn join(
 /// from; the response settles them.
 pub(crate) struct Resolved(Vec<(HeaderName, Sent)>);
 
-impl fmt::Debug for Resolved {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.0.iter().map(|(name, _)| name))
-            .finish()
-    }
-}
-
 impl Resolved {
     /// The headers as sent.
     pub(crate) fn map(&self) -> HeaderMap {

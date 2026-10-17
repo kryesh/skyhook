@@ -181,7 +181,7 @@ mod tests {
     use crate::tests::{TestRuntime, bounded};
     use crate::tool::{
         ToolError, ToolOptions, ToolRegistryBuilder,
-        policy::{AuthorizationRequest, Capability, Policy, PolicyFuture},
+        policy::{Approval, AuthorizationRequest, Capability, Policy},
     };
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -194,9 +194,11 @@ mod tests {
     struct NeverAuthorize(tokio::sync::mpsc::UnboundedSender<JobId>);
 
     impl Policy for NeverAuthorize {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-            self.0.send(request.job).unwrap();
-            Box::pin(std::future::pending())
+        fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
+            Approval::Ask(Box::pin(async move {
+                self.0.send(request.job).unwrap();
+                std::future::pending().await
+            }))
         }
     }
 
@@ -208,7 +210,7 @@ mod tests {
     }
 
     async fn cancelled(jobs: &JobManager, id: JobId) -> JobState {
-        bounded(jobs.wait(id, None, true)).await.unwrap().state
+        bounded(jobs.wait(id, true)).await.unwrap().state
     }
 
     #[tokio::test]
@@ -219,8 +221,7 @@ mod tests {
             tool::{
                 StreamEnd,
                 diagnostic::{
-                    Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic,
-                    Subject,
+                    Cause, FailureSite, Operation, PartialContext, RequestEffects, Subject,
                 },
             },
         };
@@ -232,12 +233,7 @@ mod tests {
                 "worker".parse().unwrap(),
                 "/workspace".into(),
             )))
-            .effects(Effects::MayHaveExecuted);
-        let output_diagnostic = PartialDiagnostic::new(
-            PartialContext::new(Operation::ReadCapture, Subject::Process)
-                .effects(Effects::OutputIncomplete),
-            Cause::Message("partial output".into()),
-        );
+            .request(RequestEffects::MayHaveExecuted);
         let image = ImageRef {
             file: Some("partial.png".into()),
             format: ImageFormat::Png,
@@ -263,12 +259,9 @@ mod tests {
                 .unwrap()
                 .open();
             writer.write_all(text.as_bytes()).unwrap();
-            let mut output = ToolOutput::new(serde_json::json!({
-                "partial": true, "error": {"message": null},
-            }))
-            .with_captures(vec![writer.finish().unwrap()])
-            .with_images(vec![image.clone()])
-            .with_diagnostic(output_diagnostic.clone());
+            let mut output = ToolOutput::new(serde_json::json!({"partial": true}))
+                .with_captures(vec![writer.finish().unwrap()])
+                .with_images(vec![image.clone()]);
             output.streams = streams;
             let outcome = match error {
                 Some(error) => error.context(context.clone()).with_result(output).into(),

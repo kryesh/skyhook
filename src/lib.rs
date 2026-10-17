@@ -12,7 +12,6 @@ pub mod mcp;
 pub mod media;
 mod named_enum;
 mod newtype;
-#[cfg(unix)]
 mod process_group;
 pub mod provider;
 pub mod remote;
@@ -47,7 +46,7 @@ mod tests {
             ToolContext, ToolRegistryBuilder,
             authorization::AuthorizationSubject,
             executor::ToolExecutor,
-            policy::{AllowAll, AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
+            policy::{AllowAll, Approval, AuthorizationRequest, Policy, PolicyDecision},
         },
     };
 
@@ -124,7 +123,6 @@ mod tests {
     impl RefusedPort {
         pub(crate) fn new() -> Self {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            #[cfg(unix)]
             socket.set_reuseport(true).unwrap();
             socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
             Self(socket)
@@ -162,10 +160,10 @@ mod tests {
     }
 
     impl Policy for RecordingPolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+        fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
             let decision = (self.decide)(&request);
             self.requests.lock().unwrap().push(request);
-            Box::pin(async move { decision })
+            Approval::Decided(decision)
         }
     }
 
@@ -176,20 +174,20 @@ mod tests {
     pub(crate) type Prompt = (AuthorizationRequest, tokio::sync::oneshot::Sender<()>);
 
     impl Policy for PromptingPolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+        fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
             let grants = (request.permissions.iter())
                 .filter_map(crate::tool::policy::PermissionUse::proposed_grant)
                 .collect();
-            let (reply, replied) = tokio::sync::oneshot::channel();
-            self.0.send((request, reply)).unwrap();
-            Box::pin(async move {
+            Approval::Ask(Box::pin(async move {
+                let (reply, replied) = tokio::sync::oneshot::channel();
+                self.0.send((request, reply)).unwrap();
                 match replied.await {
                     Ok(()) => PolicyDecision::Allow { grants },
                     Err(_) => PolicyDecision::Deny {
                         reason: "unanswered".into(),
                     },
                 }
-            })
+            }))
         }
     }
 
@@ -322,18 +320,13 @@ mod tests {
 
     /// `images` is one PNG whose bytes a model request loads as [`IMAGE`].
     pub(crate) async fn assert_loaded(store: &SessionStore, images: Vec<crate::media::ImageRef>) {
-        use crate::provider::protocol::{Message, ModelRequest, ToolResult};
+        use crate::provider::{codec::common::tests::tool_result, protocol::ModelRequest};
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, crate::media::ImageFormat::Png);
         let blob = images[0].blob;
+        let result = tool_result("output", "jobs", serde_json::json!({}), images, false);
         let mut request = ModelRequest {
-            context: crate::provider::protocol::entries(vec![Message::Tool(vec![ToolResult {
-                call_id: "output".into(),
-                name: "jobs".into(),
-                result: serde_json::json!({}),
-                images,
-                is_error: false,
-            }])]),
+            context: crate::provider::protocol::entries(vec![result]),
             ..ModelRequest::test("image-test")
         };
         assert!(request.blobs.get(&blob).is_err());

@@ -1,5 +1,5 @@
 //! One journal-derived status block per failed, retrying or interrupted request,
-//! not per attempt.
+//! not per attempt, and per failed turn no such block reports.
 use super::{Entry, EntryKey, Surface, Timing};
 use crate::text::brief;
 use skyhook::agent::{Failure, ObservationSnapshot};
@@ -18,6 +18,12 @@ const DIAGNOSTIC_CHARS: usize = 240;
 fn diagnostic(error: impl std::fmt::Display) -> String {
     let error = error.to_string().replace(char::is_control, " ");
     brief(&error, DIAGNOSTIC_CHARS)
+}
+
+/// A failed turn no request's card reports.
+pub(super) fn failure_entry(key: EntryKey, failure: &Failure) -> Entry {
+    let text = format!("Turn failed\n{}", diagnostic(failure));
+    Entry::new(key, text, Surface::Status)
 }
 
 pub(super) fn retry_entry(

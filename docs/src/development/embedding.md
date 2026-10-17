@@ -47,15 +47,19 @@ auditing. `SessionHandle::changes_mode(mode)` reports whether the root's next me
 would change what it runs.
 
 Each `SessionEvent::TitleSet` records its `TitleSource`: `Prompt`, `User` or `Generated`.
-`SessionHandle::set_title(title)` gives a session an automatic title from its first input (a prompt
-or a script) and leaves a titled session alone; `rename(Some(title))` sets the user's title, and
+`SessionHandle::set_title(title)` gives an automatic title to a session that has neither a title
+nor a first prompt to take one from, such as one a script starts, and leaves any other alone; `rename(Some(title))` sets the user's title, and
 `rename(None)` journals a `TitleCleared` that returns the session to its automatic title.
 `title().await` reads the title the session list shows, as a `SessionTitle` with its text and
 `TitleSource`: the user's newest title unless cleared since, otherwise the newest `Prompt` or
 `Generated` title, otherwise the first text the user sent the root agent, as a `Prompt` title.
 
 Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
-and an embedded shim catalog. A `SensitivePromptHandler` answers each `SensitivePrompt` with a
+and an embedded shim catalog. A `Policy` answers `Approval::Decided` for what it settles by itself
+and `Approval::Ask` for what it asks someone, asking nothing until that future is polled. A call
+that may not ask anyone, because a path it names outside the workspace does not exist, drops an
+`Ask` unpolled and is refused with `PolicyDecision::refused()`, the reason a person's denial
+should carry so the two cannot be told apart. A `SensitivePromptHandler` answers each `SensitivePrompt` with a
 `PromptAnswer`: `Secret` for passwords, passphrases and keyboard-interactive prompts, and
 `Confirmed` or `Rejected` for the confirmation kinds (`SensitivePromptKind::is_confirmation`), which
 cover host keys and agent key use. A handler error means no answer could be obtained; `Rejected` is a
@@ -77,8 +81,9 @@ and requests an update read that way, which no update of their own reports.
 It contains:
 
 - Durable records keyed by their original journal sequence.
-- The request ledger: each logical request's lifecycle phase, outcome, and usage, folded from
-  those records. Host statistics and displays read request state from it.
+- The request ledger: each logical request's lifecycle phase, outcome, and usage, and which
+  failed turn a request's failure ended, folded from those records. Host statistics and
+  displays read request state from it.
 - Every job as the session state holds it: its owner, call arguments, state, failure, current
   invocation, and when that invocation ran. A job's update arrives just before the record that
   moved it.
@@ -93,8 +98,7 @@ same logical request resets its live response without removing durable attempt r
 receiver lag, obtain a fresh observation and replace **both** the snapshot and receiver; continuing
 with only one can leave a gap or apply stale live state.
 
-`inspect_jobs` (a synchronous read of an agent's jobs), `inspect_output`,
-`inspect_output_with_captures`, and `inspect_output_fields` are host inspection APIs. They do not
+`inspect_output_with_captures` and `inspect_output_fields` are host inspection APIs. They do not
 claim jobs or consume agent notifications. `cancel_job` is the separate operation that requests
 cancellation. `startup_warnings`, `warnings`, and `mcp_servers` expose startup diagnostics and MCP
 discovery outcomes without inserting diagnostics into model context or writing directly to a
@@ -112,8 +116,15 @@ turns while retaining child jobs for continuation, and returns how many turns an
 agents it stopped. If that is more than none, job deliveries start no turn until
 `continue_turn_with` or new input: they stay pending for that request. An interrupt also hands
 back input no agent has taken yet: a pending `prompt` returns `Interrupted`, and each
-`QueuedPromptReceipt` from `enqueue_prompts` resolves `Interrupted`. Explicit job cancellation is
-non-resumable.
+`QueuedPromptReceipt` from `enqueue_prompts` resolves `Interrupted`. Queued prompts are checked
+when a request boundary takes them, all of them as one batch. A batch the session refuses fails
+the turn, whose `AgentFailed` record says why, and waits with it: its receipts stay pending, each
+prompt can still be withdrawn (`QueuedPromptCancellation::is_retained` tells such a prompt) until
+`continue_turn_with` takes the batch to try again under its selection, together with anything
+queued since. An interrupt leaves it waiting; a `prompt` hands it back (`Interrupted`), and so does
+an interrupt that overtakes the refusal itself or lands while `continue_turn_with` is committing it,
+after which the root rests unless a turn is still open. Closing the session drops it. Explicit job
+cancellation is non-resumable.
 `continue_turn_with` continues failed or interrupted work without duplicating its input and can
 select a model or mode for the continued root turn. Its `ContinueOutcome` distinguishes a root
 answer from resumed children and reports whether the selection applied: restarting children does
@@ -137,7 +148,7 @@ input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 22. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 23. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
@@ -188,8 +199,8 @@ time of its newest record that `SessionEvent::is_activity` (closing a session is
 `stopped`, the failed or interrupted turn that resuming the root agent would continue, if any. `stopped` reads only the root's journaled turns, so a session that closed idle with job
 deliveries pending has none, yet resumes interrupted.
 
-The SQLite layout is versioned by `session::SESSION_FORMAT_VERSION`. Opening a database validates
-its identity and version; there is no migration or compatibility layer for earlier layouts.
+The SQLite layout is versioned. Opening a database validates its identity and version; there is no
+migration or compatibility layer for earlier layouts.
 
 ## Reconstructing model calls
 

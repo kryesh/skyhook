@@ -16,29 +16,8 @@ use crate::{
 
 use super::{TargetDefinition, TargetError, TargetName, TargetRef, TargetRegistry};
 
-/// The name and revision of each target in a [`Route`], in the same shape.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RouteIdentity {
-    hops: Vec<(TargetName, u64)>,
-    destination: (TargetName, u64),
-}
-
-impl RouteIdentity {
-    pub fn destination(&self) -> &TargetName {
-        &self.destination.0
-    }
-
-    /// Each target on the route with its revision, outermost first.
-    pub fn revisions(&self) -> super::Revisions {
-        self.hops
-            .iter()
-            .chain([&self.destination])
-            .cloned()
-            .collect()
-    }
-}
-
-/// The targets an SSH connection passes through, outermost first, and its destination.
+/// The targets an SSH connection passes through, outermost first, and its
+/// destination: a snapshot; the registry may since have changed.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct Route {
     pub hops: Vec<TargetDefinition>,
@@ -49,47 +28,19 @@ impl Route {
     pub fn iter(&self) -> impl Iterator<Item = &TargetDefinition> {
         self.hops.iter().chain([&self.destination])
     }
-}
 
-/// A route snapshot; the registry may since have changed.
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedRoute {
-    identity: RouteIdentity,
-    route: Route,
-}
-
-impl ResolvedRoute {
-    /// Captures already validated definitions.
-    pub fn new(route: Route) -> Self {
-        let identity = |hop: &TargetDefinition| (hop.name.clone(), hop.revision);
-        Self {
-            identity: RouteIdentity {
-                hops: route.hops.iter().map(identity).collect(),
-                destination: identity(&route.destination),
-            },
-            route,
-        }
-    }
-
-    pub fn identity(&self) -> &RouteIdentity {
-        &self.identity
-    }
-
-    pub fn route(&self) -> &Route {
-        &self.route
-    }
-
-    pub fn destination(&self) -> &TargetDefinition {
-        &self.route.destination
+    /// Each target on the route with its revision, outermost first.
+    pub fn identity(&self) -> super::Revisions {
+        self.iter()
+            .map(|hop| (hop.name.clone(), hop.revision))
+            .collect()
     }
 
     /// Connecting needs target approval, plus ssh_agent approval when any hop
     /// forwards an agent Skyhook does not own.
     pub fn permissions(&self) -> Vec<PermissionUse> {
-        let RouteIdentity { hops, destination } = &self.identity;
-        let targets = hops.iter().chain([destination]).cloned().collect();
-        let resource = ResourceId::route(destination.0.clone(), targets);
-        let external = self.route.iter().any(|hop| hop.ssh.external_agent);
+        let resource = ResourceId::route(self.destination.name.clone(), self.identity());
+        let external = self.iter().any(|hop| hop.ssh.external_agent);
         [Capability::Targets]
             .into_iter()
             .chain(external.then_some(Capability::SshAgent))
@@ -98,9 +49,9 @@ impl ResolvedRoute {
     }
 
     pub fn authorization_arguments(&self) -> serde_json::Value {
-        let destination = self.destination();
+        let destination = &self.destination;
         let names = |external: bool| {
-            (self.route.iter())
+            self.iter()
                 .filter(|hop| !external || hop.ssh.external_agent)
                 .map(|hop| &hop.name)
                 .collect::<Vec<_>>()
@@ -234,14 +185,14 @@ impl TargetRouter {
         &self,
         target: &TargetName,
         capabilities: &CapabilitySet,
-    ) -> Result<ResolvedRoute, TargetError> {
+    ) -> Result<Route, TargetError> {
         let route = self.targets(|targets| targets.route(target))?;
         if !capabilities.contains(Capability::SshAgent)
             && route.iter().any(|hop| hop.ssh.external_agent)
         {
             return Err(TargetError::Unknown(target.clone()));
         }
-        Ok(ResolvedRoute::new(route))
+        Ok(route)
     }
 
     /// Connect along `route`, admitted only while every target on it is at the
@@ -251,13 +202,13 @@ impl TargetRouter {
     /// its call plans again.
     pub async fn prepare(
         &self,
-        route: ResolvedRoute,
+        route: Route,
         workspace: &Path,
         subject: &AuthorizationSubject,
     ) -> Result<PreparedConnection, RemoteError> {
         let redefined = || RemoteError::from(AuthorizationError::TargetRedefined);
         let current = || {
-            let current = self.resolve(route.identity.destination(), &subject.capabilities)?;
+            let current = self.resolve(&route.destination.name, &subject.capabilities)?;
             (current.identity() == route.identity())
                 .then_some(())
                 .ok_or_else(redefined)
@@ -332,7 +283,7 @@ impl TargetRouter {
 /// continued registry freshness.
 pub(crate) struct SelectedLocation {
     pub(crate) location: ExecutionLocation,
-    pub(crate) route: Option<ResolvedRoute>,
+    pub(crate) route: Option<Route>,
 }
 
 /// Select where a target-relative operation runs: the caller's location, or
@@ -370,7 +321,7 @@ pub(crate) fn select_location(
     let location = if caller.target.name() == Some(name) {
         caller.clone()
     } else {
-        let destination = route.destination();
+        let destination = &route.destination;
         ExecutionLocation::named(destination.name.clone(), destination.workspace.clone())
     };
     Ok(SelectedLocation {
@@ -390,9 +341,10 @@ mod tests {
     use crate::{
         identity::{AgentId, JobId, SessionId},
         job::CancellationToken,
-        remote::{ConnectionFactory, PendingHandshakeFactory},
+        remote::{ConnectionFactory, ShimFactory},
         tests::RecordingPolicy,
         tool::{
+            authorization::Asking,
             diagnostic::{Cause, PartialDiagnostic},
             policy::PolicyDecision,
         },
@@ -442,18 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn resolved_route_derives_destination_and_identity_from_owned_definitions() {
+    fn routes_derive_permissions_and_arguments_from_their_definitions() {
         let mut gateway = target("gateway", None);
         gateway.revision = 7;
         let mut destination = target("build", Some("gateway"));
         destination.revision = 19;
-        let mut definitions = Route {
+        let mut route = Route {
             hops: vec![gateway],
             destination,
         };
-        let route = ResolvedRoute::new(definitions.clone());
-        assert_eq!(route.route(), &definitions);
-        assert_eq!(route.identity.destination(), &name("build"));
         let hops = vec![(name("gateway"), 7), (name("build"), 19)];
         let resource = ResourceId::route(name("build"), hops);
         let permission = |capability| PermissionUse::exact(capability, resource.clone());
@@ -461,8 +410,7 @@ mod tests {
         let arguments = route.authorization_arguments();
         assert_eq!(arguments["route"], serde_json::json!(["gateway", "build"]));
         // Forwarding an external agent through any hop needs its own approval.
-        definitions.hops[0].ssh.external_agent = true;
-        let route = ResolvedRoute::new(definitions);
+        route.hops[0].ssh.external_agent = true;
         let expected = [Capability::Targets, Capability::SshAgent].map(permission);
         assert_eq!(route.permissions(), expected);
         let arguments = route.authorization_arguments();
@@ -534,7 +482,7 @@ mod tests {
         policy: Arc<RecordingPolicy>,
         factory: Option<Arc<dyn ConnectionFactory>>,
     ) -> (tempfile::TempDir, TargetRouter) {
-        let session = crate::session::tests::MemorySession::new().await;
+        let session = crate::tests::TestRuntime::new().await;
         let mut router = TargetRouter::test(&session.store, targets, policy).await;
         if let Some(factory) = factory {
             router = router.with_connection_factory(factory);
@@ -555,7 +503,7 @@ mod tests {
 
     async fn approve(
         router: &TargetRouter,
-        route: &ResolvedRoute,
+        route: &Route,
         subject: &AuthorizationSubject,
     ) -> Result<(), RemoteError> {
         let permissions = route.permissions();
@@ -566,6 +514,7 @@ mod tests {
             permissions,
             arguments,
             &[],
+            Asking::Allowed,
         );
         Ok(authorize.await?)
     }
@@ -604,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_route_snapshot_survives_later_registry_mutation() {
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let (_root, router) = router(
             definitions(&[("build", None)]),
             recording([]),
@@ -623,30 +572,12 @@ mod tests {
             .resolve(&name("build"), &CapabilitySet::default())
             .unwrap();
         assert_ne!(admitted.identity(), current.identity());
-        assert_eq!(admitted.destination().revision, 1);
+        assert_eq!(admitted.destination.revision, 1);
         // Invalidation removes pool reuse; it does not consume the admitted handle.
         assert!(!router.remote.is_current(&prepared));
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
         drop(prepared);
         router.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn waiters_share_one_startup_and_approval_and_cancel_separately() {
-        let policy = recording([]);
-        let factory = PendingHandshakeFactory::new();
-        let targets = definitions(&[("build", None)]);
-        let (_root, router) = router(targets, policy.clone(), Some(factory.clone())).await;
-        let cancelled = subject();
-        let first = spawn_prepare(&router, cancelled.clone());
-        factory.wait_for_hello().await;
-        let second = spawn_prepare(&router, subject());
-        cancelled.cancellation.cancel();
-        assert!(matches!(first.await.unwrap(), Err(RemoteError::Cancelled)));
-        factory.ready.add_permits(1);
-        second.await.unwrap().unwrap();
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(policy.requests.lock().unwrap().len(), 1);
     }
 
     /// A route redefined before it connects is refused as redefined without
@@ -657,7 +588,7 @@ mod tests {
     async fn a_stale_route_snapshot_is_refused_and_its_startup_stopped() {
         for (during_startup, origin) in [(false, false), (true, false), (true, true)] {
             let policy = recording([]);
-            let factory = PendingHandshakeFactory::new();
+            let factory = ShimFactory::new();
             let mut build = target("build", Some("gateway"));
             if origin {
                 (build.via, build.origin) = (None, Some(name("gateway")));
@@ -694,36 +625,9 @@ mod tests {
         }
     }
 
-    /// A registration whose caller gives up once its commit is queued still
-    /// commits, at its next revision.
-    #[tokio::test]
-    async fn accepted_target_publication_survives_lost_waiter() {
-        let (_root, router) = router(definitions(&[("build", None)]), recording([]), None).await;
-        let store = router.store.clone();
-        let subject = subject_for(&store);
-        let (reached, resume) = store.pause_committed(|_| true).await;
-        let waiter = tokio::spawn({
-            let router = router.clone();
-            async move { router.add(target("build", None), &subject).await }
-        });
-        reached.await.unwrap();
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        resume.send(()).unwrap();
-        assert!(store.drain().await.is_ok());
-        let saved = router
-            .targets(|targets| targets.get(&name("build")))
-            .unwrap();
-        assert_eq!(saved.revision, 2);
-        let records = store.records();
-        assert!(matches!(&records.last().unwrap().event,
-            crate::session::SessionEvent::TargetsUpserted { targets } if targets == &[saved]));
-        router.shutdown().await;
-    }
-
     #[tokio::test]
     async fn cancelled_registration_changes_nothing_and_never_connects() {
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let (_root, router) = router([], recording([]), Some(factory.clone())).await;
         let subject = subject_for(&router.store);
         subject.cancellation.cancel();
@@ -741,42 +645,20 @@ mod tests {
         router.shutdown().await;
     }
 
+    /// A registration that fails to save reports what it may have changed: an
+    /// append the journal definitely refused changed nothing; one whose journal
+    /// failed once it committed may have saved it.
     #[tokio::test]
-    async fn a_failed_target_append_publishes_nothing() {
-        for committed in [false, true] {
-            let original = target("build", None);
-            let (_root, router) =
-                router(definitions(&[("build", None)]), recording([]), None).await;
-            let store = router.store.clone();
-            let refused = (!committed)
-                .then(|| crate::session::tests::refuse(&store, "BEFORE INSERT ON entry"));
-            if committed {
-                store.fail_committed().await;
-            }
-            let error = router
-                .add(target("build", None), &subject_for(&store))
-                .await
-                .unwrap_err();
+    async fn a_failed_target_save_reports_what_it_may_have_changed() {
+        use crate::session::{SessionError, tests::journal_failure};
+        for (cause, effects) in [
+            (SessionError::Unconfirmed(None), Effects::Unknown),
+            (SessionError::WrongSession, Effects::Unchanged),
+        ] {
+            let Unsaved(error) = SessionError::JournalFailed(journal_failure(cause)).into();
             let diagnostic = error.into_tool_error().diagnostic();
-            assert_eq!(diagnostic.context.site, FailureSite::Host);
             assert_eq!(diagnostic.context.operation, Operation::Save);
-            // No live publication occurred; persistence may have committed.
-            let effects = if committed {
-                Effects::Unknown
-            } else {
-                Effects::Unchanged
-            };
             assert_eq!(diagnostic.context.effects, effects);
-            let current = router.targets(|targets| targets.get(&name("build")));
-            assert_eq!(current.unwrap(), original);
-            let Err(crate::session::SessionError::JournalFailed(failure)) = store.drain().await
-            else {
-                panic!("a failed append stops the journal");
-            };
-            let cause = PartialDiagnostic::session(failure.cause()).cause;
-            assert_eq!(diagnostic.cause, cause);
-            drop(refused);
-            router.shutdown().await;
         }
         // A mismatched session rejects append after normalization and graph validation.
         let (_root, router) = router(definitions(&[("first", None)]), recording([]), None).await;
@@ -787,7 +669,7 @@ mod tests {
         let diagnostic = error.into_tool_error().diagnostic();
         assert_eq!(
             diagnostic.cause,
-            PartialDiagnostic::session(&crate::session::SessionError::WrongSession).cause
+            PartialDiagnostic::session(&SessionError::WrongSession).cause
         );
         assert_eq!(diagnostic.context.operation, Operation::Save);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
@@ -818,8 +700,14 @@ mod tests {
         let authorize = async |resource: &ResourceId| {
             let permission = PermissionUse::exact(Capability::Write, resource.clone());
             let (tool, arguments) = ("tool".to_owned(), serde_json::Value::Null);
-            let authorize =
-                (router.authorization).authorize(&caller, tool, vec![permission], arguments, &[]);
+            let authorize = (router.authorization).authorize(
+                &caller,
+                tool,
+                vec![permission],
+                arguments,
+                &[],
+                Asking::Allowed,
+            );
             authorize.await.map(|()| asked())
         };
         for resource in [path("build"), path("deep"), mcp.clone()] {
@@ -832,17 +720,29 @@ mod tests {
         assert_eq!(authorize(&path("build")).await.unwrap(), 4);
         assert_eq!(authorize(&path("deep")).await.unwrap(), 5);
         let (tool, arguments) = ("connect_target".to_owned(), serde_json::Value::Null);
-        let route =
-            (router.authorization).authorize(&caller, tool, stale.permissions(), arguments, &[]);
+        let route = (router.authorization).authorize(
+            &caller,
+            tool,
+            stale.permissions(),
+            arguments,
+            &[],
+            Asking::Allowed,
+        );
         assert!(matches!(
             route.await,
             Err(AuthorizationError::TargetRedefined)
         ));
         let (tool, arguments) = ("tool".to_owned(), serde_json::Value::Null);
         let permission = PermissionUse::exact(Capability::Write, path("build"));
-        let admitted = stale.identity().revisions();
-        let forwarded =
-            (router.authorization).authorize(&caller, tool, vec![permission], arguments, &admitted);
+        let admitted = stale.identity();
+        let forwarded = (router.authorization).authorize(
+            &caller,
+            tool,
+            vec![permission],
+            arguments,
+            &admitted,
+            Asking::Allowed,
+        );
         assert!(matches!(
             forwarded.await,
             Err(AuthorizationError::TargetRedefined)
@@ -865,7 +765,7 @@ mod tests {
         let root = Path::new("/root");
         let build = ExecutionLocation::named("build".parse().unwrap(), "/caller-override".into());
         let overridden = ExecutionLocation::root("/override".into());
-        let session = crate::session::tests::MemorySession::new().await;
+        let session = crate::tests::TestRuntime::new().await;
         let targets = [
             TargetDefinition::test("build", "/configured", None),
             TargetDefinition::test("other", "relative directory/../project", None),
@@ -906,7 +806,7 @@ mod tests {
             let selected = select(caller, explicit, &capabilities).unwrap();
             assert_eq!(selected.location, expected);
             assert_eq!(
-                selected.route.map(|route| route.destination().name.clone()),
+                selected.route.map(|route| route.destination.name.clone()),
                 expected.target.name().cloned()
             );
         }

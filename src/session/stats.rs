@@ -42,7 +42,7 @@ pub struct AgentStats {
     pub path: String,
     pub name: String,
     pub depth: usize,
-    /// The last applied model; none for a tool-only agent.
+    /// The last applied model.
     pub model: Option<ModelRef>,
     pub parent: Option<String>,
     pub owner_job: Option<JobId>,
@@ -81,7 +81,6 @@ pub enum AgentOutcome {
 }
 
 impl AgentOutcome {
-    #[must_use]
     pub fn finished_at(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::Running => None,
@@ -203,8 +202,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     let mut agents: BTreeMap<AgentId, AgentStats> = BTreeMap::new();
     let mut ledger = RequestLedger::default();
     let mut job_names: HashMap<JobId, String> = HashMap::new();
-    // Tool calls without a result yet, per agent: call id to tool name.
-    let mut open_calls: HashMap<AgentId, HashMap<String, String>> = HashMap::new();
     let mut models: BTreeMap<ModelRef, ModelStats> = BTreeMap::new();
     let mut turns = Turns::default();
     // As an untitled session is listed: the first text in the root's user messages.
@@ -230,7 +227,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     AgentStats {
                         name: default_name(agent),
                         depth: agent.depth(),
-                        model: profile.as_ref().map(|profile| profile.name.clone()),
+                        model: Some(profile.name.clone()),
                         owner_job: *owner_job,
                         started: time(record.timestamp_millis),
                         ..AgentStats::default()
@@ -271,25 +268,15 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 };
                 for call in items.iter().filter_map(|item| item.call()) {
                     stats.tools.entry(call.name().to_owned()).or_default().calls += 1;
-                    open_calls
-                        .entry(agent.clone())
-                        .or_default()
-                        .insert(call.id().to_owned(), call.name().to_owned());
                 }
             }
             SessionEvent::MessageCommitted {
-                message: Message::Tool(results),
+                message: Message::Tool(result),
             } => {
-                let Some(stats) = agents.get_mut(agent) else {
-                    continue;
-                };
-                for result in results {
-                    if let Some(open) = open_calls.get_mut(agent) {
-                        open.remove(&result.call_id);
-                    }
-                    if result.is_error {
-                        stats.tools.entry(result.name.clone()).or_default().errors += 1;
-                    }
+                if let Some(stats) = agents.get_mut(agent)
+                    && result.is_error
+                {
+                    stats.tools.entry(result.name.clone()).or_default().errors += 1;
                 }
             }
             SessionEvent::JobCreated {
@@ -336,11 +323,9 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
             _ => {}
         }
     }
-    for (agent, open) in open_calls {
-        if let Some(stats) = agents.get_mut(&agent) {
-            for name in open.into_values() {
-                stats.tools.entry(name).or_default().unanswered += 1;
-            }
+    for (agent, _, name) in ledger.unanswered() {
+        if let Some(stats) = agents.get_mut(agent) {
+            stats.tools.entry(name.to_owned()).or_default().unanswered += 1;
         }
     }
     // The request's context names the profile, not the agent's current selection.
@@ -441,6 +426,7 @@ fn finish(
 mod tests {
     use super::*;
     use crate::provider::protocol::Usage;
+    use crate::tests::TestRuntime;
     use crate::{
         execution::ExecutionLocation,
         job::{JobEnd, JobRole},
@@ -448,10 +434,33 @@ mod tests {
         session::{
             AttemptRef, CompletedOutcome, MessageSeq, ModelContext, ModelPurpose, RequestSeq,
             SessionEvent,
-            tests::{self, MemorySession, attempt, requested, usage},
+            tests::{self, attempt, requested, usage},
         },
     };
     use serde_json::json;
+
+    /// Journal job `index`, a delegation named `worker`, and start the root's child
+    /// `index` under it.
+    async fn worker(session: &TestRuntime, index: u32) -> AgentId {
+        let job = JobId::new(index.into()).unwrap();
+        let workspace = session.root.path();
+        let created = SessionEvent::JobCreated {
+            job,
+            parent: None,
+            origin: None,
+            tool: "agent".into(),
+            role: JobRole::Agent,
+            name: Some("worker".parse().unwrap()),
+            arguments: json!({}),
+            output_schema: None,
+            accepts_input: true,
+            background: false,
+            location: ExecutionLocation::root(workspace.to_path_buf()),
+        };
+        let (store, root) = (&session.store, &session.agent);
+        store.append(root.clone(), created).await.unwrap();
+        tests::start_child(store, root, index, Some(job), workspace).await
+    }
 
     fn totals(input: u64, cached: u64, output: u64) -> UsageTotals {
         UsageTotals {
@@ -498,13 +507,13 @@ mod tests {
     }
 
     fn result(id: &str, name: &str, is_error: bool) -> Message {
-        Message::Tool(vec![ToolResult {
+        Message::Tool(ToolResult {
             call_id: id.into(),
             name: name.into(),
             result: json!({}),
             images: Vec::new(),
             is_error,
-        }])
+        })
     }
 
     /// Shutdown interrupts every agent: a final outcome stays, an idle root is done,
@@ -512,34 +521,14 @@ mod tests {
     /// get distinct paths.
     #[tokio::test]
     async fn shutdown_keeps_final_outcomes_and_sibling_paths_stay_distinct() {
-        let session = MemorySession::new().await;
+        let session = TestRuntime::new().await;
         let (store, root) = (&session.store, &session.agent);
         let append = |agent: &AgentId, event| {
             let (store, agent) = (store.clone(), agent.clone());
             async move { store.append(agent, event).await.unwrap().sequence }
         };
-        let job = |id| JobId::new(id).unwrap();
-        for id in [1, 2] {
-            append(
-                root,
-                SessionEvent::JobCreated {
-                    job: job(id),
-                    parent: None,
-                    origin: None,
-                    tool: "agent".into(),
-                    role: JobRole::Agent,
-                    name: Some("worker".parse().unwrap()),
-                    arguments: json!({}),
-                    output_schema: None,
-                    accepts_input: true,
-                    background: false,
-                    location: ExecutionLocation::root(session.root.path().to_path_buf()),
-                },
-            )
-            .await;
-        }
-        let first = session.start_child(root, 1, Some(job(1))).await;
-        let second = session.start_child(root, 2, Some(job(2))).await;
+        let first = worker(&session, 1).await;
+        let second = worker(&session, 2).await;
         let context = append(root, context_event("big")).await;
         // The root's turn continues through a response that called tools, and a
         // failure is its final outcome.
@@ -597,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_is_summarised_per_agent_model_and_tool() {
-        let session = MemorySession::new().await;
+        let session = TestRuntime::new().await;
         let (store, root) = (&session.store, &session.agent);
         let append = |agent: &AgentId, event| {
             let (store, agent) = (store.clone(), agent.clone());
@@ -656,24 +645,7 @@ mod tests {
         )
         .await;
         let job = JobId::new(1).unwrap();
-        append(
-            root,
-            SessionEvent::JobCreated {
-                job,
-                parent: None,
-                origin: None,
-                tool: "agent".into(),
-                role: JobRole::Agent,
-                name: Some("worker".parse().unwrap()),
-                arguments: json!({}),
-                output_schema: None,
-                accepts_input: true,
-                background: false,
-                location: ExecutionLocation::root(session.root.path().to_path_buf()),
-            },
-        )
-        .await;
-        let child = session.start_child(root, 1, Some(job)).await;
+        let child = worker(&session, 1).await;
         let child_context = append(&child, context_event("big")).await;
         let open = append(&child, requested(child_context)).await.request();
         append(&child, attempt(open, 1)).await;
@@ -717,7 +689,6 @@ mod tests {
                 job,
                 state: JobEnd::Interrupted,
                 diagnostic: None,
-                output_diagnostic: None,
                 images: Vec::new(),
             },
         )

@@ -84,36 +84,21 @@ impl Accounting {
 /// Preview the JSON text `input` of the value at `field`. A value within the
 /// budget is only subject to the text-field limits.
 pub(super) fn preview(
-    mut input: impl Read,
+    input: impl Read,
     field: &FieldPointer,
     presented: &Presented,
     clipped: &Clipped,
     cancellation: &crate::job::CancellationToken,
 ) -> Result<Preview, ToolError> {
-    let mut head = Vec::new();
-    (&mut input)
-        .take(PREVIEW_BUDGET as u64 + 1)
-        .read_to_end(&mut head)?;
-    let pooled = if head.len() <= PREVIEW_BUDGET {
-        let value: Value = serde_json::from_slice(&head)?;
-        let shape = Shape::of(&value);
-        Pooled::new(
-            shape,
-            Node::of(value, field, presented, Accounting::Preview),
-            true,
-            Accounting::Preview,
-        )
-    } else {
-        let mut reader = json::reader(std::io::Cursor::new(head).chain(input));
-        pool(
-            &mut reader,
-            field,
-            presented,
-            clipped,
-            cancellation,
-            Accounting::Preview,
-        )?
-    };
+    let mut reader = json::reader(input);
+    let pooled = pool(
+        &mut reader,
+        field,
+        presented,
+        clipped,
+        cancellation,
+        Accounting::Preview,
+    )?;
     Ok(pooled.fitted(field, presented.complete(), PREVIEW_BUDGET))
 }
 
@@ -128,18 +113,6 @@ pub(super) struct Pooled {
 }
 
 impl Pooled {
-    /// An in-memory value for a page, held whole.
-    pub(super) fn of(value: Value) -> Self {
-        let shape = Shape::of(&value);
-        let node = Node::of(
-            value,
-            &FieldPointer::root(),
-            &Presented::default(),
-            Accounting::Page,
-        );
-        Self::new(shape, node, true, Accounting::Page)
-    }
-
     fn new(shape: Shape, node: Node, covered: bool, accounting: Accounting) -> Self {
         Self {
             shape,
@@ -300,7 +273,7 @@ mod tests {
         let head_bytes = TEXT_BYTES * HEAD_SHARE.0 / HEAD_SHARE.1;
         let wide_head = head_bytes / 201;
         for (text, head, tail) in [
-            // Held whole in memory, and streamed.
+            // Within the preview budget, and beyond it.
             (short.clone(), 60, 140),
             (numbered.clone(), 60, 140),
             // One line over the limit leaves out one line.
@@ -582,17 +555,6 @@ mod tests {
         };
         assert_eq!(kept.last(), Some(&[1500, 1500]));
         assert_eq!(kept[0][0], 0);
-    }
-
-    #[test]
-    fn complete_fields_stay_whole_on_the_in_memory_path_too() {
-        let instructions = "step\n".repeat(150);
-        let preview = run(
-            &json!({"instructions": instructions}),
-            &["/result/instructions"],
-        );
-        assert_eq!(preview.value["instructions"], instructions);
-        assert!(preview.truncated.is_empty());
     }
 
     #[test]

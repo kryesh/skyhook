@@ -1,10 +1,8 @@
 //! The conventions that vary between Chat Completions servers.
-use serde::{Deserialize, Serialize};
-
 use crate::provider::{
     codec::{
-        BodyPath, CacheTtl, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, SchemaConstraint,
-        StateRole, ToolNames, path,
+        BodyPath, BreakpointBudget, Cache, CacheControl, Identity, Locations, NonEmpty,
+        SchemaConstraint, StateRole, ToolNames, UnsignedReasoning, path,
     },
     protocol::ReplayFormat,
 };
@@ -25,31 +23,48 @@ pub(crate) enum ReasoningReplay {
     Unsupported,
     /// The reasoning text under this key of the assistant message.
     Text(NonEmpty<BodyPath>),
-    /// The service's signed thinking blocks, kept whole and replayed under this
-    /// key of the assistant message. Like Messages thinking, they are bound to
-    /// the exact conversation before them.
-    ThinkingBlocks(NonEmpty<BodyPath>),
+    /// The service's signed thinking blocks, kept whole. Like Messages
+    /// thinking, they are bound to the exact conversation before them.
+    ThinkingBlocks(NativeReplay),
     /// A router's `reasoning_details` objects (text, encrypted, or summary),
-    /// kept whole and replayed verbatim in order under this key of the
-    /// assistant message; bound to the conversation.
-    Details(NonEmpty<BodyPath>),
+    /// kept whole and replayed verbatim in order; bound to the conversation.
+    Details(NativeReplay),
+}
+
+/// Where native reasoning objects go back on the assistant message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeReplay {
+    /// The turn's objects, in order.
+    pub objects: NonEmpty<BodyPath>,
+    /// Unsigned objects go back with reasoning that arrived as plain text, under
+    /// these keys; none where the server takes only objects.
+    pub unsigned: UnsignedReasoning<Locations<BodyPath>>,
 }
 
 impl ReasoningReplay {
     /// Where the assistant message carries the replay.
-    pub(crate) fn paths(&self) -> Option<&NonEmpty<BodyPath>> {
-        match self {
-            Self::Unsupported => None,
-            Self::Text(path) | Self::ThinkingBlocks(path) | Self::Details(path) => Some(path),
-        }
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &BodyPath> {
+        let (primary, text) = match self {
+            Self::Unsupported => (None, None),
+            Self::Text(path) => (Some(path), None),
+            Self::ThinkingBlocks(native) | Self::Details(native) => {
+                (Some(&native.objects), native.unsigned.replayed())
+            }
+        };
+        (primary.into_iter().flat_map(NonEmpty::iter))
+            .chain(text.into_iter().flat_map(Locations::iter))
     }
 
     /// The same shape under other keys; text where nothing was replayed.
     pub(crate) fn at(&self, path: NonEmpty<BodyPath>) -> Self {
+        let native = |native: &NativeReplay| NativeReplay {
+            objects: path.clone(),
+            ..native.clone()
+        };
         match self {
             Self::Unsupported | Self::Text(_) => Self::Text(path),
-            Self::ThinkingBlocks(_) => Self::ThinkingBlocks(path),
-            Self::Details(_) => Self::Details(path),
+            Self::ThinkingBlocks(blocks) => Self::ThinkingBlocks(native(blocks)),
+            Self::Details(details) => Self::Details(native(details)),
         }
     }
 
@@ -92,18 +107,6 @@ pub(crate) enum EmptyContent {
     EmptyString,
 }
 
-/// Prompt-cache breakpoints, which standard Chat has no field for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Cache {
-    Unsupported,
-    /// `cache_control: {type: ephemeral}` on marked system segments and on the
-    /// last text part of history, which forces the parts form on those messages.
-    ContentPartBreakpoints {
-        /// The breakpoint lifetime, where the server takes one.
-        ttl: Option<CacheTtl>,
-    },
-}
-
 /// How usage is requested on a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UsageRequest {
@@ -112,50 +115,13 @@ pub(crate) enum UsageRequest {
     Implicit,
 }
 
-crate::provider::settings::settings! {
-    /// OpenRouter's routing: the `provider` preferences object and the `models`
-    /// fallback list.
-    #[derive(Default)]
-    pub struct Routing => RoutingPatch {
-        @flatten { pub provider: ProviderPreferences }
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub fallback_models: Vec<String> => default,
-    }
-}
-
-crate::provider::settings::settings! {
-    /// The `provider` object. `require_parameters` is forced on whenever a response
-    /// schema is sent, so no endpoint that ignores it is routed to.
-    #[derive(Default)]
-    pub struct ProviderPreferences => ProviderPreferencesPatch {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub order: Vec<String> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub allow_fallbacks: Option<bool> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub require_parameters: Option<bool> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub data_collection: Option<DataCollection> => default,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub quantizations: Vec<String> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub zdr: Option<bool> => default,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCollection {
-    Allow,
-    Deny,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
     pub system: SystemRole,
     /// Where `max_output` goes; none when the endpoint manages the limit.
     pub output_limit: Locations<BodyPath>,
-    pub effort: Effort,
+    /// Where the profile's `reasoning` goes.
+    pub effort: NonEmpty<BodyPath>,
     pub reasoning_replay: ReasoningReplay,
     pub empty_content: EmptyContent,
     pub usage_request: UsageRequest,
@@ -164,9 +130,12 @@ pub(crate) struct Dialect {
     pub tool_stream: Locations<BodyPath>,
     pub schema: SchemaConstraint,
     pub identity: Identity,
+    /// Breakpoints go on marked system segments and history boundaries, within
+    /// `breakpoints`, which forces the parts form on those messages: as
+    /// `prompt_cache_breakpoint` in explicit mode, or as `cache_control` in any.
     pub cache: Cache,
-    /// Routing preferences a router takes in the body.
-    pub routing: Option<Routing>,
+    pub cache_control: CacheControl,
+    pub breakpoints: BreakpointBudget,
     pub state_role: StateRole,
 }
 
@@ -177,10 +146,7 @@ impl Dialect {
         Self {
             system: SystemRole::System,
             output_limit: Locations::one(const { path("max_completion_tokens") }),
-            effort: Effort {
-                path: NonEmpty::one(const { path("reasoning_effort") }),
-                levels: OPENAI_EFFORT,
-            },
+            effort: NonEmpty::one(const { path("reasoning_effort") }),
             reasoning_replay: ReasoningReplay::Text(NonEmpty::one(
                 const { path("reasoning_content") },
             )),
@@ -190,8 +156,10 @@ impl Dialect {
             tool_stream: Locations::NONE,
             schema: SchemaConstraint::Grammar,
             identity: Identity::NONE,
-            cache: Cache::Unsupported,
-            routing: None,
+            cache: Cache::Automatic,
+            cache_control: CacheControl::Omitted,
+            // A request makes at most four explicit cache writes.
+            breakpoints: BreakpointBudget::new(4),
             state_role: StateRole::User,
         }
     }

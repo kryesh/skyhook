@@ -18,9 +18,9 @@ use crate::{
     tool::{ToolError, ToolOutput},
 };
 
-/// Only successful consuming finalization constructs this evidence; it has no
-/// Serialize implementation. Finalizing a writer is not publication: discovery
-/// reports completion only after the terminal document references this capture.
+/// Only successful consuming finalization constructs this evidence. Finalizing a
+/// writer is not publication: discovery reports completion only after the
+/// terminal document references this capture.
 #[derive(Clone, Debug)]
 pub struct CompletedCapture {
     job: JobId,
@@ -105,10 +105,6 @@ impl CaptureTarget for StoredCapture {
     }
 
     fn finish(&mut self) -> io::Result<CompletedCapture> {
-        self.output
-            .db
-            .finish_capture(self.completed.capture)
-            .map_err(database)?;
         Ok(self.completed.clone())
     }
 
@@ -198,7 +194,6 @@ impl HostOutput {
             .with_images(output.images)
             .with_presented(output.presented);
         imported.streams = output.streams;
-        imported.diagnostic = output.diagnostic;
         Ok(imported)
     }
 }
@@ -279,7 +274,7 @@ mod tests {
     use crate::job::output::{Saved, captures::available_captures, tests::fixture};
     use std::{
         future::{Future, poll_fn},
-        io::{Seek, Write},
+        io::Write,
         task::Poll,
     };
 
@@ -429,11 +424,10 @@ mod tests {
         let create = |kind| PendingCapture::create(&output, &matches, kind);
         let mut writer = create(CaptureKind::Json).unwrap().open();
         writer.write_all(b"[\"a\"").unwrap();
-        let checkpoint = writer.stream_position().unwrap();
+        let checkpoint = writer.position();
         writer.write_all(b",\"binary\"").unwrap();
         writer.flush().unwrap();
         writer.truncate(checkpoint).unwrap();
-        writer.seek(io::SeekFrom::Start(checkpoint)).unwrap();
         writer.write_all(b"]").unwrap();
         assert!(create(CaptureKind::Text).is_err());
         let saved = Saved::load(&output).unwrap();

@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::{
     Arguments, CatalogEntry, JobViewResult, OutputValue, ScriptBinding, ScriptManifest,
     ToolExposure,
+    options::SchemaOrigin,
     schema::{add_background, optional_defaults, sanitize_schema, sanitize_schema_inner},
 };
 use crate::tool::{
@@ -38,7 +39,6 @@ pub enum ResultSchema {
 }
 
 impl ResultSchema {
-    #[must_use]
     pub fn schema(&self) -> &Value {
         match self {
             Self::Json(schema) => schema,
@@ -101,8 +101,7 @@ pub(super) struct GeneratedToolDefinition {
     pub(super) exposure: ToolExposure,
     pub(super) script_binding: ScriptBinding,
     pub(super) supports_background: bool,
-    pub(super) preserve_required: bool,
-    pub(super) preserve_schema_dialect: bool,
+    pub(super) schema_origin: SchemaOrigin,
     pub(super) required: BTreeSet<Capability>,
     pub(super) root_required: BTreeSet<Capability>,
 }
@@ -139,14 +138,11 @@ impl<C, O: OutputValue> CatalogEntry<C, O> {
                 if definition.supports_background {
                     add_background(&mut input_schema);
                 }
-                if !definition.preserve_required {
+                if definition.schema_origin == SchemaOrigin::Native {
                     optional_defaults(&mut input_schema);
                 }
-                sanitize_schema_inner(&mut input_schema, definition.preserve_schema_dialect);
-                // This schema describes the handler's stored native payload.
-                // Foreground/background presentation both wrap that payload in
-                // JobView elsewhere, so a background envelope alternative here
-                // would misdescribe the value persisted and later projected.
+                sanitize_schema_inner(&mut input_schema, definition.schema_origin);
+                // The stored native payload's schema; every presentation wraps it.
                 let result_schema =
                     definition
                         .output_schema
@@ -180,7 +176,6 @@ pub struct ToolSurface {
 }
 
 impl ToolSurface {
-    #[must_use]
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
     }
@@ -215,7 +210,6 @@ impl<C, O: OutputValue> Default for Catalog<C, O> {
 }
 
 impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
-    #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<CatalogEntry<C, O>>> {
         self.tools.get(name).cloned()
     }

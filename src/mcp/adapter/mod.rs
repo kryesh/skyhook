@@ -41,8 +41,7 @@ pub fn register(
         };
         let options = ToolOptions::new(discovered.capabilities.clone())
             .requires(Capability::Mcp)
-            .preserve_required()
-            .preserve_schema_dialect()
+            .external_schema()
             .background()
             .placement(ToolPlacement::Host)
             .internal_result(result::schema())
@@ -96,6 +95,7 @@ mod tests {
     use crate::{
         job::CancellationToken,
         tests::{RecordingPolicy, TestRuntime},
+        tool::executor::InvocationKind,
         tool::{executor::ToolExecutor, policy::CapabilitySet},
     };
     use serde_json::json;
@@ -181,7 +181,7 @@ for line in sys.stdin:
         );
         assert!(
             disabled
-                .execute_script(agent(), native, count, None)
+                .execute_as(InvocationKind::Script, agent(), native, count, None)
                 .await
                 .is_err()
         );
@@ -220,11 +220,11 @@ for line in sys.stdin:
         assert_eq!(arguments(&output.unwrap().output.value), wrapped);
         let input = json!({"arguments":{"bg":"upstream"},"bg":true});
         let output = executor
-            .execute_script(agent(), open, input, None)
+            .execute_as(InvocationKind::Script, agent(), open, input, None)
             .await
             .unwrap();
         assert!(output.background);
-        let envelope = runtime.jobs.wait(output.job, None, true).await.unwrap();
+        let envelope = runtime.jobs.wait(output.job, true).await.unwrap();
         assert_eq!(
             arguments(&envelope.output.unwrap()),
             json!({"bg":"upstream"})

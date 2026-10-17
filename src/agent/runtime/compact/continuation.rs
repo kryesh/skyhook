@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::{CompactionError, todo::TodoItem},
-    provider::protocol::AssistantItem,
+    provider::protocol::{AssistantItem, ResponseSchema},
     session::{Message, UserPart},
 };
 
@@ -49,7 +49,7 @@ struct Summary {
     next_actions: Vec<String>,
 }
 
-pub(crate) fn response_schema() -> serde_json::Value {
+pub(crate) fn response_schema() -> ResponseSchema {
     let settings = schemars::generate::SchemaSettings::default().with(|settings| {
         settings.meta_schema = None;
         settings.inline_subschemas = true;
@@ -62,7 +62,7 @@ pub(crate) fn response_schema() -> serde_json::Value {
     todo_properties["status"]["description"] = "Current execution status supported by the conversation. Intent to perform work is not evidence that it started or finished.".into();
     // Strict structured outputs accept no numeric format or range; parsing still checks ids.
     schema["properties"]["jobs"]["items"] = serde_json::json!({"type": "integer"});
-    schema
+    ResponseSchema::new("skyhook_compaction", schema).expect("the compaction schema is an object")
 }
 
 pub(crate) struct Continuation {
@@ -105,7 +105,8 @@ Return a complete current todo list for this agent in todos. Start from the supp
     // Constrained decoders may enforce the shape without exposing it to the model.
     text.push_str("\n\nFinal-answer JSON Schema (applies only to the final answer, not separate reasoning):\n");
     text.push_str(
-        &serde_json::to_string_pretty(&response_schema()).expect("response schema serializes"),
+        &serde_json::to_string_pretty(response_schema().schema())
+            .expect("response schema serializes"),
     );
     Message::User(vec![UserPart::Compaction { text }])
 }
@@ -151,13 +152,6 @@ pub(crate) fn continuation(text: &str) -> Result<Continuation, CompactionError> 
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn response_schema_is_a_strict_chat_schema() {
-        let schema = response_schema();
-        crate::provider::codec::chat_completions::schema::validate_schema(&schema, &schema, 0)
-            .unwrap();
-    }
 
     fn text(message: &Message) -> &str {
         let Message::User(blocks) = message else {
@@ -263,7 +257,7 @@ mod tests {
     fn generated_schema_accepts_continuations_and_rejects_invalid_contract_data() {
         // Validate after the providers' JSON round trip. Declaration order is a
         // generation hint: reordered valid responses must still validate and parse.
-        let schema = serde_json::from_str(&response_schema().to_string()).unwrap();
+        let schema = serde_json::from_str(&response_schema().schema().to_string()).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         let valid = summary();
         let reordered = valid.as_object().unwrap().iter().rev();

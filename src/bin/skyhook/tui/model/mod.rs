@@ -11,10 +11,10 @@ mod retry;
 
 pub use super::format::{Clean, Clock, Timing, clean, footer, number, pretty, span};
 pub use cache::ContentCache;
-pub use entries::{entries, status_entry};
+pub use entries::entries;
 pub use jobs::{state_glyph, state_name, state_role, target_suffix};
 pub use projection::{AgentDisplayState, AgentInfo, Projection, WaitReason, open_jobs};
-pub use requests::{RequestRow, RequestStatus};
+pub use requests::RequestRow;
 
 use super::tool_view::{Document, Run};
 use skyhook::identity::{AgentId, JobId};
@@ -67,10 +67,7 @@ pub enum EntryKey {
         message: MessageSeq,
         call: String,
     },
-    ToolResult {
-        record: RecordSeq,
-        call: String,
-    },
+    ToolResult(RecordSeq),
     Notification {
         record: RecordSeq,
         block: usize,

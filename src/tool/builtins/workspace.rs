@@ -23,11 +23,9 @@ pub(super) async fn atomic_write(
 ) -> Result<u64, AdmissionError> {
     crate::fs::atomic_write(path, contents)
         .await
-        .map_err(|error| atomic_write_error(path, error))
-}
-
-fn atomic_write_error(path: &Path, error: crate::fs::AtomicWriteError) -> AdmissionError {
-    AdmissionError::io(error.source).context(atomic_write_context(path, error.stage))
+        .map_err(|error| {
+            AdmissionError::io(error.source).context(atomic_write_context(path, error.stage))
+        })
 }
 
 /// The operation, subject and known effects of a failed atomic replacement of `path`.
@@ -72,67 +70,4 @@ pub(super) fn atomic_write_context(
         context = context.path(PathRole::Resolved, path);
     }
     context
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn atomic_stages_preserve_io_and_report_only_known_commit_effects() {
-        use crate::fs::{AtomicWriteError, AtomicWriteStage as Stage};
-        let destination = Path::new("/workspace/destination");
-        for (stage, operation, effects, subject) in [
-            (
-                Stage::CreateStaging,
-                Operation::Create,
-                Effects::Unchanged,
-                Subject::StagingFile(destination.to_owned()),
-            ),
-            (
-                Stage::Commit,
-                Operation::Rename,
-                Effects::Unknown,
-                Subject::path(destination),
-            ),
-            (
-                Stage::SyncDirectory,
-                Operation::SyncDirectory,
-                Effects::DestinationReplaced,
-                Subject::ParentDirectory(PathBuf::from("/workspace")),
-            ),
-            (
-                Stage::Wait,
-                Operation::Wait,
-                Effects::Unknown,
-                Subject::path(destination),
-            ),
-        ] {
-            let error = atomic_write_error(
-                destination,
-                AtomicWriteError {
-                    stage,
-                    source: std::io::Error::from_raw_os_error(13),
-                },
-            );
-            let diagnostic = error.diagnostic();
-            assert_eq!(diagnostic.context.operation, operation);
-            assert_eq!(diagnostic.context.subject, subject);
-            assert_eq!(diagnostic.context.effects, effects);
-            assert!(matches!(
-                diagnostic.cause,
-                crate::tool::diagnostic::Cause::Io { code: Some(13), .. }
-            ));
-            if stage == Stage::SyncDirectory {
-                assert!(
-                    diagnostic
-                        .context
-                        .paths
-                        .iter()
-                        .any(|fact| fact.role == PathRole::Resolved && fact.path == destination)
-                );
-            }
-        }
-    }
 }

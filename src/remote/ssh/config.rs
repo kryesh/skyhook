@@ -48,11 +48,7 @@ impl SshConfig {
             .create_new(true)
             .write(true)
             .open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         let mut previous = None::<String>;
         for (index, target) in route.iter().enumerate() {
             let alias = format!("skyhook-target-{index}");
@@ -224,7 +220,6 @@ mod tests {
         ProcessEnvironment::from([(AUTH_SOCK.into(), "/managed.sock".into())])
     }
 
-    #[cfg(unix)]
     #[test]
     fn ssh_wire_paths_reject_unrepresentable_native_bytes() {
         use std::os::unix::ffi::OsStringExt as _;

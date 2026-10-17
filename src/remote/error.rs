@@ -1,6 +1,6 @@
 //! Remote transport and authorization errors, with tool-facing conversion.
 use crate::{
-    remote::{ArtifactError, Platform, ShimProtocol},
+    remote::{Platform, ShimProtocol},
     target::{TargetError, TargetName},
     tool::{
         AdmissionError, ToolError, ToolOutput,
@@ -15,8 +15,6 @@ use thiserror::Error;
 pub(crate) enum RemoteError {
     #[error(transparent)]
     Target(#[from] TargetError),
-    #[error(transparent)]
-    Artifact(#[from] ArtifactError),
     #[error(transparent)]
     Session(std::sync::Arc<crate::session::SessionError>),
     #[error("could not start transport process: {source}")]
@@ -147,9 +145,7 @@ impl RemoteError {
             Self::Ssh(error) => {
                 ToolError::failed(error).operation(Operation::Connect, Subject::Label("ssh".into()))
             }
-            error @ (Self::Artifact(_) | Self::TaskFailed { .. } | Self::Protocol(_)) => {
-                ToolError::failed(error)
-            }
+            error @ (Self::TaskFailed { .. } | Self::Protocol(_)) => ToolError::failed(error),
         }
     }
 }

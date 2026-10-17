@@ -158,42 +158,24 @@ impl Authentication {
     }
 }
 
-/// Worker-side OpenSSH authentication: the forwarded agent and askpass server for
-/// worker processes, and a private agent for SSH processes this worker starts.
-/// Both share one askpass server, which the private agent's state owns.
-pub(crate) struct WorkerAuthentication {
-    environment: ProcessEnvironment,
-    agent: Arc<Authentication>,
-}
-
-impl WorkerAuthentication {
-    pub(crate) fn new(prompts: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
-        let askpass = AskpassServer::start(prompts.clone(), None, None)?;
-        let mut environment = askpass.environment();
-        // OpenSSH already owns a private forwarded socket for this connection.
-        // Pass it through; a second forwarding listener adds no isolation or lifetime.
-        // A socket path SSH configuration cannot represent only disables agent
-        // authentication; password and key authentication still work.
-        if let Some(socket) =
-            std::env::var_os(AUTH_SOCK).and_then(|socket| socket.into_string().ok())
-        {
-            environment.insert(AUTH_SOCK.into(), socket);
-        }
-        let agent = Arc::new(Authentication::with_askpass(
-            prompts,
-            None,
-            Askpass::Running(askpass),
-        ));
-        Ok(Self { environment, agent })
+/// Worker-side OpenSSH authentication: the environment for worker processes,
+/// with the forwarded agent and askpass server, and a private agent for SSH
+/// processes this worker starts. Both share one askpass server, which the
+/// private agent's state owns.
+pub(crate) fn worker_authentication(
+    prompts: Arc<dyn SensitivePromptHandler>,
+) -> Result<(ProcessEnvironment, Arc<Authentication>), std::io::Error> {
+    let askpass = AskpassServer::start(prompts.clone(), None, None)?;
+    let mut environment = askpass.environment();
+    // OpenSSH already owns a private forwarded socket for this connection.
+    // Pass it through; a second forwarding listener adds no isolation or lifetime.
+    // A socket path SSH configuration cannot represent only disables agent
+    // authentication; password and key authentication still work.
+    if let Some(socket) = std::env::var_os(AUTH_SOCK).and_then(|socket| socket.into_string().ok()) {
+        environment.insert(AUTH_SOCK.into(), socket);
     }
-
-    pub(crate) fn environment(&self) -> &ProcessEnvironment {
-        &self.environment
-    }
-
-    pub(crate) fn agent(&self) -> Arc<Authentication> {
-        self.agent.clone()
-    }
+    let agent = Authentication::with_askpass(prompts, None, Askpass::Running(askpass));
+    Ok((environment, Arc::new(agent)))
 }
 
 #[cfg(test)]
@@ -251,13 +233,12 @@ mod tests {
 
     #[tokio::test]
     async fn worker_processes_and_the_private_agent_share_one_broker() {
-        let worker =
-            WorkerAuthentication::new(Arc::new(crate::remote::RejectSensitivePrompts)).unwrap();
-        let private = (worker.agent())
+        let (forwarded, agent) =
+            worker_authentication(Arc::new(crate::remote::RejectSensitivePrompts)).unwrap();
+        let private = agent
             .process_environment(ProcessAuthentication::Prompts)
             .await
             .unwrap();
-        let forwarded = worker.environment();
         for key in ["SSH_ASKPASS", "SUDO_ASKPASS", "SKYHOOK_ASKPASS_SOCKET"] {
             assert_eq!(forwarded[key], private[key], "{key}");
         }

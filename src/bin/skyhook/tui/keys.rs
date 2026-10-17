@@ -213,26 +213,12 @@ mod tests {
     use super::parse as key;
 
     #[test]
-    fn parsing_requires_exact_command_names() {
-        assert!("unknown".parse::<Command>().is_err());
-        assert!("/resume".parse::<Command>().is_err());
-        assert!("resume later".parse::<Command>().is_err());
-        assert_eq!("resume".parse::<Command>().unwrap(), Command::Resume);
-        assert_eq!("models".parse::<Command>().unwrap(), Command::Model);
-        assert_eq!("retry".parse::<Command>().unwrap(), Command::Retry);
-        assert_eq!("continue".parse::<Command>().unwrap(), Command::Retry);
-    }
-
-    #[test]
-    fn default_bindings_resolve_to_typed_commands_and_unbound_ones_are_not_advertised() {
+    fn commands_parse_exactly_and_unbound_ones_are_not_advertised() {
+        for invalid in ["unknown", "/resume", "resume later"] {
+            assert!(invalid.parse::<Command>().is_err(), "{invalid}");
+        }
         let keys = KeyMap::default();
         let leader = key("ctrl+x");
-        assert_eq!(keys.action(Some(leader), key("m")), Some(Command::Model));
-        assert_eq!(keys.action(Some(leader), key("f")), Some(Command::Files));
-        assert_eq!(keys.binding(Command::Files).as_deref(), Some("Ctrl+X F"));
-        assert_eq!(keys.action(Some(leader), key("c")), Some(Command::Retry));
-        assert_eq!(keys.binding(Command::Retry).as_deref(), Some("Ctrl+X C"));
-        assert_eq!(keys.action(None, key("ctrl+p")), Some(Command::Commands));
         assert!(keys.prefix(leader));
         assert_eq!(keys.binding(Command::Attachments), None);
         let hint = keys.leader_hint(

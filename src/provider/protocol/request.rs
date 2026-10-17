@@ -108,12 +108,57 @@ impl From<&AgentId> for ContextId {
     }
 }
 
-/// A named JSON Schema that a provider must enforce for the final response text.
-/// Providers that cannot transmit this constraint must return an error.
+/// A named JSON Schema that a provider must enforce for the final response text: a
+/// nonblank name and a schema object, sent as written. Providers that cannot
+/// transmit this constraint must return an error.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(try_from = "SchemaFields")]
 pub struct ResponseSchema {
-    pub name: String,
-    pub schema: Value,
+    name: String,
+    schema: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidResponseSchema {
+    #[error("a response schema needs a nonblank name")]
+    BlankName,
+    #[error("a response schema must be a JSON Schema object")]
+    NotAnObject,
+}
+
+#[derive(Deserialize)]
+struct SchemaFields {
+    name: String,
+    schema: Value,
+}
+
+impl TryFrom<SchemaFields> for ResponseSchema {
+    type Error = InvalidResponseSchema;
+
+    fn try_from(SchemaFields { name, schema }: SchemaFields) -> Result<Self, Self::Error> {
+        if name.trim().is_empty() {
+            return Err(InvalidResponseSchema::BlankName);
+        }
+        if !schema.is_object() {
+            return Err(InvalidResponseSchema::NotAnObject);
+        }
+        Ok(Self { name, schema })
+    }
+}
+
+impl ResponseSchema {
+    pub fn new(name: impl Into<String>, schema: Value) -> Result<Self, InvalidResponseSchema> {
+        let name = name.into();
+        SchemaFields { name, schema }.try_into()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn schema(&self) -> &Value {
+        &self.schema
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -121,4 +166,31 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Construction and stored schemas are held to the same shape.
+    #[test]
+    fn a_response_schema_is_a_named_object() {
+        let object = json!({"type":"object"});
+        for (name, schema, expected) in [
+            (" ", object.clone(), Err(InvalidResponseSchema::BlankName)),
+            (
+                "answer",
+                json!(true),
+                Err(InvalidResponseSchema::NotAnObject),
+            ),
+            ("answer", object.clone(), Ok(())),
+        ] {
+            let built = ResponseSchema::new(name, schema.clone());
+            assert_eq!(built.as_ref().map(drop).map_err(|error| *error), expected);
+            let parsed: Result<ResponseSchema, _> =
+                serde_json::from_value(json!({"name": name, "schema": schema}));
+            assert_eq!(parsed.ok(), built.ok());
+        }
+    }
 }

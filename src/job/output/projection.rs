@@ -20,10 +20,6 @@ impl Presented {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.complete.is_empty() && self.ends.is_empty()
-    }
-
     /// Fields never shortened.
     pub(crate) const fn complete(&self) -> &BTreeSet<FieldPointer> {
         &self.complete
@@ -92,10 +88,7 @@ pub(super) fn project(
     let notice = (!product.captures_complete).then_some(views::Notice::OutputIncomplete);
     let document = product.document();
     let root = FieldPointer::result();
-    let mut presented = saved.presented.clone();
-    presented.extend(
-        (saved.diagnostic_fields.iter()).map(|field| (field.clone(), FieldPresentation::Complete)),
-    );
+    let presented = &saved.presented;
     let (result, shape, truncated) = match &product.result {
         None => (None, None, Vec::new()),
         Some(_) if presented.complete().contains(&root) => {
@@ -103,12 +96,10 @@ pub(super) fn project(
             (Some(document["result"].take()), None, Vec::new())
         }
         Some(_) => {
-            let reading = render::Reading::Sampled {
-                presented: &presented,
-            };
+            let reading = render::Reading::Sampled { presented };
             let mut input = render::json_text(saved, &root, &document["result"], reading)?;
             let clipped = input.take_clipped();
-            let preview = preview::preview(input, &root, &presented, &clipped, cancellation)?;
+            let preview = preview::preview(input, &root, presented, &clipped, cancellation)?;
             (Some(preview.value), preview.shape, preview.truncated)
         }
     };
@@ -337,7 +328,6 @@ mod tests {
             JobOutcome, JobSpec,
             output::preview::{SAMPLE_TEXT_BYTES, TEXT_BYTES},
         },
-        session::SessionStore,
         tool::ToolOutput,
     };
 
@@ -346,8 +336,12 @@ mod tests {
         schema: Value,
         error: Option<String>,
     ) -> (tempfile::TempDir, JobManager, JobId) {
-        let (root, store, agent) = crate::session::tests::on_disk().await;
-        let manager = JobManager::new(store.clone());
+        let crate::tests::TestRuntime {
+            root,
+            jobs: manager,
+            agent,
+            ..
+        } = crate::tests::TestRuntime::on_disk().await;
         let mut spec = JobSpec::test(agent, "annotated");
         spec.output_schema = Some(schema);
         let id = manager.test_create(spec).await;
@@ -439,11 +433,7 @@ mod tests {
             manager.test_snapshot(id).await.unwrap().output.unwrap(),
             value
         );
-        let session = manager.store().id();
-        manager.supervisor().drain().await;
-        drop(manager);
-        let (store, _) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = crate::job::tests::reopened(store).await;
+        let restored = crate::job::tests::reopen(manager, root.path()).await;
         assert_eq!(
             restored
                 .present_output(OutputArgs::new(id), &Default::default())
@@ -503,11 +493,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["presentation"]["preview"]["lines"][0], "line 61");
-        let session = manager.store().id();
-        manager.supervisor().drain().await;
-        drop(manager);
-        let (store, _) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = crate::job::tests::reopened(store).await;
+        let restored = crate::job::tests::reopen(manager, root.path()).await;
         assert_eq!(
             restored
                 .present_output(OutputArgs::new(id), &Default::default())

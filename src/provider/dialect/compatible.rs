@@ -3,7 +3,7 @@
 
 use super::{Dialect, DialectConfig, DialectError, Profile, Scheme};
 use crate::provider::{
-    codec::{Codec, CodecName, StateRole, chat_completions, messages, responses},
+    codec::{Codec, CodecName, SchemaConstraint, StateRole, chat_completions, messages, responses},
     http::Transport,
 };
 
@@ -38,7 +38,11 @@ pub(crate) fn base(codec: CodecName) -> Codec {
         CodecName::ChatCompletions => {
             Codec::ChatCompletions(chat_completions::Dialect::compatible())
         }
-        CodecName::Responses => Codec::Responses(responses::Dialect::stateless()),
+        CodecName::Responses => Codec::Responses(responses::Dialect {
+            reasoning_summary: Some(responses::ReasoningSummary::Auto),
+            schema: SchemaConstraint::Strict,
+            ..responses::Dialect::stateless()
+        }),
         CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
     }
 }

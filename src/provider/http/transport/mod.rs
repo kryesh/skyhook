@@ -181,6 +181,19 @@ pub(crate) mod tests {
     use super::*;
     use futures_util::StreamExt;
 
+    /// An SSE frame, named `event` if at all.
+    pub(crate) fn sse(event: Option<&str>, data: impl Into<String>) -> SseEvent {
+        SseEvent {
+            event: event.map(str::to_owned),
+            data: data.into(),
+        }
+    }
+
+    /// `value` as an SSE frame named by its `type`, if it has one.
+    pub(crate) fn event(value: serde_json::Value) -> SseEvent {
+        sse(value["type"].as_str(), value.to_string())
+    }
+
     /// A failure as a Chat provider reports it.
     fn reported(failure: Failure) -> ProviderError {
         use crate::provider::{codec::Codec, http::errors::ErrorSignals};

@@ -25,6 +25,9 @@ pub struct ToolContext {
     subject: super::authorization::AuthorizationSubject,
     execution_location: ExecutionLocation,
     caller_location: ExecutionLocation,
+    /// Where the job runs: the execution location, unless its input places
+    /// it elsewhere, with a local workspace resolved.
+    job_location: ExecutionLocation,
     pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
     authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
@@ -48,6 +51,7 @@ impl ToolContext {
     ) -> Self {
         Self {
             subject,
+            job_location: execution_location.clone(),
             execution_location,
             caller_location,
             process_environment: Default::default(),
@@ -62,6 +66,12 @@ impl ToolContext {
     /// acknowledge: the record of a read is the outcome of the job that read it.
     pub(crate) async fn read(&self, read: Option<crate::job::Delivery>) {
         self.jobs.read(self.job(), read).await;
+    }
+
+    #[must_use]
+    pub(crate) fn with_job_location(mut self, location: ExecutionLocation) -> Self {
+        self.job_location = location;
+        self
     }
 
     #[must_use]
@@ -90,34 +100,32 @@ impl ToolContext {
         self
     }
 
-    #[must_use]
     pub fn agent(&self) -> &AgentId {
         &self.subject.agent
     }
 
-    #[must_use]
     pub(crate) fn process_owner(&self) -> crate::job::ProcessOwner {
         self.jobs.process_owner(self.job())
     }
 
-    #[must_use]
     pub fn job(&self) -> JobId {
         self.subject.job
     }
 
-    #[must_use]
     pub fn capabilities(&self) -> &CapabilitySet {
         &self.subject.capabilities
     }
 
-    #[must_use]
     pub fn execution_location(&self) -> &ExecutionLocation {
         &self.execution_location
     }
 
-    #[must_use]
     pub fn caller_location(&self) -> &ExecutionLocation {
         &self.caller_location
+    }
+
+    pub(crate) fn job_location(&self) -> &ExecutionLocation {
+        &self.job_location
     }
 
     pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {
@@ -149,6 +157,7 @@ impl ToolContext {
         &self,
         permissions: Vec<super::policy::PermissionUse>,
         network_origin: Option<String>,
+        asking: super::authorization::Asking,
         admitted: &[(crate::target::TargetName, u64)],
     ) -> Result<(), AuthorizationError> {
         let Authority::Invocation {
@@ -166,11 +175,11 @@ impl ToolContext {
             permissions,
             arguments,
             admitted,
+            asking,
         ))
         .await
     }
 
-    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.subject.cancellation.is_cancelled()
     }

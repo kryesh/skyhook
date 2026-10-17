@@ -1,25 +1,24 @@
 //! Build semantic documents from tool arguments and job views.
 use super::hints::{Hints, Syntax};
-use super::{CodeSource, Document, Role, Run, Section};
+use super::{CodeSource, Document, Role, Run, Section, Wrap};
 use crate::tui::format::{Clean, clean, pretty};
 use serde::Deserialize;
 use serde_json::Value;
 use skyhook::agent::Question;
 use skyhook::job::{
-    FieldPointer, JobView, OutputPreview, OutputTruncation, Presentation, diagnostic_slot,
-    omit_null_fields,
+    FieldPointer, JobView, OutputPreview, OutputTruncation, Presentation, omit_null_fields,
 };
 use unicode_width::UnicodeWidthStr;
 
 impl Document {
     pub fn line(&mut self, text: impl Into<String>, role: Role) {
-        self.indented(0, text, role);
+        self.indented(0, text, role, Wrap::Hard);
     }
-    /// Lines of `text`, each `indent` cells in.
-    fn indented(&mut self, indent: usize, text: impl Into<String>, role: Role) {
+    /// Lines of `text`, each `indent` cells in, one logical line per source line.
+    fn indented(&mut self, indent: usize, text: impl Into<String>, role: Role, wrap: Wrap) {
         for line in text.into().split('\n') {
             let runs = vec![Run::new(line, role)];
-            self.sections.push(Section::Line { indent, runs });
+            self.sections.push(Section::Text { indent, runs, wrap });
         }
     }
     pub(super) fn code(
@@ -41,7 +40,7 @@ impl Document {
     pub fn arguments(&mut self, hints: Hints<'_>) {
         self.line("Arguments", Role::Heading);
         if hints.args.as_object().is_some_and(|v| v.is_empty()) {
-            self.indented(2, "No arguments", Role::Muted);
+            self.indented(2, "No arguments", Role::Muted, Wrap::Hard);
         } else {
             self.fields(hints.args, 2, hints, false);
         }
@@ -82,11 +81,11 @@ impl Document {
                     Role::Added => (format!("{name} (added)"), Some("+ ")),
                     _ => (name, None),
                 };
-                self.indented(indent, label, Role::Label);
+                self.indented(indent, label, Role::Label, Wrap::Hard);
                 self.code(text, &language, indent + 2, gutter.map(Clean::from), role);
             } else if let Some((text, role)) = scalar(value) {
                 if text.contains('\n') {
-                    self.indented(indent, name, Role::Label);
+                    self.indented(indent, name, Role::Label, Wrap::Hard);
                     self.argument_block(value, indent + 2, literal);
                 } else {
                     let runs = vec![
@@ -97,23 +96,17 @@ impl Document {
                         ),
                         Run::new(text, role),
                     ];
-                    self.sections.push(if value.is_string() && !literal {
-                        Section::Prose { indent, runs }
+                    let wrap = if value.is_string() && !literal {
+                        Wrap::Words
                     } else {
-                        Section::Line { indent, runs }
-                    });
+                        Wrap::Hard
+                    };
+                    self.sections.push(Section::Text { indent, runs, wrap });
                 }
             } else {
-                self.indented(indent, name, Role::Label);
+                self.indented(indent, name, Role::Label, Wrap::Hard);
                 self.fields(value, indent + 2, hints, literal);
             }
-        }
-    }
-    /// Prose wraps at words, one logical line per source line.
-    fn prose(&mut self, text: &str, indent: usize, role: Role) {
-        for line in text.split('\n') {
-            let runs = vec![Run::new(line, role)];
-            self.sections.push(Section::Prose { indent, runs });
         }
     }
     fn argument_block(&mut self, value: &Value, indent: usize, literal: bool) {
@@ -121,22 +114,20 @@ impl Document {
             return;
         };
         if value.is_string() && !literal {
-            self.prose(&text, indent, role);
+            self.indented(indent, text, role, Wrap::Words);
         } else {
             self.code(&text, "", indent, None, role);
         }
     }
     /// Error summaries belong to the expanded Output section, never the header.
-    /// Each distinct error renders once, before the output it describes, unless
-    /// the whole result below already shows it.
+    /// Each distinct error renders once, before the output it describes.
     pub fn output(&mut self, hints: Hints<'_>, view: Option<&JobView>, summaries: &[&str]) {
         self.line("Output", Role::Heading);
-        let whole = view.and_then(whole_diagnostic);
-        let mut shown: Vec<_> = whole.as_deref().into_iter().collect();
+        let mut shown = Vec::new();
         for error in summaries
             .iter()
             .copied()
-            .chain(view.and_then(JobView::error))
+            .chain(view.and_then(|view| view.error.as_deref()))
         {
             self.error(hints, error, &mut shown);
         }
@@ -166,25 +157,25 @@ impl Document {
         }
     }
     fn job_view<'a>(&mut self, hints: Hints<'_>, view: &'a JobView, shown: &mut Vec<&'a str>) {
-        let presentation = view.presentation();
+        let presentation = view.presentation.as_ref();
         // Envelope notices describe the capture, not the selected payload.
         // Reaching the final preview page does not imply that the original
         // output was captured completely.
-        if let Some(notice) = presentation.and_then(Presentation::notice) {
+        if let Some(notice) = presentation.and_then(|presentation| presentation.notice) {
             self.line("Notice", Role::Label);
             self.code(notice.as_str(), "", 2, None, Role::Muted);
         }
         self.questions(presentation.map_or(&[], Presentation::questions));
         let captures = presentation.map_or(&[][..], Presentation::captures);
         let pages = captures.iter().filter_map(|capture| {
-            let page = capture.output()?;
+            let page = capture.output.as_deref()?;
             Some((
-                capture.field(),
+                &capture.field,
                 page,
-                page.presentation().and_then(Presentation::preview),
+                page.presentation.as_ref().and_then(|p| p.preview.as_ref()),
             ))
         });
-        match presentation.and_then(Presentation::preview) {
+        match presentation.and_then(|presentation| presentation.preview.as_ref()) {
             // Live output may have no saved whole document yet. The capture
             // pages are more useful than an empty complete result pane.
             Some(preview @ OutputPreview::Lines(page))
@@ -193,11 +184,11 @@ impl Document {
                     && pages.clone().any(|(.., page)| page.is_some()) => {}
             Some(preview) => self.preview(hints, preview),
             None => {
-                if let Some(result) = view.result() {
+                if let Some(result) = &view.result {
                     self.result(hints, result);
                 }
                 if let Some(presentation) = presentation {
-                    self.cuts(presentation.truncated(), presentation.shape());
+                    self.cuts(presentation.truncated(), presentation.shape.as_ref());
                     if !presentation.truncated().is_empty() {
                         self.line("More saved output available", Role::Muted);
                     }
@@ -205,7 +196,7 @@ impl Document {
             }
         }
         for (field, page, preview) in pages {
-            if let Some(error) = page.error().filter(|error| !shown.contains(error)) {
+            if let Some(error) = page.error.as_deref().filter(|error| !shown.contains(error)) {
                 self.line(field.as_str(), Role::Label);
                 self.error(hints, error, shown);
             }
@@ -213,7 +204,7 @@ impl Document {
                 // A running job's capture pages follow the end of its output.
                 if let OutputPreview::Lines(lines) = preview
                     && !view.state().is_terminal()
-                    && let Some(total) = lines.total_lines()
+                    && let Some(total) = lines.total_lines
                     && total > lines.lines().len()
                 {
                     self.line(format!("Latest of {total} lines"), Role::Muted);
@@ -226,12 +217,13 @@ impl Document {
     fn questions(&mut self, questions: &[Question]) {
         for question in questions {
             self.line("Question", Role::Label);
-            self.prose(&question.prompt, 2, Role::Plain);
+            self.indented(2, &question.prompt, Role::Plain, Wrap::Words);
             // As in the prompt panel, a description starts on its own line.
             for option in &question.options {
-                self.prose(&format!("• {}", option.label), 2, Role::Label);
+                let label = format!("• {}", option.label);
+                self.indented(2, label, Role::Label, Wrap::Words);
                 if !option.description.is_empty() {
-                    self.prose(&option.description, 4, Role::Muted);
+                    self.indented(4, &option.description, Role::Muted, Wrap::Words);
                 }
             }
         }
@@ -284,23 +276,23 @@ impl Document {
                 }
             }
             OutputPreview::Elements(page) => {
-                let elements = Value::Array(page.elements().to_vec());
+                let elements = Value::Array(page.elements.clone());
                 self.code(&pretty(&elements), "json", 2, None, Role::Plain);
             }
             OutputPreview::Members(page) => {
-                let mut members = Value::Object(page.members().clone());
+                let mut members = Value::Object(page.members.clone());
                 if root {
                     omit_null_fields(&mut members);
                 }
                 self.code(&pretty(&members), "json", 2, None, Role::Plain);
             }
             OutputPreview::Matches(page) => {
-                if page.matches().is_empty() {
+                if page.matches.is_empty() {
                     self.line("No matches", Role::Muted);
                 }
-                for found in page.matches() {
-                    self.line(found.at().as_str(), Role::Label);
-                    self.code(&pretty(found.value()), "json", 2, None, Role::Plain);
+                for found in &page.matches {
+                    self.line(found.at.as_str(), Role::Label);
+                    self.code(&pretty(&found.value), "json", 2, None, Role::Plain);
                 }
             }
         }
@@ -335,26 +327,6 @@ impl Document {
         } else {
             self.code(text, &hints.language(syntax), 2, None, role);
         }
-    }
-}
-/// The diagnostic a whole result shows in place: the result itself, or a
-/// complete preview of the saved `{"result": …}` document.
-fn whole_diagnostic(view: &JobView) -> Option<String> {
-    let slot = diagnostic_slot();
-    // The slot addresses the saved document; a bare result starts below `result`.
-    let diagnostic = |result: &Value| {
-        let message = (slot.segments().skip(1)).try_fold(result, |value, key| value.get(key))?;
-        Some(message.as_str()?.to_owned())
-    };
-    match view.presentation().and_then(Presentation::preview) {
-        None => diagnostic(view.result()?),
-        Some(preview @ OutputPreview::Members(page))
-            if preview.field().is_some_and(FieldPointer::is_root)
-                && preview.continuation().is_none() =>
-        {
-            diagnostic(page.members().get("result")?)
-        }
-        Some(_) => None,
     }
 }
 /// Saved-output pages can stop inside a JSON container (or even a string).
@@ -696,20 +668,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_whole_result_showing_the_error_takes_the_place_of_its_summary() {
-        let error = "Permission was denied";
-        let result = json!({"error": {"message": error}});
-        let page = json!({"field": "", "members": {"result": result}, "total_members": 1});
-        for output in [
-            json!({"result": result}),
-            json!({"presentation": {"preview": page}}),
-        ] {
-            let text = with_error(output, Some(error)).plain_text();
-            assert_eq!(text.matches(error).count(), 1, "{text}");
-        }
-    }
-
     /// The document painted 40 columns wide, one trimmed string per row.
     fn rows(document: &Document) -> Vec<String> {
         use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
@@ -837,7 +795,7 @@ mod tests {
             }
             assert!(text.contains("More saved output available"));
             assert!(document.sections.iter().any(|section| {
-                matches!(section, Section::Line { runs, .. } if runs.len() == 1
+                matches!(section, Section::Text { runs, .. } if runs.len() == 1
                     && &*runs[0].text == "/result/missing" && runs[0].role == Role::Label)
             }));
             assert!(has_source(&document, "  live payload\t"));

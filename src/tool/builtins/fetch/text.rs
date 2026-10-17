@@ -11,19 +11,16 @@ use super::validation::HttpRequestUrl;
 // Keep permits inside the blocking task: cancelling a caller must not let it
 // queue unlimited parsers while previously-started work is still running.
 static EXTRACTORS: Semaphore = Semaphore::const_new(2);
-pub(super) const MAX_RAW_HTML_BYTES: usize = 10 * 1024 * 1024;
-pub(super) const MAX_DECODED_HTML_BYTES: usize = 10 * 1024 * 1024;
-pub(super) const MAX_HTML_ELEMENTS: usize = 50_000;
+const MAX_RAW_HTML_BYTES: usize = 10 * 1024 * 1024;
+const MAX_DECODED_HTML_BYTES: usize = 10 * 1024 * 1024;
+const MAX_HTML_ELEMENTS: usize = 50_000;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct ExtractionMetadata {
     pub title: String,
-    #[schemars(with = "String")]
     pub byline: Option<String>,
-    #[schemars(with = "String")]
     pub site_name: Option<String>,
-    #[schemars(with = "String")]
     pub language: Option<String>,
 }
 
@@ -39,8 +36,7 @@ pub(super) enum ContentClass {
     Binary,
 }
 
-/// Owns the bytes and their one classification/encoding decision. Raw response
-/// headers remain with the response envelope; this is not a DOM validity proof.
+/// Owns the bytes and their one classification/encoding decision.
 pub(super) struct ResponseEntity {
     bytes: Vec<u8>,
     class: ContentClass,
@@ -164,22 +160,45 @@ fn html_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
 }
 
 /// An owned HTML entity within both extraction budgets, bound to its admitted
-/// request URL. Neither successful parsing nor total heap use is proven.
+/// request URL.
 pub(super) struct ExtractableHtml {
     html: String,
     url: HttpRequestUrl,
 }
 
-/// Closed extraction evidence; parser displays and document content never cross
-/// this boundary. These reasons are projected into fetch's existing diagnostic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Closed extraction reasons; parser displays and document content never cross
+/// this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum ExtractionFailure {
+    #[error(
+        "HTML exceeds the {} MiB extraction input limit; use text:false to retrieve the response without extraction",
+        MAX_RAW_HTML_BYTES >> 20
+    )]
     RawSizeLimit,
+    #[error(
+        "decoded HTML exceeds the {} MiB extraction limit; use text:false to retrieve the response without extraction",
+        MAX_DECODED_HTML_BYTES >> 20
+    )]
     DecodedSizeLimit,
+    #[error(
+        "HTML exceeds the {MAX_HTML_ELEMENTS}-element extraction limit; use text:false to retrieve the response without extraction"
+    )]
     ElementLimit,
+    #[error(
+        "the HTML parser could not extract an article; use text:false to retrieve the original response"
+    )]
     Parser,
+    #[error(
+        "HTML extraction produced no readable text; use text:false to retrieve the original response"
+    )]
     Empty,
+    #[error(
+        "the HTML extraction worker is unavailable; retry or use text:false to retrieve the response without extraction"
+    )]
     WorkerUnavailable,
+    #[error(
+        "the HTML extraction worker did not complete; retry or use text:false to retrieve the response without extraction"
+    )]
     WorkerFailed,
 }
 

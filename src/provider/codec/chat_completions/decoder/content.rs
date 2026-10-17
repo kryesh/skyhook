@@ -16,21 +16,24 @@ impl Decoder {
             &delta.thinking_blocks,
             &delta.reasoning_details,
         ) {
-            (ReasoningFormat::ThinkingBlocks, Some(blocks), _) if !blocks.is_empty() => {
+            (ReasoningFormat::ThinkingBlocks, Some(blocks), _) => {
                 for block in blocks {
                     self.thinking_block(block, events);
                 }
             }
-            (ReasoningFormat::Details, _, Some(details)) if !details.is_empty() => {
+            (ReasoningFormat::Details, _, Some(details)) => {
                 for detail in details {
                     self.detail(detail, events);
                 }
             }
-            _ => {
-                if let Some(text) = delta.reasoning_text() {
-                    self.visible_delta(&text, true, events);
-                }
-            }
+            _ => {}
+        }
+        // A provider may stream plain reasoning and also send it as native objects,
+        // whose text takes its place in the response; see `items`.
+        if !self.reads_native()
+            && let Some(text) = delta.reasoning_text()
+        {
+            self.visible_delta(&text, true, events);
         }
         for text in [delta.content.as_deref(), delta.refusal.as_deref()]
             .into_iter()
@@ -95,13 +98,11 @@ impl Decoder {
             .iter()
             .any(|block| matches!(block, Block::Tool { .. }));
         if !streamed_tools {
-            let legacy = message.legacy_call();
             missing.tool_calls = Some(
                 message
                     .tool_calls
                     .into_iter()
                     .flatten()
-                    .chain(legacy)
                     .enumerate()
                     .map(|(index, call)| wire::ToolDelta {
                         index: Some(index as u64),
@@ -113,9 +114,10 @@ impl Decoder {
         missing
     }
 
-    /// Continue the text or plain reasoning block receiving output, or open one.
+    /// Continue the text or plain reasoning block that received the latest output,
+    /// or open one.
     fn visible_delta(&mut self, text: &str, reasoning: bool, events: &mut Vec<ResponseEvent>) {
-        let same = self.visible_id.filter(|id| {
+        let same = self.blocks.len().checked_sub(1).filter(|id| {
             matches!(
                 (&self.blocks[*id], reasoning),
                 (Block::Reasoning(_), true) | (Block::Text(_), false)
@@ -130,7 +132,6 @@ impl Decoder {
             } else {
                 Block::Text(String::new())
             });
-            self.visible_id = Some(id);
             id
         };
         match &mut self.blocks[id] {
@@ -147,14 +148,17 @@ impl Decoder {
 
     /// The completed items in block order. Tool calls are dropped when the finish
     /// does not authorize them, and otherwise must be complete and well formed.
+    /// Plain reasoning is dropped from a response whose native objects carry text.
     pub(super) fn items(&self, discard_tools: bool) -> Result<Vec<AssistantItem>, ProviderError> {
         let mut ids = self.call_ids();
         let details_signed = self.details_signed();
+        let reads_native = self.reads_native();
         let mut items = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
             let (id, position) = (index.to_string(), common::position(index)?);
             items.push(match block {
                 Block::Text(text) => AssistantItem::text(id, position, text.clone()),
+                Block::Reasoning(_) if reads_native => continue,
                 Block::Reasoning(text) => {
                     let payload = json!({"text": text});
                     let replay = replay(

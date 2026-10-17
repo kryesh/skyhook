@@ -178,7 +178,7 @@ where
             } => {
                 // The worker names its own machine as the root; everything it asks
                 // for is bound to this connection's target.
-                let (permissions, origin) = request.into_parts(&location.target);
+                let (permissions, origin, asking) = request.into_parts(&location.target);
                 let (context, admitted) = {
                     let state = state.lock().await;
                     let pending = state.pending.get(&request_id);
@@ -189,7 +189,11 @@ where
                 let writer = writer.clone();
                 callbacks.spawn(async move {
                     let decision = match context {
-                        Some(context) => context.authorize(permissions, origin, &admitted).await,
+                        Some(context) => {
+                            context
+                                .authorize(permissions, origin, asking, &admitted)
+                                .await
+                        }
                         None => Err(AuthorizationError::PolicyFailed),
                     };
                     write_frame(
@@ -197,7 +201,7 @@ where
                         &Request::AuthorizationDecision {
                             request_id,
                             authorization_id,
-                            decision: decision.into(),
+                            decision,
                         },
                     )
                     .await
@@ -217,14 +221,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        build, fixture_context, fixture_context_with_capabilities, output, route_fixture,
+        build, fixture_context, fixture_context_with_capabilities, output, route_fixture, sink,
         test_connection, write_result,
     };
     use super::*;
-    use crate::remote::protocol::{AuthorizationDecision, AuthorizationId};
+    use crate::remote::protocol::AuthorizationId;
     use crate::tests::bounded;
     use crate::tool::authorization::{
-        AuthorizationArguments, AuthorizationCoordinator, Reauthorization,
+        Asking, AuthorizationArguments, AuthorizationCoordinator, Reauthorization,
     };
     use crate::tool::policy::{Capability, PermissionUse, ResourceId};
 
@@ -265,16 +269,16 @@ mod tests {
     #[tokio::test]
     async fn authorization_callbacks_do_not_block_dispatch_and_fail_the_connection_on_write_error()
     {
-        use crate::tool::policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture};
+        use crate::tool::policy::{Approval, AuthorizationRequest, Policy, PolicyDecision};
         use tokio::sync::Notify;
         struct WaitingPolicy(Arc<Notify>, Arc<Notify>);
         impl Policy for WaitingPolicy {
-            fn authorize(&self, _: AuthorizationRequest) -> PolicyFuture<'_> {
-                Box::pin(async move {
+            fn authorize(&self, _: AuthorizationRequest) -> Approval<'_> {
+                Approval::Ask(Box::pin(async move {
                     self.0.notify_one();
                     self.1.notified().await;
                     PolicyDecision::allow()
-                })
+                }))
             }
         }
         let runtime = crate::tests::TestRuntime::new().await;
@@ -292,19 +296,7 @@ mod tests {
         let first_result = register(&connection.state, 1, &context).await;
         let receiver = register(&connection.state, 2, &context).await;
         let state = connection.state.clone();
-        let reader = tokio::spawn(async move {
-            let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
-            route_responses(
-                responses,
-                &state,
-                &writer,
-                build(),
-                prompts,
-                CancellationToken::new(),
-                Box::new(()),
-            )
-            .await;
-        });
+        let reader = tokio::spawn(async move { route_fixture(responses, &state, &writer).await });
         let prompt = || Response::SensitivePrompt {
             prompt_id: PROMPT,
             prompt: crate::remote::SensitivePrompt::test(
@@ -319,10 +311,10 @@ mod tests {
             let request = Response::Authorization {
                 request_id: RequestId::new(1),
                 authorization_id: AUTHORIZATION,
-                request: forwarded(Reauthorization::Permissions(vec![PermissionUse::new(
-                    Capability::Read,
-                    outside,
-                )])),
+                request: forwarded(Reauthorization::Permissions(
+                    vec![PermissionUse::new(Capability::Read, outside)],
+                    Asking::Allowed,
+                )),
             };
             write_frame(&mut requests, &request).await.unwrap();
             entered.notified().await;
@@ -342,7 +334,7 @@ mod tests {
                 control(&mut replies).await,
                 Some(Request::AuthorizationDecision {
                     authorization_id: AUTHORIZATION,
-                    decision: AuthorizationDecision::Allowed,
+                    decision: Ok(()),
                     ..
                 })
             ));
@@ -359,7 +351,7 @@ mod tests {
             .diagnostic();
         assert_eq!(error.context.operation, Operation::Send);
         assert_eq!(error.context.site, FailureSite::Host);
-        assert_eq!(error.context.effects, Effects::MayHaveExecuted);
+        assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
         assert!(matches!(
             error.cause,
             crate::tool::diagnostic::Cause::Io { .. }
@@ -391,19 +383,7 @@ mod tests {
         let writer: Arc<Mutex<Writer>> = Arc::new(Mutex::new(Box::new(input)));
         let _pending = register(&connection.state, 1, &context).await;
         let state = connection.state.clone();
-        let reader = tokio::spawn(async move {
-            let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
-            route_responses(
-                responses,
-                &state,
-                &writer,
-                build(),
-                prompts,
-                CancellationToken::new(),
-                Box::new(()),
-            )
-            .await;
-        });
+        let reader = tokio::spawn(async move { route_fixture(responses, &state, &writer).await });
         let origin = "https://example.test";
         let request = Response::Authorization {
             request_id: RequestId::new(1),
@@ -414,7 +394,7 @@ mod tests {
         assert!(matches!(
             bounded(control(&mut replies)).await,
             Some(Request::AuthorizationDecision {
-                decision: AuthorizationDecision::Allowed,
+                decision: Ok(()),
                 ..
             })
         ));
@@ -440,7 +420,7 @@ mod tests {
             let (mut peer, stream) = tokio::io::duplex(4096);
             let state = Arc::new(Mutex::new(ConnectionState::default()));
             let receiver = register(&state, 1, &context).await;
-            let reader = tokio::spawn(async move { route_fixture(stream, &state).await });
+            let reader = tokio::spawn(async move { route_fixture(stream, &state, &sink()).await });
             if orphan {
                 let orphaned = Response::Tool {
                     request_id: RequestId::new(99),
@@ -464,7 +444,7 @@ mod tests {
                 error.context.subject,
                 Subject::Label("remote transport".into())
             );
-            assert_eq!(error.context.effects, Effects::MayHaveExecuted);
+            assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
             if invalid_frame {
                 assert!(matches!(
                     error.cause,

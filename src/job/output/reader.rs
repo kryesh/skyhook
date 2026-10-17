@@ -135,14 +135,6 @@ pub(super) fn last_page_start(
     Ok(index.total_lines.saturating_sub(lines.max(1)) + 1)
 }
 
-fn check_cancelled(cancellation: &super::super::CancellationToken) -> Result<(), ToolError> {
-    if cancellation.is_cancelled() {
-        Err(ToolError::cancelled())
-    } else {
-        Ok(())
-    }
-}
-
 pub(super) fn not_utf8() -> ToolError {
     ToolError::failed("saved output is not UTF-8")
 }

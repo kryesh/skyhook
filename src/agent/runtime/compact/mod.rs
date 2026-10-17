@@ -2,10 +2,13 @@
 
 use std::num::NonZeroU64;
 
-use super::{HarnessError, SessionRuntime, TurnContext, compaction};
+use super::{
+    HarnessError, SessionRuntime, TurnContext,
+    recovery::{FailureRecord, TurnError},
+};
 use crate::{
     provider::{ProviderContext, ProviderErrorKind, protocol::ModelRequest},
-    session::{AttemptRef, CompactionFailure, CompactionTrigger, ProfileSnapshot, SessionEvent},
+    session::{AttemptRef, CompactionFailure, CompactionTrigger, ProfileSnapshot},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
@@ -14,6 +17,7 @@ pub(super) const MAX_COMPACTION_ATTEMPTS: u8 = 3;
 pub(super) const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 mod checkpoint;
+pub(super) mod continuation;
 mod retention;
 mod summary;
 use checkpoint::CompactionInput;
@@ -68,7 +72,8 @@ fn summary_max_output(
 }
 
 impl SessionRuntime {
-    /// Install a valid checkpoint, retrying recoverable summary failures.
+    /// Install a valid checkpoint, retrying recoverable summary failures. A failure
+    /// that ends the turn, unless an interrupt, is handed back with its record.
     pub(super) async fn compact_history(
         &self,
         turn: &TurnContext<'_>,
@@ -76,7 +81,7 @@ impl SessionRuntime {
         profile: &ProfileSnapshot,
         input: &ModelRequest,
         trigger: CompactionTrigger,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<(), TurnError> {
         let mut launches = self.jobs.active_launches(turn.agent);
         let mut model_attempt = 0;
         let mut fit = SummaryFit::default();
@@ -101,7 +106,8 @@ impl SessionRuntime {
                     &mut launches,
                 )
                 .await;
-            // Only an attempt of this summary request belongs to its outcome.
+            // Only an attempt of this summary request belongs to its outcome, and the
+            // count moves only once an attempt's start commits.
             let failure = match request_sequence {
                 None => CompactionFailure::BeforeRequest,
                 Some(request) if model_attempt > attempted => {
@@ -114,25 +120,33 @@ impl SessionRuntime {
             };
             match result {
                 Ok(()) => return Ok(()),
+                // Refused before it requested anything, the turn ends interrupted
+                // with no compaction to fail.
+                Err(HarnessError::Interrupted) if request_sequence.is_none() => {
+                    return Err(HarnessError::Interrupted.into());
+                }
                 Err(error) => {
-                    let fault = crate::agent::CompactionFault::from(&error);
-                    let retryable = fault.retryable();
-                    if fault == crate::agent::CompactionFault::Overflowed {
+                    use crate::agent::CompactionFault;
+                    let fault = CompactionFault::from(&error);
+                    let ends = !fault.retryable() || attempt == MAX_COMPACTION_ATTEMPTS;
+                    if fault == CompactionFault::Overflowed {
                         fit = fit.after_overflow(ceiling.is_some());
                     }
-                    let failed = SessionEvent::CompactionFailed {
-                        failure,
-                        error: fault,
-                    };
+                    let interrupted = fault == CompactionFault::Interrupted;
+                    let record = FailureRecord::compaction(failure, fault);
+                    if ends && !interrupted {
+                        let record = Some(record);
+                        return Err(TurnError { error, record });
+                    }
                     // The backoff runs from the failure, however long its record takes to commit.
                     let backoff = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt));
-                    self.store.append(turn.agent.clone(), failed).await?;
-                    if !retryable || attempt == MAX_COMPACTION_ATTEMPTS {
-                        return Err(error);
+                    self.record_failure(turn.agent, record).await?;
+                    if ends {
+                        return Err(error.into());
                     }
                     tokio::select! {
                         biased;
-                        () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                        () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted.into()),
                         () = backoff => {}
                     }
                 }
@@ -149,16 +163,16 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    use super::summary_max_output;
+    use super::{TurnError, summary_max_output};
     pub(super) use crate::agent::runtime::tests::{
-        Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
-        provider_name, recoverable, response, retrying, set_root_turn, summary_json, test_builder,
-        todo, usage,
+        Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events,
+        interrupt_on, models, provider_name, recoverable, response, retrying, set_root_turn,
+        spawn_prompt, summary_json, test_builder, todo, until_queued, usage,
     };
     use crate::agent::runtime::{HarnessError, SessionHandle, Turn, TurnContext, state};
     use crate::provider::profile::StateMode;
     use crate::{
-        agent::{CompactionFault, FaultKind, TodoStatus},
+        agent::{CompactionFault, TodoStatus},
         execution::ExecutionLocation,
         provider::{
             Provider, ProviderErrorKind,
@@ -298,19 +312,18 @@ mod tests {
             self.session.runtime.store.records()
         }
 
-        pub(super) async fn compact(
-            &self,
-            cancellation: &CancellationToken,
-        ) -> Result<(), HarnessError> {
-            self.compact_for(cancellation, CompactionTrigger::Overflow)
-                .await
+        pub(super) async fn compact(&self) -> Result<(), HarnessError> {
+            let compacted = self.compact_for(CompactionTrigger::Overflow).await;
+            compacted.map_err(|failed| failed.error)
         }
 
+        /// Compact for `trigger` as a turn of the root's own, which an interrupt
+        /// stops as it would any. The record of a failure that would end the turn
+        /// comes back unjournaled, as the turn's end journals it.
         pub(super) async fn compact_for(
             &self,
-            cancellation: &CancellationToken,
             trigger: CompactionTrigger,
-        ) -> Result<(), HarnessError> {
+        ) -> Result<(), TurnError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
             let records = runtime.store.records();
@@ -329,16 +342,21 @@ mod tests {
             let state = crate::session::Message::State(state);
             let sends = profile.profile.state_mode != StateMode::None;
             input.context = history.context(sends.then_some(&state));
+            let cancellation = CancellationToken::new();
             let turn = TurnContext {
                 agent,
                 owner_job: None,
-                cancellation,
+                cancellation: &cancellation,
                 location: &location,
                 capabilities: capabilities.clone(),
             };
             let mut provider = self.script.open_context(ContextId::from(agent))?;
-            // Only a busy turn requests a summary.
-            set_root_turn(&self.session, Turn::Busy);
+            let (root, token) = (agent.clone(), cancellation.clone());
+            runtime.store.enqueue(move |state| {
+                let facts = state.agents.get_mut(&root).expect("the root runs");
+                facts.turn_token = token;
+                facts.set_turn(Turn::Busy);
+            });
             let compacted =
                 runtime.compact_history(&turn, provider.as_mut(), &profile, &input, trigger);
             let compacted = compacted.await;
@@ -367,53 +385,233 @@ mod tests {
         fixture.session.shutdown().await.unwrap();
     }
 
+    /// An interrupt that lands before the summary's attempt starts fails the round
+    /// as requested; one after it fails the round on that attempt, the last thing
+    /// sent. The failure names only an attempt that committed.
     #[tokio::test]
-    async fn cancelling_a_blocked_summarizer_does_not_activate_a_checkpoint() {
-        let fixture = Fixture::new([Step::new(summary(summary_json())).gated()]).await;
-        let runtime = &fixture.session.runtime;
-        let agent = &fixture.session.root;
+    async fn an_interrupt_either_side_of_a_summary_attempt_start_fails_on_what_committed() {
+        use crate::provider::protocol::HistoryLifetime;
+        let summarizing: fn(&SessionEvent) -> bool = |event| {
+            matches!(event, SessionEvent::ModelRequested { history_lifetime, .. }
+                if *history_lifetime == HistoryLifetime::Detached)
+        };
+        for started in [false, true] {
+            let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
+            let steps = [
+                Step::stream(vec![Err(overflow)]),
+                Step::new(summary(summary_json())).gated(),
+            ];
+            let fixture = Fixture::new(steps).await;
+            fixture.add_history(20_000).await;
+            let session = &fixture.session;
+            let behind = match started {
+                true => None,
+                false => Some(interrupt_on(session, summarizing).await),
+            };
+            let prompt = spawn_prompt(session, "Continue.");
+            let interrupted = match behind {
+                Some(interrupted) => bounded(interrupted).await,
+                None => {
+                    fixture.script.request(2).await;
+                    session.interrupt().await
+                }
+            };
+            assert_eq!(interrupted, 1);
+            let interrupted = bounded(prompt).await.unwrap();
+            assert!(matches!(interrupted, Err(HarnessError::Interrupted)));
+            let records = fixture.records();
+            let failed = events!(&records, SessionEvent::CompactionFailed { failure, error }
+                => (*failure, error.clone()));
+            let [(failure, CompactionFault::Interrupted)] = failed[..] else {
+                panic!("{started}: {failed:?}")
+            };
+            let attempts = events!(&records, SessionEvent::ModelAttemptStarted(attempt)
+                if Some(attempt.request) == failure.request() => *attempt);
+            assert_eq!(failure.attempt(), attempts.last().copied(), "{started}");
+            // The failure settles the summary request on that attempt.
+            let ledger = fixture.session.observe().snapshot.ledger;
+            let request = failure.request().and_then(|request| ledger.get(request));
+            let attempt = attempts.last().map(|attempt| attempt.attempt);
+            assert!(
+                matches!(request.unwrap().phase,
+                    crate::session::RequestPhase::Interrupted { attempt: at, .. } if at == attempt),
+                "{started}"
+            );
+            assert_eq!(attempts.len(), usize::from(started));
+            assert_eq!(fixture.requests().len(), 2 + usize::from(started));
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
+
+    /// An interrupt that lands once the summary is in, before its checkpoint
+    /// commits, installs nothing: the round fails interrupted.
+    #[tokio::test]
+    async fn an_interrupt_before_the_checkpoint_commits_installs_nothing() {
+        let mut summarized = summary(summary_json());
+        let end = summarized.pop().unwrap();
+        summarized.extend([ResponseEvent::Usage(usage(1, 0, 1)), end]);
+        let fixture = Fixture::new([Step::new(summarized)]).await;
         fixture.add_history(20_000).await;
-        let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
-        runtime
-            .store
-            .replace_todos(agent, todos.clone(), None)
-            .await
-            .unwrap();
-        let before = project_history(&fixture.records(), agent);
-        let cancellation = CancellationToken::new();
-        let (result, ()) = bounded(async {
-            tokio::join!(fixture.compact(&cancellation), async {
-                fixture.script.request(1).await;
-                cancellation.cancel();
-            })
-        })
-        .await;
-        assert!(matches!(result, Err(HarnessError::Interrupted)));
+        let used: fn(&SessionEvent) -> bool = |event| matches!(event, SessionEvent::Usage { .. });
+        let interrupted = interrupt_on(&fixture.session, used).await;
+        let (result, stopped) =
+            bounded(async { tokio::join!(fixture.compact(), interrupted) }).await;
+        assert_eq!(stopped, 1);
+        assert!(
+            matches!(result, Err(HarnessError::Interrupted)),
+            "{result:?}"
+        );
         let records = fixture.records();
-        assert_eq!(project_history(&records, agent), before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-        let found = runtime.store.inspect_todos(agent, None).unwrap();
-        assert_eq!(found, todos);
+        let failed =
+            events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+        assert_eq!(failed, [CompactionFault::Interrupted]);
         fixture.session.shutdown().await.unwrap();
     }
 
+    /// An interrupt that lands right behind a queued batch joining at the boundary
+    /// an overflow sent the turn back to ends it before its compaction journals
+    /// anything: no summary context, request or failure.
     #[tokio::test]
-    async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
-        // Parser field cases live in compaction.rs; this covers rollback and tool contracts.
+    async fn an_interrupt_behind_a_join_ends_the_turn_before_its_compaction_journals() {
+        let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
+        let steps = [
+            Step::fail(overflow).gated(),
+            Step::new(answer("unrequested")),
+        ];
+        let fixture = Fixture::new(steps).await;
+        let session = &fixture.session;
+        let prompt = spawn_prompt(session, "Continue.");
+        fixture.script.request(1).await;
+        let queued = crate::agent::QueuedPrompt {
+            text: "joined".into(),
+            ..Default::default()
+        };
+        let receipts = session.enqueue_prompts(vec![queued]).await;
+        until_queued(session, &session.root).await;
+        let joined: fn(&SessionEvent) -> bool = |event| {
+            matches!(
+                event,
+                SessionEvent::MessageCommitted {
+                    message: Message::User(_)
+                }
+            )
+        };
+        let interrupted = interrupt_on(session, joined).await;
+        let from = fixture.records().len();
+        fixture.script.release(1);
+        assert_eq!(bounded(interrupted).await, 1);
+        let interrupted = bounded(prompt).await.unwrap();
+        assert!(
+            matches!(interrupted, Err(HarnessError::Interrupted)),
+            "{interrupted:?}"
+        );
+        for receipt in receipts {
+            bounded(receipt.into_future()).await.unwrap();
+        }
+        let records = fixture.records();
+        let compacting = records[from..].iter().filter(|record| {
+            matches!(
+                &record.event,
+                SessionEvent::ModelContext { .. }
+                    | SessionEvent::ModelRequested { .. }
+                    | SessionEvent::CompactionFailed { .. }
+            )
+        });
+        assert_eq!(compacting.count(), 0, "{:#?}", &records[from..]);
+        fixture.session.shutdown().await.unwrap();
+    }
+
+    /// The fault of the compaction failure that ends a turn, carried for its end.
+    fn final_fault(
+        compacted: Result<(), TurnError>,
+        agent: &crate::identity::AgentId,
+    ) -> CompactionFault {
+        let Err(TurnError {
+            record: Some(record),
+            ..
+        }) = compacted
+        else {
+            panic!("compaction did not fail for good");
+        };
+        let faults = record.events(agent).filter_map(|(_, event)| match event {
+            SessionEvent::CompactionFailed { error, .. } => Some(error),
+            _ => None,
+        });
+        let [fault] = faults.collect::<Vec<_>>().try_into().unwrap();
+        fault
+    }
+
+    /// A summary that fails for good ends the turn on its compaction failure, which
+    /// commits right ahead of the turn's end and is reported by its request, live
+    /// and once reopened: whether the failure settles the request, as a refused
+    /// summary's does, or the summary's own model failure settled it first.
+    #[tokio::test]
+    async fn a_summary_failing_for_good_ends_the_turn_on_its_compaction_failure() {
+        let partial = vec![AssistantItem::text("text/0", 0, "partial")];
+        let refused = Step::new(cut(partial, CutReason::Refusal));
+        let rejected = Step::fail(ProviderErrorKind::InvalidRequest.error("summary rejected"));
+        for failing in [refused, rejected] {
+            let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
+            let fixture = Fixture::new([Step::stream(vec![Err(overflow)]), failing]).await;
+            fixture.add_history(20_000).await;
+            let error = fixture.session.prompt("Continue.").await.unwrap_err();
+            assert!(!matches!(error, HarnessError::Interrupted), "{error}");
+            let records = fixture.records();
+            let compaction = records
+                .iter()
+                .rposition(|record| matches!(record.event, SessionEvent::CompactionFailed { .. }));
+            let ended = &records[compaction.unwrap() + 1];
+            assert!(
+                matches!(ended.event, SessionEvent::AgentFailed { .. }),
+                "{:?}",
+                ended.event
+            );
+            let live = fixture.session.observe().snapshot.ledger;
+            let reopened = crate::session::RequestLedger::of(&records);
+            for ledger in [live, reopened] {
+                assert!(ledger.failed_by(ended.sequence).is_some(), "{error}");
+            }
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
+
+    /// A cut-off summary, even one holding a whole answer, is retried as truncated,
+    /// as are a tool call and an unusable continuation; a refused one fails the
+    /// round at once, diagnosed as what it was. None of them changes history or
+    /// todos, or executes a tool.
+    #[tokio::test]
+    async fn failed_summaries_preserve_history_and_never_execute_tools() {
+        use crate::agent::FailureKind;
         let arguments = json!({"path":"must-not-exist", "content":"side effect"});
         let call = ToolCall::new("never-execute", "write", arguments).unwrap();
         let tool_call = response(vec![AssistantItem::tool_call("never-execute", 0, call)]);
         let reasoning = AssistantItem::reasoning("reasoning/0", 0, "thinking", None);
         let text = AssistantItem::text("text/1", 1, summary_json().to_string());
-        let truncated = cut(vec![reasoning, text], CutReason::MaxTokens);
+        let partial = || vec![AssistantItem::text("text/0", 0, "partial")];
         let mut blank_todo = summary_json();
         blank_todo["todos"] = json!([{"text":" \t", "status":"pending"}]);
-        let failures = [
-            (FaultKind::Truncated, truncated),
-            (FaultKind::ToolCall, tool_call),
-            (FaultKind::Continuation, summary(blank_todo)),
+        type Expected = fn(&CompactionFault) -> bool;
+        let cases: [(_, usize, Expected); 5] = [
+            (
+                cut(vec![reasoning, text], CutReason::MaxTokens),
+                3,
+                |fault| matches!(fault, CompactionFault::Truncated),
+            ),
+            (cut(partial(), CutReason::Incomplete), 3, |fault| {
+                matches!(fault, CompactionFault::Truncated)
+            }),
+            (tool_call, 3, |fault| {
+                matches!(fault, CompactionFault::ToolCall)
+            }),
+            (summary(blank_todo), 3, |fault| {
+                matches!(fault, CompactionFault::Continuation(_))
+            }),
+            (cut(partial(), CutReason::Refusal), 1, |fault| {
+                matches!(fault, CompactionFault::Summary(FailureKind::Refused))
+            }),
         ];
-        for (fault, events) in failures {
+        for (events, attempts, expected) in cases {
             let steps = (0..3).map(|_| Step::new(events.clone()));
             let fixture = Fixture::new(steps).await;
             let (todos, agent) = (&fixture.session.runtime.store, &fixture.session.root);
@@ -424,23 +622,19 @@ mod tests {
                 .await
                 .unwrap();
             let before = project_history(&fixture.records(), agent);
-            let cancellation = CancellationToken::new();
-            let compacted = retrying(&fixture.session, fixture.compact(&cancellation));
-            let error = compacted.await.unwrap_err();
-            assert_eq!(CompactionFault::from(&error).kind(), fault);
+            let compacted = fixture.compact_for(CompactionTrigger::Overflow);
+            let fault = final_fault(retrying(&fixture.session, compacted).await, agent);
+            assert!(expected(&fault), "{fault}");
             let records = fixture.records();
-            let faults = events!(&records, SessionEvent::CompactionFailed { failure, error }
-                if failure.request().is_some() => error.kind());
-            assert!(
-                !faults.is_empty() && faults.iter().all(|kind| *kind == fault),
-                "{faults:?}"
-            );
-            let requests = fixture.requests().len();
+            let faults =
+                events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+            assert_eq!(faults, vec![fault.clone(); attempts - 1]);
+            let requests = fixture.requests().len() - 1;
             let unchanged = project_history(&records, agent) == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
             let kept_todos = todos.inspect_todos(agent, None).unwrap() == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);
-            assert_eq!(outcome, (4, true, 0, true), "{fault}");
+            assert_eq!(outcome, (attempts, true, 0, true), "{fault}");
             fixture.assert_no_tool_execution();
             fixture.session.shutdown().await.unwrap();
         }
@@ -480,18 +674,21 @@ mod tests {
                 set_root_turn(&fixture.session, Turn::Busy);
                 runtime.jobs.create(spec).await.unwrap().into_test_id();
             }
-            let cancellation = CancellationToken::new();
-            let compacted = retrying(&fixture.session, fixture.compact(&cancellation));
-            let error = compacted.await.unwrap_err();
+            let compacted = fixture.compact_for(CompactionTrigger::Overflow);
+            let Err(TurnError { error, record }) = retrying(&fixture.session, compacted).await
+            else {
+                panic!("compaction succeeded")
+            };
             let failed = matches!(
                 error,
                 HarnessError::Session(crate::session::SessionError::JournalFailed(_))
             );
             assert_eq!(failed, invariant, "{error}");
+            assert!(record.is_some(), "{error}");
             let records = fixture.records();
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
             let failed = count!(&records, SessionEvent::CompactionFailed { .. });
-            assert_eq!(failed, if invariant { 0 } else { 3 }, "{error}");
+            assert_eq!(failed, if invariant { 0 } else { 2 }, "{error}");
             let shutdown = fixture.session.shutdown().await;
             assert_eq!(shutdown.is_ok(), !invariant);
         }

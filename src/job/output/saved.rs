@@ -4,26 +4,6 @@ use super::*;
 /// Strings longer than this are offloaded from a saved document into captures.
 const OFFLOAD_BYTES: usize = 4 * 1024;
 
-/// The result field an output diagnostic renders into, where a producer's result
-/// type declares a `DiagnosticSlot`. Without an output diagnostic, user JSON of
-/// the same shape remains opaque.
-pub fn diagnostic_slot() -> FieldPointer {
-    FieldPointer::result().property("error").property("message")
-}
-
-/// A result's [`diagnostic_slot`] field, serialized as null: presentation renders
-/// the output diagnostic into it for each viewer's capabilities.
-#[derive(Serialize)]
-pub(crate) struct DiagnosticSlot;
-
-/// The diagnostic slot within a result value.
-pub(crate) fn diagnostic_slot_in(result: &mut Value) -> Option<&mut Value> {
-    diagnostic_slot()
-        .segments()
-        .skip(1)
-        .try_fold(result, |value, key| value.get_mut(key.as_str()))
-}
-
 pub(super) fn database(error: crate::session::DbError) -> ToolError {
     ToolError::io(std::io::Error::other(error))
 }
@@ -90,8 +70,6 @@ pub(crate) struct Saved {
     /// Pointers the product references.
     pub(super) fields: BTreeSet<FieldPointer>,
     pub(super) captures: BTreeMap<FieldPointer, CaptureRow>,
-    /// Slots holding a diagnostic rendered for the viewer, shown whole.
-    pub(super) diagnostic_fields: BTreeSet<FieldPointer>,
     /// Fields with a declared presentation, as saved with the result.
     pub(crate) presented: Presented,
 }
@@ -117,40 +95,12 @@ impl Saved {
             output: output.clone(),
             product,
             fields,
-            diagnostic_fields: BTreeSet::new(),
             presented,
             captures: captures
                 .into_iter()
                 .map(|capture| (capture.pointer.clone(), capture))
                 .collect(),
         })
-    }
-
-    /// Replace the registered presentation-owned slot before selection or paging.
-    /// No inference from tool names or traversal of user error objects.
-    pub(super) fn present_diagnostics(
-        &mut self,
-        output_diagnostic: Option<&crate::tool::diagnostic::Diagnostic>,
-        viewer: DiagnosticViewer<'_>,
-    ) -> Result<(), ToolError> {
-        let Some(diagnostic) = output_diagnostic else {
-            return Ok(());
-        };
-        let Some(mut product) = self.product.take() else {
-            return Ok(());
-        };
-        let field = diagnostic_slot();
-        let mut document = product.document();
-        if let Some(value) = document.pointer_mut(field.as_str()) {
-            *value = Value::String(diagnostic.render_for(viewer));
-            product.result = Some(document["result"].take());
-            self.fields.remove(&field);
-            self.captures
-                .retain(|pointer, _| pointer != &field && !pointer.contains(&field));
-            self.diagnostic_fields.insert(field);
-        }
-        self.product = Some(product);
-        Ok(())
     }
 
     /// Any registered capture at `field`, complete or not.
@@ -210,7 +160,6 @@ pub(super) fn prepare_document(
     output: &Output,
     registered: &BTreeMap<FieldPointer, CaptureRow>,
     (result, captures_complete): (Option<Value>, bool),
-    kinds: Vec<(i64, CaptureKind)>,
     stored: Stored<'_>,
 ) -> std::io::Result<OutputRows> {
     let has_result = result.is_some();
@@ -233,7 +182,6 @@ pub(super) fn prepare_document(
         run: output.run(),
         result,
         captures_complete,
-        kinds,
         fields,
         offloaded,
         presented: stored.presented,
@@ -394,34 +342,18 @@ pub(super) fn serialized_bytes(
 }
 
 /// Install referenced fields into the document.
-pub(super) fn hydrate(saved: &Saved, mut value: Value) -> Result<Value, ToolError> {
-    for field in &saved.fields {
-        hydrate_field(saved, &mut value, field)?;
-    }
-    Ok(value)
-}
-
-/// Replace a stored field's placeholder in `value` with the value its bytes hold.
-fn hydrate_field(saved: &Saved, value: &mut Value, field: &FieldPointer) -> Result<(), ToolError> {
-    let target = value
-        .pointer_mut(field.as_str())
-        .ok_or_else(|| ToolError::failed("invalid saved output field"))?;
-    let mut bytes = Vec::new();
-    saved
-        .stored(field)
-        .ok_or_else(|| ToolError::failed("saved output field is missing"))?
-        .read_to_end(&mut bytes)?;
-    *target = if target.is_string() {
-        Value::String(String::from_utf8_lossy(&bytes).into_owned())
-    } else {
-        serde_json::from_slice(&bytes)?
-    };
-    Ok(())
+pub(super) fn hydrate(saved: &Saved, value: Value) -> Result<Value, ToolError> {
+    let root = FieldPointer::root();
+    let text = render::json_text(saved, &root, &value, render::Reading::Whole)?;
+    Ok(serde_json::from_reader(BufReader::with_capacity(
+        IO_BUFFER_BYTES,
+        text,
+    ))?)
 }
 
 /// The bytes automatic presentation emits for this output, which notification
 /// batching budgets: the previewed result, its shape and its truncation records, or
-/// a page when it cannot be previewed. A rendered output diagnostic is not counted.
+/// a page when it cannot be previewed.
 pub(crate) fn presented_size(output: &Output) -> usize {
     let measure = || -> Result<usize, ToolError> {
         let saved = Saved::load(output)?;
@@ -676,22 +608,13 @@ mod tests {
             // A long string keeps its own capture, so its container stays inline.
             "details": {"log": "l".repeat(OFFLOAD_BYTES + 1), "lines": 1},
             "small": {"a": 1},
-            // So does the container of the slot presentation renders a diagnostic into.
-            "error": {"message": null, "paths": items},
         });
         manager
             .test_complete(id, ToolOutput::new(result.clone()))
             .await;
         let saved = Saved::load(&output).unwrap();
         let fields: Vec<_> = saved.fields.iter().map(FieldPointer::as_str).collect();
-        assert_eq!(
-            fields,
-            [
-                "/result/details/log",
-                "/result/error/paths",
-                "/result/items"
-            ]
-        );
+        assert_eq!(fields, ["/result/details/log", "/result/items"]);
         assert_eq!(
             saved.captures[&FieldPointer::result().property("items")].kind,
             CaptureKind::Json

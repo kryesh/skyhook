@@ -89,7 +89,8 @@ impl<'a> NativeItem<'a> {
     }
 }
 
-pub(super) fn final_parts(item: &Value, kind: ItemKind) -> Result<Vec<Content>, ProviderError> {
+/// The text parts of a message or reasoning item.
+pub(super) fn final_parts(item: &Value, kind: ItemKind) -> Result<Vec<String>, ProviderError> {
     match kind {
         ItemKind::Text if item.get("role").is_some_and(|role| role != "assistant") => {
             Err(NATIVE.error("output message role is not assistant"))
@@ -103,11 +104,11 @@ pub(super) fn final_parts(item: &Value, kind: ItemKind) -> Result<Vec<Content>, 
                     PartType::Refusal => NATIVE.string(part, "refusal"),
                     PartType::ReasoningText | PartType::SummaryText => return None,
                 };
-                Some(text.map(|text| Content::Text { text: text.into() }))
+                Some(text.map(str::to_owned))
             })
             .collect(),
         ItemKind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
-        ItemKind::ToolCall => Ok(vec![Content::ToolCall(function_call(item)?)]),
+        ItemKind::ToolCall => Err(NATIVE.error("a function call has no text parts")),
     }
 }
 
@@ -151,16 +152,12 @@ mod tests {
     #[test]
     fn completed_function_identity_is_nonempty_without_chat_name_rules() {
         let mut item = json!({"type":"function_call", "call_id":"call", "name":"vendor.tool/雪", "arguments":"{}"});
-        let parts = final_parts(&item, ItemKind::ToolCall).unwrap();
-        let Content::ToolCall(call) = &parts[0] else {
-            panic!("a tool call")
-        };
-        assert_eq!(call.name(), "vendor.tool/雪");
+        assert_eq!(function_call(&item).unwrap().name(), "vendor.tool/雪");
         for (id, name) in [("", "tool"), ("call", "")] {
             item["call_id"] = json!(id);
             item["name"] = json!(name);
             assert_eq!(
-                final_parts(&item, ItemKind::ToolCall).unwrap_err().kind(),
+                function_call(&item).unwrap_err().kind(),
                 ProviderErrorKind::Protocol
             );
         }
@@ -169,28 +166,20 @@ mod tests {
     #[test]
     fn function_arguments_require_a_json_object() {
         let mut item = json!({"type":"function_call", "call_id":"call", "name":"lookup"});
-        for args in ["not json", "[]", "1", "\"[]\""] {
-            item["arguments"] = json!(args);
-            assert_eq!(
-                final_parts(&item, ItemKind::ToolCall).unwrap_err().kind(),
-                ProviderErrorKind::Protocol
-            );
-        }
-        for args in [json!(""), json!("null"), Value::Null] {
-            item["arguments"] = args;
-            assert_eq!(
-                final_parts(&item, ItemKind::ToolCall).unwrap(),
-                vec![Content::ToolCall(
-                    ToolCall::new("call", "lookup", json!({})).unwrap()
-                )]
-            );
-        }
+        item["arguments"] = json!("[]");
+        assert_eq!(
+            function_call(&item).unwrap_err().kind(),
+            ProviderErrorKind::Protocol
+        );
+        item["arguments"] = Value::Null;
+        assert_eq!(
+            function_call(&item).unwrap(),
+            ToolCall::new("call", "lookup", json!({})).unwrap()
+        );
         item["arguments"] = json!(r#"{"query":"rust"}"#);
         assert_eq!(
-            final_parts(&item, ItemKind::ToolCall).unwrap(),
-            vec![Content::ToolCall(
-                ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
-            )]
+            function_call(&item).unwrap(),
+            ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
         );
     }
 }

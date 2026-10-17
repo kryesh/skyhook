@@ -623,6 +623,7 @@ fn split_answers(
 mod tests {
     use super::split_answers;
     use crate::agent::runtime::tests::*;
+    use crate::tool::executor::InvocationKind;
     use crate::{
         job::{JobEnvelope, JobSpec, JobState},
         tool::{ToolContext, ToolError, policy::Capability},
@@ -783,14 +784,11 @@ mod tests {
             let provider = Arc::new(HangingProvider);
             let (session, _, backgrounds) =
                 mode_session(root.path(), provider, "yes", background).await;
-            let (runtime, agent) = (&session.runtime, session.root.clone());
             let source = format!(
                 "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
             );
             let arguments = json!({"source": source, "bg": script_background});
-            let script = runtime
-                .executor
-                .execute_model(agent, "script", arguments, None);
+            let script = (session.runtime.executor).run_model(&session.root, "script", arguments);
             let script = bounded(script).await.unwrap();
             let output = terminal(&session, script.job).await.output.unwrap();
             for ask in output["value"].as_array().unwrap() {
@@ -891,7 +889,8 @@ mod tests {
         for (index, id) in ["first", "second", "second"].into_iter().enumerate() {
             let arguments = json!({"id":id, "prompt":"Question?", "bg":true});
             let child = session.root.child(1);
-            let result = executor.execute_model(child, "ask", arguments, Some(owner));
+            let result =
+                executor.execute_as(InvocationKind::Model, child, "ask", arguments, Some(owner));
             let result = result.await.unwrap();
             assert!(result.background);
             if index == 2 {

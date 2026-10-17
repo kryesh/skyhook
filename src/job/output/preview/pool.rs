@@ -21,7 +21,7 @@ use super::{
     protects,
 };
 use crate::job::output::{
-    CONTENT_BYTES, FieldPointer, ToolError,
+    CONTENT_BYTES, FieldPointer, ToolError, check_cancelled,
     json::saved_json,
     projection::Presented,
     render::Clipped,
@@ -72,86 +72,6 @@ pub(super) enum Node {
     },
 }
 
-impl Node {
-    /// A whole in-memory value at `field` for `accounting`, its presented fields
-    /// marked.
-    pub(super) fn of(
-        value: Value,
-        field: &FieldPointer,
-        presented: &Presented,
-        accounting: Accounting,
-    ) -> Self {
-        let mut marker = Marker {
-            presented,
-            accounting,
-            text_bytes: 0,
-        };
-        // Pointers are only needed to find presented fields.
-        marker.mark(value, (!presented.is_empty()).then(|| field.clone()), true)
-    }
-}
-
-/// How an in-memory value's nodes are classified, as a streamed one's are.
-struct Marker<'a> {
-    presented: &'a Presented,
-    accounting: Accounting,
-    /// Bytes of text fields so far, within `TEXT_ALLOWANCE`.
-    text_bytes: usize,
-}
-
-impl Marker<'_> {
-    fn mark(&mut self, value: Value, field: Option<FieldPointer>, record: bool) -> Node {
-        if field
-            .as_ref()
-            .is_some_and(|field| self.presented.complete().contains(field))
-        {
-            return Node::Complete(value);
-        }
-        let child = |make: &dyn Fn(&FieldPointer) -> FieldPointer| field.as_ref().map(make);
-        match value {
-            Value::String(text) => {
-                let keep = keep(self.presented, field.as_ref());
-                let mut text = Text {
-                    limit: text.len(),
-                    bytes: text.len(),
-                    newlines: text.bytes().filter(|&byte| byte == b'\n').count(),
-                    ends_line: text.ends_with('\n'),
-                    end: Vec::new(),
-                    prefix: text.into_bytes(),
-                    role: TextRole::Sample,
-                };
-                text.role = role(&mut self.text_bytes, self.accounting, record, keep, &text);
-                if text.role == TextRole::Field(Keep::Ends) {
-                    text.end = text.prefix[text.bytes.saturating_sub(TEXT_BYTES)..].to_vec();
-                }
-                Node::Text(text)
-            }
-            Value::Array(items) => Node::Array {
-                total: items.len(),
-                items: (items.into_iter().enumerate())
-                    .map(|(index, item)| {
-                        let field = child(&|field| field.index(index));
-                        (index, self.mark(item, field, false))
-                    })
-                    .collect(),
-            },
-            Value::Object(map) => {
-                let record = record && map.len() <= COLLECTION_MEMBERS;
-                Node::Object {
-                    total: map.len(),
-                    members: (map.into_iter().enumerate())
-                        .map(|(index, (key, value))| {
-                            let field = child(&|field| field.property(&key));
-                            (index, key, self.mark(value, field, record))
-                        })
-                        .collect(),
-                }
-            }
-            scalar => Node::Value(scalar),
-        }
-    }
-}
-
 /// Whether a string, reached only through record members when `record`, is a
 /// text field: previews give those their own limits outside the budget until
 /// they have used `TEXT_ALLOWANCE`, charging each its most shown bytes.
@@ -172,8 +92,8 @@ fn role(
 }
 
 /// Which lines the string at `field` keeps as a text field.
-fn keep(presented: &Presented, field: Option<&FieldPointer>) -> Keep {
-    if field.is_some_and(|field| presented.ends().contains(field)) {
+fn keep(presented: &Presented, field: &FieldPointer) -> Keep {
+    if presented.ends().contains(field) {
         Keep::Ends
     } else {
         Keep::Head
@@ -335,9 +255,7 @@ impl<R: Read> Walker<'_, R> {
         record: bool,
         place: Place,
     ) -> Result<(Shape, Node), ToolError> {
-        if self.cancellation.is_cancelled() {
-            return Err(ToolError::cancelled());
-        }
+        check_cancelled(self.cancellation)?;
         if self.presented.complete().contains(field) {
             let mut bytes = Vec::new();
             let mut writer = JsonStreamWriter::new(&mut bytes);
@@ -379,7 +297,7 @@ impl<R: Read> Walker<'_, R> {
                 let text_field = record
                     && self.accounting == Accounting::Preview
                     && self.text_bytes < TEXT_ALLOWANCE;
-                let keep = keep(self.presented, Some(field));
+                let keep = keep(self.presented, field);
                 let limit = if text_field { TEXT_BYTES } else { sample };
                 let mut text = self.text(limit, text_field && keep == Keep::Ends)?;
                 if let Some(clipped) = self.clipped.get(field) {
@@ -541,9 +459,7 @@ impl<R: Read> Walker<'_, R> {
 
     /// The shape of the next value, and how many members or elements it has.
     fn scan(&mut self) -> Result<(Shape, usize), ToolError> {
-        if self.cancellation.is_cancelled() {
-            return Err(ToolError::cancelled());
-        }
+        check_cancelled(self.cancellation)?;
         let mut total = 0;
         let shape = match self.reader.peek().map_err(saved_json)? {
             ValueType::Object => {
@@ -637,9 +553,7 @@ impl<R: Read> Walker<'_, R> {
         };
         let mut buffer = [0; 8 * 1024];
         loop {
-            if self.cancellation.is_cancelled() {
-                return Err(ToolError::cancelled());
-            }
+            check_cancelled(self.cancellation)?;
             let count = input.read(&mut buffer)?;
             let Some(last) = buffer[..count].last() else {
                 return Ok(text);

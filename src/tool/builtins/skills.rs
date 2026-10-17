@@ -580,16 +580,13 @@ enum SkillOutput {
     },
     Skill {
         /// The skill directory, for `read` and `write` sources.
-        #[schemars(with = "crate::target::TargetPath")]
         location: Option<crate::target::TargetPath>,
         /// The skill's instructions, never shortened.
         #[schemars(transform = crate::tool::output::complete)]
         content: String,
-        #[schemars(with = "String")]
         assets: Option<String>,
     },
     Directory {
-        #[schemars(with = "String")]
         assets: Option<String>,
     },
     Image {
@@ -673,19 +670,8 @@ mod tests {
             metadata,
             json!({"description": "summary", "extra": [16, {"two": null}], "other": "yes"})
         );
-        for yaml in [
-            "description: !custom value",
-            "extra: !custom value",
-            "extra: .nan",
-            "extra: {1: value}",
-            "extra: {[a, b]: value}",
-            "extra: {same: 1, same: 2}",
-            "extra: {<<: {merged: value}}",
-            "- text",
-        ] {
-            let error = parse_instructions(&format!("---\n{yaml}\n---\nBody")).unwrap_err();
-            assert!(error.starts_with("invalid YAML frontmatter:"), "{error}");
-        }
+        let error = parse_instructions("---\n- text\n---\nBody").unwrap_err();
+        assert!(error.starts_with("invalid YAML frontmatter:"), "{error}");
     }
 
     #[tokio::test]
@@ -779,38 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_requests_admit_operations_and_reject_blank_or_malformed_fields() {
-        let request = |value| {
-            serde_json::from_value::<SkillArgs>(value)
-                .map_err(AdmissionError::invalid_arguments)
-                .and_then(SkillRequest::try_from)
-        };
-        assert!(matches!(request(json!({})).unwrap(), SkillRequest::List));
-        assert!(matches!(
-            request(json!({"name":"demo","path":null})).unwrap(),
-            SkillRequest::Instructions { name } if name == "demo"
-        ));
-        // Nothing is trimmed: spaces may be meaningful filename bytes.
-        assert!(matches!(
-            request(json!({"name":" demo ","path":" asset "})).unwrap(),
-            SkillRequest::Inspect { name, asset } if name == " demo " && asset == " asset "
-        ));
-        for value in [
-            json!({"path":"."}),
-            json!({"name":1}),
-            json!({"name":" \t\n"}),
-            json!({"name":"demo","path":" "}),
-            json!({"name":"demo","path":"file","to":"copy"}),
-        ] {
-            let result = request(value.clone());
-            assert!(
-                matches!(result, Err(error) if matches!(error.diagnostic().cause, Cause::InvalidArguments(_))),
-                "{value}"
-            );
-        }
-    }
-
-    #[test]
     fn asset_syntax_is_confined_without_normalizing_spelling() {
         for value in [
             "",
@@ -853,10 +807,10 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_requests_never_authorize_and_assets_stay_confined() {
-        use crate::tool::policy::{AuthorizationRequest, Policy, PolicyFuture};
+        use crate::tool::policy::{Approval, AuthorizationRequest, Policy};
         struct UnexpectedAuthorization;
         impl Policy for UnexpectedAuthorization {
-            fn authorize(&self, _: AuthorizationRequest) -> PolicyFuture<'_> {
+            fn authorize(&self, _: AuthorizationRequest) -> Approval<'_> {
                 panic!("malformed skill arguments must not request authorization");
             }
         }
@@ -870,6 +824,8 @@ mod tests {
         for args in [
             json!({"path":"."}),
             json!({"name":""}),
+            json!({"name":1}),
+            json!({"name":" \t\n"}),
             json!({"name":"mixed-assets", "path":""}),
             json!({"name":"mixed-assets", "path":"references/note.txt", "to":"copied"}),
         ] {
@@ -891,7 +847,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_discovery_does_not_allow_asset_escape() {
         use std::os::unix::fs::symlink;

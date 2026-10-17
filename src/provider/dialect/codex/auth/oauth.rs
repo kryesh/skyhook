@@ -3,17 +3,13 @@ use super::super::BodyError;
 use super::store::{Stored, store_fingerprint};
 use super::{AccountId, AuthManager, Issuer, Token, now, random_string};
 use crate::provider::{
-    ProviderError,
+    ProviderError, ProviderErrorKind,
     ProviderErrorKind::{Authentication, Timeout, Transport},
     codec::common::{lenient, lenient_count},
-    http::{
-        errors::{ErrorSignals, Reading},
-        transport::retry_after,
-    },
+    http::transport::retry_after,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -345,10 +341,12 @@ async fn response_json<T: serde::de::DeserializeOwned>(
         // descriptions: these can echo credentials and authorization codes.
         let status = response.status().as_u16();
         let retry_after = retry_after(response.headers(), std::time::SystemTime::now());
-        let read =
-            Reading::default().kind(Some(status), &Value::Null, ErrorSignals::NONE, retry_after);
         // OAuth refuses a grant or client with 400.
-        let kind = if status == 400 { Authentication } else { read };
+        let kind = if status == 400 {
+            Authentication
+        } else {
+            ProviderErrorKind::of_status(status)
+        };
         let message = match (kind, status) {
             (Authentication, _) => {
                 "Codex authorization was rejected; log in again (device auth may need enabling in ChatGPT settings)"
@@ -448,36 +446,29 @@ fn parse_callback(request: &str, state: &str) -> Result<Zeroizing<String>, Provi
 }
 
 async fn launch_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = Some(("open", vec![url]));
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let command = Some(("xdg-open", vec![url]));
-    #[cfg(not(unix))]
-    let command: Option<(&str, Vec<&str>)> = None;
-    if let Some((program, args)) = command {
-        // No shell interpolation, no inherited output, no un-reaped background
-        // process. Failure is harmless: the URL was printed for manual opening.
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let _ = tokio::time::timeout(BROWSER_TIMEOUT, command.status()).await;
-    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    // No shell interpolation, no inherited output, no un-reaped background
+    // process. Failure is harmless: the URL was printed for manual opening.
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let _ = tokio::time::timeout(BROWSER_TIMEOUT, command.status()).await;
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) mod tests {
     use super::super::manager_at;
     use super::super::store::tests::stored;
     use super::*;
-    use crate::provider::http::transport::tests::read_request as read_http_request;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use crate::provider::http::transport::tests::{Plan, Server, reply};
 
     fn jwt(expiry: u64) -> String {
         format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
@@ -489,30 +480,15 @@ pub(super) mod tests {
         serde_json::json!({"access_token":jwt(now().unwrap()+3600),"refresh_token":"rotated-refresh","expires_in":3600})
     }
 
-    /// A loopback-only HTTP mock; joins are always awaited by callers.
+    /// A loopback issuer answering `replies` in order.
     pub(in crate::provider::dialect::codex) async fn mock(
         replies: Vec<(u16, serde_json::Value)>,
-    ) -> (
-        String,
-        Arc<AtomicUsize>,
-        tokio::task::JoinHandle<Vec<String>>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let count = Arc::new(AtomicUsize::new(0));
-        let calls = count.clone();
-        let task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in replies {
-                let (mut stream, _) = crate::tests::bounded(listener.accept()).await.unwrap();
-                requests.push(read_http_request(&mut stream).await);
-                calls.fetch_add(1, Ordering::SeqCst);
-                let body = body.to_string();
-                stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (url, count, task)
+    ) -> Server {
+        let json = "Content-Type: application/json\r\n";
+        let reply = |(status, body): (u16, serde_json::Value)| {
+            Plan::reply(reply(&format!("{status} Test"), json, &body.to_string()))
+        };
+        Server::start(replies.into_iter().map(reply).collect()).await
     }
 
     #[test]
@@ -558,14 +534,14 @@ pub(super) mod tests {
     #[tokio::test]
     async fn headless_login_polls_pending_codes_exchanges_pkce_and_persists_credentials() {
         let temp = tempfile::tempdir().unwrap();
-        let (url, count, server) = mock(vec![
+        let server = mock(vec![
             (200, serde_json::json!({"device_auth_id":"device-123","usercode":"ABCD-123","interval":"0"})),
             (403, serde_json::json!({})),
             (404, serde_json::json!({})),
             (200, serde_json::json!({"authorization_code":"issued-code","code_verifier":"issued-verifier","code_challenge":"unused"})),
             (200, token_body()),
         ]).await;
-        let manager = manager_at(temp.path(), &Issuer::parse(&url).unwrap());
+        let manager = manager_at(temp.path(), &Issuer::parse(&server.root()).unwrap());
         let paced = std::sync::Mutex::new(Vec::new());
         let pace = |interval| {
             paced.lock().unwrap().push(interval);
@@ -575,8 +551,8 @@ pub(super) mod tests {
         // Each pending code waits the issuer's interval, raised to the minimum.
         let minimum = Duration::from_secs(MIN_POLL_SECS);
         assert_eq!(*paced.lock().unwrap(), [minimum, minimum]);
-        assert_eq!(count.load(Ordering::SeqCst), 5);
-        let requests = server.await.unwrap();
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 5);
         assert!(requests[0].starts_with("POST /api/accounts/deviceauth/usercode "));
         assert!(requests[0].contains(CLIENT_ID));
         for request in &requests[1..4] {

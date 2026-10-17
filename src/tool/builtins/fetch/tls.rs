@@ -1,57 +1,37 @@
-//! Per-call HTTP client configuration, system DNS, and opt-in insecure TLS.
+//! Per-call HTTP client configuration and opt-in insecure TLS.
 
 use reqwest::Client;
 
-use super::diagnostics::{DnsFailure, FetchDiagnostic, FetchError, FetchPhase};
+use super::LocalError;
 use super::validation::ClientSettings;
 
-/// Same system lookup as reqwest's default resolver, with a typed failure marker.
-/// There is no additional lookup or preflight connection.
-#[derive(Debug)]
-struct FetchResolver;
-impl reqwest::dns::Resolve for FetchResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        Box::pin(async move {
-            let addresses = tokio::net::lookup_host((name.as_str(), 0))
-                .await
-                .map_err(|error| {
-                    Box::new(DnsFailure::new(error)) as Box<dyn std::error::Error + Send + Sync>
-                })?
-                .collect::<Vec<_>>();
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-pub(super) fn client(settings: &ClientSettings) -> Result<Client, FetchError> {
+pub(super) fn client(settings: &ClientSettings) -> Result<Client, LocalError> {
     let mut builder = Client::builder()
         .user_agent(concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
-        .dns_resolver(std::sync::Arc::new(FetchResolver))
         // The tool's outer deadline is the only total limit: an equal client
         // timeout would race it and could report the timeout without its limit.
         .connect_timeout(settings.connect_timeout)
         .danger_accept_invalid_certs(settings.insecure);
-    // Proxy admission belongs here (before any send), preserving the existing
-    // client-preparation diagnostic and permission-order contract. Proxy schemes
-    // and URL credentials intentionally differ from HttpRequestUrl admission.
+    // Proxy schemes and URL credentials intentionally differ from HttpRequestUrl admission.
     if let Some(proxy) = &settings.proxy {
-        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| {
-            FetchDiagnostic::from_reqwest(&error, FetchPhase::ClientPreparation)
-        })?);
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|_| LocalError::invalid_arguments("invalid proxy URL"))?,
+        );
     }
-    builder.build().map_err(|error| {
-        FetchDiagnostic::from_reqwest(&error, FetchPhase::ClientPreparation).into()
-    })
+    builder
+        .build()
+        .map_err(|_| LocalError::failed("the HTTP client could not be built"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::super::tests::{executor, fetch, server};
-    use crate::provider::http::transport::tests::{read_request, reply};
+    use super::super::tests::executor;
+    use crate::provider::http::transport::tests::read_request;
     use rcgen::generate_simple_self_signed;
     use serde_json::json;
     use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
@@ -135,38 +115,17 @@ mod tests {
                 assert_eq!(output["result"]["body"]["text"], "tls-ok", "{output:#}");
             } else {
                 assert_eq!(output["state"], "failed", "{output:#}");
+                assert!(
+                    output["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("TLS handshake failed"),
+                    "{output:#}"
+                );
             }
         }
         let (rejected, requests) = bounded(&mut server.0).await.unwrap();
         assert_eq!((rejected, requests.len()), (4, 1), "{requests:#?}");
         assert!(requests[0].starts_with("GET /tls HTTP/1.1\r\n"));
-    }
-
-    #[tokio::test]
-    async fn default_user_agent_can_be_overridden() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = executor(&runtime);
-        let (url, task) = server(vec![reply("200 OK", "", ""); 3]).await;
-        let default = concat!("Skyhook/", env!("CARGO_PKG_VERSION"));
-        let cases = [
-            (json!({}), default),
-            (json!({"User-Agent":"CustomClient/2"}), "CustomClient/2"),
-            (json!({}), default),
-        ];
-        for (headers, _) in &cases {
-            fetch(&runtime, &executor, json!({"url":url,"headers":headers}))
-                .await
-                .unwrap();
-        }
-        for (request, (_, expected)) in task.finish().await.iter().zip(cases) {
-            let head = request.split("\r\n\r\n").next().unwrap();
-            let values: Vec<_> = head
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-                .map(|(_, value)| value.trim())
-                .collect();
-            assert_eq!(values, vec![expected]);
-        }
     }
 }

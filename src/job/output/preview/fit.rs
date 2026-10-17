@@ -119,7 +119,7 @@ pub(super) fn shallower(depth: usize) -> Fit {
 mod tests {
     use super::super::{Accounting, Pooled, pool::pool};
     use super::*;
-    use crate::job::output::{FieldPointer, projection::Presented, render::Clipped, shape::Shape};
+    use crate::job::output::{FieldPointer, projection::Presented, render::Clipped};
     use crate::tool::output::FieldPresentation;
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
@@ -163,29 +163,25 @@ mod tests {
             .collect()
     }
 
-    fn both_paths(value: &Value, complete: &BTreeSet<FieldPointer>) {
-        let field = FieldPointer::result();
+    fn pooled(value: &Value, presented: &Presented, accounting: Accounting) -> Pooled {
         let bytes = serde_json::to_vec(value).unwrap();
+        let mut reader = crate::job::output::json::reader(bytes.as_slice());
+        let (field, clipped) = (FieldPointer::result(), Clipped::new());
+        pool(
+            &mut reader,
+            &field,
+            presented,
+            &clipped,
+            &Default::default(),
+            accounting,
+        )
+        .unwrap()
+    }
+
+    fn check(value: &Value, complete: &BTreeSet<FieldPointer>) {
         let presented = complete_fields(complete);
         for accounting in [Accounting::Preview, Accounting::Page] {
-            let memory = Pooled::new(
-                Shape::of(value),
-                Node::of(value.clone(), &field, &presented, accounting),
-                true,
-                accounting,
-            );
-            assert_equivalent(&memory, complete);
-            let mut reader = crate::job::output::json::reader(bytes.as_slice());
-            let streamed = pool(
-                &mut reader,
-                &field,
-                &presented,
-                &Clipped::new(),
-                &Default::default(),
-                accounting,
-            )
-            .unwrap();
-            assert_equivalent(&streamed, complete);
+            assert_equivalent(&pooled(value, &presented, accounting), complete);
         }
     }
 
@@ -199,7 +195,7 @@ mod tests {
                 .map(|index| (format!("key{index:03}"), value.clone()))
                 .collect()
         };
-        both_paths(
+        check(
             &json!({"members": collection(&json!("v".repeat(40)))}),
             &BTreeSet::new(),
         );
@@ -217,7 +213,7 @@ mod tests {
                 "field": "field\r\n".repeat(40),
                 "complete": {"answer": "complete\r\n".repeat(40)},
             });
-            both_paths(&value, &complete);
+            check(&value, &complete);
         }
         let inner: serde_json::Map<_, _> = (0..12)
             .map(|index| (format!("inner{index}"), json!(index)))
@@ -225,7 +221,7 @@ mod tests {
         let record: serde_json::Map<_, _> = (0..12)
             .map(|index| (format!("outer{index}"), json!(inner)))
             .collect();
-        both_paths(&json!({"items": [record]}), &BTreeSet::new());
+        check(&json!({"items": [record]}), &BTreeSet::new());
 
         let record = json!({"answer": "complete".repeat(40), "id": 1});
         for (key, contents, protected) in [
@@ -239,14 +235,8 @@ mod tests {
                 .property("answer")]
             .into_iter()
             .collect();
-            let presented = complete_fields(&complete);
-            let mut node = Node::of(
-                value.clone(),
-                &FieldPointer::result(),
-                &presented,
-                Accounting::Preview,
-            );
-            let Node::Object { members, .. } = &mut node else {
+            let mut pooled = pooled(&value, &complete_fields(&complete), Accounting::Preview);
+            let Node::Object { members, .. } = &mut pooled.node else {
                 unreachable!()
             };
             // Keep an unprotected late sample and a still later complete field;
@@ -262,12 +252,13 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let pooled = Pooled::new(Shape::of(&value), node, false, Accounting::Preview);
+            pooled.covered = false;
             assert_equivalent(&pooled, &complete);
         }
 
         let [.., limit] = SAMPLE_TEXT_BYTES;
-        let mut pooled = Pooled::of(json!("x".repeat(limit + 1)));
+        let value = json!("x".repeat(limit + 1));
+        let mut pooled = pooled(&value, &Presented::default(), Accounting::Page);
         let Node::Text(text) = &mut pooled.node else {
             unreachable!()
         };

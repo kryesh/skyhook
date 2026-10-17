@@ -6,34 +6,12 @@ use chrono::{Local, NaiveDate};
 use skyhook::provider::protocol::Usage;
 use skyhook::session::{ModelPurpose, RequestPhase, RequestRecord, RequestSeq};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestStatus {
-    Failed,
-    Running,
-    Retrying,
-    Completed,
-    Interrupted,
-}
-
-impl RequestStatus {
-    /// Explicit UI text; variant names never leak into rendered rows.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Failed => "Failed",
-            Self::Running => "Running",
-            Self::Retrying => "Retrying",
-            Self::Completed => "Completed",
-            Self::Interrupted => "Interrupted",
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct RequestRow {
     pub sequence: RequestSeq,
     pub purpose: ModelPurpose,
     pub model: String,
-    pub status: RequestStatus,
+    pub phase: RequestPhase,
     pub usage: Usage,
     /// When the request was sent, on the local clock.
     pub sent: String,
@@ -51,7 +29,14 @@ impl RequestRow {
             }
             .into(),
             self.model.clone(),
-            self.status.label().into(),
+            match self.phase {
+                RequestPhase::Requested | RequestPhase::Open { .. } => "Running",
+                RequestPhase::Retrying { .. } => "Retrying",
+                RequestPhase::Failed { .. } => "Failed",
+                RequestPhase::Interrupted { .. } => "Interrupted",
+                RequestPhase::Completed { .. } => "Completed",
+            }
+            .into(),
         ]
     }
 
@@ -75,7 +60,7 @@ pub(super) fn request_entry(
         sequence,
         purpose: record.purpose,
         model: clean(record.profile.profile.model.as_str()).replace('\n', " "),
-        status: request_status(&record.phase),
+        phase: record.phase.clone(),
         usage: record.usage,
         sent: local_time(record.requested_millis, today, &Local, Precision::Seconds),
         timing: request_timing(record),
@@ -91,15 +76,5 @@ pub(super) fn request_timing(record: &RequestRecord) -> Timing {
             until,
         },
         None => Timing::Since(start),
-    }
-}
-
-fn request_status(phase: &RequestPhase) -> RequestStatus {
-    match phase {
-        RequestPhase::Requested | RequestPhase::Open { .. } => RequestStatus::Running,
-        RequestPhase::Retrying { .. } => RequestStatus::Retrying,
-        RequestPhase::Failed { .. } => RequestStatus::Failed,
-        RequestPhase::Interrupted { .. } => RequestStatus::Interrupted,
-        RequestPhase::Completed { .. } => RequestStatus::Completed,
     }
 }

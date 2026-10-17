@@ -256,11 +256,18 @@ pub trait TextField {
     }
 }
 
-/// Owns every allocation containing editor text, including history snapshots.
+/// Text whose every allocation, including those retired by growth, is wiped.
 /// There is no `DerefMut`: mutation never lets String retire an unwiped
-/// allocation. This covers owned buffers, not caller, allocator, or terminal copies.
-#[derive(Clone, Default)]
-struct SensitiveText(String);
+/// allocation. This covers its own buffers, not copies callers make from them
+/// (layout, expansion, sending), the allocator's, or the terminal's.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(super) struct SensitiveText(String);
+
+impl From<String> for SensitiveText {
+    fn from(text: String) -> Self {
+        Self(text)
+    }
+}
 
 impl std::ops::Deref for SensitiveText {
     type Target = str;
@@ -270,7 +277,7 @@ impl std::ops::Deref for SensitiveText {
 }
 
 impl SensitiveText {
-    fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> bool {
+    pub(super) fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> bool {
         if &self.0[range.clone()] == replacement {
             return false;
         }
@@ -346,7 +353,7 @@ impl Editor {
         self.anchor = None;
     }
     pub fn set(&mut self, text: String) {
-        self.text = SensitiveText(text);
+        self.text = text.into();
         self.cursor = self.text.len();
         self.anchor = None;
     }

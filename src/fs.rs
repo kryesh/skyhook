@@ -24,7 +24,6 @@ pub enum RegularFileError {
 pub(crate) fn open_regular_blocking(path: &Path, limit: u64) -> Result<fs::File, RegularFileError> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
     let file = options.open(path)?;
     admit_regular(&file, limit)?;
@@ -172,7 +171,6 @@ impl StagedFile {
         };
         let mut staging = tempfile::Builder::new();
         staging.prefix(".skyhook-").suffix(".tmp");
-        #[cfg(unix)]
         staging.permissions(std::os::unix::fs::PermissionsExt::from_mode(match policy {
             PermissionPolicy::Inherit => 0o666,
             PermissionPolicy::Private => 0o600,
@@ -340,18 +338,15 @@ mod tests {
             read_regular(root.path(), u64::MAX).await,
             Err(RegularFileError::NotRegular)
         ));
-        #[cfg(unix)]
-        {
-            let fifo = root.path().join("fifo");
-            let status = std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap();
-            assert!(status.success());
-            // Opening a FIFO without a writer would block without O_NONBLOCK.
-            let read = crate::tests::bounded(read_regular(&fifo, u64::MAX));
-            assert!(matches!(read.await, Err(RegularFileError::NotRegular)));
-        }
+        let fifo = root.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Opening a FIFO without a writer would block without O_NONBLOCK.
+        let read = crate::tests::bounded(read_regular(&fifo, u64::MAX));
+        assert!(matches!(read.await, Err(RegularFileError::NotRegular)));
     }
 
     #[test]
@@ -427,7 +422,6 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn inherit_keeps_existing_permissions_or_uses_the_umask_and_private_resets_them() {
         use std::os::unix::fs::PermissionsExt as _;

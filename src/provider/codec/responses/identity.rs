@@ -1,7 +1,7 @@
 //! Output-item identity across the `added`, `done` and terminal restatements
 //! of an item: stable native IDs first, wire indices where given, and aliases
 //! only on unique semantic evidence.
-use super::native::NativeItem;
+use super::native::{self, NativeItem};
 use super::*;
 
 impl Decoder {
@@ -68,53 +68,43 @@ impl Decoder {
             {
                 return false;
             }
+            return Self::equivalent_call(state, native);
         }
         let Ok(parts) = final_parts(native, header.kind) else {
             return false;
         };
-        if let ItemBody::Function(state) = &item.body
-            && let FunctionPhase::Completed { call, .. } = &state.phase
-        {
-            return parts.as_slice() == [Content::ToolCall(call.clone())];
-        }
         if let Some(old) = item.snapshot() {
             return final_parts(old, item.kind()).ok().as_ref() == Some(&parts);
-        }
-        if let ItemBody::Function(state) = &item.body {
-            let Ok(streaming) = state.streaming() else {
-                return false;
-            };
-            let observed = match &streaming.final_arguments {
-                Some(FinalArguments::Object(arguments)) => Some(arguments.clone()),
-                Some(FinalArguments::Incomplete(text)) => arguments(text).ok(),
-                None => state
-                    .part
-                    .as_ref()
-                    .and_then(|part| arguments(part.streamed()).ok()),
-            };
-            return observed.is_some() && observed == super::native::item_arguments(native).ok();
         }
         if item.parts().next().is_none() {
             return false;
         }
         let observed: Vec<_> = item
             .parts()
-            .map(|(_, part)| part)
-            .map(|part| {
-                part.ended().cloned().unwrap_or_else(|| {
-                    if item.kind() == ItemKind::Reasoning {
-                        Content::Reasoning {
-                            text: part.streamed().to_owned(),
-                        }
-                    } else {
-                        Content::Text {
-                            text: part.streamed().to_owned(),
-                        }
-                    }
-                })
-            })
+            .map(|(_, part)| part.ended().unwrap_or(part.streamed()))
             .collect();
         observed == parts
+    }
+
+    /// A function's final item matches its completed call, or its arguments
+    /// as received so far.
+    fn equivalent_call(state: &FunctionState, native: &Value) -> bool {
+        let Ok(call) = native::function_call(native) else {
+            return false;
+        };
+        match &state.phase {
+            FunctionPhase::Completed { call: old, .. } => old == &call,
+            FunctionPhase::Provisional(old) => native::function_call(old).ok() == Some(call),
+            FunctionPhase::Streaming(streaming) => {
+                let observed = match &streaming.final_arguments {
+                    Some(FinalArguments::Object(arguments)) => Some(arguments.clone()),
+                    Some(FinalArguments::Incomplete(text)) => arguments(text).ok(),
+                    None if !streaming.streamed.is_empty() => arguments(&streaming.streamed).ok(),
+                    None => None,
+                };
+                observed.as_ref() == Some(call.arguments())
+            }
+        }
     }
 
     pub(super) fn snapshot_index(
@@ -148,7 +138,7 @@ impl Decoder {
             return Ok(id);
         }
         let id = self.vacant_index(wire_index)?;
-        self.start(id, wire_index, native)?;
+        self.start_item(id, wire_index, native.id, native.kind, Some(native.raw))?;
         Ok(id)
     }
 }
@@ -218,6 +208,20 @@ mod tests {
                 ],
                 vec![("first", None, "hello"), ("second", None, "world")],
             ),
+            // An unbound item takes local position 0; a later wire index 0 names
+            // a different item, which takes the next local position.
+            (
+                vec![
+                    unindexed_added(message("first", "")),
+                    added(0, message("second", "")),
+                    json!({"type":"response.output_text.delta","output_index":0,"item_id":"second","delta":"world"}),
+                    delta("first", "hello"),
+                    unindexed_done(message("first", "hello")),
+                    done(0, message("second", "world")),
+                    completed(vec![message("first", "hello"), message("second", "world")]),
+                ],
+                vec![("first", Some(0), "hello"), ("second", Some(1), "world")],
+            ),
             // Equal terminal-only, done-only (with or without indices) and
             // unchanged streamed items remain distinct.
             (
@@ -255,15 +259,7 @@ mod tests {
                 vec![
                     added(0, retained.clone()),
                     done(0, retained.clone()),
-                    completed(vec![fresh.clone(), retained.clone()]),
-                ],
-                vec![("retained", None, "same"), ("fresh", None, "same")],
-            ),
-            (
-                vec![
-                    added(0, retained.clone()),
-                    done(0, retained.clone()),
-                    completed(vec![retained, fresh]),
+                    completed(vec![fresh, retained]),
                 ],
                 vec![("retained", None, "same"), ("fresh", None, "same")],
             ),

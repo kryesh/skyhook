@@ -8,7 +8,6 @@ use crate::provider::{
     dialect::{AuthStatus, LoginReason, LoginRequired},
     profile::ProviderName,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -215,23 +214,22 @@ fn lock(files: &Files) -> Result<File, ProviderError> {
         .map_err(|_| Authentication.error("Cannot open Skyhook Codex credential lock"))?;
     let start = std::time::Instant::now();
     loop {
-        match lock.try_lock_exclusive() {
+        match lock.try_lock() {
             Ok(()) => return Ok(lock),
-            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+            Err(fs::TryLockError::Error(_)) => {
                 return Err(Authentication.error("Cannot lock Skyhook Codex credentials"));
             }
-            Err(_) if start.elapsed() >= LOCK_TIMEOUT => {
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() >= LOCK_TIMEOUT => {
                 let unavailable = Unavailable;
                 return Err(
                     unavailable.error("Cannot acquire Skyhook Codex credential lock; try again")
                 );
             }
-            Err(_) => std::thread::sleep(LOCK_POLL),
+            Err(fs::TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
         }
     }
 }
 
-#[cfg(unix)]
 fn create_directory(directory: &Path) -> Result<(), ProviderError> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
@@ -243,7 +241,6 @@ fn create_directory(directory: &Path) -> Result<(), ProviderError> {
 }
 
 /// Whether the credential directory exists; it must be private to its owner.
-#[cfg(unix)]
 fn private_directory(directory: &Path) -> Result<bool, ProviderError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = match fs::symlink_metadata(directory) {
@@ -265,43 +262,21 @@ fn private_directory(directory: &Path) -> Result<bool, ProviderError> {
     Ok(true)
 }
 
-// Do not pretend Unix mode bits provide a private ACL on another OS.
-#[cfg(not(unix))]
-fn create_directory(_directory: &Path) -> Result<(), ProviderError> {
-    Err(unsupported())
-}
-#[cfg(not(unix))]
-fn private_directory(_directory: &Path) -> Result<bool, ProviderError> {
-    Err(unsupported())
-}
-#[cfg(not(unix))]
-fn unsupported() -> ProviderError {
-    Authentication
-        .error("Private Skyhook Codex credential storage is currently supported on Unix only")
-}
-
 fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = OpenOptions::new();
     options.read(true).write(create).create(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    }
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path)?;
     let metadata = crate::fs::admit_regular(&file, u64::MAX)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
-    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
     {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-            || metadata.nlink() != 1
-        {
-            return Err(std::io::ErrorKind::PermissionDenied.into());
-        }
+        return Err(std::io::ErrorKind::PermissionDenied.into());
     }
     Ok(file)
 }
@@ -374,7 +349,7 @@ pub(super) fn store_fingerprint(stored: &Stored) -> Vec<u8> {
     hash.finalize().to_vec()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) mod tests {
     use super::super::{login_command, manager_at, now};
     use super::*;

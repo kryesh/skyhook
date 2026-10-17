@@ -13,7 +13,7 @@ use crate::newtype::string_newtype;
 pub use config::{SshAuth, SshOptions, TargetAuth, TargetConfig, TargetsConfig, Transport};
 pub(crate) use registry::{Revisions, TargetRegistry, replaces};
 pub use registry::{TargetDefinition, TargetEdge, TargetError, TargetField, TargetSource};
-pub(crate) use router::{ResolvedRoute, Route, RouteIdentity, TargetRouter, select_location};
+pub(crate) use router::{Route, TargetRouter, select_location};
 
 pub(crate) const MAX_TARGET_NAME_BYTES: usize = 128;
 
@@ -94,7 +94,6 @@ impl TargetRef {
         })
     }
 
-    #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             Self::Root => Self::ROOT,
@@ -102,7 +101,6 @@ impl TargetRef {
         }
     }
 
-    #[must_use]
     pub fn name(&self) -> Option<&TargetName> {
         match self {
             Self::Root => None,

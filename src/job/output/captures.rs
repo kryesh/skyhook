@@ -17,21 +17,10 @@ pub use crate::tool::output::CaptureKind;
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct CaptureDescriptor {
-    pub(crate) field: FieldPointer,
+    pub field: FieldPointer,
     pub(crate) complete: bool,
-    #[schemars(with = "crate::job::JobView")]
-    pub(crate) output: Option<Box<crate::job::JobView>>,
-}
-
-impl CaptureDescriptor {
-    pub fn field(&self) -> &FieldPointer {
-        &self.field
-    }
-
     /// The capture's page, when the host hydrated one.
-    pub fn output(&self) -> Option<&crate::job::JobView> {
-        self.output.as_deref()
-    }
+    pub output: Option<Box<crate::job::JobView>>,
 }
 
 pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDescriptor> {

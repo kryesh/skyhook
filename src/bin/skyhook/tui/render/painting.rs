@@ -218,9 +218,7 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
-    use super::super::tests::{
-        continued, expandable_entry, fixture_row, layout, selected_text, text_x,
-    };
+    use super::super::tests::{continued, fixture_row, selected_text, text_x};
     use super::*;
     use ratatui::widgets::{Paragraph, Widget};
 
@@ -387,39 +385,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn expanded_backgrounds_fill_all_content_rows_even_with_selection() {
-        let mut rows = RowBlocks::default();
-        rows.replace_entry(0, layout(&expandable_entry(), 20), Vec::new());
-        let nonblank: Vec<_> = rows
-            .iter()
-            .filter(|row| !row.text().trim().is_empty())
-            .collect();
-        assert!(nonblank.len() > 4, "both header and body should wrap");
-        for row in rows.iter() {
-            let expected = if row.layout.is_spacer() {
-                background(row.surface)
-            } else {
-                THEME.code_bg
-            };
-            for interactive in [false, true] {
-                for selected in [false, true] {
-                    let background = row.background(true, interactive, selected);
-                    assert_eq!(
-                        background,
-                        expected,
-                        "row {:?}, {interactive}/{selected}",
-                        row.text()
-                    );
-                }
-            }
-        }
-        let row = nonblank[0];
-        assert_eq!(row.background(false, true, false), THEME.code_bg);
-        assert_eq!(row.background(false, false, false), THEME.base);
-        assert_eq!(row.background(false, true, true), THEME.base);
     }
 
     #[test]

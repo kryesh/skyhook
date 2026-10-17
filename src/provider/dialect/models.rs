@@ -1,28 +1,40 @@
 //! Flat model declarations. Partial settings retain inheritance until admission.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
-use super::{ModelError, Placements};
-use crate::provider::{
-    codec::{Codec, CodecName, CyberAccessProgram, ServiceTier, responses::Cache},
-    profile::ModelProfile,
-    settings::Patch,
+use super::{ModelError, Placements, Profile};
+use crate::{
+    newtype::{Blank, nonblank, string_newtype},
+    provider::{
+        codec::{Cache, Codec, CodecName, CyberAccessProgram, ReasoningSummary, path},
+        profile::ModelProfile,
+        settings::{Nullable, Patch},
+    },
 };
+
+string_newtype! {
+    /// A service tier's wire ID. Catalogs may advertise tiers unknown to this client.
+    pub struct ServiceTier(Blank) = |value| nonblank("service_tier", value);
+}
 
 crate::provider::settings::settings! {
     /// The request settings every dialect shares.
     pub struct Request => RequestPatch {
         @flatten { pub placements: Placements }
         pub codec: CodecName => required,
-        /// Responses only. The wire tier ID, sent without client aliases.
+        /// The wire tier ID, sent without client aliases.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub service_tier: Option<ServiceTier> => default,
+        /// Responses only: the summary detail requested in place of the dialect's
+        /// default; null requests none.
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub reasoning_summary: Nullable<ReasoningSummary> => default,
         /// Responses only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access_programs: Option<AccessPrograms> => object(AccessPrograms),
-        /// Responses only. Mark stable-prefix checkpoints instead of leaving caching to
-        /// the backend.
+        /// Chat and Responses: cache only at marked stable-prefix breakpoints instead of
+        /// leaving placement to the backend.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub explicit_caching: Option<bool> => default,
     }
@@ -40,39 +52,43 @@ crate::named_enum::named_enum! {
     /// A setting only the Responses codec can send.
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum ResponseSetting {
-        ServiceTier = "service_tier",
+        ReasoningSummary = "reasoning_summary",
         AccessPrograms = "access_programs",
-        ExplicitCaching = "explicit_caching",
     }
 }
 
 impl Request {
-    /// The codec with the shared selections applied, or the first one it cannot send.
-    pub(crate) fn apply(&self, codec: Codec) -> Result<Codec, ModelError> {
-        let mut codec = self.placements.apply(codec)?;
+    /// The wire conventions with the shared selections applied, or the first one
+    /// the codec cannot send.
+    pub(crate) fn apply(&self, mut wire: Profile) -> Result<Profile, ModelError> {
+        wire.codec = self.placements.apply(wire.codec)?;
+        if self.explicit_caching == Some(true) {
+            *wire.codec.cache_mut().ok_or(ModelError::ExplicitCaching)? = Cache::Explicit;
+        }
+        if let Some(tier) = &self.service_tier {
+            let field = (const { path("service_tier") }, json!(tier));
+            wire.transport.fields.every.push(field);
+        }
         let cyber = self
             .access_programs
             .as_ref()
             .and_then(|programs| programs.cyber);
-        let cache = match self.explicit_caching {
-            Some(true) => Cache::Explicit,
-            Some(false) | None => Cache::Automatic,
-        };
-        if let Codec::Responses(dialect) = &mut codec {
-            dialect.service_tier = self.service_tier.clone();
+        if let Codec::Responses(dialect) = &mut wire.codec {
+            dialect.reasoning_summary = self.reasoning_summary.or(dialect.reasoning_summary);
             dialect.cyber_access_program = cyber;
-            dialect.cache = cache;
         } else if let Some(setting) = [
-            (ResponseSetting::ServiceTier, self.service_tier.is_some()),
+            (
+                ResponseSetting::ReasoningSummary,
+                matches!(self.reasoning_summary, Nullable::Value(_)),
+            ),
             (ResponseSetting::AccessPrograms, cyber.is_some()),
-            (ResponseSetting::ExplicitCaching, cache == Cache::Explicit),
         ]
         .into_iter()
         .find_map(|(setting, selected)| selected.then_some(setting))
         {
             return Err(ModelError::ResponsesOnly(setting));
         }
-        Ok(codec)
+        Ok(wire)
     }
 }
 
@@ -111,11 +127,6 @@ impl<'de, P: Patch> Deserialize<'de> for RequestSettings<P> {
             serde_path_to_error::deserialize(Value::Object(fields)).map_err(E::custom)
         }
         let fields = Map::<String, Value>::deserialize(deserializer)?;
-        if fields.contains_key("overrides") {
-            return Err(de::Error::custom(
-                "overrides was removed; put its settings directly on the model",
-            ));
-        }
         let (request, dialect) = fields
             .into_iter()
             .partition(|(key, _)| RequestPatch::FIELDS.contains(&key.as_str()));
@@ -141,19 +152,10 @@ pub struct ModelSpec<P> {
 impl<'de, P: Patch> Deserialize<'de> for ModelSpec<P> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut fields = Map::new();
-        let profile = crate::yaml::split(deserializer, &mut Fields(&mut fields))?;
+        let profile = crate::yaml::split(deserializer, &mut fields)?;
         let settings =
             RequestSettings::deserialize(Value::Object(fields)).map_err(de::Error::custom)?;
         Ok(Self { profile, settings })
-    }
-}
-
-pub(crate) struct Fields<'a>(pub &'a mut Map<String, Value>);
-
-impl<'de> crate::yaml::Rest<'de> for Fields<'_> {
-    fn read<A: de::MapAccess<'de>>(&mut self, key: String, map: &mut A) -> Result<(), A::Error> {
-        self.0.insert(key, map.next_value()?);
-        Ok(())
     }
 }
 
@@ -168,10 +170,10 @@ impl<P: Patch> Serialize for ModelSpec<P> {
 }
 
 impl<P> ModelSpec<P> {
-    pub(crate) fn validate(&self, codec: &Codec) -> Result<(), ModelError> {
+    pub(crate) fn validate(&self, wire: &Profile) -> Result<(), ModelError> {
         self.profile.validate_limits()?;
-        super::placements::check(codec)?;
-        let levels = codec.effort().levels;
+        super::placements::check(&wire.codec, &wire.transport.fields)?;
+        let levels = wire.codec.name().effort_levels();
         if let Some(effort) = &self.profile.reasoning
             && !levels.accepts(effort)
         {
@@ -187,46 +189,22 @@ impl<P> ModelSpec<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::dialect::compatible::base;
+    use crate::provider::dialect::{DialectConfig, compatible};
 
-    fn apply(text: &str) -> Result<Codec, ModelError> {
+    fn apply(text: &str) -> Result<Profile, ModelError> {
         let request: Request = crate::yaml::parse(text).unwrap();
-        request.apply(base(request.codec))
+        request.apply(compatible::Config::default().admit(request.codec).unwrap())
     }
 
     #[test]
-    fn responses_selections_default_to_unset_and_reach_the_codec() {
-        let Codec::Responses(unset) = apply("codec: responses").unwrap() else {
-            panic!("Responses fixture");
-        };
-        assert_eq!(
-            (unset.service_tier, unset.cyber_access_program, unset.cache),
-            (None, None, Cache::Automatic)
-        );
-        let Codec::Responses(selected) = apply(
-            "codec: responses\nservice_tier: priority\naccess_programs: {cyber: daybreak_blue}\nexplicit_caching: true",
-        )
-        .unwrap() else {
-            panic!("Responses fixture");
-        };
-        assert_eq!(selected.service_tier, Some("priority".parse().unwrap()));
-        assert_eq!(
-            selected.cyber_access_program,
-            Some(CyberAccessProgram::DaybreakBlue)
-        );
-        assert_eq!(selected.cache, Cache::Explicit);
-    }
-
-    #[test]
-    fn other_codecs_refuse_effective_responses_selections_but_accept_empty_ones() {
+    fn codecs_refuse_selections_they_cannot_send_but_accept_empty_ones() {
         for codec in ["chat_completions", "messages"] {
             for (selection, setting) in [
-                ("service_tier: fast", ResponseSetting::ServiceTier),
+                ("reasoning_summary: auto", ResponseSetting::ReasoningSummary),
                 (
                     "access_programs: {cyber: standard}",
                     ResponseSetting::AccessPrograms,
                 ),
-                ("explicit_caching: true", ResponseSetting::ExplicitCaching),
             ] {
                 assert_eq!(
                     apply(&format!("codec: {codec}\n{selection}")).unwrap_err(),
@@ -235,11 +213,15 @@ mod tests {
             }
             assert!(
                 apply(&format!(
-                    "codec: {codec}\naccess_programs: {{}}\nexplicit_caching: false"
+                    "codec: {codec}\nreasoning_summary: null\naccess_programs: {{}}\nexplicit_caching: false"
                 ))
                 .is_ok()
             );
         }
+        assert_eq!(
+            apply("codec: messages\nexplicit_caching: true").unwrap_err(),
+            ModelError::ExplicitCaching
+        );
     }
 
     #[test]
@@ -247,6 +229,7 @@ mod tests {
         for refused in [
             "service_tier: '  '",
             "service_tier: true",
+            "reasoning_summary: brief",
             "explicit_caching: 'true'",
             "access_programs: {cyber: daybreak-blue}",
             "access_programs: {unknown: standard}",

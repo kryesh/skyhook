@@ -23,11 +23,15 @@ impl App {
     }
     pub fn observe(&mut self, event: ObservedEvent) -> bool {
         if let RuntimeEvent::Record(record) = &event.event {
-            observe_initial_input(&mut self.initial_input, record);
-            if matches!(
-                record.event,
-                SessionEvent::TitleSet { .. } | SessionEvent::TitleCleared
-            ) {
+            let retitles = match &record.event {
+                SessionEvent::TitleSet { .. } | SessionEvent::TitleCleared => true,
+                // An untitled session is named after its root's first prompt.
+                SessionEvent::MessageCommitted {
+                    message: Message::User(_),
+                } => self.title.is_none() && record.agent.parent().is_none(),
+                _ => false,
+            };
+            if retitles {
                 self.load_title();
             }
         }
@@ -51,6 +55,7 @@ impl App {
         };
         let stopped = self.snapshot.apply(event);
         let records = self.projection.observe_stopped(stopped) || records;
+        self.hold_after_root_failure();
         self.refresh_menu();
         self.deliver_queue();
         self.dirty |= repaint;
@@ -77,15 +82,6 @@ impl App {
     }
     pub fn rebuild_content(&mut self) {
         if self.content_dirty {
-            // The session's conversation, and only it, shows what stopped it.
-            let root = self.root_agent() == &self.selected;
-            let failed = (self.snapshot.phase.failure())
-                .filter(|_| root)
-                .map(|failure| {
-                    let failed = skyhook::session::SessionError::JournalFailed(failure.clone());
-                    model::status_entry(model::EntryKey::JournalFailed, &failed)
-                });
-            let overlay = failed.into_iter().collect();
             let view = self.views.get_mut(&self.selected, self.tab);
             let changes = self.content_cache.update(
                 &self.snapshot,
@@ -99,7 +95,6 @@ impl App {
                 },
                 &self.outputs,
                 &self.unsaved_status,
-                overlay,
             );
             self.render.dirty.extend(changes);
             self.content_dirty = false;
@@ -114,7 +109,7 @@ impl App {
     }
 
     pub fn busy(&self) -> bool {
-        self.start.is_creating()
+        self.creating.is_some()
             || self.stopping
             || self.operation
             || self.snapshot.revision < self.queue_activity_revision

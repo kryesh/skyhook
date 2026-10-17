@@ -1,8 +1,5 @@
 //! Agent-specific tools layered on top of the general coding tool set.
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock, Weak},
-};
+use std::sync::{Arc, OnceLock, Weak};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -73,7 +70,7 @@ pub(super) struct AgentArgs {
     #[schemars(skip)]
     pub(super) target: Option<crate::target::TargetRef>,
     /// Child workspace override: absolute, or relative to the workspace selected by target.
-    pub(super) workspace: Option<PathBuf>,
+    pub(super) workspace: Option<String>,
 }
 
 pub(super) fn register(
@@ -82,9 +79,64 @@ pub(super) fn register(
     models: &indexmap::IndexMap<ModelRef, ModelEntry>,
     modes: &indexmap::IndexMap<ModeName, Mode>,
 ) -> Result<(), RegistryError> {
-    register_wait(builder, runtime_slot.clone())?;
-    register_ask(builder, runtime_slot.clone())?;
-    register_todo(builder, runtime_slot.clone())?;
+    let (wait, ask, todo) = (
+        runtime_slot.clone(),
+        runtime_slot.clone(),
+        runtime_slot.clone(),
+    );
+    builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
+        "wait",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
+        ToolOptions::default().job_role(crate::job::JobRole::Wait),
+        move |context, args| {
+            let runtime = wait.get().and_then(Weak::upgrade);
+            async move {
+                runtime.ok_or_else(runtime_unavailable)?.wait_for_event(&context, args).await
+            }
+        },
+    )?;
+    builder.register::<Question, Value, _, _>(
+        "ask",
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
+        ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive),
+        move |context, input| {
+            let runtime = ask.get().and_then(Weak::upgrade);
+            async move {
+                let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                runtime.questions.coordinate_question(context, input).await
+            }
+        },
+    )?;
+    builder.register_checked(
+        "todo",
+        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
+        ToolOptions::default().result::<TodoList>(),
+        |TodoArgs { items, job }| match (items, job) {
+            (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments("items and job cannot be combined")
+                .operation(Operation::Validate, Subject::argument(["job"])).effects(Effects::NotStarted)),
+            (Some(items), None) => Ok(TodoRequest::Replace(items)),
+            (None, job) => Ok(TodoRequest::Inspect(job)),
+        },
+        move |request| {
+            let runtime = todo.get().and_then(Weak::upgrade);
+            match request {
+                TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
+                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                    let items = admit_todos("items", items)?;
+                    let issued_by = runtime.jobs.call_origin(context.job());
+                    let subject = Subject::Label(format!("todos for agent {}", context.agent()));
+                    runtime.store.replace_todos(context.agent(), items, issued_by).await.map_err(|error| match error {
+                        ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
+                        ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
+                    })
+                }),
+                TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {
+                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                    registry::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
+                }),
+            }
+        },
+    )?;
     register_child_agent(builder, runtime_slot, models, modes)
 }
 
@@ -140,80 +192,6 @@ fn admit_todos(argument: &str, items: Vec<TodoItem<String>>) -> Result<Vec<TodoI
     items.into_iter().enumerate().map(admit).collect()
 }
 
-fn register_todo(
-    builder: &mut ToolRegistryBuilder,
-    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-) -> Result<(), RegistryError> {
-    builder.register_checked(
-        "todo",
-        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
-        ToolOptions::default().result::<TodoList>(),
-        |TodoArgs { items, job }| match (items, job) {
-            (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments("items and job cannot be combined")
-                .operation(Operation::Validate, Subject::argument(["job"])).effects(Effects::NotStarted)),
-            (Some(items), None) => Ok(TodoRequest::Replace(items)),
-            (None, job) => Ok(TodoRequest::Inspect(job)),
-        },
-        move |request| {
-            let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            match request {
-                TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
-                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                    let items = admit_todos("items", items)?;
-                    let issued_by = runtime.jobs.call_origin(context.job());
-                    let subject = Subject::Label(format!("todos for agent {}", context.agent()));
-                    runtime.store.replace_todos(context.agent(), items, issued_by).await.map_err(|error| match error {
-                        ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
-                        ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
-                    })
-                }),
-                TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {
-                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                    registry::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
-                }),
-            }
-        },
-    )?;
-    Ok(())
-}
-
-fn register_wait(
-    builder: &mut ToolRegistryBuilder,
-    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-) -> Result<(), RegistryError> {
-    builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
-        "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
-        ToolOptions::default().job_role(crate::job::JobRole::Wait),
-        move |context, args| {
-            let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            async move {
-                runtime.ok_or_else(runtime_unavailable)?.wait_for_event(&context, args).await
-            }
-        },
-    )?;
-    Ok(())
-}
-
-fn register_ask(
-    builder: &mut ToolRegistryBuilder,
-    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-) -> Result<(), RegistryError> {
-    builder.register::<Question, Value, _, _>(
-        "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
-        ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive),
-        move |context, input| {
-            let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            async move {
-                let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                runtime.questions.coordinate_question(context, input).await
-            }
-        },
-    )?;
-    Ok(())
-}
-
 fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
@@ -230,7 +208,7 @@ fn register_child_agent(
         crate::tool::builtins::names::AGENT,
         "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Earlier replies arrive as events; the final reply is the job's result. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
-            .result::<crate::tool::output::Complete<String>>()
+            .complete_result::<String>()
             .named()
             .requires(Capability::Agents)
             .conditional_input(TARGET, Capability::Targets, crate::target::TargetRef::schema())
@@ -264,10 +242,9 @@ fn register_child_agent(
                 let (model, depth) = runtime.delegation(owner)
                     .ok_or_else(|| ToolError::failed("parent agent never started")
                         .operation(Operation::Lookup, Subject::Label(format!("parent agent {owner}"))).effects(Effects::NotStarted))?;
-                let launched = runtime.jobs.metadata(context.job()).map_err(|error| harness_error(error.into())
-                    .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?;
                 let caller = (context.capabilities(), model, depth);
-                let (launch, prompt) = child_launch(&runtime, input, caller, launched.location)?;
+                let location = context.job_location().clone();
+                let (launch, prompt) = child_launch(&runtime, input, caller, location)?;
                 // Only this call may opt its job into resumption, as its child installs.
                 let handler = child_resume_handler(
                     Arc::downgrade(&runtime),
@@ -443,6 +420,7 @@ async fn owner_update(
         let input = QueuedInput {
             options: Default::default(),
             content,
+            attachments: Vec::new(),
             cancellation: Default::default(),
             committed: oneshot::channel().0,
         };
@@ -578,6 +556,7 @@ pub(super) fn harness_error(error: crate::agent::HarnessError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use crate::agent::runtime::tests::*;
+    use crate::tool::executor::InvocationKind;
     use crate::{execution::ExecutionLocation, mcp::McpServerConfig, tool::policy::CapabilitySet};
     use std::{collections::BTreeMap, path::Path};
 
@@ -742,7 +721,13 @@ for line in sys.stdin:
         let denied = json!({"text":"denied"});
         let direct = disabled.execute(session.root.clone(), &name, denied.clone(), None);
         assert!(direct.await.is_err());
-        let scripted = disabled.execute_script(session.root.clone(), &name, denied, None);
+        let scripted = disabled.execute_as(
+            InvocationKind::Script,
+            session.root.clone(),
+            &name,
+            denied,
+            None,
+        );
         assert!(scripted.await.is_err());
         assert_eq!(script_type(&disabled, &session, &name).await, "undefined");
         shutdown_session(session).await;
@@ -869,9 +854,7 @@ for line in sys.stdin:
             .unwrap();
         let session = harness.new_session().await.unwrap();
         let executor = &session.runtime.executor;
-        let todo = |arguments| {
-            bounded(executor.execute_model(session.root.clone(), "todo", arguments, None))
-        };
+        let todo = |arguments| bounded(executor.run_model(&session.root, "todo", arguments));
         let items = json!([{"text":"done","status":"completed"}]);
         let replaced = todo(json!({"items":items})).await.unwrap();
         assert_eq!(replaced.output.value, json!({}));
@@ -1144,7 +1127,7 @@ for line in sys.stdin:
         // dispatch must still use the session-owning process and its MCP manager.
         let location = ExecutionLocation::named(
             "unconnected-remote".parse().unwrap(),
-            PathBuf::from("/remote/workspace"),
+            "/remote/workspace".into(),
         );
         let remote = session.runtime.executor.clone().with_location(location);
         let output = remote.execute(session.root.clone(), &name, json!({"text":"host"}), None);
@@ -1200,17 +1183,14 @@ for line in sys.stdin:
             let found = &ask_type.value["value"];
             assert_eq!(*found, if enabled { "function" } else { "undefined" });
             for background in [false, true] {
-                for route in ["host", "model", "script"] {
+                for kind in [
+                    InvocationKind::Host,
+                    InvocationKind::Model,
+                    InvocationKind::Script,
+                ] {
                     let args = json!({"id":"root", "prompt":"question", "bg":background});
                     let agent = session.root.clone();
-                    let result = bounded(async {
-                        match route {
-                            "host" => executor.execute(agent, "ask", args, None).await,
-                            "model" => executor.execute_model(agent, "ask", args, None).await,
-                            _ => executor.execute_script(agent, "ask", args, None).await,
-                        }
-                    })
-                    .await;
+                    let result = bounded(executor.execute_as(kind, agent, "ask", args, None)).await;
                     if enabled {
                         let output = terminal(&session, result.unwrap().job).await;
                         assert_eq!(output.output, Some(json!("host-answer")));
@@ -1241,14 +1221,15 @@ for line in sys.stdin:
             }
             assert_eq!(batches.lock().unwrap().len(), if enabled { 8 } else { 0 });
             if !enabled {
-                let jobs = session.inspect_jobs(&session.root);
+                let jobs = session.runtime.jobs.list(&session.root);
                 assert!(jobs.iter().all(|job| job.tool != "ask"));
             }
             shutdown_session(session).await;
         }
     }
 
-    /// A background handle reports where the child runs, not where the tool does.
+    /// A background handle reports the child's workspace as written, not where
+    /// the tool runs; the child runs where it resolves.
     #[tokio::test]
     async fn background_child_handle_reports_the_childs_workspace() {
         let root = tempfile::tempdir().unwrap();
@@ -1257,21 +1238,25 @@ for line in sys.stdin:
         let builder = test_builder(root.path(), &root.path().join("sessions"), provider, false);
         let harness = builder.coalescing(wait::Coalescing::held().0).build();
         let session = ephemeral_session(&harness.await.unwrap()).await;
-        let workspace = session.runtime.harness.workspace.join("sub");
-        std::fs::create_dir(&workspace).unwrap();
-        let arguments = json!({"prompt":"work", "workspace":"sub", "bg":true});
+        let workspace = &session.runtime.harness.workspace;
+        std::fs::create_dir(workspace.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", workspace.join("alias")).unwrap();
+        let arguments = json!({"prompt":"work", "workspace":"alias", "bg":true});
         let executor = &session.runtime.executor;
         let launched = executor.execute(session.root.clone(), "agent", arguments, None);
         let launched = launched.await.unwrap();
+        let written = workspace.join("alias");
         let handle = launched.output.value;
         assert_eq!(
             handle["meta"]["workspace"],
-            workspace.to_string_lossy().as_ref()
+            written.to_string_lossy().as_ref()
         );
-        assert_eq!(
-            terminal(&session, launched.job).await.location.workspace,
-            workspace
-        );
+        let job = terminal(&session, launched.job).await;
+        assert_eq!(job.location.workspace, written);
+        let records = session.runtime.store.records();
+        let started = events!(&records, SessionEvent::AgentStarted { owner_job: Some(_), location, .. } => location.workspace.clone());
+        let resolved = std::fs::canonicalize(workspace.join("sub")).unwrap();
+        assert_eq!(started, [resolved]);
         shutdown_session(session).await;
     }
 }

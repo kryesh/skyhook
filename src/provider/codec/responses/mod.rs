@@ -19,7 +19,6 @@ use crate::provider::{
 mod decoder;
 mod dialect;
 mod encoder;
-mod errors;
 mod events;
 mod identity;
 mod input;
@@ -28,36 +27,20 @@ mod normalization;
 mod reasoning;
 mod terminal;
 
-pub(crate) use dialect::{Cache, Dialect, Instructions};
-pub use dialect::{CyberAccessProgram, ReasoningSummary, ServiceTier};
+pub use dialect::{CyberAccessProgram, ReasoningSummary};
+pub(crate) use dialect::{Dialect, Instructions};
 
 pub(crate) use encoder::{BODY_FIELDS, encode};
-pub(crate) use errors::Code;
 use native::{arguments, array, final_parts};
+pub(crate) use reasoning::is_sealed;
 use reasoning::{readable_reasoning, reasoning_parts, reasoning_position, reasoning_text};
 
 const NATIVE: Native = Native(CodecName::Responses);
 
-/// A part's authoritative content, as the wire states it.
-#[derive(Clone, Debug, PartialEq)]
-enum Content {
-    Text { text: String },
-    Reasoning { text: String },
-    ToolCall(ToolCall),
-}
-
-impl Content {
-    fn text(&self) -> Option<&str> {
-        match self {
-            Self::Text { text } | Self::Reasoning { text } => Some(text),
-            Self::ToolCall(_) => None,
-        }
-    }
-}
-
+/// A content part: streaming, or its authoritative text as the wire states it.
 enum Part {
     Streaming { text: String, added: bool },
-    Completed(Content),
+    Completed(String),
 }
 impl Default for Part {
     fn default() -> Self {
@@ -68,9 +51,9 @@ impl Default for Part {
     }
 }
 impl Part {
-    fn ended(&self) -> Option<&Content> {
+    fn ended(&self) -> Option<&str> {
         match self {
-            Self::Completed(content) => Some(content),
+            Self::Completed(text) => Some(text),
             Self::Streaming { .. } => None,
         }
     }
@@ -90,8 +73,6 @@ struct TextState {
 #[derive(Default)]
 struct ReasoningState {
     parts: BTreeMap<usize, Part>,
-    // Snapshot namespace migrations resolve to the original display block ID.
-    aliases: BTreeMap<usize, usize>,
     snapshot: Option<Value>,
 }
 
@@ -105,6 +86,8 @@ enum FinalArguments {
 struct StreamingFunction {
     call_id: Option<String>,
     name: Option<String>,
+    /// The argument deltas so far.
+    streamed: String,
     final_arguments: Option<FinalArguments>,
 }
 enum FunctionPhase {
@@ -119,8 +102,6 @@ impl Default for FunctionPhase {
 }
 #[derive(Default)]
 struct FunctionState {
-    // Function items have exactly one possible block, at position zero.
-    part: Option<Part>,
     phase: FunctionPhase,
 }
 /// Variant accessors whose mismatch is a protocol error.
@@ -186,13 +167,8 @@ impl Item {
             parts
                 .iter()
                 .map(|(part, content)| {
-                    let text = match content {
-                        Part::Completed(content) => content
-                            .text()
-                            .ok_or_else(|| NATIVE.error("content part is not text"))?,
-                        Part::Streaming { .. } => {
-                            return Err(NATIVE.error("output item ended with an open content part"));
-                        }
+                    let Part::Completed(text) = content else {
+                        return Err(NATIVE.error("output item ended with an open content part"));
                     };
                     Ok(TextBlock {
                         id: self.block_ref(*part).block,
@@ -217,7 +193,7 @@ impl Item {
                         ReplayFormat::Responses,
                         model,
                         scope,
-                        native.clone(),
+                        reasoning::replayed(native, &state.parts),
                         Binding::Free,
                     )
                 }),
@@ -257,16 +233,23 @@ impl Item {
     variant_accessors!(body, "event does not match output item kind",
         ItemBody::Function => function, function_mut: FunctionState;
         ItemBody::Reasoning => reasoning, reasoning_mut: ReasoningState;);
+    /// The content parts of a text or reasoning item; a function has none.
     fn parts(&self) -> impl Iterator<Item = (&usize, &Part)> {
-        let (parts, function) = match &self.body {
-            ItemBody::Text(state) => (Some(&state.parts), None),
-            ItemBody::Reasoning(state) => (Some(&state.parts), None),
-            ItemBody::Function(state) => (None, state.part.as_ref()),
-        };
-        parts
-            .into_iter()
-            .flat_map(|parts| parts.iter())
-            .chain(function.map(|part| (&0, part)))
+        match &self.body {
+            ItemBody::Text(state) => Some(&state.parts),
+            ItemBody::Reasoning(state) => Some(&state.parts),
+            ItemBody::Function(_) => None,
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    fn delta(&self, position: usize, text: &str) -> ResponseEvent {
+        ResponseEvent::Delta {
+            block: self.block_ref(position),
+            kind: self.kind(),
+            text: text.into(),
+        }
     }
 }
 
@@ -326,8 +309,12 @@ pub(super) mod tests {
     }
 
     pub(super) fn decoder() -> Decoder {
+        decoder_for("test-model")
+    }
+
+    pub(super) fn decoder_for(model: &str) -> Decoder {
         let dialect = Dialect::stateless();
-        Decoder::new("test-model".into(), scope(), &dialect, ErrorSignals::NONE)
+        Decoder::new(model.into(), scope(), &dialect, ErrorSignals::NONE)
     }
 
     /// Feed every event, then reduce as the runtime would.

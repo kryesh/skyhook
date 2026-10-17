@@ -9,7 +9,7 @@ use crate::{
     },
     identity::{AgentId, JobId},
     job::Jobs,
-    session::{RecordSeq, RequestLedger},
+    session::{Message, RecordSeq, RequestLedger, UserPart},
 };
 
 #[derive(Default)]
@@ -23,7 +23,8 @@ pub(crate) struct CoreState {
     /// Never journaled: the agents whose loops run.
     pub(crate) agents: crate::agent::Agents,
     pub(crate) targets: crate::target::TargetRegistry,
-    /// Whether the session was ever given a title.
+    /// Whether the session has a title: one it was given, or else its root's
+    /// first prompt text.
     pub(crate) titled: bool,
     /// Registered predicates, never journaled: each resolves by replying, or goes
     /// once nobody waits for it.
@@ -98,8 +99,17 @@ impl CoreState {
         todo::apply(&mut self.todos, record);
         let job = self.jobs.apply(record);
         self.targets.apply(&record.event);
-        self.agents.observe(record);
-        self.titled |= matches!(record.event, SessionEvent::TitleSet { .. });
+        self.agents.observe(record, &self.ledger);
+        self.titled |= match &record.event {
+            SessionEvent::TitleSet { .. } => true,
+            SessionEvent::MessageCommitted {
+                message: Message::User(parts),
+            } => {
+                record.agent.parent().is_none()
+                    && (parts.iter()).any(|part| matches!(part, UserPart::Text { .. }))
+            }
+            _ => false,
+        };
         self.records.push(record.clone());
         job
     }
@@ -186,6 +196,11 @@ impl Observed {
         let applied = self.applied;
         let committed = |sequence| sequence <= applied;
         crate::agent::live(&mut self.responses, None, committed, event);
+    }
+
+    /// The newest publication's revision.
+    pub(in crate::session) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The next publication.

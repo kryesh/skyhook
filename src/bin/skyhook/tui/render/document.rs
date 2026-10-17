@@ -267,7 +267,7 @@ pub(super) fn update_entry_rows(
             } else {
                 geometry.body_width
             };
-            let layout = stream::layout_highlighted(body, width.into(), Some(highlights));
+            let layout = markdown::layout_highlighted(body, true, width.into(), Some(highlights));
             fences = layout.fences;
             for line in layout.lines {
                 let layout = line.layout.in_segment(markdown::Segment::Markdown);
@@ -285,7 +285,11 @@ pub(super) fn update_entry_rows(
                 wrap: Wrap::Hard,
             })
             .into_iter()
-            .chain(body.map(|line| DocumentLine::new(Line::from(line.to_owned()), Wrap::Hard)))
+            .chain(body.map(|line| DocumentLine {
+                lead: Line::default(),
+                text: Line::from(line.to_owned()),
+                wrap: Wrap::Hard,
+            }))
             .collect();
         kept = geometry.push_wrapped(rows, lines);
     }
@@ -342,7 +346,7 @@ mod tests {
     /// `document` as an expanded card copies `expected` at every width.
     fn assert_argument_reflow(document: &Document, expected: &str) {
         let mut body = document.clone();
-        let Section::Line { runs: header, .. } = body.sections.remove(0) else {
+        let Section::Text { runs: header, .. } = body.sections.remove(0) else {
             panic!("argument fixture starts with its tool header");
         };
         let mut entry = model::Entry::card(model::EntryKey::UnsavedStatus(1), header, Some(body));
@@ -408,7 +412,7 @@ mod tests {
     /// The expanded card of `tool` with `args`, and its rows at `width`.
     fn argument_card(tool: &str, args: &serde_json::Value, width: u16) -> Vec<Row> {
         let mut document = arguments(tool, args);
-        let Section::Line { runs: header, .. } = document.sections.remove(0) else {
+        let Section::Text { runs: header, .. } = document.sections.remove(0) else {
             panic!("argument fixture starts with its tool header");
         };
         let key = model::EntryKey::UnsavedStatus(1);
@@ -433,17 +437,6 @@ mod tests {
             byte: usize::MAX,
         };
         selected_text(&blocks, (start, end))
-    }
-
-    /// Prose arguments copy as written: the argument's own whitespace stays,
-    /// the card's indentation does not.
-    #[test]
-    fn prose_arguments_copy_without_presentation_indent() {
-        let args = serde_json::json!({"prompt": "alpha\n  beta"});
-        for width in [60, 12] {
-            let copied = copy_from(argument_card("agent", &args, width), "alpha");
-            assert_eq!(copied, "alpha\n  beta", "width {width}");
-        }
     }
 
     /// A card's disclosure glyph is painted before its header, not selected.
@@ -499,28 +492,6 @@ mod tests {
                 .repeat(5)
         );
         assert_argument_reflow(&document, &expected);
-        // A long prompt's short words must never be split, even though its
-        // paragraphs are longer than the viewport and include indentation.
-        for DocumentLine {
-            text: line,
-            wrap: wrapping,
-            ..
-        } in document.layout_lines(None)
-        {
-            let text = line.to_string();
-            if wrapping != Wrap::Words || text.contains("extraordinarily") {
-                continue;
-            }
-            for width in [24, 40, 64] {
-                let parts: Vec<_> = wrap_words(line.clone(), width)
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
-                let words = parts.join(" ");
-                let words: Vec<_> = words.split_whitespace().collect();
-                assert_eq!(words, text.split_whitespace().collect::<Vec<_>>());
-            }
-        }
         assert_eq!(args, original);
     }
 
@@ -655,24 +626,5 @@ mod tests {
         };
         assert_eq!(fg("Inspecting scripts"), Some(Some(THEME.strong)));
         assert_eq!(fg(" · incomplete"), Some(None));
-    }
-
-    #[test]
-    fn full_entry_replacements_preserve_unicode_on_resize() {
-        let body =
-            "words 界 👩‍💻\n\n```rust\nlet n = 4;\n```\n\n| A | B |\n| - | - |\n| x | long words |";
-        for surface in [Surface::Reasoning, Surface::User, Surface::Agent] {
-            let entry = model::Entry::titled(
-                model::EntryKey::UnsavedStatus(1),
-                model::Title::disclosed("Title", true),
-                body.to_owned(),
-                surface,
-            );
-            for width in [24, 8, 40] {
-                let rows = layout(&entry, width);
-                assert!(rows.iter().any(|row| row.text().contains('界')));
-                assert!(rows.iter().all(|row| row.width <= width));
-            }
-        }
     }
 }

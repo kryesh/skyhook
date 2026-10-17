@@ -10,10 +10,10 @@ use std::{
 use tokio::io::AsyncWriteExt as _;
 
 use crate::tool::{
-    PathKind,
-    invocation::{AdmissionError, LocalContext, LocalError},
-    path::{resolve_for_authorization, source_file},
-    policy::Capability,
+    PathArgument, PathKind,
+    invocation::{AdmissionError, LocalContext, LocalError, preflight_path_arguments},
+    path::source_file,
+    policy::{Capability, PathAccess},
 };
 
 /// An opened source, read from its start by the handler that consumes it.
@@ -64,21 +64,19 @@ impl Spool {
 /// workspace and authorize it if it is outside the authorized root.
 pub(crate) async fn open_on_worker(
     tool: &str,
-    path: &str,
+    mut path: String,
     context: &LocalContext,
     authorization_root: &Path,
 ) -> Result<std::fs::File, LocalError> {
     if !context.capabilities().contains(Capability::Read) {
         return Err(LocalError::unavailable(tool));
     }
+    let argument = PathArgument::new(&mut path, PathAccess::Read, PathKind::Existing);
     let location = context.execution_location();
-    let resolved = resolve_for_authorization(&location.workspace, path, PathKind::Existing).await?;
-    if let Some(permission) =
-        resolved.permission_outside(authorization_root, Capability::Read, &location.target)
-    {
-        context.authorize(vec![permission]).await?;
-    }
-    Ok(crate::fs::open_regular(resolved.path.as_path(), u64::MAX)
+    let preflight = preflight_path_arguments(vec![argument], location, authorization_root).await?;
+    (context.authorize_paths(preflight.permissions, preflight.unresolved)).await?;
+    let path = Path::new(&path);
+    Ok(crate::fs::open_regular(path, u64::MAX)
         .await
-        .map_err(source_file(resolved.path.as_path()))?)
+        .map_err(source_file(path))?)
 }

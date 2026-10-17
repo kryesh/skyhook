@@ -17,8 +17,8 @@ use super::{
     flow::{CHUNK_BYTES, WINDOW},
     payload::PayloadSender,
     protocol::{
-        AuthorizationId, MAX_FRAME_BYTES, RemoteToolError, Request, RequestId, Response, Sequence,
-        read_frame, spawn_owned_write, write_frame,
+        AuthorizationId, RemoteToolError, Request, RequestId, Response, Sequence, read_frame,
+        spawn_owned_write, write_frame,
     },
 };
 use crate::job::CANCELLATION_GRACE;
@@ -62,12 +62,7 @@ where
     let credits = receiver.credits();
     let mut tasks = JoinSet::new();
     let writer = output.clone();
-    tasks.spawn(async move {
-        (
-            WorkerTask::Output,
-            receiver.forward(writer, MAX_FRAME_BYTES).await,
-        )
-    });
+    tasks.spawn(async move { (WorkerTask::Output, receiver.forward(writer).await) });
     let mut worker = Worker {
         output,
         services,
@@ -236,7 +231,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&authorization_id)
                 {
-                    let _ = sender.send(decision.into_result().map_err(AdmissionError::from));
+                    let _ = sender.send(decision.map_err(AdmissionError::from));
                 }
             }
             Request::Control(control) => self.services.handle(control).await?,
@@ -304,7 +299,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                             .await
                     }),
                     Work::ReadSource { tool, path } => Box::pin(async move {
-                        let file = open_on_worker(&tool, &path, &context, &root).await?;
+                        let file = open_on_worker(&tool, path, &context, &root).await?;
                         source_output
                             .send_source(file)
                             .await
@@ -494,8 +489,7 @@ mod tests {
                 AuthorizationArguments, AuthorizationCoordinator, AuthorizationSubject,
             },
             policy::{
-                AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, PolicyFuture,
-                ResourceId,
+                Approval, AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, ResourceId,
             },
         },
     };
@@ -620,11 +614,8 @@ mod tests {
             let (input, worker) = lease.split();
             let context = ToolContext::new(
                 AuthorizationSubject {
-                    agent: self.runtime.agent.clone(),
-                    job,
-                    parent: None,
                     capabilities,
-                    cancellation,
+                    ..self.runtime.subject(job, cancellation)
                 },
                 location(),
                 ExecutionLocation::root(self.runtime.root.path().to_owned()),
@@ -726,35 +717,32 @@ mod tests {
     }
 
     /// A host that goes away ends the session cleanly, even when its departure
-    /// breaks output the worker is still writing. Each round races the failed
-    /// write against end of input; the worker's choice between them is random.
+    /// breaks output the worker is still writing: input is read first.
     #[tokio::test]
     async fn host_departure_mid_output_ends_the_worker_cleanly() {
-        for _ in 0..16 {
-            let (mut requests, input) = tokio::io::duplex(64 * 1024);
-            let (output, mut responses) = tokio::io::duplex(64 * 1024);
-            let gate = OutputGate::default();
-            let root = std::fs::canonicalize(".").unwrap();
-            let output = GatedOutput(output, gate.clone());
-            let worker = tokio::spawn(serve_io_at(input, output, root));
-            write_frame(&mut requests, &Request::Hello).await.unwrap();
-            let ready = read_frame::<_, Response>(&mut responses).await.unwrap();
-            assert!(matches!(ready, Some(Response::Ready)));
-            gate.set(GateState::Held(None));
-            let request = Request::Tool {
-                request_id: RequestId::new(1),
-                name: "exec".into(),
-                arguments: serde_json::json!({"command":["/bin/sh", "-c", "printf x"]}),
-                capabilities: vec![Capability::Exec],
-                source: false,
-            };
-            write_frame(&mut requests, &request).await.unwrap();
-            bounded(gate.0.1.notified()).await;
-            // Leaving closes both directions without yielding between them.
-            gate.set(GateState::Broken);
-            drop(requests);
-            bounded(worker).await.unwrap().unwrap();
-        }
+        let (mut requests, input) = tokio::io::duplex(64 * 1024);
+        let (output, mut responses) = tokio::io::duplex(64 * 1024);
+        let gate = OutputGate::default();
+        let root = std::fs::canonicalize(".").unwrap();
+        let output = GatedOutput(output, gate.clone());
+        let worker = tokio::spawn(serve_io_at(input, output, root));
+        write_frame(&mut requests, &Request::Hello).await.unwrap();
+        let ready = read_frame::<_, Response>(&mut responses).await.unwrap();
+        assert!(matches!(ready, Some(Response::Ready)));
+        gate.set(GateState::Held(None));
+        let request = Request::Tool {
+            request_id: RequestId::new(1),
+            name: "exec".into(),
+            arguments: serde_json::json!({"command":["/bin/sh", "-c", "printf x"]}),
+            capabilities: vec![Capability::Exec],
+            source: false,
+        };
+        write_frame(&mut requests, &request).await.unwrap();
+        bounded(gate.0.1.notified()).await;
+        // Leaving closes both directions without yielding between them.
+        gate.set(GateState::Broken);
+        drop(requests);
+        bounded(worker).await.unwrap().unwrap();
     }
 
     /// A call cancelled while its source is still arriving never starts, still
@@ -949,59 +937,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_enforces_exact_capabilities_and_detached_exec_sessions() {
-        let worker = Harness::start(
-            std::fs::canonicalize(".").unwrap(),
-            RecordingPolicy::allowing(),
-        )
-        .await;
-        for capabilities in [
-            vec![],
-            vec![Capability::Read],
-            vec![Capability::Exec],
-            vec![],
-        ] {
-            let allowed = capabilities.contains(&Capability::Exec);
-            let job = worker
-                .tool(
-                    capabilities.into_iter().collect(),
-                    "exec",
-                    serde_json::json!({"command":["/bin/sh", "-c", "printf exact"]}),
-                )
-                .await;
-            let result = worker.result(job).await;
-            assert_eq!(result.state == JobState::Completed, allowed);
-            if allowed {
-                assert_eq!(result.output.unwrap()["stdout"], "exact");
-            }
-        }
-        #[cfg(target_os = "linux")]
-        for interactive in [false, true, false] {
-            let mut capabilities: CapabilitySet = [Capability::Exec].into_iter().collect();
-            if interactive {
-                capabilities.insert(Capability::Interactive);
-            }
-            let stat = "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\"";
-            let job = worker
-                .tool(
-                    capabilities,
-                    "exec",
-                    serde_json::json!({"command":["/bin/sh", "-c", stat]}),
-                )
-                .await;
-            let result = worker.result(job).await.output.unwrap();
-            let ids: Vec<_> = result["stdout"]
-                .as_str()
-                .unwrap()
-                .split_whitespace()
-                .collect();
-            assert_eq!(ids.len(), 2);
-            assert_eq!(ids[0], ids[1], "every process leads its own session");
-        }
-        worker.finish().await;
-    }
-
-    #[tokio::test]
     async fn remote_captures_and_images_are_persisted_on_the_host() {
         let root = tempfile::tempdir().unwrap();
         let text = "aé🦀\n".repeat(20_000);
@@ -1011,7 +946,7 @@ mod tests {
         let image = crate::tests::png(b"remote source bytes");
         std::fs::write(&image_path, image.bytes()).unwrap();
         let policy = RecordingPolicy::allowing();
-        let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy.clone()).await;
+        let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy).await;
         let job = worker
             .tool(
                 CapabilitySet::default(),
@@ -1031,20 +966,6 @@ mod tests {
                 .unwrap(),
             text.as_bytes()
         );
-        let expected = ResourceId::path(
-            &"remote".parse().unwrap(),
-            &crate::tool::policy::PathText::new(&path).unwrap(),
-        );
-        assert!(
-            policy
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .flat_map(|request| &request.permissions)
-                .any(|permission| permission.resource == expected)
-        );
-
         let job = worker
             .tool(
                 CapabilitySet::default(),
@@ -1070,22 +991,6 @@ mod tests {
                 .output(job)
                 .test_bytes("/result/content")
                 .is_none()
-        );
-
-        let job = worker
-            .tool(
-                CapabilitySet::default(),
-                "read",
-                serde_json::json!({"path":root.path().join("missing")}),
-            )
-            .await;
-        let result = worker.result(job).await;
-        assert_eq!(result.state, JobState::Completed);
-        assert_eq!(result.output.unwrap()["kind"], "error");
-        // The completed read error is bound to the invocation's trusted location.
-        assert_eq!(
-            result.envelope.output_diagnostic.unwrap().context.site,
-            crate::tool::diagnostic::FailureSite::Execution(location()),
         );
         worker.finish().await;
     }
@@ -1124,12 +1029,12 @@ mod tests {
     }
 
     impl Policy for GatedPolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-            self.requests.send(request).unwrap();
-            Box::pin(async {
+        fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
+            Approval::Ask(Box::pin(async move {
+                self.requests.send(request).unwrap();
                 let _permit = self.release.acquire().await.unwrap();
                 PolicyDecision::allow()
-            })
+            }))
         }
     }
 

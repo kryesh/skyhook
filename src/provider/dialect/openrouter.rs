@@ -1,42 +1,45 @@
 //! openrouter.ai: Chat with the `reasoning` object, verbatim `reasoning_details`
-//! replay, `cache_control` on content parts, usage on every stream, provider
-//! routing in the body, and `x-session-id` affinity; Messages for Anthropic
-//! models; Responses stateless with the same affinity header. Bearer keys on
-//! every codec; attribution headers name Skyhook.
+//! replay (plain `reasoning` for a response without readable details), `cache_control` on
+//! content parts, usage on every stream, and `x-session-id` affinity; Messages
+//! for Anthropic models, with their tool-name alphabet; Responses stateless with
+//! the same affinity header and a top-level `cache_control`. Chat and Responses
+//! take OpenAI's tool-name alphabet and strict schemas.
+//! Provider routing rides the body and bearer keys authenticate on every codec;
+//! attribution headers name Skyhook.
 
 use reqwest::header::HeaderValue;
-use serde::Deserialize;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, Effort, Locations, NonEmpty, OPENAI_EFFORT, SchemaConstraint,
-        StateRole, ToolNames,
-        chat_completions::{self, Cache, EmptyContent, ReasoningReplay, Routing, UsageRequest},
-        header, messages, path,
+        BodyPath, BreakpointBudget, CacheControl, CacheTtl, Codec, CodecName, Locations, NonEmpty,
+        StateRole, ToolNames, UnsignedReasoning,
+        chat_completions::{self, EmptyContent, NativeReplay, ReasoningReplay, UsageRequest},
+        header, messages, path, responses,
     },
     http::{
-        Transport,
-        errors::{ErrorRule, ErrorSignals, Field, Reader, RetryAfter, error_object},
+        Fields, Transport,
+        errors::{ErrorSignals, error_object},
     },
 };
 
-fn chat(ttl: Option<CacheTtl>, routing: Option<Routing>) -> chat_completions::Dialect {
+fn chat() -> chat_completions::Dialect {
     chat_completions::Dialect {
-        effort: Effort {
-            path: NonEmpty::one(const { path("reasoning.effort") }),
-            levels: OPENAI_EFFORT,
-        },
-        reasoning_replay: ReasoningReplay::Details(NonEmpty::one(
-            const { path("reasoning_details") },
-        )),
+        effort: NonEmpty::one(const { path("reasoning.effort") }),
+        reasoning_replay: ReasoningReplay::Details(NativeReplay {
+            objects: NonEmpty::one(const { path("reasoning_details") }),
+            unsigned: UnsignedReasoning::Replayed(Locations::one(const { path("reasoning") })),
+        }),
         empty_content: EmptyContent::Null,
         usage_request: UsageRequest::Implicit,
-        tool_names: ToolNames::OpenAi,
-        schema: SchemaConstraint::OpenAiStrict,
-        cache: Cache::ContentPartBreakpoints { ttl },
-        routing,
+        cache_control: CacheControl::Sent { ttl: None },
+        // The strictest cap among the services behind it.
+        breakpoints: BreakpointBudget::new(4),
         ..chat_completions::Dialect::compatible()
     }
 }
@@ -44,18 +47,31 @@ fn chat(ttl: Option<CacheTtl>, routing: Option<Routing>) -> chat_completions::Di
 /// Moderation names its reasons under `error.metadata`. A 402 during a request
 /// is transient when the router says when to retry; without a hint it is
 /// exhausted credit.
-const RULES: &[ErrorRule] = &[
-    ErrorRule {
-        status: Some(403),
-        field: Some(Field::Present("metadata.reasons")),
-        ..ErrorRule::kind(ProviderErrorKind::InvalidRequest)
-    },
-    ErrorRule {
-        status: Some(402),
-        retry_after: RetryAfter::Required,
-        ..ErrorRule::kind(ProviderErrorKind::Unavailable)
-    },
-];
+fn statuses(
+    status: Option<u16>,
+    native: &serde_json::Value,
+    retry_after: Option<Duration>,
+) -> Option<ProviderErrorKind> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        reasons: Option<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Moderated {
+        metadata: Metadata,
+    }
+    match status? {
+        403 => {
+            let moderated = Moderated::deserialize(error_object(native)).ok()?;
+            moderated
+                .metadata
+                .reasons
+                .map(|_| ProviderErrorKind::InvalidRequest)
+        }
+        402 => retry_after.map(|_| ProviderErrorKind::Unavailable),
+        _ => None,
+    }
+}
 
 /// The router's canonical error types, which every codec's errors carry.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -155,14 +171,81 @@ impl ErrorType {
 }
 
 fn transport(codec: CodecName) -> Transport {
-    let read: Reader = match codec {
-        CodecName::ChatCompletions => ErrorType::chat,
-        CodecName::Responses => ErrorType::responses,
-        CodecName::Messages => ErrorType::messages,
+    let errors = match codec {
+        CodecName::ChatCompletions => ErrorSignals(|status, native, retry_after| {
+            statuses(status, native, retry_after).or_else(|| ErrorType::chat(native))
+        }),
+        CodecName::Responses => ErrorSignals(|status, native, retry_after| {
+            statuses(status, native, retry_after).or_else(|| ErrorType::responses(native))
+        }),
+        CodecName::Messages => ErrorSignals(|status, native, retry_after| {
+            statuses(status, native, retry_after).or_else(|| ErrorType::messages(native))
+        }),
     };
+    // A response schema routes only to endpoints that honour it, routing or not.
+    let constrained = vec![(const { path("provider.require_parameters") }, json!(true))];
     Transport {
-        errors: ErrorSignals { rules: RULES, read },
+        errors,
+        fields: Fields {
+            every: Vec::new(),
+            constrained,
+        },
         ..Transport::plain()
+    }
+}
+
+crate::provider::settings::settings! {
+    /// The `provider` preferences object and the `models` fallback list.
+    #[derive(Default)]
+    pub struct Routing => RoutingPatch {
+        @flatten { pub provider: ProviderPreferences }
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub fallback_models: Vec<String> => default,
+    }
+}
+
+crate::provider::settings::settings! {
+    /// The `provider` object. `require_parameters` is forced on whenever a response
+    /// schema is sent, so no endpoint that ignores it is routed to.
+    #[derive(Default)]
+    pub struct ProviderPreferences => ProviderPreferencesPatch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub order: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub only: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub ignore: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_fallbacks: Option<bool> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub require_parameters: Option<bool> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_collection: Option<DataCollection> => default,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub quantizations: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub zdr: Option<bool> => default,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCollection {
+    Allow,
+    Deny,
+}
+
+impl Routing {
+    fn fields(&self) -> Vec<(BodyPath, serde_json::Value)> {
+        let mut every = Vec::new();
+        if self.provider != ProviderPreferences::default() {
+            let provider = serde_json::to_value(&self.provider).expect("preferences serialize");
+            every.push((const { path("provider") }, provider));
+        }
+        if !self.fallback_models.is_empty() {
+            every.push((const { path("models") }, json!(self.fallback_models)));
+        }
+        every
     }
 }
 
@@ -172,7 +255,7 @@ pub type Options = crate::provider::settings::Empty;
 crate::provider::settings::settings! {
     #[derive(Default)]
     pub struct Config => Patch {
-        /// Chat only: provider routing preferences and fallback models.
+        /// Provider routing preferences and fallback models.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub routing: Option<Routing> => object(Routing),
         /// Cache breakpoint lifetime for models that take one.
@@ -185,36 +268,38 @@ crate::provider::settings::settings! {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("routing applies only to the chat_completions codec")]
-    RoutingNeedsChat,
-}
-
 impl DialectConfig for Config {
     fn base_url() -> BaseUrl {
         BaseUrl::Default("https://openrouter.ai/api/v1")
     }
 
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
-        if self.routing.is_some() && codec != CodecName::ChatCompletions {
-            return Err(Error::RoutingNeedsChat.into());
-        }
         let transport = transport(codec);
+        // Each codec keeps its own family's conventions.
+        let openai = |mut codec| {
+            super::openai::conventions(&mut codec);
+            codec
+        };
         let mut codec = match codec {
-            CodecName::ChatCompletions => {
-                Codec::ChatCompletions(chat(self.cache_ttl, self.routing.clone()))
-            }
-            CodecName::Responses => Codec::Responses(super::openai::responses()),
+            CodecName::ChatCompletions => openai(Codec::ChatCompletions(chat())),
+            CodecName::Responses => openai(Codec::Responses(responses::Dialect {
+                cache_control: CacheControl::Sent { ttl: None },
+                unsigned: UnsignedReasoning::Replayed(()),
+                ..super::openai::responses()
+            })),
             CodecName::Messages => Codec::Messages(messages::Dialect {
-                cache_ttl: self.cache_ttl,
+                tool_names: ToolNames::Anthropic,
                 ..messages::Dialect::standard()
             }),
         };
+        if let Some(ttl) = codec.cache_ttl_mut() {
+            *ttl = self.cache_ttl;
+        }
         codec.identity_mut().cache_key = Locations::one(header("x-session-id"));
         let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
         profile.state_role(self.state_role, StateRole::User);
         if let Some(routing) = &self.routing {
+            profile.transport.fields.every = routing.fields();
             profile.discriminate("routing", routing);
         }
         for (name, value) in [
@@ -232,23 +317,33 @@ mod tests {
     use super::*;
     use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
 
+    const CODECS: [CodecName; 3] = [
+        CodecName::ChatCompletions,
+        CodecName::Responses,
+        CodecName::Messages,
+    ];
+
     #[test]
     fn replay_identity_tracks_routing_not_cache_lifetime() {
-        let scope = |yaml| {
-            crate::yaml::parse::<Config>(yaml)
-                .unwrap()
-                .admit(CodecName::ChatCompletions)
-                .unwrap()
-                .scope
-        };
-        assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
-        let routed = scope("routing: {order: [first], fallback_models: [backup]}");
-        for other in [
-            "{}",
-            "routing: {order: [second], fallback_models: [backup]}",
-            "routing: {order: [first], fallback_models: [other]}",
-        ] {
-            assert_ne!(routed, scope(other));
+        for codec in CODECS {
+            let scope = |yaml| {
+                crate::yaml::parse::<Config>(yaml)
+                    .unwrap()
+                    .admit(codec)
+                    .unwrap()
+                    .scope
+            };
+            assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
+            let routed = scope("routing: {order: [first], fallback_models: [backup]}");
+            for other in [
+                "{}",
+                "routing: {order: [second], fallback_models: [backup]}",
+                "routing: {order: [first], fallback_models: [other]}",
+                "routing: {order: [first], only: [first], fallback_models: [backup]}",
+                "routing: {order: [first], ignore: [second], fallback_models: [backup]}",
+            ] {
+                assert_ne!(routed, scope(other), "{codec}: {other}");
+            }
         }
     }
 
@@ -258,12 +353,12 @@ mod tests {
         use serde_json::json;
 
         let lower: Patch = serde_json::from_value(json!({"routing": {
-            "order": ["first"], "allow_fallbacks": true,
+            "order": ["first"], "only": ["first", "second"], "allow_fallbacks": true,
             "require_parameters": true, "fallback_models": ["fallback"]
         }}))
         .unwrap();
         let higher_json = json!({"routing": {
-            "order": [], "allow_fallbacks": false, "require_parameters": null
+            "order": [], "ignore": ["third"], "allow_fallbacks": false, "require_parameters": null
         }});
         let higher: Patch = serde_json::from_value(higher_json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&higher).unwrap(), higher_json);
@@ -271,6 +366,8 @@ mod tests {
         let config = Config::resolve(&merged).unwrap();
         let routing = config.routing.unwrap();
         assert!(routing.provider.order.is_empty());
+        assert_eq!(routing.provider.only, ["first", "second"]);
+        assert_eq!(routing.provider.ignore, ["third"]);
         assert_eq!(routing.provider.allow_fallbacks, Some(false));
         assert_eq!(routing.provider.require_parameters, None);
         assert_eq!(routing.fallback_models, ["fallback"]);
@@ -285,6 +382,118 @@ mod tests {
         );
         assert_eq!(lower.overlay(&empty), lower);
         assert!(serde_json::from_value::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
+    }
+
+    /// Chat marks the system prompt and each earlier request's prefix end within the
+    /// strictest upstream cap, so an upstream that reads only at marked boundaries
+    /// reuses the previous request's cache; the oldest seams give way first.
+    #[test]
+    fn chat_keeps_earlier_prefix_ends_within_the_breakpoint_budget() {
+        use crate::provider::{
+            codec::{Cache, common::tests::user},
+            protocol::{AssistantItem, Message, SystemSegment, entries},
+        };
+        let mut codec = Config::default()
+            .admit(CodecName::ChatCompletions)
+            .unwrap()
+            .codec;
+        *codec.cache_mut().unwrap() = Cache::Explicit;
+        let mut request = super::super::tests::request();
+        request.system = vec![SystemSegment {
+            text: "stable".into(),
+            cache: true,
+        }];
+        let marked = |request: &crate::provider::protocol::ModelRequest| -> Vec<bool> {
+            let context = "session".parse().unwrap();
+            let body = codec.encode(request, &context).unwrap().body;
+            let messages = body["messages"].as_array().unwrap();
+            messages
+                .iter()
+                .map(|message| message.to_string().contains("cache_control"))
+                .collect()
+        };
+        assert_eq!(marked(&request), [true, true]);
+        let exchange = |request: &mut crate::provider::protocol::ModelRequest, turn| {
+            let answer = AssistantItem::text("a", 0, "answer");
+            (request.context).extend(entries([Message::Assistant(vec![answer]), user(turn)]));
+        };
+        exchange(&mut request, "two");
+        assert_eq!(marked(&request), [true, true, false, true]);
+        exchange(&mut request, "three");
+        exchange(&mut request, "four");
+        // The system prompt and the three newest prefix ends fill the budget.
+        assert_eq!(
+            marked(&request),
+            [true, false, false, true, false, true, false, true]
+        );
+        // A history without text adds no breakpoint of its own, so a system prompt
+        // filling the budget still fits.
+        let image = crate::provider::codec::common::tests::image();
+        request.blobs.insert(image.blob, b"\x01".to_vec());
+        request.system = vec![request.system[0].clone(); 4];
+        request.context = entries([Message::User(vec![
+            crate::provider::protocol::UserContent::Attachment {
+                attachment: crate::media::AttachmentRef::Image(image),
+            },
+        ])]);
+        let context = "session".parse().unwrap();
+        let body = codec.encode(&request, &context).unwrap().body;
+        let markers = serde_json::Value::Object(body).to_string();
+        assert_eq!(markers.matches("cache_control").count(), 4);
+    }
+
+    /// Every codec's body carries the preferences and fallbacks; a response
+    /// schema forces parameter support, with or without routing.
+    #[tokio::test]
+    async fn routing_rides_every_codec_body() {
+        use crate::provider::{
+            dialect::tests::{request, sent},
+            protocol::ResponseSchema,
+        };
+        use serde_json::json;
+        let parse = |text: &str| crate::yaml::parse::<Config>(text);
+        assert!(parse("routing: {sort: price}").is_err());
+        let routed = parse(
+            "routing: {order: [a], only: [a, b/turbo], ignore: [c], allow_fallbacks: false, fallback_models: [x/y]}",
+        )
+        .unwrap();
+        let mut constrained = request();
+        constrained.response_schema = Some(
+            ResponseSchema::new(
+                "answer",
+                json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+            )
+            .unwrap(),
+        );
+        // Placements stay clear of the fields routing adds.
+        let profile = routed.admit(CodecName::Responses).unwrap();
+        let placed: super::super::Placements =
+            crate::yaml::parse("cache_key: {body: provider.sort}").unwrap();
+        let codec = placed.apply(profile.codec).unwrap();
+        assert!(matches!(
+            super::super::placements::check(&codec, &profile.transport.fields),
+            Err(super::super::PlacementError::Reserved { .. })
+        ));
+        crate::tests::bounded(async {
+            for codec in CODECS {
+                let (_, body) = sent(&routed, codec, "k", request()).await;
+                assert_eq!(
+                    body["provider"],
+                    json!({"order":["a"], "only":["a","b/turbo"], "ignore":["c"], "allow_fallbacks":false}),
+                    "{codec}"
+                );
+                assert_eq!(body["models"], json!(["x/y"]), "{codec}");
+                let (_, body) = sent(&routed, codec, "k", constrained.clone()).await;
+                assert_eq!(body["provider"]["require_parameters"], true, "{codec}");
+                assert_eq!(body["provider"]["only"], json!(["a","b/turbo"]), "{codec}");
+                let (_, body) = sent(&Config::default(), codec, "k", constrained.clone()).await;
+                assert_eq!(body["provider"], json!({"require_parameters":true}), "{codec}");
+                assert!(body.get("models").is_none());
+                let (_, body) = sent(&Config::default(), codec, "k", request()).await;
+                assert!(body.get("provider").is_none());
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -338,8 +547,8 @@ mod tests {
         );
     }
 
-    /// Moderation is named by its reasons; a 402 is transient only with a
-    /// retry hint.
+    /// Moderation is named by its reasons, and a 403 without them stays an
+    /// authentication failure; a 402 is transient only with a retry hint.
     #[test]
     fn moderation_and_retry_hints_name_the_condition() {
         use crate::provider::{ProviderErrorKind, dialect::tests::rejected};
@@ -355,21 +564,14 @@ mod tests {
             ),
             ProviderErrorKind::InvalidRequest
         );
+        for native in [
+            json!({"error":{"code":403,"message":"forbidden"}}),
+            json!({"error":{"code":403,"message":"forbidden","metadata":{"reasons":null}}}),
+        ] {
+            assert_eq!(kind(403, native, None), ProviderErrorKind::Authentication);
+        }
         let hint = Some(Duration::from_secs(3));
         assert_eq!(kind(402, json!({}), hint), ProviderErrorKind::Unavailable);
         assert_eq!(kind(402, json!({}), None), ProviderErrorKind::Billing);
-    }
-
-    #[test]
-    fn routing_is_chat_only_and_parsed_strictly() {
-        let parse = |text: &str| crate::yaml::parse::<Config>(text);
-        let routed =
-            parse("routing: {order: [anthropic], zdr: true, fallback_models: [x/y]}").unwrap();
-        assert!(parse("routing: {sort: price}").is_err());
-        assert!(routed.admit(CodecName::ChatCompletions).is_ok());
-        assert_eq!(
-            routed.admit(CodecName::Messages).unwrap_err(),
-            Error::RoutingNeedsChat.into()
-        );
     }
 }

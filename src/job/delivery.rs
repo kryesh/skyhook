@@ -71,6 +71,7 @@ impl Notification {
     /// Commit the owner's `message` presenting this batch, after the owner's
     /// `preceding` entries that apply to it, with an acknowledgement row for each
     /// job outcome and child reply it delivers, in one transaction. Refused
+    /// [`JobError::Interrupted`] once the owner's turn is not busy, and
     /// [`JobError::Stale`] when any of them is no longer pending as it was read, so
     /// the owner presents what is pending now instead.
     pub(crate) async fn commit(
@@ -87,6 +88,9 @@ impl Notification {
         } = self;
         let store = manager.inner.store.clone();
         let notify = move |state: &CoreState| {
+            if !state.agents.busy(&owner) {
+                return Err(JobError::Interrupted);
+            }
             let jobs = &state.jobs.entries;
             let current = deliveries.iter().all(|Delivery { job, stamp }| {
                 jobs.get(job).is_some_and(|entry| {
@@ -202,7 +206,8 @@ impl JobManager {
                     if remaining == 0 {
                         break;
                     }
-                    let metadata = serde_json::to_vec(&envelope)
+                    let metadata = envelope.metadata_view(&CapabilitySet::default());
+                    let metadata = serde_json::to_vec(&metadata)
                         .map_or(output::PAGE_BYTES, |bytes| bytes.len());
                     let cost = output::presented_size(&output)
                         .saturating_add(metadata)
@@ -377,27 +382,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_replay_old_notification_does_not_acknowledge_resumed_completion() {
-        let (_root, manager, owner, job) = completed_job().await;
-        commit_pending(&manager, &owner, notification(job, JobState::Completed)).await;
-        let running = SessionEvent::JobStateChanged {
-            job,
-            state: JobTransition::Running,
-        };
-        manager.test_append(owner.clone(), running).await;
-        let finished = SessionEvent::JobFinished {
-            job,
-            state: JobEnd::Completed,
-            diagnostic: None,
-            output_diagnostic: None,
-            images: Vec::new(),
-        };
-        manager.test_append(owner.clone(), finished).await;
-        assert!(manager.test_replay().has_pending(&owner));
-    }
-
-    /// A delivered question never suppresses the job's later terminal delivery.
-    #[tokio::test]
     async fn delivery_question_ack_does_not_suppress_later_terminal_result() {
         for cancelled in [false, true] {
             let (_root, manager, owner, job) = question_job().await;
@@ -468,7 +452,7 @@ mod tests {
         manager.test_finish(job, serde_json::json!("done")).await;
         let first = presented(&manager, job).await;
         manager.send(job, serde_json::json!("again")).await.unwrap();
-        crate::tests::bounded(manager.wait(job, None, false))
+        crate::tests::bounded(manager.wait(job, false))
             .await
             .unwrap();
         manager.acknowledge(first).await.unwrap();
@@ -488,19 +472,10 @@ mod tests {
             .request_input(lease.id(), question("q-2"))
             .await
             .unwrap();
-        let question_view = manager.wait(lease.id(), None, true).await.unwrap();
+        let question_view = manager.wait(lease.id(), true).await.unwrap();
         assert_eq!(question_view.state, JobState::WaitingInput);
         assert_eq!(question_view.question, Some(question("q-2")));
         assert!(!manager.has_pending(&agent));
-        // Nothing changes, so this wait returns at its deadline.
-        let repeated = manager
-            .wait(lease.id(), Some(Duration::from_millis(1)), true)
-            .await
-            .unwrap();
-        assert_eq!(
-            (repeated.state, repeated.envelope.question),
-            (JobState::WaitingInput, None)
-        );
         manager.resume_input(lease.id()).await.unwrap();
         manager
             .request_input(lease.id(), question("q-3"))

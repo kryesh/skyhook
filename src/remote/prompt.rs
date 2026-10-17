@@ -71,7 +71,6 @@ impl SensitivePrompt {
 impl SensitivePromptKind {
     /// Host-key and agent-key prompts are answered `Confirmed` or `Rejected`;
     /// every other kind is answered with a `Secret`.
-    #[must_use]
     pub const fn is_confirmation(self) -> bool {
         matches!(self, Self::HostConfirmation | Self::AgentConfirmation)
     }
@@ -93,7 +92,6 @@ impl SecretValue {
         Self(Zeroizing::new(value))
     }
 
-    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }

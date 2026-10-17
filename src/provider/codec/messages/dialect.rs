@@ -3,15 +3,11 @@ use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::provider::{
     codec::{
-        BodyPath, CacheTtl, Effort, EffortLevels, Identity, NonEmpty, StateRole, ToolNames, path,
+        BodyPath, BreakpointBudget, CacheTtl, Identity, NonEmpty, StateRole, ToolNames,
+        UnsignedReasoning, path,
     },
     http::{Headers, headers::Value},
 };
-
-/// Messages thinking settings: `off` and `adaptive` select a thinking mode;
-/// the rest are `output_config.effort` levels under adaptive thinking.
-const MESSAGES_EFFORT: EffortLevels =
-    EffortLevels(&["off", "adaptive", "low", "medium", "high", "xhigh", "max"]);
 
 /// What happens to a signed thinking block whose conversation prefix changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,30 +39,34 @@ pub(crate) const BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-be
 pub(crate) struct Dialect {
     /// Where `max_output` goes; the API requires it.
     pub output_limit: NonEmpty<BodyPath>,
-    pub effort: Effort,
-    pub tool_names: ToolNames,
+    /// Where the profile's `reasoning` goes.
+    pub effort: NonEmpty<BodyPath>,
     pub identity: Identity,
     /// Lifetime written on each cache breakpoint; None takes the service default.
     pub cache_ttl: Option<CacheTtl>,
+    pub breakpoints: BreakpointBudget,
     pub thinking_binding: ThinkingBinding,
+    pub tool_names: ToolNames,
     pub state_role: StateRole,
     pub system_state: SystemState,
+    /// Thinking without a signature.
+    pub unsigned: UnsignedReasoning,
 }
 
 impl Dialect {
     pub(crate) fn standard() -> Self {
         Self {
             output_limit: NonEmpty::one(const { path("max_tokens") }),
-            effort: Effort {
-                path: NonEmpty::one(const { path("output_config.effort") }),
-                levels: MESSAGES_EFFORT,
-            },
-            tool_names: ToolNames::Anthropic,
+            effort: NonEmpty::one(const { path("output_config.effort") }),
             identity: Identity::NONE,
             cache_ttl: None,
+            // The service's cap on cache breakpoints per request.
+            breakpoints: BreakpointBudget::new(4),
             thinking_binding: ThinkingBinding::Unenforced,
+            tool_names: ToolNames::Any,
             state_role: StateRole::User,
             system_state: SystemState::Plain,
+            unsigned: UnsignedReasoning::Replayed(()),
         }
     }
 

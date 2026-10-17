@@ -16,7 +16,7 @@ use super::{
 use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
-    target::{ResolvedRoute, Route, RouteIdentity, TargetDefinition},
+    target::{Revisions, Route, TargetDefinition},
     tool::authorization::AuthorizationError,
     tool::{ToolContext, ToolOutput},
 };
@@ -43,7 +43,7 @@ struct PooledSlot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ConnectionKey {
-    route: RouteIdentity,
+    route: Revisions,
     workspace: PathBuf,
 }
 
@@ -150,14 +150,14 @@ impl RemoteManager {
     /// too, so a startup it admits is one any later invalidation sees.
     pub(crate) fn connection<'a>(
         &'a self,
-        route: ResolvedRoute,
+        route: Route,
         workspace: &'a Path,
         cancellation: &'a CancellationToken,
         admitted: &'a (dyn Fn() -> Result<(), RemoteError> + Sync),
     ) -> BoxFuture<'a, Result<PreparedConnection, RemoteError>> {
         Box::pin(async move {
             let key = ConnectionKey {
-                route: route.identity().clone(),
+                route: route.identity(),
                 workspace: workspace.to_path_buf(),
             };
             let slot = {
@@ -242,7 +242,7 @@ impl RemoteManager {
     /// keep running.
     pub(crate) fn invalidate(&self, redefined: &[TargetDefinition]) {
         self.pool().retain(|key, slot| {
-            let replaced = crate::target::replaces(redefined, &key.route.revisions());
+            let replaced = crate::target::replaces(redefined, &key.route);
             if replaced {
                 slot.startup.cancel();
             }
@@ -252,11 +252,11 @@ impl RemoteManager {
 
     async fn connect(
         &self,
-        resolved_route: &ResolvedRoute,
+        route: &Route,
         workspace: &Path,
         startup: &CancellationToken,
     ) -> Result<Session, RemoteError> {
-        let Route { hops, destination } = resolved_route.route();
+        let Route { hops, destination } = route;
         let location = ExecutionLocation::named(destination.name.clone(), workspace.to_owned());
         // The destination's origin starts this connection's SSH process on its shim;
         // the hops after it are native jumps of that process.
@@ -266,10 +266,10 @@ impl RemoteManager {
                 let index = hops.iter().position(|hop| &hop.name == origin).ok_or(
                     RemoteError::Protocol(ProtocolError::Violation("origin missing from route")),
                 )?;
-                let prefix = ResolvedRoute::new(Route {
+                let prefix = Route {
                     hops: hops[..index].to_vec(),
                     destination: hops[index].clone(),
-                });
+                };
                 // Once this startup stops, it starts no origin connection.
                 let redefined = || AuthorizationError::TargetRedefined.into();
                 let running = || {
@@ -284,15 +284,14 @@ impl RemoteManager {
                 (Some(prepared.connection), &hops[index + 1..])
             }
         };
-        let route = Route {
-            hops: hops.to_vec(),
-            destination: destination.clone(),
-        };
         let mut transport = self
             .inner
             .factory
             .connect(ConnectionRequest {
-                route,
+                route: Route {
+                    hops: hops.to_vec(),
+                    destination: destination.clone(),
+                },
                 workspace: workspace.to_path_buf(),
                 origin: origin.clone(),
             })
@@ -304,7 +303,7 @@ impl RemoteManager {
             PooledConnection::from_transport(
                 transport,
                 location,
-                resolved_route.identity().revisions(),
+                route.identity(),
                 self.inner.prompts.clone(),
                 &self.inner.tasks,
                 self.inner.shutdown.child_token(),
@@ -320,7 +319,6 @@ pub(crate) mod tests {
     use crate::remote::{
         RejectSensitivePrompts,
         backend::Transport,
-        client::test_transport,
         protocol::{Request, Response, read_frame, write_frame},
     };
     use crate::{target::TargetDefinition, tests::bounded};
@@ -335,14 +333,6 @@ pub(crate) mod tests {
         workspace: PathBuf,
     }
 
-    #[derive(Default)]
-    struct RecordingFactory {
-        requests: std::sync::Mutex<Vec<RecordedRequest>>,
-        invalid: AtomicBool,
-        rejected_owners: Arc<AtomicUsize>,
-        origins: std::sync::Mutex<Vec<std::sync::Weak<PooledConnection>>>,
-    }
-
     /// Counts transport-owner drops, aborting any fake shim task it owns.
     struct DropCounter(Arc<AtomicUsize>, Option<tokio::task::JoinHandle<()>>);
 
@@ -355,7 +345,53 @@ pub(crate) mod tests {
         }
     }
 
-    impl ConnectionFactory for RecordingFactory {
+    /// Starts fake shims, recording each request; a shim holds its handshake until
+    /// `ready` has a permit. While `invalid`, transports never answer the handshake.
+    pub(crate) struct ShimFactory {
+        pub starts: AtomicUsize,
+        hello: Arc<Semaphore>,
+        pub ready: Arc<Semaphore>,
+        dropped: Arc<AtomicUsize>,
+        invalid: AtomicBool,
+        requests: std::sync::Mutex<Vec<RecordedRequest>>,
+        origins: std::sync::Mutex<Vec<std::sync::Weak<PooledConnection>>>,
+    }
+
+    impl ShimFactory {
+        /// Shims whose handshake waits for `ready`.
+        pub fn new() -> Arc<Self> {
+            Self::with_ready(0)
+        }
+
+        /// Shims that answer their handshake at once.
+        fn answering() -> Arc<Self> {
+            Self::with_ready(Semaphore::MAX_PERMITS)
+        }
+
+        fn with_ready(permits: usize) -> Arc<Self> {
+            Arc::new(Self {
+                starts: AtomicUsize::new(0),
+                hello: Arc::new(Semaphore::new(0)),
+                ready: Arc::new(Semaphore::new(permits)),
+                dropped: Arc::new(AtomicUsize::new(0)),
+                invalid: AtomicBool::new(false),
+                requests: Default::default(),
+                origins: Default::default(),
+            })
+        }
+
+        pub async fn wait_for_hello(&self) {
+            bounded(self.hello.acquire()).await.unwrap().forget();
+        }
+
+        /// (transports started, transport owners dropped)
+        pub fn counts(&self) -> (usize, usize) {
+            let starts = self.starts.load(Ordering::SeqCst);
+            (starts, self.dropped.load(Ordering::SeqCst))
+        }
+    }
+
+    impl ConnectionFactory for ShimFactory {
         fn connect(
             &self,
             request: ConnectionRequest,
@@ -374,62 +410,14 @@ pub(crate) mod tests {
                 workspace: request.workspace,
             });
             Box::pin(async move {
-                if !self.invalid.load(Ordering::SeqCst) {
-                    return Ok(test_transport(None));
-                }
-                Ok(Transport {
-                    input: Box::new(tokio::io::sink()),
-                    output: Box::new(tokio::io::empty()),
-                    owner: Box::new(DropCounter(self.rejected_owners.clone(), None)),
-                })
-            })
-        }
-    }
-
-    fn manager(factory: Arc<dyn ConnectionFactory>) -> RemoteManager {
-        let prompts = Arc::new(RejectSensitivePrompts);
-        RemoteManager::new(
-            EmbeddedShimCatalog::default(),
-            prompts,
-            None,
-            Default::default(),
-        )
-        .with_connection_factory(factory)
-    }
-
-    /// Counts transports it starts and holds each shim handshake until `ready` has a permit.
-    pub(crate) struct PendingHandshakeFactory {
-        pub starts: AtomicUsize,
-        hello: Arc<Semaphore>,
-        pub ready: Arc<Semaphore>,
-        dropped: Arc<AtomicUsize>,
-    }
-
-    impl PendingHandshakeFactory {
-        pub fn new() -> Arc<Self> {
-            Arc::new(Self {
-                starts: AtomicUsize::new(0),
-                hello: Arc::new(Semaphore::new(0)),
-                ready: Arc::new(Semaphore::new(0)),
-                dropped: Arc::new(AtomicUsize::new(0)),
-            })
-        }
-
-        pub async fn wait_for_hello(&self) {
-            bounded(self.hello.acquire()).await.unwrap().forget();
-        }
-
-        /// (transports started, transport owners dropped)
-        pub fn counts(&self) -> (usize, usize) {
-            let starts = self.starts.load(Ordering::SeqCst);
-            (starts, self.dropped.load(Ordering::SeqCst))
-        }
-    }
-
-    impl ConnectionFactory for PendingHandshakeFactory {
-        fn connect(&self, _: ConnectionRequest) -> BoxFuture<'_, Result<Transport, RemoteError>> {
-            Box::pin(async move {
                 self.starts.fetch_add(1, Ordering::SeqCst);
+                if self.invalid.load(Ordering::SeqCst) {
+                    return Ok(Transport {
+                        input: Box::new(tokio::io::sink()),
+                        output: Box::new(tokio::io::empty()),
+                        owner: Box::new(DropCounter(self.dropped.clone(), None)),
+                    });
+                }
                 let (hello, ready) = (self.hello.clone(), self.ready.clone());
                 let (client, mut shim) = tokio::io::duplex(4096);
                 let shim = tokio::spawn(async move {
@@ -453,16 +441,27 @@ pub(crate) mod tests {
         }
     }
 
-    fn route(mut hops: Vec<TargetDefinition>) -> ResolvedRoute {
+    fn manager(factory: Arc<dyn ConnectionFactory>) -> RemoteManager {
+        let prompts = Arc::new(RejectSensitivePrompts);
+        RemoteManager::new(
+            EmbeddedShimCatalog::default(),
+            prompts,
+            None,
+            Default::default(),
+        )
+        .with_connection_factory(factory)
+    }
+
+    fn route(mut hops: Vec<TargetDefinition>) -> Route {
         let destination = hops.pop().unwrap();
-        ResolvedRoute::new(Route { hops, destination })
+        Route { hops, destination }
     }
 
     fn admitted() -> Result<(), RemoteError> {
         Ok(())
     }
 
-    fn build_route() -> ResolvedRoute {
+    fn build_route() -> Route {
         route(vec![TargetDefinition::test("build", "/build", None)])
     }
 
@@ -541,10 +540,11 @@ pub(crate) mod tests {
                     read_frame::<_, Request>(&mut shim).await.unwrap(),
                     Some(Request::Cancel { .. })
                 ));
-                assert!(matches!(
-                    abandoned.await.unwrap(),
-                    Err(RemoteError::Cancelled)
-                ));
+                let Err(error) = abandoned.await.unwrap() else {
+                    panic!("an abandoned call returned a result");
+                };
+                let cause = error.into_tool_error().diagnostic().cause;
+                assert_eq!(cause, crate::tool::diagnostic::Cause::Cancelled);
 
                 let caller = fixture_context(&runtime);
                 let completing =
@@ -565,12 +565,11 @@ pub(crate) mod tests {
 
                 // Hold the shared database connection: A's capture open blocks, and an
                 // append queued behind it; both accepted data chunks remain queued.
-                let (reached, resume) = runtime.store.hold_connection();
+                let held = crate::session::tests::hold_connection(&runtime.store);
                 let accepted = tokio::spawn({
                     let (store, agent) = (runtime.store.clone(), runtime.agent.clone());
                     async move { store.append(agent, SessionEvent::AgentInterrupted).await }
                 });
-                reached.await.unwrap();
                 for event in [
                     CaptureEvent::Open {
                         id: CaptureId::FIRST,
@@ -601,11 +600,8 @@ pub(crate) mod tests {
                         &mut shim,
                         RequestId::new(2),
                         Ok(crate::remote::protocol::RemoteToolOutput {
-                            diagnostic: None,
                             value: serde_json::json!("second"),
-                            images: Vec::new(),
-                            captures: Vec::new(),
-                            streams: Default::default(),
+                            ..Default::default()
                         }),
                     )
                     .await;
@@ -643,7 +639,7 @@ pub(crate) mod tests {
                     futures_util::poll!(&mut closing).is_pending(),
                     "session shutdown must await the accepted payload drain"
                 );
-                resume.send(()).unwrap();
+                drop(held);
                 drop(accepted);
                 closing.await;
                 assert_eq!(
@@ -657,7 +653,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn every_factory_uses_common_handshake_and_failed_slots_are_retryable() {
-        let factory = Arc::new(RecordingFactory::default());
+        let factory = ShimFactory::answering();
         factory.invalid.store(true, Ordering::SeqCst);
         let manager = manager(factory.clone());
         let cancellation = CancellationToken::new();
@@ -684,7 +680,7 @@ pub(crate) mod tests {
         assert!(
             matches!(error.cause, crate::tool::diagnostic::Cause::Message(message) if message.contains("invalid shim handshake"))
         );
-        assert_eq!(factory.rejected_owners.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.counts(), (1, 1));
         assert!(manager.pool().is_empty());
         factory.invalid.store(false, Ordering::SeqCst);
         let first = connect().await.unwrap();
@@ -696,7 +692,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn startup_outlives_a_cancelled_waiter_and_is_shared_with_pending_and_later_waiters() {
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let manager = manager(factory.clone());
         let (cancelled, survivor) = (CancellationToken::new(), CancellationToken::new());
         let first = manager.connection(build_route(), Path::new("/build"), &cancelled, &admitted);
@@ -725,7 +721,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn shutdown_drops_transport_during_shared_pending_handshake() {
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let manager = manager(factory.clone());
         let cancellation = CancellationToken::new();
         let first =
@@ -748,7 +744,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn factory_receives_only_route_after_ssh_origin() {
-        let factory = Arc::new(RecordingFactory::default());
+        let factory = ShimFactory::answering();
         let manager = manager(factory.clone());
         let origin = TargetDefinition::test("origin", "/origin", None);
         let mut via = TargetDefinition::test("via", "/via", None);

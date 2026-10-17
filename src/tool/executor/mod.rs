@@ -16,10 +16,12 @@ use crate::{
     identity::{AgentId, JobId},
     job::{JobManager, JobSpec, JobState},
     remote::RemoteError,
-    target::{ResolvedRoute, TargetRef, TargetRouter},
+    target::{Route, TargetRef, TargetRouter},
     tool::{
         ToolPlacement,
-        authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
+        authorization::{
+            Asking, AuthorizationCoordinator, AuthorizationError, AuthorizationSubject,
+        },
         diagnostic::{
             Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic, PathFact,
             Subject,
@@ -32,17 +34,10 @@ use crate::{
 use super::{ScriptBinding, ToolContext, ToolError, ToolExposure, ToolOutput, ToolRegistry};
 
 #[derive(Clone, Copy)]
-enum InvocationKind {
+pub(crate) enum InvocationKind {
     Host,
     Model,
     Script,
-}
-
-struct PreparedInvocation {
-    tool: Arc<crate::tool::RegisteredTool>,
-    original_arguments: Arguments,
-    handler_arguments: Arguments,
-    envelope: ExecutionEnvelope,
 }
 
 struct InvocationPlan {
@@ -54,8 +49,10 @@ struct InvocationPlan {
     caller_location: ExecutionLocation,
     execution_location: ExecutionLocation,
     /// Where the job reports it acts: the execution location, unless the input
-    /// places it elsewhere.
+    /// places it elsewhere, with its workspace as written.
     job_location: ExecutionLocation,
+    /// Where it runs: `job_location`, with a local workspace resolved.
+    job_runs_in: ExecutionLocation,
     permissions: Vec<PermissionUse>,
     path_facts: Vec<PathFact>,
     parent: Option<JobId>,
@@ -64,6 +61,9 @@ struct InvocationPlan {
     result_policy: super::ToolResultPolicy,
     dispatch: InvocationDispatch<PlannedRemote>,
     source: Option<SourcePlan<PlannedRemote>>,
+    /// How the call fails once authorized, which may not ask anyone, when a
+    /// path it names outside the root does not resolve.
+    unresolved: Option<ToolError>,
 }
 
 /// The read of a tool's source argument, planned and authorized with the call it
@@ -84,12 +84,11 @@ enum SourcePlan<R> {
 /// connection afterwards; local dispatch is unchanged by that transition.
 enum InvocationDispatch<R> {
     Local(super::registry::AdmittedInvocation),
-    ReadError(Box<ToolOutput>),
     Remote { remote: R, arguments: Arguments },
 }
 
 struct PlannedRemote {
-    route: ResolvedRoute,
+    route: Route,
     router: TargetRouter,
 }
 
@@ -194,7 +193,6 @@ impl ToolExecutor {
         self
     }
 
-    #[must_use]
     pub fn registry(&self) -> &ToolRegistry {
         &self.shared.registry
     }
@@ -203,7 +201,6 @@ impl ToolExecutor {
         super::diagnostic::DiagnosticViewer::new(&self.capabilities, &self.caller_location)
     }
 
-    #[must_use]
     pub fn jobs(&self) -> &JobManager {
         &self.shared.jobs
     }
@@ -219,31 +216,7 @@ impl ToolExecutor {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn execute_model(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ToolError> {
-        self.execute_as(InvocationKind::Model, agent, name, arguments, parent)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn execute_script(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ToolError> {
-        self.execute_as(InvocationKind::Script, agent, name, arguments, parent)
-            .await
-    }
-
-    async fn execute_as(
+    pub(crate) async fn execute_as(
         &self,
         kind: InvocationKind,
         agent: AgentId,
@@ -255,34 +228,12 @@ impl ToolExecutor {
         self.run(created).await
     }
 
-    /// Plan a model call and publish its job without running it, so the calls of
-    /// one response can all be outstanding before any of them runs.
-    pub(crate) async fn create_model(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ToolError> {
-        self.create(InvocationKind::Model, agent, name, arguments, parent)
-            .await
-    }
-
-    /// Plan a script call and publish its job without running it.
-    pub(crate) async fn create_script(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ToolError> {
-        self.create(InvocationKind::Script, agent, name, arguments, parent)
-            .await
-    }
-
+    /// Plan a call and publish its job without running it, so the calls of one
+    /// response can all be outstanding before any of them runs.
+    ///
     /// Boxed, so agent loops prove the creation future `Send` at this boundary
     /// rather than through every type planning and publishing hold.
-    fn create<'a>(
+    pub(crate) fn create<'a>(
         &'a self,
         kind: InvocationKind,
         agent: AgentId,
@@ -340,8 +291,7 @@ impl ToolExecutor {
     }
 
     /// Authorize, launch and collect a created invocation, with the delivery
-    /// its result reports for the caller to acknowledge with its record. Boxed,
-    /// like `create`, so callers prove the run `Send` at this boundary.
+    /// its result reports for the caller to acknowledge with its record.
     pub(crate) fn run_reported(
         &self,
         created: CreatedInvocation,
@@ -354,15 +304,16 @@ impl ToolExecutor {
                 Ok(started) => started,
                 Err(error) => return Err(error.or(fallback)).into(),
             };
-            match kind {
+            let purpose = match kind {
                 InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
-                    self.collect_model_started(started).await
+                    return self.collect_model_started(started).await;
                 }
                 InvocationKind::Model | InvocationKind::Script => {
-                    self.collect_full_view_started(started, result_policy).await
+                    results::CollectionPurpose::Public(result_policy)
                 }
-                InvocationKind::Host => self.collect_started(started).await,
-            }
+                InvocationKind::Host => results::CollectionPurpose::Native,
+            };
+            self.collect_result(started, purpose).await
         })
     }
 }

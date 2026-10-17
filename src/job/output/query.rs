@@ -10,11 +10,12 @@ use struson::{
 };
 
 use super::{
-    FieldPointer, Match, MatchPage, OutputPreview, ToolError,
+    FieldPointer, Match, MatchPage, OutputPreview, ToolError, check_cancelled,
     elements::Budget,
-    json::saved_json,
-    preview::{Accounting, Pooled, json_bytes},
-    render::JsonField,
+    json::{self, saved_json},
+    preview::{self, Accounting, json_bytes},
+    projection::Presented,
+    render::{Clipped, JsonField},
     shape::Shape,
 };
 
@@ -33,9 +34,7 @@ pub(super) fn page(
     cancellation: &crate::job::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
     let value = read(json, INPUT_BYTES)?;
-    if cancellation.is_cancelled() {
-        return Err(ToolError::cancelled());
-    }
+    check_cancelled(cancellation)?;
     let located = path.query_located(&value);
     let total = located.len();
     let (mut matches, mut next, mut budget) = (Vec::new(), None, Budget::default());
@@ -48,7 +47,15 @@ pub(super) fn page(
         let at: FieldPointer = pointer
             .parse()
             .map_err(|_| ToolError::failed("a query match has no JSON Pointer"))?;
-        let pooled = Pooled::of(node.node().clone());
+        let bytes = serde_json::to_vec(node.node())?;
+        let pooled = preview::pool(
+            &mut json::reader(bytes.as_slice()),
+            &at,
+            &Presented::default(),
+            &Clipped::new(),
+            cancellation,
+            Accounting::Page,
+        )?;
         // The match's pointer and `{"at":…,"value":…}` count toward the page.
         let framing = json_bytes(&Match {
             at: at.clone(),
@@ -60,9 +67,7 @@ pub(super) fn page(
         };
         matches.push(Match { at, value });
     }
-    if cancellation.is_cancelled() {
-        return Err(ToolError::cancelled());
-    }
+    check_cancelled(cancellation)?;
     let (shape, truncated) = budget.finish();
     let shape = shape
         .or_else(|| (total == 0).then(|| Shape::of(&value).render(Accounting::Page.shape_bytes())));

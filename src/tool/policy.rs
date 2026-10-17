@@ -45,7 +45,6 @@ impl CapabilitySet {
         Self(BTreeSet::new())
     }
 
-    #[must_use]
     pub fn contains(&self, capability: Capability) -> bool {
         self.0.contains(&capability)
     }
@@ -209,12 +208,10 @@ impl PathText {
             })
     }
 
-    #[must_use]
     pub fn as_path(&self) -> &Path {
         Path::new(&self.0)
     }
 
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -374,7 +371,6 @@ impl ApprovalGrant {
         }
     }
 
-    #[must_use]
     pub fn covers(&self, capability: Capability, resource: &ResourceId) -> bool {
         self.capability == capability
             && match self.coverage {
@@ -383,7 +379,6 @@ impl ApprovalGrant {
             }
     }
 
-    #[must_use]
     pub fn permits(&self, grant: &Self) -> bool {
         self.covers(grant.capability, &grant.resource)
             && (self.coverage == ApprovalCoverage::Descendants
@@ -433,7 +428,6 @@ impl PermissionUse {
         }
     }
 
-    #[must_use]
     pub fn proposed_grant(&self) -> Option<ApprovalGrant> {
         self.proposed.map(|coverage| ApprovalGrant {
             capability: self.capability,
@@ -451,7 +445,6 @@ pub enum PathAccess {
 }
 
 impl PathAccess {
-    #[must_use]
     pub const fn capability(self) -> Capability {
         match self {
             Self::Read => Capability::Read,
@@ -481,19 +474,36 @@ impl PolicyDecision {
     pub const fn allow() -> Self {
         Self::Allow { grants: Vec::new() }
     }
+
+    /// A person's refusal. A request that may not ask anyone is refused this
+    /// way when its policy would ask, so the call cannot tell it went unasked.
+    #[must_use]
+    pub fn refused() -> Self {
+        Self::Deny {
+            reason: "denied by user".into(),
+        }
+    }
 }
 
 pub type PolicyFuture<'a> = Pin<Box<dyn Future<Output = PolicyDecision> + Send + 'a>>;
 
+/// How a policy answers a request.
+pub enum Approval<'a> {
+    /// Settled by the policy itself.
+    Decided(PolicyDecision),
+    /// Asked of someone, who is asked only once the future is first polled.
+    Ask(PolicyFuture<'a>),
+}
+
 pub trait Policy: Send + Sync {
-    fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_>;
+    fn authorize(&self, request: AuthorizationRequest) -> Approval<'_>;
 }
 
 pub struct AllowAll;
 
 impl Policy for AllowAll {
-    fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
-        Box::pin(async { PolicyDecision::allow() })
+    fn authorize(&self, _request: AuthorizationRequest) -> Approval<'_> {
+        Approval::Decided(PolicyDecision::allow())
     }
 }
 

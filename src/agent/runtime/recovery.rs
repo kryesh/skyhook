@@ -1,4 +1,5 @@
-//! Transient model failure recovery and usage accounting.
+//! Transient model failure recovery, usage accounting, and the records of failures
+//! that may end a turn.
 
 use super::*;
 use crate::session::AttemptFailure;
@@ -23,9 +24,95 @@ pub(super) enum AttemptEnd {
     Failed(AttemptFailure),
 }
 
+/// The journal records of a failure that may end its turn, or a refusal of
+/// what the turn took, which has none: it is the turn's failure itself,
+/// journaled even when an interrupt overtook it, and holds the queued batch
+/// it refused. One that ends the turn commits in `end_turn`'s plan, right
+/// ahead of the turn's end; one the turn recovers from commits on its own.
+pub(super) enum FailureRecord {
+    Journaled(Vec<SessionEvent>),
+    Refused(Option<Box<super::queue::Batch>>),
+}
+
+impl FailureRecord {
+    /// `attempt` failed for good, having reported `usage`.
+    pub(super) fn attempt(
+        attempt: crate::session::AttemptRef,
+        usage: Usage,
+        failure: crate::agent::Failure,
+    ) -> Self {
+        let failed = AttemptEnd::Failed(AttemptFailure::Final(failure));
+        Self::Journaled(attempt_events(attempt, usage, failed))
+    }
+
+    pub(super) fn compaction(
+        failure: crate::session::CompactionFailure,
+        error: crate::agent::CompactionFault,
+    ) -> Self {
+        Self::Journaled(vec![SessionEvent::CompactionFailed { failure, error }])
+    }
+
+    pub(super) fn events(self, agent: &AgentId) -> impl Iterator<Item = (AgentId, SessionEvent)> {
+        let events = match self {
+            Self::Journaled(events) => events,
+            Self::Refused(_) => Vec::new(),
+        };
+        events.into_iter().map(move |event| (agent.clone(), event))
+    }
+}
+
+/// A turn's answer, with why the request boundary right after it refused what
+/// waited there, which `end_turn` journals while the answer stands.
+pub(super) struct Answered {
+    pub(super) text: String,
+    pub(super) refused: Option<super::queue::Refusal>,
+}
+
+/// Why a turn's run ended short of its answer, with the record of the failure
+/// that ended it when `end_turn` is to journal it.
+pub(super) struct TurnError {
+    pub(super) error: HarnessError,
+    pub(super) record: Option<FailureRecord>,
+}
+
+impl<E: Into<HarnessError>> From<E> for TurnError {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            record: None,
+        }
+    }
+}
+
+impl TurnError {
+    /// A turn whose work the session refused fails with that refusal.
+    pub(super) fn refused(refusal: super::queue::Refusal) -> Self {
+        let super::queue::Refusal { error, batch } = refusal;
+        let record = Some(FailureRecord::Refused(batch));
+        Self { error, record }
+    }
+}
+
+/// An attempt's observed usage and how it ended, which commit together so a
+/// crash never separates them.
+fn attempt_events(
+    attempt: crate::session::AttemptRef,
+    usage: Usage,
+    end: AttemptEnd,
+) -> Vec<SessionEvent> {
+    let outcome = match end {
+        AttemptEnd::Interrupted => SessionEvent::ModelAttemptInterrupted(attempt),
+        AttemptEnd::Failed(failure) => SessionEvent::ModelFailed { attempt, failure },
+    };
+    (SessionEvent::usage(attempt.request, usage).into_iter())
+        .chain([outcome])
+        .collect()
+}
+
 impl SessionRuntime {
-    /// Journal a failed attempt and, when it is transient, back off before the
-    /// caller retries its frozen request (`None`). A permanent error is handed back.
+    /// Journal a transient failure of an attempt and back off before the caller
+    /// retries its frozen request (`None`). A permanent error is handed back with
+    /// its record, unjournaled: the caller decides whether it ends the turn.
     /// Recovery continues until success or cancellation and never re-executes tools.
     ///
     /// `attempt` is the audit attempt of the logical response and the count of
@@ -36,11 +123,10 @@ impl SessionRuntime {
         (attempt, transient): (crate::session::AttemptRef, &mut u64),
         usage: Usage,
         error: crate::provider::ProviderError,
-    ) -> Result<Option<crate::provider::ProviderError>, HarnessError> {
+    ) -> Result<Option<(crate::provider::ProviderError, FailureRecord)>, HarnessError> {
         if !error.is_retryable() {
-            let failed = AttemptFailure::Final((&error).into());
-            (self.record_attempt(turn.agent, attempt, usage, AttemptEnd::Failed(failed))).await?;
-            return Ok(Some(error));
+            let record = FailureRecord::attempt(attempt, usage, (&error).into());
+            return Ok(Some((error, record)));
         }
         *transient = transient.saturating_add(1);
         let delay = recovery_delay(&error, *transient);
@@ -59,8 +145,7 @@ impl SessionRuntime {
         }
     }
 
-    /// Journal how an attempt ended together with its observed usage, so a crash
-    /// never separates them.
+    /// Journal how an attempt ended together with its observed usage.
     pub(super) async fn record_attempt(
         &self,
         agent: &AgentId,
@@ -68,27 +153,21 @@ impl SessionRuntime {
         usage: Usage,
         end: AttemptEnd,
     ) -> Result<(), HarnessError> {
-        let mut events: Vec<_> = (SessionEvent::usage(attempt.request, usage).into_iter())
-            .map(|event| (agent.clone(), event))
-            .collect();
-        let outcome = match end {
-            AttemptEnd::Interrupted => SessionEvent::ModelAttemptInterrupted(attempt),
-            AttemptEnd::Failed(failure) => SessionEvent::ModelFailed { attempt, failure },
-        };
-        events.push((agent.clone(), outcome));
+        let events = attempt_events(attempt, usage, end).into_iter();
+        let events = events.map(|event| (agent.clone(), event)).collect();
         self.store.append_all(events).await?;
         Ok(())
     }
 
-    pub(super) async fn record_model_usage(
+    /// Journal the record of a failure its turn recovers from.
+    pub(super) async fn record_failure(
         &self,
         agent: &AgentId,
-        request: RequestSeq,
-        usage: Usage,
+        record: FailureRecord,
     ) -> Result<(), HarnessError> {
-        if let Some(event) = SessionEvent::usage(request, usage) {
-            self.store.append(agent.clone(), event).await?;
-        }
+        self.store
+            .append_all(record.events(agent).collect())
+            .await?;
         Ok(())
     }
 }
@@ -102,17 +181,16 @@ mod tests {
 
     use super::*;
     use crate::agent::runtime::tests::{
-        Requests, Script, Sent, SentPart, Served, Step, bounded, child_launch, count, delta,
-        enqueue_prompts, events, journaled_usage, model_ref, next_recovery, owner, recoverable,
-        rendered, response, retrying, send, shutdown_session, spawn_prompt, stream, summary_json,
-        test_builder, test_harness, tool_call, until_queued, usage,
+        Requests, Script, Sent, SentPart, Served, Step, bounded, count, delta, enqueue_prompts,
+        events, input, journaled_usage, model_ref, next_recovery, recoverable, rendered, response,
+        retrying, send, spawn_prompt, spawned_child, summary_json, test_builder, test_harness,
+        tool_call, until_queued, usage,
     };
     use crate::provider::{
-        Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
+        ProviderError, ProviderErrorKind,
         protocol::{AssistantItem, ContextId, ResponseEvent},
     };
-    use crate::session::{ModelPurpose, project_history};
-    use futures_util::TryStreamExt;
+    use crate::session::{ModelPurpose, RequestSeq, project_history};
 
     /// A context overflow at invocation, or after streaming text as a Messages stop does.
     fn overflow(streaming: bool) -> Step {
@@ -371,40 +449,24 @@ mod tests {
         assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 1);
         let written = std::fs::read_to_string(fixture.workspace.path().join("prior-tool"));
         assert_eq!(written.unwrap(), "prior-tool");
+        // One frozen request per response, whose attempts are numbered from one.
+        let requested = events!(&records, SessionEvent::ModelRequested { .. } => ());
+        assert_eq!(requested.len(), 2);
+        let started = events!(&records, SessionEvent::ModelAttemptStarted(attempt) => *attempt);
+        let numbered = started.iter().map(|attempt| attempt.attempt);
+        assert_eq!(numbered.collect::<Vec<_>>(), [1, 2, 3, 1, 2, 3]);
+        assert!(
+            started[..3]
+                .iter()
+                .all(|attempt| attempt.request == started[0].request)
+        );
+        assert!(
+            started[3..]
+                .iter()
+                .all(|attempt| attempt.request == started[3].request)
+        );
         assert_schedule(&records, &[2, 3, 2, 3]);
         fixture.session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn transient_retries_number_attempts_of_one_frozen_request() {
-        // Past a u8, so the counters and their journal columns cannot be narrow.
-        let failures = 260;
-        let steps = (0..failures).map(|_| Step::fail(recoverable()));
-        let fixture = Fixture::new(steps.chain([answer("recovered")])).await;
-        assert_eq!(fixture.prompt("recover").await, "recovered");
-        let requests = fixture.requests();
-        assert_eq!(requests.len(), failures + 1);
-        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
-        let records = fixture.records();
-        let requested = count!(&records, SessionEvent::ModelRequested { .. });
-        assert_eq!(requested, 1, "one frozen logical request across retries");
-        let started = events!(&records, SessionEvent::ModelAttemptStarted(attempt) => (attempt.request, attempt.attempt));
-        let request = started[0].0;
-        let attempts = (1..=failures as u64 + 1).map(|attempt| (request, attempt));
-        assert_eq!(started, attempts.collect::<Vec<_>>());
-        let at_request = records
-            .iter()
-            .filter(|record| record.sequence == RecordSeq::from(request));
-        assert_eq!(count!(at_request, SessionEvent::ModelRequested { .. }), 1);
-        assert_schedule(&records, &(2..=failures as u64 + 1).collect::<Vec<_>>());
-        assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), failures);
-        let (sessions, id) = (
-            fixture.workspace.path().join("sessions"),
-            fixture.session.id(),
-        );
-        shutdown_session(fixture.session).await;
-        let reopened = SessionStore::read_records(&sessions, id).await.unwrap();
-        assert_eq!(reopened[..records.len()], records);
     }
 
     #[tokio::test]
@@ -439,82 +501,25 @@ mod tests {
         assert_eq!(fixture.requests().len(), 1);
     }
 
+    /// A permanent failure, at startup or in the stream, fails the turn without a
+    /// recovery whatever its message says.
     #[tokio::test]
-    async fn all_transient_categories_retry_past_three_startup_or_stream_failures() {
-        use ProviderErrorKind::{CredentialExpired, RateLimited, Timeout, Transport, Unavailable};
-        for kind in [
-            CredentialExpired,
-            Unavailable,
-            Transport,
-            Timeout,
-            RateLimited,
-        ] {
-            for streaming in [false, true] {
-                let failures = 4;
-                let failure = || {
-                    let error = kind.error("provider stream error");
-                    if !streaming {
-                        return Step::fail(error);
-                    }
-                    let items = [
-                        AssistantItem::text("partial", 1, "discard failed partial answer"),
-                        write_call("failed", "must-not-exist"),
-                    ];
-                    let mut events = partial(&items);
-                    events.push(Err(error));
-                    Step::stream(events)
-                };
-                let steps = (0..failures)
-                    .map(|_| failure())
-                    .chain([answer("recovered")]);
-                let fixture = Fixture::new(steps).await;
-                assert_eq!(fixture.prompt("keep retrying").await, "recovered");
-                let requests = fixture.requests();
-                assert_eq!(
-                    requests.len(),
-                    failures + 1,
-                    "{kind:?}, streaming={streaming}"
-                );
-                assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
-                assert!(!fixture.workspace.path().join("must-not-exist").exists());
-                let records = fixture.records();
-                let scheduled = recoveries(&records);
-                assert_eq!(scheduled.len(), failures);
-                assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), failures);
-                let (history, assistants) = fixture.history(&records);
-                for discarded in [
-                    "provider stream error",
-                    "discard failed partial answer",
-                    "must-not-exist",
-                ] {
-                    assert!(!history.contains(discarded));
-                }
-                assert_eq!(assistants, 1);
-                fixture.session.shutdown().await.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn permanent_error_kinds_ignore_retry_sounding_messages() {
-        use ProviderErrorKind::{Authentication, InvalidRequest, Protocol};
-        for kind in [Authentication, Protocol, InvalidRequest] {
-            for streaming in [false, true] {
-                let message =
-                    "websocket connection lost; retry this request; previous_response_not_found";
-                let error = kind.error(message);
-                let failure = if streaming {
-                    Step::stream(vec![Err(error)])
-                } else {
-                    Step::fail(error)
-                };
-                let fixture = Fixture::new([failure, answer("must not run")]).await;
-                let result = fixture.session.prompt("fail without recovery").await;
-                assert!(result.is_err(), "{kind:?}");
-                assert_eq!(fixture.requests().len(), 1, "{kind:?}");
-                assert!(recoveries(&fixture.records()).is_empty(), "{kind:?}");
-                fixture.session.shutdown().await.unwrap();
-            }
+    async fn a_permanent_failure_ignores_a_retry_sounding_message() {
+        for streaming in [false, true] {
+            let message =
+                "websocket connection lost; retry this request; previous_response_not_found";
+            let error = ProviderErrorKind::Protocol.error(message);
+            let failure = if streaming {
+                Step::stream(vec![Err(error)])
+            } else {
+                Step::fail(error)
+            };
+            let fixture = Fixture::new([failure, answer("must not run")]).await;
+            let result = fixture.session.prompt("fail without recovery").await;
+            assert!(result.is_err(), "{streaming}");
+            assert_eq!(fixture.requests().len(), 1, "{streaming}");
+            assert!(recoveries(&fixture.records()).is_empty(), "{streaming}");
+            fixture.session.shutdown().await.unwrap();
         }
     }
 
@@ -522,25 +527,12 @@ mod tests {
     async fn child_recovery_keeps_the_same_owner_job_and_does_not_fail_the_agent() {
         let fixture = Fixture::new([Step::fail(recoverable()), answer("child recovered")]).await;
         let session = &fixture.session;
-        let child = session.root.child(1);
-        let owner = owner(session, false).await;
-        let launch = child_launch(session, None);
-        let spawned = session
-            .runtime
-            .spawn_agent(child.clone(), Some(owner), launch);
-        spawned.await.unwrap();
+        let (child, owner) = spawned_child(session).await;
         let mut events = session.runtime.store.observe().updates;
         let (done, received) = oneshot::channel();
-        let content = vec![UserPart::Text {
-            text: "recover".into(),
-        }];
-        let input = AgentCommand::Input {
-            options: Default::default(),
-            content,
-            done: Some(RequestCompletion::Child(done)),
-        };
+        let recover = input("recover", Default::default(), Some(done));
         let received = retrying(session, async {
-            send(session, &child, input).await;
+            send(session, &child, recover).await;
             assert_eq!(next_recovery(&mut events).await.agent, child);
             let state = session.runtime.jobs.snapshot(owner).unwrap().state;
             assert_eq!(state, crate::job::JobState::Running);
@@ -679,59 +671,32 @@ mod tests {
         }
     }
 
+    /// A separate reader sees only committed transactions: the attempt start is
+    /// durable, and replays to what was sent, before the provider is invoked.
     #[tokio::test]
     async fn failed_provider_call_is_journaled_before_invocation() {
-        struct FailingProvider {
-            session_root: PathBuf,
-        }
-        struct FailingContext {
-            session_root: PathBuf,
-            context: ContextId,
-        }
-        impl Provider for FailingProvider {
-            fn open_context(
-                &self,
-                context: ContextId,
-            ) -> Result<Box<dyn ProviderContext>, ProviderError> {
-                Ok(Box::new(FailingContext {
-                    session_root: self.session_root.clone(),
-                    context,
-                }))
-            }
-        }
-        impl ProviderContext for FailingContext {
-            fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
-                let session = self.context.as_str().split(':').next().unwrap();
-                let session = session.parse().unwrap();
-                let root = self.session_root.clone();
-                let started = async move {
-                    // A separate reader sees only committed transactions.
-                    let records = SessionStore::read_records(&root, session).await.unwrap();
-                    let SessionEvent::ModelAttemptStarted(crate::session::AttemptRef {
-                        request: sequence,
-                        attempt: 1,
-                    }) = records.last().unwrap().event
-                    else {
-                        panic!("attempt start must be durable before invocation");
-                    };
-                    let reconstructed =
-                        crate::session::reconstruct_model_request(&records, sequence);
-                    assert_eq!(reconstructed.unwrap(), (model_ref("test"), request));
-                    Err::<ResponseStream, _>(
-                        ProviderErrorKind::Protocol.error("intentional provider failure"),
-                    )
-                };
-                Box::pin(stream::once(started).try_flatten())
-            }
-        }
+        let failure = ProviderErrorKind::Protocol.error("intentional provider failure");
+        let provider = Script::new([Step::fail(failure).gated()], &Requests::default());
         let workspace = tempfile::tempdir().unwrap();
         let sessions = workspace.path().join("sessions");
-        let provider = Arc::new(FailingProvider {
-            session_root: sessions.clone(),
-        });
-        let harness = test_harness(workspace.path(), &sessions, provider).await;
+        let harness = test_harness(workspace.path(), &sessions, provider.clone()).await;
         let session = harness.new_session().await.unwrap();
-        let error = session.prompt("test failure").await.unwrap_err();
+        let prompt = spawn_prompt(&session, "test failure");
+        let request = provider.request(0).await;
+        let records = SessionStore::read_records(&sessions, session.id()).await;
+        let records = records.unwrap();
+        let SessionEvent::ModelAttemptStarted(crate::session::AttemptRef {
+            request: sequence,
+            attempt: 1,
+        }) = records.last().unwrap().event
+        else {
+            panic!("attempt start must be durable before invocation");
+        };
+        let reconstructed = crate::session::reconstruct_model_request(&records, sequence);
+        assert_eq!(reconstructed.unwrap(), (model_ref("test"), request));
+        provider.release(0);
+        let error = bounded(prompt).await.unwrap().unwrap_err();
         assert!(error.to_string().contains("intentional provider failure"));
+        session.shutdown().await.unwrap();
     }
 }

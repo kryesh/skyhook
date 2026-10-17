@@ -91,10 +91,13 @@ pub fn header_line(runs: &[Run]) -> Line<'static> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Section {
-    /// Hard-wrapped runs. `indent` is presentation, never part of the text.
-    Line { indent: usize, runs: Vec<Run> },
-    /// Prose arguments retain their literal text, but wrap at word boundaries.
-    Prose { indent: usize, runs: Vec<Run> },
+    /// A line of runs. `indent` is presentation, never part of the text; prose
+    /// keeps its literal text but wraps at words.
+    Text {
+        indent: usize,
+        runs: Vec<Run>,
+        wrap: Wrap,
+    },
     Code {
         source: CodeSource,
         language: String,
@@ -119,15 +122,6 @@ pub struct DocumentLine {
     pub lead: Line<'static>,
     pub text: Line<'static>,
     pub wrap: Wrap,
-}
-impl DocumentLine {
-    pub fn new(text: Line<'static>, wrap: Wrap) -> Self {
-        Self {
-            lead: Line::default(),
-            text,
-            wrap,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -165,16 +159,12 @@ impl Document {
         self.sections
             .iter()
             .flat_map(|section| -> Box<dyn Iterator<Item = Logical<'_>> + '_> {
-                let line = |indent: &usize, runs, wrap| {
-                    Box::new(std::iter::once(Logical {
+                match section {
+                    Section::Text { indent, runs, wrap } => Box::new(std::iter::once(Logical {
                         indent: *indent,
                         marker: None,
-                        piece: Piece::Runs { runs, wrap },
-                    }))
-                };
-                match section {
-                    Section::Line { indent, runs } => line(indent, runs, Wrap::Hard),
-                    Section::Prose { indent, runs } => line(indent, runs, Wrap::Words),
+                        piece: Piece::Runs { runs, wrap: *wrap },
+                    })),
                     Section::Code {
                         source,
                         language,
@@ -308,12 +298,14 @@ pub(crate) mod tests {
         let mut document = Document::default();
         assert_eq!(document.plain_text(), "");
         document.line("\nheading\t\u{1b}\r", Role::Heading);
-        document.sections.push(Section::Line {
+        document.sections.push(Section::Text {
             indent: 0,
             runs: vec![],
+            wrap: Wrap::Hard,
         });
-        document.sections.push(Section::Line {
+        document.sections.push(Section::Text {
             indent: 2,
+            wrap: Wrap::Hard,
             runs: vec![
                 Run::new("a\tb", Role::String),
                 Run::new("\u{7}界", Role::Number),

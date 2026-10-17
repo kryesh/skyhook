@@ -1,14 +1,18 @@
 //! Where a dialect places a value: dot paths into the body, the one dimension that
 //! may also be a header (cache affinity), and the values placed there.
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, num::NonZeroUsize};
 
 use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::Locations;
-use crate::provider::{ProviderError, ProviderErrorKind::InvalidRequest};
+use crate::provider::{
+    ProviderError,
+    ProviderErrorKind::InvalidRequest,
+    protocol::{Entry, HistoryLifetime, Message, ModelRequest, sent},
+};
 
 /// A dot path into a request object, naming where a dialect places a value.
 /// Segments are nonempty, without whitespace, and never contain a dot. Presets use [`path`];
@@ -164,6 +168,113 @@ pub enum CacheTtl {
     FiveMinutes,
     #[serde(rename = "1h")]
     OneHour,
+}
+
+/// Whether the server places a prompt-cache breakpoint of its own besides the
+/// request's, or caches only at the request's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cache {
+    Automatic,
+    /// Sent as `prompt_cache_options`; requests with no breakpoint are not cached.
+    Explicit,
+}
+
+impl Cache {
+    /// The request-wide `prompt_cache_options`, where they depart from the server's default.
+    pub(crate) fn options(self) -> Option<Value> {
+        match self {
+            Self::Automatic => None,
+            Self::Explicit => Some(json!({"mode": "explicit"})),
+        }
+    }
+}
+
+/// The `prompt_cache_breakpoint` value marking the end of a reusable prefix.
+pub(crate) fn explicit_breakpoint() -> Value {
+    json!({"mode": "explicit"})
+}
+
+/// The most prompt-cache breakpoints one request may mark, its system prompt's
+/// included. Each codec's dialects default to the cap its API documents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BreakpointBudget(NonZeroUsize);
+
+impl BreakpointBudget {
+    pub(crate) const fn new(budget: usize) -> Self {
+        match NonZeroUsize::new(budget) {
+            Some(budget) => Self(budget),
+            None => panic!("a breakpoint budget allows at least one breakpoint"),
+        }
+    }
+}
+
+/// Push the sent prefix of the request's context and then the rest, marking cache
+/// breakpoints at the prefix's end and before each earlier response in it: each
+/// earlier request's prefix ended there, and a cache is read back only at a marked
+/// boundary. `locate` names the unmarked block a breakpoint would go on, the last
+/// text pushed so far, and `mark` marks it. Where `budget` cannot hold every distinct
+/// block beside the `system` breakpoints, the oldest go unmarked. A detached history
+/// is never reused, so it is not marked, and without a budget the server places its
+/// own breakpoints.
+pub(crate) fn push_history<T, L: PartialEq>(
+    target: &mut T,
+    request: &ModelRequest,
+    budget: Option<BreakpointBudget>,
+    system: usize,
+    mut push: impl FnMut(&mut T, &Entry) -> Result<(), ProviderError>,
+    locate: impl Fn(&T) -> Option<L>,
+    mut mark: impl FnMut(&mut T, L),
+) -> Result<(), ProviderError> {
+    let (prefix, rest) = sent(&request.context);
+    let marks = budget.filter(|_| request.history_lifetime == HistoryLifetime::Extends);
+    let mut seams = Vec::new();
+    let mut seam = |target: &T| {
+        if let Some(block) = locate(target).filter(|_| marks.is_some())
+            && !seams.contains(&block)
+        {
+            seams.push(block);
+        }
+    };
+    for entry in prefix {
+        if matches!(entry, Entry::Message(Message::Assistant(_))) {
+            seam(target);
+        }
+        push(target, entry)?;
+    }
+    seam(target);
+    if let Some(BreakpointBudget(budget)) = budget {
+        let slots = (budget.get().checked_sub(system))
+            .filter(|slots| *slots > 0 || seams.is_empty())
+            .ok_or_else(|| {
+                InvalidRequest.error(format!(
+                    "at most {budget} cache breakpoints fit a request, including one for history"
+                ))
+            })?;
+        for block in seams.into_iter().rev().take(slots) {
+            mark(target, block);
+        }
+    }
+    rest.into_iter().try_for_each(|entry| push(target, entry))
+}
+
+/// Anthropic-style `cache_control`, which some servers take in place of
+/// `prompt_cache_breakpoint`; each codec places it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheControl {
+    Omitted,
+    Sent {
+        /// The breakpoint lifetime, where the server takes one.
+        ttl: Option<CacheTtl>,
+    },
+}
+
+impl CacheControl {
+    pub(crate) fn ttl_mut(&mut self) -> Option<&mut Option<CacheTtl>> {
+        match self {
+            Self::Sent { ttl } => Some(ttl),
+            Self::Omitted => None,
+        }
+    }
 }
 
 /// The `cache_control` value marking a prompt-cache breakpoint.

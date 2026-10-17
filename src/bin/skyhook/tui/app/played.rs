@@ -6,6 +6,7 @@ use super::*;
 use crate::interaction::UiInteraction;
 use crate::tests::bounded;
 use serde_json::json;
+use skyhook::agent::{Harness, HarnessBuilder};
 use skyhook::job::JobTransition;
 use skyhook::provider::protocol::{
     AssistantItem, BlockRef, Completion, ContextId, ItemKind, ModelRequest, ResponseEvent, ToolCall,
@@ -17,7 +18,13 @@ use std::sync::Arc;
 
 /// The model a test plays: each request a played session sends waits for the
 /// response the test streams back through its [`Turn`].
-pub(in crate::tui) struct Model(pub(super) mpsc::UnboundedReceiver<Turn>);
+pub(in crate::tui) struct Model {
+    turns: mpsc::UnboundedReceiver<Turn>,
+    refused: Refused,
+}
+
+/// Conversations the played provider no longer opens.
+type Refused = Arc<std::sync::Mutex<std::collections::HashSet<ContextId>>>;
 
 /// One request the played model received, open until the test ends it.
 pub(in crate::tui) struct Turn {
@@ -26,7 +33,10 @@ pub(in crate::tui) struct Turn {
     events: mpsc::UnboundedSender<Result<ResponseEvent, ProviderError>>,
 }
 
-struct Played(mpsc::UnboundedSender<Turn>);
+struct Played {
+    turns: mpsc::UnboundedSender<Turn>,
+    refused: Refused,
+}
 
 struct Conversation {
     turns: mpsc::UnboundedSender<Turn>,
@@ -35,7 +45,11 @@ struct Conversation {
 
 impl Provider for Played {
     fn open_context(&self, context: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
-        let turns = self.0.clone();
+        if self.refused.lock().unwrap().contains(&context) {
+            let kind = skyhook::provider::ProviderErrorKind::Authentication;
+            return Err(kind.error("the provider no longer opens this conversation"));
+        }
+        let turns = self.turns.clone();
         Ok(Box::new(Conversation { turns, context }))
     }
 }
@@ -55,9 +69,14 @@ impl ProviderContext for Conversation {
 impl Model {
     /// The next request the session sends.
     pub(in crate::tui) async fn turn(&mut self) -> Turn {
-        bounded(self.0.recv())
+        bounded(self.turns.recv())
             .await
             .expect("the played session is open")
+    }
+
+    /// Open no further conversation for `agent`.
+    pub(in crate::tui) fn refuse(&self, agent: &AgentId) {
+        self.refused.lock().unwrap().insert(ContextId::from(agent));
     }
 }
 
@@ -118,17 +137,40 @@ pub(in crate::tui) async fn played(launch: &Launch) -> (SessionHandle, Model) {
 
 /// [`played`], its operations authorized by `policy`.
 async fn played_under(launch: &Launch, policy: Arc<dyn Policy>) -> (SessionHandle, Model) {
-    let (turns, model) = mpsc::unbounded_channel();
-    let first = ("first".parse().unwrap(), launch.model.profile().clone());
-    let harness = (launch.model.harness_builder(&launch.workspace).unwrap())
-        .provider("test".parse().unwrap(), Arc::new(Played(turns)), [first])
+    let (harness, model) = played_harness(launch, policy, |builder| builder).await;
+    (harness.new_session().await.unwrap(), model)
+}
+
+/// A harness for `launch`'s sessions whose model the test plays, as `configure`
+/// finishes it.
+pub(in crate::tui) async fn played_harness(
+    launch: &Launch,
+    policy: Arc<dyn Policy>,
+    configure: impl FnOnce(HarnessBuilder) -> HarnessBuilder,
+) -> (Harness, Model) {
+    let (sender, turns) = mpsc::unbounded_channel();
+    let refused = Refused::default();
+    let played = Played {
+        turns: sender,
+        refused: refused.clone(),
+    };
+    let first = launch.model.profile().clone();
+    // `test/seeing` is `test/first` taking images, which `first` refuses.
+    let seeing = skyhook::provider::profile::ModelProfile {
+        supports_images: true,
+        ..first.clone()
+    };
+    let models = [
+        ("first".parse().unwrap(), first),
+        ("seeing".parse().unwrap(), seeing),
+    ];
+    let builder = (launch.model.harness_builder(&launch.workspace).unwrap())
+        .provider("test".parse().unwrap(), Arc::new(played), models)
         .policy(policy)
         .session_root(&launch.sessions)
-        .shim_catalog(launch.catalog.clone())
-        .build()
-        .await
-        .unwrap();
-    (harness.new_session().await.unwrap(), Model(model))
+        .shim_catalog(launch.catalog.clone());
+    let harness = configure(builder).build().await.unwrap();
+    (harness, Model { turns, refused })
 }
 
 /// An app open on a played session.
@@ -375,8 +417,8 @@ pub(in crate::tui) fn tool_error(snapshot: &ObservationSnapshot) -> &str {
         .values()
         .find_map(|record| match &record.event {
             SessionEvent::MessageCommitted {
-                message: Message::Tool(results),
-            } => results[0].result["error"].as_str(),
+                message: Message::Tool(result),
+            } => result.result["error"].as_str(),
             _ => None,
         });
     error.unwrap()

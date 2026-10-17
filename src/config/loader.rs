@@ -69,26 +69,10 @@ impl fmt::Display for ConfigReport {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ResolvedConfig {
     pub config: Config,
-    /// Snapshot at resolution time. Use `config.to_yaml()` after caller overrides.
-    pub normalized_yaml: String,
     pub report: ConfigReport,
-}
-
-/// The YAML may hold literal secrets; only its length is shown.
-impl fmt::Debug for ResolvedConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResolvedConfig")
-            .field("config", &self.config)
-            .field(
-                "normalized_yaml",
-                &format_args!("<{} bytes>", self.normalized_yaml.len()),
-            )
-            .field("report", &self.report)
-            .finish()
-    }
 }
 
 pub(super) async fn resolve(
@@ -121,7 +105,7 @@ async fn resolve_paths(
             .into_config()
             .map_err(|error| explicit(&mut report, error.to_string()))?;
         report.sources.push(path.to_path_buf());
-        return finish(config, report);
+        return Ok(ResolvedConfig { config, report });
     }
 
     let mut seen = Vec::new();
@@ -196,15 +180,7 @@ async fn resolve_paths(
         let diagnostic = diagnostic(&path, error.to_string());
         failure(&mut report, ResolutionStage::Effective, diagnostic)
     })?;
-    finish(config, report)
-}
-
-fn finish(config: Config, report: ConfigReport) -> Result<ResolvedConfig, ConfigError> {
-    Ok(ResolvedConfig {
-        normalized_yaml: config.to_yaml()?,
-        config,
-        report,
-    })
+    Ok(ResolvedConfig { config, report })
 }
 
 fn failure(
@@ -404,12 +380,6 @@ mod tests {
         Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: codex\n    codec: responses\n    models:\n      bad:\n        model: bad\n        max_context: 10\n        max_output: 10"),
         Some(b"approve_all: true\ntargets:\n  bad:\n    type: ssh\n    host: bad host"),
         Some(b"approve_all: true\nmcp:\n  bad:\n    transport: stdio\n    start_command: []"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {env: ''}"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    startup_timeout_secs: 0"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: relative"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {command: '  '}"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com\n    reasoning_summary: maybe"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: responses\n    base_url: https://example.com\n    models:\n      bad:\n        model: bad\n        max_context: 4096\n        max_output: 512"),
         Some(b"approve_all: true\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a"), // route cycle
         Some(b""),
     ];
@@ -536,76 +506,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_targets_replace_whole_definition_but_other_names_survive() {
-        let f = Fixture::new();
-        write(
-            &f.xdg,
-            format!(
-                "{CONFIG}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      auth: {{kind: key, path: /old-key}}\n  retained:\n    type: ssh\n    host: other\n"
-            ),
-        );
-        write(
-            &f.local,
-            "targets:\n  changed:\n    type: ssh\n    host: new\n",
-        );
-        let targets = f.resolve().await.unwrap().config.targets;
-        assert!(targets.entries.contains_key("retained"));
-        let changed = &targets.entries["changed"];
-        assert_eq!(
-            (&*changed.host, &changed.workspace, &changed.via),
-            ("new", &PathBuf::from("."), &None)
-        );
-        assert_eq!(
-            (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
-            (&None, None, &TargetAuth::Default)
-        );
-        write(&f.local, "targets:\n  changed:\n    host: incomplete\n");
-        assert!(
-            f.resolve().await.is_err(),
-            "target must not inherit required type"
-        );
-    }
-
-    #[tokio::test]
-    async fn named_modes_replace_whole_definition_but_other_names_survive() {
-        let f = Fixture::new();
-        write(
-            &f.xdg,
-            format!(
-                "{CONFIG}\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
-            ),
-        );
-        write(
-            &f.local,
-            "default_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
-        );
-        let config = f.resolve().await.unwrap().config;
-        assert_eq!(
-            Vec::from_iter(config.modes.keys().map(|mode| mode.as_str())),
-            ["general", "changed", "retained"]
-        );
-        assert_eq!(config.default_mode.as_str(), "retained");
-        let changed = &config.modes["changed"];
-        assert!(changed.capabilities.is_empty() && changed.instructions.is_none());
-        write(&f.local, "modes:\n  changed:\n    instructions: new\n");
-        assert!(
-            f.resolve().await.is_err(),
-            "mode must not inherit capabilities"
-        );
-    }
-
-    #[tokio::test]
     async fn named_entries_replace_whole_and_keep_their_layer() {
         let f = Fixture::new();
         write(
             &f.xdg,
             format!(
-                "session_root: sessions\n{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  user-default:\n    transport: stdio\n    start_command: [old]\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\n"
+                "session_root: sessions\n{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  user-default:\n    transport: stdio\n    start_command: [old]\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      auth: {{kind: key, path: /old-key}}\n  retained:\n    type: ssh\n    host: other\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
             ),
         );
         write(
             &f.local,
-            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {kind: key, path: origin-key}\n",
+            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {kind: key, path: origin-key}\n  changed:\n    type: ssh\n    host: new\ndefault_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
         );
         let resolved = f.resolve().await.unwrap();
         let config = &resolved.config;
@@ -638,6 +549,23 @@ mod tests {
             path: "origin-key".into(),
         };
         assert_eq!(remote.ssh.auth, origin_key);
+        assert!(config.targets.entries.contains_key("retained"));
+        let changed = &config.targets.entries["changed"];
+        assert_eq!(
+            (&*changed.host, &changed.workspace, &changed.via),
+            ("new", &PathBuf::from("."), &None)
+        );
+        assert_eq!(
+            (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
+            (&None, None, &TargetAuth::Default)
+        );
+        assert_eq!(
+            Vec::from_iter(config.modes.keys().map(|mode| mode.as_str())),
+            ["general", "changed", "retained"]
+        );
+        assert_eq!(config.default_mode.as_str(), "retained");
+        let changed = &config.modes["changed"];
+        assert!(changed.capabilities.is_empty() && changed.instructions.is_none());
         // Defaults apply after merging, to the entry that won.
         let startup = |name: &str| config.mcp[name].startup_timeout();
         assert_eq!(startup("changed"), startup("inherited"));
@@ -646,6 +574,14 @@ mod tests {
             explicit.config.providers["added"].home,
             ConfigHome::File(f.local.clone())
         );
+        // A partial entry inherits no required field from the one it replaces.
+        for partial in [
+            "targets:\n  changed:\n    host: incomplete\n",
+            "modes:\n  changed:\n    instructions: new\n",
+        ] {
+            write(&f.local, partial);
+            assert!(f.resolve().await.is_err(), "{partial}");
+        }
     }
 
     #[tokio::test]
@@ -661,14 +597,11 @@ mod tests {
         );
         let mut resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
-        assert!(
-            resolved
-                .normalized_yaml
-                .contains("env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY")
-        );
+        let dump = resolved.config.to_yaml().unwrap();
+        assert!(dump.contains("env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY"));
         // Resolved provider defaults are written back, like MCP timeouts.
         for resolved_default in ["startup_timeout_secs: 600", "read_idle_timeout_secs: 600"] {
-            assert!(resolved.normalized_yaml.contains(resolved_default));
+            assert!(dump.contains(resolved_default));
         }
         resolved.config.approve_all = true;
         resolved.config.modes[0].capabilities.clear();
@@ -683,7 +616,13 @@ mod tests {
         let f = Fixture::new();
         write(&f.xdg, format!("{CONFIG}    api_key: sk-literal-secret\n"));
         let resolved = f.resolve().await.unwrap();
-        assert!(resolved.normalized_yaml.contains("sk-literal-secret"));
+        assert!(
+            resolved
+                .config
+                .to_yaml()
+                .unwrap()
+                .contains("sk-literal-secret")
+        );
         assert!(!format!("{resolved:?}").contains("sk-literal-secret"));
     }
 
@@ -707,7 +646,7 @@ mod tests {
         .concat();
         write(&f.local, format!("{PROVIDER}    models:\n{models}"));
         let resolved = f.resolve().await.unwrap();
-        let config = Config::from_yaml(&resolved.normalized_yaml).unwrap();
+        let config = Config::from_yaml(&resolved.config.to_yaml().unwrap()).unwrap();
         let runtime = config.into_runtime().unwrap();
         assert_eq!(
             runtime

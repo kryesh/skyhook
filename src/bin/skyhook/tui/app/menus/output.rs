@@ -212,7 +212,10 @@ mod tests {
         let work = recv(&mut rx).await;
         app.work(work);
         let selected = app.outputs.get(&job).unwrap().as_ref().unwrap();
-        let preview = selected.presentation().and_then(|p| p.preview());
+        let preview = selected
+            .presentation
+            .as_ref()
+            .and_then(|p| p.preview.as_ref());
         let Some(OutputPreview::Lines(page)) = preview else {
             panic!("a scalar pages as text: {preview:?}")
         };

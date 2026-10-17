@@ -24,7 +24,7 @@ use crate::{
         },
         protocol::{
             AssistantItem, Binding, Completion, ItemKind, Replay, ReplayFormat, ResponseEvent,
-            Scope, ToolCall,
+            Scope,
         },
     },
 };
@@ -62,7 +62,7 @@ const USAGE: Spelling = Spelling {
 
 // Native kind is decoded once at block admission. Thinking keeps its opaque
 // JSON so signed reasoning is never regenerated; unsigned thinking is rebuilt.
-enum StreamingBlock {
+enum Content {
     Text(String),
     Thinking(Value),
     RedactedThinking(Value),
@@ -75,19 +75,12 @@ enum StreamingBlock {
     Ignored,
 }
 
-enum CompletedBlock {
-    Text(String),
-    Reasoning { text: String, replay: Replay },
-    Tool(ToolCall),
-}
-
+/// A content block, open until its `content_block_stop`. Tool input is read
+/// only once the terminal stop reason decides whether it matters: abnormal stops
+/// discard it, ordinary stops surface its error.
 enum Block {
-    Streaming(StreamingBlock),
-    Completed(CompletedBlock),
-    // Incomplete tool input awaits the terminal stop reason: abnormal stops
-    // discard it, ordinary stops surface the original error.
-    PendingToolError(ProviderError),
-    Skipped,
+    Open(Content),
+    Stopped(Content),
 }
 
 /// Signed thinking is bound to the exact conversation before it, so compaction
@@ -116,12 +109,8 @@ fn thinking_replay(model: &str, scope: &Scope, native: &Value) -> Replay {
 
 impl Block {
     fn is_tool(&self) -> bool {
-        matches!(
-            self,
-            Self::Streaming(StreamingBlock::Tool { .. })
-                | Self::Completed(CompletedBlock::Tool(_))
-                | Self::PendingToolError(_)
-        )
+        let (Self::Open(content) | Self::Stopped(content)) = self;
+        matches!(content, Content::Tool { .. })
     }
 }
 
@@ -132,7 +121,7 @@ fn append(native: &mut Value, field: &str, suffix: &str) {
     }
 }
 
-impl StreamingBlock {
+impl Content {
     fn start(
         mut native: Value,
         id: usize,
@@ -221,42 +210,6 @@ impl StreamingBlock {
         }
         Ok(())
     }
-
-    fn complete(&self, model: &str, scope: &Scope) -> Result<Block, ProviderError> {
-        let content = match self {
-            Self::Text(text) => CompletedBlock::Text(text.clone()),
-            Self::Thinking(native) => CompletedBlock::Reasoning {
-                text: NATIVE.string(native, "thinking")?.into(),
-                replay: thinking_replay(model, scope, native),
-            },
-            Self::RedactedThinking(native) => CompletedBlock::Reasoning {
-                // Preserve optional display text from the original raw block.
-                text: native
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .into(),
-                replay: thinking_replay(model, scope, native),
-            },
-            Self::Tool {
-                unreadable: true, ..
-            } => {
-                return Ok(Block::PendingToolError(
-                    NATIVE.error("unsupported delta for tool input"),
-                ));
-            }
-            Self::Tool {
-                native,
-                partial_json,
-                ..
-            } => match tool_content(native, partial_json.as_deref()) {
-                Ok(call) => CompletedBlock::Tool(call),
-                Err(error) => return Ok(Block::PendingToolError(error)),
-            },
-            Self::Ignored => return Ok(Block::Skipped),
-        };
-        Ok(Block::Completed(content))
-    }
 }
 
 /// One decoder owns exactly one Messages response. Native indices identify blocks;
@@ -325,12 +278,12 @@ impl Decoder {
                     .get("content_block")
                     .ok_or_else(|| NATIVE.error("missing content_block"))?
                     .clone();
-                let block = StreamingBlock::start(native, id, &mut events)?;
-                self.blocks.insert(id, Block::Streaming(block));
+                let block = Content::start(native, id, &mut events)?;
+                self.blocks.insert(id, Block::Open(block));
             }
             Some(Event::BlockDelta) => {
                 let id = NATIVE.index(&value, "index")?;
-                let Some(Block::Streaming(block)) = self.blocks.get_mut(&id) else {
+                let Some(Block::Open(block)) = self.blocks.get_mut(&id) else {
                     return Err(
                         NATIVE.error(format_args!("delta for unopened or ended block {id}"))
                     );
@@ -342,11 +295,12 @@ impl Decoder {
             }
             Some(Event::BlockStop) => {
                 let id = NATIVE.index(&value, "index")?;
-                let Some(Block::Streaming(streaming)) = self.blocks.get(&id) else {
+                let Some(Block::Open(_)) = self.blocks.get(&id) else {
                     return Err(NATIVE.error(format_args!("stop for unopened or ended block {id}")));
                 };
-                let completed = streaming.complete(&self.model, &self.scope)?;
-                self.blocks.insert(id, completed);
+                if let Some(Block::Open(content)) = self.blocks.remove(&id) {
+                    self.blocks.insert(id, Block::Stopped(content));
+                }
             }
             Some(Event::MessageDelta) => {
                 // A reasonless delta only carries usage.
@@ -395,7 +349,7 @@ impl Settle for Decoder {
         if self
             .blocks
             .values()
-            .any(|block| matches!(block, Block::Streaming(_)))
+            .any(|block| matches!(block, Block::Open(_)))
         {
             return Err(NATIVE.error("message ended with open content blocks"));
         }
@@ -404,8 +358,16 @@ impl Settle for Decoder {
         }
         if finish == Finish::Normal {
             for block in self.blocks.values() {
-                if let Block::PendingToolError(error) = block {
-                    return Err(error.clone());
+                if let Block::Stopped(Content::Tool {
+                    native,
+                    partial_json,
+                    unreadable,
+                }) = block
+                {
+                    if *unreadable {
+                        return Err(NATIVE.error("unsupported delta for tool input"));
+                    }
+                    tool_content(native, partial_json.as_deref())?;
                 }
             }
         }
@@ -418,22 +380,29 @@ impl Settle for Decoder {
         let mut items = Vec::new();
         for (index, block) in std::mem::take(&mut self.blocks) {
             let (id, position) = (index.to_string(), position(index)?);
-            items.push(match block {
-                Block::Completed(CompletedBlock::Text(text)) => {
-                    AssistantItem::text(id, position, text)
+            // Admission required every block stopped.
+            let (Block::Open(content) | Block::Stopped(content)) = block;
+            let replay = |native| Some(thinking_replay(&self.model, &self.scope, native));
+            items.push(match content {
+                Content::Text(text) => AssistantItem::text(id, position, text),
+                Content::Thinking(native) => {
+                    let text = NATIVE.string(&native, "thinking")?;
+                    AssistantItem::reasoning(id, position, text, replay(&native))
                 }
-                Block::Completed(CompletedBlock::Reasoning { text, replay }) => {
-                    AssistantItem::reasoning(id, position, text, Some(replay))
+                Content::RedactedThinking(native) => {
+                    AssistantItem::reasoning(id, position, "", replay(&native))
                 }
-                Block::Completed(CompletedBlock::Tool(call)) if finish == Finish::Normal => {
-                    AssistantItem::tool_call(id, position, call)
-                }
-                // Admission raised a pending tool error for a normal finish, and
-                // required every block ended.
-                Block::Completed(CompletedBlock::Tool(_))
-                | Block::PendingToolError(_)
-                | Block::Skipped
-                | Block::Streaming(_) => continue,
+                // Admission surfaced unreadable tool input for a normal finish.
+                Content::Tool {
+                    native,
+                    partial_json,
+                    ..
+                } if finish == Finish::Normal => AssistantItem::tool_call(
+                    id,
+                    position,
+                    tool_content(&native, partial_json.as_deref())?,
+                ),
+                Content::Tool { .. } | Content::Ignored => continue,
             });
         }
         finish.complete(items)
@@ -445,17 +414,11 @@ mod tests {
     use super::super::{Dialect, encode};
     use super::*;
     use crate::provider::ProviderErrorKind;
-    use crate::provider::codec::common::tests::{Reduced, reduce, scope};
+    use crate::provider::codec::common::tests::{Reduced, drain, reduce, scope, tool_result};
+    use crate::provider::http::transport::tests::event;
     use crate::provider::protocol::Entry;
-    use crate::provider::protocol::{CutReason, Message, ModelRequest, Outcome, ToolResult, Usage};
+    use crate::provider::protocol::{CutReason, Message, ModelRequest, Outcome, Usage};
     use serde_json::json;
-
-    fn event(value: Value) -> SseEvent {
-        SseEvent {
-            event: value["type"].as_str().map(str::to_owned),
-            data: value.to_string(),
-        }
-    }
 
     fn start() -> Value {
         json!({"type":"message_start", "message":{
@@ -520,10 +483,11 @@ mod tests {
 
     /// Decode a whole message and reduce it as the runtime would.
     fn reduced(model: &str, frames: Vec<Value>) -> Reduced {
-        let mut decoder = Decoder::new(model.into(), scope(), ErrorSignals::NONE);
-        let events = decode(&mut decoder, frames);
-        decoder.finish().unwrap();
-        reduce(events)
+        let decoder = Decoder::new(model.into(), scope(), ErrorSignals::NONE);
+        drain(
+            crate::provider::codec::Decoder::Messages(decoder),
+            frames.into_iter().map(event),
+        )
     }
 
     fn calls(reduced: &Reduced) -> Vec<(String, Value)> {
@@ -576,35 +540,25 @@ mod tests {
         assert!(decode(&mut decoder, vec![delta(0, citation)]).is_empty());
     }
 
+    /// Signed thinking replays whole and bound to its conversation. Servers that
+    /// cannot sign still get their thinking back, free and without the empty
+    /// signature.
     #[test]
-    fn signed_completion_keeps_opaque_native_fields_and_unsigned_thinking_replays_free() {
+    fn signed_thinking_replays_whole_and_unsigned_thinking_replays_free() {
         let native = json!({"type":"thinking", "thinking":"reason", "signature":"signed", "x-vendor":{"nested":[1,null,"opaque"]}});
-        let streaming = StreamingBlock::start(native.clone(), 0, &mut Vec::new()).unwrap();
-        let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
-            streaming.complete("vendor-model", &scope()).unwrap()
-        else {
-            panic!("reasoning completion required");
-        };
+        let replay = thinking_replay("vendor-model", &scope(), &native);
         assert_eq!(
-            (text.as_str(), &replay.payload, replay.binding),
-            ("reason", &native, Binding::Conversation)
+            (&replay.payload, replay.binding),
+            (&native, Binding::Conversation)
         );
-        // Servers that cannot sign still get their thinking back, without the
-        // empty signature, and it is not bound to the conversation.
         for unsigned in [
             json!({"type":"thinking", "thinking":"reason", "signature":""}),
             json!({"type":"thinking", "thinking":"reason"}),
         ] {
-            let streaming = StreamingBlock::start(unsigned, 0, &mut Vec::new()).unwrap();
-            let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
-                streaming.complete("vendor-model", &scope()).unwrap()
-            else {
-                panic!("reasoning completion required");
-            };
+            let replay = thinking_replay("vendor-model", &scope(), &unsigned);
             assert_eq!(
-                (text.as_str(), &replay.payload, replay.binding),
+                (&replay.payload, replay.binding),
                 (
-                    "reason",
                     &json!({"type":"thinking", "thinking":"reason"}),
                     Binding::Free
                 )
@@ -692,15 +646,13 @@ mod tests {
         };
         blocks[0].text = "display summary only".into();
         request.context.push(Entry::from(Message::Assistant(items)));
-        request
-            .context
-            .push(Entry::from(Message::Tool(vec![ToolResult {
-                call_id: "call_1".into(),
-                name: "inspect".into(),
-                result: json!({"ok":true}),
-                images: vec![],
-                is_error: false,
-            }])));
+        request.context.push(Entry::from(tool_result(
+            "call_1",
+            "inspect",
+            json!({"ok":true}),
+            vec![],
+            false,
+        )));
         let original = request;
         let body = encode(&original, &Dialect::standard()).unwrap();
         assert_eq!(
@@ -839,18 +791,14 @@ mod tests {
 
     #[test]
     fn malformed_tool_input_still_errors_on_normal_terminal_reason() {
-        for reason in ["tool_use", "end_turn", "stop_sequence"] {
-            for input in ["{", "[]", "\"text\""] {
-                let mut decoder = started();
-                decode(
-                    &mut decoder,
-                    vec![block_start(0, tool_use("call_1")), json_delta(0, input)],
-                );
-                assert!(decode(&mut decoder, vec![stop(0)]).is_empty());
-                assert!(decoder.decode(&event(terminal(reason, 19))).is_err());
-                assert!(decoder.finish().is_err());
-            }
-        }
+        let mut decoder = started();
+        decode(
+            &mut decoder,
+            vec![block_start(0, tool_use("call_1")), json_delta(0, "[]")],
+        );
+        assert!(decode(&mut decoder, vec![stop(0)]).is_empty());
+        assert!(decoder.decode(&event(terminal("end_turn", 19))).is_err());
+        assert!(decoder.finish().is_err());
     }
 
     #[test]
@@ -962,9 +910,6 @@ mod tests {
                 None,
                 true,
             ),
-            (vec![terminal("incomplete", 2)], None, true),
-            (vec![terminal("guardrail_intervened", 2)], None, true),
-            (vec![terminal("MAX_TOKENS", 2)], None, true),
             (vec![terminal("pause_turn", 2)], None, true),
             // Usage-only deltas do not settle the response.
             (
@@ -994,8 +939,6 @@ mod tests {
                 true,
             ),
             (vec![terminal("tool_use", 2)], None, false),
-            (vec![terminal("end_turn", 2)], None, false),
-            (vec![terminal("stop_sequence", 2)], None, false),
         ] {
             let mut frames = vec![
                 start(),

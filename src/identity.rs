@@ -42,7 +42,6 @@ macro_rules! random_id {
                 Self(bytes)
             }
 
-            #[must_use]
             pub const fn to_bytes(self) -> [u8; 16] {
                 self.0
             }
@@ -128,7 +127,6 @@ impl AgentId {
         }
     }
 
-    #[must_use]
     pub fn parent(&self) -> Option<Self> {
         let mut path = self.path.clone();
         path.pop()?;
@@ -138,23 +136,19 @@ impl AgentId {
         })
     }
 
-    #[must_use]
     pub const fn session(&self) -> SessionId {
         self.session
     }
 
-    #[must_use]
     pub fn depth(&self) -> usize {
         self.path.len()
     }
 
-    #[must_use]
     pub fn path(&self) -> &[u32] {
         &self.path
     }
 
     /// Whether this agent is `root` or one of its descendants.
-    #[must_use]
     pub fn is_within(&self, root: &Self) -> bool {
         self.session == root.session && self.path.starts_with(&root.path)
     }
@@ -187,7 +181,6 @@ impl JobId {
             .ok_or(IdentityError::ZeroJobId)
     }
 
-    #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
     }

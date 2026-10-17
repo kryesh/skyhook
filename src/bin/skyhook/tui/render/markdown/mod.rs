@@ -216,7 +216,7 @@ impl LineId {
 /// Numbers logical lines by origin: the first line from an origin is its
 /// part 0, the next part 1, and so on.
 #[derive(Default)]
-pub(super) struct LineIds(std::collections::HashMap<usize, usize>);
+struct LineIds(std::collections::HashMap<usize, usize>);
 
 impl LineIds {
     pub fn next(&mut self, origin: usize) -> LineId {

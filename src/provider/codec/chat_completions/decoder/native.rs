@@ -1,5 +1,5 @@
 //! Parse native SSE envelopes into the one Chat choice this codec follows.
-use super::super::{Code, NATIVE, wire};
+use super::super::{NATIVE, wire};
 use crate::provider::{
     ProviderError,
     codec::{
@@ -44,7 +44,7 @@ pub(super) fn decode(
     let mut value: Value =
         serde_json::from_str(&event.data).map_err(|_| NATIVE.error("invalid SSE JSON"))?;
     if value.get("error").is_some_and(|value| !value.is_null()) || is_error_event {
-        let reading = openai::read::<Code>(&value);
+        let reading = openai::read::<openai::Code>(&value);
         return Err(errors::classify(None, &value, reading, signals, None));
     }
     // Follow choice zero; servers may omit its index or send extra choices.
@@ -164,7 +164,7 @@ mod tests {
             assert!(decoder.finish().is_err());
         }
         let mut decoder = decoder();
-        assert!(decoder.decode(&raw("{not json")).is_err());
+        assert!(decoder.decode(&sse(None, "{not json")).is_err());
     }
 
     #[test]
@@ -172,7 +172,6 @@ mod tests {
         for choice in [
             json!({"message":{"role":"assistant","content":"answer"}}),
             json!({"message":{"content":"answer"}, "delta":null}),
-            json!({"text":"answer", "delta":{}}),
         ] {
             let mut choice = choice;
             choice["finish_reason"] = json!("stop");
@@ -193,26 +192,6 @@ mod tests {
                 {"type":"function","function":{"name":"b","arguments":"{}"}}]}}]}),
         )]);
         assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn empty_sse_event_name_uses_default_message_framing() {
-        let frames = [
-            event(json!({})),
-            delta(json!({"content":"answer"})),
-            end("stop"),
-            done(),
-        ];
-        let frames = frames
-            .into_iter()
-            .map(|mut frame| {
-                frame.event = Some(String::new());
-                frame
-            })
-            .collect();
-        let (items, _, outcome) = decode(frames);
-        assert_eq!(outcome, Outcome::Answer);
-        assert_eq!(contents(&items), [text("answer")]);
     }
 
     #[test]

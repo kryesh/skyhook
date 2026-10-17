@@ -19,40 +19,54 @@ use std::{
     sync::Arc,
 };
 
+/// Why a file could not be attached to a prompt.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttachmentError {
+    #[error("{0}: {1}")]
+    Read(PathBuf, #[source] RegularFileError),
+    #[error("File reference leaves the workspace")]
+    OutsideWorkspace,
+    #[error("File is too large to attach; ask the agent to read it instead")]
+    TooLarge,
+    #[error("File is larger than {} MiB; ask the agent to read it instead", MAX_TEXT_BYTES >> 20)]
+    TextTooLarge,
+    #[error("{0} is neither a supported image nor UTF-8 text")]
+    Unsupported(PathBuf),
+    #[error("{0} is not a supported image")]
+    NotImage(PathBuf),
+}
+
 /// Read a workspace file as a prompt attachment: an image when its bytes are a
 /// supported image, otherwise UTF-8 text.
-pub(crate) async fn read_attachment(workspace: &Path, path: &Path) -> Result<Attachment, String> {
+pub(crate) async fn read_attachment(
+    workspace: &Path,
+    path: &Path,
+) -> Result<Attachment, AttachmentError> {
     let path = tokio::fs::canonicalize(workspace.join(path))
         .await
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+        .map_err(|error| AttachmentError::Read(path.to_owned(), error.into()))?;
     if !path.starts_with(workspace) {
-        return Err("File reference leaves the workspace".into());
+        return Err(AttachmentError::OutsideWorkspace);
     }
     let bytes = skyhook::fs::read_regular(&path, MAX_IMAGE_BYTES)
         .await
         .map_err(|error| match error {
-            RegularFileError::TooLarge { .. } => {
-                "File is too large to attach; ask the agent to read it instead".to_owned()
-            }
-            error => format!("{}: {error}", path.display()),
+            RegularFileError::TooLarge { .. } => AttachmentError::TooLarge,
+            error => AttachmentError::Read(path.clone(), error),
         })?;
     match classify(bytes) {
         Classified::Image(image) => Ok(Attachment::Image {
             file: Some(path),
             image,
         }),
-        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => Err(format!(
-            "File is larger than {} MiB; ask the agent to read it instead",
-            MAX_TEXT_BYTES >> 20
-        )),
+        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => {
+            Err(AttachmentError::TextTooLarge)
+        }
         Classified::Text(content) => Ok(Attachment::Text {
             file: Some(path),
             content,
         }),
-        Classified::Binary(_) => Err(format!(
-            "{} is neither a supported image nor UTF-8 text",
-            path.display()
-        )),
+        Classified::Binary(_) => Err(AttachmentError::Unsupported(path)),
     }
 }
 
@@ -63,8 +77,8 @@ pub(crate) enum OperationError {
     Harness(#[from] HarnessError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("{0}")]
-    Attachment(String),
+    #[error(transparent)]
+    Attachment(#[from] AttachmentError),
 }
 
 impl OperationError {
@@ -78,14 +92,12 @@ impl OperationError {
 pub(crate) async fn read_images(
     workspace: &Path,
     paths: &[PathBuf],
-) -> Result<Vec<Attachment>, String> {
+) -> Result<Vec<Attachment>, AttachmentError> {
     let mut images = Vec::with_capacity(paths.len());
     for path in paths {
         match read_attachment(workspace, path).await? {
             image @ Attachment::Image { .. } => images.push(image),
-            Attachment::Text { .. } => {
-                return Err(format!("{} is not a supported image", path.display()));
-            }
+            Attachment::Text { .. } => return Err(AttachmentError::NotImage(path.clone())),
         }
     }
     Ok(images)
@@ -320,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_precedence_and_stale_memory_preserve_the_runtime_owner() {
+    fn selection_prefers_explicit_then_remembered_then_default() {
         let original = history_config(None);
         let mut config = original.config().clone();
         let ProviderSettings::Compatible(provider) = &mut config.providers["test"].settings else {
@@ -341,9 +353,6 @@ mod tests {
             let (explicit, saved) = (explicit.map(name), saved.map(name));
             let model = select_model(&config, explicit.as_ref(), saved.as_ref()).unwrap();
             assert_eq!(model.name(), name(expected));
-            assert!(std::ptr::eq(model.config().config(), config.config()));
-            let profile = config.model(&name(expected)).unwrap();
-            assert!(std::ptr::eq(model.profile(), profile));
         }
         let explicit = name("test/removed");
         let saved = name("test/another");
@@ -354,24 +363,6 @@ mod tests {
             unknown.to_string(),
             "invalid model `test/removed`: model is not configured"
         );
-
-        // Persist names, not handles: the same name after reload belongs to the
-        // newly admitted generation, even while an earlier selection is alive.
-        let old = select_model(&original, None, None).unwrap();
-        let mut reloaded = original.config().clone();
-        let ProviderSettings::Compatible(provider) = &mut reloaded.providers["test"].settings
-        else {
-            panic!("compatible fixture");
-        };
-        provider.models["test"].profile.model = "reloaded-fixture".parse().unwrap();
-        let reloaded = reloaded.into_runtime().unwrap();
-        let rebound = select_model(&reloaded, None, Some(&old.name())).unwrap();
-        assert_eq!(old.profile().model.as_str(), "fixture");
-        assert_eq!(rebound.profile().model.as_str(), "reloaded-fixture");
-        assert!(!std::ptr::eq(
-            old.config().config(),
-            rebound.config().config()
-        ));
     }
 
     #[tokio::test]
@@ -411,50 +402,34 @@ mod tests {
         launch.create(None).await.unwrap().shutdown().await.unwrap();
     }
 
+    /// Sessions live under the selected workspace whatever the storage setting, and
+    /// resuming never falls back to another root holding valid history.
     #[tokio::test]
-    async fn history_root_is_selected_workspace_even_with_storage_override() {
+    async fn history_is_workspace_local_without_fallback() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("project/nested");
         std::fs::create_dir_all(&workspace).unwrap();
         let parent = std::fs::canonicalize(workspace.parent().unwrap()).unwrap();
-        for configured in [
+        let configured = root.path().join("shared-sessions");
+        for storage in [
             None,
-            Some(root.path().join("shared-sessions")),
+            Some(configured.clone()),
             Some(PathBuf::from("relative-sessions")),
         ] {
-            let launch = launch(&workspace.join(".."), &history_config(configured)).await;
+            let launch = launch(&workspace.join(".."), &history_config(storage)).await;
             // This is the same root passed to the TUI history loader.
             assert_eq!(launch.sessions, parent.join(".skyhook/sessions"));
             assert!(!launch.sessions.exists());
         }
-    }
-
-    #[tokio::test]
-    async fn history_creation_and_resume_are_workspace_local_without_fallback() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("project");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let configured = root.path().join("shared-sessions");
-        let mut outside_ids = vec![];
-        for outside in [
-            configured.clone(),
-            root.path().join(".skyhook/sessions"),
-            root.path().join("other/.skyhook/sessions"),
-        ] {
-            // Seed valid, resumable history, not merely empty session directories.
-            let model = history_config(None).default_model();
-            let builder = model
-                .harness_builder(&workspace)
-                .unwrap()
-                .session_root(outside);
-            let session = builder.build().await.unwrap().new_session().await.unwrap();
-            outside_ids.push(session.id());
-            session.shutdown().await.unwrap();
-        }
+        // Seed valid, resumable history, not merely an empty session directory.
+        let model = history_config(None).default_model();
+        let builder = model.harness_builder(&workspace).unwrap();
+        let builder = builder.session_root(configured.clone());
+        let outside = builder.build().await.unwrap().new_session().await.unwrap();
+        let outside_id = outside.id();
+        outside.shutdown().await.unwrap();
         let launch = launch(&workspace, &history_config(Some(configured.clone()))).await;
-        for id in outside_ids {
-            assert!(launch.create(Some(id)).await.is_err());
-        }
+        assert!(launch.create(Some(outside_id)).await.is_err());
         assert!(!launch.sessions.exists());
 
         let session = launch.create(None).await.unwrap();

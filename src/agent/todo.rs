@@ -142,13 +142,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejections_identify_the_rejected_job() {
-        let fixture = crate::session::tests::MemorySession::new().await;
-        let todos = &fixture.store;
-        let jobs = crate::job::JobManager::new(fixture.store.clone());
+        let fixture = crate::tests::TestRuntime::new().await;
+        let (todos, jobs) = (&fixture.store, &fixture.jobs);
         let spec = crate::job::JobSpec::test(fixture.agent.clone(), "agent");
         let job = jobs.create(spec).await.unwrap().into_test_id();
         let missing = todos.inspect_todos(&fixture.agent, Some(job)).unwrap_err();
-        fixture.start_child(&fixture.agent, 1, Some(job)).await;
+        let workspace = fixture.root.path();
+        crate::session::tests::start_child(todos, &fixture.agent, 1, Some(job), workspace).await;
         let sibling = fixture.agent.child(2);
         let forbidden = todos.inspect_todos(&sibling, Some(job)).unwrap_err();
         for (error, operation) in [

@@ -29,7 +29,6 @@ macro_rules! string_newtype {
         $vis struct $name(String);
 
         impl $name {
-            #[must_use]
             $vis fn as_str(&self) -> &str {
                 &self.0
             }

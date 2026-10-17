@@ -1,5 +1,5 @@
 //! Visual composer rows, source-to-cell cursor mapping, and atomic paste clipping.
-use super::{Composer, Token};
+use super::{Composer, Kind, Token};
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -72,7 +72,7 @@ impl Composer {
     pub fn layout(&self, width: usize) -> std::sync::Arc<ComposerLayout> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (&self.text, self.cursor, self.anchor, width).hash(&mut hasher);
+        (&*self.text, self.cursor, self.anchor, width).hash(&mut hasher);
         for (offset, paste) in &self.pastes {
             (offset, paste.id, paste.lines).hash(&mut hasher);
         }
@@ -131,7 +131,7 @@ impl ComposerLayout {
         let mut i = 0;
         while i < tokens.len() {
             let token = &tokens[i];
-            if token.newline {
+            if token.kind == Kind::Newline {
                 // Preserve the insertion point after a full row instead of
                 // clamping onto its final character or wide continuation cell.
                 // Rendering reserves a padding cell for this exclusive edge.
@@ -158,13 +158,10 @@ impl ComposerLayout {
             }
             // Wrap a whole word when it fits on a fresh row. Whitespace is not
             // discarded or bundled with the word, unlike Paragraph's trim mode.
-            if !token.whitespace
-                && !token.paste
-                && (i == 0 || tokens[i - 1].whitespace || tokens[i - 1].paste)
-            {
+            if token.kind == Kind::Word && (i == 0 || tokens[i - 1].kind != Kind::Word) {
                 let word_width: usize = tokens[i..]
                     .iter()
-                    .take_while(|t| !t.whitespace && !t.paste)
+                    .take_while(|t| t.kind == Kind::Word)
                     .map(|t| UnicodeWidthStr::width(t.text.as_str()))
                     .sum();
                 let column = rows.last().unwrap().width;
@@ -184,7 +181,7 @@ impl ComposerLayout {
             let (display, displayed_width) = clip(&token.text, width);
             row.spans.push(ComposerSpan {
                 text: display,
-                paste: token.paste,
+                paste: token.kind == Kind::Paste,
                 selected: selection
                     .as_ref()
                     .is_some_and(|r| r.start < token.source.end && token.source.start < r.end),

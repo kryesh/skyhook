@@ -8,7 +8,7 @@ use skyhook::agent::{AgentActivity, ObservationSnapshot, StoppedReading, TodoIte
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobEnvelope, JobRole, JobState, JobTransition};
 use skyhook::provider::protocol::UsageTotals;
-use skyhook::session::{MessageSeq, RecordSeq, SessionEvent, Turns};
+use skyhook::session::{Message, MessageSeq, RecordSeq, SessionEvent, Turns};
 use skyhook::target::TargetRef;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
@@ -43,7 +43,8 @@ impl AgentDisplayState {
     pub fn stopped(failure: &TurnFailure) -> Self {
         match failure {
             TurnFailure::Interrupted => Self::Job(JobState::Interrupted),
-            TurnFailure::Cancelled | TurnFailure::Failed(_) => Self::Job(JobState::Failed),
+            TurnFailure::Cancelled => Self::Job(JobState::Cancelled),
+            TurnFailure::Failed(_) => Self::Job(JobState::Failed),
         }
     }
 
@@ -114,8 +115,8 @@ impl AgentLifecycle {
 pub struct AgentInfo {
     pub id: AgentId,
     pub name: String,
-    /// The model the agent runs on; none for a tool-only agent.
-    pub model: Option<skyhook::provider::profile::ModelRef>,
+    /// The model the agent runs on.
+    pub model: skyhook::provider::profile::ModelRef,
     /// The root agent's applied mode.
     pub mode: Option<skyhook::tool::policy::ModeName>,
     pub capabilities: Vec<skyhook::tool::policy::Capability>,
@@ -144,6 +145,8 @@ pub struct Projection {
     turns: Turns,
     /// Each agent's most recently finished turn.
     last_turn: HashMap<AgentId, Timing>,
+    /// When each assistant message's turn began.
+    pub(super) turn_starts: HashMap<MessageSeq, i64>,
 }
 /// Whether any job the session holds has yet to end.
 pub fn open_jobs(snapshot: &ObservationSnapshot) -> bool {
@@ -262,13 +265,28 @@ impl Projection {
                         } else {
                             format!("agent {}", agent_label(&record.agent))
                         },
-                        model: profile.as_ref().map(|profile| profile.name.clone()),
+                        model: profile.name.clone(),
                         mode: mode.as_ref().map(|mode| mode.name.clone()),
                         capabilities: capabilities.clone(),
                         target: location.target.clone(),
                         owner: *owner_job,
                         lifecycle: AgentLifecycle::Active,
                     });
+                }
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_),
+                } => {
+                    if let Some(started) = self.turns.started(&record.agent) {
+                        (self.turn_starts).insert(record.sequence.message(), started);
+                    }
+                }
+                SessionEvent::MessageCommitted {
+                    message: Message::Tool(result),
+                } => {
+                    // The call shows the result that answered it.
+                    let answered = snapshot.ledger.answered(record.sequence);
+                    let call = answered.map(|message| Dep::Call(message, result.call_id.clone()));
+                    self.changes.extend(call);
                 }
                 SessionEvent::JobCreated {
                     origin: Some(origin),
@@ -301,7 +319,7 @@ impl Projection {
                 }
                 SessionEvent::ModelChanged { profile } => {
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
-                        agent.model = Some(profile.name.clone());
+                        agent.model = profile.name.clone();
                     }
                 }
                 SessionEvent::ModeChanged { mode, capabilities } => {
@@ -378,7 +396,8 @@ impl Projection {
         let agent = self.agents.iter().find(|agent| agent.id == job.agent);
         let capabilities = agent.map(|agent| agent.capabilities.iter().copied().collect());
         let capabilities = capabilities.unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
-        job.diagnostic()
+        job.diagnostic
+            .as_ref()
             .map(|diagnostic| diagnostic.render(&capabilities))
     }
     /// An agent's footer statistics.

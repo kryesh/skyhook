@@ -1,5 +1,6 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
+use super::entries::status_entry;
 use super::{
     AgentDisplayState, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Timing, Title,
     View,
@@ -8,7 +9,7 @@ use crate::tui::render::{Section, sections};
 use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::{BlockRef, ItemKind};
-use skyhook::session::{RequestPhase, RequestRecord, RequestSeq};
+use skyhook::session::{RequestPhase, RequestRecord, RequestSeq, SessionError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReasoningStatus {
@@ -161,6 +162,13 @@ pub(super) fn live_tail(
     }
     let streaming = entries[start..].iter().any(|entry| entry.timing.live());
     entries.extend(working_entry(snapshot, agent, streaming));
+    // The session's conversation, and only it, shows what stopped it.
+    if agent.path().is_empty()
+        && let Some(failure) = snapshot.phase.failure()
+    {
+        let failed = SessionError::JournalFailed(failure.clone());
+        entries.push(status_entry(EntryKey::JournalFailed, &failed));
+    }
     shown
 }
 

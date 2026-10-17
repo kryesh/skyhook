@@ -3,20 +3,19 @@
 
 use super::{
     decode::*,
-    diagnostic::{self, Slot},
+    diagnostic,
     encode::*,
     message::{image, image_row},
     *,
 };
 use crate::{
     execution::path_bytes,
-    job::{JobEnd, JobTransition},
     session::{EntryKind, ModelCallOrigin, SessionEvent},
 };
 
 impl Encoder {
     pub(super) fn job(&mut self, db: &Db, entry: Entry, event: &SessionEvent) -> DbResult<()> {
-        let Entry { seq, kind, .. } = entry;
+        let seq = entry.seq;
         match event {
             SessionEvent::JobCreated {
                 job,
@@ -66,68 +65,27 @@ impl Encoder {
                         target,
                         path_bytes(&location.workspace),
                     ],
-                )?;
-                db.execute(
-                    "INSERT INTO job_run (job, generation, started) VALUES (?1, 0, ?2)",
-                    params![job.get(), seq],
                 )
                 .map(drop)
             }
-            SessionEvent::JobStateChanged { job, state } => {
-                db.execute(
+            SessionEvent::JobStateChanged { job, state } => db
+                .execute(
                     "INSERT INTO job_transition (entry, job, state) VALUES (?1, ?2, ?3)",
                     params![seq, job.get(), *state],
-                )?;
-                // A finished job that runs again starts its next generation.
-                if *state == JobTransition::Running {
-                    db.execute(
-                        "INSERT INTO job_run (job, generation, started) \
-                         SELECT ?1, (SELECT max(generation) + 1 FROM job_run WHERE job = ?1), ?2 \
-                         WHERE (SELECT max(entry) FROM job_finish WHERE job = ?1) > coalesce( \
-                           (SELECT max(entry) FROM job_transition WHERE job = ?1 AND entry < ?2), 0)",
-                        params![job.get(), seq],
-                    )?;
-                }
-                Ok(())
-            }
+                )
+                .map(drop),
             SessionEvent::JobFinished {
                 job,
                 state,
                 diagnostic,
-                output_diagnostic,
                 images,
             } => {
-                // Retained jobs reopen after a running reset; only an interrupted
-                // outcome may be followed directly by cancellation.
-                let previous = db.query_row(
-                    "SELECT f.state, f.entry > coalesce((SELECT max(t.entry) FROM job_transition t \
-                     WHERE t.job = f.job AND t.state = ?2), 0) \
-                     FROM job_finish f WHERE f.job = ?1 ORDER BY f.entry DESC LIMIT 1",
-                    params![job.get(), JobTransition::Running],
-                    |row| Ok((enum_column::<JobEnd>(row, 0)?, row.get::<bool>(1)?)),
-                )?;
-                if let Some((previous, current)) = previous
-                    && (current || previous == JobEnd::Cancelled)
-                {
-                    let reopened =
-                        current && previous == JobEnd::Interrupted && *state == JobEnd::Cancelled;
-                    if !reopened {
-                        return Err(rejected(format!(
-                            "duplicate or invalid terminal event for job {job}"
-                        )));
-                    }
-                }
                 db.execute(
                     "INSERT INTO job_finish (entry, job, state) VALUES (?1, ?2, ?3)",
                     params![seq, job.get(), *state],
                 )?;
-                for (slot, diagnostic) in [
-                    (Slot::Diagnostic, diagnostic),
-                    (Slot::OutputDiagnostic, output_diagnostic),
-                ] {
-                    if let Some(diagnostic) = diagnostic {
-                        self.diagnostic(db, seq, slot, diagnostic)?;
-                    }
+                if let Some(diagnostic) = diagnostic {
+                    self.diagnostic(db, seq, diagnostic)?;
                 }
                 for (position, image) in images.iter().enumerate() {
                     image_row(db, "job_finish_image", "finish", seq, position, image)?;
@@ -137,28 +95,27 @@ impl Encoder {
             SessionEvent::JobClaimed { job }
             | SessionEvent::JobReleased { job }
             | SessionEvent::JobMessageReleased { job }
-            | SessionEvent::JobInjected { job } => delivery(db, entry, job.get(), None, None),
+            | SessionEvent::JobInjected { job } => delivery(db, seq, job.get(), None, None),
             SessionEvent::JobMessageDelivered {
                 job,
                 source,
                 notification,
-            } => delivery(db, entry, job.get(), Some(*notification), Some(*source)),
-            _ => unreachable!("{kind} is not a job event"),
+            } => delivery(db, seq, job.get(), Some(*notification), Some(*source)),
+            _ => unreachable!("{} is not a job event", event.kind()),
         }
     }
 }
 
 fn delivery(
     db: &Db,
-    entry: Entry,
+    seq: u64,
     job: u64,
     notification: Option<MessageSeq>,
     source: Option<MessageSeq>,
 ) -> DbResult<()> {
     db.execute(
-        "INSERT INTO job_delivery (entry, kind, job, notification, source) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![entry.seq, entry.kind, job, notification, source],
+        "INSERT INTO job_delivery (entry, job, notification, source) VALUES (?1, ?2, ?3, ?4)",
+        params![seq, job, notification, source],
     )
     .map(drop)
 }
@@ -224,13 +181,13 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         Ok(SessionEvent::JobFinished {
             job: job(row.get(1)?)?,
             state: enum_column(row, 2)?,
-            diagnostic: diagnostics.get(&(seq, Slot::Diagnostic)).cloned(),
-            output_diagnostic: diagnostics.get(&(seq, Slot::OutputDiagnostic)).cloned(),
+            diagnostic: diagnostics.get(&seq).cloned(),
             images: images.get(&seq).cloned().unwrap_or_default(),
         })
     })?;
     events.load(
-        "SELECT entry, kind, job, notification, source FROM job_delivery",
+        "SELECT d.entry, e.kind, d.job, d.notification, d.source FROM job_delivery d \
+         JOIN entry e ON e.seq = d.entry",
         |row| {
             let job = job(row.get(2)?)?;
             let message = |at: i32| {

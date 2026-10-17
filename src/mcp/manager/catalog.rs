@@ -99,7 +99,6 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, StartupError>
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, failure, shutdown};
     use super::super::{McpError, McpManager};
@@ -115,9 +114,7 @@ mod tests {
             ("repeated_cursor", DiscoveryLimit::RepeatedCursor),
         ];
         let modes = LIMITS.map(|(mode, _)| mode);
-        let Some(fixtures) = Fixture::batch::<{ LIMITS.len() }>() else {
-            return;
-        };
+        let fixtures: [Fixture; LIMITS.len()] = std::array::from_fn(|_| Fixture::new());
         let configs = std::iter::zip(modes, &fixtures)
             .map(|(mode, fixture)| {
                 let mut config = fixture.config();
@@ -136,7 +133,6 @@ mod tests {
         for (mode, limit) in LIMITS {
             assert!(matches!(*failure(&manager, mode), StartupError::Limit(l) if l == limit));
         }
-        #[cfg(unix)]
         for fixture in &fixtures {
             assert_process_reaped(fixture.pid()).await;
         }
@@ -162,7 +158,6 @@ mod tests {
             matches!(error, StartupError::Discovery(McpError::JsonRpc(-32602))),
             "{error}"
         );
-        #[cfg(unix)]
         assert_process_reaped(fixture.pid()).await;
     }
 
@@ -174,9 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn resources_only_server_gets_no_tools_requests_or_extra_client_capabilities() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let mut config = fixture.config();
         config.env.insert("MCP_TEST_NO_TOOLS".into(), "1".into());
         let manager = connect(config).await;

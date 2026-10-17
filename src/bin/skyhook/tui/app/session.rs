@@ -158,7 +158,7 @@ impl App {
     }
     /// Nothing typed, queued or starting.
     fn unattended(&self) -> bool {
-        matches!(self.start, StartState::Idle) && self.editor.is_empty() && self.queue.is_empty()
+        self.creating.is_none() && self.editor.is_empty() && self.queue.is_empty()
     }
     /// A notice about the interface itself: shown here, never journaled.
     pub fn local_notice(&mut self, message: impl Into<String>) {
@@ -299,5 +299,26 @@ mod tests {
         click(&mut app, title);
         assert!(renaming(&app));
         assert_eq!(app.prompt_input().editor.text(), "Renamed");
+    }
+
+    /// An untitled session shows its first prompt as its title once it commits.
+    #[tokio::test]
+    async fn an_untitled_session_shows_its_first_prompt_as_its_title() {
+        use super::super::played::{committed, observe_record, played_fixture, user};
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut work = capture_work(&mut app);
+        app.submit("name me after this".into());
+        let _turn = model.turn().await;
+        observe_record(&mut app, committed(user)).await;
+        bounded(async {
+            while app.title.is_none() {
+                let work = recv(&mut work).await;
+                app.work(work);
+            }
+        })
+        .await;
+        let title = app.title.as_ref().map(|title| title.text.as_str());
+        assert_eq!(title, Some("name me after this"));
+        session.shutdown().await.unwrap();
     }
 }

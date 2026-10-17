@@ -205,6 +205,8 @@ pub enum ModelError {
     Placement(#[from] PlacementError),
     #[error("{0} applies only to the responses codec")]
     ResponsesOnly(ResponseSetting),
+    #[error("explicit_caching applies only to the chat_completions and responses codecs")]
+    ExplicitCaching,
     #[error("reasoning `{effort}` is not one of: {}", .levels.0.join(", "))]
     Reasoning {
         effort: String,

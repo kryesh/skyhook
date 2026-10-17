@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{
     identity::JobId,
     job::{
-        FieldPointer, JobError, JobManager, OutputPresentation,
+        FieldPointer, JobError, JobManager, ViewKind,
         output::{DEFAULT_LIMIT, MAX_CONTEXT, MAX_LIMIT, OutputArgs, OutputOptions},
     },
     tool::{
@@ -40,7 +40,7 @@ pub(crate) fn register(
                         context.cancellation_token(),
                         context.diagnostic_viewer(),
                         OutputOptions::Model {
-                            presentation: OutputPresentation::Full,
+                            kind: ViewKind::Inspection,
                         },
                     );
                     let presented = presented.await.map_err(|error| error.or(read))?;
@@ -234,7 +234,6 @@ mod tests {
     use super::*;
     use crate::{
         job::{JobOutcome, JobRole, JobSpec},
-        session::SessionError,
         tests::{TestRuntime, tool_executor},
         tool::{ToolOutput, ToolRegistryBuilder, diagnostic::Cause},
     };
@@ -280,43 +279,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn job_failure_retains_canonical_cause_and_boundary_mutation_evidence() {
-        let job = JobId::new(42).unwrap();
-        let session_error = || {
-            SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "private persisted input",
-            ))
-        };
-        let cases = [
-            (
-                JobError::Session(session_error()),
-                ToolError::from(session_error()).diagnostic().cause,
-                Effects::Unknown,
-            ),
-            (
-                JobError::Output(Box::new(
-                    ToolError::failed("capture write failed").effects(Effects::OutputIncomplete),
-                )),
-                Cause::Message("capture write failed".into()),
-                Effects::OutputIncomplete,
-            ),
-            (
-                JobError::Unknown(job),
-                Cause::UnknownJob { job },
-                Effects::NotStarted,
-            ),
-        ];
-        for (error, cause, effects) in cases {
-            let diagnostic = job_failure(error, Operation::Send, job).diagnostic();
-            assert_eq!(diagnostic.context.operation, Operation::Send);
-            assert_eq!(diagnostic.context.subject, Subject::Job(job));
-            assert_eq!(diagnostic.context.effects, effects);
-            assert_eq!(diagnostic.cause, cause);
-        }
-    }
-
     #[tokio::test]
     async fn job_output_reads_name_the_requested_job_on_the_host() {
         let runtime = TestRuntime::new().await;
@@ -345,6 +307,10 @@ mod tests {
             assert_eq!(context.subject, subject);
             assert_eq!(context.site, crate::tool::diagnostic::FailureSite::Host);
         }
+        // An unknown job was never touched.
+        let cancel = executor.run_host(&runtime.agent, "job_cancel", json!({"job": unknown}));
+        let context = cancel.await.unwrap_err().diagnostic().context;
+        assert_eq!(context.effects, Effects::NotStarted);
     }
 
     #[tokio::test]

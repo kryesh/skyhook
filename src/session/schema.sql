@@ -1,6 +1,7 @@
--- Skyhook session database (application_id 0x534B5948, user_version 22). Tables are STRICT;
--- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
--- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
+-- Skyhook session database (application_id 0x534B5948, user_version 23). Tables are STRICT;
+-- subtype rows reference entry(seq), whose kind the decoder requires them to match.
+-- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
+-- saturate to i64::MAX.
 --
 -- Skyhook-typed data is normalized. The only JSON text columns hold shapes a model, a
 -- tool's own schema or a provider defines: tool_call.arguments, tool_result.result,
@@ -16,10 +17,7 @@ CREATE TABLE session (
 ) STRICT;
 
 -- Dictionaries hold the spellings of the enums they name, as JSON spells them;
--- `Dictionaries` in db/mod.rs seeds them at create and checks them at open. A subset
--- dictionary names the values a column may take. A flag marks the values that fill a
--- payload column several share; the payload's table references it through a
--- generated column.
+-- `Dictionaries` in db/mod.rs seeds them at create and checks them at open.
 CREATE TABLE capability (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 -- 'root' is seeded at create; it has no revision rows.
@@ -40,8 +38,7 @@ CREATE TABLE agent (
 ) STRICT;
 CREATE UNIQUE INDEX agent_single_root ON agent((parent IS NULL)) WHERE parent IS NULL;
 
--- Subtype tables narrow kind to the kinds they hold. Activity kinds are the session's
--- activity; closing it, which interrupts its agents, is not.
+-- Activity kinds are the session's activity; closing it, which interrupts its agents, is not.
 CREATE TABLE entry_kind (
   name TEXT PRIMARY KEY,
   activity INTEGER NOT NULL CHECK (activity IN (0,1))
@@ -52,8 +49,7 @@ CREATE TABLE entry (
   public_id BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
   agent INTEGER NOT NULL REFERENCES agent(id),
   created_millis INTEGER NOT NULL,
-  kind TEXT NOT NULL REFERENCES entry_kind(name),
-  UNIQUE (seq, kind)
+  kind TEXT NOT NULL REFERENCES entry_kind(name)
 ) STRICT;
 CREATE UNIQUE INDEX entry_one_agent_start ON entry(agent) WHERE kind = 'agent_started';
 -- An agent's latest entry of a kind, for state read without decoding the journal.
@@ -62,21 +58,17 @@ CREATE INDEX entry_agent_kind ON entry(agent, kind);
 -- Status text. agent_completed / agent_interrupted / session_started / title_cleared carry
 -- no subtype row.
 CREATE TABLE entry_text (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('status') VIRTUAL,
-  text TEXT NOT NULL,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  text TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE title_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 -- A title_cleared entry drops the user's earlier titles; db/state.rs TITLE applies the rule.
 CREATE TABLE title (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('title_set') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   source TEXT NOT NULL REFERENCES title_source(name),
-  text TEXT NOT NULL,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  text TEXT NOT NULL
 ) STRICT;
 
 -- ───────────────────────── Targets ─────────────────────────
@@ -84,14 +76,11 @@ CREATE TABLE title (
 CREATE TABLE target_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE ssh_auth (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
-CREATE TABLE targets_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
-
 -- via/origin NULL means the route starts at root.
 CREATE TABLE target_revision (
   id INTEGER PRIMARY KEY,
   target INTEGER NOT NULL REFERENCES target(id),
-  entry INTEGER NOT NULL,
-  kind TEXT NOT NULL REFERENCES targets_entry_kind(name),
+  entry INTEGER NOT NULL REFERENCES entry(seq),
   revision INTEGER NOT NULL CHECK (revision > 0),
   source TEXT NOT NULL REFERENCES target_source(name),
   host TEXT NOT NULL,
@@ -104,8 +93,7 @@ CREATE TABLE target_revision (
   via INTEGER REFERENCES target(id),
   origin INTEGER REFERENCES target(id),
   UNIQUE (target, revision),
-  CHECK ((ssh_auth = 'key') = (ssh_key_path IS NOT NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  CHECK ((ssh_auth = 'key') = (ssh_key_path IS NOT NULL))
 ) STRICT;
 
 CREATE TABLE target_ssh_option (
@@ -135,25 +123,17 @@ CREATE TABLE model_profile (
 ) STRICT;
 
 -- An agent's settings belong to the entry that applied them; the latest one holds.
--- profile is NULL for a tool-only agent without a model, such as a remote worker.
 CREATE TABLE agent_start (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('agent_started') VIRTUAL,
-  profile INTEGER REFERENCES model_profile(id),
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  profile INTEGER NOT NULL REFERENCES model_profile(id),
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  location_workspace BLOB NOT NULL
 ) STRICT;
 
--- Entries that apply a mode and the capabilities it grants.
-CREATE TABLE mode_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
-
 CREATE TABLE agent_capability (
-  entry INTEGER NOT NULL,
-  kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
+  entry INTEGER NOT NULL REFERENCES entry(seq),
   capability TEXT NOT NULL REFERENCES capability(name),
-  PRIMARY KEY (entry, capability),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  PRIMARY KEY (entry, capability)
 ) STRICT, WITHOUT ROWID;
 
 -- Each edition of a mode the session applied, recorded by the entry that first applied
@@ -162,12 +142,10 @@ CREATE TABLE agent_capability (
 CREATE TABLE mode (
   name TEXT NOT NULL,
   version INTEGER NOT NULL CHECK (version > 0),
-  entry INTEGER NOT NULL UNIQUE,
-  kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
+  entry INTEGER NOT NULL UNIQUE REFERENCES entry(seq),
   instructions TEXT,
   hint TEXT,
-  PRIMARY KEY (name, version),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  PRIMARY KEY (name, version)
 ) STRICT, WITHOUT ROWID;
 
 -- What the edition lists, which may exceed what the live ceiling allows; agent_capability
@@ -182,19 +160,15 @@ CREATE TABLE mode_capability (
 
 -- The agent's mode edition as of this entry.
 CREATE TABLE agent_mode (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   mode_name TEXT NOT NULL,
   mode_version INTEGER NOT NULL,
-  FOREIGN KEY (mode_name, mode_version) REFERENCES mode(name, version),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  FOREIGN KEY (mode_name, mode_version) REFERENCES mode(name, version)
 ) STRICT;
 
 CREATE TABLE model_selection (                   -- ModelChanged only
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('model_changed') VIRTUAL,
-  profile INTEGER NOT NULL REFERENCES model_profile(id),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  profile INTEGER NOT NULL REFERENCES model_profile(id)
 ) STRICT;
 
 CREATE TABLE system_prompt (
@@ -223,15 +197,13 @@ CREATE TABLE model_purpose (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- provider/model/reasoning/max_output_tokens derive from profile.
 -- The agent's first purpose='agent' context is written in its agent_started transaction.
 CREATE TABLE model_context (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('model_context') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   purpose TEXT NOT NULL REFERENCES model_purpose(name),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   system_prompt INTEGER NOT NULL REFERENCES system_prompt(id),
   response_schema_name TEXT,
   response_schema TEXT CHECK (response_schema IS NULL OR json_valid(response_schema)),
-  CHECK ((response_schema_name IS NULL) = (response_schema IS NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  CHECK ((response_schema_name IS NULL) = (response_schema IS NULL))
 ) STRICT;
 
 CREATE TABLE model_context_tool (
@@ -254,43 +226,32 @@ CREATE TABLE image_format (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE message (
   id INTEGER PRIMARY KEY,
-  role TEXT NOT NULL REFERENCES message_role(name),
-  UNIQUE (id, role)
+  role TEXT NOT NULL REFERENCES message_role(name)
 ) STRICT;
 
 -- job_events parts hold their content in user_part_job_event.
-CREATE TABLE user_part_kind (
-  name TEXT PRIMARY KEY,
-  text INTEGER NOT NULL CHECK (text IN (0,1)),
-  UNIQUE (name, text)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE user_part_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE user_part (
   id INTEGER PRIMARY KEY,
-  message INTEGER NOT NULL,
-  role TEXT GENERATED ALWAYS AS ('user') VIRTUAL,
+  message INTEGER NOT NULL REFERENCES message(id),
   position INTEGER NOT NULL CHECK (position >= 0),
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL REFERENCES user_part_kind(name),
   text TEXT,
   blob BLOB REFERENCES blob(sha256),               -- AttachmentRef
   image_format TEXT REFERENCES image_format(name),
   file TEXT,                                       -- NULL = no file name
-  has_text INTEGER GENERATED ALWAYS AS (text IS NOT NULL) VIRTUAL,
   UNIQUE (message, position),
   CHECK ((kind = 'attachment') = (blob IS NOT NULL)),
-  FOREIGN KEY (kind, has_text) REFERENCES user_part_kind(name, text),
-  CHECK (kind = 'attachment' OR (image_format IS NULL AND file IS NULL)),
-  FOREIGN KEY (message, role) REFERENCES message(id, role)
+  CHECK (kind = 'attachment' OR (image_format IS NULL AND file IS NULL))
 ) STRICT;
 
 -- The agent's state as a request sent it: its date and location, live jobs and todos.
 CREATE TABLE message_state (
-  message INTEGER PRIMARY KEY,
-  role TEXT GENERATED ALWAYS AS ('state') VIRTUAL,
+  message INTEGER PRIMARY KEY REFERENCES message(id),
   date TEXT NOT NULL,
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL,
-  FOREIGN KEY (message, role) REFERENCES message(id, role)
+  location_workspace BLOB NOT NULL
 ) STRICT;
 
 -- Jobs in pre-order; parent_position nests an agent job's active children.
@@ -346,14 +307,11 @@ CREATE TABLE item_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE assistant_item (
   id INTEGER PRIMARY KEY,
-  message INTEGER NOT NULL,
-  role TEXT GENERATED ALWAYS AS ('assistant') VIRTUAL,
+  message INTEGER NOT NULL REFERENCES message(id),
   position INTEGER NOT NULL CHECK (position >= 0),
   provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
   kind TEXT NOT NULL REFERENCES item_kind(name),
-  UNIQUE (message, position),
-  UNIQUE (id, kind),
-  FOREIGN KEY (message, role) REFERENCES message(id, role)
+  UNIQUE (message, position)
 ) STRICT;
 
 -- How tightly a replay is bound to the history that produced it.
@@ -363,47 +321,38 @@ CREATE TABLE replay_binding (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE replay_format (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE reasoning_replay (
-  item INTEGER PRIMARY KEY,
-  item_kind TEXT GENERATED ALWAYS AS ('reasoning') VIRTUAL,
+  item INTEGER PRIMARY KEY REFERENCES assistant_item(id),
   format TEXT NOT NULL REFERENCES replay_format(name),
   model TEXT NOT NULL,
   scope TEXT NOT NULL CHECK (trim(scope) <> ''),
   payload TEXT NOT NULL CHECK (json_valid(payload)),
-  binding TEXT NOT NULL REFERENCES replay_binding(name),
-  FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
+  binding TEXT NOT NULL REFERENCES replay_binding(name)
 ) STRICT;
 
 -- Readable blocks of text and reasoning items.
-CREATE TABLE block_item_kind (name TEXT PRIMARY KEY REFERENCES item_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE assistant_block (
-  item INTEGER NOT NULL,
-  item_kind TEXT NOT NULL REFERENCES block_item_kind(name),
+  item INTEGER NOT NULL REFERENCES assistant_item(id),
   position INTEGER NOT NULL CHECK (position >= 0),
   provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
   text TEXT NOT NULL,
-  PRIMARY KEY (item, position),
-  FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
+  PRIMARY KEY (item, position)
 ) STRICT;
 
 CREATE TABLE tool_call (
-  item INTEGER PRIMARY KEY,
-  item_kind TEXT GENERATED ALWAYS AS ('tool_call') VIRTUAL,
+  item INTEGER PRIMARY KEY REFERENCES assistant_item(id),
   call_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  arguments TEXT NOT NULL CHECK (json_valid(arguments) AND json_type(arguments) = 'object'),
-  FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
+  arguments TEXT NOT NULL CHECK (json_valid(arguments) AND json_type(arguments) = 'object')
 ) STRICT;
 CREATE INDEX tool_call_id ON tool_call(call_id);
 
 -- One result per tool message; name derives from the call. History merges a turn's
 -- result messages into one Message::Tool ordered by the call's item position.
 CREATE TABLE tool_result (
-  message INTEGER PRIMARY KEY,
-  role TEXT GENERATED ALWAYS AS ('tool') VIRTUAL,
+  message INTEGER PRIMARY KEY REFERENCES message(id),
   call INTEGER NOT NULL UNIQUE REFERENCES tool_call(item),
   result TEXT NOT NULL CHECK (json_valid(result)),
-  is_error INTEGER NOT NULL CHECK (is_error IN (0,1)),
-  FOREIGN KEY (message, role) REFERENCES message(id, role)
+  is_error INTEGER NOT NULL CHECK (is_error IN (0,1))
 ) STRICT;
 
 CREATE TABLE tool_result_image (
@@ -416,23 +365,18 @@ CREATE TABLE tool_result_image (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE message_commit (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('message_committed') VIRTUAL,
-  message INTEGER NOT NULL UNIQUE REFERENCES message(id),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  message INTEGER NOT NULL UNIQUE REFERENCES message(id)
 ) STRICT;
 
 CREATE TABLE todo_status (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
-CREATE TABLE todos_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE todo_item (
-  entry INTEGER NOT NULL,
-  kind TEXT NOT NULL REFERENCES todos_entry_kind(name),
+  entry INTEGER NOT NULL REFERENCES entry(seq),
   position INTEGER NOT NULL CHECK (position >= 0),
   text TEXT NOT NULL,
   status TEXT NOT NULL REFERENCES todo_status(name),
-  PRIMARY KEY (entry, position),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  PRIMARY KEY (entry, position)
 ) STRICT, WITHOUT ROWID;
 
 -- ───────────────────────── Model requests, attempts, compaction ─────────────────────────
@@ -441,16 +385,14 @@ CREATE TABLE todo_item (
 CREATE TABLE history_lifetime (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_request (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('model_requested') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   context INTEGER NOT NULL REFERENCES model_context(entry),
   -- History is the checkpoint, its retained sources, then the agent's commits after the
   -- checkpoint's frontier up to history_through; history_from drops those before it.
   checkpoint INTEGER REFERENCES compaction(entry),
   history_through INTEGER REFERENCES message_commit(entry),
   history_from INTEGER REFERENCES message_commit(entry),
-  history_lifetime TEXT NOT NULL REFERENCES history_lifetime(name),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  history_lifetime TEXT NOT NULL REFERENCES history_lifetime(name)
 ) STRICT;
 
 CREATE TABLE model_request_tail (
@@ -461,50 +403,32 @@ CREATE TABLE model_request_tail (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_attempt (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('model_attempt_started') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   request INTEGER NOT NULL REFERENCES model_request(entry),
   attempt INTEGER NOT NULL CHECK (attempt > 0),
   UNIQUE (request, attempt),
-  UNIQUE (entry, request),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  UNIQUE (entry, request)
 ) STRICT;
 
 -- How an attempt ended: at most one outcome each. A kind's detail row shares the entry.
-CREATE TABLE attempt_outcome_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE attempt_outcome (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL REFERENCES attempt_outcome_kind(name),
-  attempt INTEGER NOT NULL UNIQUE REFERENCES model_attempt(entry),
-  UNIQUE (entry, kind),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  attempt INTEGER NOT NULL UNIQUE REFERENCES model_attempt(entry)
 ) STRICT;
 
 -- How an agent turn or a model attempt failed; detailed kinds keep their detail.
-CREATE TABLE failure_kind (
-  name TEXT PRIMARY KEY,
-  detailed INTEGER NOT NULL CHECK (detailed IN (0,1)),
-  UNIQUE (name, detailed)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE failure_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE provider_error_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
-CREATE TABLE failure_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE failure (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL REFERENCES failure_entry_kind(name),
-  failure TEXT NOT NULL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  failure TEXT NOT NULL REFERENCES failure_kind(name),
   detail TEXT,
-  detailed INTEGER GENERATED ALWAYS AS (detail IS NOT NULL) VIRTUAL,
   -- A provider failure's class; its detail is the provider's message.
   provider TEXT REFERENCES provider_error_kind(name),
-  -- A model failure is its attempt's outcome; NULL leaves an agent failure unlinked.
-  outcome TEXT GENERATED ALWAYS AS (CASE kind WHEN 'model_failed' THEN kind END) VIRTUAL,
   -- The backoff before a retried model failure's next attempt; only a provider failure retries.
   retry_millis INTEGER CHECK (retry_millis >= 0),
   CHECK ((failure = 'provider') = (provider IS NOT NULL)),
-  CHECK (retry_millis IS NULL OR (outcome IS NOT NULL AND provider IS NOT NULL)),
-  FOREIGN KEY (failure, detailed) REFERENCES failure_kind(name, detailed),
-  FOREIGN KEY (entry, outcome) REFERENCES attempt_outcome(entry, kind),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  CHECK (retry_millis IS NULL OR provider IS NOT NULL)
 ) STRICT;
 
 -- How a completed response ended; a refusal is a model failure instead.
@@ -512,38 +436,32 @@ CREATE TABLE response_outcome (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE cut_reason (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_response (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('response_completed') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES attempt_outcome(entry),
   message INTEGER NOT NULL UNIQUE REFERENCES message_commit(message),
   outcome TEXT NOT NULL REFERENCES response_outcome(name),
   cut_reason TEXT REFERENCES cut_reason(name),
-  CHECK ((outcome = 'cut') = (cut_reason IS NOT NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
+  CHECK ((outcome = 'cut') = (cut_reason IS NOT NULL))
 ) STRICT;
 
 -- A count is NULL when the provider did not report it.
 CREATE TABLE usage (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('usage') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   request INTEGER NOT NULL REFERENCES model_request(entry),
   input_tokens INTEGER CHECK (input_tokens >= 0),
   cached_input_tokens INTEGER CHECK (cached_input_tokens >= 0),
   cache_write_input_tokens INTEGER CHECK (cache_write_input_tokens >= 0),
   output_tokens INTEGER CHECK (output_tokens >= 0),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
   CHECK (cache_write_input_tokens <= input_tokens)
 ) STRICT;
 
 -- The summary attempt is the entry's attempt_outcome.
 CREATE TABLE compaction (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('compaction') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES attempt_outcome(entry),
   frontier INTEGER NOT NULL REFERENCES entry(seq),
   message INTEGER NOT NULL REFERENCES message(id),
   -- The occupancy that triggered compaction; NULL when an overflow did.
   reported_tokens INTEGER CHECK (reported_tokens >= 0),
-  CHECK (frontier < entry),
-  FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
+  CHECK (frontier < entry)
 ) STRICT;
 
 CREATE TABLE compaction_retained (
@@ -552,48 +470,34 @@ CREATE TABLE compaction_retained (
   PRIMARY KEY (compaction, source)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE compaction_fault (
-  name TEXT PRIMARY KEY,
-  detailed INTEGER NOT NULL CHECK (detailed IN (0,1)),
-  UNIQUE (name, detailed)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE compaction_fault (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE checkpoint_error (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE compaction_failure (              -- CompactionFailed only
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('compaction_failed') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   request INTEGER REFERENCES model_request(entry),
   -- The summary attempt this round used. It may also hold a model failure, so it is a
   -- reference rather than an attempt_outcome.
   attempt INTEGER,
-  fault TEXT NOT NULL,
+  fault TEXT NOT NULL REFERENCES compaction_fault(name),
   detail TEXT,
-  detailed INTEGER GENERATED ALWAYS AS (detail IS NOT NULL) VIRTUAL,
   -- A checkpoint fault's detail names the checkpoint error, a summary fault its failure.
   checkpoint TEXT GENERATED ALWAYS AS (CASE fault WHEN 'checkpoint' THEN detail END) VIRTUAL,
   summary TEXT GENERATED ALWAYS AS (CASE fault WHEN 'summary' THEN detail END) VIRTUAL,
   CHECK (attempt IS NULL OR request IS NOT NULL),
   FOREIGN KEY (attempt, request) REFERENCES model_attempt(entry, request),
-  FOREIGN KEY (fault, detailed) REFERENCES compaction_fault(name, detailed),
   FOREIGN KEY (checkpoint) REFERENCES checkpoint_error(name),
-  FOREIGN KEY (summary) REFERENCES failure_kind(name),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  FOREIGN KEY (summary) REFERENCES failure_kind(name)
 ) STRICT;
 
 -- ───────────────────────── Jobs and outputs ─────────────────────────
 
 CREATE TABLE job_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- Transitions name live states and finishes terminal ones.
-CREATE TABLE job_state (
-  name TEXT PRIMARY KEY,
-  terminal INTEGER NOT NULL CHECK (terminal IN (0,1)),
-  UNIQUE (name, terminal)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE job_state (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job (
   id INTEGER PRIMARY KEY CHECK (id > 0),         -- JobId
-  created INTEGER NOT NULL UNIQUE,
-  kind TEXT GENERATED ALWAYS AS ('job_created') VIRTUAL,
+  created INTEGER NOT NULL UNIQUE REFERENCES entry(seq),
   parent INTEGER REFERENCES job(id),
   origin_call INTEGER UNIQUE REFERENCES tool_call(item),
   tool TEXT NOT NULL,
@@ -604,42 +508,26 @@ CREATE TABLE job (
   accepts_input INTEGER NOT NULL CHECK (accepts_input IN (0,1)),
   background INTEGER NOT NULL CHECK (background IN (0,1)),
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL,
-  FOREIGN KEY (created, kind) REFERENCES entry(seq, kind)
+  location_workspace BLOB NOT NULL
 ) STRICT;
 
 CREATE TABLE job_transition (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('job_state_changed') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   job INTEGER NOT NULL REFERENCES job(id),
-  state TEXT NOT NULL,
-  terminal INTEGER GENERATED ALWAYS AS (0) VIRTUAL,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
-  FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
+  state TEXT NOT NULL REFERENCES job_state(name)
 ) STRICT;
-CREATE INDEX job_transition_job ON job_transition(job, entry);
-
--- One row per run of a job: generation 0 at creation, the next when a 'running'
--- transition follows a finish.
-CREATE TABLE job_run (
-  job INTEGER NOT NULL REFERENCES job(id),
-  generation INTEGER NOT NULL CHECK (generation >= 0),
-  started INTEGER NOT NULL UNIQUE REFERENCES entry(seq),
-  PRIMARY KEY (job, generation)
-) STRICT, WITHOUT ROWID;
 
 -- Output belongs to one run, saved once with its finish: a reset never presents an
--- earlier run's output.
+-- earlier run's output. A generation counts the job's restarts after a finish.
 CREATE TABLE job_output (
-  job INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
+  job INTEGER NOT NULL REFERENCES job(id),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
   -- Every capture the producer finished was admitted into the result.
   captures_complete INTEGER NOT NULL CHECK (captures_complete IN (0,1)),
   -- The tool's result, NULL when the run produced none ('null' is a literal null);
   -- referenced captures are emptied placeholders.
   result TEXT CHECK (result IS NULL OR json_valid(result)),
-  PRIMARY KEY (job, generation),
-  FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
+  PRIMARY KEY (job, generation)
 ) STRICT;
 
 CREATE TABLE capture_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -649,33 +537,16 @@ CREATE TABLE capture_detection (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- partial output stays readable; an abandoned builtin capture deletes its row.
 CREATE TABLE job_capture (
   id INTEGER PRIMARY KEY,
-  job INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
+  job INTEGER NOT NULL REFERENCES job(id),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
   pointer TEXT NOT NULL CHECK (pointer = '' OR pointer LIKE '/%'),
   capture_kind TEXT NOT NULL REFERENCES capture_kind(name),
-  final_bytes INTEGER CHECK (final_bytes >= 0),   -- set once when the writer finishes
-  final_lines INTEGER CHECK (final_lines >= 0),
   -- What a finished text capture its schema declares as JSON holds.
   detection TEXT REFERENCES capture_detection(name),
-  CHECK (detection IS NULL OR (final_bytes IS NOT NULL AND capture_kind = 'text')),
+  CHECK (detection IS NULL OR capture_kind = 'text'),
   UNIQUE (job, generation, pointer),
-  UNIQUE (id, job, generation),
-  CHECK ((final_bytes IS NULL) = (final_lines IS NULL)),
-  FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
+  UNIQUE (id, job, generation)
 ) STRICT;
-
--- Identity is immutable; an unknown kind may resolve once, a writer finishes once, and
--- a finished capture is classified once.
-CREATE TRIGGER job_capture_update_rules BEFORE UPDATE ON job_capture
-WHEN NEW.id IS NOT OLD.id OR NEW.job IS NOT OLD.job OR NEW.generation IS NOT OLD.generation
-  OR NEW.pointer IS NOT OLD.pointer
-  OR (NEW.capture_kind IS NOT OLD.capture_kind AND OLD.capture_kind <> 'unknown')
-  OR (OLD.final_bytes IS NOT NULL
-      AND (NEW.final_bytes IS NOT OLD.final_bytes OR NEW.final_lines IS NOT OLD.final_lines))
-  OR (OLD.detection IS NOT NULL AND NEW.detection IS NOT OLD.detection)
-BEGIN
-  SELECT RAISE(ABORT, 'job_capture: identity is immutable; kind, final and detection set once');
-END;
 
 -- first_line = newlines before byte_offset; chunks are contiguous from offset 0.
 CREATE TABLE job_capture_chunk (
@@ -712,48 +583,32 @@ CREATE TABLE job_field_presentation (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('job_finished') VIRTUAL,
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   job INTEGER NOT NULL REFERENCES job(id),
-  state TEXT NOT NULL,
-  terminal INTEGER GENERATED ALWAYS AS (1) VIRTUAL,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
-  FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
+  state TEXT NOT NULL REFERENCES job_state(name)
 ) STRICT;
-CREATE INDEX job_finish_job ON job_finish(job, entry);
 
--- Diagnostics retain typed terminal and output-persistence facts, never rendered errors.
-CREATE TABLE diagnostic_slot (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
-
+-- Diagnostics retain typed terminal facts, never rendered errors.
 CREATE TABLE diagnostic_operation (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
-CREATE TABLE diagnostic_subject (
-  name TEXT PRIMARY KEY,
-  path INTEGER NOT NULL CHECK (path IN (0,1)),
-  text INTEGER NOT NULL CHECK (text IN (0,1)),
-  UNIQUE (name, path, text)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE diagnostic_subject (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE diagnostic_site (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE diagnostic_effects (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
-CREATE TABLE diagnostic_cause (
-  name TEXT PRIMARY KEY,
-  text INTEGER NOT NULL CHECK (text IN (0,1)),
-  job INTEGER NOT NULL CHECK (job IN (0,1)),
-  UNIQUE (name, text, job)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE diagnostic_request_effects (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+CREATE TABLE diagnostic_cause (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE diagnostic_io_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE diagnostic_path_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish_diagnostic (
-  finish INTEGER NOT NULL REFERENCES job_finish(entry),
-  slot TEXT NOT NULL REFERENCES diagnostic_slot(name),
+  finish INTEGER PRIMARY KEY REFERENCES job_finish(entry),
   operation TEXT NOT NULL REFERENCES diagnostic_operation(name),
-  subject TEXT NOT NULL,
+  subject TEXT NOT NULL REFERENCES diagnostic_subject(name),
   subject_path BLOB,
   subject_text TEXT,
   -- The subject may be an unsuccessful lookup of a job that does not exist.
@@ -762,37 +617,28 @@ CREATE TABLE job_finish_diagnostic (
   location_target INTEGER REFERENCES target(id),
   location_workspace BLOB,
   effects TEXT NOT NULL REFERENCES diagnostic_effects(name),
-  cause TEXT NOT NULL,
+  request TEXT NOT NULL REFERENCES diagnostic_request_effects(name),
+  cause TEXT NOT NULL REFERENCES diagnostic_cause(name),
   io_kind TEXT REFERENCES diagnostic_io_kind(name),
   io_code INTEGER CHECK (io_code BETWEEN -2147483648 AND 2147483647),
   io_detail TEXT,
   cause_text TEXT,
   cause_job INTEGER CHECK (cause_job > 0),
-  has_subject_path INTEGER GENERATED ALWAYS AS (subject_path IS NOT NULL) VIRTUAL,
-  has_subject_text INTEGER GENERATED ALWAYS AS (subject_text IS NOT NULL) VIRTUAL,
-  has_cause_text INTEGER GENERATED ALWAYS AS (cause_text IS NOT NULL) VIRTUAL,
-  has_cause_job INTEGER GENERATED ALWAYS AS (cause_job IS NOT NULL) VIRTUAL,
-  PRIMARY KEY (finish, slot),
-  FOREIGN KEY (subject, has_subject_path, has_subject_text)
-    REFERENCES diagnostic_subject(name, path, text),
-  FOREIGN KEY (cause, has_cause_text, has_cause_job) REFERENCES diagnostic_cause(name, text, job),
   CHECK ((subject = 'job') = (subject_job IS NOT NULL)),
   CHECK ((site = 'execution') = (location_target IS NOT NULL)),
   CHECK ((site = 'execution') = (location_workspace IS NOT NULL)),
   CHECK ((cause = 'io') = (io_kind IS NOT NULL)),
   CHECK (cause = 'io' OR io_code IS NULL),
   CHECK (cause = 'io' OR io_detail IS NULL)
-) STRICT, WITHOUT ROWID;
+) STRICT;
 
 -- Path facts retain caller order and native bytes separately from the attempted subject.
 CREATE TABLE diagnostic_path (
-  finish INTEGER NOT NULL,
-  slot TEXT NOT NULL,
+  finish INTEGER NOT NULL REFERENCES job_finish_diagnostic(finish),
   position INTEGER NOT NULL CHECK (position >= 0),
   role TEXT NOT NULL REFERENCES diagnostic_path_role(name),
   path BLOB NOT NULL,
-  PRIMARY KEY (finish, slot, position),
-  FOREIGN KEY (finish, slot) REFERENCES job_finish_diagnostic(finish, slot)
+  PRIMARY KEY (finish, position)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish_image (
@@ -804,15 +650,11 @@ CREATE TABLE job_finish_image (
   PRIMARY KEY (finish, position)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE delivery_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE job_delivery (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL REFERENCES delivery_kind(name),
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   job INTEGER NOT NULL REFERENCES job(id),
   -- A delivered child reply and the runtime message that carried it.
   source INTEGER REFERENCES message_commit(entry),
   notification INTEGER REFERENCES message_commit(entry),
-  CHECK ((kind = 'job_message_delivered') = (source IS NOT NULL)),
-  CHECK ((kind = 'job_message_delivered') = (notification IS NOT NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  CHECK ((source IS NULL) = (notification IS NULL))
 ) STRICT;

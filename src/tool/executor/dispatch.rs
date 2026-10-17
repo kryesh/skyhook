@@ -75,12 +75,10 @@ impl ToolExecutor {
         })
     }
 
-    /// Approve, connect and launch `plan`, whose job awaits approval. A
-    /// redefinition of a target the call names, revoking its decision or
-    /// replacing its route before it connects, plans the whole call once more,
-    /// so the policy is asked about the current definitions, never just to
-    /// connect. Nothing is held across physical tool IO or promises
-    /// execution-time freshness.
+    /// Approve, connect and launch `plan`, whose job awaits approval. A target
+    /// the call names that is redefined before it connects replans the whole
+    /// call, so the policy decides on current definitions. Nothing is held
+    /// across physical tool IO, nor is execution-time freshness promised.
     async fn admit(
         &self,
         mut plan: InvocationPlan,
@@ -99,6 +97,9 @@ impl ToolExecutor {
             // A redefinition before it connects hands back the approving lease.
             let approving = match self.approve(&subject, &plan).await {
                 Ok(()) => {
+                    if let Some(unresolved) = plan.unresolved.take() {
+                        return Err(self.fail_start(lease, unresolved).await);
+                    }
                     let running = lease.run().await.map_err(job_error)?;
                     let workspace = &plan.execution_location.workspace;
                     match connect(plan.dispatch, plan.source, workspace, &subject).await {
@@ -141,6 +142,7 @@ impl ToolExecutor {
             input,
             self.shared.jobs.clone(),
         )
+        .with_job_location(plan.job_runs_in)
         .with_invocation_authority(
             self.shared.authorization.clone(),
             tool.name().to_owned(),
@@ -187,14 +189,14 @@ impl ToolExecutor {
                                 .map_err(|e| e.into_tool_error())?,
                         );
                     }
+                    let source = open_source(source, tool.name(), &context).await;
+                    // Cancellation outranks how preparing the call ended.
                     if context.is_cancelled() {
-                        return Err(ToolError::cancelled().effects(Effects::NotStarted));
+                        return Err(ToolError::cancelled_before_start());
                     }
-                    let source = open_source(source, tool.name(), &context).await?;
-                    run(dispatch, tool.name(), context.with_source(source)).await
+                    run(dispatch, tool.name(), context.with_source(source?)).await
                 }
                 .await;
-                let result = crate::tool::output::or_fallback(result, fallback.clone());
                 let outcome = crate::job::JobOutcome::from(
                     cancellation_result(result, cancellation.is_cancelled())
                         .map_err(|error| error.or(fallback)),
@@ -217,7 +219,8 @@ impl ToolExecutor {
     ) -> impl Future<Output = Result<(), AuthorizationError>> + Send + 'a {
         let arguments = plan.authorization_arguments.document(None);
         let (tool, permissions) = (plan.tool.name().to_owned(), plan.permissions.clone());
-        (self.shared.authorization).authorize(subject, tool, permissions, arguments, &[])
+        let asking = Asking::for_unresolved(&plan.unresolved);
+        (self.shared.authorization).authorize(subject, tool, permissions, arguments, &[], asking)
     }
 
     /// Plan job `id`'s call again against the current targets, as it was
@@ -238,8 +241,7 @@ impl ToolExecutor {
     }
 
     async fn cancelled<S>(&self, lease: crate::job::JobLease<S>) -> ToolError {
-        lease.fail(ToolError::cancelled().into()).await;
-        ToolError::cancelled()
+        (self.fail_start(lease, ToolError::cancelled_before_start())).await
     }
 
     async fn fail_start<S>(&self, lease: crate::job::JobLease<S>, error: ToolError) -> ToolError {
@@ -253,7 +255,7 @@ impl ToolExecutor {
 /// How a call reports an authorization that refused it before it started.
 fn refusal(plan: &InvocationPlan, error: AuthorizationError) -> ToolError {
     if let AuthorizationError::Cancelled = error {
-        return ToolError::cancelled();
+        return ToolError::cancelled_before_start();
     }
     ToolError::from(crate::tool::AdmissionError::from(error)).or(PartialContext::new(
         Operation::Authorize,
@@ -295,7 +297,6 @@ async fn connect(
     };
     let dispatch = match dispatch {
         InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
-        InvocationDispatch::ReadError(output) => InvocationDispatch::ReadError(output),
         InvocationDispatch::Remote { remote, arguments } => InvocationDispatch::Remote {
             remote: remote
                 .router
@@ -307,7 +308,6 @@ async fn connect(
     Ok((dispatch, source))
 }
 
-/// Boxed, like `run`, to keep the executor's future types shallow.
 fn open_source<'a>(
     source: Option<SourcePlan<PreparedConnection>>,
     tool: &str,
@@ -331,7 +331,6 @@ fn open_source<'a>(
     })
 }
 
-/// Boxed so the executor's future types stay shallow enough for Send inference.
 fn run(
     dispatch: InvocationDispatch<PreparedConnection>,
     tool: &str,
@@ -341,7 +340,6 @@ fn run(
     Box::pin(async move {
         match dispatch {
             InvocationDispatch::Local(admitted) => admitted.call(context).await,
-            InvocationDispatch::ReadError(output) => Ok(*output),
             InvocationDispatch::Remote {
                 remote: connection,
                 arguments,
@@ -364,23 +362,12 @@ fn cancellation_result(
     }
     let (mut diagnostic, output) = match result {
         Err(error) => error.into_facts(),
-        Ok(output) => {
-            // A completed read error remains data within the cancelled outcome.
-            // Its marker renders that payload; the outer cause describes cancellation.
-            let context = output
-                .diagnostic
-                .as_ref()
-                .map_or_else(PartialContext::default, |diagnostic| {
-                    diagnostic.context.clone()
-                });
-            (
-                PartialDiagnostic::new(context, Cause::Cancelled),
-                Some(output),
-            )
-        }
+        Ok(output) => (
+            PartialDiagnostic::new(PartialContext::default(), Cause::Cancelled),
+            Some(output),
+        ),
     };
     diagnostic.cause = Cause::Cancelled;
-    let diagnostic = diagnostic.or(PartialContext::default().effects(Effects::MayHaveExecuted));
     Err(ToolError::from_facts(diagnostic, output))
 }
 
@@ -407,10 +394,9 @@ mod tests {
     fn remote_tool(capabilities: Vec<Capability>) -> ToolRegistryBuilder {
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register_dynamic(
+            .register_product::<Arguments, serde_json::Value, _, _>(
                 "custom_remote",
                 "test",
-                serde_json::json!({"type":"object","properties":{}}),
                 ToolOptions::new(capabilities).placement(ToolPlacement::TargetedWorkspace),
                 |_, _| async { panic!("remote job must not execute locally") },
             )
@@ -428,8 +414,8 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_retains_partial_output_and_failure_context() {
-        use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
+    fn cancellation_retains_output_and_failure_context() {
+        use crate::tool::diagnostic::{Cause, Operation, RequestEffects, Subject};
 
         for error in [
             ToolError::cancelled(),
@@ -437,7 +423,7 @@ mod tests {
         ] {
             let error = error
                 .operation(Operation::Receive, Subject::Process)
-                .effects(Effects::MayHaveExecuted)
+                .request(RequestEffects::MayHaveExecuted)
                 .with_result(ToolOutput::new(serde_json::json!({"partial":true})));
             let context = error.diagnostic().context;
             let (diagnostic, output) = cancellation_result(Err(error), true)
@@ -447,69 +433,16 @@ mod tests {
             assert_eq!(diagnostic.context, context);
             assert_eq!(output.unwrap().value, serde_json::json!({"partial":true}));
         }
-    }
-
-    #[tokio::test]
-    async fn cancelled_dispatch_keeps_a_completed_read_error_as_output() {
-        use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
-
-        let runtime = crate::tests::TestRuntime::new().await;
-        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
-        let read_facts = ToolError::source_filesystem_io(std::io::ErrorKind::NotFound.into())
-            .operation(Operation::Read, Subject::path("missing"))
-            .effects(Effects::Unchanged)
-            .into_facts()
-            .0;
-        let output = ToolOutput::new(serde_json::json!({
-            "kind":"error", "path":"missing", "error":{"code":"not_found", "message":""}
-        }))
-        .with_diagnostic(read_facts.clone());
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_dynamic(
-                "read_error",
-                "gated completion",
-                serde_json::json!({"type":"object","properties":{}}),
-                ToolOptions::default().placement(ToolPlacement::InheritWorkspace),
-                move |invocation, _| {
-                    let entered = entered.clone();
-                    let output = output.clone();
-                    async move {
-                        entered.send(invocation.job()).unwrap();
-                        invocation.cancellation_token().cancelled().await;
-                        Ok(output)
-                    }
-                },
-            )
-            .unwrap();
-        let executor = runtime.executor(builder);
-        let agent = runtime.agent.clone();
-        let running = tokio::spawn(async move {
-            executor
-                .run_host(&agent, "read_error", serde_json::json!({}))
-                .await
-        });
-        let job = bounded(started.recv()).await.unwrap();
-        runtime.jobs.cancel(job).await.unwrap();
-        let error = bounded(running).await.unwrap().unwrap_err();
-        let (diagnostic, output) = error.into_parts();
-        // The dispatch boundary binds the site the read left unset.
-        let read_diagnostic = read_facts
-            .or(
-                PartialContext::default().at(FailureSite::Execution(ExecutionLocation::root(
-                    runtime.root.path().to_owned(),
-                ))),
-            )
-            .resolve();
+        let (diagnostic, output) = cancellation_result(
+            Ok(ToolOutput::new(serde_json::json!({"partial":true}))),
+            true,
+        )
+        .unwrap_err()
+        .into_parts();
         assert_eq!(diagnostic.cause, Cause::Cancelled);
-        assert_eq!(diagnostic.context, read_diagnostic.context);
-
-        // The completed read error stays data inside the cancelled outcome.
-        let saved = runtime.jobs.snapshot(job).unwrap();
-        assert_eq!(saved.state, JobState::Cancelled);
-        assert_eq!(saved.diagnostic.as_ref(), Some(&diagnostic));
-        assert_eq!(saved.output_diagnostic.as_ref(), Some(&read_diagnostic));
-        assert!(output.is_some());
+        // Only a sender claims that its request may have executed.
+        assert_eq!(diagnostic.context.request, RequestEffects::Unknown);
+        assert_eq!(output.unwrap().value, serde_json::json!({"partial":true}));
     }
 
     /// A unit tool has no result, even when cancelled after completing or when
@@ -567,11 +500,11 @@ mod tests {
 
     #[tokio::test]
     async fn approved_remote_jobs_are_running_during_shared_connection_startup() {
-        use crate::remote::PendingHandshakeFactory;
+        use crate::remote::ShimFactory;
         use std::sync::atomic::Ordering;
 
         let runtime = crate::tests::TestRuntime::new().await;
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let policy = Arc::new(crate::tool::policy::AllowAll);
         let router = TargetRouter::test(&runtime.store, build(), policy).await;
         let router = router.with_connection_factory(factory.clone());
@@ -606,8 +539,11 @@ mod tests {
                 .await,
             5
         );
+        // Cancelled while connecting, none of them started.
         for task in tasks {
-            assert!(task.await.unwrap().is_err());
+            let error = task.await.unwrap().unwrap_err().to_string();
+            let not_started = "operation cancelled; operation did not start";
+            assert!(error.ends_with(not_started), "{error}");
         }
         router.shutdown().await;
     }
@@ -668,7 +604,7 @@ mod tests {
             let runtime = crate::tests::TestRuntime::new().await;
             let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
             let policy = Arc::new(crate::tests::PromptingPolicy(prompts));
-            let factory = crate::remote::PendingHandshakeFactory::new();
+            let factory = crate::remote::ShimFactory::new();
             let router = TargetRouter::test(&runtime.store, build(), policy)
                 .await
                 .with_connection_factory(factory.clone());

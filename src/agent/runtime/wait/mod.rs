@@ -280,7 +280,7 @@ mod tests {
     use super::{CAP, Coalescing, QUIET, WaitFloor, Waiting, burst};
     pub(super) use crate::agent::runtime::tests::{
         AssistantItem, Script, Step, activity_is, bounded, enqueue_prompts, ephemeral_session,
-        found, job_found, models, poll, provider_name, rendered, response, spawn_prompt, until,
+        found, job_found, models, provider_name, rendered, response, spawn_prompt, until,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     use crate::{
@@ -592,34 +592,6 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn queued_user_input_wakes_wait_without_consuming_the_input() {
-        let tracking = tracking(vec![
-            ("root", call("waiting", "wait", json!({"timeout":null}))),
-            ("root", call("again", "wait", json!({"timeout":1}))),
-            ("root", answer()),
-        ]);
-        let (_root, session) = start(&tracking).await;
-        let turn = spawn_prompt(&session, "start");
-        tracking.pass(0).await;
-        running_job(&session, &session.root, "wait").await;
-        let prompt = queued("queued-wake-marker");
-        let queued = tokio::spawn({
-            let session = session.clone();
-            async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
-        });
-        let request = tracking.request(1).await;
-        bounded(queued).await.unwrap().unwrap();
-        assert_reason(&request, "waiting", "event");
-        let messages = rendered(&request);
-        assert!(messages.contains("queued-wake-marker"));
-        tracking.release(1);
-        time_out(&session, &session.root, 2, 1).await;
-        assert_reason(&tracking.pass(2).await, "again", "timeout");
-        bounded(turn).await.unwrap().unwrap();
-        session.shutdown().await.unwrap();
-    }
-
     fn queued(text: &str) -> QueuedPrompt {
         QueuedPrompt {
             text: text.into(),
@@ -730,7 +702,7 @@ mod tests {
         let output = session
             .runtime
             .jobs
-            .wait(finished, None, false)
+            .wait(finished, false)
             .await
             .unwrap()
             .output;
@@ -792,9 +764,11 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// Waits must not defer to each other: both wake on the same event.
+    /// Waits must not defer to each other: both wake on the same queued input,
+    /// which reaches the next request rather than being consumed by the wake, and
+    /// leaves nothing for a later wait.
     #[tokio::test]
-    async fn concurrent_waits_do_not_defer_to_each_other() {
+    async fn concurrent_waits_wake_on_queued_input_without_consuming_it() {
         let second = ToolCall::new("second", "wait", json!({"timeout":null})).unwrap();
         let tracking = tracking_all(vec![
             (
@@ -804,6 +778,7 @@ mod tests {
                     AssistantItem::tool_call("second", 1, second),
                 ],
             ),
+            ("root", vec![call("again", "wait", json!({"timeout":1}))]),
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
@@ -829,7 +804,10 @@ mod tests {
         bounded(queued).await.unwrap().unwrap();
         assert_reason(&request, "first", "event");
         assert_reason(&request, "second", "event");
+        assert!(rendered(&request).contains("concurrent-wake-marker"));
         tracking.release(1);
+        time_out(&session, &session.root, 3, 1).await;
+        assert_reason(&tracking.pass(2).await, "again", "timeout");
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
@@ -860,7 +838,7 @@ mod tests {
         let output = session
             .runtime
             .jobs
-            .wait(script, None, false)
+            .wait(script, false)
             .await
             .unwrap()
             .output;
@@ -917,6 +895,7 @@ mod tests {
                     content: vec![UserPart::Text {
                         text: "racing input".into(),
                     }],
+                    attachments: Vec::new(),
                     options: Default::default(),
                     cancellation: Default::default(),
                     committed: tokio::sync::oneshot::channel().0,
@@ -934,27 +913,27 @@ mod tests {
         tokio::time::resume();
         bounded(input).await.unwrap();
         // Whichever wait reported it, the other only times out.
-        bounded(async {
-            let mut elapsed = false;
-            while !jobs.metadata(script).unwrap().state.is_terminal() {
-                let mut waits = jobs.list(root).into_iter().filter(|job| job.tool == "wait");
-                // Parked, its deadline is set: time let pass sooner would not count.
-                let parked =
-                    |job: JobId| session.runtime.store.read(|state| state.jobs.parked(job));
-                if !elapsed && waits.nth(1).is_some_and(|job| parked(job.id)) {
-                    crate::tests::elapse(std::time::Duration::from_secs(1)).await;
-                    elapsed = true;
+        let mut elapsed = false;
+        loop {
+            let owner = root.clone();
+            let settled = move |state: &mut CoreState| {
+                if state.jobs.snapshot(script)?.state.is_terminal() {
+                    return Some(true);
                 }
-                poll().await;
+                let views = state.jobs.views();
+                let mut waits =
+                    (views.values()).filter(|job| job.agent == owner && job.tool == "wait");
+                // Parked, its deadline is set: time let pass sooner would not count.
+                let second = waits.nth(1)?.id;
+                (!elapsed && state.jobs.parked(second)).then_some(false)
+            };
+            if found(&session, settled).await {
+                break;
             }
-        })
-        .await;
-        let output = jobs
-            .wait(script, None, false)
-            .await
-            .unwrap()
-            .output
-            .unwrap();
+            crate::tests::elapse(std::time::Duration::from_secs(1)).await;
+            elapsed = true;
+        }
+        let output = jobs.wait(script, false).await.unwrap().output.unwrap();
         let event = json!({"reason":"event"});
         let reasons = output["value"].as_array().unwrap();
         assert_eq!(

@@ -16,14 +16,14 @@ use crate::{
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::profile::{ModelName, ModelProfile, ModelRef, ProviderName},
     provider::protocol::{
-        CutReason, LiveResponse, ModelRequest, Outcome, Step as LiveStep, SystemSegment, ToolCall,
-        ToolResult, Usage, visible_text,
+        CutReason, LiveResponse, Outcome, Step as LiveStep, SystemSegment, ToolCall, ToolResult,
+        Usage, visible_text,
     },
     provider::{Provider, ProviderError},
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{
-        Command, CoreState, EventRecord, Message, MessageSeq, Plan, RecordSeq, RequestSeq,
-        SessionError, SessionEvent, SessionStore, UserPart,
+        Command, CoreState, EventRecord, Message, MessageSeq, Plan, RecordSeq, SessionError,
+        SessionEvent, SessionStore, UserPart,
     },
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
@@ -37,21 +37,25 @@ pub use super::error::{Failure, HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
 use super::{Observation, Settlement};
 
+#[cfg(test)]
+use crate::provider::protocol::ModelRequest;
+
 mod agents;
 #[cfg(test)]
 pub(crate) use agents::stopped_turn;
-use agents::{Activation, AppliedMode, Flow, Invocation, RecordedContract, Turn};
+use agents::{Activation, AppliedMode, Flow, Invocation, RecordedContract, Turn, Was};
 pub(crate) use agents::{Agents, activities};
 use modes::Selected;
 mod compact;
-mod compaction;
 mod context;
 mod modes;
 use context::AgentContext;
 mod prompt;
 mod questions;
 mod queue;
-pub use queue::{QueuedPrompt, QueuedPromptCancellation, QueuedPromptReceipt};
+pub use queue::{
+    QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommitted, QueuedPromptReceipt,
+};
 mod builder;
 mod dispatch;
 mod tools;
@@ -64,7 +68,6 @@ mod reopen;
 mod session;
 mod state;
 mod turn;
-pub(crate) use builder::Catalog;
 pub use builder::HarnessBuilder;
 pub(crate) use builder::ModelEntry;
 
@@ -150,7 +153,6 @@ pub struct ContinueOutcome {
 
 impl ContinueOutcome {
     /// True when there was nothing to continue.
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.answer.is_none() && self.children_resumed == 0
     }
@@ -197,15 +199,7 @@ impl RuntimeInstance {
 }
 
 impl SessionModel {
-    #[must_use]
     pub fn name(&self) -> &ModelRef {
-        &self.name
-    }
-}
-
-impl SessionMode {
-    #[must_use]
-    pub fn name(&self) -> &ModeName {
         &self.name
     }
 }
@@ -260,6 +254,12 @@ enum AgentCommand {
         options: Selection,
         done: oneshot::Sender<Result<(), HarnessError>>,
     },
+    /// Try again, as `continue` asks, the batch a failed turn held, claimed
+    /// with the selection that commits it.
+    Retry {
+        batch: queue::Batch,
+        done: RequestCompletion,
+    },
 }
 
 impl AgentCommand {
@@ -275,6 +275,10 @@ impl AgentCommand {
             Self::Input { done: None, .. } => {}
             Self::Select { done, .. } => {
                 let _ = done.send(Err(error()));
+            }
+            Self::Retry { batch, done } => {
+                batch.hand_back();
+                done.settle(Err(error()));
             }
         }
     }
@@ -354,36 +358,56 @@ impl SessionRuntime {
         self.store.read(|state| read(&state.agents))
     }
 
-    /// Journal `event`, a model request of `agent`'s turn. Only a busy turn
-    /// requests: one an interrupt stopped or held is refused, and ends interrupted.
-    pub(super) async fn request(
+    /// Journal the `events` of `agent`'s turn as `command`, given the state they
+    /// commit to: a model request, an attempt at one, or the state it carries.
+    /// Only a busy turn does: one an interrupt stopped, held or cancelled is
+    /// refused, and ends interrupted. The last event's record.
+    pub(super) async fn journal_turn(
         &self,
         agent: &AgentId,
-        event: SessionEvent,
-    ) -> Result<EventRecord, HarnessError> {
+        command: Command,
+        events: impl FnOnce(&CoreState) -> Vec<SessionEvent> + Send + 'static,
+    ) -> Result<RecordSeq, HarnessError> {
         let agent = agent.clone();
-        let request = move |state: &CoreState| {
+        let journal = move |state: &CoreState| {
             if !state.agents.busy(&agent) {
                 return Err(HarnessError::Interrupted);
             }
-            let requested = |_: &mut CoreState, records: &[EventRecord]| records[0].clone();
-            Ok(Plan::new(vec![(agent, event)], requested))
+            let entries = events(state)
+                .into_iter()
+                .map(|event| (agent.clone(), event));
+            let journaled = |_: &mut CoreState, records: &[EventRecord]| {
+                records.last().expect("a turn journals events").sequence
+            };
+            Ok(Plan::new(entries.collect(), journaled))
         };
-        self.store.commit(Command::Request, request).await
+        self.store.commit(command, journal).await
     }
 
-    pub(super) async fn commit(
+    /// Journal `agent`'s model request, made under `context`, with a record of
+    /// that context unless it is the agent's latest, in one commit: requests
+    /// sharing a record keep their reported prompts comparable.
+    pub(super) async fn journal_request(
         &self,
         agent: &AgentId,
-        message: Message,
-    ) -> Result<MessageSeq, SessionError> {
-        let event = SessionEvent::MessageCommitted { message };
-        Ok(self
-            .store
-            .append(agent.clone(), event)
-            .await?
-            .sequence
-            .message())
+        context: crate::session::ModelContext,
+        requested: impl FnOnce(RecordSeq) -> SessionEvent + Send + 'static,
+    ) -> Result<crate::session::RequestSeq, HarnessError> {
+        let author = agent.clone();
+        let events = move |state: &CoreState| {
+            let latest = (state.agents.contract(&author))
+                .and_then(|contract| contract.context.as_ref())
+                .filter(|(_, latest)| *latest == context);
+            match latest {
+                Some((recorded, _)) => vec![requested(*recorded)],
+                None => {
+                    let recorded = state.next_sequence();
+                    vec![SessionEvent::ModelContext { context }, requested(recorded)]
+                }
+            }
+        };
+        let requested = self.journal_turn(agent, Command::Request, events).await?;
+        Ok(requested.request())
     }
 
     /// Commit a call's result with the acknowledgement of the delivery it
@@ -394,7 +418,7 @@ impl SessionRuntime {
         result: crate::provider::protocol::ToolResult,
         acknowledges: Option<crate::job::Delivery>,
     ) -> Result<(), HarnessError> {
-        let message = Message::Tool(vec![result]);
+        let message = Message::Tool(result);
         let mut entries = vec![(agent.clone(), SessionEvent::MessageCommitted { message })];
         let commit = move |state: &CoreState| {
             let claim = acknowledges
@@ -439,7 +463,7 @@ mod tests {
             ToolCall,
         },
         provider::{ProviderContext, ResponseStream},
-        session::tests::usage,
+        session::tests::{on_commit, usage},
         tests::bounded,
     };
 
@@ -864,6 +888,19 @@ mod tests {
         assert!(session.runtime.store.live(send).await, "the agent runs");
     }
 
+    impl SessionRuntime {
+        /// Journal `message` as `agent`'s, whatever its turn.
+        pub(super) async fn commit(
+            &self,
+            agent: &AgentId,
+            message: Message,
+        ) -> Result<MessageSeq, SessionError> {
+            let event = SessionEvent::MessageCommitted { message };
+            let committed = self.store.append(agent.clone(), event).await?;
+            Ok(committed.sequence.message())
+        }
+    }
+
     /// How many commands `agent` has yet to take.
     pub(super) fn inbox(session: &SessionHandle, agent: &AgentId) -> usize {
         session
@@ -979,20 +1016,54 @@ mod tests {
         root_waiting(&session).await;
         assert_eq!(session.interrupt().await, 2);
         assert_eq!(turn(&session, &session.root), Turn::Held);
-        let job = session.inspect_jobs(&session.root)[0].id;
+        let job = session.runtime.jobs.list(&session.root)[0].id;
         (harness, session, provider, requests, parent, job)
     }
 
-    /// Interrupt behind the append `resume` holds paused, then let the append go
-    /// on; how many the interrupt stopped.
-    pub(super) async fn interrupt_behind(
+    /// Interrupt right behind the commit of the first record from here on that
+    /// `matches` accepts; how many it stopped.
+    pub(super) async fn interrupt_on(
         session: &SessionHandle,
-        resume: oneshot::Sender<()>,
-    ) -> usize {
-        let mut interrupt = Box::pin(session.interrupt());
-        assert!(futures_util::poll!(&mut interrupt).is_pending());
-        resume.send(()).unwrap();
-        bounded(interrupt).await
+        matches: fn(&SessionEvent) -> bool,
+    ) -> impl Future<Output = usize> + use<> {
+        let (interrupting, store) = (session.clone(), &session.runtime.store);
+        on_commit(store, matches, move || async move {
+            interrupting.interrupt().await
+        })
+        .await
+    }
+
+    /// The root's child 1, spawned under a running owner job.
+    pub(super) async fn spawned_child(session: &SessionHandle) -> (AgentId, JobId) {
+        let child = session.root.child(1);
+        let owner = owner(session, false).await;
+        let launch = child_launch(session, None);
+        let spawned = session
+            .runtime
+            .spawn_agent(child.clone(), Some(owner), launch);
+        spawned.await.unwrap();
+        (child, owner)
+    }
+
+    pub(super) fn input(
+        text: &str,
+        options: Selection,
+        done: Option<ChildCompletion>,
+    ) -> AgentCommand {
+        let content = vec![UserPart::Text { text: text.into() }];
+        AgentCommand::Input {
+            options,
+            content,
+            done: done.map(RequestCompletion::Child),
+        }
+    }
+
+    pub(super) async fn child_input(
+        session: &SessionHandle,
+        child: &AgentId,
+        done: Option<ChildCompletion>,
+    ) {
+        send(session, child, input("task", Selection::default(), done)).await;
     }
 
     /// Prompt the root from a task.
@@ -1002,12 +1073,6 @@ mod tests {
     ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
         let session = session.clone();
         tokio::spawn(async move { session.prompt(text).await })
-    }
-
-    /// One step of a polling loop. A timer rather than a yield, because paused
-    /// time only advances while every task is idle.
-    pub(super) async fn poll() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     /// Wait until `find` finds what it looks for in the session's core state.
@@ -1071,7 +1136,7 @@ mod tests {
         job: JobId,
     ) -> crate::job::tests::Hydrated {
         until(session, job, |job| job.state.is_terminal()).await;
-        session.runtime.jobs.wait(job, None, true).await.unwrap()
+        session.runtime.jobs.wait(job, true).await.unwrap()
     }
 
     /// Journal the start of the root's child `index`, as the agent tool would.
@@ -1228,7 +1293,7 @@ mod tests {
     pub(super) async fn enqueue_prompts(
         session: &SessionHandle,
         prompts: Vec<QueuedPrompt>,
-    ) -> Vec<Result<(), HarnessError>> {
+    ) -> Vec<Result<queue::QueuedPromptCommitted, HarnessError>> {
         let mut results = Vec::new();
         for receipt in session.enqueue_prompts(prompts).await {
             results.push(receipt.await);

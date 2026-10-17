@@ -14,11 +14,7 @@ use crate::{
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct TargetsArgs {
-    /// Include configuration and authentication metadata.
-    #[serde(default)]
-    details: bool,
-}
+struct TargetsArgs {}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -48,56 +44,22 @@ enum AuthView {
 
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, JsonSchema)]
-struct CompactTarget {
-    name: String,
-    r#type: TargetKind,
-    host: String,
-    #[schemars(with = "std::path::PathBuf")]
-    workspace: Option<std::path::PathBuf>,
-    #[schemars(with = "String")]
-    via: Option<String>,
-    #[schemars(with = "String")]
-    origin: Option<String>,
-}
-
-impl From<DetailedTarget> for CompactTarget {
-    fn from(detailed: DetailedTarget) -> Self {
-        Self {
-            name: detailed.name,
-            host: detailed.host,
-            workspace: match detailed.r#type {
-                TargetKind::Local => None,
-                TargetKind::Ssh => Some(detailed.workspace),
-            },
-            r#type: detailed.r#type,
-            via: detailed.via,
-            origin: detailed.origin,
-        }
-    }
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, JsonSchema)]
-struct DetailedTarget {
+struct TargetView {
     name: String,
     r#type: TargetKind,
     source: TargetSource,
     host: String,
-    #[schemars(with = "String")]
     user: Option<String>,
-    #[schemars(with = "u16")]
     port: Option<u16>,
     workspace: std::path::PathBuf,
-    #[schemars(with = "String")]
     via: Option<String>,
-    #[schemars(with = "String")]
     origin: Option<String>,
     #[schemars(with = "String")]
     auth: AuthView,
     external_agent: bool,
 }
 
-impl DetailedTarget {
+impl TargetView {
     fn root() -> Self {
         Self {
             name: TargetRef::Root.to_string(),
@@ -115,7 +77,7 @@ impl DetailedTarget {
     }
 }
 
-impl From<TargetDefinition> for DetailedTarget {
+impl From<TargetDefinition> for TargetView {
     fn from(target: TargetDefinition) -> Self {
         Self {
             name: target.name.into(),
@@ -133,13 +95,6 @@ impl From<TargetDefinition> for DetailedTarget {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
-enum TargetView {
-    Compact(CompactTarget),
-    Detailed(DetailedTarget),
-}
-
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     router: TargetRouter,
@@ -149,20 +104,12 @@ pub(super) fn register(
         "targets",
         "List available execution targets and their hostnames without connecting.",
         ToolOptions::default().requires(Capability::Targets),
-        move |context, args| {
+        move |context, _| {
             let router = listed.clone();
             async move {
                 let targets = router.targets(|targets| targets.list(context.capabilities()));
-                let listed = std::iter::once(DetailedTarget::root())
-                    .chain(targets.into_iter().map(DetailedTarget::from));
-                Ok(listed
-                    .map(|target| {
-                        if args.details {
-                            TargetView::Detailed(target)
-                        } else {
-                            TargetView::Compact(target.into())
-                        }
-                    })
+                Ok(std::iter::once(TargetView::root())
+                    .chain(targets.into_iter().map(TargetView::from))
                     .collect())
             }
         },
@@ -225,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn saved_target_failures_hide_submitted_aliases_from_reduced_capabilities() {
         use crate::{
-            remote::PendingHandshakeFactory,
+            remote::ShimFactory,
             tests::TestRuntime,
             tool::{
                 diagnostic::{FailureSite, Subject},
@@ -235,7 +182,7 @@ mod tests {
         use std::sync::{Arc, atomic::Ordering};
 
         let runtime = TestRuntime::new().await;
-        let factory = PendingHandshakeFactory::new();
+        let factory = ShimFactory::new();
         let router = TargetRouter::test(&runtime.store, [], Arc::new(AllowAll)).await;
         let router = router.with_connection_factory(factory.clone());
         let mut builder = ToolRegistryBuilder::default();
@@ -279,13 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn target_views_omit_absent_routing_and_keep_detailed_defaults() {
+    fn target_views_omit_absent_routing_and_hide_key_paths() {
         assert_eq!(
-            serde_json::to_value(CompactTarget::from(DetailedTarget::root())).unwrap(),
-            serde_json::json!({"name":"root", "type":"local", "host":"localhost"})
-        );
-        assert_eq!(
-            serde_json::to_value(DetailedTarget::root()).unwrap(),
+            serde_json::to_value(TargetView::root()).unwrap(),
             serde_json::json!({
                 "name":"root", "type":"local", "source":"builtin", "host":"localhost",
                 "workspace":".", "auth":"local", "external_agent":false
@@ -295,16 +238,9 @@ mod tests {
         build.ssh.auth = crate::target::TargetAuth::Key {
             path: "secret-key".into(),
         };
-        assert_eq!(
-            serde_json::to_value(CompactTarget::from(DetailedTarget::from(build.clone()))).unwrap(),
-            serde_json::json!({
-                "name":"build", "type":"ssh", "host":"build.example.com",
-                "workspace":"/srv", "via":"gateway"
-            })
-        );
-        let detailed = serde_json::to_value(DetailedTarget::from(build)).unwrap();
-        assert_eq!(detailed["auth"], "key");
-        assert!(!detailed.to_string().contains("secret-key"));
+        let view = serde_json::to_value(TargetView::from(build)).unwrap();
+        assert_eq!(view["auth"], "key");
+        assert!(!view.to_string().contains("secret-key"));
     }
 
     #[test]
@@ -332,19 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn add_accepts_nested_ssh_options() {
-        let args: TargetAddArgs = serde_json::from_str(r#"{"name":"database","type":"ssh","host":"db","origin":"build","ssh":{"auth":{"kind":"agent"},"options":{"ServerAliveInterval":"15"}}}"#).unwrap();
-        assert_eq!(args.config.origin.as_deref(), Some("build"));
-        assert_eq!(args.config.ssh.auth, crate::target::TargetAuth::Agent);
-        for invalid in [
-            r#"{"name":"db","host":"db"}"#,
-            r#"{"name":"db","type":"local","host":"db"}"#,
-            r#"{"name":"db","type":"ssh","host":"db","target":"root"}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<TargetAddArgs>(invalid).is_err(),
-                "accepted {invalid}"
-            );
-        }
+    fn add_rejects_unknown_fields_through_the_flattened_config() {
+        let invalid = r#"{"name":"db","type":"ssh","host":"db","target":"root"}"#;
+        assert!(serde_json::from_str::<TargetAddArgs>(invalid).is_err());
     }
 }

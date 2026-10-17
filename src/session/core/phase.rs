@@ -39,7 +39,7 @@ pub(crate) enum Command {
     CreateJob,
     LaunchAgent,
     BeginTurn,
-    /// Journal a model request, for a turn or its compaction.
+    /// Journal a model request, or an attempt at one, for a turn or its compaction.
     Request,
     Submit,
     Continue,
@@ -125,7 +125,6 @@ impl SessionPhase {
     }
 
     /// The failure that stopped the session, if its journal failed.
-    #[must_use]
     pub fn failure(&self) -> Option<&JournalFailure> {
         match self {
             Self::Failed(failure) => Some(failure),
@@ -135,7 +134,6 @@ impl SessionPhase {
 
     /// Whether its work may still run and journal what it does, as that of a
     /// viewed, failed or closed session does not.
-    #[must_use]
     pub fn runs(&self) -> bool {
         matches!(self, Self::Running | Self::ShuttingDown)
     }
@@ -159,12 +157,15 @@ mod tests {
     async fn in_phase(
         phase: &SessionPhase,
     ) -> (tempfile::TempDir, SessionStore, crate::identity::AgentId) {
-        let (root, store, agent) = crate::session::tests::on_disk().await;
+        let crate::tests::TestRuntime {
+            root, store, agent, ..
+        } = crate::tests::TestRuntime::on_disk().await;
         match phase {
             Viewing => {
                 let id = store.id();
                 drop(store);
-                let (store, _) = SessionStore::open(root.path(), id).await.unwrap();
+                let sessions = root.path().join("sessions");
+                let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
                 return (root, store, agent);
             }
             Running => {}

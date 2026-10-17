@@ -114,7 +114,7 @@ impl JobFacts {
 }
 
 impl JobManager {
-    /// Release the reply `Jobs::child_message` held and wake the owner for it, for
+    /// Release the reply [`Jobs::message_plan`] held and wake the owner for it, for
     /// invocations that resolve without finishing the owning job.
     pub(crate) async fn notify_owner(&self, job: JobId) -> Result<(), JobError> {
         let release = move |state: &CoreState| {
@@ -126,41 +126,59 @@ impl JobManager {
 }
 
 impl Jobs {
-    /// What committing `child`'s assistant turn through job `job` journals, with
-    /// the records `follow` builds from its sequence, publishing its visible
-    /// `text`. The source sequence is the delivery ID. Empty visible text is
+    /// What committing `author`'s assistant turn journals, with the records `follow`
+    /// builds from its sequence; through `owner`'s job it is checked and wakes that owner.
+    pub(crate) fn message_plan(
+        state: &CoreState,
+        author: AgentId,
+        message: Message,
+        owner: Option<(JobId, &str)>,
+        follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)>,
+        after: impl FnOnce(&mut CoreState) + Send + 'static,
+    ) -> Result<Plan<MessageSeq>, JobError> {
+        let job = owner
+            .map(|(job, text)| Self::check_child(state, &author, job, &message, text).map(|()| job))
+            .transpose()?;
+        let mut entries = vec![(author, SessionEvent::MessageCommitted { message })];
+        entries.extend(follow(state.next_sequence()));
+        Ok(Plan::new(entries, move |state, records| {
+            if let Some(job) = job {
+                woken(state, job);
+            }
+            after(state);
+            records[0].sequence.message()
+        }))
+    }
+
+    /// Whether job `job` takes `child`'s assistant turn `message`, publishing its
+    /// visible `text` once committed; that commit wakes the owner through
+    /// [`woken`]. The source sequence is the delivery ID. Empty visible text is
     /// committed to history but produces no delivery/wake.
     ///
     /// A text-only turn is held: completing the job makes it the result, and an
     /// invocation that goes on releases it through [`JobManager::notify_owner`].
     /// A turn with tool calls is progress and wakes the owner at once, as does
     /// a reply committed after the job already finished.
-    pub(crate) fn child_message(
+    fn check_child(
         state: &CoreState,
-        child: AgentId,
+        child: &AgentId,
         job: JobId,
-        message: Message,
+        message: &Message,
         text: &str,
-        follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)>,
-    ) -> Result<Plan<MessageSeq>, JobError> {
+    ) -> Result<(), JobError> {
         // Refuse a projection that replay could not reproduce (including reasoning).
-        Reply::of(&message)
+        Reply::of(message)
             .filter(|reply| reply.text == text)
             .ok_or(JobError::ChildTextMismatch)?;
         let entry = state.jobs.entries.get(&job).ok_or(JobError::Unknown(job))?;
         let launched = entry.child().ok_or(JobError::NoChild(job))?;
-        if launched.agent.as_ref() != Some(&child) {
+        if launched.agent.as_ref() != Some(child) {
             return Err(JobError::ChildOwnerMismatch(job));
         }
-        let mut entries = vec![(child, SessionEvent::MessageCommitted { message })];
-        entries.extend(follow(state.next_sequence()));
-        Ok(Plan::new(entries, move |state, records| {
-            woken(state, job);
-            records[0].sequence.message()
-        }))
+        Ok(())
     }
 
-    /// What releasing the reply `child_message` held for job `job` journals.
+    /// What releasing the reply [`Self::message_plan`] held for job `job` journals.
     pub(crate) fn release_answer(
         state: &CoreState,
         job: JobId,
@@ -219,46 +237,38 @@ pub(super) fn pending_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::tests::{commit, job_events, progress};
+    use crate::job::tests::{commit, job_events};
     use crate::provider::protocol::AssistantItem;
     use crate::session::JobEvent;
+    use crate::tests::TestRuntime;
 
     use crate::job::delivery::LIFECYCLE_BATCH_BYTES;
 
-    async fn child_job(
-        background: bool,
-    ) -> (tempfile::TempDir, JobManager, AgentId, AgentId, JobId) {
-        let session = crate::session::tests::MemorySession::new().await;
-        let owner = session.agent.clone();
-        let manager = JobManager::new(session.store.clone());
-        let (child, job) = agent_job(&session, &manager, &owner, 1, background).await;
-        (session.root, manager, owner, child, job)
+    async fn child_job(background: bool) -> (TestRuntime, JobManager, AgentId, AgentId, JobId) {
+        let (session, manager, owner) = owner_session().await;
+        let (child, job) = agent_job(&session, 1, background).await;
+        (session, manager, owner, child, job)
     }
 
     /// Session, manager and owner without any job, so a test controls job IDs.
-    async fn owner_session() -> (crate::session::tests::MemorySession, JobManager, AgentId) {
-        let session = crate::session::tests::MemorySession::new().await;
-        let owner = session.agent.clone();
-        let manager = JobManager::new(session.store.clone());
+    async fn owner_session() -> (TestRuntime, JobManager, AgentId) {
+        let session = TestRuntime::new().await;
+        let (manager, owner) = (session.jobs.clone(), session.agent.clone());
         (session, manager, owner)
     }
 
-    /// A running child-agent job and its child agent.
-    async fn agent_job(
-        session: &crate::session::tests::MemorySession,
-        manager: &JobManager,
-        owner: &AgentId,
-        index: u32,
-        background: bool,
-    ) -> (AgentId, JobId) {
+    /// A running child-agent job of the root, and its child agent `index`.
+    async fn agent_job(session: &TestRuntime, index: u32, background: bool) -> (AgentId, JobId) {
+        let owner = &session.agent;
         let spec = JobSpec {
             background,
             role: JobRole::Agent,
             ..JobSpec::test(owner.clone(), "agent")
         };
-        let job = manager.test_running(spec).await.into_test_id();
-        let child = session.start_child(owner, index, Some(job)).await;
-        (child, job)
+        let job = session.jobs.test_running(spec).await.into_test_id();
+        let (store, workspace) = (&session.store, session.root.path());
+        let child = crate::session::tests::start_child(store, owner, index, Some(job), workspace);
+        (child.await, job)
     }
 
     /// A running background tool job for `owner`.
@@ -482,11 +492,10 @@ mod tests {
         );
     }
 
-    /// A question envelope rides with the same job's reply.
     #[tokio::test]
     async fn question_travels_with_the_reply_of_its_own_job() {
         let (session, manager, owner) = owner_session().await;
-        let (child, job) = agent_job(&session, &manager, &owner, 1, true).await;
+        let (child, job) = agent_job(&session, 1, true).await;
         let sequence = commit(&manager, &child, job, "progress note").await;
         let question = crate::job::tests::question("continue");
         manager.request_input(job, question).await.unwrap();
@@ -520,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn held_answer_is_the_result_unless_its_invocation_goes_on() {
         let (session, manager, owner) = owner_session().await;
-        let (child, job) = agent_job(&session, &manager, &owner, 1, true).await;
+        let (child, job) = agent_job(&session, 1, true).await;
         answer(&manager, &child, job, "saved result").await;
         // Durable, but not pending until the invocation resolves.
         assert!(!manager.has_pending(&owner));
@@ -534,7 +543,7 @@ mod tests {
         assert!(!manager.has_pending(&owner));
 
         // An invocation that does not finish releases the reply explicitly instead.
-        let (child, job) = agent_job(&session, &manager, &owner, 2, true).await;
+        let (child, job) = agent_job(&session, 2, true).await;
         let sequence = answer(&manager, &child, job, "kept going").await;
         assert!(!manager.has_pending(&owner));
         manager.notify_owner(job).await.unwrap();
@@ -552,7 +561,7 @@ mod tests {
 
         // A shielded commit that lands after the job finished is delivered on its
         // own: nothing later would release a held reply.
-        let (child, job) = agent_job(&session, &manager, &owner, 3, true).await;
+        let (child, job) = agent_job(&session, 3, true).await;
         finish(&manager, job).await;
         ack(manager.pending_delivery(&owner).await.unwrap()).await;
         let sequence = answer(&manager, &child, job, "late answer").await;
@@ -564,7 +573,7 @@ mod tests {
 
         // A later turn releases the reply held before it, and an end other than
         // completion releases the last one.
-        let (child, job) = agent_job(&session, &manager, &owner, 4, true).await;
+        let (child, job) = agent_job(&session, 4, true).await;
         let first = answer(&manager, &child, job, "first answer").await;
         manager.notify_owner(job).await.unwrap();
         let second = answer(&manager, &child, job, "second answer").await;
@@ -581,7 +590,7 @@ mod tests {
 
         // Completion withdraws an answer released but not yet delivered: the
         // result is its only delivery, however many notifications released it.
-        let (child, job) = agent_job(&session, &manager, &owner, 5, true).await;
+        let (child, job) = agent_job(&session, 5, true).await;
         answer(&manager, &child, job, "released answer").await;
         manager.notify_owner(job).await.unwrap();
         manager.notify_owner(job).await.unwrap();
@@ -631,33 +640,6 @@ mod tests {
         finish(&manager, job).await;
         let restored = manager.test_replay();
         assert_eq!(first_pending(&restored, &owner).await.message, second);
-    }
-
-    #[tokio::test]
-    async fn child_commit_is_shielded_from_cancellation() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        let mut pending = Box::pin(manager.commit_child_message(
-            &child,
-            job,
-            progress("survives"),
-            "survives".into(),
-            |_| Vec::new(),
-        ));
-        // Cancel the caller once its command is queued: the commit still happens.
-        let _ = futures_util::poll!(pending.as_mut());
-        drop(pending);
-        let owner_pending = owner.clone();
-        let pending =
-            move |state: &mut CoreState| state.jobs.has_pending(&owner_pending).then_some(());
-        crate::tests::bounded(manager.store().until(pending))
-            .await
-            .unwrap();
-        assert_eq!(first_pending(&manager, &owner).await.text, "survives");
-        finish(&manager, job).await;
-        assert_eq!(
-            first_pending(&manager.test_replay(), &owner).await.text,
-            "survives"
-        );
     }
 
     /// Private reasoning plus a blank text separator is kept in history, but

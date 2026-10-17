@@ -2,10 +2,8 @@
 
 use std::{fmt, time::Duration};
 
-use super::{AdmissionError, BuildError, ConfigHome, Dialect, codex, config::Pending};
-use crate::provider::{
-    ProviderError, ProviderErrorKind::Authentication, http::Headers, profile::ProviderName,
-};
+use super::{AdmissionError, ConfigHome, Dialect, codex};
+use crate::provider::{ProviderError, ProviderErrorKind::Authentication, profile::ProviderName};
 
 /// Why a configured provider has no login to manage.
 #[derive(Debug, thiserror::Error)]
@@ -24,40 +22,7 @@ pub enum LoginError {
 }
 
 /// A configured provider's Skyhook-managed login.
-#[derive(Clone)]
-pub enum Login {
-    Codex(codex::Account),
-}
-
-impl Login {
-    /// Sign in using a browser, or the device flow when `headless`.
-    pub async fn login(&self, headless: bool) -> Result<(), ProviderError> {
-        match self {
-            Self::Codex(account) => account.login(headless).await,
-        }
-    }
-
-    /// Local state only; the server is neither asked nor refreshed.
-    pub async fn status(&self) -> Result<AuthStatus, ProviderError> {
-        match self {
-            Self::Codex(account) => account.status().await,
-        }
-    }
-
-    /// Present the credentials to the service in a request that spends no
-    /// quota, refreshing them first if a request would.
-    pub async fn check(&self) -> Result<Usage, BuildError> {
-        match self {
-            Self::Codex(account) => account.check().await,
-        }
-    }
-
-    pub(crate) fn headers(self) -> Headers<Pending> {
-        match self {
-            Self::Codex(account) => account.into_headers(),
-        }
-    }
-}
+pub type Login = codex::Account;
 
 /// What the service reports for a signed-in account; what it omits is absent.
 #[derive(Clone, Debug, PartialEq)]

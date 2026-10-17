@@ -65,7 +65,11 @@ fn notice(app: &App, prompt_shown: bool) -> Option<(String, Option<Hit>)> {
         let message = format!("{waiting} other session(s) need attention · {hint}");
         Some((message, Some(Hit::Sessions)))
     } else if !app.queue.is_empty() {
-        let paused = if app.paused { " · paused" } else { "" };
+        let paused = if app.paused.is_some() {
+            " · paused"
+        } else {
+            ""
+        };
         let message = format!("{} follow-up(s) queued{paused} · /queue", app.queue.len());
         Some((message, Some(Hit::Queue)))
     } else {
@@ -529,20 +533,15 @@ fn draw_footer(frame: &mut Frame, app: &App, rect: Rect, stats: &str, stat_lines
 fn footer_model(app: &App) -> String {
     let root = app.selected.path().is_empty();
     let model = if root {
-        Some(&app.model)
+        &app.model
     } else {
         let agent = app.projection.agents.iter().find(|a| a.id == app.selected);
-        agent.map_or(Some(&app.model), |a| a.model.as_ref())
+        agent.map_or(&app.model, |a| &a.model)
     };
     let config = app.launch.model.config();
-    let model = model.map_or_else(
-        || "-".to_owned(),
-        |name| {
-            config
-                .model(name)
-                .map_or_else(|| name.to_string(), |profile| profile.model.to_string())
-        },
-    );
+    let model = config
+        .model(model)
+        .map_or_else(|| model.to_string(), |profile| profile.model.to_string());
     if root {
         format!("{} · {model}", app.mode)
     } else {
@@ -579,13 +578,12 @@ mod tests {
                 failing_call, observe_find, observe_record, observe_until, played_fixture,
                 recorded, sleeping_script, spawn_children, user,
             },
-            tests::{fetch_output, fixture, job_named, run_script},
+            tests::{draw_sized, draw_sized_buffer, fetch_output, fixture, job_named, run_script},
         },
         keys::Command,
         theme::THEME,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use skyhook::agent::AgentActivity;
     use skyhook::provider::protocol::AssistantItem;
@@ -604,10 +602,8 @@ mod tests {
     async fn live_job_cards_paint_counters_and_only_running_ones_spin() {
         use skyhook::job::JobState;
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
-        let mut screen = |app: &mut App| {
-            terminal.draw(|frame| draw(frame, app)).unwrap();
-            let buffer = terminal.backend().buffer();
+        let screen = |app: &mut App| {
+            let buffer = draw_sized_buffer(app, 80, 40);
             let row = |y| {
                 (0..80)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
@@ -708,13 +704,8 @@ mod tests {
                 responses.any(|response| response.blocks().iter().any(|b| b.text == thought))
             })
             .await;
-            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let rows: Vec<String> = (0..24)
-                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
-                .collect();
-            assert!(rows.iter().any(|row| row.contains(shown)), "{rows:#?}");
+            let screen = draw_sized(&mut app, width, 24);
+            assert!(screen.lines().any(|row| row.contains(shown)), "{screen}");
         }
         turn.answer("done");
         crate::tests::bounded(asked).await.unwrap().unwrap();
@@ -726,13 +717,7 @@ mod tests {
         let text = "right-aligned user text ".repeat(12);
         let asked = ask(app.session().unwrap(), &text);
         observe_record(&mut app, committed(user)).await;
-        let screen = |app: &mut App, width| {
-            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-            terminal.draw(|frame| draw(frame, app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let rows = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect());
-            rows.collect::<Vec<String>>().join("\n")
-        };
+        let screen = |app: &mut App, width| draw_sized(app, width, 24);
         // Sections with nothing to list are left out, title included.
         let bare = screen(&mut app, 120);
         assert!(bare.contains("Capabilities") && bare.contains("· Read files"));
@@ -818,11 +803,9 @@ mod tests {
         app.tab = Tab::Requests;
         observe_until(&mut app, |app| recorded(&app.snapshot, answered)).await;
         for (width, header) in [(140, true), (40, false)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
             for scroll in [0, 5] {
                 app.view().scroll = Some(scroll);
-                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-                let buffer = terminal.backend().buffer();
+                let buffer = draw_sized_buffer(&mut app, width, 25);
                 let line: String = (0..width).map(|x| buffer[(x, 2)].symbol()).collect();
                 assert_eq!(line.contains("Input (uncached)"), header);
                 assert_eq!(
@@ -861,14 +844,12 @@ mod tests {
         fetch_output(&mut app, job).await;
         app.command(Command::Details);
         for width in [30, 60] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            draw_sized_buffer(&mut app, width, 18);
             // Halfway down the card, the viewport is clipped inside the body.
             let scroll = (app.render.rows.len() - app.content_rect.height as usize) / 2;
             assert!(scroll > 0, "exercise a viewport clipped inside the body");
             app.view().scroll = Some(scroll);
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let buffer = terminal.backend().buffer();
+            let buffer = draw_sized_buffer(&mut app, width, 18);
             let mut empty_body_rows = 0;
             let rows = app.render.rows.iter().skip(scroll);
             for (offset, row) in rows.take(app.content_rect.height.into()).enumerate() {
@@ -912,26 +893,21 @@ mod tests {
             if reset {
                 app.render.reset_session();
             }
-            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let mut buffer = draw_sized_buffer(&mut app, width, 30);
             if completion {
                 // The first frame paints fallback text and schedules the worker.
                 // Its retained rows must repaint when the worker wakes the UI,
                 // without manually invalidating content or rebuilding layout.
-                assert!(!number_is_painted(
-                    terminal.backend().buffer(),
-                    "let answer = 42;",
-                    accent
-                ));
+                assert!(!number_is_painted(&buffer, "let answer = 42;", accent));
                 assert!(!app.render.reset && app.render.dirty.is_empty());
                 assert!(!app.content_dirty);
                 let work = crate::tests::bounded(ready.recv()).await.unwrap();
                 assert!(matches!(work, Work::HighlightsReady));
                 app.work(work);
-                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                buffer = draw_sized_buffer(&mut app, width, 30);
             }
             assert!(
-                number_is_painted(terminal.backend().buffer(), "let answer = 42;", accent),
+                number_is_painted(&buffer, "let answer = 42;", accent),
                 "completed highlights did not reach the frame: width={width}, reset={reset}"
             );
             assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
@@ -955,13 +931,12 @@ mod tests {
         });
         exchange(&mut app, &mut model, "question", sections.collect()).await;
         let accent = THEME.accent;
-        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
             app.view().scroll = scroll;
             crate::tests::bounded(async {
                 loop {
-                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-                    if number_is_painted(terminal.backend().buffer(), source, accent) {
+                    let buffer = draw_sized_buffer(&mut app, 60, 20);
+                    if number_is_painted(&buffer, source, accent) {
                         break;
                     }
                     app.work(ready.recv().await.expect("highlight worker is running"));
@@ -976,19 +951,18 @@ mod tests {
         let (_root, mut app, mut model, _session) = played_fixture().await;
         let (children, _turns) = spawn_children(&mut app, &mut model, 12).await;
         app.editor.set("line\n".repeat(40));
-        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 60, 40);
         let body = app.content_rect.height + app.tree_rect.height + app.composer_rect.height;
         assert!(app.composer_rect.height > MIN_COMPOSER_LIMIT);
         assert!(app.composer_rect.height <= body / 2);
 
         app.selected = children[0].clone();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 60, 40);
         let tree = app.tree_rect;
         // More agents than rows: the layout, not the tree, sets its height.
         assert!(tree.height - 2 < children.len() as u16 + 1);
         app.editor.clear();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 60, 40);
         assert_eq!(app.tree_rect, tree);
     }
 
@@ -1000,15 +974,14 @@ mod tests {
             let mut hits = app.hits.iter();
             hits.find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
         app.view().scroll = None;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 80, 25);
         assert!(latest(&app).is_none());
 
         app.view().scroll = Some(0);
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = draw_sized_buffer(&mut app, 80, 25);
         let rect = latest(&app).expect("scrolled history should offer Latest activity");
-        let buffer = terminal.backend().buffer();
+        let buffer = &buffer;
         let label: String = (rect.x..rect.right())
             .map(|x| buffer[(x, rect.y)].symbol())
             .collect();
@@ -1016,13 +989,13 @@ mod tests {
         assert_eq!(app.view().scroll, Some(0));
         // A notice shares that row without moving the popup, and gives way to it.
         app.toast = Some(("notice ".repeat(30), std::time::Instant::now()));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = draw_sized_buffer(&mut app, 80, 25);
         assert_eq!(latest(&app), Some(rect));
-        let buffer = terminal.backend().buffer();
+        let buffer = &buffer;
         let row: String = (0..80).map(|x| buffer[(x, rect.y)].symbol()).collect();
         assert!(row.starts_with(" notice notice") && row.contains("noti ↓ Latest activity"));
         app.toast = None;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 80, 25);
 
         // Use the rendered hit coordinates and the real event handler. The
         // overlay overlaps selectable text, which must not repin the view.
@@ -1037,7 +1010,7 @@ mod tests {
             }));
         }
         assert!(app.view().scroll.is_none() && app.selection.is_none());
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        draw_sized_buffer(&mut app, 80, 25);
         assert!(app.view().scroll.is_none());
         assert!(latest(&app).is_none());
     }

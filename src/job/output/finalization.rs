@@ -1,8 +1,5 @@
 //! Admission of completed, destination-bound capture receipts into saved output.
-//! IO completion is not JSON validity or terminal publication. Validate first,
-//! then install the existing compact document/fields references in one owner.
 use super::*;
-use crate::tool::output::FieldPresentation;
 use std::io;
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -11,8 +8,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 /// Prepare a terminal product, referencing only its explicitly completed captures.
 /// JSON containers are referenced; JSON scalars are decoded inline. Existing
-/// null/bool/number fields remain authoritative. Known kinds can install a missing
-/// field; Unknown kinds reference only an existing string or container shape.
+/// null/bool/number fields remain authoritative; a capture can install a missing
+/// field.
 ///
 /// A receipt that fails validation never fails the terminal product: its capture
 /// stays unreferenced and is reported incomplete. Only reading a capture it
@@ -39,8 +36,7 @@ pub(crate) fn prepare_completed(
         .filter_map(|(index, capture)| {
             let field = capture.field();
             let registration = registered.get(field)?;
-            let id = registration.id;
-            (capture.belongs_to(output.job, id)
+            (capture.belongs_to(output.job, registration.id)
                 && registration.kind == capture.kind()
                 // Every receipt for a duplicate or overlapping field is unbound:
                 // neither can be referenced without shadowing the other.
@@ -50,28 +46,25 @@ pub(crate) fn prepare_completed(
                             && !field.contains(candidate)
                             && !candidate.contains(field))
                 }))
-            .then_some((id, capture))
+            .then_some(capture)
         })
         .collect::<Vec<_>>();
 
     let has_result = result.is_some();
     let mut document = json!({"result": result});
     let mut references = BTreeSet::new();
-    let mut kinds = Vec::new();
-    for (id, capture) in bound {
+    for capture in bound {
         let field = capture.field();
         let Some(saved) = &saved else { break };
-        let Some((kind, value)) = admitted_value(&document, saved, capture).ok().flatten() else {
+        let Some(value) = admitted_value(&document, saved, capture).ok().flatten() else {
             continue;
         };
         if install(&mut document, field, value.clone()).is_err() {
             continue;
         }
-        if kind == CaptureKind::Text || value.is_array() || value.is_object() {
+        if capture.kind() == CaptureKind::Text || value.is_array() || value.is_object() {
             references.insert(field.clone());
         }
-        // Unknown registrations resolve only for admitted receipts.
-        kinds.push((id, kind));
     }
     let root = FieldPointer::result();
     // Cut-off output is never taken as JSON, however it happens to end.
@@ -84,18 +77,11 @@ pub(crate) fn prepare_completed(
         &root,
         schema,
     ));
-    // A result with an output diagnostic saves its slot as null; presentation
-    // renders each viewer's diagnostic into it, whole.
-    let slot = diagnostic_slot();
-    if document.pointer(slot.as_str()) == Some(&Value::Null) {
-        presented.insert(slot, FieldPresentation::Complete);
-    }
     let result = has_result.then(|| document["result"].take());
     prepare_document(
         output,
         registered,
         (result, captures_complete),
-        kinds,
         Stored {
             referenced: &references,
             candidates: &candidates,
@@ -111,31 +97,26 @@ fn admitted_value(
     document: &Value,
     saved: &Saved,
     capture: &CompletedCapture,
-) -> io::Result<Option<(CaptureKind, Value)>> {
+) -> io::Result<Option<Value>> {
     let field = capture.field();
     let source = || {
         saved
             .capture(field)
             .ok_or_else(|| invalid("completed capture is missing"))
     };
-    Ok(Some(
-        match (capture.kind(), document.pointer(field.as_str())) {
-            // A terminal primitive historically abandons the raw capture, even
-            // when the sender completed its bytes. Do not parse or replace it.
-            (_, Some(Value::Null | Value::Bool(_) | Value::Number(_))) => return Ok(None),
-            (CaptureKind::Text, _) | (CaptureKind::Unknown, Some(Value::String(_))) => {
-                validate_utf8(source()?, &mut [0; IO_BUFFER_BYTES])?;
-                (CaptureKind::Text, Value::String(String::new()))
-            }
-            (CaptureKind::Json, _)
-            | (CaptureKind::Unknown, Some(Value::Object(_) | Value::Array(_))) => {
-                (CaptureKind::Json, validated_json_reference(source()?)?)
-            }
-            // Historical Unknown is only a hint. Scalars and missing
-            // fields never referenced its bytes; retain that distinction.
-            (CaptureKind::Unknown, _) => return Ok(None),
-        },
-    ))
+    // A terminal primitive abandons the raw capture, even when the sender
+    // completed its bytes.
+    if let Some(Value::Null | Value::Bool(_) | Value::Number(_)) = document.pointer(field.as_str())
+    {
+        return Ok(None);
+    }
+    Ok(Some(match capture.kind() {
+        CaptureKind::Text => {
+            validate_utf8(source()?, &mut [0; IO_BUFFER_BYTES])?;
+            Value::String(String::new())
+        }
+        CaptureKind::Json => validated_json_reference(source()?)?,
+    }))
 }
 
 /// Validate JSON without constructing its container tree. Scalars are then
@@ -203,10 +184,8 @@ fn validate_utf8(mut source: impl io::Read, buffer: &mut [u8]) -> io::Result<()>
     }
 }
 
-/// Preserve existing object/array shape. Missing object ancestors become objects;
-/// a JSON Pointer alone is not evidence that a numeric member denotes an array.
-/// The whole path is checked before mutation, so a rejected field leaves the
-/// document unchanged.
+/// Missing ancestors become objects. The whole path is checked before mutation,
+/// so a rejected field leaves the document unchanged.
 fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Result<()> {
     if field.is_root() {
         *document = value;
@@ -217,13 +196,12 @@ fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Resu
     let mut probe = Some(&*document);
     for key in &keys {
         let Some(current) = probe else {
-            break; // Missing ancestors are created as objects.
+            break;
         };
-        probe = match current {
-            Value::Object(map) => map.get(key),
-            Value::Array(items) => items.get(array_index(key, items.len())?),
-            _ => return Err(invalid("completed capture ancestor is not a container")),
+        let Value::Object(map) = current else {
+            return Err(invalid("completed capture ancestor is not an object"));
         };
+        probe = map.get(key);
     }
     let mut cursor = document;
     for key in ancestors {
@@ -233,28 +211,11 @@ fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Resu
     Ok(())
 }
 
-fn array_index(key: &str, length: usize) -> io::Result<usize> {
-    let index =
-        FieldPointer::array_index(key).ok_or_else(|| invalid("capture array index is invalid"))?;
-    if index > length {
-        return Err(invalid("capture array index is out of range"));
-    }
-    Ok(index)
-}
-
-/// Descend into a slot already accepted by `install`'s check.
 fn slot<'a>(cursor: &'a mut Value, key: &str) -> &'a mut Value {
-    match cursor {
-        Value::Object(map) => map.entry(key).or_insert_with(|| json!({})),
-        Value::Array(items) => {
-            let index = array_index(key, items.len()).expect("checked capture index");
-            if index == items.len() {
-                items.push(json!({}));
-            }
-            &mut items[index]
-        }
-        _ => unreachable!("checked capture ancestor"),
-    }
+    let Value::Object(map) = cursor else {
+        unreachable!("checked capture ancestor")
+    };
+    map.entry(key).or_insert_with(|| json!({}))
 }
 
 #[cfg(test)]
@@ -455,56 +416,24 @@ mod tests {
         }
     }
 
-    /// Unknown captures reference only an existing string/container shape. Existing
-    /// primitives abandon even known completed bytes for every kind: invalid
+    /// Existing primitives abandon even completed bytes of every kind: invalid
     /// UTF-8/JSON is deliberately not inspected, since IO completion alone did not
     /// reference it.
     #[tokio::test]
-    async fn unknown_uses_existing_shape_only_and_preserves_scalar_or_absent_inventory() {
-        for kind in [CaptureKind::Unknown, CaptureKind::Text, CaptureKind::Json] {
+    async fn existing_primitives_abandon_completed_captures() {
+        for kind in [CaptureKind::Text, CaptureKind::Json] {
             let (_root, manager, output, _) = outputs().await;
-            let unknown = kind == CaptureKind::Unknown;
-            let initial =
-                json!({"text":"", "object":{}, "array":[], "null":null, "bool":true,"number":4});
-            let shaped: &[(&str, &[u8])] = if unknown {
-                &[
-                    ("text", br#"{"looks":"json"}"#),
-                    ("object", br#"{"x":1}"#),
-                    ("array", b"[1,2]"),
-                    ("missing", b"[unfinished"),
-                ]
-            } else {
-                &[]
-            };
-            let scalars: [(&str, &[u8]); 3] =
-                [("null", b"\xff"), ("bool", b"\xff"), ("number", b"\xff")];
-            let captures = shaped
-                .iter()
-                .copied()
-                .chain(scalars)
-                .map(|(field, bytes)| completed(&output, &format!("/result/{field}"), kind, bytes))
-                .collect();
-            finish(&manager, &output, initial.clone(), captures).await;
-            let hydrated = hydrate(&saved(&output), document(&output)).unwrap();
-            if unknown {
-                assert_eq!(hydrated["result"]["text"], r#"{"looks":"json"}"#);
-                assert_eq!(hydrated["result"]["object"], json!({"x":1}));
-                assert_eq!(hydrated["result"]["array"], json!([1, 2]));
-                assert!(hydrated.pointer("/result/missing").is_none());
-            } else {
-                assert_eq!(document(&output)["result"], initial);
-            }
-            for (field, _) in scalars {
-                assert_eq!(hydrated["result"][field], initial[field]);
-            }
-            assert_eq!(output.test_fields().len(), if unknown { 3 } else { 0 });
-            for descriptor in captures::available_captures(&saved(&output), true) {
-                let shaped = matches!(
-                    descriptor.field.as_str(),
-                    "/result/text" | "/result/object" | "/result/array"
-                );
-                assert_eq!(descriptor.complete, unknown && shaped);
-            }
+            let initial = json!({"null":null, "bool":true, "number":4});
+            let captures = ["null", "bool", "number"]
+                .map(|field| completed(&output, &format!("/result/{field}"), kind, b"\xff"));
+            finish(&manager, &output, initial.clone(), captures.into()).await;
+            assert_eq!(document(&output)["result"], initial);
+            assert!(output.test_fields().is_empty());
+            assert!(
+                captures::available_captures(&saved(&output), true)
+                    .iter()
+                    .all(|capture| !capture.complete)
+            );
         }
     }
 

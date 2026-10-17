@@ -13,7 +13,10 @@ use crate::{
     provider::{
         ProviderError,
         codec::{Codec, CodecName, StateRole},
-        http::{Build, Headers, HttpProvider, Transport, headers::Value, transport::EVENT_STREAM},
+        http::{
+            Headers, HttpProvider, Transport, headers::Value, reasoning_scope,
+            transport::EVENT_STREAM,
+        },
     },
 };
 
@@ -45,9 +48,9 @@ pub use login::{
 };
 pub use models::{
     AccessPrograms, AccessProgramsPatch, ModelSpec, Request, RequestPatch, RequestSettings,
-    ResponseSetting,
+    ResponseSetting, ServiceTier,
 };
-pub use placements::{BodyField, PlacementError, PlacementKey, Placements, PlacementsPatch};
+pub use placements::{PlacementError, PlacementKey, Placements, PlacementsPatch};
 
 named_enum! {
     /// The preset a provider entry names.
@@ -126,7 +129,7 @@ impl Profile {
         role
     }
 
-    /// Partition private replay for nonsecret routing and tenant selectors. Each part
+    /// Partition sealed replay for nonsecret routing and tenant selectors. Each part
     /// names its setting, so different settings with equal values never collide.
     pub(crate) fn discriminate(&mut self, setting: &'static str, identity: &impl Serialize) {
         let identity = serde_json::to_string(identity).expect("replay identity serializes");
@@ -152,24 +155,13 @@ impl Profile {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("dialect {dialect} does not speak {codec}")]
-pub struct UnsupportedCodec {
-    pub dialect: Dialect,
-    pub codec: CodecName,
-}
-
 /// Why a dialect refused its settings or the codec.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DialectError {
-    #[error(transparent)]
-    Codec(#[from] UnsupportedCodec),
-    #[error(transparent)]
-    Openai(#[from] openai::Error),
-    #[error(transparent)]
-    Codex(#[from] codex::Error),
-    #[error(transparent)]
-    Openrouter(#[from] openrouter::Error),
+    #[error("dialect {dialect} does not speak {codec}")]
+    UnsupportedCodec { dialect: Dialect, codec: CodecName },
+    #[error("api_key does not apply to codex; run `skyhook auth login <provider>`")]
+    CodexApiKey,
 }
 
 /// Why an admitted entry's provider could not be constructed.
@@ -215,16 +207,20 @@ pub(crate) fn build(
     let stream = Value::Fixed(HeaderValue::from_static(EVENT_STREAM));
     headers.insert(ACCEPT, Pending::Ready(stream));
     let headers = headers.try_map(|pending| resources.sources.read(pending))?;
-    Ok(HttpProvider::new(Build {
-        name,
-        scope_tag: &profile.scope,
+    Ok(HttpProvider {
+        scope: reasoning_scope(
+            name,
+            endpoint.as_str(),
+            profile.codec.name(),
+            &profile.scope,
+        ),
         client: resources.client.clone(),
         endpoint,
         codec: profile.codec,
         transport: profile.transport,
         headers,
         timeouts: connection.timeouts,
-    }))
+    })
 }
 
 pub(crate) struct Resources {
@@ -290,29 +286,50 @@ pub(crate) mod tests {
         codec: CodecName,
         api_key: &str,
     ) -> String {
-        let mut heads = heads(1, async |root| {
+        sent(settings, codec, api_key, request()).await.0
+    }
+
+    /// The head and JSON body a keyed entry sends for `request`.
+    pub(crate) async fn sent(
+        settings: &impl DialectConfig,
+        codec: CodecName,
+        api_key: &str,
+        request: crate::provider::protocol::ModelRequest,
+    ) -> (String, serde_json::Value) {
+        let mut sent = requests(1, async |root| {
             let common = common(root, Some(Sourced::Literal(api_key.into())));
             let provider = provider("test", settings, codec, &common);
             let mut context = provider.open_context("ctx".parse().unwrap()).unwrap();
-            drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
+            drop(futures_util::StreamExt::next(&mut context.invoke(request)).await);
         })
         .await;
-        heads.remove(0)
+        let (head, body) = sent.remove(0);
+        (head, serde_json::from_str(&body).unwrap())
     }
 
     /// The raw heads of `count` requests to a server that answers each with an
     /// empty stream, after `invoke` ran them.
     pub(crate) async fn heads(count: usize, invoke: impl AsyncFnOnce(&str)) -> Vec<String> {
+        let requests = requests(count, invoke).await;
+        requests.into_iter().map(|(head, _)| head).collect()
+    }
+
+    /// The raw heads and bodies of `count` requests to a server that answers each
+    /// with an empty stream, after `invoke` ran them.
+    pub(crate) async fn requests(
+        count: usize,
+        invoke: impl AsyncFnOnce(&str),
+    ) -> Vec<(String, String)> {
         let plans = (0..count).map(|_| Plan::empty_stream()).collect();
         let server = Server::start(plans).await;
         let root = format!("{}/v1", server.url.trim_end_matches("/responses"));
         invoke(&root).await;
-        server
-            .finish()
-            .await
-            .into_iter()
-            .map(|request| request.split_once("\r\n\r\n").unwrap().0.to_owned())
-            .collect()
+        let requests = server.finish().await.into_iter();
+        let split = |request: String| {
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            (head.to_owned(), body.to_owned())
+        };
+        requests.map(split).collect()
     }
 
     /// The kind `settings` read a rejection of `codec` as.
@@ -343,10 +360,7 @@ pub(crate) mod tests {
         let scope = crate::provider::codec::common::tests::scope();
         let signals = profile.transport.errors;
         let mut decoder = profile.codec.decoder("model".into(), scope, b"", signals);
-        let event = crate::provider::http::transport::SseEvent {
-            event: None,
-            data: event.to_string(),
-        };
+        let event = crate::provider::http::transport::tests::sse(None, event.to_string());
         decoder.decode(&event).unwrap_err().kind()
     }
 
@@ -375,7 +389,57 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 settings.admit(codec).unwrap_err(),
-                UnsupportedCodec { dialect, codec }.into()
+                DialectError::UnsupportedCodec { dialect, codec }
+            );
+        }
+    }
+
+    /// A dialect's tool-name alphabet holds on every codec it admits.
+    #[test]
+    fn tool_names_follow_the_dialect() {
+        use crate::provider::{
+            codec::ToolNames::{self, *},
+            protocol::ToolDefinition,
+        };
+        use CodecName::*;
+        let litellm = |upstream| crate::yaml::parse::<litellm::Config>(upstream).unwrap();
+        let (litellm_openai, litellm_anthropic) =
+            (litellm("upstream: openai"), litellm("upstream: anthropic"));
+        let tool = |name: String| {
+            let mut request = request();
+            request.tools = vec![ToolDefinition {
+                name,
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }];
+            request
+        };
+        let (dotted, long) = (tool("vendor.tool".into()), tool("a".repeat(100)));
+        let compatible = compatible::Config::default();
+        let openrouter = openrouter::Config::default();
+        let rows: [(&dyn DialectConfig, CodecName, ToolNames); 14] = [
+            (&compatible, ChatCompletions, Any),
+            (&compatible, Responses, Any),
+            (&compatible, Messages, Any),
+            (&anthropic::Config::default(), Messages, Anthropic),
+            (&openai::Config::default(), ChatCompletions, OpenAi),
+            (&openai::Config::default(), Responses, OpenAi),
+            (&codex::Config::default(), Responses, Any),
+            (&openrouter, ChatCompletions, OpenAi),
+            (&openrouter, Responses, OpenAi),
+            (&openrouter, Messages, Anthropic),
+            (&litellm_openai, Responses, OpenAi),
+            (&litellm_anthropic, ChatCompletions, Anthropic),
+            (&litellm_anthropic, Responses, Anthropic),
+            (&litellm_anthropic, Messages, Anthropic),
+        ];
+        for (settings, codec, names) in rows {
+            let conventions = settings.admit(codec).unwrap().codec;
+            let accepts = |request| conventions.encode(request, &"c".parse().unwrap()).is_ok();
+            assert_eq!(
+                (accepts(&dotted), accepts(&long)),
+                (names == Any, names != OpenAi),
+                "{codec} {conventions:?}"
             );
         }
     }

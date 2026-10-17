@@ -1,6 +1,5 @@
-//! The native event types, and dispatch of their normalized form.
+//! The native event types.
 
-use super::normalization::NormalizedEvent;
 use super::*;
 use crate::named_enum::named_enum;
 
@@ -8,14 +7,10 @@ named_enum! {
     /// The native event types this codec reads; others carry nothing it uses.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) parsed enum Event {
-        Created = "response.created",
-        InProgress = "response.in_progress",
-        Queued = "response.queued",
         ItemAdded = "response.output_item.added",
         ItemDone = "response.output_item.done",
         TextDelta = "response.output_text.delta",
         TextDone = "response.output_text.done",
-        Annotation = "response.output_text.annotation.added",
         RefusalDelta = "response.refusal.delta",
         RefusalDone = "response.refusal.done",
         ReasoningDelta = "response.reasoning_text.delta",
@@ -44,11 +39,9 @@ impl Event {
     /// generic content-part events, whose item decides.
     pub(super) fn item_kind(self) -> Option<ItemKind> {
         match self {
-            Self::TextDelta
-            | Self::TextDone
-            | Self::Annotation
-            | Self::RefusalDelta
-            | Self::RefusalDone => Some(ItemKind::Text),
+            Self::TextDelta | Self::TextDone | Self::RefusalDelta | Self::RefusalDone => {
+                Some(ItemKind::Text)
+            }
             Self::ReasoningDelta
             | Self::ReasoningDone
             | Self::SummaryDelta
@@ -76,107 +69,6 @@ impl Event {
             self,
             Self::PartDone | Self::ReasoningPartDone | Self::SummaryPartDone
         )
-    }
-}
-
-impl Decoder {
-    /// Feed a native Responses event.
-    pub(crate) fn feed(&mut self, event: Value) -> Result<Vec<ResponseEvent>, ProviderError> {
-        if self.completed {
-            return Err(NATIVE.error("event after terminal response"));
-        }
-        let mut events = Vec::new();
-        match self.normalize_event(&event)? {
-            NormalizedEvent::Ignored => {}
-            NormalizedEvent::ItemAdded {
-                index,
-                wire,
-                native,
-            } => self.start(index, wire, native)?,
-            NormalizedEvent::ItemDone { index, native } => {
-                self.end(index, native, false)?;
-            }
-            NormalizedEvent::Delta {
-                part: (id, position),
-                text,
-            } => {
-                self.delta(id, position, text, &mut events)?;
-            }
-            NormalizedEvent::ArgumentsDelta { item: id, text } => {
-                if self.items[&id]
-                    .function()?
-                    .streaming()?
-                    .final_arguments
-                    .is_some()
-                {
-                    return Err(NATIVE.error("arguments delta after done"));
-                }
-                self.delta(id, 0, text, &mut events)?;
-            }
-            NormalizedEvent::ArgumentsDone { item: id, text } => {
-                let arguments = match arguments(text) {
-                    Ok(arguments) => arguments,
-                    Err(_) => {
-                        let item = self
-                            .items
-                            .get_mut(&id)
-                            .expect("checked item")
-                            .function_mut()?
-                            .streaming_mut()?;
-                        if item.final_arguments.is_some() {
-                            return Err(NATIVE.error("conflicting final function arguments"));
-                        }
-                        item.final_arguments = Some(FinalArguments::Incomplete(text.into()));
-                        return Ok(events);
-                    }
-                };
-                // A placeholder `done` carries no input; the final item decides.
-                if arguments.is_empty() {
-                    return Ok(events);
-                }
-                self.validate_arguments(id, &arguments)?;
-                let item = self
-                    .items
-                    .get_mut(&id)
-                    .expect("checked item")
-                    .function_mut()?
-                    .streaming_mut()?;
-                item.final_arguments = Some(FinalArguments::Object(arguments.clone()));
-                if let (Some(call_id), Some(name)) = (&item.call_id, &item.name) {
-                    let content = Content::ToolCall(
-                        ToolCall::new(call_id.clone(), name.clone(), Value::Object(arguments))
-                            .map_err(|error| NATIVE.error(error.to_string()))?,
-                    );
-                    self.close_part(id, 0, content)?;
-                }
-            }
-            NormalizedEvent::PartEnded {
-                part: (id, position),
-                content,
-            } => {
-                self.close_part(id, position, content)?;
-            }
-            NormalizedEvent::PartAdded {
-                part: (id, position),
-                text,
-            } => {
-                match self.part(id, position)? {
-                    Part::Streaming { text, added } if !*added && text.is_empty() => *added = true,
-                    _ => return Err(NATIVE.error("duplicate or late content part added")),
-                }
-                if !text.is_empty() {
-                    self.delta(id, position, text, &mut events)?;
-                }
-            }
-            NormalizedEvent::Terminal {
-                output,
-                usage,
-                finish,
-            } => {
-                self.complete_response(output, usage, finish, &mut events)?;
-            }
-        }
-        Ok(events)
     }
 }
 

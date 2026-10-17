@@ -13,7 +13,6 @@ impl Harness {
     }
 }
 impl SessionHandle {
-    #[must_use]
     pub fn id(&self) -> SessionId {
         self.root.session()
     }
@@ -23,9 +22,13 @@ impl SessionHandle {
     }
 
     /// Observe without a gap between the initial snapshot and subsequent updates.
-    #[must_use]
     pub fn observe(&self) -> Observation {
         self.runtime.store.observe()
+    }
+
+    /// The revision of the newest update published to observers.
+    pub fn revision(&self) -> u64 {
+        self.runtime.store.revision()
     }
 
     /// Host-only startup diagnostics, never inserted into agent context.
@@ -82,8 +85,8 @@ impl SessionHandle {
         self.runtime.store.directory()
     }
 
-    /// Name the session after its first prompt; a session already titled keeps
-    /// its title.
+    /// Name a session that has neither a title nor a first prompt to take one
+    /// from, as a script it starts with; any other keeps its title.
     pub async fn set_title(&self, title: String) -> Result<(), HarnessError> {
         self.running().await?;
         let root = self.root.clone();
@@ -126,33 +129,9 @@ impl SessionHandle {
         Ok(())
     }
 
-    #[must_use]
-    /// `agent`'s jobs, read as the session's observation reads them.
-    pub fn inspect_jobs(&self, agent: &AgentId) -> Vec<crate::job::JobEnvelope> {
-        let mut jobs = self.runtime.jobs.list(agent);
-        let stopped = |state: &CoreState| state.phase.stopped_at(&state.records);
-        if let Some(at) = self.runtime.store.read(stopped) {
-            jobs.iter_mut().for_each(|job| {
-                crate::agent::observation::read_job(job, at);
-            });
-        }
-        jobs
-    }
-
-    /// Host inspection is not bound to any turn: interrupting the agent never
-    /// aborts a page the host is reading.
-    pub async fn inspect_output(
-        &self,
-        query: crate::job::JobOutputQuery,
-    ) -> Result<serde_json::Value, crate::tool::ToolError> {
-        self.runtime
-            .jobs
-            .inspect_output(query, CancellationToken::new(), &self.runtime.capabilities)
-            .await
-    }
-
     /// Inspect output and hydrate eligible automatic capture text: a running
-    /// job's from each capture's last page.
+    /// job's from each capture's last page. Host inspection is not bound to any
+    /// turn: interrupting the agent never aborts a page the host is reading.
     pub async fn inspect_output_with_captures(
         &self,
         query: crate::job::JobOutputQuery,
@@ -186,11 +165,6 @@ impl SessionHandle {
         Ok(self.runtime.jobs.cancel(job).await?)
     }
 
-    #[must_use]
-    pub fn tools(&self) -> &ToolRegistry {
-        self.runtime.executor.registry()
-    }
-
     pub async fn prompt(&self, text: impl Into<String>) -> Result<String, HarnessError> {
         self.prompt_with_options(text, &[], Selection::default())
             .await
@@ -215,7 +189,7 @@ impl SessionHandle {
     }
 
     async fn continue_with(&self, options: Selection) -> Result<ContinueOutcome, HarnessError> {
-        self.admit_selection(&options)?;
+        self.runtime.admit_selection(&options)?;
         self.running().await?;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
@@ -237,14 +211,25 @@ impl SessionHandle {
                         .set_turn(Turn::Busy);
                 }
                 // A root that stopped short of its answer goes on from where it did.
-                let parked = (state.agents.get(&root))
-                    .is_some_and(|facts| matches!(facts.turn, Turn::Parked(_)));
-                let input = AgentCommand::Input {
-                    options,
-                    content: Vec::new(),
-                    done: Some(RequestCompletion::Root(done)),
+                // A batch it holds is claimed here, so a later withdrawal finds it
+                // being submitted, and commits under this selection.
+                let held = (state.agents.get_mut(&root)).and_then(|facts| facts.held.take());
+                let retried = held.and_then(|held| held.retried(options.clone()));
+                let done = RequestCompletion::Root(done);
+                let sent = match retried {
+                    Some(batch) => state
+                        .agents
+                        .send(&root, AgentCommand::Retry { batch, done }),
+                    None => {
+                        let input = AgentCommand::Input {
+                            options,
+                            content: Vec::new(),
+                            done: Some(done),
+                        };
+                        super::agents::settle_held(state, &root) && state.agents.send(&root, input)
+                    }
                 };
-                let continued = (parked && state.agents.send(&root, input)).then_some(answer);
+                let continued = sent.then_some(answer);
                 (resumed, continued)
             }))
         };
@@ -330,7 +315,11 @@ impl SessionHandle {
         options: Selection,
     ) -> Result<String, HarnessError> {
         let submitted = async {
-            let content = (self.prepare_prompt(text.into(), attachments, &options)).await?;
+            self.runtime.admit_message(attachments, &options)?;
+            self.running().await?;
+            (self.runtime.store).read(|state| state.phase.admits(Command::Submit).map(drop))?;
+            let text = vec![UserPart::Text { text: text.into() }];
+            let content = self.runtime.with_attachments(text, attachments).await?;
             let (done, answer) = oneshot::channel();
             let input = AgentCommand::Input {
                 options,
@@ -351,43 +340,8 @@ impl SessionHandle {
     }
 
     /// Where the session is in its life.
-    #[must_use]
     pub fn phase(&self) -> crate::session::SessionPhase {
-        self.runtime.store.phase()
-    }
-
-    pub(super) async fn prepare_prompt(
-        &self,
-        text: String,
-        attachments: &[crate::media::Attachment],
-        options: &Selection,
-    ) -> Result<Vec<UserPart>, HarnessError> {
-        use crate::media::Attachment;
-        self.admit_selection(options)?;
-        self.running().await?;
-        self.runtime.store.admits(Command::Submit)?;
-        // Check every limit before storing any blob.
-        let mut images = 0;
-        let mut total = 0_u64;
-        for attachment in attachments {
-            if let Attachment::Image { image, .. } = attachment {
-                let bytes = image.bytes().len() as u64;
-                images += 1;
-                total = total.saturating_add(bytes);
-                if bytes > MAX_IMAGE_BYTES
-                    || images > MAX_IMAGES_PER_SUBMISSION
-                    || total > MAX_IMAGE_BYTES_PER_SUBMISSION
-                {
-                    return Err(HarnessError::ImageLimit);
-                }
-            }
-        }
-        let mut content = vec![UserPart::Text { text }];
-        for attachment in attachments {
-            let attachment = self.runtime.store.store_attachment(attachment).await?;
-            content.push(UserPart::Attachment { attachment });
-        }
-        Ok(content)
+        self.runtime.store.read(|state| state.phase.clone())
     }
 
     /// The selection a message or continued turn can carry: a `provider/model` the
@@ -420,23 +374,6 @@ impl SessionHandle {
         Ok(Selection { model, mode })
     }
 
-    /// A selection another runtime instance issued, even for this session before a
-    /// resume, proves nothing about this instance's catalog.
-    fn admit_selection(&self, options: &Selection) -> Result<(), HarnessError> {
-        let runtime = self.runtime.instance;
-        if let Some(model) = &options.model
-            && model.runtime != runtime
-        {
-            return Err(HarnessError::UnknownModel(model.name.clone()));
-        }
-        if let Some(mode) = &options.mode
-            && mode.runtime != runtime
-        {
-            return Err(HarnessError::UnknownMode(mode.name.clone()));
-        }
-        Ok(())
-    }
-
     /// Stop runtime producers and drain their accepted work. The journal stays
     /// open so a host can record its final status after observing shutdown errors,
     /// then [`close`](Self::close) it.
@@ -458,12 +395,7 @@ impl SessionHandle {
                 runtime.stop_turns(state, &root);
                 drop(runtime.jobs.conclude(state, crate::job::Concluding::Every));
                 runtime.jobs.cancel_running(state);
-                let supervisor = runtime.jobs.supervisor().clone();
-                state.defer(move || {
-                    agents
-                        .iter()
-                        .for_each(|agent| supervisor.cancel_turn(agent))
-                });
+                state.agents.cancel_turns(&agents);
                 false
             }))
         };
@@ -501,6 +433,62 @@ impl SessionHandle {
         let (runtime, root) = (self.runtime.clone(), self.root.clone());
         let interrupt = move |state: &mut CoreState| runtime.stop_turns(state, &root);
         self.runtime.store.live(interrupt).await
+    }
+}
+
+impl SessionRuntime {
+    /// A selection another runtime instance issued, even for this session before a
+    /// resume, proves nothing about this instance's catalog.
+    pub(super) fn admit_selection(&self, options: &Selection) -> Result<(), HarnessError> {
+        if let Some(model) = &options.model
+            && model.runtime != self.instance
+        {
+            return Err(HarnessError::UnknownModel(model.name.clone()));
+        }
+        if let Some(mode) = &options.mode
+            && mode.runtime != self.instance
+        {
+            return Err(HarnessError::UnknownMode(mode.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Why the session takes no message with `attachments` under `options`,
+    /// checked before any of its blobs is stored.
+    pub(super) fn admit_message(
+        &self,
+        attachments: &[crate::media::Attachment],
+        options: &Selection,
+    ) -> Result<(), HarnessError> {
+        self.admit_selection(options)?;
+        let (mut images, mut total) = (0, 0_u64);
+        for attachment in attachments {
+            if let crate::media::Attachment::Image { image, .. } = attachment {
+                let bytes = image.bytes().len() as u64;
+                images += 1;
+                total = total.saturating_add(bytes);
+                if bytes > MAX_IMAGE_BYTES
+                    || images > MAX_IMAGES_PER_SUBMISSION
+                    || total > MAX_IMAGE_BYTES_PER_SUBMISSION
+                {
+                    return Err(HarnessError::ImageLimit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `content` followed by `attachments`, once their blobs are stored.
+    pub(super) async fn with_attachments(
+        &self,
+        mut content: Vec<UserPart>,
+        attachments: &[crate::media::Attachment],
+    ) -> Result<Vec<UserPart>, HarnessError> {
+        for attachment in attachments {
+            let attachment = self.store.store_attachment(attachment).await?;
+            content.push(UserPart::Attachment { attachment });
+        }
+        Ok(content)
     }
 }
 
@@ -964,27 +952,29 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("done")]);
+        let provider = scripted_provider(&requests, [answer("done"), answer("done")]);
         let harness = test_harness(root.path(), &sessions, provider).await;
+        let title = async |session: &SessionHandle| {
+            let summary = SessionStore::summary(&sessions, session.id()).await;
+            summary.unwrap().title.map(|title| title.text)
+        };
+        // A first prompt is the session's automatic title.
+        let prompted = harness.new_session().await.unwrap();
+        prompted.prompt("list me by my first prompt").await.unwrap();
+        prompted.set_title("script title".into()).await.unwrap();
+        let listed = title(&prompted).await;
+        assert_eq!(listed.as_deref(), Some("list me by my first prompt"));
+        shutdown_session(prompted).await;
+
         let session = harness.new_session().await.unwrap();
-        session.prompt("list me by my first prompt").await.unwrap();
-        let summary = SessionStore::summary(&sessions, session.id())
-            .await
-            .unwrap();
-        assert_eq!(
-            summary.title.map(|title| title.text).as_deref(),
-            Some("list me by my first prompt")
-        );
-        assert_eq!(summary.model, Some(model_ref("test")));
         session.set_title("first title".into()).await.unwrap();
         session.set_title("second title".into()).await.unwrap();
+        session.prompt("a later prompt").await.unwrap();
+        assert_eq!(title(&session).await.as_deref(), Some("first title"));
         let summary = SessionStore::summary(&sessions, session.id())
             .await
             .unwrap();
-        assert_eq!(
-            summary.title.map(|title| title.text).as_deref(),
-            Some("first title")
-        );
+        assert_eq!(summary.model, Some(model_ref("test")));
         let records = session.runtime.store.records();
         assert_eq!(summary.entries, records.len() as u64);
         assert_eq!(
@@ -1048,7 +1038,8 @@ mod tests {
             requests.lock().unwrap()[1]
                 .messages()
                 .any(|message| matches!(message,
-            Sent::User(parts) if parts.iter().any(SentPart::is_image)))
+            Sent::User(parts) if parts.iter().any(|part| matches!(part,
+                SentPart::Attachment { attachment: crate::media::AttachmentRef::Image(_) }))))
         );
         session.shutdown().await.unwrap();
     }
@@ -1092,6 +1083,16 @@ mod tests {
         assert_eq!((interrupted, assistant_commits(&records)), (1, 0));
         let status = session.record_status(session.root.clone(), "Interrupted".into());
         status.await.unwrap();
+        // Background work owned by the interrupted root completes afterwards. It
+        // does not wake the root, whose turn would spend the scripted answer: it
+        // reaches the model with the next request instead.
+        let arguments = json!({"source": "return 1", "bg": true});
+        let executor = &session.runtime.executor;
+        let running = executor.execute(session.root.clone(), "script", arguments, None);
+        let job = running.await.unwrap().job;
+        bounded(session.runtime.jobs.wait_settled(job))
+            .await
+            .unwrap();
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
         let records = session.runtime.store.records();
         let retained = count!(&records, SessionEvent::MessageCommitted { message: Message::User(blocks) }
@@ -1101,7 +1102,13 @@ mod tests {
         assert_eq!((retained, interrupted), (1, 1));
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
-        assert!(captured[0].messages().eq(captured[1].messages()));
+        let delivered = |message: &&Sent| {
+            matches!(message, Sent::User(blocks) if blocks.iter().any(|block|
+                matches!(block, SentPart::Runtime { text } if text.starts_with("<skyhook_job_events>"))))
+        };
+        assert_eq!(captured[1].messages().filter(delivered).count(), 1);
+        let continued = captured[1].messages().filter(|message| !delivered(message));
+        assert!(captured[0].messages().eq(continued));
         session.shutdown().await.unwrap();
         session.shutdown().await.unwrap();
     }
@@ -1147,42 +1154,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_finishing_after_an_interrupt_waits_for_the_next_input() {
-        let root = tempfile::tempdir().unwrap();
-        let requests = Requests::default();
-        let steps = [
-            Step::new(answer("initial")).midstream(),
-            Step::new(answer("jobs handled")),
-        ];
-        let provider = Script::new(steps, &requests);
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let task = spawn_prompt(&session, "start");
-        provider.request(0).await;
-        session.interrupt().await;
-        assert!(task.await.unwrap().is_err());
-        // Background work owned by the interrupted root completes afterwards.
-        let arguments = json!({"source": "return 1", "bg": true});
-        let executor = &session.runtime.executor;
-        let running = executor.execute(session.root.clone(), "script", arguments, None);
-        let job = running.await.unwrap().job;
-        bounded(session.runtime.jobs.wait_settled(job))
-            .await
-            .unwrap();
-        // The completion does not wake the interrupted root, whose turn would spend
-        // the scripted answer: it reaches the model with the next request instead.
-        assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
-        let captured = requests.lock().unwrap().clone();
-        let delivered = captured[1].messages().any(|message| {
-            matches!(message, Sent::User(blocks) if blocks.iter().any(|block|
-                matches!(block, SentPart::Runtime { text } if text.starts_with("<skyhook_job_events>"))))
-        });
-        assert!(captured.len() == 2 && delivered);
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn script_messages_preserve_order_across_calls_and_cancel_waiting_receivers() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
@@ -1215,7 +1186,7 @@ mod tests {
         assert_eq!(queued.value["value"]["state"], "running");
         let last = format!("return tool.job({id}).send({{value:\"last\"}});");
         session.run_script(last).await.unwrap();
-        jobs.wait(running, None, true).await.unwrap();
+        jobs.wait(running, true).await.unwrap();
         let output = format!("return tool.jobs({{job:{id}}});");
         let completed = session.run_script(output).await.unwrap();
         assert_eq!(completed.value["value"]["state"], "completed");
@@ -1237,7 +1208,7 @@ mod tests {
             session.run_script(cancel).await.unwrap().value["value"],
             true
         );
-        jobs.wait(waiting, None, true).await.unwrap();
+        jobs.wait(waiting, true).await.unwrap();
         let output = format!("return tool.jobs({{job:{id}}});");
         let cancelled = session.run_script(output).await.unwrap();
         assert_eq!(cancelled.value["value"]["state"], "cancelled");

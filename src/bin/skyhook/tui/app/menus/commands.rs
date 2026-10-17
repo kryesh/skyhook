@@ -1,7 +1,7 @@
 //! Commands, from the palette, a shortcut or a typed `/command`.
 use super::{ConfirmAction, Item, MenuKind};
 use crate::state;
-use crate::tui::app::{App, Focus, HostRequest, Operation, StartState, Work};
+use crate::tui::app::{App, Focus, HostRequest, Operation, Work, last_record, root_failed};
 use crate::tui::keys::{COMMANDS, Command};
 use crate::tui::model::{self, Tab, View};
 
@@ -61,13 +61,8 @@ impl App {
             Command::Copy => self.copy(),
             Command::Attention => self.activate_prompt(),
             Command::Resume => {
-                self.paused = false;
-                // Not busy means no creation is in flight, so only a parked retry can be taken.
-                if !self.busy()
-                    && let StartState::RetryScript(path) = std::mem::take(&mut self.start)
-                {
-                    self.start_script(path);
-                }
+                self.discard_edit();
+                self.paused = None;
                 self.toast("Queued input resumed");
             }
             Command::Retry => self.retry(),
@@ -162,9 +157,26 @@ impl App {
         let viewed = self.snapshot.phase == skyhook::session::SessionPhase::Viewing;
         let mut activity = self.snapshot.activity.values();
         let retryable = viewed || activity.any(|activity| activity.state.is_retryable());
-        if self.start.is_creating() || self.stopping || !retryable {
+        if self.creating.is_some() || self.stopping {
             self.toast("No failed or interrupted turns to retry");
             return;
+        }
+        // An open edit holds every queued and held row: only a turn that holds
+        // none goes on.
+        let editing = matches!(self.paused, Some(crate::tui::app::Paused::Editing { .. }));
+        if editing {
+            self.toast("Submit the message you are editing, or resume the queue, to retry it");
+            if !retryable || self.holds_rows() {
+                return;
+            }
+        }
+        // Rows a failure or an interrupt handed back are sent again too.
+        let resumed = self.resume_stopped_queue();
+        if !retryable {
+            return self.toast(match resumed {
+                true => "Queued input resumed",
+                false => "No failed or interrupted turns to retry",
+            });
         }
         let Some(session) = self.session().cloned() else {
             return;
@@ -179,18 +191,23 @@ impl App {
         };
         // A pending model or mode choice is otherwise captured only by a submitted
         // message. Forward it here too: a refusal repeats deterministically
-        // on the same model, so "swap then continue" must actually swap.
+        // on the same model, so "swap then continue" must actually swap. Rows the
+        // session holds retry under it whatever the turn runs.
+        let held = self.holds_rows();
         let mut agents = self.projection.agents.iter();
         let active = agents.find(|agent| &agent.id == self.root_agent());
-        let model = active.and_then(|agent| agent.model.as_ref());
-        let model = (model != Some(&self.model)).then(|| self.model.clone());
+        let model = active.map(|agent| &agent.model);
+        let model = (held || model != Some(&self.model)).then(|| self.model.clone());
         let mode = active.and_then(|agent| agent.mode.as_ref());
-        let mode = (mode != Some(&self.mode)).then(|| self.mode.clone());
+        let mode = (held || mode != Some(&self.mode)).then(|| self.mode.clone());
         let tx = self.tx.clone();
         let notices = self.root_notifier();
-        self.toast("Continue requested");
+        if !editing {
+            self.toast("Continue requested");
+        }
         let requested = model.is_some() || mode.is_some();
         tokio::spawn(async move {
+            let read = last_record(&session.observe().snapshot);
             let outcome = match session.selection(model.as_ref(), mode.as_ref()) {
                 Ok(selection) => session.continue_turn_with(selection).await,
                 Err(error) => Err(error),
@@ -212,6 +229,10 @@ impl App {
                             outcome.children_resumed,
                         ));
                     }
+                    Ok(())
+                }
+                // The root turn it continued failed: the journal shows that.
+                Err(_) if root_failed(&session.observe().snapshot, session.root_agent(), read) => {
                     Ok(())
                 }
                 Err(error) => Err(error.into()),
@@ -263,7 +284,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::agent::ObservationSnapshot;
     use skyhook::identity::JobId;
-    use skyhook::session::{RecordSeq, SessionEvent};
+    use skyhook::session::SessionEvent;
 
     #[tokio::test]
     async fn retry_children_without_selection_preserves_the_waiting_root_operation() {
@@ -303,8 +324,6 @@ mod tests {
         app.snapshot.activity.insert(root.clone(), waiting.clone());
         assert_eq!(app.selected, root);
         app.operation = true;
-        let initial_input = Some((root.clone(), RecordSeq::default()));
-        app.initial_input = initial_input.clone();
         let mut rx = capture_work(&mut app);
         assert!(app.busy());
 
@@ -343,7 +362,6 @@ mod tests {
         }));
         // Child retry neither replaces nor finishes the pending root operation.
         assert!(app.operation);
-        assert_eq!(app.initial_input, initial_input);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
         session.shutdown().await.unwrap();
     }
@@ -391,10 +409,7 @@ mod tests {
         };
         for (command, label, shortcut) in [
             (Command::New, "New session", "Ctrl+X N"),
-            (Command::Mode, "Mode", "Ctrl+X P"),
-            (Command::Help, "Help and shortcuts", "Ctrl+X H"),
             (Command::Resume, "Resume queued input", ""),
-            (Command::Model, "Model", "Ctrl+X M"),
         ] {
             let item = items.iter().find(|item| item.value == command).unwrap();
             assert_eq!(
@@ -426,12 +441,12 @@ mod tests {
         }
         // Typing a command id runs that command.
         app.overlay = None;
-        app.paused = true;
+        app.paused = Some(crate::tui::app::Paused::Stopped);
         key(&mut app, KeyCode::Char('/'), M::NONE);
         let typed: Vec<_> = "resume".chars().map(KeyCode::Char).collect();
         press(&mut app, &typed);
         key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(!app.paused);
+        assert!(!app.paused.is_some());
         assert!(app.menu().is_none());
     }
 }

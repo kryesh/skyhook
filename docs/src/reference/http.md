@@ -104,53 +104,19 @@ rather than reporting an incomplete body as successful. Model-visible preview tr
 independent: retrieve saved results with `jobs({job})`. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.
 
-Transport and processing failures remain failed jobs and failed JobViews (not rejected
-operational script calls). The error names the method, a safe origin, a concise message and the
-elapsed time; the structured failure result contains `duration`, `size` once bytes were received,
-redirect history, and `diagnostic.error_kind`. When available, `diagnostic.os_error` supplies the
-executing platform, a numeric OS `code`, and a portable `kind`.
-Timeouts include `diagnostic.timeout.kind` (`total`, `connect`, or `unknown`) and a `limit_ms` only
-when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
-include SSH startup or initial tool approval.
+Transport and processing failures are ordinary failed jobs with no result: in scripts, a failed
+JobView rather than a rejected promise. The error names the operation in progress (for example
+`send HTTP GET https://example.com`, `receive HTTP response body`, or the download path), then the
+cause: an I/O kind with its OS error code when the failure carries one (such as `connection refused
+(OS error 111)`), or a fixed message such as `the TLS handshake failed` or `response exceeds
+max_bytes`. A failure after the request was sent notes that the request may have executed; a
+`save_to` failure that left its destination untouched also reports that it is unchanged.
+Failure messages never copy underlying error text, query strings, credentials, headers, or bodies;
+URLs are reduced to their origin. A response's `duration` is measured inside fetch on the execution
+target; it does not include SSH startup or initial tool approval.
 
-Connection refusal, host/network unreachability, DNS failures, TLS failures, HTTP proxy
-CONNECT failures, and response-processing failures are distinguished when the underlying errors
-provide evidence. Otherwise fetch reports a generic transport category; it never infers that a
-firewall caused an error. Diagnostic messages do not copy arbitrary error strings, query strings,
-credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
-headers are included only with `include_headers: true`; they retain their normal response semantics
-and may still contain sensitive response data.
-`proxy_origin`, when present, describes an explicit proxy; its absence does not rule out an
-environment proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
-
-If headers arrived before a failure (including an outer timeout), the failure retains the
-HTTP status and byte count, plus headers when `include_headers: true`; unavailable fields are
-absent. HTTP 4xx/5xx responses still complete normally: a 405
-establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
-retain their separate semantics.
-
-In scripts, operational fetch failures are failed JobViews rather than rejected promises. Inspect
-the failed view's `.result` directly (or use `response.unwrap()` for fail-fast extraction):
-
-```js
-const response = await tool.fetch({url, target});
-if (response.state === "failed") {
-  const failure = response.result ?? {};
-  return {
-    target,
-    http_reached: Number.isInteger(failure.status),
-    status: failure.status ?? null,
-    duration: failure.duration ?? null,
-    diagnostic: failure.diagnostic ?? null,
-    error: response.error,
-  };
-}
-return {target, http_reached: true, status: response.result.status};
-```
-
-The same diagnostic is retrievable from a failed fetch JobView at `/result/diagnostic`. If a
-script returns that response, the preserved response remains in the script payload's `/result/value`;
-operational fetch failure does not become an uncaught script exception.
+HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity, not
+successful ingestion. Permission denial and cancellation retain their separate semantics.
 
 ## Redirects, proxies, and security
 

@@ -83,16 +83,9 @@ impl App {
     /// Take a queued follow-up back into the composer, queueing the current draft
     /// in its place.
     pub(super) fn edit_queued(&mut self, id: QueuedInputId) {
-        let Some(queued) = self.remove_queued(id) else {
-            return;
-        };
-        self.pause_queue();
-        if !self.editor.is_empty() {
-            let draft = self.editor.take();
-            let draft = self.queued_input(draft);
-            self.queue.push_front(draft);
+        if let Some(submission) = self.begin_edit(id) {
+            self.replace_draft(submission);
         }
-        self.replace_draft(queued.submission);
     }
 }
 
@@ -118,7 +111,7 @@ mod tests {
         app.command(Command::Queue);
         app.menu_mut().unwrap().input.set("second".into());
         app.choose();
-        assert!(app.paused);
+        assert!(app.paused.is_some());
         assert_eq!(app.editor.text(), "second");
         assert_eq!(app.editor.attachments(), [png_attachment("second").into()]);
         let texts: Vec<_> = app
@@ -126,7 +119,8 @@ mod tests {
             .iter()
             .map(|input| &input.submission.text)
             .collect();
-        assert_eq!(texts, ["draft", "first"]);
+        // The edited row keeps its place until the edit ends.
+        assert_eq!(texts, ["draft", "first", "second"]);
         assert_eq!(
             app.queue[0].submission.attachments,
             [png_attachment("draft.png")]
@@ -134,9 +128,9 @@ mod tests {
         app.command(Command::Queue);
         app.menu_mut().unwrap().input.set("first".into());
         key(&mut app, KeyCode::Delete, M::NONE);
-        assert_eq!(app.queue.len(), 1);
-        assert!(app.paused);
+        assert_eq!(app.queue.len(), 2);
+        assert!(app.paused.is_some());
         app.command(Command::Resume);
-        assert!(!app.paused);
+        assert!(!app.paused.is_some());
     }
 }

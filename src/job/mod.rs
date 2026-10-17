@@ -34,7 +34,7 @@ pub(crate) mod output;
 pub use output::{
     CaptureDescriptor, CaptureKind, Continuation, ElementPage, FieldPointer, LinePage, Match,
     MatchPage, MemberPage, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
-    OutputSelection, OutputTruncation, PresentedOutput, diagnostic_slot, omit_null_fields,
+    OutputSelection, OutputTruncation, PresentedOutput, omit_null_fields,
 };
 mod cancellation;
 pub(crate) use cancellation::{CANCELLATION_GRACE, CancelScope};
@@ -60,7 +60,7 @@ pub(crate) use input::Concluding;
 pub(crate) use lifecycle::woken;
 pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
-pub(crate) use views::{JOB_VIEW_SCHEMAS, Waiting, release_records};
+pub(crate) use views::{JOB_VIEW_SCHEMAS, ViewKind, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod persistence;
 pub(crate) use persistence::Jobs;
@@ -85,14 +85,6 @@ named_enum! {
         /// A `wait`: the agent pauses for events rather than doing work.
         Wait = "wait",
     }
-}
-
-/// How a model read presents a job: `Automatic` leaves out the metadata a
-/// successful foreground call does not need; `Full` always shows it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputPresentation {
-    Full,
-    Automatic,
 }
 
 named_enum! {
@@ -120,7 +112,6 @@ impl JobState {
         }
     }
 
-    #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -239,16 +230,6 @@ pub(crate) enum Restart {
     Call,
 }
 
-/// What runs a finished agent job again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Retained {
-    /// The child its call installed.
-    Child,
-    /// The call itself, which a stopped process interrupted before it was
-    /// accepted, asked for again.
-    Call,
-}
-
 /// What restarts a finished agent job; ordinary input-capable tools cannot restart.
 #[derive(Clone)]
 pub(crate) enum Resume {
@@ -257,15 +238,6 @@ pub(crate) enum Resume {
     /// Asks again for a call interrupted before it installed its child, then
     /// runs it, from its approval on.
     Call(Relaunch),
-}
-
-impl Resume {
-    fn retained(&self) -> Retained {
-        match self {
-            Self::Child(_) => Retained::Child,
-            Self::Call(_) => Retained::Call,
-        }
-    }
 }
 
 impl From<ResumeHandler> for Resume {
@@ -420,7 +392,6 @@ impl JobManager {
         &self.inner.supervisor
     }
 
-    #[must_use]
     pub fn store(&self) -> &SessionStore {
         &self.inner.store
     }
@@ -434,6 +405,18 @@ pub(crate) mod tests {
     pub(super) async fn runtime() -> (tempfile::TempDir, JobManager, AgentId) {
         let runtime = crate::tests::TestRuntime::new().await;
         (runtime.root, runtime.jobs, runtime.agent)
+    }
+
+    /// Drain owners, drop the manager, and replay the durable journal of the
+    /// runtime at `root`.
+    pub(crate) async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
+        let session = jobs.store().id();
+        jobs.supervisor().drain().await;
+        drop(jobs);
+        let (store, _) = SessionStore::open(&root.join("sessions"), session)
+            .await
+            .unwrap();
+        reopened(store).await
     }
 
     /// The jobs of a reopened session, what its last process left running settled.
@@ -508,7 +491,6 @@ pub(crate) mod tests {
                 end,
                 images: Vec::new(),
                 diagnostic: None,
-                output_diagnostic: None,
             })
         };
         let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
@@ -643,9 +625,10 @@ pub(crate) mod tests {
                 None,
             ),
         ];
+        let handler: ResumeHandler = Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::default()) }));
         for (case, prefix, change, expected) in cases {
             let (mut entry, mut stamps) = at(prefix);
-            entry.resume = Some(Retained::Child);
+            entry.resume = Some(Resume::Child(handler.clone()));
             let before = entry.state();
             let applied = apply(&mut entry, &mut stamps, &change);
             assert_eq!(applied.is_some(), expected.is_some(), "{case}");
@@ -705,42 +688,23 @@ pub(crate) mod tests {
             self.test_lease(spec).await.test_run().await
         }
 
-        /// The job's envelope once it ends, or asks while unacknowledged, or once
-        /// `timeout` passes; with `claim`, its delivery is acknowledged.
-        pub(crate) async fn wait(
-            &self,
-            id: JobId,
-            timeout: Option<Duration>,
-            claim: bool,
-        ) -> Result<Hydrated, JobError> {
+        /// The job's envelope once it ends, or asks while unacknowledged; with
+        /// `claim`, its delivery is acknowledged.
+        pub(crate) async fn wait(&self, id: JobId, claim: bool) -> Result<Hydrated, JobError> {
             let ready = |entry: &JobFacts| {
                 !entry.suspended()
                     && (entry.end().is_some() || entry.asks_owner() && entry.unacknowledged())
             };
-            let until = self.until_job(id, ready);
-            let (envelope, presented) = match timeout {
-                None => until.await?,
-                Some(timeout) => match tokio::time::timeout(timeout, until).await {
-                    Ok(ready) => ready?,
-                    Err(_) => {
-                        let pending = |entry: &JobFacts| JobEnvelope {
-                            question: None,
-                            ..entry.envelope(id)
-                        };
-                        (self.entry(id, pending)?, None)
-                    }
-                },
-            };
+            let (envelope, presented) = self.until_job(id, ready).await?;
             if claim {
                 self.acknowledge(presented).await?;
             }
             self.hydrated(envelope).await
         }
 
-        /// `envelope` with the result its run saved, as the default viewer reads it.
+        /// `envelope` with the result its run saved.
         pub(crate) async fn hydrated(&self, envelope: JobEnvelope) -> Result<Hydrated, JobError> {
             let output = self.saved_result(&envelope).await?;
-            let output = envelope.presented(output, &CapabilitySet::default());
             Ok(Hydrated { envelope, output })
         }
 
@@ -750,7 +714,7 @@ pub(crate) mod tests {
         }
 
         /// Commit a child's assistant history and publish its visible text in one
-        /// step: see [`Jobs::child_message`].
+        /// step: see [`Jobs::message_plan`].
         pub(crate) async fn commit_child_message(
             &self,
             child: &AgentId,
@@ -761,7 +725,7 @@ pub(crate) mod tests {
         ) -> Result<MessageSeq, JobError> {
             let child = child.clone();
             let commit = move |state: &CoreState| {
-                Jobs::child_message(state, child, job, message, &text, follow)
+                Jobs::message_plan(state, child, message, Some((job, &text)), follow, |_| {})
             };
             self.inner.store.commit(Command::Journal, commit).await
         }

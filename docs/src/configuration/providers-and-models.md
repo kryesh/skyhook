@@ -16,12 +16,12 @@ Different models on one provider may use different supported codecs:
 
 | Dialect | Codecs | Use for |
 | --- | --- | --- |
-| `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. Extra field: `state_role` (default `user`). |
-| `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary` (Responses only): `"auto"` (default), `"concise"` or `"detailed"`, or `null` to request none for an unverified organisation; `organization`, `project`. |
+| `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. Response schemas are sent as written, in strict mode on `responses`. Extra field: `state_role` (default `user`). |
+| `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas are sent in strict mode, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Reasoning summaries need a verified organisation; an unverified one is refused, so set `reasoning_summary: null` for it. Extra fields: `organization`, `project`. |
 | `anthropic` | `messages` | `base_url` defaults to `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`, `state_role` (default `system`). |
-| `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
-| `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`), `cache_ttl: "5m"` or `"1h"`, and `state_role` (default `user`). A response schema always sets `require_parameters`. |
-| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind `anthropic`, Chat replays signed thinking and takes prompt caching. Behind `openai`, Chat and Responses take OpenAI's conventions, with neither. Behind `bedrock`, which serves both families, they take OpenAI's conventions too, but Chat still replays the signed thinking the proxy returns. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Each conversation's identity rides `x-litellm-session-id`, which LiteLLM's session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind `openai` or `bedrock` also send it as `prompt_cache_key`, which LiteLLM passes on for the service's own cache affinity. LiteLLM refuses `prompt_cache_key` for every model it serves through Bedrock's Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock's OpenAI endpoint. Serve Claude through `messages`, whatever its upstream. For the others, send the identity in the header alone with `cache_key: {header: "x-litellm-session-id"}`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
+| `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. Response schemas are sent in strict mode. |
+| `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching (on Responses, through OpenRouter's automatic caching), and each conversation keeps its routing affinity. Response schemas are sent in strict mode on `chat_completions` and `responses`. Extra fields: `routing`, `cache_ttl: "5m"` or `"1h"` on every codec, and `state_role` (default `user`). `routing` is sent on every codec as OpenRouter's `provider` preferences and `models` fallbacks: `order` (provider slugs to try first; a preference unless `allow_fallbacks: false`, which restricts routing to them), `only` (provider slugs allowed), `ignore` (provider slugs skipped), `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, and `fallback_models`. A response schema always sets `require_parameters`. |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind `anthropic`, Chat replays signed thinking and takes prompt caching. Behind `openai`, Chat and Responses take OpenAI's conventions, with neither. Behind `bedrock`, which serves both families, they take OpenAI's conventions too, but Chat still replays the thinking blocks the proxy returns, and both Chat and `messages` replay unsigned thinking until signed thinking appears. Response schemas are sent in strict mode on `chat_completions` and `responses`, except behind `anthropic`, which does not honour it. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Each conversation's identity rides `x-litellm-session-id`, which LiteLLM's session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind `openai` or `bedrock` also send it as `prompt_cache_key`, which LiteLLM passes on for the service's own cache affinity. LiteLLM refuses `prompt_cache_key` for every model it serves through Bedrock's Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock's OpenAI endpoint. Serve Claude through `messages`, whatever its upstream. For the others, send the identity in the header alone with `cache_key: {header: "x-litellm-session-id"}`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
 
 Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
 dialect accepts fixed request `headers` for proxies or attribution, the
@@ -35,13 +35,12 @@ detection: `model` is the identifier sent on the wire.
 ## Provider defaults and model settings
 
 Request settings are flat: put shared defaults beside `models`, and model-specific values
-directly beside `model`. To migrate an older configuration, move each member of a model's
-`overrides` mapping directly under that model; the old wrapper is rejected.
+directly beside `model`.
 
 | Where | Fields |
 | --- | --- |
 | Provider only | `dialect`, `base_url`, `api_key`, `headers`, `startup_timeout_secs`, `read_idle_timeout_secs`; Codex's `auth_url`. |
-| Provider defaults or direct model settings | `codec`; all placement selections listed below; the Responses settings `service_tier`, `access_programs`, `explicit_caching`; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
+| Provider defaults or direct model settings | `codec`; `service_tier`; all placement selections listed below; the Responses settings `reasoning_summary`, `access_programs`; `explicit_caching`; the dialect's request fields: OpenAI's `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
 | Model only | `model`, `reasoning`, `max_context`, `max_output`, `supports_images`, `state_mode`, `hint`. |
 
 Missing model settings inherit from the provider. Explicit values win even when they are `false`,
@@ -95,29 +94,46 @@ providers:
 Configure the aliases and routing in LiteLLM itself; `upstream` tells Skyhook which request and
 reasoning conventions to use for each alias.
 
+### Service tier
+
+`service_tier` selects the backend's tier ID, such as `priority`, `flex`, or `ultrafast`, on any
+dialect and codec, as a provider default or beside `model`. It is unset by default and sent
+exactly as written: Skyhook does not translate client aliases such as `fast`. Check that the
+endpoint and model accept the tier before selecting it. Faster tiers can cost more or use more of
+a subscription; see [ChatGPT speed](https://learn.chatgpt.com/docs/agent-configuration/speed).
+
 ### Responses settings
 
-Any dialect serving `codec: "responses"` accepts three optional settings, as provider defaults
-or beside `model`. All are unset by default, and each is sent only when selected. A backend
-serving Responses need not accept them; check that the endpoint, model, and account support a
-setting before selecting it. Other codecs refuse a selection, so a model that switches away from
-Responses must clear inherited ones with `null`.
+Any dialect serving `codec: "responses"` accepts two optional settings, as provider defaults
+or beside `model`. A backend serving Responses need not accept them; check that the endpoint,
+model, and account support a setting before selecting it. Other codecs refuse a selection, so a
+model that switches away from Responses must clear inherited ones with `null`.
 
-- `service_tier` is the backend's tier ID, such as `priority`, `flex`, or `ultrafast`. It is
-  sent exactly as written: Skyhook does not translate client aliases such as `fast`. Faster
-  tiers can cost more or use more of a subscription; see
-  [ChatGPT speed](https://learn.chatgpt.com/docs/agent-configuration/speed).
+- `reasoning_summary` is the detail of the reasoning summaries requested: `"auto"` (every
+  dialect's default), `"concise"` or `"detailed"`, or `null` to request none.
 - `access_programs.cyber` requests a cybersecurity access program: `standard`, `daybreak_blue`,
-  or `daybreak_red`. The model and account must be eligible for the program; it does not grant
+  or `daybreak_red`; unset by default. The model and account must be eligible for the program; it does not grant
   entitlement, and other safeguards still apply. Some models take a different wire value from
   the approval it needs: `gpt-6-astra` and `gpt-6.1-sol` take `daybreak_blue` but require Daybreak
   Red entitlement. See the [Daybreak guide](https://developers.openai.com/api/docs/guides/daybreak).
-- `explicit_caching: true` switches the request to explicit prompt caching. Skyhook marks
-  checkpoints at the end of the stable history and at earlier turns, never on the changing
-  runtime state, so later requests can reuse the prefix. Requests with no stable history, such
-  as compaction, are not cached. Left unset, the backend's automatic caching is unchanged. See
-  the [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) for
-  supported models and pricing.
+
+### Explicit caching
+
+`explicit_caching: true`, as a provider default or beside `model`, switches a
+`chat_completions` or `responses` request to explicit prompt caching
+(`prompt_cache_options: {mode: "explicit"}`): the backend caches only at the breakpoints
+Skyhook marks, never on the changing runtime state, so later requests can reuse the prefix.
+Both mark the end of the stable history and the point where each earlier request's history
+ended, and Chat also the stable system prompt, up to four breakpoints a request: the newest
+history boundaries are kept. A dialect that already marks breakpoints with `cache_control` on
+Chat (`openrouter`, and `litellm` behind `anthropic`) places the same marks with that field.
+On `openrouter` Responses, `cache_ttl` applies to automatic caching only; explicit marks are
+cached for the backend's default lifetime.
+Neither marks the history of a request with no reusable prefix, such as compaction. Left unset, the backend's
+automatic caching is unchanged. `messages` refuses the setting. Check that the endpoint and
+model support it; see the
+[prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) for
+supported models and pricing.
 
 ```yaml
 astra:
@@ -140,10 +156,8 @@ providers:
     codec: "chat_completions"
     dialect: "compatible"
     base_url: "http://127.0.0.1:8000/v1"
-    output_limit:                                # or null for none
-      field: "max_tokens"
-    reasoning_replay:                            # the assistant-message key; or null
-      field: "reasoning"
+    output_limit: "max_tokens"                   # or null for none
+    reasoning_replay: "reasoning"                # the assistant-message key; or null
     cache_key:                                   # one location, a list of them, or null
       - body: "cache_salt"
       - header: "x-session-id"
@@ -156,16 +170,18 @@ providers:
         output_limit: null                      # Send no output limit.
 ```
 
-The selectable dimensions are `output_limit`, `reasoning_effort` (a field path), `reasoning_replay`
-and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. Each selection names one
-location or a nonempty list of distinct locations, and the value is written at every one. A selection left
+The selectable dimensions are `output_limit`, `reasoning_effort`, `reasoning_replay` and
+`tool_stream` (Chat Completions only), `cache_key`, and `user_id`. Every one but `cache_key` is a
+field path. Each selection names one location or a nonempty list of distinct locations, and the
+value is written at every one. A selection left
 out inherits, and with nothing to inherit keeps the preset for the model's effective codec and
 dialect settings; an explicit `null` places nothing. Changing `codec` does not discard inherited
 selections: set `null` for any the new codec has no place for, or replace them.
 
 A field path is dot-separated (`metadata.user_id`); `cache_key` and `user_id` carry the
 conversation identity.
-Paths must not name a field the codec writes itself (such as `model` or `messages`), and no two may
+Paths must not name a field the codec writes itself (such as `model` or `messages`) or one the
+dialect adds (such as OpenRouter's routing `provider` and `models`), and no two may
 overlap, including one inside another (`reasoning` and `reasoning.effort`), within one selection or
 across two. A `cache_key` header
 must not be `accept`, `content-type`, or a header the codec sends itself (such as
@@ -345,31 +361,37 @@ with `reasoning` unset, the model's default applies and may omit thinking text.
 Skyhook displays only the reasoning text or summaries the service returns, not otherwise-private
 reasoning. Support varies by provider, model, and compatible server.
 
-Skyhook saves returned reasoning and automatically reuses it when compatible with the selected
-provider, endpoint, API, model, and configured routing or tenant identity. Switching to an
-incompatible configuration omits private reasoning from requests without deleting the saved history.
+Skyhook saves returned reasoning and automatically reuses it with the same API and model.
+Signed or encrypted reasoning is reused only with the same provider, endpoint, and configured
+routing or tenant identity; switching to another configuration omits it from requests without
+deleting the saved history. Readable reasoning is reused across those changes.
 A proxy changing the upstream behind an unchanged alias cannot be detected automatically. Signed thinking cannot be reused across compaction
 or mode switches. Visible summaries cannot replace private reasoning state the service requires.
-Messages servers that do not sign thinking still get it replayed, until a signed block appears in
-the context; from then on only signed blocks are sent.
+Reasoning the service did not sign or encrypt is still replayed, until signed or encrypted
+reasoning from the model appears in the context; from then on only that is sent. Services that
+accept only reasoning they signed or encrypted never get the rest: `anthropic`, `openai` and
+`codex` on `responses`, and `litellm` behind Anthropic and on `responses`.
 
 Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
 replay their returned reasoning under **`reasoning_content` by default**. Ordinary Chat responses
 without reasoning do not acquire an invented reasoning field.
-A server that spells the key differently selects it with `reasoning_replay` set to
-`field: "reasoning"`; `reasoning_replay: null` keeps reasoning local. The `openai` dialect never
+A server that spells the key differently selects it with `reasoning_replay: "reasoning"`; `reasoning_replay: null` keeps reasoning local. The `openai` dialect never
 replays on Chat, since the official API rejects unknown message keys; `litellm` behind an
-`anthropic` or `bedrock` upstream replays the signed thinking blocks the proxy returns, and `openrouter` replays its
-`reasoning_details`; both are bound to the exact conversation like Messages thinking. As on
-Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
-on, only signed thinking blocks are sent, and a turn's `reasoning_details` are sent whole, in
-order, only if one of them is signed. Responses and Messages replay native reasoning automatically.
+`anthropic` or `bedrock` upstream replays the thinking blocks the proxy returns, and `openrouter` replays its
+`reasoning_details`; signed ones are bound to the exact conversation like Messages thinking. A
+response with readable `reasoning_details` keeps those as its reasoning, in place of any plain-text
+reasoning it also streamed; a response without them keeps its plain text, which `openrouter`
+replays under its `reasoning` field. Once signed reasoning appears in the context, only signed
+thinking blocks are sent, a turn's `reasoning_details` are sent whole, in order, only if one of them
+is signed, and plain-text reasoning stays local. Responses and Messages replay native reasoning
+automatically; a Responses reasoning item that restates its summary as content, or the reverse,
+is kept once, as its final item states.
 
 Reasoning is replayed with its owning assistant turn, including turns that only call tools;
 it is never merged into answer text or fabricated `<think>` tags. Server-side tool and reasoning
 parsers/templates must be configured appropriately; Skyhook does not infer them from model names.
 Chat requests send `max_output` as `max_completion_tokens`; a server that only honours
-`max_tokens` sets `output_limit` to `field: "max_tokens"`.
+`max_tokens` sets `output_limit: "max_tokens"`.
 
 ## Connection timeouts
 

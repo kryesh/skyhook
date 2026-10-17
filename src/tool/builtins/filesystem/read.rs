@@ -1,6 +1,6 @@
-//! File snapshots, directory listings, images, and expected read failures.
+//! File snapshots, directory listings and images.
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{Cause, Diagnostic, Effects, IoKind, Operation, Subject};
+use crate::tool::diagnostic::{Effects, Operation, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 
@@ -23,9 +23,8 @@ use crate::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<ReadArgs, ReadOutput, _, _>(
         crate::tool::builtins::names::READ,
-        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot.",
         ToolOptions::new(vec![Capability::Read])
-            .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut ReadArgs| {
                 vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
@@ -45,30 +44,21 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
         let mut directory = fs::read_dir(&path)
             .await
             .map_err(source(Operation::ReadDirectory, &path))?;
-        let mut entries = Vec::new();
+        let mut entries = DirectoryGroups::default();
         while let Some(entry) = directory
             .next_entry()
             .await
             .map_err(source(Operation::ReadDirectory, &path))?
         {
             let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
-                LocalError::source_filesystem_io(error)
+                LocalError::io(error)
                     .operation(Operation::Inspect, Subject::DirectoryEntry(entry.path()))
             })?;
-            entries.push(DirectoryEntry::from_metadata(
-                entry.file_name().to_string_lossy().into_owned(),
-                &metadata,
-            ));
+            entries.push(entry.file_name().to_string_lossy().into_owned(), &metadata);
         }
-        entries.sort_by(|left, right| left.name().cmp(right.name()));
+        entries.sort();
         return Ok(ProducedOutput::new(serde_json::to_value(
-            ReadOutput::Directory {
-                entries: if args.details {
-                    DirectoryEntries::Detailed(entries)
-                } else {
-                    DirectoryEntries::Grouped(DirectoryGroups::from(entries))
-                },
-            },
+            ReadOutput::Directory { entries },
         )?));
     }
 
@@ -97,13 +87,12 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
     .with_images(vec![reference]))
 }
 
-/// Only failures of the requested source may complete as read-error results.
 fn source(
     operation: Operation,
     path: &std::path::Path,
 ) -> impl FnOnce(std::io::Error) -> LocalError + use<> {
     let subject = Subject::path(path);
-    move |error| LocalError::source_filesystem_io(error).operation(operation, subject)
+    move |error| LocalError::io(error).operation(operation, subject)
 }
 
 /// The captured text, or `None` when the file is not text.
@@ -207,103 +196,14 @@ fn copy_text(
 struct ReadArgs {
     /// File or directory path.
     path: String,
-    /// Include explicit entry kinds in a flat list. File sizes are always included.
-    #[serde(default)]
-    details: bool,
-}
-
-#[derive(Serialize, JsonSchema)]
-struct ReadError {
-    code: ReadErrorCode,
-    #[schemars(with = "String")]
-    message: crate::job::output::DiagnosticSlot,
-}
-
-#[derive(Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum ReadErrorCode {
-    NotFound,
-    PermissionDenied,
-}
-
-fn read_error_output(diagnostic: &Diagnostic) -> Option<serde_json::Value> {
-    let code = match diagnostic.cause {
-        Cause::Io {
-            kind: IoKind::NotFound,
-            ..
-        } => ReadErrorCode::NotFound,
-        Cause::Io {
-            kind: IoKind::PermissionDenied,
-            ..
-        } => ReadErrorCode::PermissionDenied,
-        _ => return None,
-    };
-    Some(
-        serde_json::to_value(ReadOutput::Error {
-            error: ReadError {
-                code,
-                message: crate::job::output::DiagnosticSlot,
-            },
-        })
-        .expect("read errors serialize"),
-    )
 }
 
 #[derive(Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ReadOutput {
-    /// Expected filesystem failures, not policy or approval denials.
-    Error {
-        error: ReadError,
-    },
-    File {
-        content: String,
-    },
-    Directory {
-        entries: DirectoryEntries,
-    },
-    Image {
-        image: ImageSummary,
-    },
-}
-
-#[derive(Clone, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum DirectoryEntry {
-    File { name: String, bytes: u64 },
-    Directory { name: String },
-    Symlink { name: String },
-    Other { name: String },
-}
-
-impl DirectoryEntry {
-    fn from_metadata(name: String, metadata: &std::fs::Metadata) -> Self {
-        match FileKind::from(metadata.file_type()) {
-            FileKind::File => Self::File {
-                name,
-                bytes: metadata.len(),
-            },
-            FileKind::Directory => Self::Directory { name },
-            FileKind::Symlink => Self::Symlink { name },
-            FileKind::Other => Self::Other { name },
-        }
-    }
-
-    fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. }
-            | Self::Directory { name }
-            | Self::Symlink { name }
-            | Self::Other { name } => name,
-        }
-    }
-}
-
-#[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
-enum DirectoryEntries {
-    Grouped(DirectoryGroups),
-    Detailed(Vec<DirectoryEntry>),
+    File { content: String },
+    Directory { entries: DirectoryGroups },
+    Image { image: ImageSummary },
 }
 
 #[serde_with::skip_serializing_none]
@@ -323,20 +223,25 @@ struct DirectoryFile {
     bytes: u64,
 }
 
-impl From<Vec<DirectoryEntry>> for DirectoryGroups {
-    fn from(entries: Vec<DirectoryEntry>) -> Self {
-        let mut groups = Self::default();
-        for entry in entries {
-            match entry {
-                DirectoryEntry::File { name, bytes } => {
-                    groups.files.push(DirectoryFile { name, bytes })
-                }
-                DirectoryEntry::Directory { name } => groups.directories.push(name),
-                DirectoryEntry::Symlink { name } => groups.symlinks.push(name),
-                DirectoryEntry::Other { name } => groups.other.push(name),
-            }
+impl DirectoryGroups {
+    /// Classifies by the entry's own metadata, so a symlink is never followed.
+    fn push(&mut self, name: String, metadata: &std::fs::Metadata) {
+        match FileKind::from(metadata.file_type()) {
+            FileKind::File => self.files.push(DirectoryFile {
+                name,
+                bytes: metadata.len(),
+            }),
+            FileKind::Directory => self.directories.push(name),
+            FileKind::Symlink => self.symlinks.push(name),
+            FileKind::Other => self.other.push(name),
         }
-        groups
+    }
+
+    fn sort(&mut self) {
+        self.files.sort_by(|left, right| left.name.cmp(&right.name));
+        for names in [&mut self.directories, &mut self.symlinks, &mut self.other] {
+            names.sort();
+        }
     }
 }
 
@@ -347,64 +252,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::job::{CancellationToken, JobState};
+    use crate::job::CancellationToken;
     use crate::tests::tool_executor;
-
-    #[test]
-    fn grouped_directory_entries_omit_empty_rare_groups() {
-        let groups = DirectoryGroups::from(vec![DirectoryEntry::File {
-            name: "one.txt".into(),
-            bytes: 3,
-        }]);
-        assert_eq!(
-            serde_json::to_value(groups).unwrap(),
-            json!({"files":[{"name":"one.txt", "bytes":3}], "directories":[]})
-        );
-    }
-
-    /// Schema-valid input rejected by typed admission fails before a job, any IO
-    /// or script evaluation exists.
-    #[tokio::test]
-    async fn typed_read_and_script_admission_fails_before_a_job_io_or_evaluation() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
-        for (tool, arguments, argument) in [
-            ("read", json!({"path":".", "details":"invalid"}), "/details"),
-            ("script", json!({"source":42}), "/source"),
-        ] {
-            let error = executor.run_host(&runtime.agent, tool, arguments).await;
-            let error =
-                error.expect_err("typed arguments must reject before IO or script evaluation");
-            let diagnostic = error.diagnostic();
-            assert_eq!(diagnostic.context.operation, Operation::Deserialize);
-            assert_eq!(
-                diagnostic.context.subject,
-                Subject::Argument(argument.into())
-            );
-        }
-        assert!(runtime.jobs.list(&runtime.agent).is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn directory_classification_uses_entry_metadata_not_symlink_referent() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file"), b"abc").unwrap();
-        std::fs::create_dir(root.path().join("directory")).unwrap();
-        std::os::unix::fs::symlink(root.path().join("file"), root.path().join("link")).unwrap();
-        let _socket = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
-        for (name, kind) in [
-            ("file", "file"),
-            ("directory", "directory"),
-            ("link", "symlink"),
-            ("socket", "other"),
-        ] {
-            let metadata = std::fs::symlink_metadata(root.path().join(name)).unwrap();
-            let entry = DirectoryEntry::from_metadata(name.into(), &metadata);
-            assert_eq!(entry.name(), name);
-            assert_eq!(serde_json::to_value(entry).unwrap()["kind"], kind);
-        }
-    }
+    use crate::tool::diagnostic::{Cause, IoKind};
 
     /// Invalid UTF-8 and NUL bytes are not text rather than IO errors, real
     /// invalid data stays IO, and cancellation before or during a read is typed.
@@ -456,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_permission_failures_are_not_completed_source_read_errors() {
+    async fn capture_failures_name_their_stage() {
         use crate::execution::ExecutionLocation;
         use crate::tool::invocation::{
             LocalCatalog,
@@ -506,46 +356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_reads_complete_direct_and_script_jobs() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
-        let direct = executor
-            .run_host(
-                &runtime.agent,
-                "read",
-                json!({"path":"missing/nested/file.txt"}),
-            )
-            .await
-            .unwrap();
-        let value = &direct.output.value;
-        assert_eq!(value["kind"], "error");
-        assert_eq!(value["error"]["code"], "not_found");
-        assert!(!value["error"]["message"].as_str().unwrap().is_empty());
-        assert_eq!(
-            runtime.jobs.snapshot(direct.job).unwrap().state,
-            JobState::Completed
-        );
-
-        // Script unwrap must resolve the completed read error, not throw it.
-        let script = executor
-            .run_host(
-                &runtime.agent,
-                "script",
-                json!({"source":
-                    "return (await tool.read({path:'missing'})).unwrap();"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(script.output.value["value"]["error"]["code"], "not_found");
-        assert!(script.output.value["failure"].is_null());
-        assert_eq!(
-            runtime.jobs.snapshot(script.job).unwrap().state,
-            JobState::Completed
-        );
-    }
-
-    #[tokio::test]
     async fn read_captures_complete_snapshot() {
         let runtime = crate::tests::TestRuntime::new().await;
         let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
@@ -566,5 +376,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["presentation"]["preview"]["lines"][0], "two");
+    }
+
+    #[tokio::test]
+    async fn directories_group_entries_by_their_own_metadata() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let listing = runtime.root.path().join("listing");
+        std::fs::create_dir_all(listing.join("directory")).unwrap();
+        std::fs::write(listing.join("file"), b"abc").unwrap();
+        std::os::unix::fs::symlink(listing.join("file"), listing.join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(listing.join("socket")).unwrap();
+        let read = async |path| {
+            let result = executor.run_host(&runtime.agent, "read", json!({"path": path}));
+            result.await.unwrap().output.value
+        };
+        assert_eq!(
+            read("listing").await,
+            json!({"kind":"directory", "entries":{
+                "files":[{"name":"file", "bytes":3}], "directories":["directory"],
+                "symlinks":["link"], "other":["socket"]
+            }})
+        );
+        assert_eq!(
+            read("listing/directory").await,
+            json!({"kind":"directory", "entries":{"files":[], "directories":[]}})
+        );
     }
 }

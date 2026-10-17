@@ -21,7 +21,7 @@ pub use artifact::{
 pub(crate) use backend::ConnectionFactory;
 pub(crate) use error::RemoteError;
 #[cfg(test)]
-pub(crate) use manager::tests::PendingHandshakeFactory;
+pub(crate) use manager::tests::ShimFactory;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
     PromptAnswer, RejectSensitivePrompts, Requester, RequesterExecutable, SecretValue,

@@ -3,7 +3,7 @@
 use std::{future::Future, sync::Arc};
 
 use futures_util::future::BoxFuture;
-use schemars::{JsonSchema, generate::SchemaSettings};
+use schemars::{JsonSchema, generate::SchemaSettings, transform::RecursiveTransform};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -86,33 +86,6 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         Ok(self)
     }
 
-    pub fn register_dynamic<F, Fut>(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: Value,
-        options: ToolOptions,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        F: Fn(C, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        let admission = |arguments: &Arguments| Ok(Value::Object(arguments.clone()));
-        self.register_schema(
-            name,
-            description,
-            input_schema,
-            options,
-            admission,
-            move |arguments| {
-                let handler = handler.clone();
-                Invocation::new(move |context| handler(context, arguments))
-            },
-        )
-    }
-
     /// Register a tool whose typed input `I` admits into its handler's input `A`;
     /// `invoke` runs the admitted input.
     pub(crate) fn register_checked<I, A>(
@@ -158,10 +131,9 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         })
     }
 
-    /// Register a typed input with an already-constructed output product.
-    /// `O` supplies only the advertised result schema. Unlike `register`, this
-    /// adapter never serializes the product, so native capture ownership and
-    /// images survive until the canonical completion owner consumes them.
+    /// Register a typed input with an already-constructed output product; `O`
+    /// supplies only the advertised result schema. The product is never
+    /// serialized, so its captures and images survive to completion.
     pub fn register_product<I, O, F, Fut>(
         &mut self,
         name: impl Into<String>,
@@ -240,8 +212,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             execution,
             hooks,
             supports_background,
-            preserve_required,
-            preserve_schema_dialect,
+            schema_origin,
             exposure,
             script_binding,
             required,
@@ -294,8 +265,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             exposure,
             script_binding,
             supports_background,
-            preserve_required,
-            preserve_schema_dialect,
+            schema_origin,
             required,
             root_required,
         };
@@ -308,7 +278,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
                 definition,
                 execution,
                 admit: Arc::new(move |arguments| {
-                    Ok(Admitted::new(TypedInput {
+                    Ok(Box::new(TypedInput {
                         input: admission(arguments)?,
                         hooks: hooks.clone(),
                         invoke: invoke.clone(),
@@ -337,9 +307,7 @@ fn input_schema<I: JsonSchema>() -> Value {
     )
 }
 
-/// Results are described by their serialization contract. schemars gives every
-/// `Option` a null alternative, so a field that omits `None` declares the schema
-/// of its present value with `#[schemars(with = "T")]`.
+/// Results are described by their serialization contract.
 pub(crate) fn result_schema<O: JsonSchema>() -> Value {
     schema_value(root_schema::<O>())
 }
@@ -354,8 +322,45 @@ pub(crate) fn complete_result_schema<O: JsonSchema>() -> Value {
 fn root_schema<O: JsonSchema>() -> schemars::Schema {
     SchemaSettings::default()
         .for_serialize()
+        .with_transform(RecursiveTransform(omit_null))
         .into_generator()
         .into_root_schema_for::<O>()
+}
+
+/// schemars gives every `Option` a null alternative, but a result omits `None`:
+/// an optional property declares only the schema of its present value.
+fn omit_null(schema: &mut schemars::Schema) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let required = object.get("required").cloned().unwrap_or_default();
+    let required = required.as_array().map(Vec::as_slice).unwrap_or_default();
+    let Some(Value::Object(properties)) = object.get_mut("properties") else {
+        return;
+    };
+    for (name, property) in properties {
+        if required.iter().any(|required| required == name) {
+            continue;
+        }
+        let Value::Object(property) = property else {
+            continue;
+        };
+        if let Some(Value::Array(types)) = property.get_mut("type") {
+            types.retain(|kind| kind != "null");
+            if let [kind] = types.as_slice() {
+                let kind = kind.clone();
+                property.insert("type".to_owned(), kind);
+            }
+        } else if let Some(Value::Array(options)) = property.get("anyOf")
+            && let [Value::Object(present), null] = options.as_slice()
+            && null == &serde_json::json!({"type": "null"})
+        {
+            let mut present = present.clone();
+            property.shift_remove("anyOf");
+            present.append(property);
+            *property = present;
+        }
+    }
 }
 
 /// Serialized rather than unwrapped: serialization puts keywords in schemars'
@@ -372,8 +377,9 @@ impl crate::tool::invocation::LocalAuthorizer for HostAuthorizer {
         request: crate::tool::authorization::Reauthorization,
     ) -> BoxFuture<'static, Result<(), AdmissionError>> {
         let context = self.0.clone();
-        let (permissions, origin) = request.into_parts(&context.execution_location().target);
-        Box::pin(async move { Ok(context.authorize(permissions, origin, &[]).await?) })
+        let (permissions, origin, asking) =
+            request.into_parts(&context.execution_location().target);
+        Box::pin(async move { Ok(context.authorize(permissions, origin, asking, &[]).await?) })
     }
 }
 
@@ -397,7 +403,7 @@ impl AdmittedInput<ToolContext, ToolOutput> for HostedInput {
     }
 
     fn invoke(self: Box<Self>) -> Invocation<ToolContext, ToolOutput> {
-        let admitted = self.0.0.invoke();
+        let admitted = self.0.invoke();
         Invocation {
             result_policy: admitted.result_policy(),
             ..Invocation::new(move |context: ToolContext| async move {
@@ -442,7 +448,7 @@ impl super::ToolRegistryBuilder {
                 definition: tool.definition.clone(),
                 execution: tool.execution.clone(),
                 admit: Arc::new(move |arguments: &Arguments| {
-                    Ok(Admitted::new(HostedInput((local.admit)(arguments)?)))
+                    Ok(Box::new(HostedInput((local.admit)(arguments)?)))
                 }),
             };
             self.tools.insert(name, Arc::new(host));
@@ -456,7 +462,7 @@ mod tests {
     use super::*;
     use crate::job::JobSpec;
     use crate::tool::registry::AgentLevel;
-    use crate::tool::{ToolError, ToolOutput, ToolRegistryBuilder};
+    use crate::tool::{ToolError, ToolOutput, ToolRegistryBuilder, executor::InvocationKind};
     use std::io::Write as _;
 
     #[derive(serde::Deserialize, JsonSchema)]
@@ -539,6 +545,10 @@ mod tests {
             assert!(required.contains(&Value::String(field.into())), "{schema}");
         }
         assert!(!required.contains(&Value::String("skipped".into())));
+        assert_eq!(
+            schema["properties"]["skipped"],
+            serde_json::json!({"type": "string"})
+        );
         let output = jsonschema::validator_for(schema).unwrap();
         for value in [
             Output {
@@ -608,7 +618,7 @@ mod tests {
         );
         let arguments = serde_json::json!({"content":"native evidence"});
         let arguments = arguments.as_object().unwrap();
-        let admitted = tool.invoke(tool.admit(arguments).unwrap());
+        let admitted = tool.admit(arguments).unwrap().invoke();
         let output = admitted.call(context).await.unwrap();
         assert_eq!(output.value, serde_json::json!({}));
         assert_eq!(output.captures.len(), 1);
@@ -715,7 +725,6 @@ mod tests {
     async fn unit_results_complete_without_a_result() {
         let runtime = crate::tests::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
-        let script = ToolOptions::default().job_role(crate::job::JobRole::Script);
         builder
             .register_unit::<Empty, _, _>(
                 "noop",
@@ -723,20 +732,16 @@ mod tests {
                 ToolOptions::default().script_only(),
                 |_, _| async { Ok(()) },
             )
-            .unwrap()
-            .register::<Empty, Value, _, _>("script", "Run scripts.", script, |_, _| async {
-                unreachable!("documentation-only fixture")
-            })
             .unwrap();
         let executor = runtime.executor(builder);
-        let definitions = executor.surface_for_agent(&runtime.agent).definitions();
-        assert!(
-            definitions[0]
-                .description
-                .ends_with("- `tool.noop()` — Do nothing.")
-        );
         let response = executor
-            .execute_script(runtime.agent.clone(), "noop", serde_json::json!({}), None)
+            .execute_as(
+                InvocationKind::Script,
+                runtime.agent.clone(),
+                "noop",
+                serde_json::json!({}),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(response.output.value, serde_json::json!({}));

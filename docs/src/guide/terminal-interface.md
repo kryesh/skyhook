@@ -27,10 +27,14 @@ The composer always sends to the root agent. While root is busy, Enter queues a 
 for its next model request, without interrupting the current request or tools. It does not wait
 for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed.
 Selecting a queued message to edit pauses automatic queue delivery and moves it into the
-composer; merely opening the queue or deleting an item does not pause it. Interruption,
-submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
-clears that pause, as does normal composer Enter (even with an empty draft); slash commands
-do not automatically resume the queue.
+composer; merely opening the queue or deleting an item does not pause it. While the edit is open,
+nothing queued is sent, including messages held for `/retry`, whatever else happens. Submitting
+the edit puts it back in its place, however the messages around it change meanwhile, and the
+messages behind it go with it when the queue resumes; Enter on an empty draft, or `/resume`,
+discards the edit and leaves the message as it was. Interruption, a
+failed turn, submission or delivery errors, and session-start failures also pause queue delivery;
+a failed turn's error is shown in the conversation. `/resume` clears that pause, as does normal
+composer Enter (even with an empty draft); slash commands do not automatically resume the queue.
 If Skyhook cannot write a session's journal, that session stops as if the process had crashed:
 its queued input is dropped and its conversation shows why. It stays open to read until you close
 it, and reopening it continues from what was saved.
@@ -38,7 +42,9 @@ Queued input lives only in the running interface: it is not saved with the sessi
 session keeps its own queue, which keeps delivering while you look at another session and is
 discarded when its session is closed.
 
-`/retry` continues failed or interrupted turns without duplicating their original prompts.
+`/retry` continues failed or interrupted turns without duplicating their original prompts, and
+resends, as one batch on the bottom bar's model and mode, queued messages a failure or interrupt
+paused; a queue paused while you edit a message stays paused.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits. On a reopened session
 that has not run anything yet, `/retry` always starts it and continues whatever it left
@@ -95,6 +101,16 @@ until a message is sent; cancelling the picker or leaving without sending does n
 session's recorded model. Each submitted message captures its model, including queued messages.
 Queued messages are submitted together as one batch, in order, including their attachments.
 The batch cannot be split across requests; the last message's captured model is used for that request.
+A batch is saved whole or not at all: if the session cannot take its model, mode or attachments,
+the turn it reached fails with why, queue delivery pauses, and every message in it stays queued
+for `/retry`, which tries the batch again on the model and mode the bottom bar shows, in place
+of the ones the messages captured; messages already on their way join the batch.
+Removing a message from the queue withdraws it, unless `/retry` is already submitting it. Once
+every held message is withdrawn, the batch no longer waits: a turn the batch began rests with
+nothing to continue, while one it stopped mid tool loop stays failed and `/retry` continues it
+without the batch. Interrupting while `/retry` sends the batch returns its messages to the queue,
+paused: nothing is sent until you resume the queue, submit another message, or `/retry`. A
+session closed before then drops the batch.
 Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.

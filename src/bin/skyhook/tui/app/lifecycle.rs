@@ -4,7 +4,6 @@ use crate::launch::LaunchError;
 /// What a new session is created for, and the model and mode it starts with.
 pub(super) enum PendingStart {
     Input(Box<QueuedInput>),
-    QueuedInput(Box<QueuedInput>),
     Script {
         path: PathBuf,
         model: ModelRef,
@@ -14,38 +13,23 @@ pub(super) enum PendingStart {
 impl PendingStart {
     fn selection(&self) -> (&ModelRef, &ModeName) {
         match self {
-            Self::Input(input) | Self::QueuedInput(input) => (&input.model, &input.mode),
+            Self::Input(input) => (&input.model, &input.mode),
             Self::Script { model, mode, .. } => (model, mode),
         }
     }
 }
 
-/// Creation owns its pending action until the asynchronous task completes.
-/// A parked or failed script remains an explicit retry, not an active creation.
-#[derive(Default)]
-pub(super) enum StartState {
-    #[default]
-    Idle,
-    Creating(PendingStart),
-    RetryScript(PathBuf),
-}
-impl StartState {
-    pub(super) fn is_creating(&self) -> bool {
-        matches!(self, Self::Creating(_))
-    }
-}
-
 impl App {
     /// Invariant: at most one creation is in flight. Every caller is gated by
-    /// `busy()`/`start.is_creating()`, so a `Started` completion is the current one.
+    /// `busy()`/`creating`, so a `Started` completion is the current one.
     pub(super) fn begin_session(&mut self, action: PendingStart) {
-        if self.start.is_creating() {
+        if self.creating.is_some() {
             return;
         }
         let (model, mode) = action.selection();
         let Ok(model) = self.launch.model.config().select_model(model) else {
-            self.notice("The selected model is no longer configured; input retained");
-            self.paused = true;
+            self.notice("The selected model is no longer configured");
+            self.pause(Paused::Stopped);
             return self.park_action(action);
         };
         let launch = Launch {
@@ -53,7 +37,7 @@ impl App {
             permissions: crate::launch::Permissions::Mode(mode.clone()),
             ..self.launch.clone()
         };
-        self.replace_start(StartState::Creating(action));
+        self.creating = Some(action);
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = match launch.create(None).await {
@@ -71,10 +55,7 @@ impl App {
         self.dirty = true;
     }
     pub(super) fn session_started(&mut self, prepared: PreparedObservation) {
-        let pending = match std::mem::take(&mut self.start) {
-            StartState::Creating(action) => Some(action),
-            _ => None,
-        };
+        let pending = self.creating.take();
         let draft = self.root_agent().clone();
         let attached_draft = match &self.phase {
             Phase::Draft { root } => Some(root.clone()),
@@ -85,6 +66,7 @@ impl App {
             attached_draft,
         };
         self.snapshot = *prepared.snapshot;
+        self.failures_read = last_record(&self.snapshot);
         self.selected = self.root_agent().clone();
         self.views.transfer(&draft, self.selected.clone());
         for status in &mut self.unsaved_status {
@@ -102,39 +84,34 @@ impl App {
             return;
         }
         match pending {
-            Some(action) if self.paused => self.park_action(action),
-            Some(PendingStart::Input(input)) => self.send_input(*input),
-            Some(PendingStart::QueuedInput(input)) => {
-                self.queue.push_front(*input);
+            Some(action) if self.paused.is_some() => self.park_action(action),
+            Some(PendingStart::Input(input)) => {
+                self.own_queue().push_front(*input);
                 self.deliver_queue();
             }
             Some(PendingStart::Script { path, .. }) => self.start_script(path),
             None => {}
         }
     }
-    /// Keep an action whose session was not created: input returns to the
-    /// head of the queue, and a script becomes an explicit retry.
+    /// Settle an action whose session was not created: input returns to the
+    /// head of the queue, and a script is dropped.
     fn park_action(&mut self, action: PendingStart) {
         match action {
-            PendingStart::Input(input) | PendingStart::QueuedInput(input) => {
-                self.queue.push_front(*input);
+            PendingStart::Input(input) => {
+                self.own_queue().push_front(*input);
                 self.refresh_menu();
             }
-            PendingStart::Script { path, .. } => self.replace_start(StartState::RetryScript(path)),
-        }
-    }
-    /// A new action displaces a parked script only once it takes the start slot.
-    fn replace_start(&mut self, start: StartState) {
-        if let StartState::RetryScript(_) = std::mem::replace(&mut self.start, start) {
-            self.toast("Cancelled the pending script in favor of the new action");
+            PendingStart::Script { path, .. } => {
+                self.notice(format!("Script {} was not run", path.display()));
+            }
         }
     }
     pub(super) fn start_failed(&mut self, error: LaunchError) {
-        if let StartState::Creating(action) = std::mem::take(&mut self.start) {
+        self.pause(Paused::Stopped);
+        self.notice(error.to_string());
+        if let Some(action) = self.creating.take() {
             self.park_action(action);
         }
-        self.paused = true;
-        self.notice(error.to_string());
         if self.stopping {
             self.finish_shutdown();
         }
@@ -145,7 +122,7 @@ impl App {
         match crate::launch::read_images(&self.launch.workspace, &images).await {
             Ok(attachments) => self.submit(Submission { text, attachments }),
             Err(error) => {
-                self.notice(error);
+                self.notice(error.to_string());
                 self.replace_draft(Submission {
                     text,
                     attachments: Vec::new(),
@@ -182,10 +159,10 @@ impl App {
         if self.stopping {
             return;
         }
-        self.pause_queue();
+        self.pause_queue(Paused::Stopped);
         self.stopping = true;
         // A creation task owns a handle which must arrive before teardown.
-        if !self.start.is_creating() {
+        if self.creating.is_none() {
             self.finish_shutdown();
         }
         self.dirty = true;
@@ -227,7 +204,7 @@ mod tests {
         assert_eq!(app.editor.expanded_text(), "long prompt");
         assert!(app.editor.attachments().is_empty());
         assert!(app.history.is_empty() && app.queue.is_empty());
-        assert!(!app.start.is_creating() && app.session().is_none());
+        assert!(app.creating.is_none() && app.session().is_none());
     }
 
     async fn started(rx: &mut mpsc::UnboundedReceiver<Work>) -> PreparedObservation {
@@ -276,7 +253,7 @@ mod tests {
         }
         assert!(app.session().is_none() && !app.launch.sessions.exists());
         app.submit("first input".into());
-        assert!(app.start.is_creating() && app.session().is_none());
+        assert!(app.creating.is_some() && app.session().is_none());
         app.model = "test/second".parse().unwrap();
         let attachments = vec![png_attachment("queued.png")];
         app.submit(Submission {
@@ -288,14 +265,30 @@ mod tests {
         let prepared = started(&mut rx).await;
         assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
         app.session_started(prepared);
-        assert!(!app.start.is_creating() && app.operation);
-        assert_eq!(app.history, ["first input"]);
-        assert_eq!(app.model, "test/second".parse().unwrap());
+        // The session cannot take the second row's model, so the batch stays queued whole.
+        assert!(app.creating.is_none() && app.paused.is_some());
         let image = [png_attachment("queued.png")];
         assert_eq!(
             queued(&app),
-            [("second input", "test/second".to_owned(), &image[..])]
+            [
+                ("first input", "test/first".to_owned(), &[][..]),
+                ("second input", "test/second".to_owned(), &image[..])
+            ]
         );
+        let second = app.remove_queued(app.queue[1].id).unwrap();
+        app.command(Command::Resume);
+        app.tick();
+        assert!(app.busy());
+        bounded(async {
+            while app.history.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
+        assert_eq!(app.history, ["first input"]);
+        assert_eq!(app.model, "test/second".parse().unwrap());
+        assert_eq!(second.model, "test/second".parse().unwrap());
         assert_eq!(
             app.editor.expanded_text(),
             "still composingunsent attachment"
@@ -330,7 +323,7 @@ mod tests {
         app.submit("second".into());
         app.editor.set("new draft".into());
         fail_creation(&mut app, &mut rx).await;
-        assert!(!app.busy() && app.paused && app.session().is_none());
+        assert!(!app.busy() && app.paused.is_some() && app.session().is_none());
         let image = [png_attachment("first.png")];
         assert_eq!(
             queued(&app),
@@ -343,7 +336,7 @@ mod tests {
         std::fs::remove_file(&app.launch.sessions).unwrap();
         app.command(Command::Resume);
         app.tick();
-        assert!(app.start.is_creating());
+        assert!(app.creating.is_some());
         app.tick();
         assert_eq!(app.queue.len(), 1);
         let prepared = started(&mut rx).await;
@@ -358,11 +351,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unstartable_input_leaves_the_pending_script_in_place() {
+    async fn an_unconfigured_model_keeps_the_input_queued_and_pauses() {
         let (_root, mut app) = draft_fixture().await;
         let mut rx = capture_work(&mut app);
         app.status = crate::tui::status::StatusLog::new(app.tx.clone());
-        app.start = StartState::RetryScript("pending.js".into());
         app.model = "test/removed".parse().unwrap();
         app.submit("input".into());
         app.status.flush().await;
@@ -372,11 +364,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            notices,
-            ["The selected model is no longer configured; input retained"]
-        );
-        assert!(matches!(app.start, StartState::RetryScript(_)));
+        assert_eq!(notices, ["The selected model is no longer configured"]);
+        assert!(app.paused.is_some() && app.creating.is_none());
         assert_eq!(app.queue.len(), 1);
     }
 
@@ -404,21 +393,19 @@ mod tests {
         app.status = crate::tui::status::StatusLog::new(app.tx.clone());
         app.submit("first".into());
         let _turn = model.turn().await;
+        bounded(async {
+            while !app.queue.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
         app.submit("queued".into());
         assert_eq!(app.queue.len(), 1);
         let foreign = AgentId::root(SessionId::generate().unwrap());
         let refused = session.record_status(foreign, "elsewhere".into()).await;
         assert!(refused.is_err());
         observe_until(&mut app, |app| app.queue.is_empty()).await;
-        // The prompt the failure cut short reports it too.
-        loop {
-            let work = recv(&mut rx).await;
-            let done = matches!(work, Work::Done { .. });
-            app.work(work);
-            if done {
-                break;
-            }
-        }
         app.status.flush().await;
         while let Ok(work) = rx.try_recv() {
             app.work(work);

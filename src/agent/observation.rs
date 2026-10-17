@@ -3,10 +3,9 @@ use super::{RuntimeEvent, TurnFailure};
 use crate::{
     identity::{AgentId, JobId},
     job::{JobEnvelope, JobState},
-    provider::protocol::{LiveBlock, LiveResponse, Step},
+    provider::protocol::{LiveBlock, LiveResponse, Step, Usage},
     session::{
-        CommittedUsage, EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestSeq,
-        SessionEvent, SessionPhase,
+        EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestSeq, SessionEvent, SessionPhase,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -28,13 +27,11 @@ pub enum AgentActivity {
 
 impl AgentActivity {
     /// Whether the agent is mid-turn.
-    #[must_use]
     pub fn is_busy(&self) -> bool {
         !matches!(self, Self::Idle | Self::Stopped(_))
     }
 
     /// Whether the last turn can be continued.
-    #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Stopped(_))
     }
@@ -59,12 +56,10 @@ pub struct ContextUsage {
 /// journal.
 #[derive(Clone, Debug, Default)]
 pub struct ContextGauge {
-    committed: CommittedUsage,
     usage: HashMap<AgentId, ContextUsage>,
 }
 
 impl ContextGauge {
-    #[must_use]
     pub fn get(&self, agent: &AgentId) -> Option<&ContextUsage> {
         self.usage.get(agent)
     }
@@ -72,14 +67,18 @@ impl ContextGauge {
     /// Fold `record`, which `ledger` has already observed.
     fn fold(&mut self, ledger: &RequestLedger, record: &EventRecord) {
         let agent = &record.agent;
-        if matches!(record.event, SessionEvent::Compaction { .. }) {
-            self.usage.remove(agent);
-        }
-        let Some((request, usage)) = self.committed.fold(record) else {
-            return;
+        let attempt = match &record.event {
+            SessionEvent::Compaction { .. } => {
+                self.usage.remove(agent);
+                return;
+            }
+            // Only an agent's own requests complete responses; a summary installs a checkpoint.
+            SessionEvent::ResponseCompleted { attempt, .. } => attempt,
+            _ => return,
         };
-        // Only an agent's own requests complete responses; a summary installs a checkpoint.
-        if let (Some(requested), Some(tokens)) = (ledger.get(request), usage.occupancy()) {
+        if let Some(requested) = ledger.get(attempt.request)
+            && let Some(tokens) = (requested.phase.completed_usage()).and_then(Usage::occupancy)
+        {
             let capacity = requested.profile.profile.max_context.get();
             self.usage
                 .insert(agent.clone(), ContextUsage { tokens, capacity });
@@ -117,7 +116,6 @@ impl Default for ObservedResponse {
 
 impl ObservedResponse {
     /// Blocks in arrival order.
-    #[must_use]
     pub fn blocks(&self) -> &[LiveBlock] {
         match self {
             Self::Streaming(live) => live.blocks(),
@@ -126,12 +124,10 @@ impl ObservedResponse {
     }
 
     /// Whether `block` is the one still being streamed.
-    #[must_use]
     pub fn streaming(&self, block: &LiveBlock) -> bool {
         matches!(self, Self::Streaming(live) if live.current() == Some(&block.block))
     }
 
-    #[must_use]
     pub fn settlement(&self) -> Option<&Settlement> {
         match self {
             Self::Settled { how, .. } => Some(how),
@@ -140,7 +136,6 @@ impl ObservedResponse {
     }
 
     /// Whether the response settled without becoming a complete answer.
-    #[must_use]
     pub fn incomplete(&self) -> bool {
         matches!(self.settlement(), Some(Settlement::Failed(_)))
     }
@@ -230,23 +225,20 @@ impl ObservationSnapshot {
                 response.settle(Settlement::Failed(TurnFailure::Interrupted));
             }
         }
-        let jobs = self.jobs.values_mut().filter_map(|job| read_job(job, at));
+        let jobs = self
+            .jobs
+            .values_mut()
+            .filter(|job| !job.state.is_terminal())
+            .map(|job| {
+                job.state = JobState::Interrupted;
+                job.timing = job.timing.after(JobState::Interrupted, at);
+                job.id
+            });
         StoppedReading {
             jobs: jobs.collect(),
             requests: self.ledger.stop(at),
         }
     }
-}
-
-/// Read a job a stopped session left going as interrupted at its last activity,
-/// `at`, returning it if that changed it.
-pub(crate) fn read_job(job: &mut JobEnvelope, at: i64) -> Option<JobId> {
-    if job.state.is_terminal() {
-        return None;
-    }
-    job.state = JobState::Interrupted;
-    job.timing = job.timing.after(JobState::Interrupted, at);
-    Some(job.id)
 }
 
 /// What observers fold from each committed record beside the record itself.

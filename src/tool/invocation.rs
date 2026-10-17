@@ -4,7 +4,7 @@ use std::io;
 
 use super::diagnostic::{
     Cause, Diagnostic, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic,
-    PathFact, PathRole, Subject, safe_text,
+    PathFact, PathRole, RequestEffects, Subject, safe_text,
 };
 
 /// A failure normalized at an annotation, transport, or persistence boundary.
@@ -17,24 +17,9 @@ pub struct OperationError<O>(Box<Facts<O>>);
 struct Facts<O> {
     diagnostic: PartialDiagnostic,
     output: Option<O>,
-    local: LocalFacts,
-}
-
-/// Local handler evidence and authority, deliberately absent from wire and
-/// persistence facts.
-#[derive(Debug, Default)]
-struct LocalFacts {
-    provenance: FailureProvenance,
-    native_io: Option<io::Error>,
-    /// The phase of the session that refused the operation.
+    /// The phase of the session that refused the operation: local authority,
+    /// deliberately absent from wire and persistence facts.
     refused: Option<crate::session::SessionPhase>,
-}
-
-#[derive(Debug, Default)]
-enum FailureProvenance {
-    #[default]
-    Unspecified,
-    SourceFilesystemIo,
 }
 
 /// Admission never produces partial output.
@@ -73,12 +58,12 @@ impl<O: OutputValue> From<AdmissionError> for OperationError<O> {
         let Facts {
             diagnostic,
             output,
-            local,
+            refused,
         } = *error.0;
         Self(Box::new(Facts {
             diagnostic,
             output: output.map(|never| match never {}),
-            local,
+            refused,
         }))
     }
 }
@@ -121,45 +106,29 @@ impl<O> OperationError<O> {
     pub fn cancelled() -> Self {
         Self::cause(Cause::Cancelled)
     }
+    /// Cancelled before the operation started, so nothing it would send was sent.
+    pub fn cancelled_before_start() -> Self {
+        Self::cancelled().effects(Effects::NotStarted)
+    }
     pub fn interrupted() -> Self {
         Self::cause(Cause::Interrupted)
     }
     pub fn input_closed() -> Self {
         Self::cause(Cause::InputClosed)
     }
-    /// Classify a native I/O error, retaining it locally as evidence.
     pub fn io(error: io::Error) -> Self {
-        let mut this = Self::cause(Cause::io(&error));
-        this.0.local.native_io = Some(error);
-        this
+        Self::cause(Cause::io(&error))
     }
     fn session(error: &crate::session::SessionError) -> Self {
         let mut this = Self::from_facts(PartialDiagnostic::session(error), None);
         if let crate::session::SessionError::Refused(phase) = error {
-            this.0.local.refused = Some(phase.clone());
+            this.0.refused = Some(phase.clone());
         }
         this
     }
     /// The phase of the session that refused this operation, when one did.
     pub(crate) fn refused(&self) -> Option<crate::session::SessionPhase> {
-        self.0.local.refused.clone()
-    }
-    /// The native error this failure was classified from, when it arose locally.
-    pub(crate) fn native_io(&self) -> Option<&io::Error> {
-        self.0.local.native_io.as_ref()
-    }
-    /// Identify a source-filesystem failure at the handler boundary. Presentation
-    /// context alone never grants the read policy authority to turn it into data.
-    pub(crate) fn source_filesystem_io(error: io::Error) -> Self {
-        let mut this = Self::io(error);
-        this.0.local.provenance = FailureProvenance::SourceFilesystemIo;
-        this
-    }
-    pub(crate) fn is_source_filesystem_io(&self) -> bool {
-        matches!(
-            self.0.local.provenance,
-            FailureProvenance::SourceFilesystemIo
-        )
+        self.0.refused.clone()
     }
 
     /// `map_err` adapter: convert a source error and attach the facts its site chose.
@@ -203,6 +172,11 @@ impl<O> OperationError<O> {
         self.0.diagnostic.context = self.0.diagnostic.context.effects(effects);
         self
     }
+    #[must_use]
+    pub fn request(mut self, request: RequestEffects) -> Self {
+        self.0.diagnostic.context = self.0.diagnostic.context.request(request);
+        self
+    }
     /// Retain classification/context/output while dropping opaque I/O detail.
     #[must_use]
     pub(crate) fn opaque_io(mut self) -> Self {
@@ -237,7 +211,7 @@ impl<O> OperationError<O> {
         Self(Box::new(Facts {
             diagnostic,
             output,
-            local: LocalFacts::default(),
+            refused: None,
         }))
     }
     pub(crate) fn try_map_output<P, E>(
@@ -247,12 +221,12 @@ impl<O> OperationError<O> {
         let Facts {
             diagnostic,
             output,
-            local,
+            refused,
         } = *self.0;
         Ok(OperationError(Box::new(Facts {
             diagnostic,
             output: output.map(convert).transpose()?,
-            local,
+            refused,
         })))
     }
 }
@@ -261,16 +235,14 @@ pub(crate) type LocalError = OperationError<super::output::ProducedOutput>;
 
 use super::output::{
     CaptureKind, FieldPointer, OutputContext, PendingOutput, ProducedOutput, TextCaptureField,
-    or_fallback,
 };
 use crate::{
     execution::ExecutionLocation,
     tool::{
-        authorization::Reauthorization,
+        authorization::{Asking, Reauthorization},
         policy::{Capability, CapabilitySet, PathText, PermissionUse, ResourceId},
         registry::{
             AgentLevel, Catalog, CatalogBuilder, CatalogEntry, OutputValue, PathArgument, PathKind,
-            PathScope,
         },
     },
 };
@@ -381,13 +353,17 @@ impl LocalContext {
         Ok(self.output.store_image(path, image).await?)
     }
 
-    /// Authorize permissions this machine derived while running the call.
-    pub(crate) async fn authorize(
+    /// Authorize path permissions this machine derived, then fail with the
+    /// path preflight left `unresolved`, if any.
+    pub(crate) async fn authorize_paths(
         &self,
         permissions: Vec<PermissionUse>,
+        unresolved: Option<AdmissionError>,
     ) -> Result<(), LocalError> {
-        let request = Reauthorization::Permissions(permissions);
-        Ok(self.authorizer.authorize(request).await?)
+        let asking = Asking::for_unresolved(&unresolved);
+        let request = Reauthorization::Permissions(permissions, asking);
+        self.authorizer.authorize(request).await?;
+        unresolved.map_or(Ok(()), |error| Err(error.into()))
     }
 
     pub(crate) async fn authorize_network(&self, origin: &str) -> Result<(), LocalError> {
@@ -414,7 +390,7 @@ impl LocalCatalog {
     ) -> Result<ProducedOutput, LocalError> {
         let fallback = PartialContext::new(Operation::Execute, Subject::Tool(name.to_owned()));
         let result = self.run_admitted(name, arguments, context, authorization_root);
-        or_fallback(result.await, fallback)
+        result.await.map_err(|error| error.or(fallback))
     }
 
     async fn run_admitted(
@@ -432,13 +408,9 @@ impl LocalCatalog {
         let arguments = spec.validate_arguments(arguments)?;
         let mut admitted = tool.admit(&arguments)?;
         let derived = admitted.permissions(&context.location)?;
-        let path = preflight_path_arguments(
-            &tool,
-            admitted.paths(),
-            &context.location,
-            authorization_root,
-        )
-        .await?;
+        let path =
+            preflight_path_arguments(admitted.paths(), &context.location, authorization_root)
+                .await?;
         let permissions = assemble_permissions(
             &tool,
             &context.location,
@@ -447,29 +419,21 @@ impl LocalCatalog {
             &path,
             false,
         )?;
-        (context.authorizer)
-            .authorize(Reauthorization::Permissions(permissions))
+        context
+            .authorize_paths(permissions, path.unresolved)
             .await?;
         if context.is_cancelled() {
-            return Err(LocalError::cancelled());
+            return Err(LocalError::cancelled_before_start());
         }
-        match path.outcome {
-            PathOutcome::Ready => {
-                let fallback = PartialContext::default().paths(path.paths);
-                let result = tool.invoke(admitted).call(context);
-                or_fallback(result.await, fallback)
-            }
-            PathOutcome::ReadError { value, diagnostic } => {
-                Ok(ProducedOutput::new(value).with_diagnostic(*diagnostic))
-            }
-        }
+        let fallback = PartialContext::default().paths(path.paths);
+        let result = admitted.invoke().call(context);
+        result.await.map_err(|error| error.or(fallback))
     }
 }
 
 /// The permissions an invocation needs, wherever it is planned. Permissions its
 /// arguments derive replace their capabilities' static scope, as do its path
-/// permissions once every path resolved (an unresolved read still needs the
-/// workspace scope); the capabilities left are scoped to the tool's resource or
+/// permissions; the capabilities left are scoped to the tool's resource or
 /// workspace. A `forwarded` invocation's destination authorizes its own path
 /// and network permissions and forwards them, so they are not asked for twice.
 /// A capability this context lacks makes the tool unavailable, not denied.
@@ -482,9 +446,7 @@ pub(crate) fn assemble_permissions<C: Send + 'static, O: OutputValue>(
     forwarded: bool,
 ) -> Result<Vec<PermissionUse>, AdmissionError> {
     let mut covered = arguments.iter().collect::<Vec<_>>();
-    if matches!(path.outcome, PathOutcome::Ready) {
-        covered.extend(&path.permissions);
-    }
+    covered.extend(&path.permissions);
     let mut capabilities = tool.capabilities();
     capabilities.retain(|capability| {
         !covered
@@ -505,8 +467,10 @@ pub(crate) fn assemble_permissions<C: Send + 'static, O: OutputValue>(
 
 pub(crate) struct PathPreflight {
     pub(crate) permissions: Vec<PermissionUse>,
-    pub(crate) outcome: PathOutcome,
     pub(crate) paths: Vec<PathFact>,
+    /// How the first path outside the root that does not resolve fails, once
+    /// the call is authorized without asking anyone.
+    pub(crate) unresolved: Option<AdmissionError>,
 }
 
 impl PathPreflight {
@@ -514,26 +478,17 @@ impl PathPreflight {
     pub(crate) const fn deferred() -> Self {
         Self {
             permissions: Vec::new(),
-            outcome: PathOutcome::Ready,
             paths: Vec::new(),
+            unresolved: None,
         }
     }
 }
 
-pub(crate) enum PathOutcome {
-    Ready,
-    ReadError {
-        value: Value,
-        diagnostic: Box<PartialDiagnostic>,
-    },
-}
-
-use crate::tool::path::{lexical_path, resolve_for_authorization};
+use crate::tool::path::{Resolution, resolve_for_authorization};
 
 /// Resolve each path argument where the invocation runs and replace it with its
 /// resolved spelling.
-pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
-    tool: &CatalogEntry<C, O>,
+pub(crate) async fn preflight_path_arguments(
     arguments: Vec<PathArgument<'_>>,
     location: &ExecutionLocation,
     authorization_root: &Path,
@@ -542,42 +497,30 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
     let mut preflight = PathPreflight::deferred();
     for argument in arguments {
         let input = argument.path.clone();
-        let capability = argument.access.capability();
-        let resolved = match resolve_for_authorization(workspace, &input, argument.kind).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                // Preflight adds what it knows to the resolver's facts; nothing is
-                // resolved here, so the tool's own fallback still fills the rest.
-                let mut facts = error
-                    .facts()
-                    .context
-                    .clone()
-                    .at(FailureSite::Execution(location.clone()))
-                    .path(PathRole::Requested, &input);
-                if argument.kind == PathKind::WorkingDirectory {
-                    facts = facts
-                        .subject(Subject::working_directory(lexical_path(workspace, &input)?))
-                        .effects(Effects::NotStarted);
-                }
-                let error = error.context(facts);
-                let diagnostic = error.diagnostic();
-                let Some(output) = tool.read_error_output(&diagnostic) else {
-                    return Err(error);
-                };
-                // Canonicalization failed, so this path is not proven to be within
-                // the authorization root. Require exact path authorization even for
-                // apparently local paths, then return the captured failure without
-                // retrying the handler (which could now access a changed target).
-                let path = PathText::new(lexical_path(workspace, &input)?)?;
-                preflight.permissions.push(PermissionUse::exact(
-                    capability,
-                    ResourceId::path(target, &path),
-                ));
-                preflight.outcome = PathOutcome::ReadError {
-                    value: output,
-                    diagnostic: Box::new(error.into_facts().0),
-                };
-                continue;
+        // Preflight adds what it knows to the resolver's facts; nothing is
+        // resolved here, so the tool's own fallback still fills the rest.
+        let annotate = |error: AdmissionError| {
+            let mut facts = (error.facts().context.clone())
+                .at(FailureSite::Execution(location.clone()))
+                .path(PathRole::Requested, &input);
+            if matches!(
+                argument.kind,
+                PathKind::WorkingDirectory | PathKind::Workspace
+            ) {
+                facts = facts
+                    .subject(Subject::working_directory(workspace.join(&input)))
+                    .effects(Effects::NotStarted);
+            }
+            error.context(facts)
+        };
+        let resolution =
+            resolve_for_authorization(workspace, authorization_root, &input, argument.kind);
+        let resolved = match resolution.await.map_err(&annotate)? {
+            Resolution::Resolved(resolved) => resolved,
+            // Later paths resolve as they would had this one existed.
+            Resolution::Unresolved(resolved, error) => {
+                preflight.unresolved.get_or_insert_with(|| annotate(error));
+                resolved
             }
         };
         resolved.path.as_str().clone_into(argument.path);
@@ -589,12 +532,8 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
             role: PathRole::Resolved,
             path: resolved.path.as_path().to_owned(),
         });
-        preflight.permissions.extend(match argument.scope {
-            PathScope::Exact => Some(resolved.permission(capability, target)),
-            PathScope::Workspace => {
-                resolved.permission_outside(authorization_root, capability, target)
-            }
-        });
+        let capability = argument.access.capability();
+        (preflight.permissions).extend(resolved.permission(capability, argument.scope, target));
     }
     Ok(preflight)
 }
@@ -676,24 +615,20 @@ pub(crate) mod tests {
     /// merely named `cwd` keeps its resolver's facts.
     #[tokio::test]
     async fn only_a_declared_working_directory_fails_as_one() {
-        use crate::tool::{ToolOptions, policy::PathAccess};
+        use crate::tool::{ToolOptions, policy::PathAccess, registry::Arguments};
         let root = tempfile::tempdir().unwrap();
         let mut builder = LocalCatalogBuilder::default();
         crate::tool::builtins::register_local_tools(&mut builder).unwrap();
-        let options = ToolOptions::default().argument_paths(|arguments: &mut Value| {
+        let options = ToolOptions::default().argument_paths(|arguments: &mut Arguments| {
             let Some(Value::String(cwd)) = arguments.get_mut("cwd") else {
                 return Vec::new();
             };
             vec![PathArgument::new(cwd, PathAccess::Read, PathKind::Existing)]
         });
         builder
-            .register_dynamic(
-                "named_cwd",
-                "",
-                serde_json::json!({"type":"object"}),
-                options,
-                |_, _| async { Ok(ProducedOutput::new(Value::Null)) },
-            )
+            .register_product::<Arguments, Value, _, _>("named_cwd", "", options, |_, _| async {
+                Ok(ProducedOutput::new(Value::Null))
+            })
             .unwrap();
         let catalog = builder.build();
         let context = LocalContext::new(
@@ -722,8 +657,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// A path that does not resolve fails in preflight, before any approval.
     #[tokio::test]
-    async fn local_admission_preserves_read_errors_and_capability_checks_without_persistence() {
+    async fn local_admission_preserves_preflight_facts_and_capability_checks_without_persistence() {
         let root = tempfile::tempdir().unwrap();
         let catalog = LocalCatalog::builtins().unwrap();
         let authorizations = Arc::new(Authorizations::default());
@@ -744,11 +680,18 @@ pub(crate) mod tests {
                 root.path(),
             )
             .await
-            .unwrap();
-        assert_eq!(missing.value["error"]["code"], "not_found");
+            .unwrap_err()
+            .diagnostic();
+        assert!(matches!(
+            missing.cause,
+            Cause::Io {
+                kind: crate::tool::diagnostic::IoKind::NotFound,
+                ..
+            }
+        ));
         // Preflight adds only what it knows: the site and the requested path. The
         // resolver's own facts stand, and nothing claims effects it cannot see.
-        let facts = missing.diagnostic.clone().unwrap().resolve().context;
+        let facts = missing.context;
         assert_eq!(facts.operation, Operation::Canonicalize);
         assert_eq!(facts.subject, Subject::path(root.path().join("missing")));
         assert_eq!(
@@ -759,17 +702,6 @@ pub(crate) mod tests {
         assert!(facts.paths.iter().any(|fact| {
             fact.role == PathRole::Requested && fact.path == std::path::Path::new("missing")
         }));
-        {
-            let requests = authorizations.0.lock().unwrap();
-            let [Reauthorization::Permissions(permissions)] = &requests[..] else {
-                panic!("one admission: {requests:?}");
-            };
-            assert!(
-                permissions
-                    .iter()
-                    .any(|permission| matches!(permission.resource, ResourceId::Path { .. }))
-            );
-        }
         // A missing capability makes the tool unavailable; it is not a denial.
         let unavailable = catalog
             .run(
@@ -787,7 +719,7 @@ pub(crate) mod tests {
             }
         );
         assert!(!root.path().join("missing").exists());
-        assert_eq!(authorizations.0.lock().unwrap().len(), 1);
+        assert!(authorizations.0.lock().unwrap().is_empty());
         output.settle().await.unwrap();
     }
 }

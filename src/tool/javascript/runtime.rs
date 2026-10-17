@@ -11,12 +11,12 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::{bridge::HostResponse, console::ConsoleOutput};
+use super::bridge::Outcome;
 
 use crate::{
     media::ImageRef,
     tool::diagnostic::{Effects, FailureSite, Operation, Subject},
-    tool::executor::{ToolExecutor, failure_response},
+    tool::executor::{InvocationKind, ToolExecutor, failure_response},
     tool::{ToolContext, ToolError, ToolOutput},
 };
 
@@ -61,10 +61,13 @@ pub(crate) async fn evaluate_captured(
             console_failure(error, Operation::CreateCapture, Effects::NotStarted)
                 .with_result(super::result::script_output(Value::Null, None, None))
         })?;
-    let console = Arc::new(std::sync::Mutex::new(ConsoleOutput::new(capture.open())));
+    let console = Arc::new(std::sync::Mutex::new(capture.open()));
     let result = evaluate_inner(source, executor, context, console.clone()).await;
-    let console = console.lock().expect("console lock poisoned").finish();
-    finish_evaluation(result, console)
+    let finished = console
+        .lock()
+        .expect("console lock poisoned")
+        .close_nonempty();
+    finish_evaluation(result, finished)
 }
 
 fn finish_evaluation(
@@ -154,7 +157,7 @@ async fn evaluate_inner(
     source: String,
     executor: ToolExecutor,
     context: ToolContext,
-    console: Arc<std::sync::Mutex<ConsoleOutput>>,
+    console: Arc<std::sync::Mutex<crate::job::output::CaptureWriter>>,
 ) -> Result<ToolOutput, ToolError> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(javascript_error(JsError::SourceTooLarge));
@@ -219,7 +222,7 @@ async fn evaluate_inner(
         .map_err(|error| JsError::Initialization(error.to_string()))?;
         js.globals().set("sleep", sleep).map_err(|error| JsError::Initialization(error.to_string()))?;
         let log = Function::new(js.clone(), move |text: String| {
-            console.lock().expect("console lock poisoned").log(&text).map_err(|error| {
+            console.lock().expect("console lock poisoned").write_text(&format!("{text}\n")).map_err(|error| {
                 bridge_error(&console_failure(error.into(), Operation::WriteCapture, Effects::OutputIncomplete))
             })
         })
@@ -253,8 +256,7 @@ async fn evaluate_inner(
                             // Native schemas describe only envelope.result.
                             let mut policy = crate::tool::ToolResultPolicy::Value;
                             let created = host_executor
-                                .create_script(
-                                    host_context.agent().clone(),
+                                .create(InvocationKind::Script, host_context.agent().clone(),
                                     &name,
                                     arguments,
                                     parent,
@@ -293,9 +295,8 @@ async fn evaluate_inner(
                                     presented.insert(crate::job::FieldPointer::root(), crate::tool::output::FieldPresentation::Complete);
                                 }
                             }
-                            let presented = (!presented.is_empty()).then_some(presented);
                             host_images.lock().await.extend(output.images);
-                            HostResponse::Success { value: output.value, presented }
+                            Outcome::Ok { value: output.value, presented }
                         }
                         HostRequest::Receive => {
                             drop(issuing);
@@ -305,12 +306,12 @@ async fn evaluate_inner(
                                 Err(error) => Err(error.to_string()),
                             };
                             match result {
-                                Ok(value) => HostResponse::Success { value, presented: None },
-                                Err(message) => HostResponse::Failure(message),
+                                Ok(value) => Outcome::Ok { value, presented: std::collections::BTreeMap::new() },
+                                Err(error) => Outcome::Failed { error },
                             }
                         }
                     };
-                    response.encode().map_err(|error| bridge_error(&error))
+                    serde_json::to_string(&response).map_err(|error| bridge_error(&error))
                 }
             }),
         )
@@ -340,11 +341,11 @@ async fn evaluate_inner(
             error => error,
         })
     })?;
-    let envelope: super::outcome::Envelope = serde_json::from_str(&encoded)
+    let envelope: Outcome<Value> = serde_json::from_str(&encoded)
         .map_err(|error| javascript_error(JsError::InvalidOutput(error.to_string())))?;
     let (value, presented) = match envelope {
-        super::outcome::Envelope::Ok { value, presented } => (value, presented),
-        super::outcome::Envelope::Failed { error: mut details } => {
+        Outcome::Ok { value, presented } => (value, presented),
+        Outcome::Failed { error: mut details } => {
             map_failure_stack_lines(&mut details, user_start_line, user_line_count);
             let (message, details) = failure_parts(details);
             return Err(javascript_error(JsError::Failure {
@@ -543,13 +544,11 @@ mod tests {
     async fn sleep_stops_on_cancellation_and_unawaited_sleep_does_not_keep_a_script_alive() {
         let entered = Arc::new(tokio::sync::Notify::new());
         let mut builder = ToolRegistryBuilder::default();
-        let schema = json!({"type":"object", "properties":{}});
         let notify = entered.clone();
         builder
-            .register_dynamic(
+            .register_product::<crate::tool::registry::Arguments, Value, _, _>(
                 "entered",
                 "",
-                schema,
                 ToolOptions::default(),
                 move |_, _| {
                     notify.notify_one();
@@ -686,7 +685,7 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
             .unwrap();
         let value = &output.value["value"];
         assert_eq!(value["visible"], "undefined");
-        assert_eq!(value["direct"]["ok"], true);
+        assert_eq!(value["direct"]["outcome"], "ok");
         assert_eq!(value["direct"]["value"]["state"], "failed");
         assert_eq!(value["direct"]["value"].get("id"), None);
         assert_eq!(value["direct"]["value"].get("meta"), None);
@@ -832,6 +831,18 @@ return {first, second, started};
             panic!("expected JavaScript syntax failure");
         };
         assert!(message.contains("skyhook-script:3:"), "{message}");
+        // A host script's failure is its execution's, at the host.
+        let runtime = TestRuntime::new().await;
+        let (executor, _slot) =
+            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let source = json!({"source": "return {nested:undefined};"});
+        let failed = executor.run_host(&runtime.agent, "script", source).await;
+        let diagnostic = failed.unwrap_err().diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Execute);
+        assert_eq!(diagnostic.context.site, FailureSite::Host);
+        assert!(
+            matches!(&diagnostic.cause, Cause::Message(message) if message.contains("undefined at $.nested"))
+        );
     }
 
     #[tokio::test]
@@ -926,39 +937,6 @@ return {first, second, started};
         assert_eq!(details["output"], response["result"]);
     }
 
-    #[tokio::test]
-    async fn script_errors_preserve_captured_console() {
-        let runtime = TestRuntime::new().await;
-        let (executor, _slot) =
-            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
-        for (source, expected) in [
-            (
-                "console.log('before error'); throw new Error('boom');",
-                "boom",
-            ),
-            (
-                "console.log('before error'); return {nested:undefined};",
-                "undefined at $.nested",
-            ),
-        ] {
-            let error = executor
-                .run_host(&runtime.agent, "script", json!({"source": source}))
-                .await
-                .unwrap_err();
-            let diagnostic = error.diagnostic();
-            assert_eq!(diagnostic.context.operation, Operation::Execute);
-            assert_eq!(diagnostic.context.site, FailureSite::Host);
-            assert!(
-                matches!(&diagnostic.cause, Cause::Message(message) if message.contains(expected))
-            );
-            let output = error
-                .into_parts()
-                .1
-                .expect("script failure retains captured output");
-            assert_eq!(output.value["console"], "before error\n");
-        }
-    }
-
     // Standalone wrapper regressions: no executor, jobs, or external processes are needed.
     const BUILDERS: &str = r#"[
     {"binding":"top_level","name":"echo","properties":["value"],"required":["value"]},
@@ -972,11 +950,11 @@ function __skyhookHostCall(encoded) {
   const request = JSON.parse(encoded);
   __testCalls.push(request);
   if (request.type === "receive") {
-    return JSON.stringify({ok: true, value: {id: 99, state: "completed"}});
+    return JSON.stringify({outcome: "ok", value: {id: 99, state: "completed"}, presented: {}});
   }
   const presented = {"/result/value": "complete"};
   if (Array.isArray(request.arguments.value)) presented["/result/value/0"] = "ends";
-  return JSON.stringify({ok: true, value: {
+  return JSON.stringify({outcome: "ok", value: {
     id: __testCalls.length, state: "completed", result: request.arguments,
   }, presented});
 }
@@ -1085,31 +1063,6 @@ return {
         assert_eq!(result["received"], json!({"id":99,"state":"completed"}));
     }
 
-    #[test]
-    fn non_object_job_responses_fail_at_the_bridge_boundary() {
-        let result = evaluate_wrapper(
-            r#"
-const errors = [];
-for (const value of [null, 17, [], "bad"]) {
-  __skyhookHostCall = () => JSON.stringify({ok:true, value});
-  try { await tool.echo({value:null}); }
-  catch (error) { errors.push(error.message); }
-}
-return errors;
-"#,
-        );
-        let errors = result.as_array().unwrap();
-        assert_eq!(errors.len(), 4);
-        for error in errors {
-            assert!(
-                error
-                    .as_str()
-                    .unwrap()
-                    .contains("invalid JobView envelope: expected an object")
-            );
-        }
-    }
-
     /// `unwrap()` returns a completed view's result, where an absent `state`
     /// means completed, and throws with the view for any other state.
     #[test]
@@ -1123,7 +1076,7 @@ for (const value of [
   {state:"failed", error:"unadmitted"},
   {id:10, state:"running"},
 ]) {
-  __skyhookHostCall = () => JSON.stringify({ok:true, value});
+  __skyhookHostCall = () => JSON.stringify({outcome:"ok", value, presented:{}});
   const response = await tool.echo({value:null});
   try { results.push({value:response.unwrap()}); }
   catch (error) {
@@ -1312,7 +1265,7 @@ return __testCalls;
         let source = "return await tool.read({path:'image.png'});";
         let launched = script(&executor, agent, source.into(), true).await;
         assert!(launched.background);
-        runtime.jobs.wait(launched.job, None, true).await.unwrap();
+        runtime.jobs.wait(launched.job, true).await.unwrap();
         for _ in 0..2 {
             let output = executor
                 .run_model(agent, "jobs", json!({"job":launched.job}))
@@ -1324,14 +1277,18 @@ return __testCalls;
             assert_eq!(output.value["result"].get("console"), None);
             assert_loaded(&runtime.store, output.images).await;
         }
-        let source = format!("return await tool.jobs({{job:{}}});", launched.job);
+        let source = format!(
+            "console.log('kept'); return await tool.jobs({{job:{}}});",
+            launched.job
+        );
         let output = script(&executor, agent, source.clone(), false).await.output;
         assert_eq!(output.value["result"]["value"]["id"], launched.job.get());
+        assert_eq!(output.value["result"]["console"], "kept\n");
         assert_loaded(&runtime.store, output.images).await;
         // A background script that retrieves an existing image must itself retain
         // the attachment, not merely the nested job's JSON metadata.
         let background = script(&executor, agent, source, true).await;
-        runtime.jobs.wait(background.job, None, true).await.unwrap();
+        runtime.jobs.wait(background.job, true).await.unwrap();
         let output = executor
             .run_model(agent, "jobs", json!({"job":background.job}))
             .await;

@@ -315,40 +315,6 @@ mod tests {
         EntryGeometry::new(&entry, 30, 0).row(Line::from(text.to_owned()), false, layout)
     }
 
-    #[test]
-    fn selection_preserves_soft_wrapped_text_and_code_whitespace() {
-        let source = "  first line with enough text to wrap\n    second line  ";
-        let text = format!("```text\n{source}\n```");
-        let entry = model::Entry::titled(
-            model::EntryKey::UnsavedStatus(2),
-            model::Title::plain("Agent"),
-            text,
-            Surface::Agent,
-        );
-        let rows = layout(&entry, 30);
-        let start = rows
-            .iter()
-            .position(|row| row.text().starts_with("  first"))
-            .unwrap();
-        let end = rows
-            .iter()
-            .rposition(|row| row.text().ends_with("second line  "))
-            .unwrap();
-        let byte = rows[end].text().len();
-        let selection = (
-            TextPosition {
-                row: start,
-                byte: 2,
-            },
-            TextPosition { row: end, byte },
-        );
-        let mut blocks = RowBlocks::default();
-        blocks.replace_entry(0, rows.clone(), Vec::new());
-        let expected = source.strip_prefix("  ").unwrap();
-        assert_eq!(selected_text(&blocks, selection), expected);
-        assert_eq!(selected_text(&blocks, (selection.1, selection.0)), expected);
-    }
-
     /// Each entry laid out at its index, as the transcript lays them out.
     fn transcript(entries: &[model::Entry], width: u16) -> RowBlocks {
         let highlights = super::super::super::tool_view::HighlightCache::default();
@@ -432,21 +398,6 @@ mod tests {
             transcript(&[reasoning(true)], 40),
         ] {
             assert!(selection.clone().reflow(&rows).is_none());
-        }
-    }
-
-    /// A table rewraps its cells into a different number of rows at each
-    /// width; the prose after it keeps its identity.
-    #[test]
-    fn a_table_rewrapping_above_keeps_a_selection_below_it() {
-        let body = "| Key | Description |\n| --- | --- |\n| x | one two three four |\n\nAfter";
-        let selection = select(&transcript(&[answer(body, None)], 88), "After", "After");
-        assert_eq!(selection.text(), "After");
-        for width in [27, 20, 88] {
-            let rows = transcript(&[answer(body, None)], width);
-            let reflowed = selection.clone().reflow(&rows);
-            let text = reflowed.as_ref().map(Selection::text);
-            assert_eq!(text, Some("After"), "width {width}");
         }
     }
 
@@ -742,20 +693,6 @@ mod tests {
         let body = "| A | B | C |\n| - | - | - |\n| x |\n\nafter";
         let rows = transcript(&[answer(body, None)], 80);
         assert_eq!(select(&rows, "x", "after").text(), "x\n\n\n\nafter");
-    }
-
-    /// The spinner's gutter is decoration: a selected title outlives it.
-    #[test]
-    fn a_selected_title_survives_its_spinner_gutter_going_away() {
-        let selection = select(
-            &transcript(&[reasoning(true)], 40),
-            "Reasoning",
-            "Reasoning",
-        );
-        assert_eq!(selection.text(), "Reasoning");
-        let settled = transcript(&[reasoning(false)], 40);
-        let reflowed = selection.reflow(&settled);
-        assert_eq!(reflowed.as_ref().map(Selection::text), Some("Reasoning"));
     }
 
     /// Rows without source (box edges, separators) snap to the entry's

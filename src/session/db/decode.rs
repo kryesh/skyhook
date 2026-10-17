@@ -25,23 +25,27 @@ impl Events<'_> {
     pub(super) fn load(
         &mut self,
         sql: &str,
-        event: impl FnMut(&Row) -> DbResult<SessionEvent>,
-    ) -> DbResult<()> {
-        self.load_with(sql, Vec::new(), event)
-    }
-
-    pub(super) fn load_with(
-        &mut self,
-        sql: &str,
-        params: Vec<Value>,
         mut event: impl FnMut(&Row) -> DbResult<SessionEvent>,
     ) -> DbResult<()> {
         let rows = self
             .db
-            .query(sql, params, |row| Ok((row.get::<i64>(0)?, event(row)?)))?;
-        self.by_entry.extend(rows);
-        Ok(())
+            .query(sql, Vec::new(), |row| Ok((row.get::<i64>(0)?, event(row)?)))?;
+        rows.into_iter()
+            .try_for_each(|(entry, event)| self.insert(entry, event))
     }
+
+    /// File `event` under `entry`, which holds at most one.
+    pub(super) fn insert(&mut self, entry: i64, event: SessionEvent) -> DbResult<()> {
+        match self.by_entry.insert(entry, event) {
+            Some(_) => Err(corrupt(format!("entry {entry} has rows of two kinds"))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The rows `key` owns; rows no owner takes are corrupt.
+pub(super) fn take<T: Default>(rows: &mut HashMap<i64, T>, key: i64) -> T {
+    rows.remove(&key).unwrap_or_default()
 }
 
 pub(super) fn parse_json<T: DeserializeOwned>(text: &str) -> DbResult<T> {
@@ -137,7 +141,7 @@ pub(in crate::session) fn decode_records(
         return Err(corrupt("database belongs to another session"));
     }
     let messages = Messages::load(db)?;
-    let todos = super::message::entry_todos(db)?;
+    let mut todos = super::message::entry_todos(db)?;
     let mut events = Events {
         db,
         by_entry: HashMap::new(),
@@ -153,9 +157,9 @@ pub(in crate::session) fn decode_records(
     })?;
     contract::events(&mut events)?;
     messages.events(&mut events)?;
-    request::events(&mut events, &messages, &todos)?;
+    request::events(&mut events, &messages, &mut todos)?;
     job::events(&mut events)?;
-    let targets = contract::targets(db)?;
+    let mut targets = contract::targets(db)?;
     let agents = agent_paths(db, session)?;
     let entries = db.query(
         "SELECT seq, public_id, agent, created_millis, kind FROM entry ORDER BY seq",
@@ -172,23 +176,26 @@ pub(in crate::session) fn decode_records(
     )?;
     let mut records = Vec::with_capacity(entries.len());
     for (seq, public_id, agent, created, kind) in entries {
-        let event = match kind {
-            EntryKind::SessionStarted => SessionEvent::SessionStarted {
-                targets: targets.get(&seq).cloned().unwrap_or_default(),
+        // Rows filed under an entry of another kind, or missing, are corrupt.
+        let event = match (kind, events.by_entry.remove(&seq)) {
+            (EntryKind::SessionStarted, None) => SessionEvent::SessionStarted {
+                targets: take(&mut targets, seq),
             },
-            EntryKind::TargetsUpserted => SessionEvent::TargetsUpserted {
-                targets: targets.get(&seq).cloned().unwrap_or_default(),
+            (EntryKind::TargetsUpserted, None) => SessionEvent::TargetsUpserted {
+                targets: take(&mut targets, seq),
             },
-            EntryKind::TodosReplaced => SessionEvent::TodosReplaced {
-                items: todos.get(&seq).cloned().unwrap_or_default(),
+            (EntryKind::TodosReplaced, None) => SessionEvent::TodosReplaced {
+                items: take(&mut todos, seq),
             },
-            EntryKind::AgentCompleted => SessionEvent::AgentCompleted,
-            EntryKind::AgentInterrupted => SessionEvent::AgentInterrupted,
-            EntryKind::TitleCleared => SessionEvent::TitleCleared,
-            _ => events
-                .by_entry
-                .remove(&seq)
-                .ok_or_else(|| corrupt(format!("entry {seq} ({kind}) has no {kind} row")))?,
+            (EntryKind::AgentCompleted, None) => SessionEvent::AgentCompleted,
+            (EntryKind::AgentInterrupted, None) => SessionEvent::AgentInterrupted,
+            (EntryKind::TitleCleared, None) => SessionEvent::TitleCleared,
+            (_, Some(event)) if event.kind() == kind => event,
+            _ => {
+                return Err(corrupt(format!(
+                    "entry {seq} ({kind}) does not match its rows"
+                )));
+            }
         };
         records.push(EventRecord {
             id: EventId::from_bytes(bytes(public_id)?),
@@ -200,6 +207,11 @@ pub(in crate::session) fn decode_records(
                 .ok_or_else(|| corrupt("entry agent is missing"))?,
             event,
         });
+    }
+    if !targets.is_empty() || !todos.is_empty() {
+        return Err(corrupt(
+            "target or todo rows belong to another kind's entry",
+        ));
     }
     Ok(records)
 }

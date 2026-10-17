@@ -27,9 +27,6 @@ pub(super) struct Choice {
     // Non-streaming Chat output, sent by some servers in place of deltas.
     #[serde(default, deserialize_with = "lenient_delta")]
     pub message: Option<Delta>,
-    // Legacy Completions output.
-    #[serde(default, deserialize_with = "lenient")]
-    pub text: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -46,14 +43,11 @@ pub(super) struct Delta {
     /// its `thinking` text and, in a trailing delta, its `signature`.
     #[serde(default, deserialize_with = "lenient_objects")]
     pub thinking_blocks: Option<Vec<Native<ThinkingBlock>>>,
-    /// A router's reasoning objects, each addressed by `index` across deltas.
+    /// A router's reasoning objects, each continued across deltas while it receives output.
     #[serde(default, deserialize_with = "lenient_objects")]
     pub reasoning_details: Option<Vec<Native<Detail>>>,
     #[serde(default, deserialize_with = "lenient_tool_calls")]
     pub tool_calls: Option<Vec<ToolDelta>>,
-    /// Legacy single function call, equivalent to a tool call at index 0.
-    #[serde(default, deserialize_with = "lenient_function")]
-    pub function_call: Option<Function>,
 }
 
 impl Delta {
@@ -95,15 +89,6 @@ impl Delta {
         }
     }
 
-    /// The legacy `function_call`, as the tool call at index 0 it stands for.
-    pub(super) fn legacy_call(&self) -> Option<ToolDelta> {
-        self.function_call.clone().map(|function| ToolDelta {
-            index: Some(0),
-            id: None,
-            function: Some(function),
-        })
-    }
-
     /// Whether this delta carries no output a decoder of `format` reads.
     /// Compatible servers vary between omitted, null, and empty placeholders,
     /// including repeated roles.
@@ -115,7 +100,6 @@ impl Delta {
             && self.fragments().all(str::is_empty)
             && !self.has_native_reasoning(format)
             && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
-            && self.function_call.is_none()
     }
 }
 
@@ -193,11 +177,12 @@ pub(super) enum DetailKind {
 }
 
 impl DetailKind {
-    /// The field carrying the entry's readable text.
-    pub(super) fn text_field(self) -> &'static str {
+    /// The field carrying the entry's readable text; opaque entries have none.
+    pub(super) fn text_field(self) -> Option<&'static str> {
         match self {
-            Self::Summary => "summary",
-            Self::Text | Self::Encrypted => "text",
+            Self::Text => Some("text"),
+            Self::Summary => Some("summary"),
+            Self::Encrypted => None,
         }
     }
 }
@@ -206,8 +191,25 @@ impl DetailKind {
 pub(super) struct Detail {
     pub kind: DetailKind,
     pub index: Option<u64>,
+    pub id: Option<String>,
     pub text: Option<String>,
     pub signed: bool,
+}
+
+impl Detail {
+    /// Whether this fragment continues the open detail at `index` of `kind` and `id`.
+    /// Routers reuse an index across a sequence, so a new type or a different id
+    /// starts the next detail; a fragment without an index or id continues one of
+    /// its type. Only readable text arrives in fragments: an opaque entry is whole.
+    pub(super) fn continues(&self, index: Option<u64>, kind: DetailKind, id: Option<&str>) -> bool {
+        self.kind == kind
+            && kind.text_field().is_some()
+            && (self.index.is_none() || self.index == index)
+            && match (self.id.as_deref(), id) {
+                (Some(own), Some(open)) => own == open,
+                _ => true,
+            }
+    }
 }
 
 impl ParseNative for Detail {
@@ -221,7 +223,8 @@ impl ParseNative for Detail {
         Self {
             kind,
             index: raw.get("index").and_then(lenient_u64),
-            text: field(kind.text_field()).map(str::to_owned),
+            id: field("id").map(str::to_owned),
+            text: kind.text_field().and_then(field).map(str::to_owned),
             signed: is_signed(field("signature"), field("data")),
         }
     }

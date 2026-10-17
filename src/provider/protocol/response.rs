@@ -165,12 +165,10 @@ impl Completion {
         Ok(items)
     }
 
-    #[must_use]
     pub fn outcome(&self) -> Outcome {
         self.outcome
     }
 
-    #[must_use]
     pub fn items(&self) -> &[AssistantItem] {
         &self.items
     }
@@ -284,7 +282,6 @@ impl Usage {
 
     /// The whole prompt, cached or not. Unknown without the input count; missing cache
     /// reads add nothing.
-    #[must_use]
     pub fn prompt_tokens(self) -> Option<u64> {
         let cached = self.cached_input_tokens.unwrap_or_default();
         Some(self.input_tokens?.saturating_add(cached))
@@ -292,7 +289,6 @@ impl Usage {
 
     /// What the request and its response occupy of the context: the whole prompt and
     /// the output, when the prompt is known.
-    #[must_use]
     pub fn occupancy(self) -> Option<u64> {
         let output = self.output_tokens.unwrap_or_default();
         Some(self.prompt_tokens()?.saturating_add(output))
@@ -391,18 +387,15 @@ impl LiveResponse {
         }
     }
 
-    #[must_use]
     pub fn blocks(&self) -> &[LiveBlock] {
         &self.blocks
     }
 
-    #[must_use]
     pub fn usage(&self) -> Usage {
         self.usage
     }
 
     /// The block still being streamed: the one the latest delta extended.
-    #[must_use]
     pub fn current(&self) -> Option<&BlockRef> {
         self.current.map(|index| &self.blocks[index].block)
     }

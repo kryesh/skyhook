@@ -9,23 +9,10 @@ impl JobManager {
         id: JobId,
         resume: impl Into<Resume>,
     ) -> Result<(), JobError> {
-        let (manager, resume) = (self.clone(), resume.into());
+        let resume = resume.into();
         (self.inner.store)
-            .live(move |state| manager.install(state, id, resume))
+            .live(move |state| state.jobs.set_resume(id, resume))
             .await
-    }
-
-    /// Let `resume` restart agent job `id` once it ends, in the change being
-    /// applied: the core records that it can, and the supervisor holds what does.
-    pub(crate) fn install(
-        &self,
-        state: &mut CoreState,
-        id: JobId,
-        resume: Resume,
-    ) -> Result<(), JobError> {
-        state.jobs.set_resume(id, resume.retained())?;
-        self.handles(id, |handles| handles.resume = Some(resume));
-        Ok(())
     }
 
     /// Without a handler an interrupted job is no longer suspended but settled,
@@ -232,19 +219,19 @@ impl JobManager {
         impl FnOnce(&mut CoreState) -> usize + use<>,
     ) {
         let mut jobs = (state.jobs.entries.iter())
-            .filter(|(_, entry)| entry.accepts_input && session_retryable(entry))
-            .map(|(id, entry)| (*id, entry.agent.depth(), entry.agent.clone()))
+            .filter(|(_, entry)| entry.accepts_input)
+            .filter_map(|(id, entry)| Some((*id, entry.agent.clone(), session_retryable(entry)?)))
             .collect::<Vec<_>>();
-        jobs.sort_by_key(|(_, depth, ..)| std::cmp::Reverse(*depth));
+        jobs.sort_by_key(|(_, owner, _)| std::cmp::Reverse(owner.depth()));
         let running = (jobs.iter())
-            .map(|(id, _, owner)| (owner.clone(), running(*id)))
+            .map(|(id, owner, _)| (owner.clone(), running(*id)))
             .collect();
         let manager = self.clone();
         let restart = move |state: &mut CoreState| {
             // An invocation an interrupt stopped before it began begins after all.
             let resumed = jobs.len() + state.jobs.resume_preempted();
-            for (id, ..) in jobs {
-                manager.restart(state, id, None);
+            for (id, _, resume) in jobs {
+                manager.restart(state, id, resume, None);
             }
             resumed
         };
@@ -263,10 +250,10 @@ impl JobManager {
             }
             let reason = if entry.cancel_requested() {
                 InputUnavailableReason::CancellationRequested
-            } else if entry.resume.is_some() {
+            } else if let Some(resume) = entry.resume.clone() {
                 let running = vec![(entry.agent.clone(), running(id))];
                 return Ok(Plan::new(running, move |state, _| {
-                    manager.restart(state, id, Some(value));
+                    manager.restart(state, id, resume, Some(value));
                     Resumption::Started
                 }));
             } else {
@@ -281,13 +268,12 @@ impl JobManager {
     /// transition starts a new output generation, so old saved results cannot
     /// masquerade as the new invocation's output. A relaunched call finds the
     /// input that restarted it waiting in its mailbox.
-    fn restart(&self, state: &mut CoreState, id: JobId, value: Option<Value>) {
+    fn restart(&self, state: &mut CoreState, id: JobId, resume: Resume, value: Option<Value>) {
         let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
-        let (cancellation, resume) = self.handles(id, |handles| {
+        let cancellation = self.handles(id, |handles| {
             handles.input = input.clone();
-            (handles.cancellation.clone(), handles.resume.clone())
+            handles.cancellation.clone()
         });
-        let resume = resume.expect("the supervisor holds what restarts a resumable job");
         let run = Run(id, state.jobs.entries[&id].invocation);
         let manager = self.clone();
         match resume {
@@ -346,21 +332,20 @@ fn running(job: JobId) -> SessionEvent {
     SessionEvent::JobStateChanged { job, state }
 }
 
-/// Failed or interrupted, uncancelled, with a live handler: a session-wide retry
-/// restarts it. Unlike an explicit send, it never restarts Completed.
-fn session_retryable(entry: &JobFacts) -> bool {
-    matches!(entry.end(), Some(JobEnd::Failed | JobEnd::Interrupted))
-        && entry.resume.is_some()
-        && !entry.cancel_requested()
+/// The handler of a failed or interrupted, uncancelled job: a session-wide retry
+/// restarts it with that. Unlike an explicit send, it never restarts Completed.
+fn session_retryable(entry: &JobFacts) -> Option<Resume> {
+    let retryable = matches!(entry.end(), Some(JobEnd::Failed | JobEnd::Interrupted))
+        && !entry.cancel_requested();
+    entry.resume.clone().filter(|_| retryable)
 }
 
 impl Jobs {
-    /// Record that `retained` runs agent job `id` again once it ends: only as the
-    /// supervisor takes the handler that does, so the two never disagree.
-    fn set_resume(&mut self, id: JobId, retained: Retained) -> Result<(), JobError> {
+    /// Let `resume` restart agent job `id` once it ends.
+    pub(crate) fn set_resume(&mut self, id: JobId, resume: Resume) -> Result<(), JobError> {
         let entry = self.entries.get_mut(&id).ok_or(JobError::Unknown(id))?;
         entry.child().ok_or(JobError::NoChild(id))?;
-        entry.resume = Some(retained);
+        entry.resume = Some(resume);
         Ok(())
     }
 
@@ -462,9 +447,7 @@ mod tests {
     }
 
     async fn settled(jobs: &JobManager, id: JobId) -> crate::job::tests::Hydrated {
-        crate::tests::bounded(jobs.wait(id, None, true))
-            .await
-            .unwrap()
+        crate::tests::bounded(jobs.wait(id, true)).await.unwrap()
     }
 
     #[tokio::test]
@@ -541,7 +524,7 @@ mod tests {
                 .unwrap();
             if cancel {
                 let (cancelled, _) = crate::tests::expire(
-                    jobs.wait(lease.id(), None, true),
+                    jobs.wait(lease.id(), true),
                     async { jobs.cancel(lease.id()).await.unwrap() },
                     super::super::cancellation::CANCELLATION_GRACE,
                 )

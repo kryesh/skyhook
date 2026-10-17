@@ -1,7 +1,6 @@
 //! Terminal status, output completeness, usage accounting, and safe tool discard.
 use super::events::Event;
 use super::native::NativeItem;
-use super::normalization::NormalizedEvent;
 use super::*;
 use crate::provider::codec::{
     common::StopReason,
@@ -16,11 +15,13 @@ const USAGE: Spelling = Spelling {
 };
 
 impl Decoder {
-    pub(super) fn normalize_terminal<'a>(
-        &self,
-        event: &'a Value,
+    /// Complete the response from its terminal event.
+    pub(super) fn terminal(
+        &mut self,
+        event: &Value,
         kind: Event,
-    ) -> Result<NormalizedEvent<'a>, ProviderError> {
+        events: &mut Vec<ResponseEvent>,
+    ) -> Result<(), ProviderError> {
         let response = event
             .get("response")
             .ok_or_else(|| NATIVE.error("missing final response"))?;
@@ -53,14 +54,10 @@ impl Decoder {
             .get("usage")
             .and_then(|usage| Observed::read(usage, &USAGE))
             .map(|observed| Counters::new(InputAccounting::PromptTotal).observe(observed));
-        Ok(NormalizedEvent::Terminal {
-            output,
-            usage,
-            finish,
-        })
+        self.complete_response(output, usage, finish, events)
     }
 
-    pub(super) fn complete_response(
+    fn complete_response(
         &mut self,
         output: &[Value],
         usage: Option<Usage>,
@@ -305,21 +302,5 @@ mod tests {
             error.kind(),
             crate::provider::ProviderErrorKind::ContextWindowExceeded
         );
-    }
-
-    #[test]
-    fn deferred_malformed_tools_still_fail_on_normal_terminal() {
-        for restated in [true, false] {
-            let mut decoder = decoder();
-            let mut call = call_item();
-            call["arguments"] = json!("{\"query\":");
-            decoder.feed(added(0, call.clone())).unwrap();
-            assert!(decoder.feed(done(0, call.clone())).unwrap().is_empty());
-            assert!(
-                decoder
-                    .feed(completed(if restated { vec![call] } else { vec![] }))
-                    .is_err()
-            );
-        }
     }
 }

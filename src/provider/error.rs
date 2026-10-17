@@ -25,6 +25,19 @@ crate::named_enum::named_enum! {
 }
 
 impl ProviderErrorKind {
+    /// The kind an HTTP status names on its own.
+    pub(crate) fn of_status(status: u16) -> Self {
+        match status {
+            401 | 403 => Self::Authentication,
+            402 => Self::Billing,
+            408 | 504 => Self::Timeout,
+            429 => Self::RateLimited,
+            409 | 425 => Self::Unavailable,
+            300..=499 => Self::InvalidRequest,
+            _ => Self::Unavailable,
+        }
+    }
+
     #[must_use]
     pub fn error(self, message: impl Into<String>) -> ProviderError {
         ProviderError {
@@ -45,13 +58,11 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
-    #[must_use]
     pub fn kind(&self) -> ProviderErrorKind {
         self.kind
     }
 
     /// Whether the runtime may retry an *uncommitted* response after this error.
-    #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
@@ -74,8 +85,29 @@ impl ProviderError {
     }
 
     /// The server-directed delay for a runtime-owned retry, when one was sent.
-    #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::named_enum::NamedEnum;
+
+    #[test]
+    fn only_transient_kinds_are_retryable() {
+        use ProviderErrorKind::{CredentialExpired, RateLimited, Timeout, Transport, Unavailable};
+        let transient = [
+            CredentialExpired,
+            RateLimited,
+            Timeout,
+            Transport,
+            Unavailable,
+        ];
+        for &kind in <ProviderErrorKind as NamedEnum>::ALL {
+            let retryable = kind.error("retry this request").is_retryable();
+            assert_eq!(retryable, transient.contains(&kind), "{kind}");
+        }
     }
 }

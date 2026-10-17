@@ -10,38 +10,47 @@ use serde_json::{Map, Value};
 
 impl Decoder {
     /// A `thinking_blocks` entry. Thinking fragments continue the block
-    /// receiving output until an entry completes it; redacted thinking stands
-    /// alone. A completing entry re-sends either the block's text so far (a
-    /// snapshot, of which only the unstreamed part is new) or an empty marker;
-    /// any other text it carries is a fragment.
+    /// receiving output, and a completing entry completes the latest open block
+    /// whatever output came since; redacted thinking stands alone. A completing
+    /// entry re-sends either the block's text so far (a snapshot, of which only
+    /// the unstreamed part is new) or an empty marker; any other text it carries
+    /// is a fragment.
     pub(super) fn thinking_block(
         &mut self,
         block: &wire::Native<wire::ThinkingBlock>,
         events: &mut Vec<ResponseEvent>,
     ) {
         let signed = block.view.is_signed();
+        let open = |block: &Block| {
+            matches!(
+                block,
+                Block::Native {
+                    shape: NativeShape::Thinking {
+                        complete: false,
+                        ..
+                    },
+                    ..
+                }
+            )
+        };
+        let complete = block.view.completes();
         let (open, shape) = match block.view {
             wire::ThinkingBlock::Other => return,
-            wire::ThinkingBlock::Thinking { .. } => {
-                let open = self.visible_id.filter(|id| {
-                    matches!(
-                        self.blocks[*id],
-                        Block::Native {
-                            shape: NativeShape::Thinking {
-                                complete: false,
-                                ..
-                            },
-                            ..
-                        }
-                    )
-                });
-                let complete = block.view.completes();
-                (open, NativeShape::Thinking { complete, signed })
-            }
+            wire::ThinkingBlock::Thinking { .. } if complete => (
+                self.blocks.iter().rposition(open),
+                NativeShape::Thinking { complete, signed },
+            ),
+            wire::ThinkingBlock::Thinking { .. } => (
+                self.blocks
+                    .len()
+                    .checked_sub(1)
+                    .filter(|id| open(&self.blocks[*id])),
+                NativeShape::Thinking { complete, signed },
+            ),
             wire::ThinkingBlock::Redacted { .. } => (None, NativeShape::Redacted { signed }),
         };
         let fragment = block.view.text().unwrap_or("");
-        if open.is_none() && fragment.is_empty() && !block.view.completes() {
+        if open.is_none() && fragment.is_empty() && !complete {
             return;
         }
         let id = open.unwrap_or_else(|| self.open_native(shape));
@@ -52,7 +61,7 @@ impl Decoder {
         else {
             unreachable!()
         };
-        let new = if block.view.completes() {
+        let new = if complete {
             fragment
                 .strip_prefix(current.text(object))
                 .unwrap_or(fragment)
@@ -63,22 +72,47 @@ impl Decoder {
         self.native_fragment(id, new, &block.raw, events);
     }
 
-    /// A `reasoning_details` entry, continuing the detail at its index. Every
-    /// entry is replayed, even an empty one.
+    /// A `reasoning_details` entry, continuing an unsealed detail it fits. Its text
+    /// continues the latest detail at its index among the native objects receiving
+    /// output; a signature alone seals the latest it fits, whatever output came
+    /// since. Every entry is replayed, even an empty one.
     pub(super) fn detail(
         &mut self,
         detail: &wire::Native<wire::Detail>,
         events: &mut Vec<ResponseEvent>,
     ) {
         let view = &detail.view;
-        let open = view.index.and_then(|index| {
-            self.blocks.iter().rposition(|block| {
+        let fits = |block: &Block| match block {
+            Block::Native {
+                object,
+                shape:
+                    NativeShape::Detail {
+                        index,
+                        kind,
+                        signed: false,
+                    },
+            } => view.continues(*index, *kind, object.get("id").and_then(Value::as_str)),
+            _ => false,
+        };
+        let open = if view.signed && view.text.as_deref().is_none_or(str::is_empty) {
+            self.blocks.iter().rposition(fits)
+        } else {
+            let run = self
+                .blocks
+                .iter()
+                .rposition(|block| !matches!(block, Block::Native { .. }))
+                .map_or(0, |id| id + 1);
+            let at_index = |block: &Block| {
                 matches!(block, Block::Native {
-                    shape: NativeShape::Detail { index: Some(open), .. },
+                    shape: NativeShape::Detail { index, .. },
                     ..
-                } if *open == index)
-            })
-        });
+                } if view.index.is_none() || *index == view.index)
+            };
+            let latest = self.blocks[run..].iter().rposition(at_index);
+            latest
+                .map(|id| run + id)
+                .filter(|id| fits(&self.blocks[*id]))
+        };
         let id = open.unwrap_or_else(|| {
             self.open_native(NativeShape::Detail {
                 index: view.index,
@@ -98,13 +132,20 @@ impl Decoder {
         self.native_fragment(id, new, &detail.raw, events);
     }
 
+    /// Whether this response carries native reasoning with readable text, which
+    /// then takes the place of its plain reasoning.
+    pub(super) fn reads_native(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            matches!(block, Block::Native { object, shape } if !shape.text(object).is_empty())
+        })
+    }
+
     fn open_native(&mut self, shape: NativeShape) -> usize {
         let id = self.blocks.len();
         self.blocks.push(Block::Native {
             object: Map::new(),
             shape,
         });
-        self.visible_id = Some(id);
         id
     }
 
@@ -584,5 +625,224 @@ mod tests {
             items[0].replay().unwrap().payload,
             json!({"text":"Weigh both."})
         );
+    }
+
+    #[test]
+    fn a_new_type_or_id_at_a_reused_index_starts_the_next_detail() {
+        // OpenRouter's ai-sdk-provider issue-519 fixture: every entry at index 0.
+        let summary = |text: &str| json!({"type":"reasoning.summary","summary":text,"format":"openai-responses-v1","index":0});
+        let encrypted = |data: &str, id: &str| json!({"type":"reasoning.encrypted","data":data,"id":id,"index":0});
+        let frames = vec![
+            delta(json!({"role":"assistant","content":"","reasoning_details":[summary("a")]})),
+            delta(json!({"reasoning_details":[summary("b")]})),
+            delta(json!({"reasoning_details":[encrypted("BLOB1", "rs_1")]})),
+            delta(json!({"reasoning_details":[summary("c")]})),
+            delta(json!({"reasoning_details":[encrypted("BLOB2", "rs_2")]})),
+            delta(json!({"content":"done"})),
+            end("stop"),
+        ];
+        let reduced = reduced_as(ReasoningFormat::Details, frames);
+        assert_eq!(
+            contents(reduced.items()),
+            [
+                reasoning("ab"),
+                reasoning(""),
+                reasoning("c"),
+                reasoning(""),
+                text("done"),
+            ]
+        );
+        let details = [
+            summary("ab"),
+            encrypted("BLOB1", "rs_1"),
+            summary("c"),
+            encrypted("BLOB2", "rs_2"),
+        ];
+        let bound = details
+            .iter()
+            .map(|detail| (detail.clone(), Binding::Conversation));
+        assert_eq!(
+            native_replays(&reduced, ReasoningFormat::Details),
+            bound.collect::<Vec<_>>()
+        );
+        use super::super::super::{ReasoningReplay, encode, encoder::tests::*};
+        let mut request = crate::provider::codec::common::tests::request("test-model");
+        let turn = crate::provider::protocol::Message::Assistant(reduced.items().to_vec());
+        (request.context).extend(crate::provider::protocol::entries([turn]));
+        let router = native_dialect(ReasoningReplay::Details, "reasoning_details", replayed());
+        let body = encode(&request, &router).unwrap();
+        assert_eq!(body["messages"][1]["reasoning_details"], json!(details));
+        // So does another id on a detail of the same type; an encrypted entry is
+        // whole, so one without an id never continues another.
+        let null_id =
+            |data: &str| json!({"type":"reasoning.encrypted","data":data,"id":null,"index":0});
+        for blobs in [
+            [encrypted("BLOB1", "rs_1"), encrypted("BLOB2", "rs_2")],
+            [null_id("BLOB1"), null_id("BLOB2")],
+        ] {
+            let reduced = reduced_as(
+                ReasoningFormat::Details,
+                vec![delta(json!({ "reasoning_details": blobs })), end("stop")],
+            );
+            let replays = native_replays(&reduced, ReasoningFormat::Details);
+            let payloads: Vec<_> = replays.into_iter().map(|(payload, _)| payload).collect();
+            assert_eq!(payloads, blobs);
+        }
+        // While native objects receive output, an indexed fragment continues the
+        // latest detail at its index.
+        let entry = |kind: &str, field: &str, text: &str, index: u64| json!({"type": format!("reasoning.{kind}"), field: text, "index": index});
+        let reduced = reduced_as(
+            ReasoningFormat::Details,
+            vec![
+                delta(json!({"reasoning_details":[entry("text", "text", "a", 0),
+                    entry("summary", "summary", "s", 1), entry("text", "text", "b", 0)]})),
+                delta(json!({"reasoning_details":[entry("summary", "summary", "t", 1)]})),
+                end("stop"),
+            ],
+        );
+        assert_eq!(
+            contents(reduced.items()),
+            [reasoning("ab"), reasoning("st")]
+        );
+        // Readable fragments without an index continue the latest detail of their type.
+        let text = |text: &str| {
+            delta(json!({"reasoning_details":[{"type":"reasoning.text","text":text}]}))
+        };
+        let reduced = reduced_as(
+            ReasoningFormat::Details,
+            vec![
+                text("Weigh "),
+                text("both."),
+                delta(json!({"reasoning_details":[{"type":"reasoning.summary","summary":"Sum"}]})),
+                text("Again"),
+                end("stop"),
+            ],
+        );
+        assert_eq!(
+            contents(reduced.items()),
+            [
+                reasoning("Weigh both."),
+                reasoning("Sum"),
+                reasoning("Again")
+            ]
+        );
+    }
+
+    /// A response's readable details take the place of its plain reasoning, which a
+    /// provider may stream and then send whole as a detail; it is shown live and
+    /// kept only where the response has no readable detail.
+    #[test]
+    fn readable_details_take_the_place_of_plain_reasoning_per_response() {
+        let signed = json!({"type":"reasoning.text","text":"Weigh both.","signature":"sig"});
+        let reduced = reduced_as(
+            ReasoningFormat::Details,
+            vec![
+                delta(json!({"reasoning":"Weigh "})),
+                delta(json!({"reasoning":"both."})),
+                delta(json!({"reasoning":"Weigh both.","reasoning_details":[signed]})),
+                delta(json!({"reasoning":"Later."})),
+                delta(json!({"content":"399."})),
+                end("stop"),
+            ],
+        );
+        assert_eq!(
+            reduced.streamed(ItemKind::Reasoning),
+            ["Weigh both.", "Weigh both."]
+        );
+        assert_eq!(
+            contents(reduced.items()),
+            [reasoning("Weigh both."), text("399.")]
+        );
+        assert_eq!(
+            native_replays(&reduced, ReasoningFormat::Details),
+            [(signed, Binding::Conversation)]
+        );
+        // Without readable details, the plain reasoning stays beside them.
+        let opaque = json!({"type":"reasoning.encrypted","data":""});
+        let reduced = reduced_as(
+            ReasoningFormat::Details,
+            vec![
+                delta(json!({"reasoning":"Weigh.","reasoning_details":[opaque]})),
+                delta(json!({"content":"399."})),
+                end("stop"),
+            ],
+        );
+        assert_eq!(
+            contents(reduced.items()),
+            [reasoning(""), reasoning("Weigh."), text("399.")]
+        );
+    }
+
+    /// Text continues a detail only while it receives output and before its
+    /// signature; a signature alone seals the latest open detail across output since.
+    /// Thinking blocks complete the same way. Fragments may carry no index or reuse one.
+    #[test]
+    fn a_signed_detail_is_never_extended() {
+        let call = |index: u64, id: &str| {
+            delta(
+                json!({"tool_calls":[{"index":index,"id":id,"function":{"name":"run","arguments":"{}"}}]}),
+            )
+        };
+        let content = |text: &str| delta(json!({ "content": text }));
+        for index in [Value::Null, json!(0)] {
+            let detail = |text: &str, signature: Option<&str>| {
+                let mut detail = json!({"type":"reasoning.text","text":text,"index":index});
+                if let Some(signature) = signature {
+                    detail["signature"] = json!(signature);
+                }
+                delta(json!({ "reasoning_details": [detail] }))
+            };
+            let reduced = reduced_as(
+                ReasoningFormat::Details,
+                vec![
+                    detail("First.", None),
+                    detail("", Some("s1")),
+                    call(0, "c1"),
+                    detail("Second.", None),
+                    detail("", Some("s2")),
+                    detail("Third.", None),
+                    content("ok"),
+                    detail("Fourth.", None),
+                    content("more"),
+                    detail("", Some("s4")),
+                    detail("Fifth.", None),
+                    call(1, "c2"),
+                    detail("", Some("s5")),
+                    end("stop"),
+                ],
+            );
+            let texts: Vec<_> = native_replays(&reduced, ReasoningFormat::Details)
+                .into_iter()
+                .map(|(payload, _)| (payload["text"].clone(), payload.get("signature").cloned()))
+                .collect();
+            assert_eq!(
+                texts,
+                [
+                    (json!("First."), Some(json!("s1"))),
+                    (json!("Second."), Some(json!("s2"))),
+                    (json!("Third."), None),
+                    (json!("Fourth."), Some(json!("s4"))),
+                    (json!("Fifth."), Some(json!("s5"))),
+                ],
+                "{index}"
+            );
+        }
+        let thinking =
+            |text: &str| delta(json!({"thinking_blocks":[{"type":"thinking","thinking":text}]}));
+        let sealed =
+            delta(json!({"thinking_blocks":[{"type":"thinking","thinking":"","signature":"sig"}]}));
+        for between in [content("Hi"), call(0, "c1")] {
+            let reduced = reduced_as(
+                ReasoningFormat::ThinkingBlocks,
+                vec![thinking("Think."), between, sealed.clone(), end("stop")],
+            );
+            assert_eq!(
+                native_replays(&reduced, ReasoningFormat::ThinkingBlocks),
+                [(
+                    json!({"type":"thinking","thinking":"Think.","signature":"sig"}),
+                    Binding::Conversation
+                )]
+            );
+        }
     }
 }

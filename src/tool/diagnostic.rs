@@ -73,6 +73,15 @@ named_enum! {
         DestinationReplaced = "destination_replaced",
         PartialChange = "partial_change",
         OutputIncomplete = "output_incomplete",
+    }
+}
+
+named_enum! {
+    /// What a request sent over the network, to an MCP server or to a remote
+    /// target may have done there, independent of the local [`Effects`].
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum RequestEffects {
+        Unknown = "unknown",
         MayHaveExecuted = "may_have_executed",
     }
 }
@@ -205,6 +214,7 @@ pub struct DiagnosticContext {
     pub subject: Subject,
     pub site: FailureSite,
     pub effects: Effects,
+    pub request: RequestEffects,
     pub paths: Vec<PathFact>,
 }
 
@@ -215,6 +225,7 @@ pub struct PartialContext {
     operation: Option<(Operation, Subject)>,
     site: Option<FailureSite>,
     effects: Option<Effects>,
+    request: Option<RequestEffects>,
     paths: Vec<PathFact>,
 }
 
@@ -258,6 +269,11 @@ impl PartialContext {
         self.effects = Some(effects);
         self
     }
+    #[must_use]
+    pub fn request(mut self, request: RequestEffects) -> Self {
+        self.request = Some(request);
+        self
+    }
     /// Fill the facts this context leaves unset from `fallback`.
     #[must_use]
     pub fn or(self, fallback: Self) -> Self {
@@ -265,6 +281,7 @@ impl PartialContext {
             operation: self.operation.or(fallback.operation),
             site: self.site.or(fallback.site),
             effects: self.effects.or(fallback.effects),
+            request: self.request.or(fallback.request),
             paths: if self.paths.is_empty() {
                 fallback.paths
             } else {
@@ -283,6 +300,7 @@ impl PartialContext {
             subject,
             site: self.site.unwrap_or(FailureSite::Invocation),
             effects: self.effects.unwrap_or(Effects::Unknown),
+            request: self.request.unwrap_or(RequestEffects::Unknown),
             paths: self.paths,
         }
     }
@@ -295,6 +313,7 @@ impl From<DiagnosticContext> for PartialContext {
             operation: Some((context.operation, context.subject)),
             site: Some(context.site),
             effects: Some(context.effects),
+            request: Some(context.request),
             paths: context.paths,
         }
     }
@@ -465,9 +484,6 @@ impl PartialDiagnostic {
             JournalFailed(failure) => return Self::session(failure.cause()),
             Refused(phase) => Message(format!("the session is {phase}")),
             Database(_) => Message("session database operation failed".into()),
-            TemplateHistory => {
-                Message("model request template must not contain conversation history".into())
-            }
             ModelRequestReplay { sequence, reason } => Message(format!(
                 "cannot reconstruct model request at sequence {sequence}: {reason}"
             )),
@@ -605,6 +621,10 @@ impl Diagnostic {
                 text.push_str(&JobError::AlreadyTerminal(*job).to_string())
             }
         }
+        text.push_str(match self.context.request {
+            RequestEffects::Unknown => "",
+            RequestEffects::MayHaveExecuted => "; request may have executed",
+        });
         text.push_str(match self.context.effects {
             Effects::Unknown => "",
             Effects::NotStarted => "; operation did not start",
@@ -613,7 +633,6 @@ impl Diagnostic {
             Effects::DestinationReplaced => "; destination replaced; durability is uncertain",
             Effects::PartialChange => "; partial changes may remain",
             Effects::OutputIncomplete => "; output incomplete",
-            Effects::MayHaveExecuted => "; request may have executed; completion is unknown",
         });
         text
     }
@@ -727,9 +746,9 @@ pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>
                     .map(|error| schema_argument_failure(&schema, &value, &error))
             })
             .unwrap_or_else(|| {
-                // Custom deserializers may reject values the schema accepts. Report
-                // the declared expectation, never serde's Display.
-                let (path, node) = argument_location(
+                // Custom deserializers may reject values the schema accepts. Never
+                // report serde's Display, which embeds the rejected value.
+                let path = safe_argument_path(
                     &schema,
                     error.path().iter().map(|segment| match segment {
                         serde_path_to_error::Segment::Map { key } => {
@@ -741,10 +760,7 @@ pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>
                         _ => ArgumentPathSegment::Unknown,
                     }),
                 );
-                let expectation = node
-                    .and_then(argument_expectation)
-                    .unwrap_or_else(|| "invalid argument value".to_owned());
-                (path, expectation)
+                (path, "invalid argument value".to_owned())
             });
         super::AdmissionError::invalid_arguments(expectation)
             .operation(Operation::Deserialize, Subject::Argument(path))
@@ -919,13 +935,6 @@ pub(crate) fn safe_argument_path<'a>(
     schema: &serde_json::Value,
     path: impl IntoIterator<Item = ArgumentPathSegment<'a>>,
 ) -> String {
-    argument_location(schema, path).0
-}
-
-fn argument_location<'schema, 'path>(
-    schema: &'schema serde_json::Value,
-    path: impl IntoIterator<Item = ArgumentPathSegment<'path>>,
-) -> (String, Option<&'schema serde_json::Value>) {
     let resolver = crate::json_schema::Resolver::new(schema);
     let mut node = Some(resolver.root());
     let mut rendered = String::new();
@@ -955,28 +964,7 @@ fn argument_location<'schema, 'path>(
             }
         };
     }
-    let leaf = node.and_then(|node| resolver.resolve(node));
-    (rendered, leaf.map(|node| node.schema))
-}
-
-/// Read expectations from the same trusted leaf used for path privacy, never
-/// serde's Display (which embeds the rejected value).
-fn argument_expectation(node: &serde_json::Value) -> Option<String> {
-    let kind = node.get("type")?.as_str()?.parse().ok()?;
-    let mut expectation = format!("expected {}", argument_type(kind));
-    for (key, label) in [
-        ("minimum", "minimum"),
-        ("maximum", "maximum"),
-        ("minLength", "minimum length"),
-        ("maxLength", "maximum length"),
-        ("minItems", "minimum items"),
-        ("maxItems", "maximum items"),
-    ] {
-        if let Some(value) = node.get(key).and_then(serde_json::Value::as_number) {
-            expectation.push_str(&format!("; {label} {value}"));
-        }
-    }
-    Some(expectation)
+    rendered
 }
 
 #[cfg(test)]
@@ -1014,19 +1002,16 @@ mod tests {
             host.render_for(DiagnosticViewer::new(&capabilities, &remote))
                 .contains("on session host")
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let mut diagnostic = diagnostic;
-            let path = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
-            diagnostic.context.subject = Subject::path(PathBuf::from(path));
-            let decoded: Diagnostic =
-                serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
-            assert_eq!(decoded, diagnostic);
-            let text = decoded.render(&CapabilitySet::default());
-            assert!(text.contains("\\xff"));
-            assert!(!text.contains('�'));
-        }
+        use std::os::unix::ffi::OsStringExt;
+        let mut diagnostic = diagnostic;
+        let path = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        diagnostic.context.subject = Subject::path(PathBuf::from(path));
+        let decoded: Diagnostic =
+            serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
+        assert_eq!(decoded, diagnostic);
+        let text = decoded.render(&CapabilitySet::default());
+        assert!(text.contains("\\xff"));
+        assert!(!text.contains('�'));
     }
     #[test]
     fn native_arguments_report_declared_paths_and_types_without_user_data() {
@@ -1091,7 +1076,7 @@ mod tests {
         use ArgumentPathSegment::{Index as I, Property as P, Unknown as U};
         let schema = json!({
             "$defs": {"entry/name": {"properties": {
-                "value": {"type": "integer", "minimum": 1},
+                "value": {},
                 "next": {"$ref": "#/$defs/entry~1name"}
             }}},
             "properties": {
@@ -1104,40 +1089,28 @@ mod tests {
                 "choice": {"anyOf": [{"type": "integer"}, {"type": "string"}]}
             }
         });
-        let integer = Some("expected an integer; minimum 1");
-        for (path, expected, expectation) in [
-            (vec![], "", None),
-            (
-                vec![P("map"), P("secret"), P("value")],
-                "/map/*/value",
-                integer,
-            ),
+        for (path, expected) in [
+            (vec![], ""),
+            (vec![P("map"), P("secret"), P("value")], "/map/*/value"),
             (
                 vec![P("array"), I(2), P("next"), P("value")],
                 "/array/2/next/value",
-                integer,
             ),
-            (vec![P("~a/b"), P(""), P("007")], "/~0a~1b//007", None),
-            (vec![P("map"), P("123456"), P("unknown")], "/map/*/*", None),
-            (vec![P("unknown"), P("map")], "/*/*", None),
-            (vec![U, P("map")], "/*/*", None),
-            (vec![P("cycle"), P("value")], "/cycle/*", None),
-            (vec![P("external"), P("value")], "/external/*", None),
-            (
-                vec![P("pattern"), P("secret"), P("value")],
-                "/pattern/*/*",
-                None,
-            ),
-            (vec![P("choice")], "/choice", None),
+            (vec![P("~a/b"), P(""), P("007")], "/~0a~1b//007"),
+            (vec![P("map"), P("123456"), P("unknown")], "/map/*/*"),
+            (vec![P("unknown"), P("map")], "/*/*"),
+            (vec![U, P("map")], "/*/*"),
+            (vec![P("cycle"), P("value")], "/cycle/*"),
+            (vec![P("external"), P("value")], "/external/*"),
+            (vec![P("pattern"), P("secret"), P("value")], "/pattern/*/*"),
+            (vec![P("choice")], "/choice"),
         ] {
-            assert_eq!(safe_argument_path(&schema, path.clone()), expected);
-            let (_, node) = argument_location(&schema, path);
-            assert_eq!(node.and_then(argument_expectation).as_deref(), expectation);
+            assert_eq!(safe_argument_path(&schema, path), expected);
         }
     }
 
     #[test]
-    fn normalization_retains_facts_and_output_but_not_local_provenance() {
+    fn normalization_retains_facts_and_output() {
         let context =
             PartialContext::new(Operation::Deserialize, Subject::argument(["items", "0"]))
                 .at(FailureSite::Host)
@@ -1151,17 +1124,15 @@ mod tests {
             },
         );
         let native = serde_json::from_str::<serde_json::Value>("{private-payload").unwrap_err();
-        for (error, cause, source) in [
-            (OperationError::from(native), Cause::Json, false),
+        for (error, cause) in [
+            (OperationError::from(native), Cause::Json),
             (
-                OperationError::source_filesystem_io(io::Error::other("filesystem reason")),
+                OperationError::io(io::Error::other("filesystem reason")),
                 Cause::io(&io::Error::other("filesystem reason")),
-                true,
             ),
             (
                 OperationError::from_diagnostic(wire.clone(), None),
                 wire.cause,
-                false,
             ),
         ] {
             let error = error
@@ -1170,7 +1141,6 @@ mod tests {
                 .with_result(7)
                 .try_map_output(|value| Ok::<_, ()>(u16::from(value)))
                 .unwrap();
-            assert_eq!(error.is_source_filesystem_io(), source);
             let (diagnostic, output) = error.into_parts();
             assert_eq!(diagnostic.cause, cause);
             assert_eq!(diagnostic.context, context.clone().resolve());
@@ -1183,7 +1153,6 @@ mod tests {
             let restored = OperationError::from_diagnostic(decoded, output).or(
                 PartialContext::new(Operation::Copy, Subject::path("fallback")),
             );
-            assert!(!restored.is_source_filesystem_io());
             assert_eq!(restored.into_parts(), (diagnostic, output));
         }
     }

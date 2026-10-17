@@ -21,16 +21,10 @@ pub(super) struct CallIds<'a> {
 }
 
 impl Decoder {
-    /// Apply a delta's tool fragments, the legacy `function_call` among them.
+    /// Apply a delta's tool fragments.
     pub(super) fn tool_deltas(&mut self, delta: &wire::Delta, events: &mut Vec<ResponseEvent>) {
-        let legacy = delta.legacy_call();
-        // Unindexed entries seen in this delta; another named entry is a new call.
-        let mut touched = BTreeSet::new();
-        for call in delta.tool_calls.iter().flatten().chain(legacy.as_ref()) {
-            let index = self.tool_index(call, &touched);
-            if call.index.is_none() {
-                touched.insert(index);
-            }
+        for call in delta.tool_calls.iter().flatten() {
+            let index = self.tool_index(call);
             // One delta may carry a header and argument fragments for the
             // same index. Apply each entry in wire order, not as a map.
             let id = if let Some(id) = self.tool_ids.get(&index) {
@@ -81,7 +75,7 @@ impl Decoder {
 
     /// The wire index of a tool fragment. Unindexed fragments continue the latest
     /// call unless their ID, name, or a new object shows a different call.
-    fn tool_index(&self, call: &wire::ToolDelta, touched: &BTreeSet<u64>) -> u64 {
+    fn tool_index(&self, call: &wire::ToolDelta) -> u64 {
         if let Some(index) = call.index {
             return index;
         }
@@ -114,21 +108,18 @@ impl Decoder {
             .and_then(|function| function.name.as_deref())
             .filter(|name| !name.is_empty());
         let fragment = function.and_then(|function| function.arguments.as_deref());
-        let id_differs = id.is_some_and(|id| !call_id.is_empty() && id != call_id);
+        let complete = !arguments.trim().is_empty() && parse_tool_arguments(arguments).is_some();
+        // A late ID names an anonymous call until its arguments are complete.
+        let id_differs = id.is_some_and(|id| id != call_id && (!call_id.is_empty() || complete));
         let name_differs = new_name.is_some_and(|new_name| !name.is_empty() && new_name != name);
-        let id_after_anonymous =
-            id.is_some() && call_id.is_empty() && new_name.is_some() && !name.is_empty();
-        let named_again_in_delta = new_name.is_some() && touched.contains(&index);
-        let new_object_after_complete = new_name.is_some()
-            && !arguments.trim().is_empty()
-            && parse_tool_arguments(arguments).is_some()
+        let new_object_after_complete = complete
+            && new_name.is_some()
             && fragment.is_some_and(|fragment| fragment.trim_start().starts_with('{'));
-        let new_call = id_differs
-            || name_differs
-            || id_after_anonymous
-            || named_again_in_delta
-            || new_object_after_complete;
-        if new_call { next() } else { index }
+        if id_differs || name_differs || new_object_after_complete {
+            next()
+        } else {
+            index
+        }
     }
 
     pub(super) fn call_ids(&self) -> CallIds<'_> {
@@ -294,8 +285,6 @@ mod tests {
     fn unusable_tool_calls_are_rejected_at_the_finish() {
         for calls in [
             call("call", "{"),
-            call("call", "[]"),
-            call("call", "1"),
             json!([{"index":0,"function":{"arguments":"{}"}}]),
             // Non-string arguments are rejected, not emptied.
             json!([{"index":0,"id":"c","function":{"name":"rm","arguments":[1]}}]),
@@ -448,6 +437,34 @@ mod tests {
                 ],
                 vec![("c", "run", json!({}))],
             ),
+            // An ID after an anonymous header of the same name continues it.
+            (
+                vec![
+                    tool_delta(json!([{"function":{"name":"one","arguments":""}}])),
+                    tool_delta(json!([{"id":"b","function":{"name":"one","arguments":"{}"}}])),
+                ],
+                vec![("b", "one", json!({}))],
+            ),
+            // ...but not one whose arguments are already complete.
+            (
+                vec![
+                    tool_delta(json!([{"function":{"name":"one","arguments":"{}"}}])),
+                    tool_delta(json!([{"id":"call_b","function":{"name":"one"}}])),
+                    tool_delta(json!([{"function":{"arguments":"{\"path\":\"b\"}"}}])),
+                ],
+                vec![
+                    (SYNTHETIC, "one", json!({})),
+                    ("call_b", "one", json!({"path":"b"})),
+                ],
+            ),
+            // The same name re-sent within one delta continues incomplete arguments.
+            (
+                vec![tool_delta(json!([
+                    {"function":{"name":"same","arguments":"{\"n\":"}},
+                    {"function":{"name":"same","arguments":"1}"}}
+                ]))],
+                vec![(SYNTHETIC, "same", json!({"n":1}))],
+            ),
             // Same-name unindexed calls in separate deltas: a new object after
             // a complete one opens a second call.
             (
@@ -473,18 +490,6 @@ mod tests {
         ] {
             assert_calls(frames, expected);
         }
-    }
-
-    #[test]
-    fn legacy_function_call_is_a_tool_call() {
-        let (items, _, _) = decode(vec![
-            delta(json!({"function_call":{"name":"legacy","arguments":"{\"y\":2}"}})),
-            end("function_call"),
-        ]);
-        assert_eq!(
-            calls_of(&items),
-            [(SYNTHETIC.to_owned(), "legacy".to_owned(), json!({"y":2}))]
-        );
     }
 
     #[test]

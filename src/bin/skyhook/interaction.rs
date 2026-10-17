@@ -5,8 +5,8 @@ use skyhook::{
     remote::{PromptAnswer, SensitivePrompt, SensitivePromptFuture, SensitivePromptHandler},
     target::TargetRef,
     tool::policy::{
-        AuthorizationRequest, Capability, CapabilitySet, PermissionUse, Policy, PolicyDecision,
-        PolicyFuture, ResourceId,
+        Approval, AuthorizationRequest, Capability, CapabilitySet, PermissionUse, Policy,
+        PolicyDecision, ResourceId,
     },
 };
 use std::sync::{
@@ -174,40 +174,27 @@ pub enum HostApprovalPolicy {
     },
 }
 
-/// Settled by the policy itself, or handed to the interface.
-enum Approval<'a> {
-    Decided(PolicyDecision),
-    Ask(&'a UiInteraction),
-}
-
-impl HostApprovalPolicy {
-    fn approval(&self, permissions: &[PermissionUse]) -> Approval<'_> {
-        if !permissions.iter().any(requires_prompt) {
+impl Policy for HostApprovalPolicy {
+    fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
+        if !request.permissions.iter().any(requires_prompt) {
             return Approval::Decided(PolicyDecision::allow());
         }
-        match self {
-            Self::Unattended => Approval::Decided(PolicyDecision::Deny {
-                reason: "approval requires an interactive interface".into(),
-            }),
+        let ui = match self {
+            Self::Unattended => {
+                return Approval::Decided(PolicyDecision::Deny {
+                    reason: "approval requires an interactive interface".into(),
+                });
+            }
             Self::Attended { capabilities, .. }
                 if !capabilities.contains(Capability::Interactive) =>
             {
-                Approval::Decided(PolicyDecision::Deny {
+                return Approval::Decided(PolicyDecision::Deny {
                     reason: "approval requires the interactive capability".into(),
-                })
+                });
             }
-            Self::Attended { ui, .. } => Approval::Ask(ui),
-        }
-    }
-}
-
-impl Policy for HostApprovalPolicy {
-    fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-        Box::pin(async move {
-            let ui = match self.approval(&request.permissions) {
-                Approval::Decided(decision) => return decision,
-                Approval::Ask(ui) => ui,
-            };
+            Self::Attended { ui, .. } => ui,
+        };
+        Approval::Ask(Box::pin(async move {
             let grants = request
                 .permissions
                 .iter()
@@ -219,12 +206,10 @@ impl Policy for HostApprovalPolicy {
             {
                 Ok(ApprovalReply::Allow) => PolicyDecision::allow(),
                 Ok(ApprovalReply::Grant) => PolicyDecision::Allow { grants },
-                Ok(ApprovalReply::Deny) => PolicyDecision::Deny {
-                    reason: "denied by user".into(),
-                },
+                Ok(ApprovalReply::Deny) => PolicyDecision::refused(),
                 Err(reason) => PolicyDecision::Deny { reason },
             }
-        })
+        }))
     }
 }
 
@@ -262,42 +247,16 @@ pub(crate) mod tests {
         skyhook::config::Config::from_yaml("providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n").unwrap()
     }
 
-    // AuthorizationRequest contains core-private provenance. Capture a real
-    // core-produced request rather than introducing a test-only public ctor.
-    pub(crate) async fn approval_request() -> AuthorizationRequest {
-        let root = tempfile::tempdir().unwrap();
-        let config = test_config();
-        let (ui, mut rx) = UiInteraction::new();
-        let harness = config
-            .into_runtime()
-            .unwrap()
-            .select_model(&"test/first".parse().unwrap())
-            .unwrap()
-            .harness_builder(root.path())
-            .unwrap()
-            .session_root(root.path().join("sessions"))
-            .policy(Arc::new(attended(true, ui)))
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        let operation = tokio::spawn({
-            let session = session.clone();
-            async move {
-                let script = "return await tool.exec({command:['true']});";
-                session.run_script(script).await
-            }
-        });
-        let prompt = crate::tests::bounded(rx.recv()).await.unwrap();
-        let PromptKind::Approval { request, .. } = &prompt.kind else {
-            panic!("expected approval");
-        };
-        let request = request.clone();
-        // The subprocess is never approved or executed by this fixture.
-        prompt.reject("fixture captures only".into());
-        let _ = operation.await.unwrap();
-        session.shutdown().await.unwrap();
-        request
+    pub(crate) fn approval_request() -> AuthorizationRequest {
+        let session = skyhook::identity::SessionId::from_bytes([1; 16]);
+        AuthorizationRequest {
+            agent: skyhook::identity::AgentId::root(session),
+            job: skyhook::identity::JobId::new(1).unwrap(),
+            parent: None,
+            tool: "exec".into(),
+            permissions: vec![PermissionUse::exact(Exec, workspace("root"))],
+            arguments: serde_json::json!({"tool": {"command": ["true"]}}),
+        }
     }
 
     fn workspace(target: &str) -> ResourceId {
@@ -324,20 +283,31 @@ pub(crate) mod tests {
         policy: &HostApprovalPolicy,
         permissions: &[PermissionUse],
     ) -> Option<PolicyDecision> {
-        match policy.approval(permissions) {
+        let request = AuthorizationRequest {
+            permissions: permissions.to_vec(),
+            ..approval_request()
+        };
+        match policy.authorize(request) {
             Approval::Decided(decision) => Some(decision),
             Approval::Ask(_) => None,
         }
     }
 
-    fn password_prompt() -> SensitivePrompt {
+    pub(crate) fn sensitive_prompt(
+        kind: skyhook::remote::SensitivePromptKind,
+        message: impl Into<String>,
+    ) -> SensitivePrompt {
         SensitivePrompt {
-            kind: skyhook::remote::SensitivePromptKind::Password,
-            message: "password".into(),
+            kind,
+            message: message.into(),
             target: None,
             origin: TargetRef::Root,
             requester: Default::default(),
         }
+    }
+
+    fn password_prompt() -> SensitivePrompt {
+        sensitive_prompt(skyhook::remote::SensitivePromptKind::Password, "password")
     }
 
     #[test]
@@ -447,7 +417,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn approval_replies_preserve_decisions_and_only_proposed_grants() {
         use skyhook::tool::policy::ApprovalGrant;
-        let mut request = approval_request().await;
+        let mut request = approval_request();
         let grant = ApprovalGrant::exact(Exec, workspace("root"));
         request.permissions = vec![PermissionUse::exact(Exec, workspace("root"))];
         let deny = |reason: &str| PolicyDecision::Deny {
@@ -455,7 +425,7 @@ pub(crate) mod tests {
         };
         for (answer, expected) in [
             (Ok(ApprovalReply::Allow), PolicyDecision::allow()),
-            (Ok(ApprovalReply::Deny), deny("denied by user")),
+            (Ok(ApprovalReply::Deny), PolicyDecision::refused()),
             (
                 Ok(ApprovalReply::Grant),
                 PolicyDecision::Allow {
@@ -470,7 +440,12 @@ pub(crate) mod tests {
             let (ui, mut rx) = UiInteraction::new();
             let request = request.clone();
             let policy = attended(true, ui);
-            let task = tokio::spawn(async move { policy.authorize(request).await });
+            let task = tokio::spawn(async move {
+                let Approval::Ask(asked) = policy.authorize(request) else {
+                    panic!("an interactive approval asks");
+                };
+                asked.await
+            });
             let PromptKind::Approval { reply, .. } = rx.recv().await.unwrap().kind else {
                 panic!("approval");
             };

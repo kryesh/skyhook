@@ -14,8 +14,8 @@ pub use message::{
     UserContent, visible_text,
 };
 pub use request::{
-    ContextId, HistoryLifetime, ModelRequest, ResponseSchema, SystemSegment, ToolDefinition,
-    WireModel,
+    ContextId, HistoryLifetime, InvalidResponseSchema, ModelRequest, ResponseSchema, SystemSegment,
+    ToolDefinition, WireModel,
 };
 pub use response::{
     BlockRef, Completion, CompletionError, CutReason, LiveBlock, LiveResponse, Outcome,

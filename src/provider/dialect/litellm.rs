@@ -3,8 +3,11 @@
 //! takes Anthropic's conventions on every codec: signed `thinking_blocks` and
 //! `cache_control` on Chat, and its own Messages conventions, since the proxy forwards
 //! Messages as sent. OpenAI takes OpenAI's. Bedrock serves both families, so its codec
-//! decides: OpenAI's conventions on Chat and Responses, with Chat replaying the signed
-//! `thinking_blocks` its Bedrock path returns, and standard Messages on Messages.
+//! decides: OpenAI's conventions on Chat and Responses, with Chat replaying the
+//! `thinking_blocks` its Bedrock path returns, and standard Messages on Messages; both
+//! send unsigned thinking back, which only Anthropic's services refuse.
+//! Tool names follow the upstream's alphabet on every codec; response schemas are
+//! strict except behind Anthropic, which does not honour `strict`, so they go as written.
 //! Every codec takes the proxy's virtual key as a bearer token; deployment tags ride
 //! `x-litellm-tags`.
 //!
@@ -14,7 +17,7 @@
 //! to the service for its own cache affinity.
 
 use reqwest::header::HeaderValue;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{Dialect, DialectConfig, DialectError, Profile};
 use crate::{
@@ -23,14 +26,15 @@ use crate::{
     provider::{
         ProviderErrorKind,
         codec::{
-            CacheKey, Codec, CodecName, Locations, NonEmpty, SchemaConstraint, StateRole,
-            ToolNames,
-            chat_completions::{self, Cache, EmptyContent, ReasoningReplay},
+            BodyPath, BreakpointBudget, CacheControl, CacheKey, Codec, CodecName, Locations,
+            NonEmpty, StateRole, ToolNames, UnsignedReasoning,
+            chat_completions::{self, EmptyContent, NativeReplay, ReasoningReplay},
+            common::lenient,
             header, messages, path,
         },
         http::{
             Transport,
-            errors::{ErrorRule, ErrorSignals, Field},
+            errors::{ErrorSignals, error_object},
         },
     },
 };
@@ -63,52 +67,65 @@ fn chat_openai() -> chat_completions::Dialect {
     chat_completions::Dialect {
         reasoning_replay: ReasoningReplay::Unsupported,
         empty_content: EmptyContent::Null,
-        tool_names: ToolNames::OpenAi,
-        schema: SchemaConstraint::OpenAiStrict,
         ..chat_completions::Dialect::compatible()
     }
 }
 
-/// OpenAI's conventions, replaying the signed `thinking_blocks` the proxy returns, from
-/// which its Bedrock path rebuilds the model's reasoning.
+/// OpenAI's conventions, replaying the `thinking_blocks` the proxy returns, from which
+/// its Bedrock path rebuilds the model's reasoning. Bedrock serves models that take
+/// back unsigned thinking as well as models that sign theirs.
 fn chat_bedrock() -> chat_completions::Dialect {
     chat_completions::Dialect {
-        reasoning_replay: thinking_blocks(),
+        reasoning_replay: thinking_blocks(UnsignedReasoning::Replayed(Locations::NONE)),
         ..chat_openai()
     }
 }
 
-/// Anthropic's tool-name alphabet is OpenAI's; `strict` is not honoured, so the
-/// schema goes as written.
+/// The service behind takes back no unsigned thinking.
 fn chat_anthropic() -> chat_completions::Dialect {
     chat_completions::Dialect {
-        reasoning_replay: thinking_blocks(),
+        reasoning_replay: thinking_blocks(UnsignedReasoning::Dropped),
         empty_content: EmptyContent::Null,
-        tool_names: ToolNames::OpenAi,
-        cache: Cache::ContentPartBreakpoints { ttl: None },
+        cache_control: CacheControl::Sent { ttl: None },
+        // The service's cap on breakpoints per request.
+        breakpoints: BreakpointBudget::new(4),
         ..chat_completions::Dialect::compatible()
     }
 }
 
-fn thinking_blocks() -> ReasoningReplay {
-    ReasoningReplay::ThinkingBlocks(NonEmpty::one(const { path("thinking_blocks") }))
+fn thinking_blocks(unsigned: UnsignedReasoning<Locations<BodyPath>>) -> ReasoningReplay {
+    ReasoningReplay::ThinkingBlocks(NativeReplay {
+        objects: NonEmpty::one(const { path("thinking_blocks") }),
+        unsigned,
+    })
 }
 
 /// Proxy errors name an overflow only in the message, and an exhausted
 /// virtual-key budget by its type.
-const ERRORS: ErrorSignals = ErrorSignals {
-    rules: &[
-        ErrorRule {
-            message: Some("ContextWindowExceededError"),
-            ..ErrorRule::kind(ProviderErrorKind::ContextWindowExceeded)
-        },
-        ErrorRule {
-            field: Some(Field::Equals("type", "budget_exceeded")),
-            ..ErrorRule::kind(ProviderErrorKind::Billing)
-        },
-    ],
-    ..ErrorSignals::NONE
-};
+const ERRORS: ErrorSignals = ErrorSignals(|_, native, _| {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Type {
+        BudgetExceeded,
+    }
+    #[derive(Deserialize)]
+    struct ProxyError {
+        #[serde(default, deserialize_with = "lenient")]
+        message: Option<String>,
+        #[serde(rename = "type", default, deserialize_with = "lenient")]
+        kind: Option<Type>,
+    }
+    let error = ProxyError::deserialize(error_object(native)).ok()?;
+    if error
+        .message
+        .is_some_and(|message| message.contains("ContextWindowExceededError"))
+    {
+        return Some(ProviderErrorKind::ContextWindowExceeded);
+    }
+    error
+        .kind
+        .map(|Type::BudgetExceeded| ProviderErrorKind::Billing)
+});
 
 fn transport() -> Transport {
     Transport {
@@ -163,6 +180,11 @@ impl DialectConfig for Config {
             }
             CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
+        if anthropic {
+            *conventions.tool_names_mut() = ToolNames::Anthropic;
+        } else {
+            super::openai::conventions(&mut conventions);
+        }
         let session = Locations::one(header("x-litellm-session-id"));
         conventions.identity_mut().cache_key = if codec != CodecName::Messages && !anthropic {
             session.with(CacheKey::Body(const { path("prompt_cache_key") }))
@@ -224,6 +246,12 @@ mod tests {
         assert_eq!(header_values(&chat, "authorization"), ["Bearer sk-virtual"]);
         assert_eq!(header_values(&chat, "x-litellm-session-id"), ["ctx"]);
         assert_eq!(header_values(&chat, "x-litellm-tags"), ["team-a,prod"]);
+        let messages = head(&config, CodecName::Messages, "sk-virtual").await;
+        assert_eq!(
+            header_values(&messages, "authorization"),
+            ["Bearer sk-virtual"]
+        );
+        assert!(header_values(&messages, "x-api-key").is_empty());
         // Affinity rides the session header behind every upstream.
         let openai = Config {
             upstream: Upstream::Openai,
@@ -237,7 +265,8 @@ mod tests {
     }
 
     /// Bedrock serves both families, so its codec decides: OpenAI's conventions on Chat and
-    /// Responses, where Anthropic keeps its own, with Chat still replaying signed thinking.
+    /// Responses, where Anthropic keeps its own, with Chat still replaying thinking blocks.
+    /// Unsigned thinking goes back behind Bedrock, but not behind Anthropic.
     #[test]
     fn bedrock_takes_openai_conventions_and_replays_thinking_on_chat() {
         let codec = |upstream, codec| {
@@ -257,10 +286,22 @@ mod tests {
             other => panic!("Chat conventions: {other:?}"),
         };
         let (bedrock, openai) = (chat(Upstream::Bedrock), chat(Upstream::Openai));
+        let anthropic = chat(Upstream::Anthropic);
+        let unsigned = |dialect: &chat_completions::Dialect| match &dialect.reasoning_replay {
+            ReasoningReplay::ThinkingBlocks(native) => native.unsigned.clone(),
+            other => panic!("thinking blocks: {other:?}"),
+        };
         assert_eq!(
-            bedrock.reasoning_replay,
-            chat(Upstream::Anthropic).reasoning_replay
+            unsigned(&bedrock),
+            UnsignedReasoning::Replayed(Locations::NONE)
         );
+        assert_eq!(unsigned(&anthropic), UnsignedReasoning::Dropped);
+        let Codec::Messages(messages) = codec(Upstream::Bedrock, CodecName::Messages) else {
+            panic!("Messages conventions")
+        };
+        assert_eq!(messages.unsigned, UnsignedReasoning::Replayed(()));
+        assert_eq!(anthropic.cache_control, CacheControl::Sent { ttl: None });
+        assert_ne!(openai.cache_control, anthropic.cache_control);
         assert_eq!(
             chat_completions::Dialect {
                 reasoning_replay: openai.reasoning_replay.clone(),

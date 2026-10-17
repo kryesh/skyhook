@@ -1,18 +1,16 @@
 //! Encode Responses input history, replay, runtime state, and explicit cache checkpoints.
-use super::{Cache, Dialect, ProviderError, native::ItemType, reasoning_parts};
-use crate::{
-    named_enum::named_enum,
-    provider::{
-        ProviderErrorKind::InvalidRequest,
-        codec::{
-            StateRole,
-            common::{image_url, own_replay, tagged, tool_text, user_parts},
+use super::{Dialect, ProviderError, native::ItemType, reasoning_parts};
+use crate::provider::{
+    ProviderErrorKind::InvalidRequest,
+    codec::{
+        Cache,
+        common::{
+            StateWire, image_url, is_sealed, own_replay, push_state, signed_context, tagged,
+            tool_text, user_parts,
         },
-        protocol::{
-            AssistantItem, Entry, HistoryLifetime, Message, ModelRequest, Replay, ReplayFormat,
-            State, sent,
-        },
+        placement::{explicit_breakpoint, push_history},
     },
+    protocol::{AssistantItem, Entry, Message, ModelRequest, Replay, ReplayFormat},
 };
 use serde_json::{Value, json};
 
@@ -20,227 +18,190 @@ pub(super) fn encode(
     request: &ModelRequest,
     dialect: &Dialect,
 ) -> Result<Vec<Value>, ProviderError> {
-    let mut input = Vec::new();
-    let (prefix, rest) = sent(&request.context);
-    let checkpoints =
-        dialect.cache == Cache::Explicit && request.history_lifetime == HistoryLifetime::Extends;
-    // Reconstruct earlier writes at response seams before advancing to the prefix tail.
-    // Current state may coalesce into that tail's wrapper, but not its marked text block.
-    for entry in prefix {
-        if checkpoints && matches!(entry, Entry::Message(Message::Assistant(_))) {
-            mark_last(&mut input);
-        }
-        push_entry(request, dialect, &mut input, entry)?;
-    }
-    if checkpoints {
-        mark_last(&mut input);
-    }
-    for entry in rest {
-        push_entry(request, dialect, &mut input, entry)?;
-    }
-    Ok(input)
+    let mut input = Input::default();
+    let budget = match dialect.cache {
+        Cache::Explicit => Some(dialect.breakpoints),
+        Cache::Automatic => None,
+    };
+    let unsigned =
+        dialect.unsigned.replayed().is_some() && !signed_context(request, ReplayFormat::Responses);
+    // Current state may coalesce into the prefix tail's wrapper, but not its marked text block.
+    push_history(
+        &mut input,
+        request,
+        budget,
+        0,
+        |input, entry| input.push_entry(request, dialect, unsigned, entry),
+        |input| input.text,
+        Input::mark,
+    )?;
+    Ok(input.items)
 }
 
-fn push_entry(
-    request: &ModelRequest,
-    dialect: &Dialect,
-    input: &mut Vec<Value>,
-    entry: &Entry,
-) -> Result<(), ProviderError> {
-    let message = match entry {
-        Entry::Message(message) => message,
-        Entry::State(state) => {
-            push_state(dialect.state_role, input, state);
-            return Ok(());
+const STATE: StateWire = StateWire {
+    system: "developer",
+    text: "input_text",
+    message: |role, content| json!({"type":"message", "role":role, "content":content}),
+};
+
+/// Input items, and the last nonempty text part among them: where an explicit cache
+/// checkpoint goes.
+#[derive(Default)]
+struct Input {
+    items: Vec<Value>,
+    text: Option<TextPart>,
+}
+
+/// A text part: its item, the item's field holding its parts, and its index there.
+#[derive(Clone, Copy, PartialEq)]
+struct TextPart(usize, &'static str, usize);
+
+impl Input {
+    /// Push `item`, whose `field` may hold a nonempty text part at an index.
+    fn push(&mut self, item: Value, text: Option<(&'static str, usize)>) {
+        if let Some((field, part)) = text {
+            self.text = Some(TextPart(self.items.len(), field, part));
         }
-    };
-    match message {
-        Message::User(parts) => {
-            let content = user_parts(request, parts, "input_text", |image| {
-                Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
-            })?;
-            input.push(json!({"type":"message", "role":"user", "content":content}));
-        }
-        Message::Assistant(items) => {
-            for item in items {
-                match item {
-                    // Private replay belongs to the item, never to each display summary.
-                    AssistantItem::Reasoning { replay, .. } => {
-                        if let Some(Replay {
-                            payload: native, ..
-                        }) = own_replay(
-                            replay.as_ref(),
-                            ReplayFormat::Responses,
-                            request.model.as_str(),
-                        ) {
-                            if tagged(native) != Some(ItemType::Reasoning)
-                                || reasoning_parts(native).is_err()
+        self.items.push(item);
+    }
+
+    fn mark(&mut self, TextPart(item, field, part): TextPart) {
+        self.items[item][field][part]["prompt_cache_breakpoint"] = explicit_breakpoint();
+    }
+
+    fn push_entry(
+        &mut self,
+        request: &ModelRequest,
+        dialect: &Dialect,
+        unsigned: bool,
+        entry: &Entry,
+    ) -> Result<(), ProviderError> {
+        let message = match entry {
+            Entry::Message(message) => message,
+            Entry::State(state) => {
+                let pushed = push_state(dialect.state_role, &STATE, &mut self.items, state);
+                if let Some((item, part)) = pushed
+                    && !state.text.is_empty()
+                {
+                    self.text = Some(TextPart(item, "content", part));
+                }
+                return Ok(());
+            }
+        };
+        match message {
+            Message::User(parts) => {
+                let content = user_parts(request, parts, "input_text", |image| {
+                    Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
+                })?;
+                let text = content.iter().rposition(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                });
+                self.push(
+                    json!({"type":"message", "role":"user", "content":content}),
+                    text.map(|part| ("content", part)),
+                );
+            }
+            Message::Assistant(items) => {
+                for item in items {
+                    match item {
+                        // Private replay belongs to the item, never to each display summary.
+                        AssistantItem::Reasoning { replay, .. } => {
+                            if let Some(Replay {
+                                payload: native, ..
+                            }) = own_replay(
+                                replay.as_ref(),
+                                ReplayFormat::Responses,
+                                request.model.as_str(),
+                            )
+                            .filter(|replay| unsigned || is_sealed(replay))
                             {
-                                return Err(InvalidRequest.error(
-                                    "Responses reasoning replay is not a readable reasoning item",
-                                ));
+                                if tagged(native) != Some(ItemType::Reasoning)
+                                    || reasoning_parts(native).is_err()
+                                {
+                                    return Err(InvalidRequest.error(
+                                        "Responses reasoning replay is not a readable reasoning item",
+                                    ));
+                                }
+                                self.push(native.clone(), None);
                             }
-                            input.push(native.clone());
                         }
-                    }
-                    // `type` is optional in the spec, but some servers
-                    // cannot identify an assistant item without it.
-                    AssistantItem::Text { blocks, .. } => {
-                        for block in blocks {
-                            input.push(json!({
-                                "type":"message", "role":"assistant",
-                                "content":[{"type":"output_text", "text":block.text}]
-                            }));
+                        // `type` is optional in the spec, but some servers
+                        // cannot identify an assistant item without it.
+                        AssistantItem::Text { blocks, .. } => {
+                            for block in blocks {
+                                self.push(
+                                    json!({
+                                        "type":"message", "role":"assistant",
+                                        "content":[{"type":"output_text", "text":block.text}]
+                                    }),
+                                    None,
+                                );
+                            }
                         }
-                    }
-                    AssistantItem::ToolCall { call, .. } => {
-                        input.push(json!({"type":"function_call", "call_id":call.id(),
-                                "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}));
+                        AssistantItem::ToolCall { call, .. } => {
+                            self.push(json!({"type":"function_call", "call_id":call.id(),
+                                    "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}), None);
+                        }
                     }
                 }
             }
-        }
-        Message::Tool(results) => {
-            for result in results {
-                if result.call_id.is_empty() {
-                    return Err(InvalidRequest.error("Responses tool output requires a call ID"));
-                }
-                let output = match dialect.cache {
-                    Cache::Automatic => json!(tool_text(result)),
-                    Cache::Explicit => {
-                        json!([{"type":"input_text", "text":tool_text(result)}])
-                    }
-                };
-                input.push(json!({"type":"function_call_output",
-                        "call_id":result.call_id, "output":output}));
-                if !result.images.is_empty() {
-                    let mut content = vec![json!({"type":"input_text", "text":format!(
-                            "Images from tool {} (call_id: {}):", result.name, result.call_id)})];
-                    for image in &result.images {
-                        content.push(
-                            json!({"type":"input_image", "image_url":image_url(request, image)?}),
+            Message::Tool(results) => {
+                for result in results {
+                    if result.call_id.is_empty() {
+                        return Err(
+                            InvalidRequest.error("Responses tool output requires a call ID")
                         );
                     }
-                    input.push(json!({"type":"message", "role":"user", "content":content}));
+                    let (output, text) = match dialect.cache {
+                        Cache::Automatic => (json!(tool_text(result)), None),
+                        Cache::Explicit => (
+                            json!([{"type":"input_text", "text":tool_text(result)}]),
+                            Some(("output", 0)),
+                        ),
+                    };
+                    self.push(
+                        json!({"type":"function_call_output",
+                            "call_id":result.call_id, "output":output}),
+                        text,
+                    );
+                    if !result.images.is_empty() {
+                        let mut content = vec![json!({"type":"input_text", "text":format!(
+                                "Images from tool {} (call_id: {}):", result.name, result.call_id)})];
+                        for image in &result.images {
+                            content.push(
+                                json!({"type":"input_image", "image_url":image_url(request, image)?}),
+                            );
+                        }
+                        self.push(
+                            json!({"type":"message", "role":"user", "content":content}),
+                            Some(("content", 0)),
+                        );
+                    }
                 }
             }
         }
-    }
-    Ok(())
-}
-
-/// A state the model reads, in the dialect's role: a developer message, or user content
-/// joining the user message before it. Responses cannot hide a superseded state, so it is
-/// omitted.
-fn push_state(role: StateRole, input: &mut Vec<Value>, state: &State) {
-    if !state.is_read() {
-        return;
-    }
-    let text = || json!({"type":"input_text", "text":state.text});
-    match role {
-        StateRole::System => {
-            input.push(json!({"type":"message", "role":"developer", "content":[text()]}));
-        }
-        StateRole::User => match input.last_mut() {
-            Some(previous) if previous["type"] == "message" && previous["role"] == "user" => {
-                previous["content"]
-                    .as_array_mut()
-                    .expect("constructed array")
-                    .push(text());
-            }
-            _ => input.push(json!({"type":"message", "role":"user", "content":[text()]})),
-        },
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    parsed enum Carrier {
-        Message = "message",
-        ToolOutput = "function_call_output",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    parsed enum Part {
-        InputText = "input_text",
-    }
-}
-
-/// Mark the last supported, nonempty text block, leaving opaque native items alone.
-/// Repeated response seams may select the same block; insertion is idempotent.
-fn mark_last(input: &mut [Value]) {
-    for item in input.iter_mut().rev() {
-        let field = match tagged(item) {
-            Some(Carrier::Message) => "content",
-            Some(Carrier::ToolOutput) => "output",
-            None => continue,
-        };
-        let Some(parts) = item.get_mut(field).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for part in parts.iter_mut().rev() {
-            if tagged(part) == Some(Part::InputText)
-                && part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            {
-                part.as_object_mut()
-                    .expect("tagged object")
-                    .insert("prompt_cache_breakpoint".into(), json!({"mode":"explicit"}));
-                return;
-            }
-        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        Decoder,
-        tests::{assemble_with, call_item, completed, reasoning_item},
+    use super::super::tests::{
+        assemble_with, call_item, completed, decoder_for, message, reasoning_item,
     };
     use super::*;
-    use crate::media::{AttachmentRef, ImageRef};
+    use crate::media::AttachmentRef;
+    use crate::provider::codec::StateRole;
     use crate::provider::{
-        codec::common::tests::{envelope, image, notes, request, scope},
-        http::errors::ErrorSignals,
-        protocol::{Binding, Outcome, ToolResult, UserContent, entries},
+        codec::common::tests::{envelope, image, notes, request, tool_result, user},
+        protocol::{Binding, HistoryLifetime, Outcome, UserContent, entries},
     };
 
     fn assemble(output: Vec<Value>) -> Vec<AssistantItem> {
-        let decoder = Decoder::new(
-            "gpt-5".into(),
-            scope(),
-            &Dialect::stateless(),
-            ErrorSignals::NONE,
-        );
-        assemble_with(decoder, vec![completed(output)])
-            .unwrap()
-            .completion
-            .items()
-            .to_vec()
-    }
-
-    fn text_item(id: &str, text: &str) -> Value {
-        json!({"type":"message", "id":id, "role":"assistant",
-            "content":[{"type":"output_text", "text":text}]})
-    }
-
-    fn user(text: &str) -> Message {
-        Message::User(vec![UserContent::Text { text: text.into() }])
-    }
-
-    fn tool_result(result: Value, images: Vec<ImageRef>, is_error: bool) -> Message {
-        Message::Tool(vec![ToolResult {
-            call_id: "call_1".into(),
-            name: "search".into(),
-            result,
-            images,
-            is_error,
-        }])
+        let reduced = assemble_with(decoder_for("gpt-5"), vec![completed(output)]).unwrap();
+        reduced.completion.items().to_vec()
     }
 
     #[test]
@@ -256,7 +217,13 @@ mod tests {
         ]);
         req.context = entries(vec![
             Message::User(content),
-            tool_result(json!({"answer":42, "error":null}), vec![image()], true),
+            tool_result(
+                "call_1",
+                "search",
+                json!({"answer":42, "error":null}),
+                vec![image()],
+                true,
+            ),
         ]);
         assert!(encode(&req, &Dialect::stateless()).is_err());
         // Load the fixture blobs as the session store would.
@@ -297,6 +264,39 @@ mod tests {
         }
     }
 
+    /// Unencrypted reasoning goes back until the model encrypts reasoning in the
+    /// context, and never where the dialect takes only encrypted reasoning.
+    #[test]
+    fn unencrypted_reasoning_replays_only_before_encrypted_reasoning() {
+        let sealed =
+            json!({"type":"reasoning", "id":"rs_1", "summary":[], "encrypted_content":"BLOB"});
+        let plain = json!({"type":"reasoning", "id":"rs_2",
+            "summary":[{"type":"summary_text", "text":"plain"}]});
+        let turn = |native: &Value| {
+            let replay = envelope(
+                ReplayFormat::Responses,
+                "test-model",
+                native.clone(),
+                Binding::Free,
+            );
+            Message::Assistant(vec![AssistantItem::reasoning("r", 0, "", Some(replay))])
+        };
+        let sealed_only = Dialect {
+            unsigned: crate::provider::codec::UnsignedReasoning::Dropped,
+            ..Dialect::stateless()
+        };
+        for (turns, dialect, expected) in [
+            (vec![&plain], Dialect::stateless(), vec![&plain]),
+            (vec![&sealed, &plain], Dialect::stateless(), vec![&sealed]),
+            (vec![&plain, &sealed], sealed_only, vec![&sealed]),
+        ] {
+            let mut req = request("test-model");
+            req.context = entries(turns.into_iter().map(turn));
+            let input = encode(&req, &dialect).unwrap();
+            assert_eq!(input.iter().collect::<Vec<_>>(), expected);
+        }
+    }
+
     #[test]
     fn encrypted_reasoning_replays_only_to_its_model_beside_tools() {
         let mut req = request("gpt-5");
@@ -304,14 +304,8 @@ mod tests {
         let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
             "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
             "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
-        let decoder = Decoder::new(
-            req.model.to_string(),
-            scope(),
-            &Dialect::stateless(),
-            ErrorSignals::NONE,
-        );
-        let reduced =
-            assemble_with(decoder, vec![completed(vec![native.clone(), call_item()])]).unwrap();
+        let output = vec![completed(vec![native.clone(), call_item()])];
+        let reduced = assemble_with(decoder_for("gpt-5"), output).unwrap();
         assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
         let items = reduced.items().to_vec();
         assert_eq!(
@@ -320,7 +314,7 @@ mod tests {
         );
         req.context = entries(vec![
             Message::Assistant(items),
-            tool_result(json!({"found":true}), vec![], false),
+            tool_result("call_1", "search", json!({"found":true}), vec![], false),
         ]);
         let input = encode(&req, &Dialect::stateless()).unwrap();
         assert_eq!(input[0], native);
@@ -341,14 +335,14 @@ mod tests {
         native_reasoning["encrypted_content"] = json!("mock-replay-state");
         let items = assemble(vec![
             native_reasoning.clone(),
-            text_item("text-terminal", "checking"),
+            message("text-terminal", "checking"),
             call_item(),
         ]);
         let mut req = request("gpt-5");
         req.context = entries(vec![
             user("look it up"),
             Message::Assistant(items),
-            tool_result(json!({"value":42}), vec![], false),
+            tool_result("call_1", "search", json!({"value":42}), vec![], false),
         ]);
         let input = encode(&req, &Dialect::stateless()).unwrap();
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
@@ -373,7 +367,7 @@ mod tests {
         );
 
         req.context
-            .push(Entry::from(Message::Assistant(assemble(vec![text_item(
+            .push(Entry::from(Message::Assistant(assemble(vec![message(
                 "answer", "42",
             )]))));
         req.context.push(Entry::from(user("thanks")));
@@ -393,7 +387,7 @@ mod tests {
         let mut req = request("gpt-5");
         req.context = vec![
             state("earlier", Superseded),
-            tool_result(json!(1), vec![], false).into(),
+            tool_result("call_1", "search", json!(1), vec![], false).into(),
             state("now", Current),
         ];
         let as_user = Dialect::stateless();
@@ -453,7 +447,14 @@ mod tests {
             user("stable").into(),
             state("old", Persisted),
             answer("checking"),
-            tool_result(json!({"failure":"details"}), vec![], true).into(),
+            tool_result(
+                "call_1",
+                "search",
+                json!({"failure":"details"}),
+                vec![],
+                true,
+            )
+            .into(),
             state("now", Current),
         ];
         let input = encode(&req, &Dialect::stateless()).unwrap();
@@ -541,11 +542,31 @@ mod tests {
                     req.context.push(state("stable state", Persisted));
                 }
                 let first = encode(&req, &dialect).unwrap();
+                if persisted {
+                    let content = first.last().unwrap()["content"].as_array().unwrap();
+                    assert!(marked(content.last().unwrap()));
+                }
                 let prefix = first.as_slice();
                 req.context.extend([answer("one"), user("next").into()]);
                 let second = encode(&req, &dialect).unwrap();
                 assert_eq!(&second[..prefix.len()], prefix);
                 assert!(marked(&second.last().unwrap()["content"][0]));
+                // Only the newest seams that fit the budget are marked, the
+                // prefix's end among them.
+                for prompt in ["three", "four", "five", "six"] {
+                    req.context.extend([answer("reply"), user(prompt).into()]);
+                }
+                let input = encode(&req, &dialect).unwrap();
+                let mut seams = Vec::new();
+                for [turn, next] in input.array_windows() {
+                    if next["role"] == "assistant" {
+                        seams.push(has_checkpoint(turn));
+                    } else {
+                        assert!(!has_checkpoint(turn), "{turn}");
+                    }
+                }
+                seams.push(has_checkpoint(input.last().unwrap()));
+                assert_eq!(seams, [false, false, true, true, true, true]);
             }
         }
     }
@@ -556,11 +577,18 @@ mod tests {
         let dialect = explicit(StateRole::User);
         let mut req = request("gpt-5");
         req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
-        let Message::Tool(mut results) = tool_result(json!({"failed":true}), vec![], true) else {
+        let Message::Tool(mut results) =
+            tool_result("call_1", "search", json!({"failed":true}), vec![], true)
+        else {
             unreachable!()
         };
-        let Message::Tool(mut with_images) = tool_result(json!({"found":42}), vec![image()], false)
-        else {
+        let Message::Tool(mut with_images) = tool_result(
+            "call_1",
+            "search",
+            json!({"found":42}),
+            vec![image()],
+            false,
+        ) else {
             unreachable!()
         };
         with_images[0].call_id = "call_2".into();
@@ -571,7 +599,7 @@ mod tests {
             Message::Tool(results).into(),
             state("now", Current),
             answer("rest assistant"),
-            tool_result(json!("rest output"), vec![], false).into(),
+            tool_result("call_1", "search", json!("rest output"), vec![], false).into(),
         ];
         let input = encode(&req, &dialect).unwrap();
         assert_eq!(input[1]["call_id"], input[2]["call_id"]);
@@ -614,23 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn historical_seams_are_not_limited_to_the_servers_latest_writes() {
-        let mut req = request("gpt-5");
-        req.context.clear();
-        let prompts = ["one", "two", "three", "four", "five", "six"];
-        for prompt in prompts {
-            req.context.extend([user(prompt).into(), answer("reply")]);
-        }
-        let input = encode(&req, &explicit(StateRole::User)).unwrap();
-        assert_eq!(input.len(), prompts.len() * 2);
-        for ([user, answer], prompt) in input.as_chunks::<2>().0.iter().zip(prompts) {
-            assert_eq!(user["content"][0]["text"], prompt);
-            assert!(marked(&user["content"][0]));
-            assert!(!has_checkpoint(answer));
-        }
-    }
-
-    #[test]
     fn unsupported_trailing_items_fall_back_without_mutating_native_replay() {
         let native = reasoning_item();
         let mut req = request("gpt-5");
@@ -640,7 +651,7 @@ mod tests {
             Message::Assistant(assemble(vec![
                 native.clone(),
                 call_item(),
-                text_item("text", "answer"),
+                message("text", "answer"),
             ])),
             Message::User(vec![
                 UserContent::Text {
@@ -682,7 +693,7 @@ mod tests {
         req.context = vec![
             user("first").into(),
             answer("response"),
-            tool_result(json!("result"), vec![], false).into(),
+            tool_result("call_1", "search", json!("result"), vec![], false).into(),
             answer("done"),
             user("tail").into(),
         ];
@@ -701,7 +712,7 @@ mod tests {
             user("rest user").into(),
             state("visible current", Current),
             answer("rest assistant"),
-            tool_result(json!("rest tool"), vec![], false).into(),
+            tool_result("call_1", "search", json!("rest tool"), vec![], false).into(),
             state("tail current", Current),
         ];
         let input = encode(&req, &explicit(StateRole::User)).unwrap();
@@ -712,51 +723,5 @@ mod tests {
         assert!(!json!(input).to_string().contains("filtered current"));
         assert!(input[3]["output"].is_array());
         assert_eq!(input[4]["content"][0]["text"], "tail current");
-    }
-
-    #[test]
-    fn only_supported_array_text_carriers_are_marked_idempotently() {
-        let fallback = json!({"type":"message", "role":"user", "content":[
-            {"type":"input_text", "text":"stable"},
-            {"type":"input_text", "text":""},
-            {"type":"input_image", "image_url":"image"},
-            {"type":"input_file", "file_id":"file"}
-        ]});
-        let unsupported = vec![
-            json!({"type":"reasoning", "content":[{"type":"input_text", "text":"opaque"}]}),
-            json!({"type":"function_call", "arguments":"{}"}),
-            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}),
-            json!({"type":"function_call_output", "output":"string"}),
-            json!({"type":"function_call_output", "output":[{"type":"input_text", "text":42}]}),
-            json!({"type":"future", "content":[{"type":"input_text", "text":"unknown"}]}),
-        ];
-        let mut input = vec![fallback.clone()];
-        input.extend(unsupported.clone());
-        mark_last(&mut input);
-        assert_eq!(&input[1..], unsupported);
-        let mut expected = fallback;
-        expected["content"][0]["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
-        assert_eq!(input[0], expected);
-        let marked = input.clone();
-        mark_last(&mut input);
-        assert_eq!(input, marked);
-
-        let mut output = vec![
-            json!({"type":"function_call_output", "call_id":"call", "output":[
-                {"type":"input_text", "text":"first"},
-                {"type":"input_text", "text":"last"}
-            ]}),
-        ];
-        mark_last(&mut output);
-        assert_eq!(output[0]["call_id"], "call");
-        assert!(
-            output[0]["output"][0]
-                .get("prompt_cache_breakpoint")
-                .is_none()
-        );
-        assert_eq!(
-            output[0]["output"][1]["prompt_cache_breakpoint"],
-            json!({"mode":"explicit"})
-        );
     }
 }

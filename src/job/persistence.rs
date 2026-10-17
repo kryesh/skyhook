@@ -254,6 +254,7 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
     use crate::identity::JobId;
+    use crate::job::tests::reopen;
     use crate::job::{JOB_VIEW_SCHEMAS, JobOutcome, JobRole, JobState, JobTransition};
     use crate::{
         job::output,
@@ -262,8 +263,10 @@ mod tests {
 
     /// An on-disk runtime, so `reopen` can replay its journal.
     async fn runtime() -> (tempfile::TempDir, JobManager, crate::identity::AgentId) {
-        let (root, store, agent) = crate::session::tests::on_disk().await;
-        (root, JobManager::new(store), agent)
+        let crate::tests::TestRuntime {
+            root, jobs, agent, ..
+        } = crate::tests::TestRuntime::on_disk().await;
+        (root, jobs, agent)
     }
 
     /// Abandon leases the way a process exit does: cancelled, never finalized.
@@ -271,17 +274,8 @@ mod tests {
         std::thread::spawn(move || drop(leases)).join().unwrap();
     }
 
-    /// Drain owners, drop the manager, and replay the durable journal.
-    async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
-        let session = jobs.store().id();
-        jobs.supervisor().drain().await;
-        drop(jobs);
-        let (store, _) = SessionStore::open(root, session).await.unwrap();
-        crate::job::tests::reopened(store).await
-    }
-
     #[tokio::test]
-    async fn diagnostic_replay_filters_targets_and_only_renders_registered_error_slots() {
+    async fn diagnostic_replay_filters_targets_per_viewer() {
         use crate::tool::{
             diagnostic::{
                 Cause, Effects, FailureSite, IoKind, Operation, PartialContext, PartialDiagnostic,
@@ -310,43 +304,15 @@ mod tests {
             },
         )
         .resolve();
-        let payload = || {
-            json!({
-                "kind":"error", "path":"missing.txt",
-                "error":{"code":"not_found", "message":"producer placeholder"},
-                "opaque":{"error":{"message":"opaque user error"}},
-                // An offloaded sibling exercises whole-document render caching.
-                "text":"ordinary output\n".repeat(800),
-            })
-        };
+        // An offloaded field exercises whole-document render caching.
+        let payload = json!({"path":"missing.txt", "text":"ordinary output\n".repeat(800)});
         let failed = jobs
             .test_create(JobSpec::test(agent.clone(), "fixture"))
             .await;
         let error = ToolError::io(std::io::Error::from_raw_os_error(2))
             .context(context)
-            .with_result(ToolOutput::new(payload()));
+            .with_result(ToolOutput::new(payload));
         jobs.finish(failed, error.into()).await.unwrap();
-        let read = jobs
-            .test_create(JobSpec::test(agent.clone(), "fixture"))
-            .await;
-        jobs.finish(
-            read,
-            JobOutcome::Completed(
-                ToolOutput::new(payload()).with_diagnostic(diagnostic.clone().into()),
-            ),
-        )
-        .await
-        .unwrap();
-        let opaque = jobs.test_create(JobSpec::test(agent, "read")).await;
-        jobs.test_finish(opaque, payload()).await;
-
-        // Durable facts are authoritative; the saved result retains only its slot,
-        // never a rendering selected by an earlier reader's capabilities.
-        assert!(jobs.output(read).test_document().unwrap()["result"]["error"]["message"].is_null());
-        assert_eq!(
-            jobs.output(opaque).test_document().unwrap()["result"]["error"]["message"],
-            "producer placeholder"
-        );
 
         let privileged: CapabilitySet = [Capability::Targets].into_iter().collect();
         let restricted = CapabilitySet::default();
@@ -354,50 +320,25 @@ mod tests {
         let views = async |jobs: &JobManager| {
             let mut views = Vec::new();
             for caps in [&privileged, &restricted, &privileged] {
-                for (job, field) in [
-                    (failed, None),
-                    (read, None),
-                    (opaque, None),
-                    (read, Some(output::diagnostic_slot())),
-                    (failed, Some(crate::job::FieldPointer::root())),
-                    (read, Some(crate::job::FieldPointer::result())),
-                ] {
-                    let mut query = output::OutputArgs::new(job);
+                for field in [None, Some(crate::job::FieldPointer::root())] {
+                    let mut query = output::OutputArgs::new(failed);
                     query.field = field;
                     let view = jobs
                         .inspect_output(query, crate::job::CancellationToken::new(), caps)
                         .await
                         .unwrap();
-                    if job != opaque {
-                        assert_eq!(
-                            view.to_string().contains("private-build-target"),
-                            caps.contains(Capability::Targets)
-                        );
-                    }
+                    assert_eq!(
+                        view.to_string().contains("private-build-target"),
+                        caps.contains(Capability::Targets)
+                    );
                     views.push(view);
                 }
             }
             views
         };
         let live = views(&jobs).await;
-        let (failed_view, read_view, opaque_view) = (&live[0], &live[1], &live[2]);
-        assert_eq!(failed_view["state"], "failed");
-        assert_eq!(failed_view["error"], diagnostic.render(&privileged));
-        assert_eq!(read_view["state"], "completed");
-        assert!(read_view["error"].is_null());
-        assert_eq!(read_view["result"]["error"]["code"], "not_found");
-        assert_eq!(
-            read_view["result"]["error"]["message"],
-            diagnostic.render(&privileged)
-        );
-        assert_eq!(
-            read_view["result"]["opaque"]["error"]["message"],
-            "opaque user error"
-        );
-        assert_eq!(
-            opaque_view["result"]["error"]["message"],
-            "producer placeholder"
-        );
+        assert_eq!(live[0]["state"], "failed");
+        assert_eq!(live[0]["error"], diagnostic.render(&privileged));
         let restored = reopen(jobs, root.path()).await;
         assert_eq!(views(&restored).await, live);
     }
@@ -453,7 +394,6 @@ mod tests {
             job: JobId::new(job).unwrap(),
             state,
             diagnostic: None,
-            output_diagnostic: None,
             images: Vec::new(),
         };
         let (first, _) = step(&mut jobs, 1, created(1));
@@ -475,12 +415,12 @@ mod tests {
 
     #[tokio::test]
     async fn replay_recovers_creation_committed_before_map_publication() {
-        let (root, store, agent) = crate::session::tests::on_disk().await;
+        let (root, jobs, agent) = runtime().await;
         let job = JobId::new(7).unwrap();
         let created = crate::session::tests::job_created(job, JobRole::Tool);
-        store.append(agent.clone(), created).await.unwrap();
+        jobs.store().append(agent.clone(), created).await.unwrap();
         // A creation no manager ever ran, as a crash leaves it.
-        let jobs = reopen(JobManager::new(store), root.path()).await;
+        let jobs = reopen(jobs, root.path()).await;
         let interrupted = jobs.metadata(job).unwrap();
         assert_eq!(interrupted.state, JobState::Interrupted);
         assert!(
@@ -514,7 +454,7 @@ mod tests {
             .await
             .unwrap();
         let denied = jobs
-            .wait(job, None, true)
+            .wait(job, true)
             .await
             .unwrap()
             .metadata_view(&capabilities)

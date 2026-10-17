@@ -1,13 +1,13 @@
 //! Encode request options and the input array as a native Responses body.
 use super::*;
 use crate::provider::{
-    ProviderErrorKind::InvalidRequest,
     codec::{
-        CodecName,
+        Cache, CacheControl, CodecName,
         common::{check_tool, system_text},
+        placement::breakpoint,
         set_each,
     },
-    protocol::ModelRequest,
+    protocol::{HistoryLifetime, ModelRequest},
 };
 use serde_json::Map;
 
@@ -19,8 +19,8 @@ pub(crate) const BODY_FIELDS: &[&str] = &[
     "store",
     "include",
     "reasoning.summary",
-    "service_tier",
     "access_programs",
+    "cache_control",
     "instructions",
     "tools",
     "text",
@@ -35,18 +35,19 @@ pub(crate) fn encode(
     let mut settings = serde_json::Map::from_iter([
         ("model".into(), json!(request.model)),
         ("stream".into(), json!(true)),
-    ]);
-    // Gateways can inspect routing fields before reading a large input array.
-    if let Some(tier) = &dialect.service_tier {
-        settings.insert("service_tier".into(), json!(tier));
-    }
-    settings.extend([
         ("input".into(), Value::Array(input)),
         ("store".into(), json!(false)),
         ("include".into(), json!(["reasoning.encrypted_content"])),
     ]);
-    if dialect.cache == Cache::Explicit {
-        settings.insert("prompt_cache_options".into(), json!({"mode":"explicit"}));
+    if let Some(options) = dialect.cache.options() {
+        settings.insert("prompt_cache_options".into(), options);
+    }
+    // The server places this breakpoint on the last cacheable block itself, so it is
+    // sent only for automatic caching, and a detached history is never reused.
+    if let (CacheControl::Sent { ttl }, Cache::Automatic) = (dialect.cache_control, dialect.cache)
+        && request.history_lifetime == HistoryLifetime::Extends
+    {
+        settings.insert("cache_control".into(), breakpoint(ttl));
     }
     if let Some(cyber) = dialect.cyber_access_program {
         settings.insert("access_programs".into(), json!({"cyber": cyber}));
@@ -73,18 +74,12 @@ pub(crate) fn encode(
         settings.insert("tools".into(), Value::Array(tools));
     }
     if let Some(schema) = &request.response_schema {
-        if schema.name.is_empty() || !schema.schema.is_object() {
-            return Err(InvalidRequest
-                .error("Responses structured output requires a name and object JSON Schema"));
-        }
-        settings.insert(
-            "text".into(),
-            json!({"format":{"type":"json_schema", "name":schema.name,
-            "schema":schema.schema, "strict":true}}),
-        );
+        let mut format = Map::from_iter([("type".into(), json!("json_schema"))]);
+        format.extend(dialect.schema.format(schema));
+        settings.insert("text".into(), json!({"format": format}));
     }
     if let Some(reasoning) = &request.reasoning {
-        dialect.effort.place(&mut settings, reasoning)?;
+        CodecName::Responses.place_effort(&dialect.effort, &mut settings, reasoning)?;
     }
     if let Some(max) = request.max_output_tokens {
         set_each(dialect.output_limit.iter(), &mut settings, json!(max))?;
@@ -96,61 +91,47 @@ pub(crate) fn encode(
 mod tests {
     use super::*;
     use crate::provider::{
-        codec::common::tests::request,
+        codec::{CacheTtl, common::tests::request},
         protocol::{ResponseSchema, SystemSegment, ToolDefinition},
     };
 
     #[test]
-    fn request_selectors_are_optional_and_routing_precedes_input() {
+    fn access_programs_are_optional() {
         let req = request("gpt-6-astra");
-        for (tier, cyber) in [
-            (None, None),
-            (Some("priority"), None),
-            (None, Some(CyberAccessProgram::Standard)),
-            (Some("ultrafast"), Some(CyberAccessProgram::DaybreakBlue)),
-            (
-                Some("future-catalog-tier"),
-                Some(CyberAccessProgram::DaybreakRed),
-            ),
+        for cyber in [
+            None,
+            Some(CyberAccessProgram::Standard),
+            Some(CyberAccessProgram::DaybreakRed),
         ] {
             let dialect = Dialect {
-                service_tier: tier.map(|tier| tier.parse().unwrap()),
                 cyber_access_program: cyber,
                 ..Dialect::stateless()
             };
             let body = encode(&req, &dialect).unwrap();
             assert_eq!(
-                body.get("service_tier"),
-                tier.map(|tier| json!(tier)).as_ref()
-            );
-            assert_eq!(
                 body.get("access_programs"),
                 cyber.map(|cyber| json!({"cyber": cyber})).as_ref()
             );
-            if tier.is_some() {
-                let routing = body.keys().position(|key| key == "service_tier").unwrap();
-                let input = body.keys().position(|key| key == "input").unwrap();
-                assert!(routing < input);
-            }
         }
     }
 
     #[test]
     fn summary_and_effort_are_placed_by_the_dialect() {
         let mut req = request("gpt-5");
+        let summarized = Dialect {
+            reasoning_summary: Some(ReasoningSummary::Auto),
+            ..Dialect::stateless()
+        };
         for effort in [None, Some("high".into())] {
             let expected = effort.as_ref().map(|e| json!(e));
             req.reasoning = effort;
-            let body = encode(&req, &Dialect::stateless()).unwrap();
+            let body = encode(&req, &summarized).unwrap();
             assert_eq!(body["reasoning"]["summary"], "auto");
             assert_eq!(body["reasoning"].get("effort"), expected.as_ref());
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
         req.reasoning = Some("low".into());
-        let silent = Dialect {
-            reasoning_summary: None,
-            ..Dialect::stateless()
-        };
+        let silent = Dialect::stateless();
         let body = encode(&req, &silent).unwrap();
         assert_eq!(body["reasoning"], json!({"effort":"low"}));
         req.reasoning = Some("adaptive".into());
@@ -167,11 +148,10 @@ mod tests {
             .unwrap();
         assert!(encoded.headers.is_empty());
         assert_eq!(
-            encoded.body,
+            Value::Object(encoded.body),
             json!({
                 "model":"gpt-5", "input":[], "stream":true, "store":false,
-                "include":["reasoning.encrypted_content"],
-                "reasoning":{"summary":"auto"}, "prompt_cache_key":"session"
+                "include":["reasoning.encrypted_content"], "prompt_cache_key":"session"
             })
         );
     }
@@ -189,24 +169,27 @@ mod tests {
             input_schema: json!({"type":"object"}),
         }];
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
-        req.response_schema = Some(ResponseSchema {
-            name: "answer".into(),
-            schema: schema.clone(),
-        });
+        req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
         req.reasoning = Some("high".into());
         let body = encode(&req, &Dialect::stateless()).unwrap();
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");
-        assert_eq!(body["text"]["format"]["schema"], schema);
-        assert_eq!(
-            body["reasoning"],
-            json!({"effort":"high", "summary":"auto"})
-        );
+        let format = json!({"type":"json_schema", "name":"answer", "schema":schema});
+        assert_eq!(body["text"]["format"], format);
+        assert_eq!(body["reasoning"], json!({"effort":"high"}));
+        // A strict dialect flags the schema and sends it as written, keywords and all.
+        let strict = Dialect {
+            schema: crate::provider::codec::SchemaConstraint::Strict,
+            ..Dialect::stateless()
+        };
+        let schema = json!({"type":"object", "properties":{"n":{"type":"integer", "minimum":1}}});
+        req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
+        let format = json!({"type":"json_schema", "name":"answer", "strict":true, "schema":schema});
+        assert_eq!(encode(&req, &strict).unwrap()["text"]["format"], format);
     }
 
     #[test]
-    fn explicit_cache_mode_is_opt_in_even_without_checkpoints() {
-        use crate::provider::protocol::HistoryLifetime;
+    fn cache_mode_and_lifetime_select_the_request_wide_cache_fields() {
         let mut req = request("gpt-5");
         req.context.clear();
         req.system.push(SystemSegment {
@@ -218,16 +201,31 @@ mod tests {
                 .unwrap()
                 .contains_key("prompt_cache_options")
         );
-        let dialect = Dialect {
+        let cache_control = CacheControl::Sent {
+            ttl: Some(CacheTtl::OneHour),
+        };
+        let automatic = Dialect {
+            cache_control,
+            ..Dialect::stateless()
+        };
+        let explicit = Dialect {
             cache: Cache::Explicit,
+            cache_control,
             ..Dialect::stateless()
         };
         for lifetime in [HistoryLifetime::Extends, HistoryLifetime::Detached] {
             req.history_lifetime = lifetime;
-            let body = encode(&req, &dialect).unwrap();
+            let body = encode(&req, &explicit).unwrap();
             assert_eq!(body["prompt_cache_options"], json!({"mode":"explicit"}));
             assert_eq!(body["instructions"], "instructions");
             assert_eq!(body["input"], json!([]));
+            assert!(!body.contains_key("cache_control"));
+            let control = (lifetime == HistoryLifetime::Extends)
+                .then(|| json!({"type":"ephemeral", "ttl":"1h"}));
+            assert_eq!(
+                encode(&req, &automatic).unwrap().get("cache_control"),
+                control.as_ref()
+            );
         }
     }
 }

@@ -261,43 +261,31 @@ impl Jobs {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JobEnvelope {
     pub id: JobId,
     /// The agent whose job it is.
-    #[serde(skip)]
     pub agent: AgentId,
     /// What it was called with.
-    #[serde(skip)]
     pub arguments: std::sync::Arc<Value>,
-    #[serde(skip)]
     pub invocation: Invocation,
-    #[serde(skip)]
     pub timing: RunTiming,
     pub parent: Option<JobId>,
     pub tool: String,
     pub role: JobRole,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<JobName>,
     pub state: JobState,
     /// The images its finished run returned.
-    #[serde(skip)]
     pub(crate) images: Vec<ImageRef>,
     /// The model call that launched the job; its parent is then the calling
     /// agent's own.
-    #[serde(skip)]
     pub(crate) origin: Option<crate::session::ModelCallOrigin>,
     /// The question a waiting job asks, until its owner has seen it.
-    #[serde(skip)]
     pub(crate) question: Option<QuestionOutput>,
     /// Failure facts; every viewer renders them under its own capabilities.
-    #[serde(skip)]
-    pub(crate) diagnostic: Option<Diagnostic>,
-    #[serde(skip)]
-    pub(crate) output_diagnostic: Option<Diagnostic>,
+    pub diagnostic: Option<Diagnostic>,
     pub location: ExecutionLocation,
     /// Input would resume it after it ends.
-    #[serde(skip)]
     pub(crate) resumable: bool,
 }
 
@@ -309,19 +297,17 @@ pub struct JobEnvelope {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct JobView {
-    #[schemars(with = "JobId")]
-    pub(crate) id: Option<JobId>,
-    #[schemars(with = "JobState")]
+    /// None when the call settled before a job was published, or completed with
+    /// nothing more to read or resume.
+    pub id: Option<JobId>,
     pub(crate) state: Option<JobState>,
     /// Precedes the result, so a reader learns what was left out before reading it.
-    #[schemars(with = "Presentation")]
-    pub(crate) presentation: Option<Presentation>,
+    pub presentation: Option<Presentation>,
     /// A present `null` is a real result, distinct from no result.
     #[serde(default, deserialize_with = "present")]
-    pub(crate) result: Option<Value>,
-    #[schemars(with = "String", transform = complete)]
-    pub(crate) error: Option<String>,
-    #[schemars(with = "JobMetadata")]
+    pub result: Option<Value>,
+    #[schemars(transform = complete)]
+    pub error: Option<String>,
     pub(crate) meta: Option<JobMetadata>,
 }
 
@@ -334,39 +320,31 @@ fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Value>, 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct JobMetadata {
-    #[schemars(with = "JobId")]
     pub(crate) parent: Option<JobId>,
-    #[schemars(with = "String")]
     pub(crate) tool: Option<String>,
     #[schemars(with = "String")]
     pub(crate) name: Option<JobName>,
-    #[schemars(with = "String")]
     pub(crate) target: Option<String>,
     /// Display metadata; execution keeps its native PathBuf in JobEnvelope.
-    #[schemars(with = "String")]
     pub(crate) workspace: Option<String>,
-    #[schemars(with = "crate::tool::DenialCode")]
     pub(crate) code: Option<crate::tool::DenialCode>,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct Presentation {
-    #[schemars(with = "output::OutputPreview")]
-    pub(crate) preview: Option<output::OutputPreview>,
+    pub preview: Option<output::OutputPreview>,
     /// The whole result's type, with counts, when samples leave parts out.
-    pub(crate) shape: Option<Value>,
-    #[schemars(with = "Vec<output::OutputTruncation>")]
+    pub shape: Option<Value>,
     pub(crate) truncated: Option<Vec<output::OutputTruncation>>,
     /// Captures a presented result does not already show in full.
-    #[schemars(with = "Vec<output::CaptureDescriptor>")]
     pub(crate) captures: Option<Vec<output::CaptureDescriptor>>,
     /// A waiting child agent returns a question batch rather than a result.
-    #[schemars(with = "QuestionOutput", transform = complete)]
+    #[schemars(transform = complete)]
     pub(crate) question: Option<QuestionOutput>,
     // The schema keeps the plain string the system prompt's JobView type shows.
     #[schemars(with = "String")]
-    pub(crate) notice: Option<Notice>,
+    pub notice: Option<Notice>,
 }
 
 crate::named_enum::named_enum! {
@@ -377,14 +355,6 @@ crate::named_enum::named_enum! {
 }
 
 impl Presentation {
-    pub fn preview(&self) -> Option<&output::OutputPreview> {
-        self.preview.as_ref()
-    }
-
-    pub fn shape(&self) -> Option<&Value> {
-        self.shape.as_ref()
-    }
-
     pub fn truncated(&self) -> &[output::OutputTruncation] {
         self.truncated.as_deref().unwrap_or_default()
     }
@@ -395,10 +365,6 @@ impl Presentation {
 
     pub fn questions(&self) -> &[crate::agent::Question] {
         self.question.as_ref().map_or(&[], |batch| &batch.questions)
-    }
-
-    pub fn notice(&self) -> Option<Notice> {
-        self.notice
     }
 
     pub(crate) fn into_option(self) -> Option<Self> {
@@ -427,62 +393,12 @@ pub(crate) enum ViewKind {
 }
 
 impl JobView {
-    /// None when the call settled before a job was published, or completed with
-    /// nothing more to read or resume.
-    pub fn id(&self) -> Option<JobId> {
-        self.id
-    }
-
     pub fn state(&self) -> JobState {
         self.state.unwrap_or(JobState::Completed)
     }
 
     pub fn tool(&self) -> Option<&str> {
         self.meta.as_ref().and_then(|meta| meta.tool.as_deref())
-    }
-
-    /// None when the job has produced no result, rather than a JSON null result.
-    pub fn result(&self) -> Option<&Value> {
-        self.result.as_ref()
-    }
-
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    pub fn presentation(&self) -> Option<&Presentation> {
-        self.presentation.as_ref()
-    }
-
-    /// The view without its result, error, preview, notice, question or capture
-    /// pages; None when nothing else is left.
-    pub fn envelope(&self) -> Option<Self> {
-        let presentation = self.presentation.as_ref().and_then(|presentation| {
-            let captures = presentation.captures.as_ref().map(|captures| {
-                captures
-                    .iter()
-                    .map(|capture| output::CaptureDescriptor {
-                        output: None,
-                        ..capture.clone()
-                    })
-                    .collect()
-            });
-            Presentation {
-                shape: presentation.shape.clone(),
-                truncated: presentation.truncated.clone(),
-                captures,
-                ..Presentation::default()
-            }
-            .into_option()
-        });
-        let envelope = Self {
-            id: self.id,
-            state: self.state,
-            meta: self.meta.clone(),
-            presentation,
-            ..Self::default()
-        };
-        (envelope != Self::default()).then_some(envelope)
     }
 
     /// Where the next saved-source page starts: the selected preview's
@@ -527,27 +443,6 @@ impl JobView {
 }
 
 impl JobEnvelope {
-    /// Why it failed, for each viewer to render under its own capabilities.
-    #[must_use]
-    pub fn diagnostic(&self) -> Option<&Diagnostic> {
-        self.diagnostic.as_ref()
-    }
-
-    /// Its saved `result`, with the output diagnostic rendered into its slot for
-    /// `viewer`.
-    pub(crate) fn presented<'a>(
-        &self,
-        mut result: Option<Value>,
-        viewer: impl Into<DiagnosticViewer<'a>>,
-    ) -> Option<Value> {
-        if let (Some(result), Some(diagnostic)) = (&mut result, &self.output_diagnostic)
-            && let Some(message) = output::diagnostic_slot_in(result)
-        {
-            *message = Value::String(diagnostic.render_for(viewer.into()));
-        }
-        result
-    }
-
     pub(crate) fn rendered_error<'a>(
         &self,
         viewer: impl Into<DiagnosticViewer<'a>>,
@@ -558,8 +453,8 @@ impl JobEnvelope {
             .map(|diagnostic| diagnostic.render_for(viewer))
     }
 
-    /// The viewer's own foreground call, with its [`presented`](Self::presented)
-    /// `result`: launch metadata only on failure.
+    /// The viewer's own foreground call with its saved `result`: launch
+    /// metadata only on failure.
     pub(crate) fn response_view<'a>(
         &self,
         viewer: impl Into<DiagnosticViewer<'a>>,
@@ -710,7 +605,6 @@ impl JobManager {
         Ok(self.handles(id, |handles| handles.cancellation.clone()))
     }
 
-    #[must_use]
     pub fn list(&self, owner: &AgentId) -> Vec<JobEnvelope> {
         let mut output = self.facts(|jobs| {
             (jobs.entries.iter())
@@ -782,7 +676,6 @@ mod tests {
             origin: None,
             question: None,
             diagnostic: None,
-            output_diagnostic: None,
             location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
             resumable: false,
         }
@@ -803,7 +696,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn display_metadata_with_non_utf8_workspace_is_json_serializable() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -811,6 +703,74 @@ mod tests {
         job.location.workspace = std::ffi::OsString::from_vec(b"/work/\xff".to_vec()).into();
         let view = job.metadata_view(&CapabilitySet::default()).into_value();
         assert_eq!(view["meta"]["workspace"], "/work/\u{fffd}");
+    }
+
+    /// A view with every part a replayed job event can carry, including each
+    /// untagged preview, line and truncation shape.
+    fn presented() -> JobView {
+        let field = |field: &str| field.parse::<FieldPointer>().unwrap();
+        let page = JobView {
+            id: JobId::new(2).ok(),
+            state: Some(JobState::Completed),
+            result: Some(serde_json::json!("line")),
+            error: None,
+            meta: None,
+            presentation: None,
+        };
+        JobView {
+            id: JobId::new(2).ok(),
+            state: Some(JobState::Failed),
+            result: None,
+            error: Some("denied".into()),
+            meta: Some(JobMetadata {
+                parent: JobId::new(1).ok(),
+                tool: Some("read".into()),
+                name: Some("reader".parse().unwrap()),
+                target: Some("build".into()),
+                workspace: Some("/srv".into()),
+                code: Some(crate::tool::DenialCode::PermissionDenied),
+            }),
+            presentation: Some(Presentation {
+                preview: Some(output::OutputPreview::Lines(output::LinePage {
+                    field: Some(FieldPointer::result()),
+                    lines: output::PageLines::Numbered(vec![output::NumberedLine {
+                        line: 3,
+                        text: "line".into(),
+                    }]),
+                    total_lines: Some(1),
+                    next_start: None,
+                    next_offset: None,
+                })),
+                shape: Some(serde_json::json!({"items": [3, "integer"]})),
+                truncated: Some(vec![
+                    output::OutputTruncation::Elements {
+                        field: field("/result/items"),
+                        shown: 1,
+                        total_elements: 3,
+                        kept: None,
+                    },
+                    output::OutputTruncation::Text {
+                        field: field("/result/content"),
+                        total_lines: 9,
+                        next_start: 4,
+                        next_offset: None,
+                    },
+                    output::OutputTruncation::TextGap {
+                        field: field("/result/stdout"),
+                        total_lines: 9,
+                        next_start: 4,
+                        tail_start: 8,
+                    },
+                ]),
+                captures: Some(vec![output::CaptureDescriptor {
+                    field: field("/result/stdout"),
+                    complete: true,
+                    output: Some(Box::new(page)),
+                }]),
+                question: None,
+                notice: Some(Notice::OutputIncomplete),
+            }),
+        }
     }
 
     #[test]
@@ -844,7 +804,7 @@ mod tests {
         );
         assert_eq!(null.clone().into_value().get("result"), Some(&Value::Null));
         assert_eq!(missing.clone().into_value().get("result"), None);
-        for view in [null, missing, noticed] {
+        for view in [null, missing, noticed, presented()] {
             let value = view.clone().into_value();
             assert!(validator.is_valid(&value), "{value}");
             assert_eq!(serde_json::from_value::<JobView>(value).unwrap(), view);
@@ -904,11 +864,11 @@ mod tests {
         };
         let resumable = view().await;
         assert_eq!(
-            (resumable.id(), resumable.state),
+            (resumable.id, resumable.state),
             (Some(id), Some(JobState::Completed))
         );
         jobs.clear_resume_handler(id).await;
-        assert_eq!(view().await.id(), None);
+        assert_eq!(view().await.id, None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ mod connection;
 use super::config::McpServerConfig;
 use crate::tool::{
     ToolError,
-    diagnostic::{Effects, Operation, PartialContext, Subject},
+    diagnostic::{Effects, Operation, PartialContext, RequestEffects, Subject},
     policy::{Capability, CapabilitySet},
 };
 pub use catalog::DiscoveryLimit;
@@ -85,26 +85,7 @@ impl From<McpError> for ToolError {
         match error {
             McpError::Cancelled => Self::cancelled(),
             McpError::Io(error) => Self::io(error),
-            error @ (McpError::HeaderName
-            | McpError::HeaderVariable(_)
-            | McpError::HeaderValue(_)
-            | McpError::Timeout
-            | McpError::Closed
-            | McpError::UnknownTool
-            | McpError::ArgumentsTooLarge
-            | McpError::ResultTooLarge
-            | McpError::JsonRpc(_)
-            | McpError::HttpStatus(_)
-            | McpError::TransportClosed
-            | McpError::UnexpectedResponse
-            | McpError::Transport
-            | McpError::AuthenticationRequired
-            | McpError::InsufficientScope
-            | McpError::SessionExpired
-            | McpError::Decode
-            | McpError::ProtocolVersion
-            | McpError::SubscriptionLagged
-            | McpError::InputRequiredRoundsExceeded) => Self::failed(error),
+            error => Self::failed(error),
         }
     }
 }
@@ -287,7 +268,8 @@ impl McpManager {
         arguments: Map<String, Value>,
         cancel: CancellationToken,
     ) -> Result<CallToolResult, ToolError> {
-        let mut stage = (Operation::Prepare, Effects::NotStarted);
+        let mut stage =
+            PartialContext::new(Operation::Prepare, Subject::None).effects(Effects::NotStarted);
         self.call_staged(
             server,
             tool,
@@ -299,11 +281,12 @@ impl McpManager {
         .await
         .map_err(|error| {
             let subject = Subject::Label(format!("MCP server {server}, tool {tool}"));
-            ToolError::from(error).context(PartialContext::new(stage.0, subject).effects(stage.1))
+            ToolError::from(error).context(stage.subject(subject))
         })
     }
 
-    /// `stage` names the step a failure interrupted and what it left behind.
+    /// `stage` names the step a failure interrupted and what it left behind;
+    /// the caller supplies the subject.
     /// `deadline` turns the server's call timeout into the future that ends the call.
     async fn call_staged<D: Future<Output = ()>>(
         &self,
@@ -312,7 +295,7 @@ impl McpManager {
         arguments: Map<String, Value>,
         cancel: CancellationToken,
         deadline: impl FnOnce(Duration) -> D,
-        stage: &mut (Operation, Effects),
+        stage: &mut PartialContext,
     ) -> Result<CallToolResult, McpError> {
         if self.closed.is_cancelled() {
             return Err(McpError::Closed);
@@ -344,17 +327,20 @@ impl McpManager {
             .send_cancellable_request(request, PeerRequestOptions::default());
         // Once submission starts, neither cancellation nor a failed transport
         // proves that the server did not execute the request. Never replay it.
-        *stage = (Operation::Send, Effects::MayHaveExecuted);
+        let sent = |operation| {
+            PartialContext::new(operation, Subject::None).request(RequestEffects::MayHaveExecuted)
+        };
+        *stage = sent(Operation::Send);
         let handle = guarded(&self.closed, &cancel, &mut deadline, send)
             .await?
             .map_err(request_error)?;
-        *stage = (Operation::Receive, Effects::MayHaveExecuted);
+        *stage = sent(Operation::Receive);
         let mut handle = CancelOnDrop(Some(handle));
         let response = &mut handle.0.as_mut().expect("active request").rx;
         let result = match guarded(&self.closed, &cancel, &mut deadline, response).await {
             Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => {
                 if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
-                    *stage = (Operation::Receive, Effects::OutputIncomplete);
+                    *stage = std::mem::take(stage).effects(Effects::OutputIncomplete);
                     Err(McpError::ResultTooLarge)
                 } else {
                     Ok(result)
@@ -539,22 +525,10 @@ for line in sys.stdin:
     }
 
     impl Fixture {
-        pub(super) fn new() -> Option<Self> {
-            Self::batch().map(|[fixture]| fixture)
-        }
-
-        /// Compound tests share the availability probe, not their server directories.
-        pub(super) fn batch<const N: usize>() -> Option<[Self; N]> {
-            let python = std::process::Command::new("python3")
-                .arg("--version")
-                .output();
-            if !python.is_ok_and(|output| output.status.success()) {
-                eprintln!("skipping MCP subprocess test: python3 is unavailable");
-                return None;
-            }
-            Some(std::array::from_fn(|_| Self {
+        pub(super) fn new() -> Self {
+            Self {
                 directory: tempfile::tempdir().expect("fixture directory"),
-            }))
+            }
         }
 
         pub(super) fn config(&self) -> crate::mcp::config::RawMcpServerConfig {
@@ -584,7 +558,6 @@ for line in sys.stdin:
                 .to_owned()
         }
 
-        #[cfg(unix)]
         pub(super) fn pid(&self) -> libc::pid_t {
             let pid = std::fs::read_to_string(self.path("pid")).expect("fixture wrote its pid");
             pid.parse().expect("fixture pid is numeric")
@@ -618,9 +591,9 @@ for line in sys.stdin:
             .await
     }
 
-    fn stage(error: ToolError) -> (Operation, Effects) {
+    fn stage(error: ToolError) -> (Operation, Effects, RequestEffects) {
         let context = error.diagnostic().context;
-        (context.operation, context.effects)
+        (context.operation, context.effects, context.request)
     }
 
     fn is(error: &ToolError, expected: McpError) -> bool {
@@ -647,7 +620,6 @@ for line in sys.stdin:
         .await;
     }
 
-    #[cfg(unix)]
     pub(super) async fn assert_process_reaped(pid: libc::pid_t) {
         bounded(async {
             // SAFETY: signal zero only checks whether the recorded child exists.
@@ -662,9 +634,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn ineligible_servers_have_no_startup_effects_or_failure_warnings() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -706,9 +676,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn discovers_all_pages_and_passes_arguments_cwd_and_env() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let workspace = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let process = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
@@ -745,9 +713,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn call_errors_cancellation_and_unknown_tools_do_not_poison_the_session() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let manager = connect(fixture.config()).await;
         assert_eq!(manager.catalog().len(), 4, "{:?}", manager.warnings());
         let result = fixture_call(&manager, "tool_error")
@@ -770,7 +736,14 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(is(&error, McpError::Cancelled), "{error:?}");
-        assert_eq!(stage(error), (Operation::Prepare, Effects::NotStarted));
+        assert_eq!(
+            stage(error),
+            (
+                Operation::Prepare,
+                Effects::NotStarted,
+                RequestEffects::Unknown
+            )
+        );
         // Cancellation while waiting for a call slot is also definitely pre-send.
         let ServerEntry::Connected { server, .. } = &manager.servers["fixture"] else {
             panic!("fixture server is connected")
@@ -784,7 +757,14 @@ for line in sys.stdin:
         cancel.cancel();
         let error = call.await.unwrap_err();
         assert!(is(&error, McpError::Cancelled), "{error:?}");
-        assert_eq!(stage(error), (Operation::Prepare, Effects::NotStarted));
+        assert_eq!(
+            stage(error),
+            (
+                Operation::Prepare,
+                Effects::NotStarted,
+                RequestEffects::Unknown
+            )
+        );
         assert!(!fixture.directory.path().join("started").exists());
         drop(permits);
         let error = fixture_call(&manager, "not-advertised").await.unwrap_err();
@@ -796,9 +776,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn cancelled_and_dropped_inflight_calls_notify_the_server_and_keep_the_session() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let manager = std::sync::Arc::new(connect(fixture.config()).await);
         let (started, cancelled) = (fixture.path("started"), fixture.path("cancelled"));
         let cancel = CancellationToken::new();
@@ -817,7 +795,7 @@ for line in sys.stdin:
                 Operation::Receive,
                 Subject::Label("MCP server fixture, tool slow".into())
             )
-            .effects(Effects::MayHaveExecuted)
+            .request(RequestEffects::MayHaveExecuted)
             .resolve()
         );
         wait_for_file(Path::new(&cancelled)).await;
@@ -838,13 +816,11 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn call_timeout_and_result_size_limits_are_enforced() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let manager = connect(fixture.config()).await;
         // The deadline expires once the server has received the call.
         let started = fixture.directory.path().join("started");
-        let mut reached = (Operation::Prepare, Effects::NotStarted);
+        let mut reached = PartialContext::default();
         let slow = manager.call_staged(
             "fixture",
             "slow",
@@ -855,7 +831,11 @@ for line in sys.stdin:
         );
         let error = bounded(slow).await.unwrap_err();
         assert!(matches!(error, McpError::Timeout), "{error:?}");
-        assert_eq!(reached, (Operation::Receive, Effects::MayHaveExecuted));
+        assert_eq!(
+            reached,
+            PartialContext::new(Operation::Receive, Subject::None)
+                .request(RequestEffects::MayHaveExecuted)
+        );
         // The session stays usable.
         fixture_call(&manager, "echo").await.unwrap();
         // Oversized results are rejected without exposing content.
@@ -865,16 +845,18 @@ for line in sys.stdin:
         assert!(is(&error, McpError::ResultTooLarge), "{error:?}");
         assert_eq!(
             stage(error),
-            (Operation::Receive, Effects::OutputIncomplete)
+            (
+                Operation::Receive,
+                Effects::OutputIncomplete,
+                RequestEffects::MayHaveExecuted
+            )
         );
         shutdown(&manager).await;
     }
 
     #[tokio::test]
     async fn one_failed_server_does_not_hide_healthy_server_tools() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let mut bad = fixture.config();
         bad.start_command = Some(vec![fixture.path("nonexistent-executable")]);
         let configs = BTreeMap::from([

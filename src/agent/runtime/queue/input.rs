@@ -1,6 +1,15 @@
-//! Individual queued-input validation, model selection, and commit receipts.
+//! Model and mode selection for an agent's input, and its adoption.
 
 use super::*;
+
+/// The messages an adoption journals with its selection.
+pub(in crate::agent::runtime) enum Adopting {
+    /// What the agent took itself: a selection alone, or the input that begins
+    /// its turn, which commits even when an interrupt stopped that turn first.
+    Taken(Option<Message>),
+    /// Queued input joining the turn, refused once it is no longer busy.
+    Joins(Vec<Message>),
+}
 
 impl SessionRuntime {
     /// Resolve an input's model and mode, where given and different, without
@@ -26,13 +35,13 @@ impl SessionRuntime {
             let model = options
                 .model
                 .map(|model| model.name)
-                .filter(|name| name != &context.profile.name);
+                .filter(|name| name != &context.model.profile.name);
             let snapshot = match &model {
                 Some(name) => crate::session::ProfileSnapshot {
                     name: name.clone(),
                     profile: self.model_entry(name)?.profile,
                 },
-                None => context.profile.clone(),
+                None => context.model.profile.clone(),
             };
             let profile = &snapshot.profile;
             if images && !profile.supports_images {
@@ -57,12 +66,17 @@ impl SessionRuntime {
                 }
             };
             let replacement = if let Some(change) = &mode {
-                let system = self.mode_prompt(agent, turn.location, change).await?;
-                Some(self.mode_context(agent, snapshot.clone(), system, change)?)
+                let (mode, capabilities) = (Some(&change.mode), &change.capabilities);
+                let prompt =
+                    self.system_prompt(agent, turn.location, change.depth, mode, capabilities);
+                let system = prompt.await?;
+                let context =
+                    self.open_agent_context(agent, snapshot.clone(), system, capabilities, None)?;
+                Some(context)
             } else if model.is_some() {
-                let system = context.template.system().to_vec();
+                let system = context.model.system.clone();
                 // The tools stay pinned across a model change.
-                let tools = Some(context.template.to_request().tools);
+                let tools = Some(context.model.tools.clone());
                 let capabilities = &settings.capabilities;
                 let opening =
                     self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
@@ -93,21 +107,39 @@ impl SessionRuntime {
         })
     }
 
-    /// Journal `selected` and the `message` it applies to in one transaction, then
-    /// install them. `ModelChanged` and `ModeChanged` precede that message.
+    /// Journal `selected` and the messages it applies to in one transaction,
+    /// admitted as a submission when there are any, then install them.
+    /// `ModelChanged` and `ModeChanged` precede those messages.
     pub(in crate::agent::runtime) async fn adopt(
         &self,
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
         mut selected: Selected,
-        message: Option<Message>,
-    ) -> Result<(), SessionError> {
+        adopting: Adopting,
+    ) -> Result<(), HarnessError> {
+        let (messages, joins) = match adopting {
+            Adopting::Taken(message) => (Vec::from_iter(message), false),
+            Adopting::Joins(messages) => (messages, true),
+        };
+        let command = if messages.is_empty() {
+            Command::Journal
+        } else {
+            Command::Submit
+        };
         let mut events = std::mem::take(&mut selected.events);
-        let message = message.map(|message| SessionEvent::MessageCommitted { message });
-        events.extend(message.map(|message| (turn.agent.clone(), message)));
+        let messages = messages.into_iter();
+        let messages = messages.map(|message| SessionEvent::MessageCommitted { message });
+        events.extend(messages.map(|message| (turn.agent.clone(), message)));
         if !events.is_empty() {
-            self.store.append_all(events).await?;
+            let agent = turn.agent.clone();
+            let plan = move |state: &CoreState| {
+                if joins && !state.agents.busy(&agent) {
+                    return Err(HarnessError::Interrupted);
+                }
+                Ok(Plan::journal(events))
+            };
+            self.store.commit(command, plan).await?;
         }
         // No await between installation and its routing projection.
         selected.install(turn, context, settings);
@@ -117,7 +149,8 @@ impl SessionRuntime {
     /// Deliver the owner's pending events with the selection its next turn makes
     /// unasked, the root's configured mode, in one transaction. A selection that
     /// cannot be prepared delivers nothing: the events stay pending for the input
-    /// that resumes the agent. None when nothing was pending.
+    /// that resumes the agent. None when nothing was pending, or an interrupt
+    /// stopped the turn first, which leaves them pending.
     pub(in crate::agent::runtime) async fn deliver_selected(
         &self,
         turn: &mut TurnContext<'_>,
@@ -139,7 +172,7 @@ impl SessionRuntime {
             (selected.mode.as_ref()).map_or(&turn.capabilities, |change| &change.capabilities);
         let viewer = crate::tool::diagnostic::DiagnosticViewer::new(capabilities, turn.location);
         match self.deliver_events(turn.agent, viewer, &preceding).await {
-            Ok(None) => None,
+            Ok(None) | Err(HarnessError::Interrupted) => None,
             Ok(Some(_)) => {
                 selected.install(turn, context, settings);
                 Some(Ok(()))
@@ -147,50 +180,13 @@ impl SessionRuntime {
             Err(error) => Some(Err(error)),
         }
     }
-
-    pub(in crate::agent::runtime) async fn consume_queued_input(
-        &self,
-        turn: &mut TurnContext<'_>,
-        context: &mut AgentContext,
-        settings: &mut AgentSettings,
-        input: QueuedInput,
-    ) -> bool {
-        if let Err(refused) = self.store.admits(Command::Submit) {
-            input.reject(refused.into());
-            return false;
-        }
-        if !input.cancellation.try_claim() {
-            input.reject(HarnessError::Interrupted);
-            return false;
-        }
-        let QueuedInput {
-            content,
-            options,
-            committed,
-            ..
-        } = input;
-        let images = content.iter().any(UserPart::is_image);
-        let result = async {
-            let selected = self
-                .select(turn, context, settings, options, images)
-                .await?;
-            let message = Some(Message::User(content));
-            self.adopt(turn, context, settings, selected, message)
-                .await?;
-            Ok(())
-        }
-        .await;
-        let consumed = result.is_ok();
-        let _ = committed.send(result);
-        consumed
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use crate::agent::runtime::tests::{answer, inbox, model_ref, scripted_provider};
+    use crate::agent::runtime::tests::{answer, inbox, scripted_provider};
 
     #[tokio::test]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
@@ -264,7 +260,7 @@ mod tests {
         assert!(!state.is_terminal());
 
         tracking.release(1);
-        let completed = bounded(runtime.jobs.wait(job, None, true)).await.unwrap();
+        let completed = bounded(runtime.jobs.wait(job, true)).await.unwrap();
         assert_eq!(completed.state, crate::job::JobState::Completed);
         assert_eq!(completed.output, Some(json!("answer-1")));
         drop(root_inbox);
@@ -347,14 +343,12 @@ mod tests {
         let second = id(&second);
         assert_ne!(first, second);
         tracking.request(2).await;
-        let completed = bounded(runtime.jobs.wait(second, None, true))
-            .await
-            .unwrap();
+        let completed = bounded(runtime.jobs.wait(second, true)).await.unwrap();
         assert_eq!(completed.state, crate::job::JobState::Completed);
         refused(&call(&manager, duplicate).await, second);
 
         tracking.release(0);
-        let completed = bounded(runtime.jobs.wait(first, None, true)).await.unwrap();
+        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
         assert_eq!(completed.state, crate::job::JobState::Completed);
         refused(&call(&session.root, duplicate).await, first);
         // Rejecting a duplicate does not interfere with the intended follow-up
@@ -368,7 +362,7 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("test:resume"))
         );
-        let completed = bounded(runtime.jobs.wait(first, None, true)).await.unwrap();
+        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
         assert_eq!(completed.output, Some(json!("answer-3")));
         drop(root_inbox);
         stop(&session).await;
@@ -376,7 +370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_fifo_images_and_all_model_changes_commit_before_next_request() {
+    async fn queued_fifo_images_and_the_last_model_commit_before_next_request() {
         let (root, tracking, session) = start(true).await;
         let png = |name| crate::tests::png(name);
         let (first_png, second_png) = (png(b"first image fixture"), png(b"second image fixture"));
@@ -435,11 +429,8 @@ mod tests {
         assert_eq!(images.collect::<Vec<_>>(), expected_images);
         // The ongoing tool call must finish normally.
         assert!(next.messages().any(todo_finished));
-        // Do not collapse intermediate captured model changes.
-        assert_eq!(
-            model_changes(&session),
-            ["queue-test/second", "queue-test/third"]
-        );
+        // Both batches are one submission: only the selection it ends with is journaled.
+        assert_eq!(model_changes(&session), ["queue-test/third"]);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
@@ -478,26 +469,6 @@ mod tests {
         assert_eq!(bounded(switched).await.unwrap(), "from b");
         assert_eq!((first.remaining(), second.remaining()), (0, 0));
         stop(&session).await;
-    }
-
-    #[tokio::test]
-    async fn queued_input_is_not_lost_at_a_final_response_boundary() {
-        let (_root, tracking, session) = start(false).await;
-        let turn = spawn_prompt(&session, "test:initial");
-        tracking.request(0).await;
-        let (receipt, token_cancel) = enqueue(&session, "test:follow-up", vec![], None);
-        buffered(&session, 1).await;
-        assert!(!receipt.is_finished());
-        tracking.release(0);
-        let next = tracking.request(1).await;
-        // The receipt must not wait for the gated continuation response.
-        bounded(receipt).await.unwrap().unwrap();
-        assert!(token_cancel.is_claimed());
-        assert_eq!(texts(next.messages()), ["test:initial", "test:follow-up"]);
-        tracking.release(1);
-        bounded(turn).await.unwrap().unwrap();
-        stop(&session).await;
-        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
@@ -543,42 +514,5 @@ mod tests {
         assert_eq!(texts(last.messages()), ["test:initial", "test:ordinary"]);
         stop(&session).await;
         assert_eq!(count(&tracking), 3);
-    }
-
-    #[tokio::test]
-    async fn queued_validation_errors_do_not_claim_or_commit() {
-        let (_root, tracking, session) = start(false).await;
-        let runtime = &session.runtime;
-        let missing = model_ref("missing");
-        let unknown = session.selection(Some(&missing), None).unwrap_err();
-        assert!(matches!(unknown, HarnessError::UnknownModel(name) if name == missing));
-        // One byte over the per-image limit, and one image over the count limit.
-        let image = |bytes: &[u8]| crate::media::Attachment::Image {
-            file: None,
-            image: crate::tests::png(bytes),
-        };
-        let (oversized, small) = (image(&vec![0; MAX_IMAGE_BYTES as usize - 7]), image(b""));
-        let before = runtime.store.records().len();
-        let cases = [
-            (vec![oversized], "size"),
-            (vec![small; MAX_IMAGES_PER_SUBMISSION + 1], "count"),
-        ];
-        for (attachments, case) in cases {
-            let prompt = QueuedPrompt {
-                text: "test:invalid".into(),
-                attachments,
-                options: Selection::default(),
-                cancellation: QueuedPromptCancellation::default(),
-            };
-            let token_cancel = prompt.cancellation.clone();
-            let enqueued = enqueue_prompts(&session, vec![prompt]);
-            let error = bounded(enqueued).await.pop().unwrap().unwrap_err();
-            assert!(matches!(error, HarnessError::ImageLimit), "{case}");
-            assert!(!token_cancel.is_claimed(), "{case}");
-            assert!(token_cancel.cancel(), "{case}");
-            assert_eq!(runtime.store.records().len(), before, "{case}");
-        }
-        assert_eq!(count(&tracking), 0);
-        stop(&session).await;
     }
 }

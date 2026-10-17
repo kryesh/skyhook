@@ -13,9 +13,7 @@ use crate::{
         AssistantItem, ItemId, ItemKind, Position, Provenance, Replay, TextBlock, ToolCall,
         ToolResult,
     },
-    session::{
-        EntryKind, JobEvent, Message, RuntimeState, SessionEvent, StateJob, StateJobKind, UserPart,
-    },
+    session::{JobEvent, Message, RuntimeState, SessionEvent, StateJob, StateJobKind, UserPart},
 };
 
 named_enum! {
@@ -39,13 +37,6 @@ named_enum! {
     }
 }
 
-impl UserPartKind {
-    /// Whether the part holds its text inline.
-    pub(super) fn text(self) -> bool {
-        matches!(self, Self::Text | Self::ParentInput | Self::Compaction)
-    }
-}
-
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
     pub(super) enum JobEventKind {
@@ -58,11 +49,8 @@ impl Encoder {
     /// Insert a message committed by `agent`; a tool result binds to that agent's
     /// latest committed call of the same id that has no result yet.
     pub(super) fn message_for(&mut self, db: &Db, agent: i64, message: &Message) -> DbResult<i64> {
-        let Message::Tool(results) = message else {
+        let Message::Tool(result) = message else {
             return self.message(db, message);
-        };
-        let [result] = results.as_slice() else {
-            return Err(rejected("a tool message carries exactly one result"));
         };
         let (call, name) = db
             .query_row(
@@ -80,21 +68,25 @@ impl Encoder {
         if name != result.name {
             return Err(rejected("tool result name differs from its call"));
         }
-        let message = db.insert(
-            "INSERT INTO message (role) VALUES (?1)",
-            params![MessageRole::Tool],
-        )?;
+        let message = message_row(db, MessageRole::Tool)?;
         tool_result(db, message, call, result)?;
         Ok(message)
     }
 
     pub(super) fn message(&mut self, db: &Db, message: &Message) -> DbResult<i64> {
+        let role = match message {
+            Message::User(_) => MessageRole::User,
+            Message::Assistant(_) => MessageRole::Assistant,
+            Message::State(_) => MessageRole::State,
+            Message::Tool(_) => {
+                return Err(rejected(
+                    "tool results are only stored as committed agent messages",
+                ));
+            }
+        };
+        let id = message_row(db, role)?;
         match message {
             Message::User(parts) => {
-                let id = db.insert(
-                    "INSERT INTO message (role) VALUES (?1)",
-                    params![MessageRole::User],
-                )?;
                 for (position, part) in parts.iter().enumerate() {
                     let (kind, text, attachment) = match part {
                         UserPart::Text { text } => (UserPartKind::Text, Some(text), None),
@@ -118,7 +110,7 @@ impl Encoder {
                         }
                         None => (None, None, None),
                     };
-                    let blob = blob.map(|blob| stored_blob(db, blob)).transpose()?;
+                    let blob = blob.map(|blob| blob.sha256.to_bytes().to_vec());
                     let row = db.insert(
                         "INSERT INTO user_part (message, position, kind, text, blob, \
                          image_format, file) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -128,30 +120,16 @@ impl Encoder {
                         job_events(db, row, events)?;
                     }
                 }
-                Ok(id)
             }
             Message::Assistant(items) => {
-                let id = db.insert(
-                    "INSERT INTO message (role) VALUES (?1)",
-                    params![MessageRole::Assistant],
-                )?;
                 for item in items {
                     assistant_item(db, id, item)?;
                 }
-                Ok(id)
             }
-            Message::State(state) => {
-                let id = db.insert(
-                    "INSERT INTO message (role) VALUES (?1)",
-                    params![MessageRole::State],
-                )?;
-                self.state(db, id, state)?;
-                Ok(id)
-            }
-            Message::Tool(_) => Err(rejected(
-                "tool results are only stored as committed agent messages",
-            )),
+            Message::State(state) => self.state(db, id, state)?,
+            Message::Tool(_) => {}
         }
+        Ok(id)
     }
 
     fn state(&mut self, db: &Db, message: i64, state: &RuntimeState) -> DbResult<()> {
@@ -167,14 +145,13 @@ impl Encoder {
             ],
         )?;
         self.state_jobs(db, message, &state.jobs, None, &mut 0)?;
-        for (position, item) in state.todos.iter().enumerate() {
-            db.execute(
-                "INSERT INTO message_state_todo (message, position, text, status) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![message, position, &item.text, item.status],
-            )?;
-        }
-        Ok(())
+        todos(
+            db,
+            "message_state_todo",
+            "message",
+            message as u64,
+            &state.todos,
+        )
     }
 
     /// Jobs in pre-order, each child naming its parent's position.
@@ -223,6 +200,10 @@ impl Encoder {
     }
 }
 
+fn message_row(db: &Db, role: MessageRole) -> DbResult<i64> {
+    db.insert("INSERT INTO message (role) VALUES (?1)", params![role])
+}
+
 fn job_events(db: &Db, part: i64, events: &[JobEvent]) -> DbResult<()> {
     for (position, event) in events.iter().enumerate() {
         match event {
@@ -257,11 +238,10 @@ fn job_events(db: &Db, part: i64, events: &[JobEvent]) -> DbResult<()> {
 }
 
 fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
-    let kind = item.kind();
     let id = db.insert(
         "INSERT INTO assistant_item (message, position, provider_id, kind) \
          VALUES (?1, ?2, ?3, ?4)",
-        params![message, item.position().get(), item.id(), kind],
+        params![message, item.position().get(), item.id(), item.kind()],
     )?;
     if let Some(replay) = item.replay() {
         db.execute(
@@ -281,15 +261,9 @@ fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
         AssistantItem::Text { blocks, .. } | AssistantItem::Reasoning { blocks, .. } => {
             for block in blocks {
                 db.execute(
-                    "INSERT INTO assistant_block (item, item_kind, position, provider_id, text) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        id,
-                        kind,
-                        block.position.get(),
-                        &block.id,
-                        block.text.clone()
-                    ],
+                    "INSERT INTO assistant_block (item, position, provider_id, text) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, block.position.get(), &block.id, block.text.clone()],
                 )?;
             }
         }
@@ -329,7 +303,7 @@ pub(super) fn image_row(
     position: usize,
     image: &ImageRef,
 ) -> DbResult<()> {
-    let blob = stored_blob(db, &image.blob)?;
+    let blob = image.blob.sha256.to_bytes().to_vec();
     db.execute(
         &format!(
             "INSERT INTO {table} ({owner}, position, blob, format, file) VALUES (?1, ?2, ?3, ?4, ?5)"
@@ -339,28 +313,20 @@ pub(super) fn image_row(
     Ok(())
 }
 
-/// A reference must name a stored blob of exactly its recorded length.
-fn stored_blob(db: &Db, blob: &BlobRef) -> DbResult<Value> {
-    let key = blob.sha256.to_bytes().to_vec();
-    let length = db
-        .query_row(
-            "SELECT length(bytes) FROM blob WHERE sha256 = ?1",
-            params![key.clone()],
-            |row| Ok(row.get::<u64>(0)?),
-        )?
-        .ok_or_else(|| rejected(format!("blob {} is not stored", blob.sha256)))?;
-    if length != blob.bytes {
-        return Err(rejected(format!("blob {} length differs", blob.sha256)));
-    }
-    Ok(Value::Blob(key))
-}
-
-pub(super) fn todos(db: &Db, seq: u64, kind: EntryKind, items: &[TodoItem]) -> DbResult<()> {
+/// Insert `items` as the `table` rows of `owner` `id`.
+pub(super) fn todos(
+    db: &Db,
+    table: &str,
+    owner: &str,
+    id: u64,
+    items: &[TodoItem],
+) -> DbResult<()> {
     for (position, item) in items.iter().enumerate() {
         db.execute(
-            "INSERT INTO todo_item (entry, kind, position, text, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seq, kind, position, &item.text, item.status],
+            &format!(
+                "INSERT INTO {table} ({owner}, position, text, status) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            params![id, position, &item.text, item.status],
         )?;
     }
     Ok(())
@@ -498,9 +464,14 @@ fn job_event(row: &Row) -> DbResult<JobEvent> {
     })
 }
 
+/// Whether every row of `rows` belongs to an owner `owners` holds as one of `kinds`.
+fn filed<T, K: PartialEq>(rows: &HashMap<i64, T>, owners: &HashMap<i64, K>, kinds: &[K]) -> bool {
+    (rows.keys()).all(|owner| owners.get(owner).is_some_and(|kind| kinds.contains(kind)))
+}
+
 impl Messages {
     pub(super) fn load(db: &Db) -> DbResult<Self> {
-        Ok(Self {
+        let messages = Self {
             roles: keyed(db, "SELECT id, role FROM message", |row| {
                 enum_column(row, 1)
             })?,
@@ -594,7 +565,25 @@ impl Messages {
                  ORDER BY i.result, i.position",
                 |row| image(row, 1),
             )?,
-        })
+        };
+        let items: HashMap<_, _> = (messages.items.values().flatten())
+            .map(|(item, _, _, kind)| (*item, *kind))
+            .collect();
+        let roles = &messages.roles;
+        if !(filed(&messages.parts, roles, &[MessageRole::User])
+            && filed(&messages.states, roles, &[MessageRole::State])
+            && filed(&messages.items, roles, &[MessageRole::Assistant])
+            && filed(&messages.results, roles, &[MessageRole::Tool])
+            && filed(
+                &messages.blocks,
+                &items,
+                &[ItemKind::Text, ItemKind::Reasoning],
+            )
+            && filed(&messages.replays, &items, &[ItemKind::Reasoning]))
+        {
+            return Err(corrupt("message rows belong to another role or item kind"));
+        }
+        Ok(messages)
     }
 
     pub(super) fn message(&self, id: i64) -> DbResult<Message> {
@@ -708,13 +697,13 @@ impl Messages {
                     .results
                     .get(&id)
                     .ok_or_else(|| corrupt("tool message has no result"))?;
-                Message::Tool(vec![ToolResult {
+                Message::Tool(ToolResult {
                     call_id: call_id.clone(),
                     name: name.clone(),
                     result: parse_json(result)?,
                     images: self.images.get(&id).cloned().unwrap_or_default(),
                     is_error: *is_error,
-                }])
+                })
             }
         })
     }

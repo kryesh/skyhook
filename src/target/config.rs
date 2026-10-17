@@ -31,6 +31,7 @@ impl TargetsConfig {
     }
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
@@ -45,7 +46,6 @@ pub struct TargetConfig {
     /// Jump through this target (ProxyJump) within the SSH connection origin starts; the jump must share that origin.
     pub via: Option<String>,
     /// Target whose Skyhook shim starts the SSH connection, using its key paths and agents; defaults to root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
 
@@ -56,6 +56,7 @@ pub enum Transport {
     Ssh,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SshOptions {
@@ -100,7 +101,6 @@ named_enum! {
 }
 
 impl TargetAuth {
-    #[must_use]
     pub const fn kind(&self) -> SshAuth {
         match self {
             Self::Default => SshAuth::Default,

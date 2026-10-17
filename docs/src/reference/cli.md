@@ -28,7 +28,9 @@ binary's command help. `skyhook` itself requires an interactive terminal; `batch
 | `-h, --help` | Print command help. |
 | `-V, --version` | Print the version. |
 
-An initial prompt or script runs in the terminal interface, which remains open afterward.
+An initial prompt or script runs in the terminal interface, which remains open afterward. If
+the session cannot start, the prompt stays queued for `/resume`, but the script is not run; run
+the command again to retry it.
 Startup without initial input opens an empty draft; no session is created until a message or
 script is submitted. These options belong to session execution only: a subcommand accepts
 just its own options, after its name.

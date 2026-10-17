@@ -155,18 +155,14 @@ tool.job = job => {
 
 async function __request(request) {
   const response = __parse(await __skyhookHostCall(__stringify(request)));
-  if (!response.ok) {
+  if (response.outcome !== "ok") {
     throw new Error(response.error);
   }
-  if (response.presented) __rememberPresented(response.value, response.presented);
+  __rememberPresented(response.value, response.presented);
   // Only tool calls produce JobViews. A received message or a nested payload
   // may look like one, but remains arbitrary user JSON without runtime methods.
   if (request.type === "call") {
-    // The Rust response type owns the schema; guard only the object boundary.
     const view = response.value;
-    if (view === null || typeof view !== "object" || Array.isArray(view)) {
-      throw new TypeError(`tool "${request.name}" returned an invalid JobView envelope: expected an object`);
-    }
     Object.defineProperty(view, "unwrap", {
       enumerable: false,
       value() { return __unwrapResponse(view); },

@@ -10,8 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::{
     target::{Route, TargetRef},
     tool::{
-        authorization::{AuthorizationError, Reauthorization},
-        diagnostic::{Diagnostic, PartialDiagnostic},
+        authorization::{Asking, AuthorizationError, Reauthorization},
+        diagnostic::Diagnostic,
         output::{CaptureEvent, CaptureId, ProducedOutput},
         policy::{ApprovalCoverage, Capability, PermissionUse, ResourceId},
     },
@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use super::error::ProtocolError;
 
-pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 macro_rules! wire_ids {
     ($($(#[$attr:meta])* $name:ident),+ $(,)?) => {$(
@@ -119,7 +119,7 @@ pub(crate) enum Request {
     AuthorizationDecision {
         request_id: RequestId,
         authorization_id: AuthorizationId,
-        decision: AuthorizationDecision,
+        decision: Result<(), AuthorizationError>,
     },
 }
 
@@ -150,48 +150,6 @@ pub(crate) enum ControlRequest {
         prompt_id: PromptId,
         answer: super::prompt::PromptAnswer,
     },
-}
-
-/// The host's answer to a shim's authorization request.
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) enum AuthorizationDecision {
-    Allowed,
-    Denied(String),
-    InvalidGrant(String),
-    Cancelled,
-    Unavailable(String),
-    /// The host policy stopped before deciding.
-    Failed,
-    /// A target the request names was redefined.
-    Redefined,
-}
-
-impl From<Result<(), AuthorizationError>> for AuthorizationDecision {
-    fn from(decision: Result<(), AuthorizationError>) -> Self {
-        match decision {
-            Ok(()) => Self::Allowed,
-            Err(AuthorizationError::Denied(reason)) => Self::Denied(reason),
-            Err(AuthorizationError::InvalidGrant(reason)) => Self::InvalidGrant(reason),
-            Err(AuthorizationError::Cancelled) => Self::Cancelled,
-            Err(AuthorizationError::Unavailable(tool)) => Self::Unavailable(tool),
-            Err(AuthorizationError::PolicyFailed) => Self::Failed,
-            Err(AuthorizationError::TargetRedefined) => Self::Redefined,
-        }
-    }
-}
-
-impl AuthorizationDecision {
-    pub(crate) fn into_result(self) -> Result<(), AuthorizationError> {
-        match self {
-            Self::Allowed => Ok(()),
-            Self::Denied(reason) => Err(AuthorizationError::Denied(reason)),
-            Self::InvalidGrant(reason) => Err(AuthorizationError::InvalidGrant(reason)),
-            Self::Cancelled => Err(AuthorizationError::Cancelled),
-            Self::Unavailable(tool) => Err(AuthorizationError::Unavailable(tool)),
-            Self::Failed => Err(AuthorizationError::PolicyFailed),
-            Self::Redefined => Err(AuthorizationError::TargetRedefined),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -236,12 +194,13 @@ pub(crate) enum Response {
 }
 
 /// What a worker asks its host to authorize while it runs a call: permissions
-/// for its own paths and network origins, each with the grant it proposes, or
-/// the origin a request moved to there. A worker can name nothing else: the
-/// host binds what it asks to the connection's target.
+/// for its own paths and network origins, each with the grant it proposes, and
+/// whether the decision may ask anyone, or the origin a request moved to there.
+/// A worker can name nothing else: the host binds what it asks to the
+/// connection's target.
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum Forwarded {
-    Permissions(Vec<(Capability, Own, Option<ApprovalCoverage>)>),
+    Permissions(Vec<(Capability, Own, Option<ApprovalCoverage>)>, Asking),
     Network(String),
 }
 
@@ -257,9 +216,9 @@ impl Forwarded {
     /// it names root, resolves; none if that is nothing. Refused for a path or
     /// origin it names on another machine.
     pub(crate) fn of(request: Reauthorization) -> Result<Option<Self>, ProtocolError> {
-        let permissions = match request {
+        let (permissions, asking) = match request {
             Reauthorization::Network(origin) => return Ok(Some(Self::Network(origin))),
-            Reauthorization::Permissions(permissions) => permissions,
+            Reauthorization::Permissions(permissions, asking) => (permissions, asking),
         };
         let mut own = Vec::new();
         for permission in permissions {
@@ -280,15 +239,18 @@ impl Forwarded {
             };
             own.push((permission.capability, resource, permission.proposed));
         }
-        Ok((!own.is_empty()).then_some(Self::Permissions(own)))
+        Ok((!own.is_empty()).then_some(Self::Permissions(own, asking)))
     }
 
     /// The permissions asked for on `target`, the machine the worker runs on,
-    /// and the origin a request moved to.
-    pub(crate) fn into_parts(self, target: &TargetRef) -> (Vec<PermissionUse>, Option<String>) {
-        let permissions = match self {
+    /// the origin a request moved to, and whether the decision may ask anyone.
+    pub(crate) fn into_parts(
+        self,
+        target: &TargetRef,
+    ) -> (Vec<PermissionUse>, Option<String>, Asking) {
+        let (permissions, asking) = match self {
             Self::Network(origin) => return Reauthorization::Network(origin).into_parts(target),
-            Self::Permissions(permissions) => permissions,
+            Self::Permissions(permissions, asking) => (permissions, asking),
         };
         let bound = permissions
             .into_iter()
@@ -306,7 +268,7 @@ impl Forwarded {
                     proposed,
                 }
             });
-        (bound.collect(), None)
+        (bound.collect(), None, asking)
     }
 }
 
@@ -341,13 +303,12 @@ pub(crate) enum PayloadEvent {
 
 pub(crate) type RemoteToolResult = Result<RemoteToolOutput, RemoteToolError>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct RemoteToolOutput {
     pub value: Value,
     pub images: Vec<crate::media::ImageRef>,
     pub captures: Vec<CaptureId>,
     pub streams: crate::tool::StreamEnd,
-    pub diagnostic: Option<Diagnostic>,
 }
 
 impl From<ProducedOutput> for RemoteToolOutput {
@@ -361,7 +322,6 @@ impl From<ProducedOutput> for RemoteToolOutput {
                 .map(|capture| capture.id())
                 .collect(),
             streams: output.streams,
-            diagnostic: output.diagnostic.map(PartialDiagnostic::resolve),
         }
     }
 }
@@ -377,24 +337,11 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_within(writer, value, MAX_FRAME_BYTES).await
-}
-
-/// Write a frame of at most `limit` bytes.
-pub(super) async fn write_frame_within<W, T>(
-    writer: &mut W,
-    value: &T,
-    limit: usize,
-) -> Result<(), std::io::Error>
-where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
-{
     let bytes = zeroize::Zeroizing::new(
         rmp_serde::to_vec_named(value)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
     );
-    if bytes.len() > limit {
+    if bytes.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "RPC frame is too large",
@@ -452,7 +399,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{AdmissionError, diagnostic::Cause, policy::PathText};
+    use crate::tool::policy::PathText;
 
     /// A worker forwards only its own paths and network origins, which the host
     /// binds to the connection's target with the grants they propose; it refuses
@@ -479,67 +426,27 @@ mod tests {
         ];
         let admitted = admitted.map(|resource| PermissionUse::new(Capability::Read, resource));
         let asked = own(&root).into_iter().chain(admitted).collect();
-        let forwarded = Forwarded::of(Reauthorization::Permissions(asked)).unwrap();
-        assert_eq!(forwarded.unwrap().into_parts(&build), (own(&build), None));
-        let elsewhere = Reauthorization::Permissions(own(&build));
+        let forwarded = Forwarded::of(Reauthorization::Permissions(asked, Asking::Never)).unwrap();
+        assert_eq!(
+            forwarded.unwrap().into_parts(&build),
+            (own(&build), None, Asking::Never)
+        );
+        let elsewhere = Reauthorization::Permissions(own(&build), Asking::Allowed);
         assert!(Forwarded::of(elsewhere).is_err());
         let frame = |request| Response::Authorization {
             request_id: RequestId::new(1),
             authorization_id: AuthorizationId::new(1),
             request,
         };
-        let forwarded = Forwarded::of(Reauthorization::Permissions(own(&root)));
+        let forwarded = Forwarded::of(Reauthorization::Permissions(own(&root), Asking::Allowed));
         let mut frame = serde_json::to_value(frame(forwarded.unwrap().unwrap())).unwrap();
         let decodes = |frame: &Value| {
             let bytes = rmp_serde::to_vec_named(frame).unwrap();
             rmp_serde::from_slice::<Response>(&bytes).is_ok()
         };
         assert!(decodes(&frame));
-        frame["authorization"]["request"]["Permissions"][0][1] =
+        frame["authorization"]["request"]["Permissions"][0][0][1] =
             serde_json::json!({"Session": "root"});
         assert!(!decodes(&frame));
-    }
-
-    /// Every path that reports an authorization failure to a tool reads it the
-    /// same way, including after a wire round trip; a cancellation is never
-    /// relayed as a denial.
-    #[test]
-    fn authorization_failures_read_the_same_on_every_path() {
-        let cases = [
-            (
-                AuthorizationError::Denied("no".into()),
-                Cause::Denied("no".into()),
-            ),
-            (AuthorizationError::Cancelled, Cause::Cancelled),
-            (
-                AuthorizationError::InvalidGrant("unproposed".into()),
-                Cause::Message("unproposed".into()),
-            ),
-            (
-                AuthorizationError::Unavailable("tool".into()),
-                Cause::Unavailable {
-                    tool: "tool".into(),
-                },
-            ),
-            (
-                AuthorizationError::PolicyFailed,
-                Cause::Message("authorization could not be decided".into()),
-            ),
-            (
-                AuthorizationError::TargetRedefined,
-                Cause::Message("target was redefined".into()),
-            ),
-        ];
-        for (error, cause) in cases {
-            let direct = AdmissionError::from(error.clone()).diagnostic().cause;
-            let relayed = AuthorizationDecision::from(Err(error))
-                .into_result()
-                .map_err(AdmissionError::from)
-                .unwrap_err()
-                .diagnostic()
-                .cause;
-            assert_eq!(direct, cause);
-            assert_eq!(relayed, cause);
-        }
     }
 }

@@ -461,107 +461,79 @@ mod tests {
         assert!(!runtime.root.path().join("missing").exists());
     }
 
+    /// A missing parent fails unless `create_parents` asks for the resolved path's
+    /// missing directories, never below a file nor for an oversized write.
     #[tokio::test]
-    async fn write_creates_nested_parents_only_when_requested() {
-        let runtime = TestRuntime::new().await;
-        let executor = runtime.executor(builder());
-        for create_parents in [None, Some(false)] {
-            let mut args = json!({"path": "missing/nested/file.txt", "content": "text"});
-            if let Some(value) = create_parents {
-                args["create_parents"] = json!(value);
-            }
-            let error = executor
-                .run_host(&runtime.agent, "write", args)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(
-                    error.diagnostic().cause,
-                    Cause::Io {
-                        kind: IoKind::NotFound,
-                        ..
-                    }
-                ),
-                "{error:?}"
-            );
-            assert!(!runtime.root.path().join("missing").exists());
-        }
-        for relative in ["relative/nested/file.txt", "absolute/nested/file.txt"] {
-            let path = runtime.root.path().join(relative);
-            let input = if relative.starts_with("absolute") {
-                path.to_string_lossy().into_owned()
-            } else {
-                relative.to_owned()
-            };
-            let result = write(&executor, &runtime, &input, "hello", true)
-                .await
-                .unwrap();
-            assert_eq!(result.output.value["bytes"], 5);
-            assert_eq!(fs::read_to_string(&path).await.unwrap(), "hello");
-            // Both modes keep working with existing parents and replace files.
-            for create_parents in [false, true] {
-                write(&executor, &runtime, &input, "replacement", create_parents)
-                    .await
-                    .unwrap();
-                assert_eq!(fs::read_to_string(&path).await.unwrap(), "replacement");
-                let sibling = path.with_file_name(format!("new-{create_parents}.txt"));
-                write(&executor, &runtime, sibling, "new", create_parents)
-                    .await
-                    .unwrap();
-            }
-            let entries = std::fs::read_dir(path.parent().unwrap()).unwrap();
-            let temporary =
-                |name: std::ffi::OsString| name.to_string_lossy().starts_with(".skyhook-");
-            assert!(
-                !entries
-                    .into_iter()
-                    .any(|entry| temporary(entry.unwrap().file_name()))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn write_create_parents_normalizes_traversal_and_rejects_file_ancestors_and_oversize() {
+    async fn write_creates_missing_parents_only_when_requested() {
         let runtime = TestRuntime::new().await;
         let executor = runtime.executor(builder());
         let root = runtime.root.path();
-        for (input, expected) in [
-            ("missing/../file.txt", "file.txt"),
-            ("missing/../new/nested/file.txt", "new/nested/file.txt"),
+        let missing = json!({"path": "missing/nested/file.txt", "content": "text"});
+        let error = executor
+            .run_host(&runtime.agent, "write", missing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.diagnostic().cause,
+                Cause::Io {
+                    kind: IoKind::NotFound,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        fs::write(root.join("file"), "unchanged").await.unwrap();
+        let absolute = root.join("absolute/nested/file.txt");
+        let oversized = "x".repeat(MAX_WRITE_BYTES + 1);
+        for (path, create_parents, content, written) in [
+            ("missing/nested/file.txt", false, "text", None),
+            (
+                "relative/nested/file.txt",
+                true,
+                "text",
+                Some("relative/nested/file.txt"),
+            ),
+            (
+                absolute.to_str().unwrap(),
+                true,
+                "text",
+                Some("absolute/nested/file.txt"),
+            ),
+            ("missing/../new/nested/file.txt", true, "text", None),
+            ("file/child.txt", true, "text", None),
+            ("file/nested/child.txt", true, "text", None),
+            ("file/../child.txt", true, "text", None),
+            ("oversized/nested/file.txt", true, &oversized, None),
         ] {
-            write(&executor, &runtime, input, "text", true)
+            let result = write(&executor, &runtime, path, content, create_parents).await;
+            assert_eq!(result.is_ok(), written.is_some(), "{path}");
+            if let Some(written) = written {
+                let text = fs::read_to_string(root.join(written)).await.unwrap();
+                assert_eq!(text, content);
+            }
+        }
+        for untouched in ["missing", "new", "oversized"] {
+            assert!(!root.join(untouched).exists(), "{untouched}");
+        }
+        let file = fs::read_to_string(root.join("file")).await.unwrap();
+        assert_eq!(file, "unchanged");
+        // Existing parents work in both modes, replacing without leftovers.
+        let path = "relative/nested/file.txt";
+        for create_parents in [false, true] {
+            let content = format!("replacement {create_parents}");
+            write(&executor, &runtime, path, &content, create_parents)
                 .await
                 .unwrap();
-            assert_eq!(
-                fs::read_to_string(root.join(expected)).await.unwrap(),
-                "text"
-            );
-            assert!(!root.join("missing").exists());
+            assert_eq!(fs::read_to_string(root.join(path)).await.unwrap(), content);
         }
-        fs::write(root.join("file"), "unchanged").await.unwrap();
-        for path in [
-            "file/child.txt",
-            "file/nested/child.txt",
-            "file/../child.txt",
-        ] {
-            assert!(
-                write(&executor, &runtime, path, "text", true)
-                    .await
-                    .is_err()
-            );
-        }
-        assert_eq!(
-            fs::read_to_string(root.join("file")).await.unwrap(),
-            "unchanged"
-        );
-        let oversized = "x".repeat(MAX_WRITE_BYTES + 1);
-        let path = "oversized/nested/file.txt";
+        let entries = std::fs::read_dir(root.join("relative/nested")).unwrap();
+        let temporary = |name: std::ffi::OsString| name.to_string_lossy().starts_with(".skyhook-");
         assert!(
-            write(&executor, &runtime, path, &oversized, true)
-                .await
-                .is_err()
+            !entries
+                .into_iter()
+                .any(|entry| temporary(entry.unwrap().file_name()))
         );
-        assert!(!root.join("oversized").exists());
     }
 
     /// Denies every path resource, plus every write when `deny_write` is set.
@@ -581,50 +553,11 @@ mod tests {
         })
     }
 
+    /// A denied write creates nothing: the policy sees the resolved destination,
+    /// through symlinks, before any directory exists, and a path that climbs
+    /// out of a missing entry fails without asking.
     #[tokio::test]
-    async fn write_create_parents_does_not_mutate_denied_paths() {
-        let runtime = TestRuntime::new().await;
-        let workspace = runtime.root.path().join("workspace");
-        fs::create_dir(&workspace).await.unwrap();
-        let outside = runtime.root.path().join("outside");
-        for deny_write in [false, true] {
-            let policy = write_policy(deny_write);
-            let executor = ToolExecutor::new(
-                builder().build(),
-                policy.clone(),
-                runtime.jobs.clone(),
-                workspace.clone(),
-            );
-            let mut paths = vec![
-                outside
-                    .join("nested/file.txt")
-                    .to_string_lossy()
-                    .into_owned(),
-                "../outside/nested/file.txt".to_owned(),
-                "missing/../../outside/nested/file.txt".to_owned(),
-            ];
-            if deny_write {
-                paths.push("local/nested/file.txt".to_owned());
-            }
-            for path in paths {
-                let error = write(&executor, &runtime, path, "text", true)
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(error.diagnostic().cause, Cause::Denied(_)),
-                    "{error:?}"
-                );
-            }
-            assert!(!policy.requests.lock().unwrap().is_empty());
-            assert!(!outside.exists());
-            assert!(!workspace.join("missing").exists());
-            assert!(!workspace.join("local").exists());
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn write_create_parents_resolves_symlinks_before_authorization() {
+    async fn write_create_parents_creates_nothing_before_authorization() {
         use std::os::unix::fs::symlink;
 
         let runtime = TestRuntime::new().await;
@@ -634,44 +567,84 @@ mod tests {
         fs::create_dir(&outside).await.unwrap();
         symlink(&outside, workspace.join("link")).unwrap();
         symlink(outside.join("missing"), workspace.join("dangling")).unwrap();
-        let policy = write_policy(false);
-        let executor = ToolExecutor::new(
-            builder().build(),
-            policy.clone(),
-            runtime.jobs.clone(),
-            workspace,
-        );
-        let error = write(&executor, &runtime, "link/nested/file.txt", "text", true)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error.diagnostic().cause, Cause::Denied(_)),
-            "{error:?}"
-        );
-        let resource = ResourceId::path(
+        let resolved = ResourceId::path(
             &crate::target::TargetRef::Root,
             &crate::tool::policy::PathText::new(outside.join("nested/file.txt")).unwrap(),
         );
-        let requests = policy.requests.lock().unwrap().clone();
-        assert!(
-            requests
-                .iter()
-                .flat_map(|r| &r.permissions)
-                .any(|p| p.resource == resource)
-        );
-        assert!(
-            write(
+        for deny_write in [false, true] {
+            let policy = write_policy(deny_write);
+            let executor = ToolExecutor::new(
+                builder().build(),
+                policy.clone(),
+                runtime.jobs.clone(),
+                workspace.clone(),
+            );
+            let mut paths = vec![
+                "link/nested/file.txt".to_owned(),
+                outside
+                    .join("nested/file.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                "../outside/nested/file.txt".to_owned(),
+            ];
+            if deny_write {
+                paths.push("local/nested/file.txt".to_owned());
+            }
+            let dangling = write(
                 &executor,
                 &runtime,
                 "dangling/nested/file.txt",
                 "text",
-                true
-            )
-            .await
-            .is_err()
-        );
-        assert!(!outside.join("nested").exists());
-        assert!(!outside.join("missing").exists());
+                true,
+            );
+            assert!(dangling.await.is_err());
+            // Nothing resolves under a missing entry, so these fail unasked
+            // rather than step back out through a link.
+            let asked = policy.requests.lock().unwrap().len();
+            for path in [
+                "missing/../../outside/nested/file.txt",
+                "missing/../link/pwned",
+                "missing/../../workspace/link/pwned",
+            ] {
+                let error = write(&executor, &runtime, path, "text", true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error.diagnostic().cause,
+                        Cause::Io {
+                            kind: IoKind::NotFound,
+                            ..
+                        }
+                    ),
+                    "{path}: {error:?}"
+                );
+            }
+            assert_eq!(policy.requests.lock().unwrap().len(), asked);
+            for path in paths {
+                let error = write(&executor, &runtime, &path, "text", true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error.diagnostic().cause, Cause::Denied(_)),
+                    "{path}: {error:?}"
+                );
+                if path.starts_with("link/") {
+                    let requests = policy.requests.lock().unwrap();
+                    let asked = &requests.last().unwrap().permissions;
+                    assert!(asked.iter().any(|p| p.resource == resolved), "{asked:?}");
+                }
+            }
+        }
+        for created in [
+            outside.join("nested"),
+            outside.join("missing"),
+            outside.join("pwned"),
+            workspace.join("missing"),
+            workspace.join("local"),
+        ] {
+            assert!(!created.exists(), "{}", created.display());
+        }
     }
 
     #[tokio::test]
@@ -698,16 +671,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!fs::try_exists(workspace.join("directory")).await.unwrap());
-        #[cfg(unix)]
-        {
-            std::fs::write(workspace.join("target"), "safe").unwrap();
-            std::os::unix::fs::symlink("target", workspace.join("link")).unwrap();
-            let result = remove(json!({"path":"link"})).await.unwrap();
-            assert_eq!(result.output.value["kind"], "symlink");
-            assert!(fs::try_exists(workspace.join("target")).await.unwrap());
-            assert!(!fs::try_exists(workspace.join("link")).await.unwrap());
-        }
+        std::fs::write(workspace.join("target"), "safe").unwrap();
+        std::os::unix::fs::symlink("target", workspace.join("link")).unwrap();
+        let result = remove(json!({"path":"link"})).await.unwrap();
+        assert_eq!(result.output.value["kind"], "symlink");
+        assert!(fs::try_exists(workspace.join("target")).await.unwrap());
+        assert!(!fs::try_exists(workspace.join("link")).await.unwrap());
         let error = remove(json!({"path":"."})).await.unwrap_err();
-        assert!(error.to_string().contains("workspace root"));
+        assert!(error.to_string().contains("authorization root"));
     }
 }

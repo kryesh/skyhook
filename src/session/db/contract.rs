@@ -9,7 +9,7 @@ use crate::{
         profile::ModelProfile,
         protocol::{ResponseSchema, SystemSegment, ToolDefinition},
     },
-    session::{EntryKind, ModeSelection, ModelContext, ProfileSnapshot, SessionEvent},
+    session::{ModeSelection, ModelContext, ProfileSnapshot, SessionEvent},
     target::{SshAuth, SshOptions, TargetAuth, TargetDefinition, TargetName},
     tool::policy::{Capability, Mode},
 };
@@ -31,10 +31,10 @@ fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
 
 impl Encoder {
     pub(super) fn contract(&mut self, db: &Db, entry: Entry, event: &SessionEvent) -> DbResult<()> {
-        let Entry { seq, kind, .. } = entry;
+        let seq = entry.seq;
         match event {
             SessionEvent::SessionStarted { targets, .. }
-            | SessionEvent::TargetsUpserted { targets } => self.targets(db, entry, targets),
+            | SessionEvent::TargetsUpserted { targets } => self.targets(db, seq, targets),
             SessionEvent::AgentStarted {
                 profile,
                 mode,
@@ -42,10 +42,7 @@ impl Encoder {
                 location,
                 ..
             } => {
-                let profile = profile
-                    .as_ref()
-                    .map(|profile| self::profile(db, profile))
-                    .transpose()?;
+                let profile = self::profile(db, profile)?;
                 let target = self.target(db, &location.target)?;
                 db.execute(
                     "INSERT INTO agent_start (entry, profile, location_target, \
@@ -53,13 +50,13 @@ impl Encoder {
                     params![seq, profile, target, path_bytes(&location.workspace)],
                 )?;
                 if let Some(mode) = mode {
-                    self::mode(db, entry, mode)?;
+                    self::mode(db, seq, mode)?;
                 }
-                self::capabilities(db, entry, capabilities)
+                self::capabilities(db, seq, capabilities)
             }
             SessionEvent::ModeChanged { mode, capabilities } => {
-                self::mode(db, entry, mode)?;
-                self::capabilities(db, entry, capabilities)
+                self::mode(db, seq, mode)?;
+                self::capabilities(db, seq, capabilities)
             }
             SessionEvent::ModelChanged { profile } => {
                 let profile = self::profile(db, profile)?;
@@ -70,11 +67,11 @@ impl Encoder {
                 .map(drop)
             }
             SessionEvent::ModelContext { context } => self::context(db, seq, context),
-            _ => unreachable!("{kind} is not a contract event"),
+            _ => unreachable!("{} is not a contract event", event.kind()),
         }
     }
 
-    fn targets(&mut self, db: &Db, entry: Entry, targets: &[TargetDefinition]) -> DbResult<()> {
+    fn targets(&mut self, db: &Db, entry: u64, targets: &[TargetDefinition]) -> DbResult<()> {
         for definition in targets {
             let target = self.target(db, &definition.name.clone().into())?;
             let mut named = |name: &Option<TargetName>| {
@@ -89,14 +86,13 @@ impl Encoder {
                 _ => None,
             };
             let revision = db.insert(
-                "INSERT INTO target_revision (target, entry, kind, revision, source, host, \
+                "INSERT INTO target_revision (target, entry, revision, source, host, \
                  workspace, ssh_user, ssh_port, ssh_auth, ssh_key_path, ssh_external_agent, \
                  via, origin) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     target,
-                    entry.seq,
-                    entry.kind,
+                    entry,
                     definition.revision,
                     definition.source,
                     &definition.host,
@@ -123,16 +119,15 @@ impl Encoder {
 
 /// Apply a mode: an entry with a definition records the name's next edition, and
 /// every entry names the latest one.
-fn mode(db: &Db, entry: Entry, mode: &ModeSelection) -> DbResult<()> {
+fn mode(db: &Db, entry: u64, mode: &ModeSelection) -> DbResult<()> {
     let name = &mode.name;
     if let Some(definition) = &mode.definition {
         db.execute(
-            "INSERT INTO mode (name, version, entry, kind, instructions, hint) \
-             SELECT ?1, coalesce(max(version), 0) + 1, ?2, ?3, ?4, ?5 FROM mode WHERE name = ?1",
+            "INSERT INTO mode (name, version, entry, instructions, hint) \
+             SELECT ?1, coalesce(max(version), 0) + 1, ?2, ?3, ?4 FROM mode WHERE name = ?1",
             params![
                 name,
-                entry.seq,
-                entry.kind,
+                entry,
                 definition.instructions.as_ref(),
                 definition.hint.as_ref()
             ],
@@ -141,14 +136,14 @@ fn mode(db: &Db, entry: Entry, mode: &ModeSelection) -> DbResult<()> {
             db.execute(
                 "INSERT INTO mode_capability (mode_name, mode_version, capability) \
                  SELECT name, version, ?2 FROM mode WHERE entry = ?1",
-                params![entry.seq, *capability],
+                params![entry, *capability],
             )?;
         }
     }
     let inserted = db.execute(
-        "INSERT INTO agent_mode (entry, kind, mode_name, mode_version) \
-         SELECT ?1, ?2, name, max(version) FROM mode WHERE name = ?3 GROUP BY name",
-        params![entry.seq, entry.kind, name],
+        "INSERT INTO agent_mode (entry, mode_name, mode_version) \
+         SELECT ?1, name, max(version) FROM mode WHERE name = ?2 GROUP BY name",
+        params![entry, name],
     )?;
     if inserted == 0 {
         return Err(rejected(format!(
@@ -158,11 +153,11 @@ fn mode(db: &Db, entry: Entry, mode: &ModeSelection) -> DbResult<()> {
     Ok(())
 }
 
-fn capabilities(db: &Db, entry: Entry, capabilities: &[Capability]) -> DbResult<()> {
+fn capabilities(db: &Db, entry: u64, capabilities: &[Capability]) -> DbResult<()> {
     for capability in capabilities {
         db.execute(
-            "INSERT INTO agent_capability (entry, kind, capability) VALUES (?1, ?2, ?3)",
-            params![entry.seq, entry.kind, *capability],
+            "INSERT INTO agent_capability (entry, capability) VALUES (?1, ?2)",
+            params![entry, *capability],
         )?;
     }
     Ok(())
@@ -209,7 +204,7 @@ fn context(db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
         }
     }
     let (schema_name, schema) = match &context.response_schema {
-        Some(schema) => (Some(schema.name.clone()), Some(json(&schema.schema)?)),
+        Some(schema) => (Some(schema.name().to_owned()), Some(json(schema.schema())?)),
         None => (None, None),
     };
     db.execute(
@@ -330,15 +325,11 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             .cloned()
             .ok_or_else(|| corrupt("model profile is missing"))
     };
-    let agent_capabilities = grouped(
+    let mut capabilities = grouped(
         db,
         "SELECT entry, capability FROM agent_capability",
         |row| enum_column(row, 1),
     )?;
-    let capabilities_at = |entry: i64| {
-        let capabilities = agent_capabilities.get(&entry);
-        sorted(capabilities.cloned().unwrap_or_default())
-    };
     // Mode editions by the entry that recorded them.
     let mode_capabilities = grouped(
         db,
@@ -346,7 +337,7 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
          JOIN mode m ON m.name = c.mode_name AND m.version = c.mode_version",
         |row| enum_column(row, 1),
     )?;
-    let editions = keyed(db, "SELECT entry, instructions, hint FROM mode", |row| {
+    let mut editions = keyed(db, "SELECT entry, instructions, hint FROM mode", |row| {
         let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
         Ok(Mode {
             capabilities: sorted(capabilities.cloned().unwrap_or_default()),
@@ -354,39 +345,39 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             hint: row.get::<Option<String>>(2)?.map(parsed).transpose()?,
         })
     })?;
-    let selection = |entry: i64, name: Option<String>| {
-        let definition = editions.get(&entry).cloned();
-        let name = name.map(parsed).transpose()?;
-        DbResult::Ok(name.map(|name| ModeSelection { name, definition }))
-    };
+    let mut modes = keyed(db, "SELECT entry, mode_name FROM agent_mode", |row| {
+        parsed(row.get(1)?)
+    })?;
     events.load(
         "SELECT s.entry, a.owner_job, a.available_depth, t.name, s.location_workspace, \
-         s.profile, am.mode_name FROM agent_start s \
+         s.profile FROM agent_start s \
          JOIN entry e ON e.seq = s.entry JOIN agent a ON a.id = e.agent \
-         JOIN target t ON t.id = s.location_target \
-         LEFT JOIN agent_mode am ON am.entry = s.entry",
+         JOIN target t ON t.id = s.location_target",
         |row| {
+            let entry = row.get(0)?;
             Ok(SessionEvent::AgentStarted {
                 owner_job: row.get::<Option<i64>>(1)?.map(job).transpose()?,
-                profile: row.get::<Option<i64>>(5)?.map(profile).transpose()?,
+                profile: profile(row.get(5)?)?,
                 available_depth: row.get(2)?,
-                mode: selection(row.get(0)?, row.get(6)?)?,
-                capabilities: capabilities_at(row.get(0)?),
+                mode: (modes.remove(&entry)).map(|name| ModeSelection {
+                    name,
+                    definition: editions.remove(&entry),
+                }),
+                capabilities: sorted(take(&mut capabilities, entry)),
                 location: location(row.get(3)?, row.get(4)?)?,
             })
         },
     )?;
-    events.load_with(
-        "SELECT entry, mode_name FROM agent_mode WHERE kind = ?1",
-        params![EntryKind::ModeChanged],
-        |row| {
-            Ok(SessionEvent::ModeChanged {
-                mode: selection(row.get(0)?, row.get(1)?)?
-                    .ok_or_else(|| corrupt("mode_changed entry has no mode"))?,
-                capabilities: capabilities_at(row.get(0)?),
-            })
-        },
-    )?;
+    // Every other entry that applied a mode changed it.
+    for (entry, name) in modes {
+        let definition = editions.remove(&entry);
+        let mode = ModeSelection { name, definition };
+        let capabilities = sorted(take(&mut capabilities, entry));
+        events.insert(entry, SessionEvent::ModeChanged { mode, capabilities })?;
+    }
+    if !editions.is_empty() || !capabilities.is_empty() {
+        return Err(corrupt("mode rows belong to an entry that applied no mode"));
+    }
     events.load("SELECT entry, profile FROM model_selection", |row| {
         Ok(SessionEvent::ModelChanged {
             profile: profile(row.get(1)?)?,
@@ -418,13 +409,14 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         "SELECT entry, purpose, profile, system_prompt, response_schema_name, response_schema \
          FROM model_context",
         |row| {
-            let response_schema = match (row.get(4)?, row.get::<Option<String>>(5)?) {
-                (Some(name), Some(schema)) => Some(ResponseSchema {
-                    name,
-                    schema: parse_json(&schema)?,
-                }),
-                _ => None,
-            };
+            let response_schema =
+                match (row.get::<Option<String>>(4)?, row.get::<Option<String>>(5)?) {
+                    (Some(name), Some(schema)) => Some(
+                        ResponseSchema::new(name, parse_json(&schema)?)
+                            .map_err(|error| corrupt(error.to_string()))?,
+                    ),
+                    _ => None,
+                };
             Ok(SessionEvent::ModelContext {
                 context: ModelContext {
                     purpose: enum_column(row, 1)?,

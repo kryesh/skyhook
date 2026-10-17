@@ -62,7 +62,7 @@ pub(super) fn job_event_entries(
                     }
                 }
                 JobEvent::Job(job_view) => {
-                    let id = job_view.id();
+                    let id = job_view.id;
                     let job = id.and_then(|id| snapshot.jobs.get(&id));
                     let tool = job_view
                         .tool()

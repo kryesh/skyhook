@@ -8,7 +8,7 @@ use struson::reader::{JsonReader, JsonStreamReader};
 
 use super::{
     ElementPage, FieldPointer, MemberPage, OutputFields, OutputPreview, OutputTruncation,
-    ToolError,
+    ToolError, check_cancelled,
     json::saved_json,
     preview::{self, Accounting, Pooled},
     projection::Presented,
@@ -36,9 +36,7 @@ pub(super) fn page(
     let mut elements = Vec::new();
     let mut members = Map::new();
     while reader.has_next().map_err(saved_json)? {
-        if cancellation.is_cancelled() {
-            return Err(ToolError::cancelled());
-        }
+        check_cancelled(cancellation)?;
         if position < index || next.is_some() || budget.shown == limit {
             if position >= index {
                 next.get_or_insert(position);
@@ -182,9 +180,7 @@ pub(super) fn children<R: Read>(
     .map_err(saved_json)?;
     let (mut fields, mut position) = (Vec::new(), 0);
     while reader.has_next().map_err(saved_json)? {
-        if cancellation.is_cancelled() {
-            return Err(ToolError::cancelled());
-        }
+        check_cancelled(cancellation)?;
         if fields.len() == LISTED_CHILDREN {
             let next_index = Some(position);
             return Ok(OutputFields { fields, next_index });

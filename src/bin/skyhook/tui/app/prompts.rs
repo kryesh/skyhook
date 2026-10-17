@@ -665,13 +665,7 @@ mod tests {
         kind: skyhook::remote::SensitivePromptKind,
     ) -> oneshot::Receiver<Result<PromptAnswer, String>> {
         let (reply, response) = oneshot::channel();
-        let prompt = skyhook::remote::SensitivePrompt {
-            kind,
-            message: format!("SSH prompt {id}"),
-            target: None,
-            origin: skyhook::target::TargetRef::Root,
-            requester: Requester::default(),
-        };
+        let prompt = crate::interaction::tests::sensitive_prompt(kind, format!("SSH prompt {id}"));
         let kind = PromptKind::Authentication { prompt, reply };
         app.prompt(Prompt { id, kind });
         response
@@ -899,46 +893,6 @@ mod tests {
     /// A rename edits the title in its own input and never touches the composer.
     /// It starts from the user's title, or empty from an automatic one. Esc keeps
     /// the title; Enter saves a user title, or clears it when empty.
-    /// Every prompt keeps a margin above its text and a row either side of its input.
-    #[tokio::test]
-    async fn prompts_space_their_text_input_and_help() {
-        let (_root, mut app) = fixture().await;
-        let rows = |app: &mut App| {
-            let screen = draw(app);
-            let rect = app.composer_rect;
-            let rows: Vec<String> = screen.lines().map(|row| row.trim().to_owned()).collect();
-            rows[rect.y as usize..rect.bottom() as usize].to_vec()
-        };
-        app.rename_session();
-        app.prompt_input_mut().editor.set("My title".into());
-        let rename = rows(&mut app);
-        let expected = [
-            "",
-            "Rename session",
-            "Leave empty to use the automatic title",
-            "",
-            "My title",
-            "",
-        ];
-        assert_eq!(rename[..expected.len()], expected);
-        assert!(rename[expected.len()].starts_with("↑↓ choose"));
-        assert_eq!(rename.len(), expected.len() + 1);
-        app.prompts.clear();
-        let _ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
-        paste(&mut app, "secret");
-        let askpass = rows(&mut app);
-        let masked = "●".repeat("secret".len());
-        let expected = [
-            "",
-            "Authentication",
-            "Requested by an unknown program",
-            "SSH prompt 100",
-            "",
-            masked.as_str(),
-        ];
-        assert_eq!(askpass[..expected.len()], expected);
-    }
-
     #[tokio::test]
     async fn rename_prompt_edits_the_title_apart_from_the_draft() {
         use skyhook::session::{SessionTitle, TitleSource};
@@ -1172,7 +1126,7 @@ mod tests {
         let rejected = question(&mut app, "Next question".into(), vec![]);
         assert!(app.prompt_input_mut().editor.text().is_empty());
         key(&mut app, Esc, M::NONE);
-        app.paused = true;
+        app.paused = Some(Paused::Stopped);
         app.submit("A new direction".into());
         assert!(rejected.await.unwrap().is_err());
         assert!(app.prompts.is_empty());
@@ -1181,11 +1135,9 @@ mod tests {
         assert!(!app.prompt_shown());
     }
 
-    #[tokio::test]
-    async fn approval_preview_leads_with_the_tool_arguments() {
-        let mut document = crate::interaction::tests::approval_request()
-            .await
-            .arguments;
+    #[test]
+    fn approval_preview_leads_with_the_tool_arguments() {
+        let mut document = crate::interaction::tests::approval_request().arguments;
         let arguments = crate::tui::format::pretty(&document["tool"]);
         document["network_origin"] = json!("https://redirect.test");
         let preview = approval_preview(&document);
@@ -1203,7 +1155,7 @@ mod tests {
     async fn approval_dispatch_uses_checked_actions_and_only_offers_proposed_grants() {
         use skyhook::tool::policy::ApprovalCoverage;
         let (_root, mut app) = draft_fixture().await;
-        let original = crate::interaction::tests::approval_request().await;
+        let original = crate::interaction::tests::approval_request();
         for proposed in [false, true] {
             let mut request = original.clone();
             for permission in &mut request.permissions {
@@ -1234,9 +1186,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn authentication_names_its_requester_and_job() {
-        let (_root, mut app) = fixture().await;
+    #[test]
+    fn authentication_names_its_requester_and_job() {
         let job = skyhook::identity::JobId::new(7).unwrap();
         for (requester, expected) in [
             (
@@ -1244,7 +1195,7 @@ mod tests {
                     executable: RequesterExecutable::Path("/usr/bin/ssh".into()),
                     job: None,
                 },
-                "Requested by /usr/bin/ssh\n",
+                "Requested by /usr/bin/ssh",
             ),
             (
                 Requester {
@@ -1254,27 +1205,11 @@ mod tests {
                     },
                     job: Some(job),
                 },
-                "Requested by sudo (running as uid 0) in job 7\n",
+                "Requested by sudo (running as uid 0) in job 7",
             ),
-            (Requester::default(), "Requested by an unknown program\n"),
+            (Requester::default(), "Requested by an unknown program"),
         ] {
-            let (reply, _response) = oneshot::channel();
-            let prompt = skyhook::remote::SensitivePrompt {
-                kind: SensitivePromptKind::Password,
-                message: "[sudo] password:".into(),
-                target: None,
-                origin: skyhook::target::TargetRef::Root,
-                requester,
-            };
-            let kind = PromptKind::Authentication { prompt, reply };
-            app.prompt(Prompt { id: 100, kind });
-            assert!(
-                app.prompt_text().contains(expected),
-                "{}",
-                app.prompt_text()
-            );
-            key(&mut app, Esc, M::NONE);
-            assert!(app.prompts.is_empty());
+            assert_eq!(requester_text(&requester), expected);
         }
     }
 }

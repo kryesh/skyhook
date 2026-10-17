@@ -7,7 +7,7 @@ use serde::Serialize;
 use super::{Db, DbResult, corrupt, params, rejected};
 use crate::{
     identity::AgentId,
-    session::{EntryKind, EventRecord, SessionEvent},
+    session::{EventRecord, SessionEvent},
     target::TargetRef,
 };
 
@@ -19,7 +19,6 @@ pub(super) fn json(value: &impl Serialize) -> DbResult<String> {
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
     pub seq: u64,
-    pub kind: EntryKind,
     pub agent: i64,
 }
 
@@ -50,9 +49,9 @@ impl Encoder {
             self.start_agent(db, record)?;
         }
         for record in records {
+            let kind = record.event.kind();
             let entry = Entry {
                 seq: record.sequence.get(),
-                kind: record.event.kind(),
                 agent: self.agent(db, &record.agent)?,
             };
             db.execute(
@@ -63,13 +62,13 @@ impl Encoder {
                     record.id.to_bytes().to_vec(),
                     entry.agent,
                     record.timestamp_millis,
-                    entry.kind
+                    kind
                 ],
             )
             .and_then(|_| self.subtype(db, entry, &record.event))
             .map_err(|error| match error {
                 super::DbError::Sql(error) => {
-                    rejected(format!("{} entry {}: {error}", entry.kind, record.sequence))
+                    rejected(format!("{kind} entry {}: {error}", record.sequence))
                 }
                 error => error,
             })?;
@@ -125,7 +124,9 @@ impl Encoder {
                     params![entry.seq, message],
                 )
                 .map(drop),
-            E::TodosReplaced { items } => super::message::todos(db, entry.seq, entry.kind, items),
+            E::TodosReplaced { items } => {
+                super::message::todos(db, "todo_item", "entry", entry.seq, items)
+            }
             E::MessageCommitted { message } => {
                 let message = self.message_for(db, entry.agent, message)?;
                 db.execute(
@@ -394,14 +395,12 @@ mod tests {
             job,
             state: JobEnd::Interrupted,
             diagnostic: None,
-            output_diagnostic: None,
             images: vec![png.clone()],
         });
         one!(SessionEvent::JobFinished {
             job,
             state: JobEnd::Cancelled,
             diagnostic: None,
-            output_diagnostic: None,
             images: Vec::new(),
         });
         one!(SessionEvent::TargetsUpserted {
@@ -430,10 +429,9 @@ mod tests {
                 purpose: ModelPurpose::Compaction,
                 profile,
                 tools: Vec::new(),
-                response_schema: Some(ResponseSchema {
-                    name: "summary".into(),
-                    schema: json!({"type": "object"}),
-                }),
+                response_schema: Some(
+                    ResponseSchema::new("summary", json!({"type": "object"})).unwrap()
+                ),
                 ..agent_context
             },
         });
@@ -544,14 +542,6 @@ mod tests {
             }],
             location: ExecutionLocation::root("/workspace".into()),
         };
-        let page = JobView {
-            id: Some(job),
-            state: Some(JobState::Completed),
-            result: Some(json!("line")),
-            error: None,
-            meta: None,
-            presentation: None,
-        };
         let events = vec![
             JobEvent::Message(crate::job::AgentMessage {
                 id: owner,
@@ -564,58 +554,8 @@ mod tests {
                 state: Some(JobState::Failed),
                 result: None,
                 error: Some("denied".into()),
-                meta: Some(crate::job::views::JobMetadata {
-                    parent: Some(owner),
-                    tool: Some("read".into()),
-                    name: Some("reader".parse().unwrap()),
-                    target: Some("build".into()),
-                    workspace: Some("/srv".into()),
-                    code: Some(crate::tool::DenialCode::PermissionDenied),
-                }),
-                presentation: Some(crate::job::Presentation {
-                    preview: Some(crate::job::output::OutputPreview::Lines(
-                        crate::job::output::LinePage {
-                            field: Some(crate::job::FieldPointer::result()),
-                            lines: crate::job::output::PageLines::Numbered(vec![
-                                crate::job::output::NumberedLine {
-                                    line: 3,
-                                    text: "line".into(),
-                                },
-                            ]),
-                            total_lines: Some(1),
-                            next_start: None,
-                            next_offset: None,
-                        },
-                    )),
-                    shape: Some(json!({"items": [3, "integer"]})),
-                    truncated: Some(vec![
-                        crate::job::output::OutputTruncation::Elements {
-                            field: "/result/items".parse().unwrap(),
-                            shown: 1,
-                            total_elements: 3,
-                            kept: None,
-                        },
-                        crate::job::output::OutputTruncation::Text {
-                            field: "/result/content".parse().unwrap(),
-                            total_lines: 9,
-                            next_start: 4,
-                            next_offset: None,
-                        },
-                        crate::job::output::OutputTruncation::TextGap {
-                            field: "/result/stdout".parse().unwrap(),
-                            total_lines: 9,
-                            next_start: 4,
-                            tail_start: 8,
-                        },
-                    ]),
-                    captures: Some(vec![crate::job::output::CaptureDescriptor {
-                        field: "/result/stdout".parse().unwrap(),
-                        complete: true,
-                        output: Some(Box::new(page)),
-                    }]),
-                    question: None,
-                    notice: Some(crate::job::Notice::OutputIncomplete),
-                }),
+                meta: None,
+                presentation: None,
             })),
             JobEvent::Job(Box::new(JobView {
                 id: Some(owner),

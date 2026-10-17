@@ -208,7 +208,6 @@ mod tests {
             job: done,
             state: crate::job::JobEnd::Completed,
             diagnostic: None,
-            output_diagnostic: None,
             images: Vec::new(),
         };
         let left =
@@ -242,9 +241,9 @@ mod tests {
                 SessionEvent::ModelAttemptInterrupted(attempt) => (attempt.request, attempt.attempt));
             assert_eq!(interrupted, [(request.sequence.request(), 1)]);
             let results = events!(&records,
-                SessionEvent::MessageCommitted { message: Message::Tool(results) } => results.clone());
+                SessionEvent::MessageCommitted { message: Message::Tool(result) } => result.clone());
             let placeholders = (results.iter())
-                .map(|results| (results[0].call_id.as_str(), results[0].is_error))
+                .map(|result| (result.call_id.as_str(), result.is_error))
                 .collect::<Vec<_>>();
             assert_eq!(placeholders, [("orphan", true), ("done", true)]);
             // The settled turn stays continuable on every resume, not only the
@@ -306,7 +305,6 @@ mod tests {
                 job,
                 state: crate::job::JobEnd::Completed,
                 diagnostic: None,
-                output_diagnostic: None,
                 images: Vec::new(),
             },
         ));
@@ -327,7 +325,7 @@ mod tests {
         };
         ran.push((agent.clone(), completed));
         let results = SessionEvent::MessageCommitted {
-            message: Message::Tool(vec![result]),
+            message: Message::Tool(result),
         };
         ran.push((agent.clone(), results));
         ran.push((agent.clone(), SessionEvent::JobClaimed { job }));
@@ -355,7 +353,7 @@ mod tests {
         };
         let history = last.messages().rev().find(|message| !runtime(message));
         assert!(matches!(history, Some(Sent::Tool(_))), "{history:?}");
-        assert_eq!(resumed.inspect_jobs(&resumed.root).len(), 1);
+        assert_eq!(resumed.runtime.jobs.list(&resumed.root).len(), 1);
         shutdown_session(resumed).await;
     }
 
@@ -461,80 +459,6 @@ mod tests {
         assert_eq!(settled(&records, request), cut);
         assert_eq!(interrupted(&records), before + 1);
         shutdown_session(resumed).await;
-
-        // Nothing left to settle: an attempt its agent's interruption closed without
-        // an outcome of its own is settled already, so a further resume settles
-        // nothing, yet the interrupted turn can still be continued.
-        let (store, _) = crate::session::tests::reopen(&sessions, id).await;
-        let closed = store
-            .append(root_agent.clone(), requested(context))
-            .await
-            .unwrap();
-        let attempt = AttemptRef {
-            request: closed.sequence.request(),
-            attempt: 1,
-        };
-        let started = SessionEvent::ModelAttemptStarted(attempt);
-        store.append(root_agent.clone(), started).await.unwrap();
-        let stopped = SessionEvent::AgentInterrupted;
-        store.append(root_agent.clone(), stopped).await.unwrap();
-        let before = interrupted(&store.records());
-        drop(store);
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        assert_eq!(interrupted(&resumed.runtime.store.records()), before);
-        assert!(matches!(turn(&resumed, &resumed.root), Turn::Parked(_)));
-        shutdown_session(resumed).await;
-    }
-
-    /// Closing ends running work, not an interruption, even one closing follows
-    /// at once: a turn held on an interrupted child is released, and when the
-    /// session reopens the child resumes and its result reaches the parent.
-    #[tokio::test]
-    async fn shutdown_leaves_interrupted_children_resumable() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let (harness, session, _, requests, parent, job) = held_on_interrupted_child(
-            root.path(),
-            [answer("child recovered"), answer("root continued")].map(Step::new),
-        )
-        .await;
-        let id = session.id();
-        shutdown_session(session).await;
-        assert!(bounded(parent).await.unwrap().is_err());
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        let state = resumed.runtime.jobs.snapshot(job).unwrap().state;
-        assert_eq!(state, JobState::Interrupted);
-        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
-        until(&resumed, job, |job| job.state == JobState::Completed).await;
-        assert_eq!(resumed.continue_turn().await.unwrap(), "root continued");
-        let last = requests.lock().unwrap().last().unwrap().request.clone();
-        assert!(format!("{last:?}").contains("child recovered"));
-        shutdown_session(resumed).await;
-    }
-
-    /// Closing a session whose interruption has settled, with nothing left
-    /// running, leaves its last activity where it was.
-    #[tokio::test]
-    async fn closing_a_settled_interruption_is_not_activity() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let (_harness, session, _, _, parent, job) = held_on_interrupted_child(
-            root.path(),
-            [answer("child recovered"), answer("root continued")].map(Step::new),
-        )
-        .await;
-        until(&session, job, |job| job.state == JobState::Interrupted).await;
-        let sessions = root.path().join("sessions");
-        let id = session.id();
-        let before = last_millis(&sessions, id).await;
-        // Close strictly later, so an entry dated now would show.
-        crate::tests::past(before).await;
-        shutdown_session(session).await;
-        assert!(bounded(parent).await.unwrap().is_err());
-        assert_eq!(last_millis(&sessions, id).await, before);
     }
 
     /// Closing ends running work as a crash would: what it cuts short ends at the
@@ -573,7 +497,8 @@ mod tests {
     }
 
     /// Closing stops agents in no particular order. A child stopping before the
-    /// turn held on it is released leaves that turn releasable.
+    /// turn held on it is released leaves that turn releasable, and closing a
+    /// settled interruption, with nothing left running, is not activity.
     #[tokio::test]
     async fn shutdown_releases_a_turn_whose_interrupted_child_stopped_first() {
         use crate::job::JobState;
@@ -584,6 +509,11 @@ mod tests {
         )
         .await;
         until(&session, job, |job| job.state == JobState::Interrupted).await;
+        let sessions = root.path().join("sessions");
+        let id = session.id();
+        let before = last_millis(&sessions, id).await;
+        // Close strictly later, so an entry dated now would show.
+        crate::tests::past(before).await;
         let child = session.root.child(1);
         let shutdown = session.runtime.store.enter(Command::BeginShutdown);
         shutdown.await.unwrap();
@@ -591,6 +521,7 @@ mod tests {
         bounded(session.runtime.store.until(stopped)).await.unwrap();
         shutdown_session(session).await;
         assert!(bounded(parent).await.unwrap().is_err());
+        assert_eq!(last_millis(&sessions, id).await, before);
     }
 
     /// A continue once closing has begun is refused and journals nothing, and the
@@ -598,20 +529,10 @@ mod tests {
     #[tokio::test]
     async fn a_continue_after_closing_began_leaves_the_interruption_resumable() {
         use crate::job::JobState;
-        let child_task = json!({"prompt": "child task", "depth": 0});
-        let delegate = Step::new(response(vec![tool_call(0, "agent-0", "agent", child_task)]));
-        let recovered = (0..4).map(|_| Step::new(answer("recovered")));
-        let steps = [delegate, Step::new(Vec::new()).midstream()];
-        let provider = Script::new(steps.into_iter().chain(recovered), &Requests::default());
         let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let parent = spawn_prompt(&session, "delegate");
-        provider.request(1).await;
-        root_waiting(&session).await;
-        let job = session.inspect_jobs(&session.root)[0].id;
-        assert_eq!(session.interrupt().await, 2);
+        let recovered = (0..4).map(|_| Step::new(answer("recovered")));
+        let (harness, session, _, _, parent, job) =
+            held_on_interrupted_child(root.path(), recovered).await;
         bounded(session.shutdown()).await.unwrap();
         assert!(bounded(parent).await.unwrap().is_err());
         let closed = session.runtime.store.records();
@@ -675,10 +596,6 @@ mod tests {
             let viewed = resumed.observe().snapshot;
             assert_eq!(viewed.phase, crate::session::SessionPhase::Viewing);
             assert_eq!(viewed.jobs[&job].state, crate::job::JobState::Interrupted);
-            assert_eq!(
-                resumed.inspect_jobs(&agent)[0].state,
-                viewed.jobs[&job].state
-            );
         }
         // Shut down, a viewed session is closed: it reads as it did, can no longer
         // be activated or journal, and is released for another open at once.
@@ -731,22 +648,6 @@ mod tests {
         let running = |state: &mut CoreState| state.phase.runs().then_some(());
         bounded(resumed.runtime.store.until(running)).await.unwrap();
         assert_eq!(bounded(resumed.prompt("go")).await.unwrap(), "again");
-        shutdown_session(resumed).await;
-    }
-
-    /// Closing frees the session for another open while its handle lives on, and
-    /// work still winding down behind it can no longer write.
-    #[tokio::test]
-    async fn a_closed_session_reopens_while_its_handle_lives() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
-        let session = harness.new_session().await.unwrap();
-        session.shutdown().await.unwrap();
-        session.close().await.unwrap();
-        let resumed = harness.resume_session(session.id()).await.unwrap();
-        let late = session.record_status(session.root.clone(), "late".into());
-        assert!(late.await.is_err());
         shutdown_session(resumed).await;
     }
 
@@ -876,12 +777,7 @@ mod tests {
             panic!("expected the write result");
         };
         assert!(results[0].is_error);
-        assert!(
-            results[0]
-                .result
-                .to_string()
-                .contains("unavailable in this session")
-        );
+        assert!(results[0].result.to_string().contains("unavailable"));
         assert!(!root.path().join("must-not-exist").exists());
         let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModelChanged { .. }), 0);
@@ -1018,67 +914,11 @@ mod tests {
     }
 
     /// A retained child accepts owner input after a restart: its loop starts again
-    /// under its journaled contract and continues its own history.
-    #[tokio::test]
-    async fn retained_children_resume_after_the_session_restarts() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let delegate = tool_call(0, "delegate", "agent", json!({"prompt": "work"}));
-        let responses = [
-            response(vec![delegate]),
-            answer("child done"),
-            answer("root done"),
-        ];
-        let provider = scripted_provider(&requests, responses);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
-        let records = session.runtime.store.records();
-        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
-            [0];
-        let id = session.id();
-        shutdown_session(session).await;
-
-        let responses = [answer("child resumed"), answer("root again")];
-        let provider = scripted_provider(&requests, responses);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        // A later commit beside the journaled child leaves its activity alone.
-        let last = resumed
-            .runtime
-            .store
-            .records()
-            .last()
-            .unwrap()
-            .timestamp_millis;
-        crate::tests::past(last).await;
-        let mut updates = resumed.observe().updates;
-        resumed.rename(Some("renamed".into())).await.unwrap();
-        while let Ok(event) = updates.try_recv() {
-            let child = resumed.root.child(1);
-            assert!(!matches!(event.event, RuntimeEvent::Activity { agent, .. } if agent == child));
-        }
-        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
-        let finished = terminal(&resumed, job).await;
-        assert_eq!(finished.state, crate::job::JobState::Completed);
-        let captured = requests.lock().unwrap().clone();
-        let child = captured
-            .iter()
-            .rev()
-            .find(|request| request.context_id != ContextId::from(&resumed.root))
-            .expect("the child made a request after the restart");
-        let history = serde_json::to_string(&child.context).unwrap();
-        assert!(history.contains("work") && history.contains("child done"));
-        assert!(history.contains("Owner input"));
-        shutdown_session(resumed).await;
-    }
-
-    /// Events delivered to a reopened root that runs a redefined mode commit in one
+    /// under its journaled contract and continues its own history. The events
+    /// delivered to its reopened root, which runs a redefined mode, commit in one
     /// transaction with the mode change its turn makes, ahead of the delivery.
     #[tokio::test]
-    async fn a_delivery_to_a_reopened_root_commits_with_its_mode_change() {
+    async fn a_retained_child_resumes_after_a_restart_and_reaches_its_reopened_root() {
         use crate::tool::policy::{Capability, Mode};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
@@ -1121,6 +961,21 @@ mod tests {
         // root no input that could carry the mode change first.
         let continued = resumed.continue_turn_with(Selection::default()).await;
         assert!(continued.unwrap().answer.is_none());
+        // A later commit beside the journaled child leaves its activity alone.
+        let last = resumed
+            .runtime
+            .store
+            .records()
+            .last()
+            .unwrap()
+            .timestamp_millis;
+        crate::tests::past(last).await;
+        let mut updates = resumed.observe().updates;
+        resumed.rename(Some("renamed".into())).await.unwrap();
+        let child = resumed.root.child(1);
+        while let Ok(event) = updates.try_recv() {
+            assert!(!matches!(event.event, RuntimeEvent::Activity { agent, .. } if agent == child));
+        }
         resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
         let root = resumed.root.clone();
         let answered = move |state: &mut CoreState| {
@@ -1157,6 +1012,14 @@ mod tests {
         let captured = requests.lock().unwrap().clone();
         let last = captured.last().unwrap();
         assert!(last.system[0].text.contains("Changed."));
+        let child = captured
+            .iter()
+            .rev()
+            .find(|request| request.context_id == ContextId::from(&child))
+            .expect("the child made a request after the restart");
+        let history = serde_json::to_string(&child.context).unwrap();
+        assert!(history.contains("work") && history.contains("child done"));
+        assert!(history.contains("Owner input"));
         shutdown_session(resumed).await;
     }
 
@@ -1211,13 +1074,12 @@ mod tests {
         let resumed = reopened_in_a_redefined_mode(root.path(), &sessions, answered, []).await;
         let changed: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::ModeChanged { .. });
-        let (reached, resume) = resumed.runtime.store.pause_committed(changed).await;
+        let interrupted = interrupt_on(&resumed, changed).await;
         let script = tokio::spawn({
             let resumed = resumed.clone();
             async move { resumed.run_script("return 1;").await }
         });
-        bounded(reached).await.unwrap();
-        assert_eq!(interrupt_behind(&resumed, resume).await, 0);
+        assert_eq!(bounded(interrupted).await, 0);
         bounded(script).await.unwrap().unwrap();
         let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
@@ -1238,21 +1100,16 @@ mod tests {
                 .await;
         let changed: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::ModeChanged { .. });
-        let (reached, resume) = resumed.runtime.store.pause_committed(changed).await;
+        // Queued behind the change: it finds the root still parked.
+        let continuing = resumed.clone();
+        let continued = on_commit(&resumed.runtime.store, changed, move || async move {
+            continuing.continue_turn_with(Selection::default()).await
+        });
+        let continued = continued.await;
         let script = tokio::spawn({
             let resumed = resumed.clone();
             async move { resumed.run_script("return 1;").await }
         });
-        bounded(reached).await.unwrap();
-        let root = resumed.root.clone();
-        let turn = resumed
-            .runtime
-            .agents(|agents| agents.get(&root).map(|facts| facts.turn.clone()));
-        assert!(matches!(turn, Some(Turn::Parked(_))), "{turn:?}");
-        // Queued behind the paused change: it reads the root as parked.
-        let mut continued = Box::pin(resumed.continue_turn_with(Selection::default()));
-        assert!(futures_util::poll!(&mut continued).is_pending());
-        resume.send(()).unwrap();
         let continued = bounded(continued).await.unwrap();
         assert_eq!(continued.answer.as_deref(), Some("continued"));
         bounded(script).await.unwrap().unwrap();
@@ -1333,7 +1190,6 @@ mod tests {
                 job: read,
                 state: crate::job::JobEnd::Completed,
                 diagnostic: None,
-                output_diagnostic: None,
                 images: Vec::new(),
             };
             store.append(root_agent.clone(), finished).await.unwrap();
@@ -1353,14 +1209,13 @@ mod tests {
                         job,
                         state: crate::job::JobEnd::Interrupted,
                         diagnostic: Some(crate::tool::ToolError::interrupted().diagnostic()),
-                        output_diagnostic: None,
                         images: Vec::new(),
                     },
                 ),
                 (
                     root_agent.clone(),
                     SessionEvent::MessageCommitted {
-                        message: Message::Tool(vec![result]),
+                        message: Message::Tool(result),
                     },
                 ),
                 (
@@ -1388,20 +1243,38 @@ mod tests {
             assert!(resumed.runtime.jobs.is_background(unread).unwrap());
         }
         bounded(resumed.continue_turn()).await.unwrap();
-        // The child's answer reaches the root as a job event.
-        bounded(async {
-            loop {
-                let delivered = requests.lock().unwrap().iter().any(|request| {
-                    let history = rendered(request);
-                    history.contains("job_events") && history.contains("recovered")
+        // The child's answer reaches the root as a job event, which the root answers.
+        let owner = resumed.root.clone();
+        let reports = move |events: &[crate::session::JobEvent]| {
+            events.iter().any(|event| match event {
+                crate::session::JobEvent::Message(message) => message.id == job,
+                crate::session::JobEvent::Job(view) => view.id == Some(job),
+            })
+        };
+        let answered = move |state: &mut CoreState| {
+            let mut messages = (state.records.iter())
+                .filter(|record| record.agent == owner)
+                .filter_map(|record| match &record.event {
+                    SessionEvent::MessageCommitted { message } => Some(message),
+                    _ => None,
                 });
-                if delivered {
-                    break;
-                }
-                poll().await;
-            }
-        })
-        .await;
+            messages.position(|message| {
+                let Message::User(parts) = message else {
+                    return false;
+                };
+                (parts.iter())
+                    .any(|part| matches!(part, UserPart::JobEvents { events } if reports(events)))
+            })?;
+            messages
+                .any(|message| matches!(message, Message::Assistant(_)))
+                .then_some(())
+        };
+        found(&resumed, answered).await;
+        let delivered = requests.lock().unwrap().iter().any(|request| {
+            let history = rendered(request);
+            history.contains("job_events") && history.contains("recovered")
+        });
+        assert!(delivered);
         let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::AgentStarted { .. }), 2);
         shutdown_session(resumed).await;

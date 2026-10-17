@@ -170,9 +170,11 @@ fn layout_source(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tests::continued;
     use super::super::render;
     use super::*;
     use ratatui::style::Style;
+    use unicode_width::UnicodeWidthStr;
 
     /// Exercise the paint path: source strings alone cannot reveal a gap
     /// inserted by source_prefix_width or decorative continuation prefixes.
@@ -251,6 +253,107 @@ mod tests {
             ),
         ] {
             assert_eq!(painted_markdown(text), expected, "{text:?}");
+        }
+    }
+
+    fn layout(text: &str, width: usize) -> Vec<LayoutLine> {
+        layout_highlighted(text, true, width, None).lines
+    }
+
+    #[test]
+    fn replacement_code_geometry_partial_input_and_resize() {
+        let input = "prose `inline`\n\n```rust\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n```\n\nafter";
+        let mut text = String::new();
+        for width in [7, 29, 3] {
+            text.clear();
+            let mut rows = Vec::new();
+            for ch in input.chars() {
+                text.push(ch);
+                rows = layout(&text, width);
+            }
+            assert_eq!(rows.iter().filter(|row| row.layout.decorative()).count(), 2);
+            let mut copied = String::new();
+            let mut first = true;
+            for row in rows.iter().filter(|row| !row.layout.decorative()) {
+                if !first && !continued(&row.layout) {
+                    copied.push('\n');
+                }
+                copied.push_str(&row.line.to_string());
+                first = false;
+            }
+            assert_eq!(
+                copied,
+                "prose inline\n\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n\nafter"
+            );
+        }
+    }
+
+    const NARROW_TABLE: &str = "| Name | Description |\n| :--- | ---: |\n| 界 | **long words** and `code` |\n| e\u{301} | abcdefghijklmnopqrstuvwxyz |";
+
+    /// Screen columns of every table border character in `text`.
+    fn border_columns(text: &str) -> Vec<usize> {
+        let borders = text
+            .char_indices()
+            .filter(|(_, ch)| "│├┼┤┌┬┐└┴┘".contains(*ch));
+        borders.map(|(at, _)| text[..at].width()).collect()
+    }
+
+    #[test]
+    fn narrow_tables_keep_borders_on_single_rows_through_resize_and_growth() {
+        let quoted: String = NARROW_TABLE
+            .lines()
+            .map(|line| format!("> > {line}\n"))
+            .collect();
+        let sources = [
+            NARROW_TABLE.to_owned(),
+            quoted,
+            format!("```\n```\n\n{NARROW_TABLE}"),
+        ];
+        for source in sources {
+            for width in [18, 23, 28] {
+                let rows = layout(&source, width);
+                assert!(rows.len() > 4, "cells should wrap inside the table");
+                let start = rows
+                    .iter()
+                    .position(|row| row.line.to_string().contains('┌'));
+                let table_rows = &rows[start.unwrap()..];
+                let separator = table_rows
+                    .iter()
+                    .find(|row| row.line.to_string().contains('├'));
+                // Measure actual screen columns, including quote containers.
+                let columns = border_columns(&separator.unwrap().line.to_string());
+                let mut separators = 0;
+                for row in table_rows {
+                    let text = row.line.to_string();
+                    assert!(row.line.width() <= width, "{text:?}, width {width}");
+                    let continued = continued(&row.layout);
+                    assert!(!continued, "downstream wrapper split a table row: {text:?}");
+                    let actual = border_columns(&text);
+                    assert_eq!(actual, columns, "misaligned physical borders: {text:?}");
+                    let (end, joint) = if text.contains('├') {
+                        separators += 1;
+                        ('┤', Some('┼'))
+                    } else if text.contains('┌') {
+                        ('┐', Some('┬'))
+                    } else if text.contains('└') {
+                        ('┘', Some('┴'))
+                    } else {
+                        assert!(text.starts_with('│'), "{text:?}");
+                        ('│', None)
+                    };
+                    assert!(text.ends_with(end), "{text:?}");
+                    assert!(joint.is_none_or(|joint| text.matches(joint).count() == 1));
+                }
+                assert_eq!(separators, 2);
+            }
+        }
+        // Replacement rendering follows resizes of a growing table.
+        let mut source = format!("{NARROW_TABLE}\n\nplain tail");
+        let wide_rows = layout(&source, 60).len();
+        for width in [17, 8, 3, 35, 60] {
+            let rows = layout(&source, width);
+            assert!(width != 17 || rows.len() > wide_rows);
+            source.push_str(" more");
         }
     }
 }

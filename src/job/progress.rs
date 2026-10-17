@@ -157,12 +157,11 @@ mod tests {
 
     #[tokio::test]
     async fn active_progress_is_recursive_exclusive_and_location_filtered() {
-        let session = crate::session::tests::MemorySession::new().await;
-        let (store, root) = (session.store.clone(), session.agent.clone());
+        let session = crate::tests::TestRuntime::new().await;
+        let (jobs, root) = (session.jobs.clone(), session.agent.clone());
         let child = root.child(1);
         let grandchild = child.child(1);
         let great_grandchild = grandchild.child(1);
-        let jobs = JobManager::new(store);
         let delegated = jobs.test_lease(agent_spec(&root, None, "child")).await;
         let ordinary = jobs.test_lease(JobSpec::test(root.clone(), "agent")).await;
         // Even queued agents without AgentStarted have zero counters; tools do not.
@@ -238,10 +237,9 @@ mod tests {
 
     #[tokio::test]
     async fn progress_survives_retained_resume_and_replay() {
-        let session = crate::session::tests::MemorySession::new().await;
-        let (store, root) = (session.store.clone(), session.agent.clone());
+        let session = crate::tests::TestRuntime::new().await;
+        let (jobs, root) = (session.jobs.clone(), session.agent.clone());
         let child = root.child(1);
-        let jobs = JobManager::new(store.clone());
         let spec = JobSpec {
             accepts_input: true,
             ..agent_spec(&root, None, "child")
@@ -282,7 +280,7 @@ mod tests {
         let resumed = progress_of(&snapshot(&jobs, &root, false)[0]);
         assert_eq!(resumed, progress(2, 2));
         release.add_permits(1);
-        crate::tests::bounded(jobs.wait(delegated.id(), None, true))
+        crate::tests::bounded(jobs.wait(delegated.id(), true))
             .await
             .unwrap();
         jobs.clear_resume_handler(delegated.id()).await;

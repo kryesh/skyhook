@@ -15,12 +15,30 @@ use crate::{
 use super::{
     AdmissionError,
     policy::{
-        ApprovalGrant, AuthorizationRequest, CapabilitySet, PermissionUse, Policy, PolicyDecision,
-        ResourceId,
+        Approval, ApprovalGrant, AuthorizationRequest, CapabilitySet, PermissionUse, Policy,
+        PolicyDecision, ResourceId,
     },
 };
 
-#[derive(Clone, Debug, thiserror::Error)]
+/// Whether a decision may ask anyone. One for a call naming a path outside the
+/// root that does not resolve may not: asking would tell the call it exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum Asking {
+    Allowed,
+    Never,
+}
+
+impl Asking {
+    /// Whether a call whose path preflight left `unresolved` may ask anyone.
+    pub(crate) const fn for_unresolved<T>(unresolved: &Option<T>) -> Self {
+        match unresolved {
+            Some(_) => Self::Never,
+            None => Self::Allowed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, serde::Deserialize, serde::Serialize)]
 pub(crate) enum AuthorizationError {
     #[error("{0}")]
     Denied(String),
@@ -107,23 +125,24 @@ impl AuthorizationArguments {
 #[derive(Debug)]
 pub(crate) enum Reauthorization {
     /// Permissions derived where the invocation runs.
-    Permissions(Vec<PermissionUse>),
+    Permissions(Vec<PermissionUse>, Asking),
     /// The origin a running request moved to, which the policy is also shown.
     Network(String),
 }
 
 impl Reauthorization {
-    /// The permissions asked for on `target`, and the origin a request moved to.
+    /// The permissions asked for on `target`, the origin a request moved to,
+    /// and whether the decision may ask anyone.
     pub(crate) fn into_parts(
         self,
         target: &crate::target::TargetRef,
-    ) -> (Vec<PermissionUse>, Option<String>) {
+    ) -> (Vec<PermissionUse>, Option<String>, Asking) {
         match self {
-            Self::Permissions(permissions) => (permissions, None),
+            Self::Permissions(permissions, asking) => (permissions, None, asking),
             Self::Network(origin) => {
                 let resource = super::policy::ResourceId::network(target, &origin);
                 let permission = PermissionUse::new(super::policy::Capability::Network, resource);
-                (vec![permission], Some(origin))
+                (vec![permission], Some(origin), Asking::Allowed)
             }
         }
     }
@@ -163,6 +182,9 @@ struct ApprovalState {
 struct Decision {
     /// What it may grant: a call proposing any of these shares it.
     proposals: Vec<ApprovalGrant>,
+    /// Only a decision that may ask someone is shared: a `Never` refusal
+    /// belongs to its own call.
+    asking: Asking,
     future: WeakShared<BoxFuture<'static, Result<(), Ended>>>,
     /// The revisions of the targets its call's permissions name, granted or not.
     revisions: Revisions,
@@ -215,13 +237,14 @@ impl AuthorizationCoordinator {
     /// a decision another call already awaits for the same proposal. A call
     /// naming a target revision since replaced, or asking from a connection
     /// `admitted` at one, is refused as redefined.
-    pub async fn authorize(
+    pub(crate) async fn authorize(
         &self,
         subject: &AuthorizationSubject,
         tool: String,
         permissions: Vec<PermissionUse>,
         arguments: serde_json::Value,
         admitted: &[(TargetName, u64)],
+        asking: Asking,
     ) -> Result<(), AuthorizationError> {
         if permissions
             .iter()
@@ -236,7 +259,7 @@ impl AuthorizationCoordinator {
             }
         }
         loop {
-            let pending = self.pending(subject, &tool, &unique, &arguments, admitted)?;
+            let pending = self.pending(subject, &tool, &unique, &arguments, admitted, asking)?;
             match pending {
                 None => return Ok(()),
                 Some(Pending::Asked(future)) => {
@@ -269,6 +292,7 @@ impl AuthorizationCoordinator {
         permissions: &[PermissionUse],
         arguments: &serde_json::Value,
         admitted: &[(TargetName, u64)],
+        asking: Asking,
     ) -> Result<Option<Pending>, AuthorizationError> {
         let mut state = self.state();
         let grants = &mut state.grants;
@@ -292,8 +316,13 @@ impl AuthorizationCoordinator {
         state
             .decisions
             .retain(|_, decision| decision.future.upgrade().is_some());
+        // Only calls that may ask share a decision: one that may not must
+        // neither refuse for one that may nor keep its prompt alive.
         let shared = (state.decisions.values())
-            .filter(|decision| decision.proposals.iter().any(|key| proposals.contains(key)))
+            .filter(|decision| {
+                (asking, decision.asking) == (Asking::Allowed, Asking::Allowed)
+                    && decision.proposals.iter().any(|key| proposals.contains(key))
+            })
             .find_map(|decision| decision.future.upgrade());
         if let Some(future) = shared {
             return Ok(Some(Pending::Joined(future)));
@@ -307,6 +336,7 @@ impl AuthorizationCoordinator {
             needed,
             arguments.clone(),
             proposals.clone(),
+            asking,
         );
         let (coordinator, cancelled) = (self.clone(), revoked.clone());
         let future = async move {
@@ -320,6 +350,7 @@ impl AuthorizationCoordinator {
         let future = future.boxed().shared();
         let decision = Decision {
             proposals,
+            asking,
             future: future.downgrade().expect("a new decision has not finished"),
             revisions: asked.into_iter().flatten().collect(),
             revoked,
@@ -360,6 +391,7 @@ impl AuthorizationCoordinator {
         permissions: Vec<PermissionUse>,
         arguments: serde_json::Value,
         proposals: Vec<ApprovalGrant>,
+        asking: Asking,
     ) -> BoxFuture<'static, Result<Vec<ApprovalGrant>, AuthorizationError>> {
         let policy = self.policy.clone();
         let request = AuthorizationRequest {
@@ -371,7 +403,12 @@ impl AuthorizationCoordinator {
             arguments,
         };
         let decided = async move {
-            match policy.authorize(request).await {
+            let decision = match (policy.authorize(request), asking) {
+                (Approval::Decided(decision), _) => decision,
+                (Approval::Ask(_), Asking::Never) => PolicyDecision::refused(),
+                (Approval::Ask(asked), Asking::Allowed) => asked.await,
+            };
+            match decision {
                 PolicyDecision::Deny { reason } => Err(AuthorizationError::Denied(reason)),
                 PolicyDecision::Allow { grants } => {
                     if let Some(grant) = grants
@@ -452,7 +489,14 @@ mod tests {
         let permission = PermissionUse::exact(Capability::Write, resource.clone());
         let arguments = serde_json::Value::Null;
         coordinator
-            .authorize(subject, "tool".to_owned(), vec![permission], arguments, &[])
+            .authorize(
+                subject,
+                "tool".to_owned(),
+                vec![permission],
+                arguments,
+                &[],
+                Asking::Allowed,
+            )
             .await
             .map(drop)
     }
@@ -514,13 +558,13 @@ mod tests {
     struct PanickingPolicy(tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>);
 
     impl Policy for PanickingPolicy {
-        fn authorize(&self, _: AuthorizationRequest) -> super::super::policy::PolicyFuture<'_> {
-            let (release, released) = tokio::sync::oneshot::channel();
-            self.0.send(release).unwrap();
-            Box::pin(async move {
+        fn authorize(&self, _: AuthorizationRequest) -> Approval<'_> {
+            Approval::Ask(Box::pin(async move {
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.0.send(release).unwrap();
                 let _ = released.await;
                 panic!("policy panicked")
-            })
+            }))
         }
     }
 
@@ -551,6 +595,39 @@ mod tests {
             )
         ));
         assert!(asked.try_recv().is_err());
+    }
+
+    /// Only calls that may ask share a decision: a call that may not ask
+    /// anyone neither shares its refusal nor joins a prompt it cannot keep.
+    #[tokio::test]
+    async fn only_calls_that_may_ask_share_a_decision() {
+        let (prompts, _asked) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator =
+            AuthorizationCoordinator::new(Arc::new(crate::tests::PromptingPolicy(prompts)));
+        let subject = subject(CancellationToken::new());
+        let permissions = [PermissionUse::exact(
+            Capability::Write,
+            ResourceId::session("one"),
+        )];
+        let pending = |asking| {
+            coordinator.pending(
+                &subject,
+                "tool",
+                &permissions,
+                &serde_json::Value::Null,
+                &[],
+                asking,
+            )
+        };
+        let never = pending(Asking::Never);
+        assert!(matches!(never, Ok(Some(Pending::Asked(_)))));
+        let allowed = pending(Asking::Allowed);
+        assert!(matches!(allowed, Ok(Some(Pending::Asked(_)))));
+        assert!(matches!(
+            pending(Asking::Never),
+            Ok(Some(Pending::Asked(_)))
+        ));
+        drop((never, allowed));
     }
 
     #[test]

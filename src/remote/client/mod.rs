@@ -1,5 +1,11 @@
 //! Shim protocol client, response routing, and relayed SSH streams.
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 
@@ -18,7 +24,7 @@ use crate::{
     },
     tool::{
         ToolContext, ToolOutput,
-        diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
+        diagnostic::{Effects, FailureSite, Operation, PartialContext, RequestEffects, Subject},
         source::Source,
     },
 };
@@ -30,8 +36,6 @@ mod routing;
 mod streams;
 use routing::route_responses;
 use streams::ClientStream;
-#[cfg(test)]
-pub(crate) use tests::test_transport;
 
 pub(crate) struct PooledConnection {
     writer: Arc<Mutex<Writer>>,
@@ -181,7 +185,7 @@ async fn call(
     source: Option<Source>,
 ) -> Result<results::Received, RemoteError> {
     if context.is_cancelled() {
-        return Err(RemoteError::Cancelled);
+        return Err(not_started(RemoteError::Cancelled));
     }
     let credits = source.as_ref().map(|_| Credits::default());
     let upload = credits.clone().map(OwnedCredits);
@@ -204,10 +208,15 @@ async fn call(
         .await?;
     if let Some((source, credits)) = source.zip(credits) {
         // The worker holds the call until its source ends, so a failed upload
-        // relies on the guard to release it.
+        // relies on the guard to release it, and a call cancelled before then
+        // never started.
+        let ending = AtomicBool::new(false);
         tokio::select! {
-            result = send_source(connection, request_id, source, credits) => result,
-            () = context.cancelled() => Err(RemoteError::Cancelled),
+            result = send_source(connection, request_id, source, credits, &ending) => result,
+            () = context.cancelled() => Err(match ending.load(Ordering::Acquire) {
+                true => sent_cancelled(),
+                false => not_started(RemoteError::Cancelled),
+            }),
         }?;
     }
     let received = async {
@@ -216,7 +225,7 @@ async fn call(
                 ProtocolError::Violation("remote response dispatcher stopped unexpectedly"),
                 Operation::Receive,
             )
-            .or(PartialContext::default().effects(Effects::MayHaveExecuted))
+            .or(PartialContext::default().request(RequestEffects::MayHaveExecuted))
         })?
     };
     tokio::select! {
@@ -224,23 +233,33 @@ async fn call(
             unfinished.defuse();
             result
         }
-        () = context.cancelled() => Err(RemoteError::Cancelled),
+        () = context.cancelled() => Err(sent_cancelled()),
     }
 }
 
+/// A call cancelled once the worker may have started it.
+fn sent_cancelled() -> RemoteError {
+    RemoteError::Cancelled.or(PartialContext::default().request(RequestEffects::MayHaveExecuted))
+}
+
 /// Send a source's contents in credited chunks; the worker starts the call at
-/// the end. Closed credits mean the call already ended, so its result follows.
+/// the end, which sets `ending` as it is sent. Closed credits mean the call
+/// already ended, so its result follows.
 async fn send_source(
     connection: &PooledConnection,
     request_id: RequestId,
     source: Source,
     credits: Credits,
+    ending: &AtomicBool,
 ) -> Result<(), RemoteError> {
     let reader = tokio::fs::File::from_std(source.reader().map_err(host_source_error)?);
     flow::pump(reader, Some(&credits), |data| async move {
         let request = match data {
             Some(data) => Request::SourceData { request_id, data },
-            None => Request::SourceEnd { request_id },
+            None => {
+                ending.store(true, Ordering::Release);
+                Request::SourceEnd { request_id }
+            }
         };
         let writer = connection.writer.clone().lock_owned().await;
         write_request(writer, &connection.state, request).await
@@ -286,7 +305,7 @@ async fn write_request(
     if let Err(error) = spawn_owned_write(writer, request).await {
         let failure = transport_error(error, Operation::Send);
         fail_connection(state, failure.clone()).await;
-        return Err(failure.or(PartialContext::default().effects(Effects::MayHaveExecuted)));
+        return Err(failure.or(PartialContext::default().request(RequestEffects::MayHaveExecuted)));
     }
     Ok(())
 }
@@ -342,7 +361,7 @@ async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
     for pending in pending.into_values() {
         let _ = pending.sender.send(Err(failure
             .clone()
-            .or(PartialContext::default().effects(Effects::MayHaveExecuted))));
+            .or(PartialContext::default().request(RequestEffects::MayHaveExecuted))));
     }
 }
 
@@ -410,46 +429,6 @@ pub(in crate::remote) mod tests {
         policy::{AllowAll, Capability},
     };
 
-    /// A live fake shim transport for manager/router tests, including the real handshake.
-    pub(crate) fn test_transport(
-        mut reply: Option<crate::tool::invocation::LocalError>,
-    ) -> Transport {
-        struct FakeShim(tokio::task::JoinHandle<()>);
-        impl Drop for FakeShim {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-
-        let (client, mut shim) = tokio::io::duplex(4096);
-        let owner = FakeShim(tokio::spawn(async move {
-            let hello = read_frame::<_, Request>(&mut shim).await;
-            if !matches!(hello, Ok(Some(Request::Hello)))
-                || write_frame(&mut shim, &Response::Ready).await.is_err()
-            {
-                return;
-            }
-            while let Ok(Some(request)) = read_frame::<_, Request>(&mut shim).await {
-                if let Request::Tool { request_id, .. } = request
-                    && let Some(error) = reply.take()
-                {
-                    write_result(
-                        &mut shim,
-                        request_id,
-                        Err(crate::remote::worker::remote_error(error)),
-                    )
-                    .await;
-                }
-            }
-        }));
-        let (output, input) = tokio::io::split(client);
-        Transport {
-            input: Box::new(input),
-            output: Box::new(output),
-            owner: Box::new(owner),
-        }
-    }
-
     pub(super) fn sink() -> Arc<Mutex<Writer>> {
         Arc::new(Mutex::new(Box::new(tokio::io::sink())))
     }
@@ -484,7 +463,10 @@ pub(in crate::remote) mod tests {
         context.cancellation_token().cancel();
         let connection = test_connection();
         let result = connection.execute("read".into(), serde_json::json!({}), &context);
-        assert!(matches!(result.await, Err(RemoteError::Cancelled)));
+        let error = result.await.err().unwrap().into_tool_error().diagnostic();
+        assert_eq!(error.cause, crate::tool::diagnostic::Cause::Cancelled);
+        assert_eq!(error.context.effects, Effects::NotStarted);
+        assert_eq!(error.context.request, RequestEffects::Unknown);
         assert!(connection.state.lock().await.pending.is_empty());
         assert_eq!(connection.ids.next(), Some(RequestId::new(1)));
     }
@@ -619,12 +601,10 @@ pub(in crate::remote) mod tests {
         runtime: &crate::tests::TestRuntime,
         capabilities: crate::tool::policy::CapabilitySet,
     ) -> ToolContext {
+        let job = crate::identity::JobId::new(1).unwrap();
         let subject = crate::tool::authorization::AuthorizationSubject {
-            agent: runtime.agent.clone(),
-            job: crate::identity::JobId::new(1).unwrap(),
-            parent: None,
             capabilities,
-            cancellation: CancellationToken::new(),
+            ..runtime.subject(job, CancellationToken::new())
         };
         let location = crate::execution::ExecutionLocation::root(runtime.root.path().to_owned());
         ToolContext::new(
@@ -643,11 +623,8 @@ pub(in crate::remote) mod tests {
 
     pub(super) fn output(value: &str) -> RemoteToolResult {
         Ok(RemoteToolOutput {
-            diagnostic: None,
-            streams: Default::default(),
             value: serde_json::json!(value),
-            images: Vec::new(),
-            captures: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -693,12 +670,13 @@ pub(in crate::remote) mod tests {
     pub(super) async fn route_fixture<R: tokio::io::AsyncRead + Unpin>(
         output: R,
         state: &Mutex<ConnectionState>,
+        writer: &Arc<Mutex<Writer>>,
     ) {
         let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
         route_responses(
             output,
             state,
-            &sink(),
+            writer,
             build(),
             prompts,
             CancellationToken::new(),
@@ -814,7 +792,7 @@ pub(in crate::remote) mod tests {
         let error = stream.await.err().unwrap().into_tool_error().diagnostic();
         assert_eq!(error.context.operation, Operation::Send);
         assert_eq!(error.context.site, FailureSite::Host);
-        assert_eq!(error.context.effects, Effects::MayHaveExecuted);
+        assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
         assert!(matches!(
             error.cause,
             crate::tool::diagnostic::Cause::Io { .. }

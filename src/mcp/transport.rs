@@ -92,12 +92,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLines<R> {
     }
 }
 
-/// Only processes created by this session enter this type. On Unix each command
-/// is the leader of a fresh process group, so shutdown also reaches descendants.
+/// Only processes created by this session enter this type. Each command is the
+/// leader of a fresh process group, so shutdown also reaches descendants.
 /// Dropping it kills the group and the child; Tokio reaps a dropped child as a
 /// best-effort fallback for a cancelled owner future.
 pub(crate) struct OwnedProcess {
-    #[cfg(unix)]
     group: crate::process_group::ProcessGroup,
     child: Child,
 }
@@ -114,18 +113,15 @@ impl OwnedProcess {
         command.stdout(if piped { Stdio::piped() } else { Stdio::null() });
         // Never leave an unread stderr pipe that could deadlock initialization.
         command.stderr(Stdio::null());
-        #[cfg(unix)]
         command.process_group(0);
         let child = command.spawn().map_err(McpError::Io)?;
         Ok(Self {
-            #[cfg(unix)]
             group: crate::process_group::ProcessGroup::led_by(&child),
             child,
         })
     }
 
     pub(crate) async fn shutdown(&mut self) {
-        #[cfg(unix)]
         self.group.kill();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -307,7 +303,6 @@ impl BoundedHttpClient {
         response: reqwest::Response,
         message: &ClientJsonRpcMessage,
         session_attached: bool,
-        max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
         let status = response.status();
         if matches!(
@@ -352,10 +347,7 @@ impl BoundedHttpClient {
         if status.is_success() && content_type.starts_with("text/event-stream") {
             // Deliberately cap the entire POST stream, including comments and
             // progress events. This also bounds each raw event before parsing.
-            let bytes = bounded_bytes(
-                response.bytes_stream(),
-                MAX_MESSAGE_BYTES.min(max_sse_event_size),
-            );
+            let bytes = bounded_bytes(response.bytes_stream(), MAX_MESSAGE_BYTES);
             let events = sse_stream::SseStream::from_bytes_stream(bytes).boxed();
             return Ok(StreamableHttpPostResponse::Sse(events, session));
         }
@@ -421,26 +413,6 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
-        self.post_message_with_max_sse_event_size(
-            uri,
-            message,
-            session_id,
-            auth_header,
-            custom_headers,
-            MAX_MESSAGE_BYTES,
-        )
-        .await
-    }
-
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        max_sse_event_size: usize,
-    ) -> Result<StreamableHttpPostResponse, HttpError> {
         let mut request = self.inner.post(uri.as_ref()).timeout(self.timeout).header(
             reqwest::header::ACCEPT,
             "text/event-stream, application/json",
@@ -467,9 +439,11 @@ impl StreamableHttpClient for BoundedHttpClient {
             .send()
             .await
             .map_err(|error| StreamableHttpError::Client(error.without_url()))?;
-        Self::parse_post_response(response, &message, attached, max_sse_event_size).await
+        Self::parse_post_response(response, &message, attached).await
     }
 
+    // The worker opens this stream in a task that close aborts, and never
+    // reconnects, so only the raw event size needs bounding here.
     async fn get_stream(
         &self,
         uri: Arc<str>,
@@ -478,46 +452,17 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>, HttpError> {
-        self.get_stream_with_max_sse_event_size(
-            uri,
-            session_id,
-            last_event_id,
-            auth_header,
-            custom_headers,
-            MAX_MESSAGE_BYTES,
-        )
-        .await
-    }
-
-    async fn get_stream_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        session_id: Option<Arc<str>>,
-        last_event_id: Option<String>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        max_sse_event_size: usize,
-    ) -> Result<BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>, HttpError> {
-        // Bound establishment, not the lifetime of the long-lived GET stream.
-        // The built-in adapter applies its raw per-event limiter before parsing.
-        tokio::time::timeout(
-            self.timeout,
-            self.inner.get_stream_with_max_sse_event_size(
+        self.inner
+            .get_stream_with_max_sse_event_size(
                 uri,
                 session_id,
                 last_event_id,
                 auth_header,
                 custom_headers,
-                MAX_MESSAGE_BYTES.min(max_sse_event_size),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            StreamableHttpError::UnexpectedServerResponse(
-                "MCP HTTP stream establishment timed out".into(),
+                MAX_MESSAGE_BYTES,
             )
-        })?
-        .map_err(redact_http_error)
+            .await
+            .map_err(redact_http_error)
     }
 
     async fn delete_session(
@@ -527,18 +472,10 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), HttpError> {
-        tokio::time::timeout(
-            self.timeout,
-            self.inner
-                .delete_session(uri, session_id, auth_header, custom_headers),
-        )
-        .await
-        .map_err(|_| {
-            StreamableHttpError::UnexpectedServerResponse(
-                "MCP HTTP session deletion timed out".into(),
-            )
-        })?
-        .map_err(redact_http_error)
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
+            .map_err(redact_http_error)
     }
 }
 
@@ -784,18 +721,12 @@ mod tests {
     #[tokio::test]
     async fn http_post_and_get_bound_sse_before_an_event_terminator() {
         for post in [true, false] {
-            let (uri, server) = http_fixture("200 OK", "text/event-stream", vec![b'x'; 100]).await;
+            let body = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+            let (uri, server) = http_fixture("200 OK", "text/event-stream", body).await;
             let client = test_http_client();
             let mut stream = if post {
                 let response = client
-                    .post_message_with_max_sse_event_size(
-                        uri,
-                        ping_message(),
-                        None,
-                        None,
-                        HashMap::new(),
-                        32,
-                    )
+                    .post_message(uri, ping_message(), None, None, HashMap::new())
                     .await
                     .unwrap();
                 let StreamableHttpPostResponse::Sse(stream, _) = response else {
@@ -804,7 +735,7 @@ mod tests {
                 stream
             } else {
                 client
-                    .get_stream_with_max_sse_event_size(uri, None, None, None, HashMap::new(), 32)
+                    .get_stream(uri, None, None, None, HashMap::new())
                     .await
                     .unwrap()
             };

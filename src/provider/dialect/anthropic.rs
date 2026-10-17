@@ -1,28 +1,33 @@
 //! api.anthropic.com: the Messages API with its version header, `x-api-key`,
 //! prefix-bound thinking, cache breakpoint lifetimes, and workspace-scoped keys.
 
-use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
+use serde::Deserialize;
+
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, Scheme};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, StateRole,
+        CacheTtl, Codec, CodecName, StateRole, ToolNames, UnsignedReasoning,
         messages::{self, SystemState, ThinkingBinding},
     },
     http::{
         Transport,
-        errors::{ErrorRule, ErrorSignals, Field},
+        errors::{ErrorSignals, error_object},
         headers::HeaderText,
     },
 };
 
-/// Anthropic's Messages conventions, wherever the service is reached. Signed thinking
-/// is bound to the exact conversation before it; letting the service drop a
-/// mismatched block keeps mode switches and compaction from failing, and the
-/// runtime still unbinds client-side. System-role state is turn-scoped, which
-/// keeps that conversation fixed as the state changes.
+/// Anthropic's Messages conventions, wherever the service is reached, with its
+/// tool-name alphabet. Signed thinking is bound to the exact conversation before it;
+/// letting the service drop a mismatched block keeps mode switches and compaction
+/// from failing, and the runtime still unbinds client-side. System-role state is
+/// turn-scoped, which keeps that conversation fixed as the state changes. The service
+/// takes back only thinking it signed.
 pub(super) fn messages() -> messages::Dialect {
     messages::Dialect {
         thinking_binding: ThinkingBinding::DropOnMismatch,
+        unsigned: UnsignedReasoning::Dropped,
+        tool_names: ToolNames::Anthropic,
         system_state: SystemState::TurnScoped,
         ..messages::Dialect::standard()
     }
@@ -47,17 +52,30 @@ pub(super) fn state(profile: &mut Profile, configured: Option<StateRole>) {
 }
 
 /// A spend cap is reported as a rate limit without a retry hint.
-const ERRORS: ErrorSignals = ErrorSignals {
-    rules: &[ErrorRule {
-        status: Some(429),
-        field: Some(Field::Equals(
-            "details.error_code",
-            "enforced_spend_limit_reached",
-        )),
-        ..ErrorRule::kind(ProviderErrorKind::Billing)
-    }],
-    ..ErrorSignals::NONE
-};
+const ERRORS: ErrorSignals = ErrorSignals(|status, native, _| {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Code {
+        EnforcedSpendLimitReached,
+    }
+    #[derive(Deserialize)]
+    struct Details {
+        error_code: Code,
+    }
+    #[derive(Deserialize)]
+    struct SpendCap {
+        details: Details,
+    }
+    if status != Some(429) {
+        return None;
+    }
+    let SpendCap {
+        details: Details {
+            error_code: Code::EnforcedSpendLimitReached,
+        },
+    } = SpendCap::deserialize(error_object(native)).ok()?;
+    Some(ProviderErrorKind::Billing)
+});
 
 fn transport() -> Transport {
     Transport {
@@ -92,16 +110,15 @@ impl DialectConfig for Config {
     /// The key travels as the codec's own, `x-api-key`.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Messages {
-            return Err(UnsupportedCodec {
+            return Err(DialectError::UnsupportedCodec {
                 dialect: Dialect::Anthropic,
                 codec,
-            }
-            .into());
+            });
         }
-        let codec = Codec::Messages(messages::Dialect {
-            cache_ttl: self.cache_ttl,
-            ..messages()
-        });
+        let mut codec = Codec::Messages(messages());
+        if let Some(ttl) = codec.cache_ttl_mut() {
+            *ttl = self.cache_ttl;
+        }
         let mut profile = Profile {
             key: Scheme::XApiKey,
             ..Profile::new(codec, transport(), Dialect::Anthropic)
@@ -127,6 +144,41 @@ mod tests {
         http::transport::tests::header_values,
     };
     use futures_util::StreamExt;
+
+    /// The service takes back only thinking it signed, so unsigned thinking stays
+    /// local even while the context is unsigned; a server that accepts it gets it.
+    #[test]
+    fn unsigned_thinking_is_never_sent() {
+        use crate::provider::{
+            codec::common::tests::envelope,
+            dialect::compatible,
+            protocol::{AssistantItem, Binding, Message, ReplayFormat, entries},
+        };
+        use serde_json::json;
+        let mut request = request();
+        let thinking = |payload, binding| {
+            let replay = envelope(
+                ReplayFormat::Messages,
+                request.model.as_str(),
+                payload,
+                binding,
+            );
+            AssistantItem::reasoning("r", 0, "", Some(replay))
+        };
+        let unsigned = json!({"type":"thinking", "thinking":"open"});
+        let turn = vec![
+            thinking(unsigned.clone(), Binding::Free),
+            AssistantItem::text("t", 1, "said"),
+        ];
+        request.context.extend(entries([Message::Assistant(turn)]));
+        let sent = |settings: &dyn DialectConfig| {
+            let codec = settings.admit(CodecName::Messages).unwrap().codec;
+            let body = codec.encode(&request, &"c".parse().unwrap()).unwrap().body;
+            body["messages"][1]["content"][0].clone()
+        };
+        assert_eq!(sent(&Config::default())["type"], "text");
+        assert_eq!(sent(&compatible::Config::default()), unsigned);
+    }
 
     #[test]
     fn replay_identity_tracks_workspace_not_cache_lifetime() {

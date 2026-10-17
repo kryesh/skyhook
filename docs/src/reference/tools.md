@@ -42,7 +42,8 @@ replacement.
 `write({path, content})` atomically creates or replaces a UTF-8 file. Set the optional
 `create_parents: true` to create missing parent directories recursively before writing, for example
 `write({path: "reports/run/summary.md", content: "...", create_parents: true})`.
-It defaults to `false`, so a missing parent directory causes the call to fail.
+It defaults to `false`, so a missing parent directory causes the call to fail. As in the operating
+system, `..` cannot follow a directory that does not exist yet, so `missing/../file` fails either way.
 
 `write({path, source: {path, target?}})` copies another file's bytes exactly, including binary
 files of any size. Supply exactly one of `content` or `source`. The destination is always in the

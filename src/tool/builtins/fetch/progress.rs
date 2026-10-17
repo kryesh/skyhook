@@ -1,298 +1,126 @@
 //! Per-operation context retained even when the outer deadline cancels a request.
-use std::time::{Duration, Instant};
+use std::error::Error;
+use std::time::Instant;
 
-use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
+use crate::tool::diagnostic::{
+    Cause, Effects, IoKind, Operation, PartialContext, RequestEffects, Subject,
+};
 
-use reqwest::Method;
-use schemars::JsonSchema;
-use serde::Serialize;
-
-use super::diagnostics::{FetchDiagnostic, FetchError, FetchPhase};
-use super::response::collect_headers;
-use super::validation::{HttpRequestUrl, SanitizedOrigin};
-use super::{LocalError, ProducedOutput};
-
-/// Failures add diagnostics and only include HTTP response fields when a response
-/// actually arrived. Response headers also require explicit opt-in. The error text
-/// carries the method, origin and message.
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, JsonSchema)]
-pub(super) struct FetchFailureOutput {
-    /// Milliseconds.
-    duration: u64,
-    /// Decoded entity bytes received, when any were.
-    #[schemars(with = "u64")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    redirects: Vec<FailureRedirect>,
-    diagnostic: FetchDiagnostic,
-    /// Explicitly configured proxy only; absence does not rule out an environment proxy.
-    #[schemars(with = "SanitizedOrigin")]
-    proxy_origin: Option<SanitizedOrigin>,
-    #[serde(flatten)]
-    response: Option<FailureResponse>,
-}
-
-/// Success redirects intentionally carry full URLs. Failure redirects cannot:
-/// these are distinct types and require sanitized origin evidence.
-#[derive(Clone, Serialize, JsonSchema)]
-struct FailureRedirect {
-    status: u16,
-    location: SanitizedOrigin,
-    method: String,
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Clone, Serialize, JsonSchema)]
-struct FailureResponse {
-    status: u16,
-    #[schemars(with = "std::collections::BTreeMap<String, Vec<String>>")]
-    headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
-}
+use super::LocalError;
 
 pub(super) struct FetchProgress {
     started: Instant,
-    pub(super) phase: FetchPhase,
     context: PartialContext,
     /// Once a request is sent, a failure no longer proves the server did nothing.
-    request_sent: bool,
-    /// The response accounting owner records observed decoded bytes, including the
-    /// chunk that crossed the limit. Resetting belongs only to begin_request.
-    pub(super) received_bytes: u64,
-    method: String,
-    origin: SanitizedOrigin,
-    redirects: Vec<FailureRedirect>,
-    response: Option<FailureResponse>,
-    proxy_origin: Option<SanitizedOrigin>,
-    connect_timeout_ms: u64,
-    include_headers: bool,
+    request: RequestEffects,
 }
 
 impl FetchProgress {
-    pub fn new(
-        url: &HttpRequestUrl,
-        method: &Method,
-        include_headers: bool,
-        connect_timeout: Duration,
-        proxy_origin: Option<SanitizedOrigin>,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
             started: Instant::now(),
-            phase: FetchPhase::ClientPreparation,
-            context: phase_context(FetchPhase::ClientPreparation),
-            request_sent: false,
-            received_bytes: 0,
-            method: method.to_string(),
-            origin: url.origin(),
-            redirects: Vec::new(),
-            response: None,
-            proxy_origin,
-            connect_timeout_ms: duration_ms(connect_timeout),
-            include_headers,
+            context: PartialContext::default(),
+            request: RequestEffects::Unknown,
         }
     }
 
-    /// Phase and operation are recorded before work begins, including across
-    /// awaits cancelled by the outer deadline. Execution site is bound centrally.
-    pub fn operation(&mut self, phase: FetchPhase, context: PartialContext) {
-        self.phase = phase;
+    /// Recorded before work begins, so it survives an await cancelled by the outer deadline.
+    pub fn operation(&mut self, context: PartialContext) {
         self.context = context;
     }
 
-    pub fn phase(&mut self, phase: FetchPhase) {
-        self.operation(phase, phase_context(phase));
-    }
-
-    pub fn local_io(&mut self, operation: Operation, subject: Subject) {
-        self.operation(FetchPhase::LocalIo, PartialContext::new(operation, subject));
+    pub fn step(&mut self, operation: Operation, subject: Subject) {
+        self.operation(PartialContext::new(operation, subject));
     }
 
     /// Download staging never touches the destination before its final rename.
     pub fn download_io(&mut self, operation: Operation, path: &std::path::Path) {
         self.operation(
-            FetchPhase::LocalIo,
             PartialContext::new(operation, Subject::path(path)).effects(Effects::Unchanged),
         );
     }
 
-    pub fn request_started(&mut self) {
-        self.request_sent = true;
-        self.phase(FetchPhase::Request);
+    pub fn request_started(&mut self, request: String) {
+        self.request = RequestEffects::MayHaveExecuted;
+        self.step(Operation::Send, Subject::Label(request));
     }
 
     pub fn elapsed_ms(&self) -> u64 {
-        duration_ms(self.started.elapsed())
-    }
-
-    pub fn begin_request(&mut self, url: &HttpRequestUrl, method: &Method) {
-        self.origin = url.origin();
-        self.method = method.to_string();
-        self.response = None;
-        self.received_bytes = 0;
-        self.phase(FetchPhase::Request);
-    }
-
-    pub fn response(&mut self, response: &reqwest::Response) {
-        self.response = Some(FailureResponse {
-            status: response.status().as_u16(),
-            headers: self
-                .include_headers
-                .then(|| collect_headers(response.headers())),
-        });
-    }
-
-    pub fn redirect(&mut self, status: u16, to: &HttpRequestUrl, method: &Method) {
-        self.redirects.push(FailureRedirect {
-            status,
-            location: to.origin(),
-            method: method.to_string(),
-        });
+        self.started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     pub fn timeout(&self, limit_secs: u64) -> LocalError {
-        self.diagnostic_failure(FetchDiagnostic::total_timeout(
-            self.phase,
-            limit_secs.saturating_mul(1000),
-        ))
+        self.failure(LocalError::failed(format!(
+            "the {limit_secs} s timeout elapsed"
+        )))
     }
 
-    pub fn failure(&self, error: FetchError) -> LocalError {
-        match error.into_diagnostic() {
-            Ok(diagnostic) => self.diagnostic_failure(diagnostic),
-            // Cancellation, denial and argument contracts retain their original metadata.
-            Err(error) => error.or(self.context.clone()),
+    /// Fill the facts the failure site left unset from the current operation.
+    pub fn failure(&self, error: LocalError) -> LocalError {
+        error.or(self.context.clone().request(self.request))
+    }
+}
+
+/// HTTP, TLS, resolver and I/O error displays can contain URLs, credentials,
+/// response data or local paths, so none is copied: a transport failure carries
+/// a typed I/O kind and OS code, or a fixed message.
+pub(super) fn transport_error(error: reqwest::Error) -> LocalError {
+    // io::Error::source skips the error it wraps, so descend through get_ref.
+    let chain =
+        std::iter::successors(Some(&error as &(dyn Error + 'static)), |&error| match error
+            .downcast_ref::<std::io::Error>(
+        ) {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn Error + 'static)),
+            None => error.source(),
+        });
+    let mut io = None;
+    for source in chain {
+        if source.is::<rustls::Error>() {
+            return LocalError::failed("the TLS handshake failed");
         }
+        io = source.downcast_ref::<std::io::Error>().or(io);
     }
-
-    fn diagnostic_failure(&self, diagnostic: FetchDiagnostic) -> LocalError {
-        let diagnostic = diagnostic.with_connect_limit(self.connect_timeout_ms);
-        let context = if diagnostic.phase() == self.phase {
-            self.context.clone()
+    if error.is_timeout() {
+        return LocalError::failed(if error.is_connect() {
+            "connect_timeout elapsed while connecting"
         } else {
-            phase_context(diagnostic.phase())
-        };
-        let elapsed_ms = self.elapsed_ms();
-        let mut summary = format!(
-            "HTTP {} {}: {} ({} ms)",
-            self.method,
-            self.origin.as_str(),
-            diagnostic.message(),
-            elapsed_ms
-        );
-        if let Some((platform, code)) = diagnostic.os_code() {
-            summary.push_str(&format!("; OS error {code} on {platform}"));
-        }
-        if self.request_sent {
-            summary.push_str("; server-side effects are unknown");
-        }
-        let report = FetchFailureOutput {
-            duration: elapsed_ms,
-            size: (self.received_bytes > 0).then_some(self.received_bytes),
-            redirects: self.redirects.clone(),
-            diagnostic,
-            proxy_origin: self.proxy_origin.clone(),
-            response: self.response.clone(),
-        };
-        // One typed projection, with no JSON recovery, arbitrary output merge, or
-        // images inherited from a nested failure. Headers can only enter via response().
-        let value = serde_json::to_value(report).expect("fetch diagnostics serialize");
-        LocalError::with_output(summary, ProducedOutput::new(value)).context(context)
+            "the request timed out"
+        });
     }
-}
-
-fn phase_context(phase: FetchPhase) -> PartialContext {
-    let (operation, subject) = match phase {
-        FetchPhase::ClientPreparation => (Operation::Prepare, "HTTP client"),
-        FetchPhase::Request => (Operation::Send, "HTTP request"),
-        FetchPhase::Connect => (Operation::Connect, "HTTP connection"),
-        FetchPhase::Resolve => (Operation::Lookup, "HTTP server address"),
-        FetchPhase::Tls => (Operation::Connect, "TLS connection"),
-        FetchPhase::Proxy => (Operation::Connect, "HTTP proxy"),
-        FetchPhase::Redirect => (Operation::Validate, "HTTP redirect"),
-        FetchPhase::Authorization => (Operation::Authorize, "HTTP request"),
-        FetchPhase::ResponseBody => (Operation::Receive, "HTTP response body"),
-        FetchPhase::Decode => (Operation::Deserialize, "HTTP response decoding"),
-        FetchPhase::Extraction => (Operation::Capture, "HTML text extraction"),
-        FetchPhase::LocalIo => (Operation::Prepare, "fetch files"),
-    };
-    PartialContext::new(operation, Subject::Label(subject.into()))
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
+    if let Some(io) = io {
+        let kind = IoKind::from(io.kind());
+        let code = io.raw_os_error();
+        if code.is_some() || kind != IoKind::Other {
+            return LocalError::cause(Cause::Io {
+                kind,
+                code,
+                detail: None,
+            });
+        }
+    }
+    LocalError::failed(if error.is_connect() {
+        "connecting to the server failed"
+    } else if error.is_decode() {
+        "decoding the response failed"
+    } else if error.is_body() {
+        "the response body failed"
+    } else {
+        "the HTTP request failed"
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, progress_for, server};
+    use super::super::tests::{executor, fetch};
     use super::*;
-    use crate::provider::http::transport::tests::{Plan, Server, reply};
-    use crate::tool::diagnostic::{Cause, FailureSite, PartialDiagnostic};
-    use serde_json::{Value, json};
-
-    fn with_headers(mut arguments: Value, include_headers: Option<bool>) -> Value {
-        if let Some(include) = include_headers {
-            arguments["include_headers"] = json!(include);
-        }
-        arguments
-    }
-
-    #[tokio::test]
-    async fn response_headers_are_opt_in_for_http_results_and_failures() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = executor(&runtime);
-        for include_headers in [None, Some(false), Some(true)] {
-            for (status, extra, options, error_kind) in [
-                ("200 OK", "", json!({}), None),
-                ("404 Not Found", "", json!({}), None),
-                ("200 OK", "", json!({"max_bytes":1}), Some("size_limit")),
-                (
-                    "201 Created",
-                    "",
-                    json!({"method":"POST","text":true}),
-                    Some("extraction_failure"),
-                ),
-                (
-                    "302 Found",
-                    "Location: /again\r\n",
-                    json!({"max_redirects":0}),
-                    Some("redirect_failure"),
-                ),
-            ] {
-                let headers = format!(
-                    "Content-Type: application/pdf\r\nX-Result: one\r\nX-Result: two\r\n{extra}"
-                );
-                let (url, task) = server(vec![reply(status, &headers, "body")]).await;
-                let mut arguments = with_headers(options, include_headers);
-                arguments["url"] = json!(url);
-                let result = fetch(&runtime, &executor, arguments).await;
-                let output = if let Some(kind) = error_kind {
-                    let output = result.unwrap_err().into_parts().1.unwrap().value;
-                    assert_eq!(output["diagnostic"]["error_kind"], kind);
-                    if kind == "extraction_failure" {
-                        assert_eq!(
-                            (&output["status"], &output["size"]),
-                            (&json!(201), &json!(4))
-                        );
-                    }
-                    output
-                } else {
-                    let output = result.unwrap();
-                    assert!(output.get("diagnostic").is_none());
-                    assert_eq!(output["body"], json!({"kind":"base64", "data":"Ym9keQ=="}));
-                    output
-                };
-                let status: u16 = status.split_whitespace().next().unwrap().parse().unwrap();
-                assert_eq!(output["status"], status);
-                if include_headers == Some(true) {
-                    assert_eq!(output["headers"]["x-result"], json!(["one", "two"]));
-                } else {
-                    assert_eq!(output["headers"], Value::Null, "{output}");
-                }
-                task.finish().await;
-            }
-        }
-    }
+    use crate::provider::http::transport::tests::{Plan, Server};
+    use crate::tool::diagnostic::FailureSite;
+    use serde_json::json;
+    use std::time::Duration;
 
     /// Wait until a download's staging file holds `bytes`: the client has read
     /// the response head and that much of its body.
@@ -316,208 +144,130 @@ mod tests {
         .await;
     }
 
-    /// Transport failures never have response headers; a deadline reports the
-    /// status and opt-in headers only once a response head arrived.
+    /// Failures are plain failed jobs: no structured result, the operation in
+    /// progress, and a typed transport cause.
     #[tokio::test]
-    async fn transport_failures_and_deadlines_report_headers_only_when_received() {
+    async fn transport_failures_and_deadlines_name_the_operation_in_progress() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
         let hour = Duration::from_secs(3600);
         // A dropped listener's port can be rebound by another test's server
         // before the connect; the privileged port is never listened on.
-        let refused = "http://127.0.0.1:1";
-        for include_headers in [None, Some(false), Some(true)] {
-            let arguments = with_headers(json!({"url":refused}), include_headers);
-            let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_parts().1.unwrap().value;
-            assert_eq!(output["diagnostic"]["error_kind"], "connection_refused");
-            assert!(output.get("status").is_none() && output.get("headers").is_none());
-
-            // The deadline elapses after the head and part of the body arrived.
-            let partial = "partial";
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Result: waiting\r\n\r\n{partial}"
-            );
-            let server = Server::start(vec![Plan::stalled(head.as_bytes())]).await;
-            let arguments = json!({"url":server.root(), "timeout":3600, "save_to":"download"});
-            let fetched = fetch(
-                &runtime,
-                &executor,
-                with_headers(arguments, include_headers),
-            );
-            let received = staged(runtime.root.path(), partial.len() as u64);
-            let (result, ()) = crate::tests::expire(fetched, received, hour).await;
-            let output = result.unwrap_err().into_parts().1.unwrap().value;
-            assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
-            assert_eq!(output["status"], 200);
-            assert_eq!(output["size"], partial.len());
-            if include_headers == Some(true) {
-                assert_eq!(output["headers"]["x-result"], json!(["waiting"]));
-            } else {
-                assert_eq!(output["headers"], Value::Null);
+        let url = "http://127.0.0.1:1/private?token=secret#secret";
+        let error = fetch(&runtime, &executor, json!({"url":url}))
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+        let (diagnostic, output) = error.into_parts();
+        assert!(output.is_none());
+        assert!(matches!(
+            diagnostic.cause,
+            Cause::Io {
+                kind: IoKind::ConnectionRefused,
+                code: Some(_),
+                ..
             }
-            assert!(!runtime.root.path().join("download").exists());
-            assert_eq!(server.finish().await.len(), 1);
-        }
+        ));
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::Label("HTTP GET http://127.0.0.1:1".into())
+        );
+
+        // The deadline elapses after the head and part of the body arrived.
+        let partial = "partial";
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{partial}");
+        let server = Server::start(vec![Plan::stalled(head.as_bytes())]).await;
+        let arguments = json!({"url":server.root(), "timeout":3600, "save_to":"download"});
+        let fetched = fetch(&runtime, &executor, arguments);
+        let received = staged(runtime.root.path(), partial.len() as u64);
+        let (result, ()) = crate::tests::expire(fetched, received, hour).await;
+        let diagnostic = result.unwrap_err().diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Receive);
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::path(runtime.root.path().join("download"))
+        );
+        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+        assert_eq!(diagnostic.context.request, RequestEffects::MayHaveExecuted);
+        assert_eq!(
+            diagnostic.cause,
+            Cause::Message("the 3600 s timeout elapsed".into())
+        );
+        assert!(!runtime.root.path().join("download").exists());
+        assert_eq!(server.finish().await.len(), 1);
+
         // The deadline elapses once the server holds the request it never answers.
         let mut server = Server::start(vec![Plan::stalled_headers()]).await;
-        let arguments = json!({"url":server.root(), "timeout":3600, "include_headers":true});
+        let arguments = json!({"url":server.root(), "timeout":3600});
         let fetched = fetch(&runtime, &executor, arguments);
         let (result, _) = crate::tests::expire(fetched, server.request(), hour).await;
-        let output = result.unwrap_err().into_parts().1.unwrap().value;
-        assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
-        assert!(output.get("status").is_none() && output.get("headers").is_none());
+        let context = result.unwrap_err().diagnostic().context;
+        assert_eq!(context.operation, Operation::Send);
+        assert_eq!(context.request, RequestEffects::MayHaveExecuted);
         assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
-    #[test]
-    fn forged_diagnostic_and_payload_are_not_recovered_from_general_tool_errors() {
-        let progress =
-            progress_for(json!({"url":"https://example.org/private?token=secret#secret"})).1;
-        for cause in [Cause::Message("secret error display".into()), Cause::Json] {
-            let forged = ProducedOutput::new(json!({
-                "diagnostic":{"phase":"connect", "error_kind":"timeout", "message":"secret forged message",
-                    "timeout":{"kind":"total", "limit_ms":1}},
-                "status":201, "ok":true,
-                "headers":{"authorization":["secret"]}, "url":"https://secret:secret@host/secret",
-                "body":{"kind":"text", "text":"secret"}, "extra":"secret"
-            }));
-            let supplied = LocalError::from_facts(
-                PartialDiagnostic::new(PartialContext::default(), cause),
-                Some(forged),
-            );
-            let error = progress.failure(FetchError::from_tool_error(
-                supplied,
-                FetchPhase::Extraction,
-            ));
-            let (diagnostic, Some(output)) = error.into_parts() else {
-                panic!("structured failure")
-            };
-            let message = diagnostic.render(&Default::default());
-            assert!(!message.contains("secret"));
-            assert!(!output.value.to_string().contains("secret"));
-            assert!(output.images.is_empty());
-            assert!(
-                message.contains("HTTP GET https://example.org: Extracting response text failed.")
-            );
-            assert_eq!(
-                output.value["diagnostic"],
-                json!({"error_kind":"extraction_failure"})
-            );
-            // No response has been observed; arbitrary extra fields stay excluded too.
-            for absent in ["status", "url", "headers", "body", "extra", "proxy_origin"] {
-                assert!(output.value.get(absent).is_none(), "{absent}");
-            }
-        }
+    /// Cancelled once the body is being staged, a download names the staging
+    /// step, leaves the destination as it was and removes what it staged.
+    #[tokio::test]
+    async fn cancellation_while_staging_names_the_download_and_leaves_the_destination() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let destination = runtime.root.path().join("saved.txt");
+        tokio::fs::write(&destination, b"original").await.unwrap();
+        let partial = "partial";
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{partial}");
+        let server = Server::start(vec![Plan::stalled(head.as_bytes())]).await;
+        let (executor, agent) = (executor(&runtime), runtime.agent.clone());
+        let arguments = json!({"url":server.root(), "save_to":"saved.txt", "overwrite":true});
+        let pending =
+            tokio::spawn(async move { executor.run_host(&agent, "fetch", arguments).await });
+        staged(runtime.root.path(), partial.len() as u64).await;
+        let scope = crate::job::CancelScope::Outcome;
+        assert_eq!(runtime.jobs.cancel_all(&runtime.agent, scope).await, 1);
+        let result = crate::tests::bounded(pending).await.unwrap();
+        let diagnostic = result.unwrap_err().diagnostic();
+        assert_eq!(diagnostic.cause, Cause::Cancelled);
+        assert_eq!(diagnostic.context.operation, Operation::Receive);
+        assert_eq!(diagnostic.context.subject, Subject::path(&destination));
+        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+        assert_eq!(diagnostic.context.request, RequestEffects::MayHaveExecuted);
+        assert_eq!(server.finish().await.len(), 1);
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"original");
+        let staging = std::fs::read_dir(runtime.root.path()).unwrap().flatten();
+        let staging =
+            staging.filter(|entry| entry.file_name().to_string_lossy().starts_with(".skyhook-"));
+        assert_eq!(staging.count(), 0);
     }
 
     #[test]
-    fn admission_and_control_flow_keep_cause_and_context_but_discard_supplied_output() {
-        let progress = progress_for(json!({"url":"https://example.org"})).1;
+    fn failures_keep_the_context_their_site_chose() {
+        let mut progress = FetchProgress::new();
+        progress.request_started("HTTP GET https://example.org".into());
         let authorization = PartialContext::new(
             Operation::Authorize,
             Subject::Label("network permission".into()),
         )
         .at(FailureSite::Host)
         .effects(Effects::NotStarted);
-        for cause in [
-            Cause::Cancelled,
-            Cause::Interrupted,
-            Cause::InputClosed,
-            Cause::Denied("permission metadata".into()),
-            Cause::InvalidArguments("invalid fetch option".into()),
-        ] {
-            // A boundary that named no context of its own gets the current fetch operation.
-            for (supplied, expected) in [
-                (authorization.clone(), &authorization),
-                (PartialContext::default(), &progress.context),
-            ] {
-                let error = LocalError::from_facts(
-                    PartialDiagnostic::new(supplied, cause.clone()),
-                    Some(ProducedOutput::new(json!({"status":200}))),
-                );
-                let admitted = progress.failure(FetchError::from_tool_error(
-                    error,
-                    FetchPhase::Authorization,
-                ));
-                let (diagnostic, output) = admitted.into_facts();
-                assert_eq!(
-                    diagnostic,
-                    PartialDiagnostic::new(expected.clone(), cause.clone())
-                );
-                assert!(output.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn deadline_retains_pending_file_stage_instead_of_claiming_a_network_timeout() {
-        let mut progress = progress_for(json!({"url":"https://example.org"})).1;
-        progress.request_started();
-        for (operation, path, effects) in [
-            (
-                Operation::SyncFile,
-                "download-stage",
-                Some(Effects::Unchanged),
-            ),
-            (Operation::Rename, "download", None),
-        ] {
-            if operation == Operation::SyncFile {
-                progress.download_io(operation, std::path::Path::new(path));
-            } else {
-                progress.local_io(operation, Subject::path(path));
-            }
-            let mut context = PartialContext::new(operation, Subject::path(path));
-            if let Some(effects) = effects {
-                context = context.effects(effects);
-            }
-            let error = progress.timeout(7);
-            assert_eq!(error.facts().context, context);
-            let (diagnostic, Some(output)) = error.into_parts() else {
-                panic!("structured timeout")
-            };
-            let message = diagnostic.render(&Default::default());
-            assert!(message.contains("Local file I/O timed out."), "{message}");
-            assert!(message.contains("server-side effects are unknown"));
-            assert_eq!(
-                output.value["diagnostic"]["timeout"],
-                json!({"kind":"total", "limit_ms":7000})
-            );
-        }
-    }
-
-    #[test]
-    fn request_transition_resets_only_per_response_state_and_sanitizes_hops() {
-        let from = HttpRequestUrl::parse("https://example.org/private?token=secret").unwrap();
-        let to =
-            HttpRequestUrl::parse("https://other.example/private?token=secret#secret").unwrap();
-        let (_, mut progress) = progress_for(json!({
-            "url":from.as_str(), "proxy":"http://user:secret@proxy.example:8080/path?secret#secret"
-        }));
-        progress.request_started();
-        progress.phase(FetchPhase::ResponseBody);
-        progress.received_bytes = 100;
-        progress.redirect(302, &to, &Method::GET);
-        progress.begin_request(&to, &Method::POST);
+        let denied = progress
+            .failure(LocalError::denied("policy").context(authorization.clone()))
+            .diagnostic();
+        // A denied redirect hop does not undo the request already sent.
         assert_eq!(
-            (progress.phase, progress.received_bytes),
-            (FetchPhase::Request, 0)
+            denied.context,
+            authorization
+                .request(RequestEffects::MayHaveExecuted)
+                .resolve()
         );
-        let (diagnostic, Some(output)) = progress.timeout(7).into_parts() else {
-            panic!("structured failure")
-        };
-        let message = diagnostic.render(&Default::default());
-        assert!(!message.contains("secret"));
-        assert!(!output.value.to_string().contains("secret"));
-        assert!(message.contains("server-side effects are unknown"));
-        assert!(
-            message.contains("HTTP POST https://other.example:"),
-            "{message}"
-        );
+        let cancelled = progress.failure(LocalError::cancelled()).diagnostic();
         assert_eq!(
-            output.value["redirects"],
-            json!([{"status":302,"location":"https://other.example","method":"GET"}])
+            cancelled.context,
+            PartialContext::new(
+                Operation::Send,
+                Subject::Label("HTTP GET https://example.org".into())
+            )
+            .request(RequestEffects::MayHaveExecuted)
+            .resolve()
         );
-        assert_eq!(output.value["proxy_origin"], "http://proxy.example:8080");
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use skyhook::agent::{HarnessError, QueuedPrompt, QueuedPromptCancellation};
+use skyhook::agent::{HarnessError, QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommitted};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueuedInputId(u64);
@@ -9,6 +9,10 @@ pub(super) enum RowState {
     Waiting,
     /// Dispatched; the cancellation withdraws it while its commit is pending.
     InFlight(QueuedPromptCancellation),
+    /// Taken back into the composer to edit: it keeps its place, and is never
+    /// sent, until the edit is submitted, which replaces it, or discarded, which
+    /// restores it.
+    Editing,
 }
 
 /// One composer submission waiting behind the current operation.
@@ -22,15 +26,51 @@ pub struct QueuedInput {
     pub(super) mode: ModeName,
 }
 
+/// Why queue delivery is paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paused {
+    /// Something stopped what the queue was sending: a failure, an interrupt or
+    /// the session. `/retry` resumes it.
+    Stopped,
+    /// The user took a row back to edit it: nothing queued or held is sent until
+    /// the edit is submitted or discarded, whatever stops it meanwhile. `stopped`
+    /// says whether something also stopped the queue, which holds it once the
+    /// edit ends.
+    Editing { stopped: bool },
+}
+
+/// How a dispatched row's receipt ended.
+pub enum Delivered {
+    /// Committed under this model and mode.
+    Committed(QueuedPromptCommitted),
+    /// Handed back: whatever held it reports why, such as a failed turn, an
+    /// interrupt, or the session, which reports its own stop.
+    HeldBack,
+    /// Refused before any turn took it, which nothing else reports.
+    Refused(HarnessError),
+}
+
+impl From<Result<QueuedPromptCommitted, HarnessError>> for Delivered {
+    fn from(result: Result<QueuedPromptCommitted, HarnessError>) -> Self {
+        match result {
+            Ok(committed) => Self::Committed(committed),
+            Err(HarnessError::Interrupted | HarnessError::Session(_)) => Self::HeldBack,
+            Err(error) => Self::Refused(error),
+        }
+    }
+}
+
 pub(super) struct QueueDelivery {
     pub(super) id: QueuedInputId,
     pub(super) generation: u64,
     pub(super) prompt: QueuedPrompt,
 }
 
-/// Register each UI queue snapshot as one request-boundary batch, in order.
+/// Register each UI queue snapshot as one request-boundary batch, in order,
+/// after the notices sent before it.
 pub(super) async fn queue_dispatcher(
     session: SessionHandle,
+    status: crate::tui::status::StatusLog,
     mut rx: mpsc::UnboundedReceiver<Vec<QueueDelivery>>,
     tx: mpsc::UnboundedSender<Work>,
 ) {
@@ -50,13 +90,14 @@ pub(super) async fn queue_dispatcher(
                         .into_iter()
                         .map(|input| ((input.id, input.generation), input.prompt))
                         .unzip();
+                    status.flush().await;
                     let receipts = session.enqueue_prompts(prompts).await;
                     for ((id, generation), receipt) in ids.into_iter().zip(receipts) {
                         let session = session.clone();
                         pending.push(async move {
-                            let result = receipt.await;
-                            let revision = session.observe().snapshot.revision;
-                            Work::QueueCommitted { id, generation, revision, result }
+                            let delivered = Delivered::from(receipt.await);
+                            let revision = session.revision();
+                            Work::QueueCommitted { id, generation, revision, delivered }
                         });
                     }
                 }
@@ -78,53 +119,84 @@ impl App {
         self.reject_pending_questions();
         self.advance_draft();
         let queued = self.queued_input(submission);
-        if self.busy() || self.paused || !self.queue.is_empty() {
-            self.queue.push_back(queued);
-            self.refresh_menu();
-            self.deliver_queue();
-            self.dirty = true;
-            return;
+        // An edited message takes its row's place.
+        match self.edited() {
+            Some(at) => {
+                self.own_queue()[at] = queued;
+                self.end_edit();
+            }
+            None => self.own_queue().push_back(queued),
         }
-        self.send_input(queued);
-    }
-    pub(super) fn send_input(&mut self, queued: QueuedInput) {
-        let Some(session) = self.session().cloned() else {
-            return self.begin_session(PendingStart::Input(Box::new(queued)));
-        };
-        self.commit_row(&queued);
-        let QueuedInput {
-            submission: Submission { text, attachments },
-            model,
-            mode,
-            ..
-        } = queued;
-        self.operation = true;
-        self.initial_input = Some((
-            self.root_agent().clone(),
-            self.snapshot
-                .records
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or_default(),
-        ));
-        let tx = self.tx.clone();
-        let status = self.status.clone();
-        tokio::spawn(async move {
-            status.flush().await;
-            let result = match session.selection(Some(&model), Some(&mode)) {
-                Ok(selection) => {
-                    session
-                        .prompt_with_options(text, &attachments, selection)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            let _ = tx.send(Work::Done {
-                result: result.map(|_| ()).map_err(Into::into),
-            });
-        });
+        self.refresh_menu();
+        self.deliver_queue();
         self.dirty = true;
+    }
+
+    /// The queue to change. Rows the session holds for `/retry` are taken back
+    /// first, waiting under the queue's pause: once the queue changes, it alone
+    /// orders them. A row already being submitted stays where it is.
+    pub(super) fn own_queue(&mut self) -> &mut VecDeque<QueuedInput> {
+        for input in &mut self.queue {
+            if matches!(&input.state, RowState::InFlight(row) if row.is_retained() && row.cancel())
+            {
+                input.state = RowState::Waiting;
+                input.generation = input.generation.wrapping_add(1);
+            }
+        }
+        &mut self.queue
+    }
+
+    /// Take row `id` back to edit, holding the queue until the edit is done, and
+    /// return what to edit. An edit already open goes back to its place, edited
+    /// or not, and any other draft is queued first.
+    pub(super) fn begin_edit(&mut self, id: QueuedInputId) -> Option<Submission> {
+        let queue = self.own_queue();
+        let index = queue.iter().position(|input| input.id == id)?;
+        if matches!(&queue[index].state, RowState::InFlight(row) if !row.cancel()) {
+            self.toast("This message is already being submitted");
+            return None;
+        }
+        let draft = self.editor.take();
+        match self.edited() {
+            Some(at) if draft.is_empty() => self.queue[at].state = RowState::Waiting,
+            Some(at) => self.queue[at] = self.queued_input(draft),
+            None if draft.is_empty() => {}
+            None => {
+                let draft = self.queued_input(draft);
+                self.queue.push_front(draft);
+            }
+        }
+        let stopped = matches!(
+            self.paused,
+            Some(Paused::Stopped | Paused::Editing { stopped: true })
+        );
+        let input = self.queue.iter_mut().find(|input| input.id == id)?;
+        input.state = RowState::Editing;
+        input.generation = input.generation.wrapping_add(1);
+        let submission = input.submission.clone();
+        self.paused = None;
+        self.pause_queue(Paused::Editing { stopped });
+        Some(submission)
+    }
+
+    /// Discard an open edit: its row goes back as it was.
+    pub(super) fn discard_edit(&mut self) {
+        if let Some(at) = self.edited() {
+            self.own_queue()[at].state = RowState::Waiting;
+        }
+        self.end_edit();
+    }
+
+    /// End an open edit, leaving the queue as a stop meanwhile left it.
+    fn end_edit(&mut self) {
+        if let Some(Paused::Editing { stopped }) = self.paused {
+            self.paused = stopped.then_some(Paused::Stopped);
+        }
+    }
+
+    /// The place of the row being edited.
+    fn edited(&self) -> Option<usize> {
+        (self.queue.iter()).position(|input| matches!(input.state, RowState::Editing))
     }
     fn remember_selection(&mut self, model: &ModelRef, mode: &ModeName) {
         let selection = (Some(model.clone()), Some(mode.clone()));
@@ -144,26 +216,73 @@ impl App {
             }
         });
     }
-    /// A committed or directly sent row goes through ordinary history bookkeeping.
-    pub(super) fn commit_row(&mut self, input: &QueuedInput) {
+    /// A committed row goes through ordinary history bookkeeping, remembering
+    /// the model and mode it committed under.
+    pub(super) fn commit_row(&mut self, input: &QueuedInput, committed: QueuedPromptCommitted) {
         self.history.push(input.submission.text.clone());
         self.history_browse = None;
-        self.set_title(&input.submission.text);
-        self.remember_selection(&input.model, &input.mode);
+        let mode = committed.mode.unwrap_or_else(|| input.mode.clone());
+        self.remember_selection(&committed.model, &mode);
     }
-    /// Withdraw every dispatched row that is still cancellable.
+    /// Whether the session holds rows with a failed turn for `/retry`.
+    pub(super) fn holds_rows(&self) -> bool {
+        (self.queue.iter())
+            .any(|input| matches!(&input.state, RowState::InFlight(row) if row.is_retained()))
+    }
+
+    /// Withdraw every dispatched row that is still cancellable, except those the
+    /// session holds for `/retry`.
     pub(super) fn cancel_queue_delivery(&mut self) {
         for input in &mut self.queue {
-            if matches!(&input.state, RowState::InFlight(row) if row.cancel()) {
+            if matches!(&input.state, RowState::InFlight(row) if !row.is_retained() && row.cancel())
+            {
                 input.state = RowState::Waiting;
                 input.generation = input.generation.wrapping_add(1);
             }
         }
     }
-    /// Stop dispatch and withdraw what can still be withdrawn.
-    pub(super) fn pause_queue(&mut self) {
-        self.paused = true;
+    /// Pause delivery for `why`; an open edit holds it whatever else does,
+    /// remembering a stop for when the edit ends.
+    pub(super) fn pause(&mut self, why: Paused) {
+        match &mut self.paused {
+            Some(Paused::Editing { stopped }) => *stopped |= why == Paused::Stopped,
+            paused => *paused = Some(why),
+        }
+    }
+
+    /// Stop dispatch for `why` and withdraw what can still be withdrawn.
+    pub(super) fn pause_queue(&mut self, why: Paused) {
+        self.pause(why);
         self.cancel_queue_delivery();
+    }
+
+    /// Resume delivery the queue stopped for, re-sending its waiting rows as one
+    /// batch on the bottom bar's model and mode, as `/retry` does; whether any.
+    pub(super) fn resume_stopped_queue(&mut self) -> bool {
+        let waiting = |input: &&mut QueuedInput| matches!(input.state, RowState::Waiting);
+        let (model, mode) = (self.model.clone(), self.mode.clone());
+        let mut resumed = false;
+        if self.paused == Some(Paused::Stopped) {
+            for input in self.queue.iter_mut().filter(waiting) {
+                (input.model, input.mode) = (model.clone(), mode.clone());
+                resumed = true;
+            }
+        }
+        if resumed {
+            self.paused = None;
+            self.deliver_queue();
+        }
+        resumed
+    }
+
+    /// A failed root turn, however it started, holds the input queued behind
+    /// it. Every record since the last read is checked, so a failure a lagged
+    /// update stream skipped still pauses before anything more is delivered.
+    pub(super) fn hold_after_root_failure(&mut self) {
+        if root_failed(&self.snapshot, self.root_agent(), self.failures_read) {
+            self.pause_queue(Paused::Stopped);
+        }
+        self.failures_read = last_record(&self.snapshot);
     }
 
     pub(super) fn deliver_queue(&mut self) {
@@ -172,43 +291,36 @@ impl App {
             self.queue.clear();
             return;
         }
-        // Lag recovery replaces the snapshot without replaying each event. Only
-        // records after the gate can release it.
-        if let Some(&(_, after)) = self.initial_input.as_ref() {
-            let after = (std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded);
-            for record in self.snapshot.records.range(after).map(|(_, record)| record) {
-                if observe_initial_input(&mut self.initial_input, record) {
-                    break;
-                }
-            }
-        }
-        if self.start.is_creating() || self.stopping || self.paused || self.queue.is_empty() {
+        if self.creating.is_some()
+            || self.stopping
+            || self.paused.is_some()
+            || self.queue.is_empty()
+        {
             return;
         }
         let Some(session) = self.session().cloned() else {
             // Retain the head across creation, then register the entire queue.
             let input = self.queue.pop_front().unwrap();
             self.refresh_menu();
-            return self.begin_session(PendingStart::QueuedInput(Box::new(input)));
+            return self.begin_session(PendingStart::Input(Box::new(input)));
         };
-        if self.initial_input.is_some() {
-            return;
-        }
-        let mut deliveries = Vec::new();
-        let mut rejected = None;
-        let queue = self.queue.iter_mut();
-        for input in queue {
-            if matches!(input.state, RowState::InFlight(_)) {
-                continue;
+        let waiting = |input: &&mut QueuedInput| matches!(input.state, RowState::Waiting);
+        // The waiting rows are one batch: a row the session cannot take holds
+        // every one of them back.
+        let selections = (self.queue.iter_mut().filter(waiting))
+            .map(|input| session.selection(Some(&input.model), Some(&input.mode)))
+            .collect::<Result<Vec<_>, _>>();
+        let selections = match selections {
+            Ok(selections) => selections,
+            Err(error) => {
+                self.pause(Paused::Stopped);
+                return self.notice(format!(
+                    "Queued message was not submitted: {error}. Resume to retry."
+                ));
             }
-            // A row the session cannot take holds itself and the rows behind it back.
-            let options = match session.selection(Some(&input.model), Some(&input.mode)) {
-                Ok(options) => options,
-                Err(error) => {
-                    rejected = Some(error);
-                    break;
-                }
-            };
+        };
+        let mut deliveries = Vec::new();
+        for (input, options) in self.queue.iter_mut().filter(waiting).zip(selections) {
             let cancellation = QueuedPromptCancellation::default();
             input.generation = input.generation.wrapping_add(1);
             input.state = RowState::InFlight(cancellation.clone());
@@ -223,24 +335,19 @@ impl App {
                 },
             });
         }
-        if let Some(error) = rejected {
-            self.paused = true;
-            self.notice(format!(
-                "Queued message was not submitted: {error}. Resume to retry."
-            ));
-        }
         if deliveries.is_empty() {
             return;
         }
         let sender = self.queue_sender.get_or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(queue_dispatcher(session, rx, self.tx.clone()));
+            let status = self.status.clone();
+            tokio::spawn(queue_dispatcher(session, status, rx, self.tx.clone()));
             tx
         });
         if sender.send(deliveries).is_err() {
             // Nothing reached the runtime: every row is waiting again.
             self.queue_sender = None;
-            self.pause_queue();
+            self.pause_queue(Paused::Stopped);
             self.notice("Could not deliver queued messages; resume to retry");
         }
     }
@@ -249,7 +356,7 @@ impl App {
         id: QueuedInputId,
         generation: u64,
         revision: u64,
-        result: Result<(), HarnessError>,
+        delivered: Delivered,
     ) {
         let Some(index) = self.queue.iter().position(|input| {
             input.id == id
@@ -258,20 +365,19 @@ impl App {
         }) else {
             return;
         };
-        match result {
-            Ok(()) => {
+        match delivered {
+            Delivered::Committed(committed) => {
                 let input = self.queue.remove(index).unwrap();
                 self.queue_activity_revision = self.queue_activity_revision.max(revision);
-                self.commit_row(&input);
+                self.commit_row(&input, committed);
             }
-            Err(error) => {
+            Delivered::HeldBack => {
                 self.queue[index].state = RowState::Waiting;
-                self.pause_queue();
-                // A held-back row is reported by whatever held it back, and a
-                // failed journal by the session it stopped.
-                if matches!(error, HarnessError::Interrupted) || error.journal_failed() {
-                    return self.refresh_menu();
-                }
+                self.pause_queue(Paused::Stopped);
+            }
+            Delivered::Refused(error) => {
+                self.queue[index].state = RowState::Waiting;
+                self.pause_queue(Paused::Stopped);
                 self.notice(format!(
                     "Queued message was not submitted: {error}. Resume to retry."
                 ));
@@ -293,6 +399,7 @@ impl App {
     pub(super) fn queue_items(&self) -> Vec<Item<QueuedInputId>> {
         self.queue
             .iter()
+            .filter(|queued| !matches!(queued.state, RowState::Editing))
             .map(|queued| {
                 let profile = self.launch.model.config().model(&queued.model);
                 Item::new(
@@ -308,8 +415,9 @@ impl App {
     }
     /// Take a row out of the queue, withdrawing its dispatch if one is pending.
     pub(super) fn remove_queued(&mut self, id: QueuedInputId) -> Option<QueuedInput> {
-        let index = self.queue.iter().position(|queued| queued.id == id)?;
-        if matches!(&self.queue[index].state, RowState::InFlight(row) if !row.cancel()) {
+        let queue = self.own_queue();
+        let index = queue.iter().position(|queued| queued.id == id)?;
+        if matches!(&queue[index].state, RowState::InFlight(row) if !row.cancel()) {
             self.toast("This message is already being submitted");
             return None;
         }
@@ -324,7 +432,6 @@ mod tests {
     use super::super::played::*;
     use super::super::tests::*;
     use super::*;
-    use skyhook::session::RecordSeq;
 
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
 
@@ -374,12 +481,18 @@ mod tests {
         batch.iter().map(|row| row.prompt.text.as_str()).collect()
     }
 
-    fn receipt(app: &mut App, row: &QueueDelivery, result: Result<(), HarnessError>) {
+    /// What a batch committed under, as the fixture's model reports it.
+    fn committed() -> QueuedPromptCommitted {
+        let model = "test/first".parse().unwrap();
+        QueuedPromptCommitted { model, mode: None }
+    }
+
+    fn receipt(app: &mut App, row: &QueueDelivery, delivered: Delivered) {
         app.work(Work::QueueCommitted {
             id: row.id,
             generation: row.generation,
             revision: app.snapshot.revision + 1,
-            result,
+            delivered,
         });
     }
 
@@ -432,14 +545,14 @@ mod tests {
         );
         assert!(app.history.is_empty());
 
-        receipt(&mut app, &first[0], Ok(()));
+        receipt(&mut app, &first[0], Delivered::Committed(committed()));
         assert_eq!(app.history, ["first"]);
         assert_eq!(app.queue.len(), 1);
         // A commit is not a turn completion, and an idle enqueue stays busy
         // until the observed activity catches up.
         assert!(app.operation);
         app.operation = false;
-        receipt(&mut app, &second[0], Ok(()));
+        receipt(&mut app, &second[0], Delivered::Committed(committed()));
         assert!(app.queue.is_empty() && app.busy());
         app.snapshot.revision = app.queue_activity_revision;
         assert!(!app.busy());
@@ -452,7 +565,7 @@ mod tests {
         app.submit("second".into());
         let stale = deliveries.try_recv().unwrap();
         deliveries.try_recv().unwrap();
-        app.pause_queue();
+        app.pause_queue(Paused::Stopped);
         assert!(
             app.queue
                 .iter()
@@ -460,8 +573,8 @@ mod tests {
         );
         assert!(stale[0].prompt.cancellation.cancel());
         // Neither outcome of a withdrawn dispatch touches the row.
-        receipt(&mut app, &stale[0], Ok(()));
-        receipt(&mut app, &stale[0], Err(HarnessError::Interrupted));
+        receipt(&mut app, &stale[0], Delivered::Committed(committed()));
+        receipt(&mut app, &stale[0], Delivered::HeldBack);
         assert_eq!(app.queue.len(), 2);
         app.tick();
         assert!(deliveries.try_recv().is_err());
@@ -474,35 +587,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_receipt_retains_the_row_and_pauses_the_rows_behind_it() {
+    async fn a_refused_batch_stays_pending_for_retry_and_its_failed_turn_reports_it_once() {
         let (_root, mut app) = fixture().await;
-        let mut rx = capture_work(&mut app);
-        app.paused = true;
+        let _rx = capture_work(&mut app);
+        app.paused = Some(Paused::Stopped);
         app.submit(image_row());
         app.submit("second".into());
         app.submit("third".into());
         app.command(Command::Resume);
         app.tick();
-        // The runtime claims and fails the first row, then holds back the rest.
-        for _ in 0..3 {
-            let work = recv(&mut rx).await;
-            assert!(matches!(work, Work::QueueCommitted { .. }));
-            app.work(work);
-        }
-        assert!(app.paused && app.history.is_empty());
+        let refusal = "does not support image inputs";
+        bounded(async {
+            while shown(&app, refusal).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(shown(&app, refusal).await, 1);
+        // The session holds the whole batch for /retry: the queue pauses without
+        // taking any row back.
+        app.resubscribe();
+        assert!(app.paused.is_some() && app.history.is_empty());
         assert_eq!(app.queue.len(), 3);
         assert!(
             app.queue
                 .iter()
+                .all(|input| matches!(&input.state, RowState::InFlight(row) if row.is_retained()))
+        );
+        // Editing a held row withdraws it and the rows behind it, which then follow
+        // it; while the edit is open, neither a later failure nor /retry sends them.
+        let editing = app.queue[0].submission.text.clone();
+        app.command(Command::Queue);
+        app.choose();
+        assert_eq!(app.editor.text(), editing);
+        app.pause_queue(Paused::Stopped);
+        app.command(Command::Retry);
+        let toast = app.toast.take().map(|(toast, _)| toast);
+        assert!(toast.is_some_and(|toast| toast.starts_with("Submit the message you are editing")));
+        assert!(matches!(app.paused, Some(Paused::Editing { .. })));
+        assert!(matches!(app.queue[0].state, RowState::Editing));
+        assert!(
+            app.queue
+                .iter()
+                .skip(1)
                 .all(|input| matches!(input.state, RowState::Waiting))
         );
-        let notices = notices(&app, &mut rx).await;
-        // Only the claimed row reports; the rows it held back stay quiet.
-        let failed = notices
-            .iter()
-            .filter(|notice| notice.contains("was not submitted"));
-        assert_eq!(failed.count(), 1);
+        // Submitted, the edit goes back ahead of the rows behind it; the stop still
+        // holds them all.
+        let edited = app.editor.take();
+        app.submit(edited);
+        let texts: Vec<_> = (app.queue.iter())
+            .map(|row| row.submission.text.as_str())
+            .collect();
+        assert_eq!(texts, ["image", "second", "third"]);
+        app.tick();
+        assert_eq!(app.paused, Some(Paused::Stopped));
+        assert!(
+            app.queue
+                .iter()
+                .all(|row| matches!(row.state, RowState::Waiting))
+        );
+        // /retry sends them again as one batch, on the bottom bar's model.
+        app.command(Command::Retry);
+        assert_eq!(app.paused, None);
+        assert!(
+            app.queue
+                .iter()
+                .all(|row| matches!(row.state, RowState::InFlight(_)) && row.model == app.model)
+        );
         app.session().unwrap().shutdown().await.unwrap();
+    }
+
+    /// A receipt the session's own stop resolves is reported by the session; only
+    /// a refusal no turn took is the row's to report.
+    #[test]
+    fn receipts_parse_into_who_reports_them() {
+        use skyhook::session::{SessionError, SessionPhase};
+        assert!(matches!(
+            Delivered::from(Ok(committed())),
+            Delivered::Committed(_)
+        ));
+        for held in [
+            HarnessError::Interrupted,
+            HarnessError::Session(SessionError::Refused(SessionPhase::ShuttingDown)),
+            HarnessError::Session(SessionError::Refused(SessionPhase::Closed)),
+        ] {
+            assert!(matches!(Delivered::from(Err(held)), Delivered::HeldBack));
+        }
+        let refused = Delivered::from(Err(HarnessError::ImageLimit));
+        assert!(matches!(
+            refused,
+            Delivered::Refused(HarnessError::ImageLimit)
+        ));
     }
 
     #[tokio::test]
@@ -511,7 +687,7 @@ mod tests {
         let mut rx = capture_work(&mut app);
         drop(deliveries);
         app.submit("first".into());
-        assert!(app.paused && app.queue_sender.is_none());
+        assert!(app.paused.is_some() && app.queue_sender.is_none());
         assert!(matches!(app.queue[0].state, RowState::Waiting));
         let notices = notices(&app, &mut rx).await;
         assert!(
@@ -529,6 +705,42 @@ mod tests {
         app.session().unwrap().shutdown().await.unwrap();
     }
 
+    /// Editing a row holds the queue: `/retry` leaves it paused and nothing is
+    /// sent. The edit keeps its place whatever happens to the rows around it.
+    #[tokio::test]
+    async fn an_edit_holds_the_queue_and_keeps_its_place() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
+        for text in ["before", "edited", "behind", "last"] {
+            app.submit(text.into());
+        }
+        while deliveries.try_recv().is_ok() {}
+        let id = |app: &App, text: &str| {
+            let mut rows = app.queue.iter();
+            rows.find(|row| row.submission.text == text).unwrap().id
+        };
+        let texts = |app: &App| {
+            let rows = app.queue.iter();
+            rows.map(|row| row.submission.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(app.begin_edit(id(&app, "edited")).is_some());
+        app.command(Command::Retry);
+        app.tick();
+        assert!(matches!(app.paused, Some(Paused::Editing { .. })));
+        assert!(matches!(app.queue[1].state, RowState::Editing));
+        assert!(deliveries.try_recv().is_err());
+        for removed in ["behind", "before"] {
+            assert!(app.remove_queued(id(&app, removed)).is_some());
+        }
+        app.submit("edited again".into());
+        assert_eq!(texts(&app), ["edited again", "last"]);
+        assert!(app.begin_edit(id(&app, "edited again")).is_some());
+        assert!(app.remove_queued(id(&app, "last")).is_some());
+        app.submit("final".into());
+        assert_eq!(texts(&app), ["final"]);
+        assert_eq!(app.paused, None);
+    }
+
     #[tokio::test]
     async fn editing_a_dispatched_row_withdraws_it_unless_it_is_already_being_submitted() {
         let (_root, mut app, mut deliveries) = queue_fixture().await;
@@ -536,7 +748,7 @@ mod tests {
         let editable = deliveries.try_recv().unwrap();
         app.command(Command::Queue);
         app.choose();
-        assert!(app.queue.is_empty() && app.paused);
+        assert!(matches!(app.queue[0].state, RowState::Editing) && app.paused.is_some());
         assert_eq!(app.editor.text(), "editable");
         assert!(editable[0].prompt.cancellation.cancel());
 
@@ -551,8 +763,9 @@ mod tests {
             receipt.await.unwrap();
         }
         app.command(Command::Queue);
+        app.menu_mut().unwrap().input.set("claimed".into());
         app.choose();
-        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.len(), 2);
         assert_eq!(app.editor.text(), "draft");
         let toast = app.toast.take().map(|(toast, _)| toast);
         assert_eq!(
@@ -562,46 +775,458 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    const REJECTED: &str = "fixture credentials rejected";
+
+    /// A terminal failure, unlike a refused connection, which retries.
+    fn rejected() -> skyhook::provider::ProviderError {
+        skyhook::provider::ProviderErrorKind::Authentication.error(REJECTED)
+    }
+
+    /// How many entries of the root's conversation show `text`, once every
+    /// notice sent so far is journaled.
+    async fn shown(app: &App, text: &str) -> usize {
+        app.status.flush().await;
+        let snapshot = app.session().unwrap().observe().snapshot;
+        let projection = model::Projection::new(&snapshot);
+        let view = model::EntryView {
+            agent: app.root_agent(),
+            tab: model::Tab::Conversation,
+            view: &model::View::default(),
+            all_details: false,
+            today: app.clock.day(),
+        };
+        let entries = model::entries(&snapshot, &projection, view, &app.outputs, &[], false);
+        entries
+            .iter()
+            .filter(|entry| entry.text().contains(text))
+            .count()
+    }
+
+    async fn continued(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
+        bounded(async {
+            loop {
+                match recv(rx).await {
+                    work @ Work::Continued { .. } => break work,
+                    work => app.work(work),
+                }
+            }
+        })
+        .await
+    }
+
+    fn agent_failed(event: &SessionEvent) -> bool {
+        matches!(event, SessionEvent::AgentFailed { .. })
+    }
+
+    /// A failed root turn pauses the queue, whether a submission or /retry
+    /// started it, and the conversation shows each failure once: its request's
+    /// card. A /retry refused before its turn starts reports its own error.
     #[tokio::test]
-    async fn queue_waits_for_the_initial_input_to_commit() {
-        let (_root, mut app, _model, _session) = played_fixture().await;
-        let _asked = ask(app.session().unwrap(), "initial");
-        // The root's input, committed while the played model holds its turn open.
-        let input = committed(user);
-        let first = |app: &App| {
-            let mut records = app.snapshot.records.values();
-            records.find(|record| input(&record.event)).cloned()
-        };
-        let committed = observe_find(&mut app, first).await;
-        let mut deliveries = busy(&mut app);
+    async fn a_failed_root_turn_pauses_the_queue_and_is_shown_once() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
         let root = app.root_agent().clone();
-        // Bound to the input just committed, which comes before what releases it.
-        app.initial_input = Some((root.clone(), committed.sequence));
-        app.submit("followup".into());
-        app.tick();
-        assert!(deliveries.try_recv().is_err());
-        // Only a later user record from the bound root releases the gate.
-        assert!(!observe_initial_input(&mut app.initial_input, &committed));
-        app.initial_input = Some((root.clone(), RecordSeq::default()));
-        let child = EventRecord {
-            agent: root.child(1),
-            ..committed.clone()
-        };
-        let status = EventRecord {
-            event: SessionEvent::Status {
-                message: "status".into(),
-            },
-            ..committed.clone()
-        };
-        for ignored in [&child, &status] {
-            assert!(!observe_initial_input(&mut app.initial_input, ignored));
-        }
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(committed)),
+        app.model = "test/seeing".parse().unwrap();
+        app.submit(Submission {
+            text: "first".into(),
+            attachments: vec![png_attachment("first.png")],
         });
-        assert!(app.initial_input.is_none());
-        app.tick();
-        assert_eq!(texts(&deliveries.try_recv().unwrap()), ["followup"]);
+        model.turn().await.fail(rejected());
+        observe_until(&mut app, |app| stopped(&app.snapshot, &root)).await;
+        assert!(app.paused.is_some());
+        assert_eq!(shown(&app, REJECTED).await, 1);
+
+        app.command(Command::Retry);
+        model.turn().await.fail(rejected());
+        let work = continued(&mut app, &mut rx).await;
+        assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
+        app.work(work);
+        observe_until(&mut app, |app| {
+            count(&app.snapshot, agent_failed) == 2 && stopped(&app.snapshot, &root)
+        })
+        .await;
+        assert_eq!(shown(&app, REJECTED).await, 2);
+
+        // Swapping to a model without image support refuses the continue.
+        app.model = "test/first".parse().unwrap();
+        app.command(Command::Retry);
+        let work = continued(&mut app, &mut rx).await;
+        let Work::Continued {
+            result: Err(error), ..
+        } = &work
+        else {
+            panic!("the swap is refused");
+        };
+        assert!(error.to_string().contains("does not support image inputs"));
+        app.work(work);
+        assert_eq!(shown(&app, "does not support image inputs").await, 1);
+        assert_eq!(shown(&app, REJECTED).await, 2);
+        session.shutdown().await.unwrap();
+    }
+
+    /// A root parked by a failed turn passes through work it does not take
+    /// without failing again.
+    #[tokio::test]
+    async fn a_withdrawn_row_does_not_fail_a_parked_root_again() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
+        let root = app.root_agent().clone();
+        app.submit("first".into());
+        model.turn().await.fail(rejected());
+        observe_until(&mut app, |app| {
+            stopped(&app.snapshot, &root) && app.paused.is_some()
+        })
+        .await;
+        // Sent, then withdrawn before the runtime claims it.
+        app.paused = None;
+        app.submit("second".into());
+        let row = app.queue.iter().find(|row| row.submission.text == "second");
+        let id = row.unwrap().id;
+        assert!(app.remove_queued(id).is_some());
+        // Its receipt resolves once the session has dropped it, whether or not
+        // the root took it as work.
+        bounded(async {
+            while !matches!(recv(&mut rx).await,
+                Work::QueueCommitted { id: committed, .. } if committed == id)
+            {}
+        })
+        .await;
+        let busy = || session.observe().snapshot.activity[&root].state.is_busy();
+        bounded(async {
+            while busy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        app.resubscribe();
+        assert_eq!(count(&app.snapshot, agent_failed), 1);
+        assert!(!app.paused.is_some());
+        session.shutdown().await.unwrap();
+    }
+
+    /// A failure inside updates the app skipped still holds the queue once it
+    /// resubscribes.
+    #[tokio::test]
+    async fn a_root_failure_missed_by_a_lagged_observer_pauses_on_resubscribe() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let _rx = capture_work(&mut app);
+        let mut updates = session.observe().updates;
+        app.submit("first".into());
+        app.close_observation();
+        model.turn().await.fail(rejected());
+        bounded(async {
+            while !matches!(updates.recv().await.unwrap().event, RuntimeEvent::Record(record)
+                if agent_failed(&record.event))
+            {}
+        })
+        .await;
+        app.resubscribe();
+        assert!(app.paused.is_some());
+        app.submit("second".into());
+        let row = app.queue.iter().find(|row| row.submission.text == "second");
+        assert!(matches!(row.unwrap().state, RowState::Waiting));
+        session.shutdown().await.unwrap();
+    }
+
+    /// Reopening a session whose last root turn failed shows that failure
+    /// once, and takes new input.
+    #[tokio::test]
+    async fn a_reopened_failed_session_takes_new_input() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let _rx = capture_work(&mut app);
+        app.submit("first".into());
+        model.turn().await.fail(rejected());
+        observe_until(&mut app, |app| app.paused.is_some()).await;
+        session.close().await.unwrap();
+        let reopened = app.launch.create(Some(session.id())).await.unwrap();
+        let prepared = PreparedObservation::subscribe(reopened.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app.sibling(Some(prepared), app.launch.clone(), tx);
+        app.submit("second".into());
+        let user = |event: &SessionEvent| {
+            matches!(
+                event,
+                SessionEvent::MessageCommitted {
+                    message: Message::User(_)
+                }
+            )
+        };
+        observe_until(&mut app, |app| count(&app.snapshot, user) == 2).await;
+        assert!(!app.paused.is_some());
+        assert!(
+            !app.queue
+                .iter()
+                .any(|row| matches!(row.state, RowState::Waiting))
+        );
+        assert_eq!(shown(&app, REJECTED).await, 1);
+        reopened.shutdown().await.unwrap();
+    }
+
+    /// A delivery its idle root cannot take fails the root's turn as a failed
+    /// request would: journaled, shown, and holding the queue. Here a retained
+    /// child's answer reaches a reopened root that must first adopt its
+    /// redefined mode, in a conversation its provider no longer opens.
+    #[tokio::test]
+    async fn a_delivery_the_idle_root_refuses_fails_its_turn_and_pauses_the_queue() {
+        use serde_json::json;
+        use skyhook::agent::HarnessBuilder;
+        use skyhook::provider::protocol::ContextId;
+        use skyhook::tool::policy::{AllowAll, Capability, Mode};
+        let (_root, mut app) = draft_fixture().await;
+        let name = app.mode.clone();
+        let mode = |instructions: &str| {
+            let general = Mode {
+                capabilities: vec![Capability::Read, Capability::Agents],
+                instructions: Some(instructions.parse().unwrap()),
+                hint: None,
+            };
+            let modes = [(name.clone(), general)].into_iter().collect();
+            move |builder: HarnessBuilder| builder.modes(modes)
+        };
+        let policy = std::sync::Arc::new(AllowAll);
+        let (harness, mut model) = played_harness(&app.launch, policy.clone(), mode("Look.")).await;
+        let session = harness.new_session().await.unwrap();
+        let root = session.root_agent().clone();
+        attach(&mut app, session.clone());
+        let _rx = capture_work(&mut app);
+        app.submit("delegate".into());
+        let task = json!({"prompt": "work", "bg": true});
+        model
+            .turn()
+            .await
+            .end(vec![call("agent-0", "agent", task, 0)]);
+        // The root answers while its child's request stays open, until closing
+        // interrupts it.
+        let (first, second) = (model.turn().await, model.turn().await);
+        let (answering, _child) = match first.context == ContextId::from(&root) {
+            true => (first, second),
+            false => (second, first),
+        };
+        answering.answer("delegated");
+        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+
+        let (harness, mut model) = played_harness(&app.launch, policy, mode("Changed.")).await;
+        let reopened = harness.resume_session(session.id()).await.unwrap();
+        // Activation opens the root's conversation: the last one opened for it.
+        let activated = reopened.record_status(root.clone(), "reopened".into());
+        activated.await.unwrap();
+        model.refuse(&root);
+        attach(&mut app, reopened.clone());
+        let mut rx = capture_work(&mut app);
+        app.command(Command::Retry);
+        model.turn().await.answer("worked");
+        let work = continued(&mut app, &mut rx).await;
+        assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
+        app.work(work);
+        observe_until(&mut app, |app| {
+            let mut records = app.snapshot.records.values();
+            let failed = records.any(|record| record.agent == root && agent_failed(&record.event));
+            failed && stopped(&app.snapshot, &root)
+        })
+        .await;
+        assert!(app.paused.is_some());
+        assert_eq!(shown(&app, "no longer opens this conversation").await, 1);
+        reopened.shutdown().await.unwrap();
+    }
+
+    /// `/retry` tries held rows on the bottom bar's model, even one the root
+    /// already runs, so swapping then retrying does swap.
+    #[tokio::test]
+    async fn retry_tries_held_rows_on_the_bottom_bar_model() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
+        let root = app.root_agent().clone();
+        app.model = "test/seeing".parse().unwrap();
+        app.submit("warmup".into());
+        model.turn().await.answer("ok");
+        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        bounded(async {
+            while !app.queue.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
+        app.rebuild_projection();
+        let active = app
+            .projection
+            .agents
+            .iter()
+            .find(|agent| agent.id == root)
+            .unwrap();
+        assert_eq!(active.model.to_string(), "test/seeing");
+        app.model = "test/first".parse().unwrap();
+        app.submit(image_row());
+        observe_until(&mut app, |app| {
+            stopped(&app.snapshot, &root) && app.paused.is_some()
+        })
+        .await;
+        bounded(async {
+            while !app.holds_rows() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        app.model = "test/seeing".parse().unwrap();
+        app.command(Command::Retry);
+        model.turn().await.answer("seen");
+        let work = continued(&mut app, &mut rx).await;
+        assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
+        app.work(work);
+        bounded(async {
+            while !app.queue.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
+        assert_eq!(app.history, ["warmup", "image"]);
+        // What the retry committed under is remembered, not what the row captured.
+        let seeing: ModelRef = "test/seeing".parse().unwrap();
+        assert_eq!(app.remembered_model, Some(seeing.clone()));
+        let workspace = app.launch.workspace.clone();
+        bounded(async {
+            while crate::state::load(&workspace).0.model != Some(seeing.clone()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let mode = app.remembered_mode.clone();
+        assert_eq!(crate::state::load(&workspace).0.mode, mode);
+        session.shutdown().await.unwrap();
+    }
+
+    /// Changing the queue takes back every row the session holds, so the queue
+    /// alone orders them: an edit discarded, or left for another edit and then
+    /// submitted, a draft queued by an edit, and a delete.
+    #[tokio::test]
+    async fn an_edit_keeps_the_held_rows_behind_it_in_order() {
+        use skyhook::session::{Message, UserPart};
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
+        let committed = || {
+            let records = session.observe().snapshot.records;
+            let users = records
+                .into_values()
+                .filter_map(|record| match record.event {
+                    SessionEvent::MessageCommitted {
+                        message: Message::User(parts),
+                    } => parts.into_iter().find_map(|part| match part {
+                        UserPart::Text { text } => Some(text),
+                        _ => None,
+                    }),
+                    _ => None,
+                });
+            users.collect::<Vec<_>>()
+        };
+        let id = |app: &App, text: &str| {
+            let mut rows = app.queue.iter();
+            rows.find(|row| row.submission.text == text).unwrap().id
+        };
+        let seeing: ModelRef = "test/seeing".parse().unwrap();
+        for case in 0..4 {
+            let behind: &[&str] = if case == 0 {
+                &["behind"]
+            } else {
+                &["second", "third"]
+            };
+            app.model = "test/first".parse().unwrap();
+            app.submit(image_row());
+            for text in behind {
+                app.submit((*text).into());
+            }
+            observe_until(&mut app, |app| {
+                app.paused.is_some()
+                    && (app.queue.iter()).all(
+                        |row| matches!(&row.state, RowState::InFlight(row) if row.is_retained()),
+                    )
+            })
+            .await;
+            let edit = |app: &mut App, text: &str| {
+                let edited = app.begin_edit(id(app, text)).unwrap();
+                app.editor.set_submission(edited);
+            };
+            let expected = match case {
+                0 => {
+                    edit(&mut app, "image");
+                    app.discard_edit();
+                    vec!["image", "behind"]
+                }
+                1 => {
+                    edit(&mut app, "image");
+                    edit(&mut app, "third");
+                    app.submit("third edited".into());
+                    vec!["image", "second", "third edited"]
+                }
+                2 => {
+                    app.editor.set("draft".into());
+                    edit(&mut app, "second");
+                    app.submit("second edited".into());
+                    vec!["draft", "image", "second edited", "third"]
+                }
+                _ => {
+                    assert!(app.remove_queued(id(&app, "second")).is_some());
+                    vec!["image", "third"]
+                }
+            };
+            app.model = seeing.clone();
+            app.command(Command::Retry);
+            model.turn().await.answer("seen");
+            bounded(async {
+                while !app.queue.is_empty() {
+                    let work = recv(&mut rx).await;
+                    app.work(work);
+                }
+            })
+            .await;
+            let committed = committed();
+            assert_eq!(committed[committed.len() - expected.len()..], expected[..]);
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    /// A row the session refuses before any turn takes it, as a reopened
+    /// session whose root cannot activate does, is reported with why.
+    #[tokio::test]
+    async fn a_row_refused_before_a_turn_is_reported() {
+        use skyhook::tool::policy::AllowAll;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let root = session.root_agent().clone();
+        // The reopened session's status log reports on this channel.
+        let mut status = capture_work(&mut app);
+        app.submit("first".into());
+        model.turn().await.answer("ok");
+        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+        let policy = std::sync::Arc::new(AllowAll);
+        let (harness, model) = played_harness(&app.launch, policy, |builder| builder).await;
+        model.refuse(&root);
+        let reopened = harness.resume_session(session.id()).await.unwrap();
+        attach(&mut app, reopened.clone());
+        let mut rx = capture_work(&mut app);
+        app.submit("second".into());
+        bounded(async {
+            loop {
+                let work = recv(&mut rx).await;
+                let done = matches!(work, Work::QueueCommitted { .. });
+                app.work(work);
+                if done {
+                    break;
+                }
+            }
+        })
+        .await;
+        let notices = notices(&app, &mut status).await;
+        assert!(app.paused.is_some() && matches!(app.queue[0].state, RowState::Waiting));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("no longer opens")),
+            "{notices:?}"
+        );
+        reopened.shutdown().await.unwrap();
     }
 }

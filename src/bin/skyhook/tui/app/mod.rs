@@ -1,13 +1,13 @@
 use events::Gesture;
 pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
-use lifecycle::{PendingStart, StartState};
+use lifecycle::PendingStart;
 pub use menus::{
     ConfirmAction, Emphasis, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef,
 };
 use prompts::UiPrompt;
+pub use queue::{Delivered, Paused, QueuedInput, QueuedInputId};
 use queue::{QueueDelivery, RowState};
-pub use queue::{QueuedInput, QueuedInputId};
 use skyhook::{provider::profile::ModelRef, tool::policy::ModeName};
 mod events;
 mod input;
@@ -73,26 +73,6 @@ pub enum Focus {
     Tree,
     Content,
 }
-/// A root submission blocks queue dispatch until a later root user record is
-/// observed, either live or through a replacement snapshot after lag. The gate
-/// is `Some((root, last sequence))` while waiting.
-fn observe_initial_input(gate: &mut Option<(AgentId, RecordSeq)>, record: &EventRecord) -> bool {
-    let Some((root, after)) = gate else {
-        return false;
-    };
-    let released = record.agent == *root
-        && record.sequence > *after
-        && matches!(
-            &record.event,
-            SessionEvent::MessageCommitted {
-                message: Message::User(_)
-            }
-        );
-    if released {
-        *gate = None;
-    }
-    released
-}
 fn draft_root() -> AgentId {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = SessionId::generate().unwrap_or_else(|_| {
@@ -136,6 +116,21 @@ enum Phase {
     },
 }
 
+/// The newest record `snapshot` holds.
+fn last_record(snapshot: &ObservationSnapshot) -> Option<RecordSeq> {
+    snapshot.records.keys().next_back().copied()
+}
+
+/// Whether `root` journaled a failed turn after record `after`.
+fn root_failed(snapshot: &ObservationSnapshot, root: &AgentId, after: Option<RecordSeq>) -> bool {
+    use std::ops::Bound;
+    let after = after.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut records = snapshot.records.range((after, Bound::Unbounded));
+    records.any(|(_, record)| {
+        &record.agent == root && matches!(record.event, SessionEvent::AgentFailed { .. })
+    })
+}
+
 pub struct App {
     phase: Phase,
     pub launch: Launch,
@@ -162,10 +157,14 @@ pub struct App {
     next_queued_id: QueuedInputId,
     queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
     queue_activity_revision: u64,
-    /// `Some((root, sequence))` while a root submission blocks queue dispatch.
-    initial_input: Option<(AgentId, RecordSeq)>,
-    start: StartState,
-    pub paused: bool,
+    /// The newest journal record, of any kind, already checked for a failed root
+    /// turn. Failures journaled before the session was shown hold nothing: no
+    /// input queued behind them.
+    failures_read: Option<RecordSeq>,
+    /// Creation owns its pending action until the asynchronous task completes.
+    creating: Option<PendingStart>,
+    /// Why queue delivery is paused, if it is.
+    pub paused: Option<Paused>,
     pub operation: bool,
     pub prompts: VecDeque<UiPrompt>,
     pub prompt_body_rect: Rect,
@@ -254,6 +253,7 @@ impl App {
                 ObservationSnapshot::default(),
             ),
         };
+        let failures_read = last_record(&snapshot);
         let selected = match &phase {
             Phase::Draft { root } => root.clone(),
             Phase::Open { observation, .. } => observation.session.root_agent().clone(),
@@ -281,9 +281,9 @@ impl App {
             next_queued_id: QueuedInputId::default(),
             queue_sender: None,
             queue_activity_revision: 0,
-            initial_input: None,
-            start: StartState::Idle,
-            paused: false,
+            failures_read,
+            creating: None,
+            paused: None,
             operation: false,
             prompts: VecDeque::new(),
             prompt_body_rect: Rect::default(),
@@ -329,13 +329,11 @@ impl App {
         app.select_mode(mode);
         let mut agents = app.projection.agents.iter();
         let root = agents.find(|agent| agent.id == app.selected);
-        let (model, mode) =
-            root.map_or((None, None), |root| (root.model.clone(), root.mode.clone()));
-        if let Some(model) = model {
-            app.model = model;
-        }
-        if let Some(mode) = mode {
-            app.select_mode(&mode);
+        if let Some(root) = root {
+            app.model = root.model.clone();
+            if let Some(mode) = root.mode.clone() {
+                app.select_mode(&mode);
+            }
         }
         app.show_warnings();
         app.load_title();
@@ -486,7 +484,7 @@ pub(super) mod tests {
     pub(super) fn draw_buffer(app: &mut App) -> ratatui::buffer::Buffer {
         draw_sized_buffer(app, 60, 24)
     }
-    pub(super) fn draw_sized_buffer(
+    pub(in crate::tui) fn draw_sized_buffer(
         app: &mut App,
         width: u16,
         height: u16,
@@ -499,9 +497,12 @@ pub(super) mod tests {
         terminal.backend().buffer().clone()
     }
     pub(in super::super) fn draw(app: &mut App) -> String {
-        draw_buffer(app)
+        draw_sized(app, 60, 24)
+    }
+    pub(in crate::tui) fn draw_sized(app: &mut App, width: u16, height: u16) -> String {
+        draw_sized_buffer(app, width, height)
             .content
-            .chunks(60)
+            .chunks(width.into())
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")

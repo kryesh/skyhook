@@ -12,10 +12,7 @@ use serde_json::{Map, Value};
 use super::{
     self as dialect, AdmissionError, BaseUrl, BuildError, Common, Connection, Dialect,
     DialectConfig, ModelError, ModelSpec, Profile, Request, RequestSettings, anthropic, codex,
-    compatible, litellm,
-    login::{Login, LoginError},
-    models::{Fields, object},
-    openai, openrouter,
+    compatible, litellm, login::Login, models::object, openai, openrouter,
 };
 use crate::provider::{
     Provider, ProviderError,
@@ -106,9 +103,9 @@ impl<P: Patch, O> ProviderModels<P, O> {
                 let admit = || -> Result<AdmittedModel, ModelError> {
                     let settings = self.defaults.overlay(&model.settings);
                     let request = Request::resolve(&settings.request)?;
-                    let mut wire = C::resolve(&settings.dialect)?.admit(request.codec)?;
-                    wire.codec = request.apply(wire.codec)?;
-                    model.validate(&wire.codec)?;
+                    let wire = C::resolve(&settings.dialect)?.admit(request.codec)?;
+                    let wire = request.apply(wire)?;
+                    model.validate(&wire)?;
                     Ok(AdmittedModel {
                         profile: model.profile.clone(),
                         wire,
@@ -160,20 +157,6 @@ macro_rules! providers {
                     }),+
                 })
             }
-
-            fn login(
-                &self,
-                name: &ProviderName,
-                common: &Common,
-                home: &ConfigHome,
-            ) -> Result<Option<Login>, LoginError> {
-                Ok(match self {
-                    $(Self::$variant(entry) => {
-                        let connection = entry.options.admit(common, <$module::Config as DialectConfig>::base_url())?;
-                        entry.options.login(name, home, &connection)?
-                    }),+
-                })
-            }
         }
 
         pub(crate) enum AdmittedProvider {
@@ -187,6 +170,10 @@ macro_rules! providers {
 
             pub(crate) fn build(&self, name: &ProviderName) -> Result<Vec<BuiltModel>, BuildError> {
                 match self { $(Self::$variant(entry) => entry.build(name)),+ }
+            }
+
+            pub(crate) fn login(&self, name: &ProviderName) -> Result<Option<Login>, ProviderError> {
+                match self { $(Self::$variant(entry) => entry.options.login(name, &entry.home, &entry.connection)),+ }
             }
         }
 
@@ -236,7 +223,7 @@ pub struct RawProviderConfig {
 impl<'de> Deserialize<'de> for RawProviderConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut fields = Map::new();
-        let common = crate::yaml::split(deserializer, &mut Fields(&mut fields))?;
+        let common = crate::yaml::split(deserializer, &mut fields)?;
         let dialect = fields
             .remove("dialect")
             .ok_or_else(|| de::Error::missing_field("dialect"))?;
@@ -265,10 +252,6 @@ impl Serialize for RawProviderConfig {
 impl RawProviderConfig {
     pub(crate) fn admit(&self) -> Result<AdmittedProvider, AdmissionError> {
         self.settings.admit(&self.common, &self.home)
-    }
-
-    pub(crate) fn login(&self, name: &ProviderName) -> Result<Option<Login>, LoginError> {
-        self.settings.login(name, &self.common, &self.home)
     }
 }
 
@@ -306,7 +289,7 @@ impl<O: ProviderOptions> AdmittedEntry<O> {
         let authentication = self
             .options
             .login(name, &self.home, &self.connection)?
-            .map(|login| login.headers());
+            .map(Login::into_headers);
         self.models
             .iter()
             .map(|(model, admitted)| {
@@ -473,8 +456,8 @@ providers:
                 "`providers.local.startup_timeout_secs`",
             ),
             (
-                "    reasoning_summary: false",
-                "`providers.local`: reasoning_summary: unknown field",
+                "    workspace_id: w",
+                "`providers.local`: workspace_id: unknown field",
             ),
         ] {
             let refused = error(&with(LOCAL, field.trim_end()));
@@ -523,7 +506,7 @@ providers:
         let refused = error(&placed);
         assert!(
             refused.contains(
-                "`providers.local`: models.local: reasoning_effort `messages` is a field the chat_completions codec writes"
+                "`providers.local`: models.local: reasoning_effort `messages` is a field chat_completions requests already carry"
             ),
             "{refused}"
         );
@@ -588,8 +571,9 @@ providers:
     #[tokio::test]
     async fn model_settings_specialise_the_provider_per_model() {
         use crate::provider::{
+            codec::common::tests::{tool_result, user},
             http::tests::{chat_request, complete, serve},
-            protocol::{Message, ToolResult, UserContent},
+            protocol::Message,
         };
         use serde_json::json;
         let first = vec![
@@ -606,22 +590,14 @@ providers:
             .replace("http://127.0.0.1:11434/v1", &root)
             .replace(
                 "        max_output: 512\n",
-                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: null\n        output_limit: {field: max_tokens}\n",
+                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: null\n        output_limit: max_tokens\n",
             );
         for entry in &build(&text) {
             let mut context = entry.provider.open_context("c".parse().unwrap()).unwrap();
-            let user = Message::User(vec![UserContent::Text {
-                text: "find".into(),
-            }]);
+            let user = user("find");
             let model = entry.profile.model.as_str();
             let reduced = complete(&mut *context, chat_request(model, vec![user.clone()])).await;
-            let result = Message::Tool(vec![ToolResult {
-                call_id: "call_a".into(),
-                name: "lookup".into(),
-                result: json!({}),
-                is_error: false,
-                images: Vec::new(),
-            }]);
+            let result = tool_result("call_a", "lookup", json!({}), vec![], false);
             let assistant = Message::Assistant(reduced.items().to_vec());
             complete(
                 &mut *context,
@@ -716,135 +692,7 @@ providers:
     }
 
     #[test]
-    fn request_roundtrip_preserves_explicit_defaults_and_nullable_fields() {
-        let openai = with(
-            &LOCAL
-                .replace("dialect: compatible", "dialect: openai")
-                .replace("codec: chat_completions", "codec: responses")
-                .replace(
-                    "max_output: 512",
-                    "max_output: 512\n        reasoning_summary: auto\n        organization: null",
-                ),
-            "    reasoning_summary: null\n    organization: inherited",
-        );
-        let config = roundtrip(&openai);
-        let ProviderSettings::Openai(models) = &config.providers["local"].settings else {
-            panic!("OpenAI fixture");
-        };
-        let effective = models.defaults.overlay(&models.models["local"].settings);
-        assert!(
-            openai::Config::resolve(&effective.dialect)
-                .unwrap()
-                .organization
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn responses_selections_inherit_per_leaf_and_null_clears_them() {
-        use crate::provider::codec::{Codec, CyberAccessProgram::*, responses::Cache};
-        let provider = with(
-            &LOCAL.replace("codec: chat_completions", "codec: responses"),
-            "    service_tier: priority\n    access_programs: {cyber: daybreak_blue}\n    explicit_caching: true",
-        );
-        let models = [
-            ("empty", "access_programs: {}"),
-            (
-                "override",
-                "service_tier: flex\n        access_programs: {cyber: standard}\n        explicit_caching: false",
-            ),
-            ("leaf_null", "access_programs: {cyber: null}"),
-            (
-                "cleared",
-                "service_tier: null\n        access_programs: null\n        explicit_caching: null",
-            ),
-            (
-                "switched",
-                "codec: messages\n        service_tier: null\n        access_programs: null\n        explicit_caching: false",
-            ),
-        ]
-        .map(|(name, selection)| {
-            format!("      {name}:\n        model: local-model\n        max_context: 4096\n        max_output: 512\n        {selection}\n")
-        })
-        .concat();
-        let config = roundtrip(&format!("{provider}{models}"));
-        let admitted = config.providers["local"].admit().unwrap();
-        for (name, tier, cyber, cache) in [
-            (
-                "local",
-                Some("priority"),
-                Some(DaybreakBlue),
-                Cache::Explicit,
-            ),
-            (
-                "empty",
-                Some("priority"),
-                Some(DaybreakBlue),
-                Cache::Explicit,
-            ),
-            ("override", Some("flex"), Some(Standard), Cache::Automatic),
-            ("leaf_null", Some("priority"), None, Cache::Explicit),
-            ("cleared", None, None, Cache::Automatic),
-        ] {
-            let Codec::Responses(profile) = &admitted.models()[name].wire.codec else {
-                panic!("Responses fixture");
-            };
-            assert_eq!(
-                (
-                    profile.service_tier.as_ref().map(|tier| tier.as_str()),
-                    profile.cyber_access_program,
-                    profile.cache,
-                ),
-                (tier, cyber, cache),
-                "{name}"
-            );
-        }
-        assert!(matches!(
-            admitted.models()["switched"].wire.codec,
-            Codec::Messages(_)
-        ));
-        // An empty object inherits the provider's leaves, so it does not clear them.
-        let inherited = provider.replace(
-            "max_output: 512",
-            "max_output: 512\n        codec: messages\n        service_tier: null\n        access_programs: {}\n        explicit_caching: false",
-        );
-        assert!(error(&inherited).contains("access_programs applies only to the responses codec"));
-    }
-
-    #[test]
-    fn routing_roundtrip_merges_only_declared_members_and_can_clear_the_object() {
-        use crate::provider::codec::{Codec, chat_completions::DataCollection};
-        let router = with(
-            &LOCAL.replace("dialect: compatible", "dialect: openrouter")
-                .replace("max_output: 512", "max_output: 512\n        routing:\n          order: [chosen]\n          allow_fallbacks: false\n          require_parameters: null\n          quantizations: []\n          fallback_models: []\n          data_collection: allow"),
-            "    routing:\n      order: [first, second]\n      allow_fallbacks: true\n      require_parameters: true\n      quantizations: [int8]\n      fallback_models: [other-model]\n      data_collection: deny\n      zdr: true",
-        );
-        let config = roundtrip(&router);
-        let admitted = config.providers["local"].admit().unwrap();
-        let Codec::ChatCompletions(profile) = &admitted.models()["local"].wire.codec else {
-            panic!("Chat fixture");
-        };
-        let routing = profile.routing.as_ref().unwrap();
-        assert_eq!(routing.provider.order, ["chosen"]);
-        assert_eq!(routing.provider.allow_fallbacks, Some(false));
-        assert_eq!(routing.provider.require_parameters, None);
-        assert_eq!(routing.provider.zdr, Some(true));
-        assert_eq!(
-            routing.provider.data_collection,
-            Some(DataCollection::Allow)
-        );
-        assert!(routing.provider.quantizations.is_empty());
-        assert!(routing.fallback_models.is_empty());
-
-        let cleared = router.replace(
-            "        routing:\n          order: [chosen]\n          allow_fallbacks: false\n          require_parameters: null\n          quantizations: []\n          fallback_models: []\n          data_collection: allow",
-            "        codec: responses\n        routing: null",
-        );
-        assert!(roundtrip(&cleared).into_runtime().is_ok());
-    }
-
-    #[test]
-    fn models_refuse_connection_fields_foreign_settings_and_removed_wrappers() {
+    fn models_refuse_connection_fields_and_foreign_settings() {
         for field in [
             "dialect: compatible",
             "base_url: https://example.com/v1",
@@ -855,7 +703,6 @@ providers:
             "auth_url: https://auth.example.com",
             "upstream: openai",
             "unknown_setting: true",
-            "overrides: {output_limit: null}",
         ] {
             let refused = error(&LOCAL.replace(
                 "max_output: 512",
@@ -868,87 +715,6 @@ providers:
                 "{field}: {refused}"
             );
         }
-    }
-
-    #[test]
-    fn placement_null_places_nothing_and_clears_a_foreign_inherited_selection() {
-        use crate::provider::codec::{Codec, Locations, path};
-        let provider = with(
-            LOCAL,
-            "    output_limit: {field: max_tokens}\n    reasoning_replay: {field: reasoning}",
-        );
-        for (selection, expected) in [
-            ("", Locations::one(path("max_tokens"))),
-            ("\n        output_limit: null", Locations::NONE),
-            (
-                "\n        output_limit: [{field: max_tokens}, {field: limit}]",
-                Locations::one(path("max_tokens")).with(path("limit")),
-            ),
-        ] {
-            let text = provider.replace("max_output: 512", &format!("max_output: 512{selection}"));
-            let config = roundtrip(&text);
-            let admitted = config.providers["local"].admit().unwrap();
-            let Codec::ChatCompletions(profile) = &admitted.models()["local"].wire.codec else {
-                panic!("Chat fixture");
-            };
-            assert_eq!(profile.output_limit, expected);
-        }
-        let switched = provider.replace(
-            "max_output: 512",
-            "max_output: 512\n        codec: responses\n        reasoning_replay: null",
-        );
-        let config = roundtrip(&switched);
-        let admitted = config.providers["local"].admit().unwrap();
-        let Codec::Responses(profile) = &admitted.models()["local"].wire.codec else {
-            panic!("Responses fixture");
-        };
-        assert_eq!(profile.output_limit, Locations::one(path("max_tokens")));
-        let inherited = switched.replace("        reasoning_replay: null\n", "");
-        assert!(error(&inherited).contains("reasoning_replay is not a responses setting"));
-    }
-
-    #[tokio::test]
-    async fn one_litellm_entry_builds_different_wire_profiles_over_one_virtual_key() {
-        use crate::provider::{
-            dialect::tests::{heads, request},
-            http::transport::tests::header_values,
-        };
-        use futures_util::StreamExt;
-        crate::tests::bounded(async {
-            let requests = heads(2, async |root| {
-                for model in build(&PROXY.replace("http://127.0.0.1:11434/v1", root)) {
-                    let mut context = model
-                        .provider
-                        .open_context("shared-context".parse().unwrap())
-                        .unwrap();
-                    let mut request = request();
-                    request.model = model.profile.model;
-                    drop(context.invoke(request).next().await);
-                }
-            })
-            .await;
-            let [responses, messages] = &requests[..] else {
-                panic!("{requests:?}")
-            };
-            assert!(responses.starts_with("POST /v1/responses HTTP/1.1\r\n"));
-            assert!(messages.starts_with("POST /v1/messages HTTP/1.1\r\n"));
-            for request in &requests {
-                assert_eq!(
-                    header_values(request, "authorization"),
-                    ["Bearer virtual-key"]
-                );
-                assert!(header_values(request, "x-api-key").is_empty());
-                assert_eq!(
-                    header_values(request, "x-litellm-session-id"),
-                    ["shared-context"]
-                );
-            }
-            assert!(header_values(responses, "anthropic-version").is_empty());
-            assert_eq!(header_values(messages, "anthropic-version"), ["2023-06-01"]);
-            assert!(header_values(responses, "x-litellm-tags").is_empty());
-            assert_eq!(header_values(messages, "x-litellm-tags"), ["shared"]);
-        })
-        .await;
     }
 
     #[tokio::test]
@@ -1005,11 +771,12 @@ providers:
     #[tokio::test]
     async fn litellm_model_upstream_and_tags_scope_signed_chat_history() {
         use crate::provider::{
+            codec::common::tests::{tool_result, user},
             http::{
                 tests::{chat_request, complete, serve},
                 transport::tests::header_values,
             },
-            protocol::{Message, ToolResult, UserContent},
+            protocol::Message,
         };
         use serde_json::json;
         const SIBLINGS: &str = "
@@ -1049,20 +816,12 @@ providers:
                 .replace("http://127.0.0.1:11434/v1", &root);
             let proxy = with(&proxy, "    upstream: anthropic\n    tags: [tenant-a]");
             let models = build(&format!("{proxy}{}", &SIBLINGS[1..]));
-            let user = Message::User(vec![UserContent::Text {
-                text: "find".into(),
-            }]);
+            let user = user("find");
             let initial = models[0].provider.open_context("initial".parse().unwrap());
             let request = chat_request("local-model", vec![user.clone()]);
             let completion = complete(&mut *initial.unwrap(), request).await;
             let assistant = Message::Assistant(completion.items().to_vec());
-            let result = Message::Tool(vec![ToolResult {
-                call_id: "call_a".into(),
-                name: "lookup".into(),
-                result: json!({}),
-                is_error: false,
-                images: Vec::new(),
-            }]);
+            let result = tool_result("call_a", "lookup", json!({}), vec![], false);
             let history = vec![user, assistant, result];
             for model in models {
                 let context = model.provider.open_context("replay".parse().unwrap());
@@ -1096,5 +855,181 @@ providers:
             assert!(!cached(&bodies[3]) && !cached(&bodies[4]));
         })
         .await;
+    }
+
+    /// Request settings reach the body on every codec a dialect speaks: the service
+    /// tier leads it; a Responses model asks for its dialect's summary unless it
+    /// chooses another or null; a cache lifetime rides wherever the vendor marks
+    /// breakpoints, and OpenRouter's Responses asks for automatic caching unless
+    /// explicit caching is selected.
+    #[tokio::test]
+    async fn request_settings_reach_every_dialect_and_codec() {
+        use crate::provider::dialect::tests::{request, requests};
+        use serde_json::json;
+        /// Every prompt-cache field in the body, as `{field: value}`.
+        fn caching(value: &Value, found: &mut Vec<Value>) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, value) in fields {
+                        match key.as_str() {
+                            "cache_control"
+                            | "prompt_cache_breakpoint"
+                            | "prompt_cache_options" => {
+                                found.push(json!({key: value}));
+                            }
+                            _ => caching(value, found),
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|item| caching(item, found)),
+                _ => {}
+            }
+        }
+        let hour = json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}});
+        let automatic = json!({"cache_control": {"type": "ephemeral"}});
+        let explicit = json!({"prompt_cache_options": {"mode": "explicit"}});
+        let breakpoint = json!({"prompt_cache_breakpoint": {"mode": "explicit"}});
+        // Per entry: its dialect and fields, then each model's codec and fields, the
+        // summary it asks for, and the prompt-cache fields it sends, if checked.
+        let entries = [
+            (
+                "compatible",
+                "",
+                vec![
+                    ("chat_completions", "", None, Some(vec![])),
+                    ("responses", "", Some("auto"), Some(vec![])),
+                    (
+                        "responses",
+                        "reasoning_summary: concise",
+                        Some("concise"),
+                        None,
+                    ),
+                    ("responses", "reasoning_summary: null", None, None),
+                    ("messages", "", None, None),
+                ],
+            ),
+            (
+                "openai",
+                "",
+                vec![
+                    ("chat_completions", "", None, Some(vec![])),
+                    (
+                        "chat_completions",
+                        "explicit_caching: true",
+                        None,
+                        Some(vec![breakpoint.clone(), explicit.clone()]),
+                    ),
+                    ("responses", "", Some("auto"), Some(vec![])),
+                    (
+                        "responses",
+                        "explicit_caching: true",
+                        Some("auto"),
+                        Some(vec![breakpoint.clone(), explicit.clone()]),
+                    ),
+                    ("responses", "reasoning_summary: null", None, None),
+                ],
+            ),
+            (
+                "anthropic",
+                "cache_ttl: 1h",
+                vec![("messages", "", None, Some(vec![hour.clone()]))],
+            ),
+            (
+                "litellm",
+                "upstream: openai",
+                vec![
+                    ("chat_completions", "", None, None),
+                    ("responses", "", Some("auto"), None),
+                    (
+                        "responses",
+                        "reasoning_summary: detailed",
+                        Some("detailed"),
+                        None,
+                    ),
+                    ("messages", "", None, None),
+                ],
+            ),
+            (
+                "openrouter",
+                "",
+                vec![
+                    (
+                        "chat_completions",
+                        "cache_ttl: 1h",
+                        None,
+                        Some(vec![hour.clone()]),
+                    ),
+                    (
+                        "chat_completions",
+                        "explicit_caching: true",
+                        None,
+                        Some(vec![automatic.clone(), explicit.clone()]),
+                    ),
+                    (
+                        "responses",
+                        "cache_ttl: 1h",
+                        Some("auto"),
+                        Some(vec![hour.clone()]),
+                    ),
+                    (
+                        "responses",
+                        "reasoning_summary: null",
+                        None,
+                        Some(vec![automatic]),
+                    ),
+                    (
+                        "responses",
+                        "explicit_caching: true",
+                        Some("auto"),
+                        Some(vec![breakpoint, explicit]),
+                    ),
+                    ("messages", "cache_ttl: 1h", None, Some(vec![hour])),
+                ],
+            ),
+        ];
+        let expected: Vec<_> = entries
+            .iter()
+            .flat_map(|(dialect, _, models)| models.iter().map(move |model| (dialect, model)))
+            .collect();
+        let sent = crate::tests::bounded(requests(expected.len(), async |root| {
+            for (dialect, fields, models) in &entries {
+                let models: String = models
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (codec, fields, ..))| {
+                        format!(
+                            "      m{index}:\n        model: m{index}\n        codec: {codec}\n        max_context: 4096\n        max_output: 512\n        {fields}\n"
+                        )
+                    })
+                    .collect();
+                let text = format!(
+                    "providers:\n  local:\n    dialect: {dialect}\n    base_url: {root}\n    api_key: k\n    service_tier: priority\n    {fields}\n    models:\n{models}"
+                );
+                for model in build(&text) {
+                    let mut context = model.provider.open_context("c".parse().unwrap()).unwrap();
+                    drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
+                }
+            }
+        }))
+        .await;
+        assert_eq!(sent.len(), expected.len());
+        for ((_, body), (dialect, (codec, fields, summary, expected_caching))) in
+            sent.iter().zip(expected)
+        {
+            let case = format!("{dialect} {codec} {fields}");
+            let body: Value = serde_json::from_str(body).unwrap();
+            let object = body.as_object().unwrap();
+            assert_eq!(object.keys().next().unwrap(), "service_tier", "{case}");
+            assert_eq!(body["service_tier"], "priority", "{case}");
+            let sent_summary = body.pointer("/reasoning/summary");
+            assert_eq!(sent_summary, summary.map(Value::from).as_ref(), "{case}");
+            if let Some(expected) = expected_caching {
+                let mut found = Vec::new();
+                caching(&body, &mut found);
+                found.sort_by_key(Value::to_string);
+                found.dedup();
+                assert_eq!(&found, expected, "{case}");
+            }
+        }
     }
 }

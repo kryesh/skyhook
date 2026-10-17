@@ -1,7 +1,4 @@
-//! Explicit redirect policy: method rewrites, credential isolation, and failure metadata.
-use super::diagnostics::{
-    DiagnosticMessage, FetchDiagnostic, FetchError, FetchErrorKind, FetchPhase,
-};
+//! Explicit redirect policy: method rewrites and credential isolation.
 use reqwest::{Method, header::HeaderMap};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -81,15 +78,6 @@ pub(super) fn redirect_headers(
     }
 }
 
-pub(super) fn redirect_error(message: DiagnosticMessage) -> FetchError {
-    FetchDiagnostic::classified(
-        FetchPhase::Redirect,
-        FetchErrorKind::RedirectFailure,
-        message,
-    )
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -101,7 +89,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn redirect_methods_and_credential_stripping() {
+    fn redirect_statuses_and_method_rewrites() {
         for (status, method, rewrite) in [
             (301, Method::POST, true),
             (302, Method::POST, true),
@@ -121,6 +109,10 @@ mod tests {
         for status in [200, 300, 304, 305, 306, 400] {
             assert!(FollowableRedirectStatus::new(status).is_none());
         }
+    }
+
+    #[test]
+    fn redirect_credential_stripping() {
         let a = args(json!({"url":"https://a.example", "headers":{
             "Authorization":"secret", "X-Api-Key":"custom", "Cookie":"secret", "Host":"wrong",
             "Content-Type":"text/plain", "Digest":"secret", "Accept":"text/plain"

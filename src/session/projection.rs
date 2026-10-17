@@ -58,7 +58,6 @@ impl Projected {
 
 impl Projection {
     /// The last committed message after the checkpoint, which bounds a request's history.
-    #[must_use]
     pub fn through(&self) -> Option<MessageSeq> {
         let start = usize::from(self.checkpoint.is_some());
         let projected = self.messages[start..].last()?;
@@ -72,7 +71,7 @@ impl Projection {
 
     /// Add what the journal committed for `agent` among `window`, the records after the
     /// last refresh; `records` is the whole journal and `ledger` its request fold. A
-    /// mode switch in the window unbinds what it committed before the switch.
+    /// mode switch unbinds what was committed before it.
     pub(crate) fn extend(
         &mut self,
         ledger: &RequestLedger,
@@ -80,18 +79,12 @@ impl Projection {
         window: &[EventRecord],
         agent: &AgentId,
     ) {
-        let own = |record: &&EventRecord| &record.agent == agent;
-        let switched = window.iter().rposition(|record| {
-            own(&record) && matches!(record.event, SessionEvent::ModeChanged { .. })
-        });
-        for (index, record) in window.iter().enumerate().filter(|(_, record)| own(record)) {
-            if let SessionEvent::MessageCommitted { message } = &record.event {
-                self.messages
-                    .push(if switched.is_some_and(|switched| index < switched) {
-                        Projected::unbound(record.sequence, message.clone())
-                    } else {
-                        Projected::bound(ledger, records, record.sequence, message)
-                    });
+        for record in window.iter().filter(|record| &record.agent == agent) {
+            match &record.event {
+                SessionEvent::MessageCommitted { message } => (self.messages)
+                    .push(Projected::bound(ledger, records, record.sequence, message)),
+                SessionEvent::ModeChanged { .. } => self.unbind(),
+                _ => {}
             }
         }
     }
@@ -143,10 +136,9 @@ impl Projection {
         )
     }
 
-    /// A mode switch invalidates bound reasoning, and the state sent for it, in the
-    /// messages from `from` on.
-    pub(crate) fn unbind(&mut self, from: usize) {
-        for projected in &mut self.messages[from..] {
+    /// A changed conversation invalidates bound reasoning, and the state sent for it.
+    pub(crate) fn unbind(&mut self) {
+        for projected in &mut self.messages {
             projected.message.unbind();
             projected.sent = None;
         }
@@ -240,6 +232,16 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
     let checkpoint = records.iter().rposition(|record| {
         &record.agent == agent && matches!(record.event, SessionEvent::Compaction { .. })
     });
+    project_from(records, agent, checkpoint)
+}
+
+/// Project the compaction at `checkpoint`, an index into `records`, and the messages
+/// `agent` committed after its frontier.
+pub(super) fn project_from(
+    records: &[EventRecord],
+    agent: &AgentId,
+    checkpoint: Option<usize>,
+) -> Projection {
     let mut result = Projection::default();
     let frontier = if let Some(index) = checkpoint {
         let record = &records[index];
@@ -266,7 +268,7 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
         RecordSeq::default()
     };
     let switched = mode_boundary(records, agent);
-    let ledger = ledger(records);
+    let ledger = RequestLedger::of(records);
     for record in records {
         if &record.agent == agent
             && record.sequence > frontier
@@ -282,18 +284,9 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
     result
 }
 
-/// The request fold of `records`, which attributes responses to their requests.
-pub(super) fn ledger(records: &[EventRecord]) -> RequestLedger {
-    let mut ledger = RequestLedger::default();
-    for record in records {
-        ledger.observe(record);
-    }
-    ledger
-}
-
 /// A mode switch replaces the system prompt and tools, which invalidates bound
 /// reasoning before it exactly as compaction does.
-pub(super) fn mode_boundary(records: &[EventRecord], agent: &AgentId) -> RecordSeq {
+fn mode_boundary(records: &[EventRecord], agent: &AgentId) -> RecordSeq {
     let switched = records.iter().rev().find(|record| {
         &record.agent == agent && matches!(record.event, SessionEvent::ModeChanged { .. })
     });
@@ -545,13 +538,13 @@ mod tests {
             Message::Assistant(vec![AssistantItem::tool_call(id, 0, call)])
         };
         let result = |id: &str| {
-            Message::Tool(vec![ToolResult {
+            Message::Tool(ToolResult {
                 call_id: id.into(),
                 name: "read".into(),
                 result: json!("ok"),
                 images: vec![],
                 is_error: false,
-            }])
+            })
         };
         let projection = |messages: &[Message]| Projection {
             checkpoint: None,

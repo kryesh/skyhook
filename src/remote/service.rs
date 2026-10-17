@@ -105,7 +105,7 @@ pub(super) struct WorkerServices<W> {
     pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
-    authentication: super::ssh::WorkerAuthentication,
+    agent: Arc<super::ssh::Authentication>,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub fn new(output: Arc<Mutex<W>>) -> Result<Self, std::io::Error> {
@@ -115,8 +115,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             answers: answers.clone(),
             ids: Sequence::default(),
         });
-        let authentication = super::ssh::WorkerAuthentication::new(prompts.clone())?;
-        let environment = authentication.environment().clone();
+        let (environment, agent) = super::ssh::worker_authentication(prompts.clone())?;
         Ok(Self {
             output,
             answers,
@@ -124,7 +123,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             tasks: tokio::task::JoinSet::new(),
             prompts,
             environment,
-            authentication,
+            agent,
         })
     }
     pub async fn handle(&mut self, request: ControlRequest) -> Result<(), std::io::Error> {
@@ -159,7 +158,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                     },
                 );
                 let output = self.output.clone();
-                let agent = self.authentication.agent();
+                let agent = self.agent.clone();
                 let prompts = self.prompts.clone();
                 self.tasks.spawn(async move {
                     let result = async {

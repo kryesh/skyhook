@@ -14,13 +14,14 @@ use zeroize::Zeroizing;
 
 use super::{
     AdmissionError, BaseUrl, Common, ConfigHome, Connection, Dialect, DialectConfig, DialectError,
-    Login, LoginCommand, Pending, Profile, UnsupportedCodec, entry::ProviderOptions,
+    Login, LoginCommand, Pending, Profile, entry::ProviderOptions,
 };
 use crate::provider::{
     ProviderError,
     codec::{
-        Codec, CodecName, Identity, Locations, StateRole, header,
-        responses::{self, Instructions},
+        Codec, CodecName, Identity, Locations, SchemaConstraint, StateRole, UnsignedReasoning,
+        header,
+        responses::{self, Instructions, ReasoningSummary},
     },
     http::{Headers, Session, Transport, auth::Authenticator, headers::Value},
     profile::ProviderName,
@@ -34,7 +35,8 @@ const SKYHOOK: HeaderValue = HeaderValue::from_static("skyhook");
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// The subscription service's Responses conventions: `instructions` is required, no
-/// output limit is accepted, cache affinity travels as a header, and quota notices
+/// output limit is accepted, cache affinity travels as a header, response schemas
+/// are strict, reasoning goes back only with its encrypted state, and quota notices
 /// ride the stream.
 fn responses() -> responses::Dialect {
     responses::Dialect {
@@ -44,7 +46,10 @@ fn responses() -> responses::Dialect {
             cache_key: Locations::one(header("session-id")),
             user_id: Locations::NONE,
         },
+        reasoning_summary: Some(ReasoningSummary::Auto),
+        schema: SchemaConstraint::Strict,
         state_role: StateRole::System,
+        unsigned: UnsignedReasoning::Dropped,
         metadata_events: &[
             "codex.rate_limits",
             "codex.response.metadata",
@@ -79,17 +84,11 @@ crate::provider::settings::settings! {
     pub struct Config => Patch {}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("api_key does not apply to codex; run `skyhook auth login <provider>`")]
-    ApiKey,
-}
-
 impl ProviderOptions for Options {
     fn admit(&self, common: &Common, base_url: BaseUrl) -> Result<Connection, AdmissionError> {
         let connection = common.admit(base_url)?;
         if common.api_key.is_some() {
-            return Err(DialectError::Codex(Error::ApiKey).into());
+            return Err(DialectError::CodexApiKey.into());
         }
         Ok(connection)
     }
@@ -105,7 +104,7 @@ impl ProviderOptions for Options {
             home: home.clone(),
         };
         let manager = auth::AuthManager::new(command, self.issuer())?;
-        Ok(Some(Login::Codex(Account::new(manager, connection))))
+        Ok(Some(Account::new(manager, connection)))
     }
 }
 
@@ -124,11 +123,10 @@ impl DialectConfig for Config {
 
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Responses {
-            return Err(UnsupportedCodec {
+            return Err(DialectError::UnsupportedCodec {
                 dialect: Dialect::Codex,
                 codec,
-            }
-            .into());
+            });
         }
         let mut profile = Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex);
         profile.service = Some("codex");
@@ -224,8 +222,8 @@ mod tests {
             base_url: Some(server.url.trim_end_matches("/responses").to_owned()),
             ..Common::default()
         };
-        let mut profile = Config::default().admit(request.codec).unwrap();
-        profile.codec = request.apply(profile.codec).unwrap();
+        let profile = Config::default().admit(request.codec).unwrap();
+        let profile = request.apply(profile).unwrap();
         let connection = common.admit(BaseUrl::Required).unwrap();
         let credentials = subscription(auth::test_manager(directory));
         super::super::build(
@@ -263,7 +261,7 @@ mod tests {
         .unwrap();
         let provider = provider("codex", &server, directory.path().to_owned(), &settings);
         let mut context = provider.open_context("context".parse().unwrap()).unwrap();
-        let request = reasoning_tool_request(provider.scope());
+        let request = reasoning_tool_request(&provider.scope);
         let events: Vec<_> = context.invoke(request).collect().await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         let reduced = reduce(events.into_iter().map(Result::unwrap));
@@ -286,6 +284,7 @@ mod tests {
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["instructions"], "");
         assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["access_programs"], json!({"cyber": "daybreak_blue"}));
         assert_eq!(body["prompt_cache_options"], json!({"mode": "explicit"}));
         assert_eq!(
@@ -303,7 +302,10 @@ mod tests {
         let refused = crate::config::Config::from_yaml(keyed)
             .unwrap_err()
             .to_string();
-        assert!(refused.contains(&Error::ApiKey.to_string()), "{refused}");
+        assert!(
+            refused.contains(&DialectError::CodexApiKey.to_string()),
+            "{refused}"
+        );
         let options = Options::default();
         assert_eq!(options.issuer().as_str(), "https://auth.openai.com/");
         Config::default().admit(CodecName::Responses).unwrap();
@@ -323,7 +325,7 @@ mod tests {
             };
             assert!(matches!(
                 options.admit(&common, Config::base_url()),
-                Err(AdmissionError::Dialect(DialectError::Codex(Error::ApiKey)))
+                Err(AdmissionError::Dialect(DialectError::CodexApiKey))
             ));
         }
         let mirror = |url: &str| crate::yaml::parse::<Options>(&format!("auth_url: '{url}'"));

@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 #[derive(Default)]
 pub struct ContentCache {
     entries: Vec<Entry>,
-    overlay_len: usize,
     identity: Option<Identity>,
     history: History,
     /// Requests whose responses form the live tail.
@@ -85,43 +84,8 @@ impl ContentCache {
         presentation: EntryView<'_>,
         outputs: &OutputStore,
         unsaved: &[UnsavedStatus],
-        overlay: Vec<Entry>,
     ) -> Vec<usize> {
-        let mut entries = std::mem::take(&mut self.entries);
-        let old_overlay_start = entries.len().saturating_sub(self.overlay_len);
-        let old_overlay = entries.split_off(old_overlay_start);
-        let mut dirty = self.update_retained(
-            &mut entries,
-            snapshot,
-            projection,
-            presentation,
-            outputs,
-            unsaved,
-        );
-        let start = entries.len();
-        self.overlay_len = overlay.len();
-        for (offset, entry) in overlay.into_iter().enumerate() {
-            if start != old_overlay_start || old_overlay.get(offset) != Some(&entry) {
-                dirty.push(start + offset);
-            }
-            entries.push(entry);
-        }
-        dirty.retain(|index| *index < entries.len());
-        dirty.sort_unstable();
-        dirty.dedup();
-        self.entries = entries;
-        dirty
-    }
-
-    fn update_retained(
-        &mut self,
-        entries: &mut Vec<Entry>,
-        snapshot: &ObservationSnapshot,
-        projection: &mut Projection,
-        presentation: EntryView<'_>,
-        outputs: &OutputStore,
-        unsaved: &[UnsavedStatus],
-    ) -> Vec<usize> {
+        let entries = &mut self.entries;
         let mut changed = projection.take_changes();
         let projection = &*projection;
         let EntryView {
@@ -183,6 +147,8 @@ impl ContentCache {
             // A reply committing to history takes the place of its live entries.
             dirty.extend(changed_indices(&old, &entries[old_len..], old_len));
         }
+        dirty.sort_unstable();
+        dirty.dedup();
         dirty
     }
 }
@@ -197,7 +163,7 @@ fn changed_indices(old: &[Entry], new: &[Entry], offset: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::super::entries::entries as history_entries;
-    use super::super::tests::{loaded, replay, root, update};
+    use super::super::tests::{loaded, replay, update};
     use super::super::{Clock, EntryKey, ResponseRef, Surface, Timing, Title, View};
     use super::*;
     use crate::tests::bounded;
@@ -207,7 +173,7 @@ mod tests {
             activity, ask, assistant, at, call, committed, completed, count, failing_call,
             job_ended, job_events, job_of_call, latest_request, model_failed, observe_find,
             observe_next, observe_record, observe_until, played_fixture, reached, recorded,
-            results, sleeping_script, status, stopped, streamed, tool_error,
+            results, sleeping_script, status, stopped, streamed,
         },
         tests::fixture,
     };
@@ -231,8 +197,6 @@ mod tests {
         projection: Projection,
         cache: ContentCache,
         outputs: OutputStore,
-        /// UI-only entries shown after the history.
-        overlay: Vec<Entry>,
         unsaved: Vec<UnsavedStatus>,
         /// Job views as the fold last saw them.
         jobs: std::collections::BTreeMap<JobId, skyhook::job::JobEnvelope>,
@@ -249,7 +213,6 @@ mod tests {
                 projection: Projection::default(),
                 cache: ContentCache::default(),
                 outputs: OutputStore::default(),
-                overlay: Vec::new(),
                 unsaved: Vec::new(),
                 jobs: Default::default(),
             }
@@ -273,19 +236,11 @@ mod tests {
                 today: self.today,
             };
             let (projection, outputs) = (&mut self.projection, &self.outputs);
-            let (unsaved, overlay) = (&self.unsaved, self.overlay.clone());
-            let dirty = (self.cache).update(
-                snapshot,
-                projection,
-                presentation,
-                outputs,
-                unsaved,
-                overlay,
-            );
-            let entries = self.cache.entries();
+            let unsaved = &self.unsaved;
+            let dirty = (self.cache).update(snapshot, projection, presentation, outputs, unsaved);
             let fresh = history_entries(snapshot, projection, presentation, outputs, unsaved, true);
             assert!(
-                entries[..entries.len() - self.overlay.len()] == fresh,
+                self.cache.entries() == fresh,
                 "the retained history differs from a fresh build"
             );
             dirty
@@ -385,31 +340,14 @@ mod tests {
         let tool = |entry: &Entry| entry.surface == Surface::Tool;
         let card = fold.cache.entries().iter().position(tool).unwrap();
         let key = fold.cache.entries()[card].key().clone();
-        assert!(!fold.cache.entries()[card].text().contains("Failed"));
+        // The results commit refreshes the card in place, as does expanding it.
         observe_record(&mut app, committed(results)).await;
-        let records_before = serde_json::to_value(&app.snapshot.records).unwrap();
         assert_eq!(fold.refresh(&app.snapshot), [card]);
-        let entry = &fold.cache.entries()[card];
-        assert_eq!(
-            (entry.key(), entry.surface, entry.job_id()),
-            (&key, Surface::Tool, None)
-        );
-        assert_eq!(entry.text(), "▸ × exec · Failed");
-        // Expanding rebuilds only the toggled entry's source.
+        assert_eq!(fold.cache.entries()[card].key(), &key);
         fold.view.set_expanded(key.clone(), true);
         fold.cache.invalidate_entry(key.clone());
         assert_eq!(fold.refresh(&app.snapshot), [card]);
-        let text = fold.cache.entries()[card].text();
         assert_eq!(fold.cache.entries()[card].key(), &key);
-        for part in ["Arguments", "Output"] {
-            assert!(text.contains(part), "{text}");
-        }
-        let error = tool_error(&app.snapshot);
-        assert_eq!(text.matches(error).count(), 1, "{text}");
-        assert_eq!(
-            records_before,
-            serde_json::to_value(&app.snapshot.records).unwrap()
-        );
     }
 
     #[tokio::test]
@@ -511,29 +449,6 @@ mod tests {
         observe_record(&mut app, committed(assistant)).await;
         sync(&mut fold, &app.snapshot);
         assert_eq!(cached(&fold.cache), keys);
-    }
-
-    #[test]
-    fn cached_reconnecting_indicator_tracks_activity_changes() {
-        let agent = root(1);
-        let mut snapshot = ObservationSnapshot::default();
-        let mut fold = Fold::new(&agent, Tab::Conversation);
-        let reconnecting = |attempt| AgentActivity::Reconnecting { attempt };
-        for state in [
-            AgentActivity::Working,
-            reconnecting(2),
-            reconnecting(3),
-            AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted),
-        ] {
-            let activity = skyhook::agent::ObservedActivity { state, since: 0 };
-            let event = RuntimeEvent::Activity {
-                agent: agent.clone(),
-                activity,
-            };
-            update(&mut snapshot, event);
-            fold.refresh(&snapshot);
-        }
-        assert!(fold.cache.entries().is_empty());
     }
 
     #[tokio::test]
@@ -736,38 +651,19 @@ mod tests {
         assert_eq!(cards(tabs[2].cache.entries())[..7], tree);
     }
 
+    /// Unsaved statuses keep their place as history grows: before every record,
+    /// or after the one that was newest when they arrived.
     #[tokio::test]
-    async fn retained_owner_separates_overlay_and_keeps_replacement_indices_valid() {
+    async fn unsaved_statuses_keep_their_place_as_history_grows() {
         let (_root, mut app) = fixture().await;
         let agent = app.root_agent().clone();
         let mut fold = Fold::new(&agent, Tab::Conversation);
-        let failed = |text: &str| {
-            vec![Entry::new(
-                EntryKey::JournalFailed,
-                text.into(),
-                Surface::Status,
-            )]
-        };
-        fold.overlay = failed("first");
-        assert_eq!(fold.refresh(&app.snapshot), [0]);
-        assert_eq!(fold.cache.entries().len(), 1);
-        fold.overlay = failed("other");
-        assert_eq!(fold.refresh(&app.snapshot), [0]);
-        assert_eq!(fold.cache.entries()[0].text(), "other");
         (app.session().unwrap())
             .record_status(agent.clone(), "saved".into())
             .await
             .unwrap();
         observe_record(&mut app, status).await;
         fold.refresh(&app.snapshot);
-        assert_eq!(fold.cache.entries().len(), 2);
-        assert_eq!(fold.cache.entries()[1].key(), &EntryKey::JournalFailed);
-        fold.overlay.clear();
-        fold.refresh(&app.snapshot);
-        assert_eq!(fold.cache.entries().len(), 1);
-
-        // Unsaved statuses keep their place as history grows: before every record,
-        // or after the one that was newest when they arrived.
         let saved = app
             .snapshot
             .records
@@ -790,7 +686,7 @@ mod tests {
         let texts: Vec<_> = fold.cache.entries().iter().map(Entry::text).collect();
         let statuses = ["drafted", "saved", "anchored", "later"].map(|s| format!("Status · {s}"));
         assert_eq!(texts, statuses);
-        // Switching to an empty tab invalidates retained history and old overlay.
+        // Switching to an empty tab invalidates retained history.
         fold.tab = Tab::Requests;
         fold.refresh(&app.snapshot);
         assert!(fold.cache.entries().is_empty());

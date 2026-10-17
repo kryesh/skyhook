@@ -19,6 +19,18 @@ its own approval requirements. Permissions name paths as text, so an operation w
 names a path or workspace that is not valid Unicode is refused rather than approved under an
 approximate name.
 
+A path counts as outside the workspace when resolving it leaves the workspace: it ends outside, or
+passes through an outside directory or symbolic link on the way, even if it ends back inside. Whether such a path exists is revealed only once its operation is approved. When it
+does not exist, the operation is refused without a prompt, exactly as if the user had denied it,
+unless the approval policy would allow the operation without asking; then it fails as not found.
+A missing path inside the workspace fails before approval. On the session host, a child agent's
+`workspace` is checked like a path when the child starts: outside the workspace, it follows the
+rules above; inside, it need not exist yet, and a write that creates parent directories can create
+it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
+`workspace` resolves to, and its relative paths resolve from there. On the session host, its job
+shows the `workspace` joined to the agent's workspace, with any `..` kept. `remove` refuses the root workspace, the agent's workspace, and any directory
+containing either.
+
 Choose **Allow once** to approve only the current operation. When offered, **Allow proposed
 scope** saves the displayed grant for later operations while the session stays open; reopening
 the session asks again. Inspect **Details** before granting it. Path grants apply only to the

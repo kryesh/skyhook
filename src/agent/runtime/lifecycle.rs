@@ -103,22 +103,17 @@ impl SessionRuntime {
                 }
             }
             let error = "interrupted while the session was not running";
-            for (agent, call_id, name) in ledger.unanswered() {
-                let (call_id, name) = (call_id.to_owned(), name.to_owned());
-                let result = dispatch::unrun_tool_result(call_id, name, error.into());
-                let message = Message::Tool(vec![result]);
-                events.push((agent.clone(), SessionEvent::MessageCommitted { message }));
-            }
+            events.extend(dispatch::unrun_results(ledger.unanswered(), error));
             let open = ledger.open_turns().into_iter().cloned();
             events.extend(open.map(|agent| (agent, SessionEvent::AgentInterrupted)));
             events.extend(state.jobs.reopened());
             // A reopened session waits for `continue` or a prompt, as an interrupted
             // one does: what it stopped, and the deliveries it closed with.
-            let paused = move |state: &mut CoreState| {
+            let paused = move |state: &mut CoreState, _: &[_]| {
                 state.agents.flow = Flow::Paused;
                 resume(state);
             };
-            Ok::<_, SessionError>(Plan::journal(events).saving(outputs).then(paused))
+            Ok::<_, SessionError>(Plan::new(events, paused).saving(outputs))
         };
         Ok(self.store.commit(Command::Activate, activate).await?)
     }
@@ -185,17 +180,13 @@ impl SessionRuntime {
                 Turn::Busy if work.children => drop(facts.set_turn(Turn::Held)),
                 Turn::Busy => {
                     facts.set_turn(Turn::Parked(TurnFailure::Interrupted));
+                    facts.turn_token.cancel();
                     // Input behind it has no turn left to join or follow; what
                     // arrives from here on is new input.
                     state.agents.hand_back(&agent, &state.jobs);
-                    // Order is load-bearing: cancel the turn before its jobs. A job
-                    // cancelled first would let the drain finish and reach its
-                    // request boundary before the turn knows it was stopped.
-                    let (supervisor, stopped) = (self.jobs.supervisor().clone(), agent.clone());
-                    state.defer(move || supervisor.cancel_turn(&stopped));
                 }
-                Turn::Held => continue,
-                Turn::Idle | Turn::Parked(_) => {
+                Turn::Held | Turn::Cancelled(Was::Held) => continue,
+                Turn::Idle | Turn::Parked(_) | Turn::Cancelled(Was::Idle) => {
                     let waits = takes && facts.turn == Turn::Idle;
                     // What begins an invocation yet to begin stays: its owner counted it.
                     let rejected = state.agents.hand_back(&agent, &state.jobs);
@@ -274,8 +265,7 @@ impl SessionRuntime {
                     // Cancelled before its wait returns: the released wait must not
                     // reach its request boundary as a running turn.
                     facts.set_turn(Turn::Parked(TurnFailure::Interrupted));
-                    let (supervisor, cancelled) = (jobs.supervisor().clone(), agent.clone());
-                    state.defer(move || supervisor.cancel_turn(&cancelled));
+                    facts.turn_token.cancel();
                     stopped.push(agent);
                 }
                 // Each link the interrupt stopped ends interrupted now, so its
@@ -288,13 +278,16 @@ impl SessionRuntime {
         self.store.commit(Command::Journal, queue).await
     }
 
-    pub(super) async fn interrupt_tree(&self, root: &AgentId) -> usize {
+    /// Stop the tree under `root` for good, as its owner gave it up: each turn
+    /// is cancelled, so nothing more it asks is admitted, and the jobs each agent
+    /// owns are cancelled. A held turn waits on its children until those
+    /// cancellations end them.
+    pub(super) async fn interrupt_tree(&self, root: &AgentId) {
         let (root, jobs) = (root.clone(), self.jobs.clone());
         let interrupt = move |state: &mut CoreState| {
             let agents = state.agents.within(&root);
-            let (supervisor, turns) = (jobs.supervisor().clone(), agents.clone());
-            state.defer(move || turns.iter().for_each(|agent| supervisor.cancel_turn(agent)));
-            jobs.cancel_owned(state, &agents, CancelScope::Outcome)
+            state.agents.cancel_turns(&agents);
+            jobs.cancel_owned(state, &agents, CancelScope::Outcome);
         };
         self.store.live(interrupt).await
     }
@@ -308,8 +301,8 @@ mod tests {
 
     /// Results omit an absent field rather than sending null, so no result schema
     /// has a nullable property: a required one is an `Option` serialized as null,
-    /// and an optional one a skipped `Option` whose schema is not declared, or an
-    /// `Option<Option<T>>`.
+    /// and an optional one an `Option<Option<T>>` or an `Option` of an inline
+    /// enum, whose null alternative result generation does not remove.
     #[tokio::test]
     async fn result_schemas_never_declare_a_nullable_property() {
         use serde_json::Value;
@@ -449,7 +442,7 @@ mod tests {
         let receipts = bounded(session.enqueue_prompts(vec![queued])).await;
         for receipt in receipts {
             assert!(failed(
-                bounded(receipt.into_future()).await.map(|()| String::new())
+                bounded(receipt.into_future()).await.map(|_| String::new())
             ));
         }
         assert!(failed(bounded(session.prompt("new direction")).await));
@@ -551,8 +544,8 @@ mod tests {
         assert_eq!(turn(&session, &child), INTERRUPTED);
         let records = session.runtime.store.records();
         let released = records.iter().filter(|record| record.agent == child);
-        let released = count!(released, SessionEvent::MessageCommitted { message: Message::Tool(results) }
-            if results.iter().any(|result| result.call_id == "grandchild"));
+        let released = count!(released, SessionEvent::MessageCommitted { message: Message::Tool(result) }
+            if result.call_id == "grandchild");
         assert_eq!(released, 1);
         let redirected = rendered(&provider.request(3).await);
         assert!(
@@ -609,6 +602,35 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// A held turn whose tree is cancelled never runs on, whether a cancellation
+    /// of the job it holds lands before or after: it asks nothing more and ends
+    /// interrupted.
+    #[tokio::test]
+    async fn a_held_turn_whose_tree_is_cancelled_never_runs_on() {
+        for tree_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let after = [Step::new(answer("must not run"))];
+            let (_harness, session, provider, _, parent, job) =
+                held_on_interrupted_child(root.path(), after).await;
+            let cancel = session.runtime.jobs.cancel(job);
+            let tree = session.runtime.interrupt_tree(&session.root);
+            match tree_first {
+                true => drop(tokio::join!(tree, cancel)),
+                false => drop(tokio::join!(cancel, tree)),
+            }
+            let ended = bounded(parent).await.unwrap();
+            assert!(
+                matches!(ended, Err(HarnessError::Interrupted)),
+                "{tree_first}: {ended:?}"
+            );
+            assert!(
+                !provider.requested_from(2),
+                "{tree_first}: the held turn ran on"
+            );
+            session.shutdown().await.unwrap();
+        }
+    }
+
     /// A held turn whose wait ends without `continue` or a cancellation parks
     /// interrupted, its results committed: it asks its model only once continued.
     #[tokio::test]
@@ -624,13 +646,11 @@ mod tests {
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
         let session = harness.new_session().await.unwrap();
-        let store = session.runtime.store.clone();
         let delegated: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::JobCreated { .. });
-        let (reached, resume) = store.pause_committed(delegated).await;
+        let interrupted = interrupt_on(&session, delegated).await;
         let parent = spawn_prompt(&session, "delegate");
-        bounded(reached).await.unwrap();
-        assert_eq!(interrupt_behind(&session, resume).await, 2);
+        assert_eq!(bounded(interrupted).await, 2);
         let ended = bounded(parent).await.unwrap();
         assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
         assert_eq!(turn(&session, &session.root), INTERRUPTED);
@@ -715,16 +735,12 @@ mod tests {
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, provider.clone()).await;
             let session = harness.new_session().await.unwrap();
-            let store = session.runtime.store.clone();
-            // Past COMMIT the pause holds no connection a running script may need.
-            let (reached, resume) = store.pause_committed(landing).await;
-            let parent = spawn_prompt(&session, "delegate");
-            bounded(reached).await.unwrap();
             // Owner input behind the launch is handed back; the input that begins
             // the child is not.
             let (committed, owner_input) = oneshot::channel();
             let input = queue::QueuedInput {
                 content: Vec::new(),
+                attachments: Vec::new(),
                 options: Selection::default(),
                 cancellation: Default::default(),
                 committed,
@@ -733,12 +749,18 @@ mod tests {
                 session.root.child(1),
                 AgentCommand::QueuedInputs(vec![input]),
             );
-            store.enqueue(move |state| {
-                state.agents.send(&child, queued);
+            // Both queued behind the landing commit, ahead of the child's first take.
+            let interrupting = session.clone();
+            let interrupted = on_commit(&session.runtime.store, landing, move || {
+                interrupting.runtime.store.enqueue(move |state| {
+                    state.agents.send(&child, queued);
+                });
+                async move { interrupting.interrupt().await }
             });
-            // Queued behind the landing commit, ahead of the child's first take.
-            assert_eq!(interrupt_behind(&session, resume).await, stopped);
-            assert!(!matches!(bounded(owner_input).await, Ok(Ok(()))));
+            let interrupted = interrupted.await;
+            let parent = spawn_prompt(&session, "delegate");
+            assert_eq!(bounded(interrupted).await, stopped);
+            assert!(!matches!(bounded(owner_input).await, Ok(Ok(_))));
             assert_eq!(turn(&session, &session.root), Turn::Held);
             let jobs = session.runtime.jobs.list(&session.root);
             let delegation = jobs.iter().find(|job| job.tool == "agent").unwrap().id;
@@ -800,13 +822,11 @@ mod tests {
                 std::iter::successors(Some(session.root.clone()), |link| Some(link.child(1)))
                     .take(depth as usize)
                     .collect();
-            let store = session.runtime.store.clone();
-            let (reached, resume) = store.pause_committed(landing).await;
-            let parent = spawn_prompt(&session, "delegate");
-            bounded(reached).await.unwrap();
             if redirect {
                 // Queued behind the last delegation, ahead of its launch.
-                assert_eq!(interrupt_behind(&session, resume).await, depth as usize + 1);
+                let interrupted = interrupt_on(&session, landing).await;
+                let parent = spawn_prompt(&session, "delegate");
+                assert_eq!(bounded(interrupted).await, depth as usize + 1);
                 for link in &links {
                     assert_eq!(turn(&session, link), Turn::Held, "{link}");
                 }
@@ -815,9 +835,15 @@ mod tests {
                 session.shutdown().await.unwrap();
                 continue;
             }
-            let mut shutdown = Box::pin(session.shutdown());
-            assert!(futures_util::poll!(&mut shutdown).is_pending());
-            resume.send(()).unwrap();
+            let closing = session.clone();
+            let store = &session.runtime.store;
+            let shutdown = on_commit(
+                store,
+                landing,
+                move || async move { closing.shutdown().await },
+            );
+            let shutdown = shutdown.await;
+            let parent = spawn_prompt(&session, "delegate");
             bounded(shutdown).await.unwrap();
             assert!(bounded(parent).await.unwrap().is_err());
             let id = session.id();
@@ -880,6 +906,7 @@ mod tests {
             };
             let batch = queue::QueuedInput {
                 content: Vec::new(),
+                attachments: Vec::new(),
                 options: Selection::default(),
                 cancellation: Default::default(),
                 committed,
@@ -893,7 +920,9 @@ mod tests {
         assert!(interrupted(
             bounded(prompted).await.map(|answer| answer.map(drop))
         ));
-        assert!(interrupted(bounded(queued).await));
+        assert!(interrupted(
+            bounded(queued).await.map(|queued| queued.map(drop))
+        ));
 
         let first = spawn_prompt(&session, "first");
         provider.held(0).await;
@@ -912,7 +941,9 @@ mod tests {
 
     /// A reopened session asks no model for what was delivered as it closed: the
     /// delivery stays pending, the root reads as interrupted, and continuing
-    /// carries the delivery in its request.
+    /// carries the delivery in its request. A batch refused in the meantime parks
+    /// the root on its failure, which reopening keeps while the delivery waits;
+    /// with nothing else to continue, the reopened root, its batch gone, is idle.
     #[tokio::test]
     async fn reopening_parks_the_root_on_a_pending_delivery_for_continue() {
         let requests = Requests::default();
@@ -935,11 +966,59 @@ mod tests {
         assert_eq!(turn(&resumed, &resumed.root), INTERRUPTED);
         let activity = resumed.observe().snapshot.activity;
         assert!(activity[&resumed.root].state.is_retryable());
+        let held = Turn::Parked(TurnFailure::from(&HarnessError::ImageLimit));
+        let resumed = refuse_and_reopen(&harness, resumed, held.clone()).await;
+        assert_eq!(turn(&resumed, &resumed.root), held);
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(resumed.continue_turn().await.unwrap(), "second");
         let carried = rendered(&requests.lock().unwrap()[1].request);
         assert!(carried.contains(&job.to_string()), "{carried}");
+        // Live, the root holds the refused batch for continue; reopened, it is gone.
+        let resumed = refuse_and_reopen(&harness, resumed, held).await;
+        assert_eq!(turn(&resumed, &resumed.root), Turn::Idle);
+        assert_eq!(resumed.continue_turn().await.unwrap(), "");
+        assert_eq!(requests.lock().unwrap().len(), 2);
         shutdown_session(resumed).await;
+    }
+
+    /// Queue a batch the session refuses, wait for `session`'s root to rest at
+    /// `rests`, then close and reopen it.
+    async fn refuse_and_reopen(
+        harness: &Harness,
+        session: SessionHandle,
+        rests: Turn,
+    ) -> SessionHandle {
+        let oversized = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(&vec![0; crate::media::MAX_IMAGE_BYTES as usize]),
+        };
+        let refused = QueuedPrompt {
+            text: "oversized".into(),
+            attachments: vec![oversized],
+            ..QueuedPrompt::default()
+        };
+        let failed = |session: &SessionHandle| {
+            count!(
+                &session.runtime.store.records(),
+                SessionEvent::AgentFailed { .. }
+            )
+        };
+        let before = failed(&session);
+        let receipts = session.enqueue_prompts(vec![refused]).await;
+        bounded(async {
+            while failed(&session) == before || turn(&session, &session.root) != rests {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let id = session.id();
+        shutdown_session(session).await;
+        for receipt in receipts {
+            assert!(bounded(receipt.into_future()).await.is_err());
+        }
+        let resumed = harness.resume_session(id).await.unwrap();
+        resumed.running().await.unwrap();
+        resumed
     }
 
     /// A root whose turn holds an embedder's agent call that is still preparing
@@ -962,7 +1041,6 @@ mod tests {
         let options = crate::tool::ToolOptions::default()
             .job_role(crate::job::JobRole::Agent)
             .input();
-        let schema = json!({"type": "object", "properties": {}});
         let prepared = Arc::new(tokio::sync::Semaphore::new(0));
         let gate = prepared.clone();
         let preparing = move |_, _| {
@@ -972,8 +1050,13 @@ mod tests {
                 Ok(crate::tool::ToolOutput::default())
             }
         };
-        let registered =
-            tools.register_dynamic("delegate", "Delegate.", schema, options, preparing);
+        let registered = tools
+            .register_product::<crate::tool::registry::Arguments, serde_json::Value, _, _>(
+                "delegate",
+                "Delegate.",
+                options,
+                preparing,
+            );
         registered.unwrap();
         let sessions = root.path().join("sessions");
         let builder = test_builder(root.path(), &sessions, provider, false);
@@ -987,7 +1070,7 @@ mod tests {
     }
 
     fn delegated(session: &SessionHandle) -> Option<crate::job::JobEnvelope> {
-        let jobs = session.inspect_jobs(&session.root).into_iter();
+        let jobs = session.runtime.jobs.list(&session.root);
         jobs.into_iter().find(|job| job.tool == "delegate")
     }
 
@@ -1057,15 +1140,13 @@ mod tests {
         until(&session, job, |job| job.state == JobState::Interrupted).await;
         let restarted: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::JobStateChanged { .. });
-        let store = session.runtime.store.clone();
-        let (reached, resume) = store.pause_committed(restarted).await;
+        // Queued behind the restart, ahead of the child taking its input.
+        let interrupted = interrupt_on(&session, restarted).await;
         let continued = tokio::spawn({
             let session = session.clone();
             async move { session.continue_turn().await }
         });
-        bounded(reached).await.unwrap();
-        // Queued behind the restart, ahead of the child taking its input.
-        assert_eq!(interrupt_behind(&session, resume).await, 1);
+        assert_eq!(bounded(interrupted).await, 1);
         bounded(continued).await.unwrap().unwrap();
         until(&session, job, |job| job.state == JobState::Interrupted).await;
         assert!(!provider.requested_from(1), "the child requested");

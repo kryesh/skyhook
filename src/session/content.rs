@@ -22,7 +22,7 @@ use crate::{
 pub enum Message {
     User(Vec<UserPart>),
     Assistant(Vec<AssistantItem>),
-    Tool(Vec<ToolResult>),
+    Tool(ToolResult),
     /// The agent's state at a request: the harness speaking, never conversation.
     State(RuntimeState),
 }
@@ -52,7 +52,6 @@ impl Message {
     /// An assistant message with neither nonblank text nor a tool call. Reasoning
     /// accompanies an action but is never one, so such a turn is refused before it
     /// is committed: a committed one would make every later request unencodable.
-    #[must_use]
     pub fn is_content_free(&self) -> bool {
         match self {
             Self::Assistant(items) => items.iter().all(AssistantItem::is_content_free),
@@ -85,7 +84,7 @@ impl Message {
                 protocol::Message::User(parts.iter().map(UserPart::content).collect())
             }
             Self::Assistant(items) => protocol::Message::Assistant(items.clone()),
-            Self::Tool(results) => protocol::Message::Tool(results.clone()),
+            Self::Tool(result) => protocol::Message::Tool(vec![result.clone()]),
             Self::State(state) => {
                 let text = state.to_string();
                 return Entry::State(protocol::State { text, lifetime });
@@ -95,7 +94,6 @@ impl Message {
 }
 
 impl UserPart {
-    #[must_use]
     pub fn is_image(&self) -> bool {
         matches!(
             self,
@@ -153,7 +151,6 @@ pub enum StateJobKind {
 }
 
 impl StateJobKind {
-    #[must_use]
     pub fn tool(&self) -> &str {
         match self {
             Self::Agent { .. } => crate::tool::builtins::names::AGENT,
@@ -454,7 +451,6 @@ mod tests {
         assert!(!Message::Assistant(vec![visible]).is_content_free());
         // Only assistant messages can be content-free.
         assert!(!Message::User(Vec::new()).is_content_free());
-        assert!(!Message::Tool(Vec::new()).is_content_free());
     }
 
     #[test]

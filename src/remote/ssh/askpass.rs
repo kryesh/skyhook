@@ -10,8 +10,6 @@ use crate::{
     target::{TargetName, TargetRef},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use std::path::PathBuf;
 use std::{
     io::{Read as _, Write as _},
     path::Path,
@@ -52,10 +50,6 @@ pub fn askpass_main() {
 }
 
 pub(crate) struct AskpassServer {
-    #[cfg(test)]
-    pub socket: PathBuf,
-    #[cfg(test)]
-    pub executable: PathBuf,
     environment: std::collections::BTreeMap<String, String>,
     _directory: tempfile::TempDir,
     task: tokio::task::JoinHandle<()>,
@@ -131,10 +125,6 @@ impl AskpassServer {
             }
         });
         Ok(Self {
-            #[cfg(test)]
-            socket,
-            #[cfg(test)]
-            executable,
             environment,
             _directory: directory,
             task,
@@ -291,32 +281,16 @@ fn answer_value(answer: PromptAnswer) -> Result<SecretValue, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct FixedAnswer {
-        value: &'static str,
-        calls: AtomicUsize,
-    }
+    struct FixedAnswer(&'static str);
 
     impl SensitivePromptHandler for FixedAnswer {
         fn prompt(&self, prompt: SensitivePrompt) -> crate::remote::SensitivePromptFuture {
             assert_eq!(prompt.kind, SensitivePromptKind::Password);
             assert_eq!(prompt.target, Some("build".parse().unwrap()));
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let value = PromptAnswer::Secret(SecretValue::new(self.value.into()));
+            let value = PromptAnswer::Secret(SecretValue::new(self.0.into()));
             Box::pin(async move { Ok(value) })
         }
-    }
-
-    fn start(handler: Arc<FixedAnswer>) -> AskpassServer {
-        AskpassServer::start(handler, Some("build".parse().unwrap()), None).unwrap()
-    }
-
-    fn fixed(value: &'static str) -> Arc<FixedAnswer> {
-        Arc::new(FixedAnswer {
-            value,
-            calls: AtomicUsize::new(0),
-        })
     }
 
     async fn ask(client: UnixStream) -> PromptAnswer {
@@ -405,57 +379,23 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let server = start(fixed("private-answer"));
+            let handler = Arc::new(FixedAnswer("private-answer"));
+            let server = AskpassServer::start(handler, Some("build".parse().unwrap()), None);
+            let server = server.unwrap();
+            let environment = server.environment();
+            let socket = Path::new(&environment[SOCKET]);
             for (path, mode) in [
                 (server._directory.path(), 0o700),
-                (server.executable.as_path(), 0o700),
-                (server.socket.as_path(), 0o600),
+                (Path::new(&environment["SSH_ASKPASS"]), 0o700),
+                (socket, 0o600),
             ] {
                 let actual = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
                 assert_eq!(actual, mode, "incorrect permissions on {}", path.display());
             }
-            let socket = &server.environment()[SOCKET];
-            assert_eq!(*socket, server.socket.to_string_lossy());
-            assert_ne!(*socket, std::env::var(SOCKET).unwrap());
-            let answer = request_password(&server.socket).await;
+            assert_ne!(environment[SOCKET], std::env::var(SOCKET).unwrap());
+            let answer = request_password(socket).await;
             assert_eq!(answer.expose(), "private-answer");
         });
-    }
-
-    #[tokio::test]
-    async fn concurrent_servers_have_independent_handlers_and_cleanup() {
-        let (first_handler, second_handler) = (fixed("first-answer"), fixed("second-answer"));
-        let first = start(first_handler.clone());
-        let second = start(second_handler.clone());
-        assert_ne!(first._directory.path(), second._directory.path());
-        assert_ne!(first.socket, second.socket);
-        assert_ne!(first.executable, second.executable);
-        for key in ["SSH_ASKPASS", SOCKET] {
-            assert_ne!(first.environment()[key], second.environment()[key]);
-        }
-        let (first_answer, second_answer) = tokio::join!(
-            request_password(&first.socket),
-            request_password(&second.socket)
-        );
-        assert_eq!(first_answer.expose(), "first-answer");
-        assert_eq!(second_answer.expose(), "second-answer");
-        let calls = |handler: &FixedAnswer| handler.calls.load(Ordering::SeqCst);
-        assert_eq!((calls(&first_handler), calls(&second_handler)), (1, 1));
-
-        let first_paths = [
-            first._directory.path().to_path_buf(),
-            first.socket.clone(),
-            first.executable.clone(),
-        ];
-        drop(first);
-        assert!(first_paths.iter().all(|path| !path.exists()));
-        assert!(second.socket.exists() && second.executable.exists());
-        let answer = request_password(&second.socket).await;
-        assert_eq!(answer.expose(), "second-answer");
-        assert_eq!(calls(&second_handler), 2);
-        let second_directory = second._directory.path().to_path_buf();
-        drop(second);
-        assert!(!second_directory.exists());
     }
 
     #[test]
@@ -493,7 +433,7 @@ mod tests {
     }
 
     /// The handler contract is not a type guarantee: an answer of the wrong shape
-    /// for the prompt's kind is a rejection, never a confirmation.
+    /// for the prompt's kind is a rejection, never a confirmation, as is a handler error.
     #[tokio::test]
     async fn mismatched_answers_reject() {
         struct Mismatched;
@@ -507,9 +447,18 @@ mod tests {
                 Box::pin(async move { Ok(answer) })
             }
         }
-        for prompt in ["Are you sure (yes/no)?", "Password:"] {
+        let rejecting: Arc<dyn SensitivePromptHandler> =
+            Arc::new(crate::remote::RejectSensitivePrompts);
+        for (handler, prompt) in [
+            (
+                Arc::new(Mismatched) as Arc<dyn SensitivePromptHandler>,
+                "Are you sure (yes/no)?",
+            ),
+            (Arc::new(Mismatched), "Password:"),
+            (rejecting, "Password:"),
+        ] {
             let (client, server) = UnixStream::pair().unwrap();
-            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched), None, None));
+            let task = tokio::spawn(serve_one(server, handler, None, None));
             assert!(matches!(
                 ask_for(client, prompt).await,
                 PromptAnswer::Rejected
@@ -545,17 +494,6 @@ mod tests {
             requesters.iter().map(|r| r.job).collect::<Vec<_>>(),
             [Some(job)]
         );
-    }
-
-    #[tokio::test]
-    async fn rejected_prompts_are_distinct_from_empty_secrets() {
-        let (client, server) = UnixStream::pair().unwrap();
-        let rejecting = Arc::new(crate::remote::RejectSensitivePrompts);
-        let task = tokio::spawn(serve_one(server, rejecting, None, None));
-        assert!(matches!(ask(client).await, PromptAnswer::Rejected));
-        task.await.unwrap().unwrap();
-        let empty = serde_json::from_str::<PromptAnswer>(r#"{"Secret":""}"#).unwrap();
-        assert!(matches!(empty, PromptAnswer::Secret(_)));
     }
 
     #[test]

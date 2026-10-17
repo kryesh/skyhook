@@ -32,7 +32,6 @@ fn describe(description: &str, label: &str, result: Option<&ResultSchema>) -> St
 }
 
 impl ToolSurface {
-    #[must_use]
     pub fn definitions(&self) -> Vec<ProviderToolDefinition> {
         self.tools
             .values()

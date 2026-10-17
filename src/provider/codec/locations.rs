@@ -27,8 +27,6 @@ pub struct NonEmpty<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Locations<T>(Vec<T>);
 
-/// `one` and `map` skip the distinctness check: one location cannot repeat, and every
-/// `map` caller maps distinct locations to distinct ones.
 impl<T> NonEmpty<T> {
     pub const fn one(location: T) -> Self {
         Self {
@@ -39,13 +37,6 @@ impl<T> NonEmpty<T> {
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         std::iter::once(&self.first).chain(&self.rest)
-    }
-
-    pub(crate) fn map<U>(self, mut f: impl FnMut(T) -> U) -> NonEmpty<U> {
-        NonEmpty {
-            first: f(self.first),
-            rest: self.rest.into_iter().map(f).collect(),
-        }
     }
 }
 

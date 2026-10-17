@@ -300,7 +300,16 @@ impl App {
                             }
                         }
                     } else {
-                        self.paused = false;
+                        // Enter resumes the queue; with an edit open it ends the edit,
+                        // an empty draft discarding it.
+                        match self.paused {
+                            Some(Paused::Editing { .. }) if submission.is_empty() => {
+                                self.discard_edit();
+                                self.deliver_queue();
+                            }
+                            Some(Paused::Editing { .. }) => {}
+                            _ => self.paused = None,
+                        }
                         self.submit(submission);
                     }
                 }
@@ -499,7 +508,7 @@ impl App {
         self.clipboard = Some(text);
     }
     pub(super) fn interrupt(&mut self) {
-        self.pause_queue();
+        self.pause_queue(Paused::Stopped);
         let Some(session) = self.session().cloned() else {
             return;
         };
@@ -656,7 +665,7 @@ mod tests {
         let (_root, mut app) = draft_fixture().await;
         // Keep the submitted message queued without starting a provider/session.
         let (path, model, mode) = ("pending.js".into(), app.model.clone(), app.mode.clone());
-        app.start = StartState::Creating(PendingStart::Script { path, model, mode });
+        app.creating = Some(PendingStart::Script { path, model, mode });
         let (first, second) = ("first\n".repeat(13), "second\n".repeat(14));
         app.editor.insert("before after");
         app.editor.set_cursor("before ".len());

@@ -7,7 +7,7 @@ mod requester;
 
 pub use askpass::askpass_main;
 pub(crate) use askpass::{AskpassServer, apply_environment};
-pub(crate) use authentication::WorkerAuthentication;
+pub(crate) use authentication::{Authentication, worker_authentication};
 pub(crate) use config::SshOption;
 pub(crate) use process::open;
 
@@ -29,7 +29,7 @@ const AUTH_SOCK: &str = "SSH_AUTH_SOCK";
 pub(crate) struct Backend {
     catalog: EmbeddedShimCatalog,
     prompts: Arc<dyn SensitivePromptHandler>,
-    authentication: authentication::Authentication,
+    authentication: Authentication,
 }
 
 impl Backend {
@@ -40,7 +40,7 @@ impl Backend {
     ) -> Self {
         Self {
             catalog,
-            authentication: authentication::Authentication::new(prompts.clone(), jobs),
+            authentication: Authentication::new(prompts.clone(), jobs),
             prompts,
         }
     }

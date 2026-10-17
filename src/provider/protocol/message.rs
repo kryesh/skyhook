@@ -35,18 +35,7 @@ pub enum UserContent {
 }
 
 impl UserContent {
-    #[must_use]
-    pub fn is_image(&self) -> bool {
-        matches!(
-            self,
-            Self::Attachment {
-                attachment: AttachmentRef::Image(_)
-            }
-        )
-    }
-
     /// Content the harness produced rather than the user or a parent.
-    #[must_use]
     pub fn is_runtime(&self) -> bool {
         matches!(self, Self::Runtime { .. })
     }
@@ -81,7 +70,6 @@ pub struct Position(u32);
 pub struct PositionOverflow;
 
 impl Position {
-    #[must_use]
     pub fn get(self) -> u32 {
         self.0
     }
@@ -195,7 +183,8 @@ named_enum! {
 
 string_newtype! {
     /// The configured provider identity a replay is valid under, assigned by the provider
-    /// that issued it. Private state never crosses to another endpoint or provider name.
+    /// that issued it. Sealed state never crosses to another endpoint or provider name;
+    /// readable reasoning does.
     pub struct Scope(Blank) = |scope| nonblank("replay scope", scope);
 }
 
@@ -258,14 +247,12 @@ impl AssistantItem {
         }
     }
 
-    #[must_use]
     pub fn id(&self) -> &ItemId {
         match self {
             Self::Text { id, .. } | Self::Reasoning { id, .. } | Self::ToolCall { id, .. } => id,
         }
     }
 
-    #[must_use]
     pub fn position(&self) -> Position {
         match self {
             Self::Text { position, .. }
@@ -274,7 +261,6 @@ impl AssistantItem {
         }
     }
 
-    #[must_use]
     pub fn kind(&self) -> ItemKind {
         match self {
             Self::Text { .. } => ItemKind::Text,
@@ -283,7 +269,6 @@ impl AssistantItem {
         }
     }
 
-    #[must_use]
     pub fn replay(&self) -> Option<&Replay> {
         match self {
             Self::Reasoning { replay, .. } => replay.as_ref(),
@@ -291,7 +276,6 @@ impl AssistantItem {
         }
     }
 
-    #[must_use]
     pub fn call(&self) -> Option<&ToolCall> {
         match self {
             Self::ToolCall { call, .. } => Some(call),
@@ -300,7 +284,6 @@ impl AssistantItem {
     }
 
     /// Concatenates a text item's blocks; other kinds project no text.
-    #[must_use]
     pub fn text_content(&self) -> Option<String> {
         match self {
             Self::Text { blocks, .. } => {
@@ -323,7 +306,6 @@ impl AssistantItem {
 
     /// Whether the item carries nothing a turn can stand on: text that says
     /// nothing, or reasoning, which accompanies an action but is never one.
-    #[must_use]
     pub fn is_content_free(&self) -> bool {
         match self {
             Self::Text { blocks, .. } => blocks.iter().all(|block| block.text.trim().is_empty()),

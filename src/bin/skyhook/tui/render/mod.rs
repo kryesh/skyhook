@@ -11,7 +11,6 @@ mod row;
 mod rows;
 mod selection;
 mod sidebar;
-mod stream;
 mod wrapping;
 
 pub use cache::RenderState;
@@ -109,14 +108,5 @@ mod tests {
         let columns = RequestColumns::default();
         update_entry_rows(&mut rows, entry, 0, width, &highlights, columns);
         rows
-    }
-
-    pub(super) fn expandable_entry() -> model::Entry {
-        model::Entry::titled(
-            model::EntryKey::UnsavedStatus(1),
-            model::Title::disclosed("first header with many wrapped fragments", true),
-            "body with many wrapped fragments\n  \n".into(),
-            Surface::Tool,
-        )
     }
 }

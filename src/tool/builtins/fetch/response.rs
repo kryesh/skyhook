@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::fs::{CommitMode, PermissionPolicy};
-use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
+use crate::tool::diagnostic::{Operation, Subject};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
@@ -10,19 +10,12 @@ use reqwest::{Method, header::HeaderMap};
 use tokio::io::AsyncWriteExt;
 
 use super::super::workspace::atomic_write_context;
-use super::diagnostics::{
-    DiagnosticMessage, FetchDiagnostic, FetchError, FetchErrorKind, FetchPhase,
-};
-use super::progress::FetchProgress;
+use super::progress::{FetchProgress, transport_error};
 use super::validation::{HttpRequestUrl, InlineMode, OutputPlan};
 use super::{LocalContext, LocalError, ResponseBody, text};
 
 enum BodySink {
-    Memory {
-        bytes: Vec<u8>,
-        mode: InlineMode,
-        limit: u64,
-    },
+    Memory { bytes: Vec<u8>, mode: InlineMode },
     Download(PendingDownload),
 }
 
@@ -40,11 +33,11 @@ impl PendingDownload {
         destination: PathBuf,
         overwrite: bool,
         progress: &mut FetchProgress,
-    ) -> Result<Self, FetchError> {
+    ) -> Result<Self, LocalError> {
         progress.download_io(Operation::CreateCapture, &destination);
         let staged = crate::fs::StagedFile::create(&destination, PermissionPolicy::Inherit)
-            .map_err(|error| local_io(error.into()))?;
-        let writer = tokio::fs::File::from_std(staged.as_file().try_clone().map_err(local_io)?);
+            .map_err(|error| LocalError::io(error.into()))?;
+        let writer = tokio::fs::File::from_std(staged.as_file().try_clone()?);
         Ok(Self {
             writer,
             staged,
@@ -64,19 +57,17 @@ impl PendingDownload {
         mut self,
         context: &LocalContext,
         progress: &mut FetchProgress,
-    ) -> Result<ResponseBody, FetchError> {
+        bytes: u64,
+    ) -> Result<ResponseBody, LocalError> {
         let path = self.destination.to_string_lossy().into_owned();
         // Keep the owner intact across every await: cancellation must drop its
         // writer field before its staging-file field, not reverse-order locals.
         progress.download_io(Operation::FinishCapture, self.staged.path());
-        self.writer.flush().await.map_err(local_io)?;
+        self.writer.flush().await?;
         progress.download_io(Operation::SyncFile, self.staged.path());
-        self.writer.sync_all().await.map_err(local_io)?;
+        self.writer.sync_all().await?;
         if context.is_cancelled() {
-            return Err(FetchError::from_tool_error(
-                LocalError::cancelled(),
-                FetchPhase::LocalIo,
-            ));
+            return Err(LocalError::cancelled());
         }
         // No await follows this split. Close the writer before publication.
         let Self {
@@ -87,30 +78,19 @@ impl PendingDownload {
         } = self;
         drop(writer);
         staged.commit(commit).map_err(|error| {
-            progress.operation(
-                FetchPhase::LocalIo,
-                atomic_write_context(&destination, error.stage),
-            );
-            local_io(error.source)
+            progress.operation(atomic_write_context(&destination, error.stage));
+            LocalError::io(error.source)
         })?;
-        Ok(ResponseBody::File {
-            path,
-            bytes: progress.received_bytes,
-        })
+        Ok(ResponseBody::File { path, bytes })
     }
 }
 
 impl BodySink {
-    fn new(
-        output: OutputPlan,
-        limit: u64,
-        progress: &mut FetchProgress,
-    ) -> Result<Self, FetchError> {
+    fn new(output: OutputPlan, progress: &mut FetchProgress) -> Result<Self, LocalError> {
         match output {
             OutputPlan::Inline(mode) => Ok(Self::Memory {
                 bytes: Vec::new(),
                 mode,
-                limit,
             }),
             OutputPlan::Download {
                 destination,
@@ -123,15 +103,17 @@ impl BodySink {
         &mut self,
         chunk: &[u8],
         progress: &mut FetchProgress,
-    ) -> Result<(), FetchError> {
+    ) -> Result<(), LocalError> {
         match self {
-            Self::Memory { bytes, limit, .. } => {
-                reserve_bounded(bytes, chunk.len(), *limit)?;
+            Self::Memory { bytes, .. } => {
+                bytes
+                    .try_reserve(chunk.len())
+                    .map_err(|_| LocalError::failed("the response does not fit in memory"))?;
                 bytes.extend_from_slice(chunk);
             }
             Self::Download(download) => {
                 progress.download_io(Operation::WriteCapture, download.staged.path());
-                download.writer.write_all(chunk).await.map_err(local_io)?;
+                download.writer.write_all(chunk).await?;
             }
         }
         Ok(())
@@ -143,86 +125,32 @@ impl BodySink {
         progress: &mut FetchProgress,
         content_type: Option<&str>,
         url: &HttpRequestUrl,
-    ) -> Result<ResponseBody, FetchError> {
+        received: u64,
+    ) -> Result<ResponseBody, LocalError> {
         match self {
-            Self::Memory { bytes, mode, .. } => {
-                progress.phase(match mode {
-                    InlineMode::ExtractText => FetchPhase::Extraction,
-                    _ => FetchPhase::Decode,
-                });
+            Self::Memory { bytes, mode } => {
+                match mode {
+                    InlineMode::ExtractText => progress.step(
+                        Operation::Capture,
+                        Subject::Label("HTML text extraction".into()),
+                    ),
+                    _ => progress.step(
+                        Operation::Deserialize,
+                        Subject::Label("HTTP response body".into()),
+                    ),
+                }
                 response_body(bytes, content_type, url, mode).await
             }
-            Self::Download(download) => download.finish(context, progress).await,
+            Self::Download(download) => download.finish(context, progress, received).await,
         }
     }
 }
 
-/// The diagnostic counter is the sole accounting owner. Publish the rejecting
-/// chunk's decoded size before rejecting it; callers must not write on failure.
-fn observe_chunk(
-    progress: &mut FetchProgress,
-    chunk_len: usize,
-    limit: u64,
-) -> Result<(), FetchError> {
-    progress.received_bytes += chunk_len as u64;
-    if progress.received_bytes > limit {
-        return Err(response_exceeds_max_bytes());
-    }
-    Ok(())
+fn exceeds_max_bytes() -> LocalError {
+    LocalError::failed("response exceeds max_bytes")
 }
 
-/// Keep geometric growth but cap requested vector capacity at the admitted byte
-/// limit. This bounds this buffer's request, not allocator rounding or total heap
-/// (decoded strings, base64, decompression and extraction have separate costs).
-fn reserve_bounded(bytes: &mut Vec<u8>, additional: usize, limit: u64) -> Result<(), FetchError> {
-    let required = bytes
-        .len()
-        .checked_add(additional)
-        .ok_or_else(response_too_large)?;
-    let limit = usize::try_from(limit).map_err(|_| response_too_large())?;
-    if required > limit {
-        return Err(response_exceeds_max_bytes());
-    }
-    if required > bytes.capacity() {
-        let geometric = bytes.capacity().checked_mul(2).unwrap_or(limit);
-        let capacity = required.max(geometric).max(8).min(limit);
-        bytes
-            .try_reserve_exact(capacity - bytes.len())
-            .map_err(|_| response_too_large())?;
-    }
-    Ok(())
-}
-
-fn response_too_large() -> FetchError {
-    FetchDiagnostic::new(
-        FetchPhase::ResponseBody,
-        FetchErrorKind::ResponseBodyFailure,
-    )
-    .into()
-}
-
-fn response_exceeds_max_bytes() -> FetchError {
-    FetchDiagnostic::classified(
-        FetchPhase::ResponseBody,
-        FetchErrorKind::SizeLimit,
-        DiagnosticMessage::ResponseExceedsMaxBytes,
-    )
-    .into()
-}
-
-fn extraction_failure(message: DiagnosticMessage) -> FetchError {
-    FetchDiagnostic::classified(
-        FetchPhase::Extraction,
-        FetchErrorKind::ExtractionFailure,
-        message,
-    )
-    .into()
-}
-
-fn local_io(error: std::io::Error) -> FetchError {
-    FetchDiagnostic::from_io(&error, FetchPhase::LocalIo).into()
-}
-
+/// The body and its decoded entity byte count.
 pub(super) async fn read_body(
     context: &LocalContext,
     progress: &mut FetchProgress,
@@ -231,42 +159,44 @@ pub(super) async fn read_body(
     max_bytes: u64,
     url: &HttpRequestUrl,
     method: &Method,
-) -> Result<ResponseBody, FetchError> {
+) -> Result<(ResponseBody, u64), LocalError> {
     let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    progress.phase(FetchPhase::ResponseBody);
-    // Content-Length is decoded length when known; the streamed count remains authoritative.
+    progress.step(
+        Operation::Receive,
+        Subject::Label("HTTP response body".into()),
+    );
     if *method != Method::HEAD
         && response
             .content_length()
             .is_some_and(|length| length > max_bytes)
     {
-        return Err(response_exceeds_max_bytes());
+        return Err(exceeds_max_bytes());
     }
-    let mut sink = BodySink::new(output, max_bytes, progress)?;
+    let mut sink = BodySink::new(output, progress)?;
     let mut stream = response.bytes_stream();
+    let mut received = 0;
     loop {
-        match &sink {
-            BodySink::Memory { .. } => progress.phase(FetchPhase::ResponseBody),
-            BodySink::Download(download) => progress.operation(
-                FetchPhase::ResponseBody,
-                PartialContext::new(Operation::Receive, Subject::path(&download.destination))
-                    .effects(Effects::Unchanged),
-            ),
+        if let BodySink::Download(download) = &sink {
+            progress.download_io(Operation::Receive, &download.destination);
         }
         let Some(chunk) = stream.next().await else {
             break;
         };
-        let chunk = chunk
-            .map_err(|error| FetchDiagnostic::from_reqwest(&error, FetchPhase::ResponseBody))?;
-        observe_chunk(progress, chunk.len(), max_bytes)?;
+        let chunk = chunk.map_err(transport_error)?;
+        received += chunk.len() as u64;
+        if received > max_bytes {
+            return Err(exceeds_max_bytes());
+        }
         sink.write(&chunk, progress).await?;
     }
-    sink.finish(context, progress, content_type.as_deref(), url)
-        .await
+    let body = sink
+        .finish(context, progress, content_type.as_deref(), url, received)
+        .await?;
+    Ok((body, received))
 }
 
 pub(super) fn collect_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
@@ -284,13 +214,12 @@ async fn response_body(
     content_type: Option<&str>,
     url: &HttpRequestUrl,
     mode: InlineMode,
-) -> Result<ResponseBody, FetchError> {
+) -> Result<ResponseBody, LocalError> {
     use text::{ContentClass, ExtractableHtml, ResponseEntity};
 
     if bytes.is_empty() {
         return Ok(ResponseBody::Empty);
     }
-    // Explicit Base64 requires no media parsing, sniffing or decoding.
     if matches!(mode, InlineMode::Base64) {
         return Ok(ResponseBody::Base64 {
             data: STANDARD.encode(bytes),
@@ -300,18 +229,16 @@ async fn response_body(
     if matches!(mode, InlineMode::ExtractText) {
         match entity.class() {
             ContentClass::Html => {
-                let extraction_error =
-                    |reason| extraction_failure(DiagnosticMessage::Extraction(reason));
-                let input = ExtractableHtml::admit(entity, url).map_err(extraction_error)?;
-                let extracted = text::extract(input).await.map_err(extraction_error)?;
+                let input = ExtractableHtml::admit(entity, url).map_err(LocalError::failed)?;
+                let extracted = text::extract(input).await.map_err(LocalError::failed)?;
                 return Ok(ResponseBody::Text {
                     text: extracted.text,
                     metadata: Some(extracted.metadata),
                 });
             }
             ContentClass::Binary => {
-                return Err(extraction_failure(
-                    DiagnosticMessage::TextExtractionUnsupported,
+                return Err(LocalError::failed(
+                    "text extraction is unsupported for this binary content type",
                 ));
             }
             ContentClass::Text => {}
@@ -348,46 +275,14 @@ async fn response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, progress_for, server};
+    use super::super::tests::{executor, fetch, server};
     use super::*;
     use crate::provider::http::transport::tests::{Plan, Server, read_request, reply};
+    use crate::tool::diagnostic::{Cause, Effects, IoKind, RequestEffects};
     use serde_json::json;
 
-    fn accounting_fixture(limit: u64) -> (FetchProgress, u64) {
-        let (plan, progress) = progress_for(json!({"url":"http://example.org","max_bytes":limit}));
-        (progress, plan.max_bytes)
-    }
-
-    #[test]
-    fn byte_budget_rejection_and_bounded_reservation() {
-        let (mut progress, limit) = accounting_fixture(5);
-        observe_chunk(&mut progress, 0, limit).unwrap();
-        observe_chunk(&mut progress, 5, limit).unwrap();
-        assert_eq!(progress.received_bytes, 5);
-        assert!(observe_chunk(&mut progress, 1, limit).is_err());
-        assert_eq!(
-            progress.received_bytes, 6,
-            "rejecting chunk remains observable"
-        );
-        // Reservation caps growth and checks before allocation.
-        let (_, limit) = accounting_fixture(100);
-        let mut bytes = Vec::new();
-        for _ in 0..100 {
-            reserve_bounded(&mut bytes, 1, limit).unwrap();
-            bytes.push(0);
-            assert!(bytes.capacity() <= 100);
-        }
-        assert!(reserve_bounded(&mut bytes, 1, limit).is_err());
-        assert!(reserve_bounded(&mut bytes, usize::MAX, limit).is_err());
-        assert_eq!((bytes.len(), bytes.capacity()), (100, 100));
-        let (_, small_limit) = accounting_fixture(1);
-        let mut tiny = Vec::new();
-        reserve_bounded(&mut tiny, 1, small_limit).unwrap();
-        assert_eq!(tiny.capacity(), 1);
-    }
-
     #[tokio::test]
-    async fn extraction_failure_keeps_its_reason_and_the_response_payload() {
+    async fn extraction_failure_names_its_reason() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
         let html = "<html><body></body></html>";
@@ -401,22 +296,12 @@ mod tests {
             .await
             .unwrap_err();
         task.finish().await;
-        let rendered = error
-            .diagnostic()
-            .render(&crate::tool::policy::CapabilitySet::default());
-        let output = error.into_parts().1.unwrap().value;
-        assert_eq!(output["status"], 201);
-        assert_eq!(output["size"], html.len());
-        let expected = FetchDiagnostic::classified(
-            FetchPhase::Extraction,
-            FetchErrorKind::ExtractionFailure,
-            DiagnosticMessage::Extraction(text::ExtractionFailure::Parser),
-        );
-        // The reason is in the rendered error; the serialized diagnostic omits it.
-        assert!(rendered.contains(expected.message()), "{rendered}");
+        let (diagnostic, output) = error.into_parts();
+        assert!(output.is_none());
+        assert_eq!(diagnostic.context.operation, Operation::Capture);
         assert_eq!(
-            output["diagnostic"],
-            serde_json::to_value(expected).unwrap()
+            diagnostic.cause,
+            Cause::Message(text::ExtractionFailure::Parser.to_string())
         );
     }
 
@@ -424,20 +309,21 @@ mod tests {
     fn download_staging_failure_identifies_destination_and_unchanged_effects() {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("missing").join("download");
-        let mut progress = progress_for(json!({"url":"http://example.org"})).1;
+        let mut progress = FetchProgress::new();
         let error = PendingDownload::new(destination.clone(), false, &mut progress)
             .err()
             .unwrap();
-        let error = progress.failure(error);
-        let context = error.diagnostic().context;
-        assert_eq!(context.operation, Operation::CreateCapture);
-        assert_eq!(context.subject, Subject::path(&destination));
-        assert_eq!(context.effects, Effects::Unchanged);
-        let (_, Some(output)) = error.into_parts() else {
-            panic!("structured staging failure")
-        };
-        assert_eq!(output.value["diagnostic"]["error_kind"], "local_io");
-        assert_eq!(output.value["diagnostic"]["os_error"]["kind"], "not_found");
+        let diagnostic = progress.failure(error).diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::CreateCapture);
+        assert_eq!(diagnostic.context.subject, Subject::path(&destination));
+        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+        assert!(matches!(
+            diagnostic.cause,
+            Cause::Io {
+                kind: IoKind::NotFound,
+                ..
+            }
+        ));
         assert!(!destination.exists());
     }
 
@@ -471,23 +357,13 @@ mod tests {
         let context = error.diagnostic().context;
         assert_eq!(context.operation, Operation::Rename);
         assert_eq!(context.subject, Subject::path(&destination));
-        assert_eq!(context.effects, Effects::Unknown);
-        assert!(
-            error
-                .to_string()
-                .contains("server-side effects are unknown")
-        );
-        let output = error.into_parts().1.unwrap().value;
-        assert_eq!(output["status"], 200);
-        assert_eq!(output["size"], 11);
-        assert_eq!(output["diagnostic"]["error_kind"], "local_io");
+        assert_eq!(context.request, RequestEffects::MayHaveExecuted);
         assert_eq!(
             tokio::fs::read(destination).await.unwrap(),
             b"keep original"
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn download_atomicity_limits_truncation_and_head() {
         let runtime = crate::tests::TestRuntime::new().await;
@@ -569,12 +445,7 @@ mod tests {
             InlineMode::ExtractText,
         )
         .await;
-        let diagnostic = error.unwrap_err().into_diagnostic().unwrap();
-        assert_eq!(diagnostic.phase(), FetchPhase::Extraction);
-        assert_eq!(
-            serde_json::to_value(diagnostic).unwrap()["error_kind"],
-            "extraction_failure"
-        );
+        assert!(error.is_err());
     }
 
     #[tokio::test]

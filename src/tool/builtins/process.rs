@@ -1,5 +1,4 @@
 use super::TimeoutSecs;
-#[cfg(unix)]
 use crate::process_group::ProcessGroup;
 use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
@@ -85,9 +84,7 @@ impl Exec {
                 None => std::future::pending().await,
             }
         };
-        run_process(context, self.command, deadline)
-            .await
-            .map(ProcessResult::into_output)
+        run_process(context, self.command, deadline).await
     }
 }
 
@@ -111,7 +108,7 @@ async fn run_process(
     context: LocalContext,
     mut command: Command,
     deadline: impl Future<Output = TimeoutSecs>,
-) -> Result<ProcessResult, LocalError> {
+) -> Result<ProducedOutput, LocalError> {
     // Override inherited/provider askpass settings even without Targets. Keep the
     // rejecting broker alive until the command and its cleanup have completed.
     let rejecting_askpass = if context.capabilities().contains(Capability::Interactive) {
@@ -149,7 +146,6 @@ async fn run_process(
     // its process-group leader, preserving group-wide cleanup below.
     // SAFETY: setsid is async-signal-safe and the hook does not allocate or
     // access shared state between fork and exec.
-    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -159,9 +155,9 @@ async fn run_process(
         });
     }
     if context.is_cancelled() {
-        return Err(LocalError::cancelled()
-            .operation(Operation::Spawn, Subject::Process)
-            .effects(Effects::NotStarted));
+        return Err(
+            LocalError::cancelled_before_start().operation(Operation::Spawn, Subject::Process)
+        );
     }
     // Spawn can fail while setting up the child or loading its interpreter. In
     // particular, ENOENT does not establish that the executable itself is absent.
@@ -171,7 +167,6 @@ async fn run_process(
             .effects(Effects::NotStarted)
     })?;
     let attributed = child.id().and_then(|pid| context.attach_process(pid));
-    #[cfg(unix)]
     let mut group = ProcessGroup::led_by(&child);
     let pipe_unavailable = |pipe: &str| {
         LocalError::failed("pipe unavailable")
@@ -215,7 +210,6 @@ async fn run_process(
         }
     };
     let mut stop = async || {
-        #[cfg(unix)]
         group.kill();
         child.kill().await.map_err(LocalError::annotated(started(
             Operation::Terminate,
@@ -227,23 +221,18 @@ async fn run_process(
         )))
     };
     let finish = async move |status: ExitStatus| {
-        Ok::<_, LocalError>(ProcessResult {
-            status,
-            captures: [
-                stdout_capture.finish().await?,
-                stderr_capture.finish().await?,
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-        })
+        let captures = [
+            stdout_capture.finish().await?,
+            stderr_capture.finish().await?,
+        ];
+        Ok::<_, LocalError>(produced(status, captures.into_iter().flatten().collect()))
     };
     // Keep select! unbiased above. The selected variant alone controls both
     // cleanup and presentation; only expiry can carry a finite deadline.
     match completion {
         ProcessCompletion::Exited(status) => finish(status).await,
         ProcessCompletion::TimedOut(seconds) => {
-            let mut output = finish(stop().await?).await?.into_output();
+            let mut output = finish(stop().await?).await?;
             output.streams = StreamEnd::Cut;
             Err(LocalError::with_output(
                 format!("timed out after {} seconds", u64::from(seconds)),
@@ -344,47 +333,33 @@ impl CommandLine {
     }
 }
 
-/// Internal output retains completed field bindings until the canonical product handoff.
-struct ProcessResult {
-    status: ExitStatus,
-    captures: Vec<FinishedOutput>,
-}
-
-impl ProcessResult {
-    fn into_output(self) -> ProducedOutput {
-        let output = ProcessOutput {
-            exit_code: self.status.code(),
-            #[cfg(unix)]
-            signal: std::os::unix::process::ExitStatusExt::signal(&self.status),
-            #[cfg(not(unix))]
-            signal: None,
-            // Completed captures install these fields when bytes were observed. An
-            // absent stream was therefore observed to be empty, not unknown.
-            stdout: None,
-            stderr: None,
-        };
-        ProducedOutput::new(serde_json::to_value(output).expect("process output serializes"))
-            .with_captures(self.captures)
-    }
+fn produced(status: ExitStatus, captures: Vec<FinishedOutput>) -> ProducedOutput {
+    let output = ProcessOutput {
+        exit_code: status.code(),
+        signal: std::os::unix::process::ExitStatusExt::signal(&status),
+        // Completed captures install these fields when bytes were observed. An
+        // absent stream was therefore observed to be empty, not unknown.
+        stdout: None,
+        stderr: None,
+    };
+    ProducedOutput::new(serde_json::to_value(output).expect("process output serializes"))
+        .with_captures(captures)
 }
 
 /// A terminated process has exactly one of an exit code or the signal that killed it.
 #[serde_with::skip_serializing_none]
 #[derive(JsonSchema, Serialize)]
 struct ProcessOutput {
-    #[schemars(with = "i32")]
     exit_code: Option<i32>,
-    #[schemars(with = "i32")]
     signal: Option<i32>,
     #[schemars(with = "crate::tool::output::JsonText", transform = ends)]
     stdout: Option<String>,
-    #[schemars(with = "String", transform = ends)]
+    #[schemars(transform = ends)]
     stderr: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use std::{
         io::Read as _,
         os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
@@ -425,7 +400,6 @@ mod tests {
     }
 
     /// Argv and shell-string `exec` arguments running the same `/bin/sh` command.
-    #[cfg(unix)]
     fn sh_args(argv: bool, command: &str, timeout: Option<u64>) -> Value {
         let mut args = if argv {
             json!({"command":["/bin/sh", "-c", command]})
@@ -474,7 +448,6 @@ mod tests {
 
     /// A reaped process's PID may be reused while a descendant keeps its output
     /// open, so it stops naming the job before the call ends.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_reaped_process_stops_naming_its_job_while_output_stays_open() {
         let runtime = TestRuntime::new().await;
@@ -507,7 +480,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exit_codes_captures_and_timeout_partial_output() {
         let runtime = TestRuntime::new().await;
@@ -596,7 +568,6 @@ mod tests {
         assert_eq!(view["presentation"]["notice"], "Output incomplete.");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn failures_before_spawn_report_their_stage_and_that_nothing_started() {
         let runtime = TestRuntime::new().await;
@@ -685,7 +656,6 @@ mod tests {
         assert!(!runtime.root.path().join("started").exists());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn capture_and_pipe_io_failures_keep_distinct_phases() {
         use crate::tool::{
@@ -783,7 +753,6 @@ mod tests {
         producer.settle().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_and_timeout_kill_descendants_even_after_the_shell_exits() {
         // The descendant outlives the shell holding `held`, a FIFO, open for
@@ -814,7 +783,7 @@ mod tests {
             } else {
                 runtime.jobs.cancel(running.job).await.unwrap();
             }
-            let finished = bounded(runtime.jobs.wait(running.job, None, true)).await;
+            let finished = bounded(runtime.jobs.wait(running.job, true)).await;
             bounded(held.read_to_end(&mut Vec::new())).await.unwrap();
             finished.unwrap()
         };
@@ -831,12 +800,26 @@ mod tests {
         assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
     }
 
+    /// Every process leads its own session, with or without a terminal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn each_process_leads_its_own_session() {
+        let runtime = TestRuntime::new().await;
+        let stat = "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\"";
+        for interactive in [false, true] {
+            let executor = executor(&runtime, interactive, tokio::time::sleep);
+            let output = executor.run_host(&runtime.agent, "exec", sh_args(true, stat, None));
+            let output = output.await.unwrap().output.value;
+            let ids = output["stdout"].as_str().unwrap().split_once(' ');
+            let (pid, sid) = ids.unwrap();
+            assert_eq!(pid, sid, "interactive={interactive}");
+        }
+    }
+
     // Use a separate session with a real controlling PTY; never change the
     // test runner's own session or terminal state.
-    #[cfg(unix)]
     const PTY_HELPER: &str = "SKYHOOK_PROCESS_PTY_TEST";
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn process_tools_detach_from_the_terminal_under_a_pty() {
         let (mut master, mut slave) = (-1, -1);
@@ -917,7 +900,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     #[ignore = "invoked in a dedicated PTY/session by process_tools_detach_from_the_terminal_under_a_pty"]
     fn pty_executor_helper() {
@@ -949,7 +931,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn session_askpass_reaches_exec_without_targets_keeping_agent_and_display() {
         let runtime = TestRuntime::new().await;
@@ -976,7 +957,6 @@ mod tests {
         router.shutdown().await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn noninteractive_askpass_overrides_provider_without_targets() {
         let inherited = [

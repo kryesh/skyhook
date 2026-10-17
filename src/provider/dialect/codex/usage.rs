@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::{BodyError, ORIGINATOR, SKYHOOK, auth::AuthManager, body, subscription};
 use crate::provider::{
-    ProviderError,
+    ProviderError, ProviderErrorKind,
     ProviderErrorKind::{Protocol, Timeout, Transport},
     dialect::{
         AuthStatus, BuildError, Connection, LoginReason, Usage, UsageWindow,
@@ -16,7 +16,6 @@ use crate::provider::{
     },
     http::{
         Headers, Timeouts,
-        errors::{ErrorSignals, Reading},
         headers::Value,
         transport::{client, retry_after},
     },
@@ -46,14 +45,13 @@ impl Account {
         }
     }
 
-    pub(in crate::provider::dialect) async fn login(
-        &self,
-        headless: bool,
-    ) -> Result<(), ProviderError> {
+    /// Sign in using a browser, or the device flow when `headless`.
+    pub async fn login(&self, headless: bool) -> Result<(), ProviderError> {
         self.manager.login(headless).await
     }
 
-    pub(in crate::provider::dialect) async fn status(&self) -> Result<AuthStatus, ProviderError> {
+    /// Local state only; the server is neither asked nor refreshed.
+    pub async fn status(&self) -> Result<AuthStatus, ProviderError> {
         self.manager.status().await
     }
 
@@ -61,8 +59,9 @@ impl Account {
         subscription(self.manager)
     }
 
-    /// Present the credentials, refreshed if due, to the account's usage.
-    pub(in crate::provider::dialect) async fn check(&self) -> Result<Usage, BuildError> {
+    /// Present the credentials to the service in a request that spends no
+    /// quota, refreshing them first if a request would.
+    pub async fn check(&self) -> Result<Usage, BuildError> {
         let mut headers = self.headers.clone();
         headers.extend(subscription(self.manager.clone()));
         let mut sources = Sources::default();
@@ -84,12 +83,7 @@ impl Account {
         if !response.status().is_success() {
             // Bodies and URLs are never echoed: either may carry credentials.
             let retry_after = retry_after(response.headers(), std::time::SystemTime::now());
-            let kind = Reading::default().kind(
-                Some(status),
-                &serde_json::Value::Null,
-                ErrorSignals::NONE,
-                retry_after,
-            );
+            let kind = ProviderErrorKind::of_status(status);
             let message = format!("Codex usage service returned HTTP {status}");
             return Err(kind.error(message).with_retry_after(retry_after).into());
         }
@@ -143,7 +137,7 @@ impl From<Payload> for Usage {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::super::auth::{login_command, oauth_mock, test_manager};
     use super::*;
@@ -158,9 +152,9 @@ mod tests {
         let usage = serde_json::json!({"plan_type": "plus", "rate_limit": {
             "primary_window": {"used_percent": 41, "limit_window_seconds": 18000},
             "secondary_window": {"used_percent": 12.5}}, "credits": {}});
-        let (url, _, server) = oauth_mock(vec![(200, usage), (401, serde_json::json!({}))]).await;
+        let server = oauth_mock(vec![(200, usage), (401, serde_json::json!({}))]).await;
         let common = Common {
-            base_url: Some(url),
+            base_url: Some(server.root()),
             headers: [("x-proxy-key".into(), Sourced::Literal("proxy".into()))].into(),
             ..Common::default()
         };
@@ -183,7 +177,7 @@ mod tests {
             panic!("a 401 is a rejection");
         };
         assert_eq!(rejected, required.into());
-        let requests = server.await.unwrap();
+        let requests = server.finish().await;
         let head = requests[0].to_ascii_lowercase();
         assert!(head.starts_with("get /wham/usage "), "{head}");
         for header in [

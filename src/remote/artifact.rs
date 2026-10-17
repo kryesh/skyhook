@@ -141,12 +141,10 @@ impl EmbeddedShimCatalog {
 }
 
 impl EmbeddedShim {
-    #[must_use]
     pub fn sha256(&self) -> String {
         crate::sha256_hex(&self.bytes)
     }
 
-    #[must_use]
     pub fn installed_name(&self) -> String {
         format!("{}-{}", self.platform.os, self.protocol)
     }

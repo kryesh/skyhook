@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use super::{
     JobLocation, PathArgument, ScriptBinding, ToolExecution, ToolExposure, ToolPlacement,
-    envelope::TARGET, registration::result_schema, surface::OutputSchema,
+    envelope::TARGET,
+    registration::{complete_result_schema, result_schema},
+    surface::OutputSchema,
 };
 use crate::{
     execution::ExecutionLocation,
@@ -38,14 +40,24 @@ fn gated(capability: Capability, schema: Value) -> ComputedProperty {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SchemaOrigin {
+    /// Generated for a Skyhook handler: a documented default permits omission,
+    /// and the dialect is the provider's.
+    Native,
+    /// Supplied by an external tool, whose required fields stay required even
+    /// with defaults (defaults are annotations, not values Skyhook supplies) and
+    /// whose declared dialect is retained.
+    External,
+}
+
 /// Registration options for a tool whose handler input is `A`; dynamic tools
 /// take their arguments as JSON.
 pub struct ToolOptions<A = Value> {
     pub(super) execution: ToolExecution,
     pub(super) hooks: ArgumentHooks<A>,
     pub(super) supports_background: bool,
-    pub(super) preserve_required: bool,
-    pub(super) preserve_schema_dialect: bool,
+    pub(super) schema_origin: SchemaOrigin,
     pub(super) exposure: ToolExposure,
     pub(super) script_binding: ScriptBinding,
     pub(super) required: BTreeSet<Capability>,
@@ -60,15 +72,6 @@ impl<A> ToolOptions<A> {
     #[must_use]
     pub const fn job_role(mut self, role: crate::job::JobRole) -> Self {
         self.execution.job_role = role;
-        self
-    }
-
-    /// Built-in read only: expected OS read failures are successful structured results.
-    pub(crate) fn read_error_output(
-        mut self,
-        convert: fn(&crate::tool::diagnostic::Diagnostic) -> Option<Value>,
-    ) -> Self {
-        self.execution.read_error_output = Some(convert);
         self
     }
 
@@ -112,8 +115,7 @@ impl<A> ToolOptions<A> {
         let required = capabilities.iter().copied().collect();
         Self {
             supports_background: false,
-            preserve_required: false,
-            preserve_schema_dialect: false,
+            schema_origin: SchemaOrigin::Native,
             execution: ToolExecution {
                 capabilities,
                 ..ToolExecution::default()
@@ -142,19 +144,10 @@ impl<A> ToolOptions<A> {
         self
     }
 
-    /// Preserve JSON Schema required fields even when they have defaults.
-    /// External tools need this because defaults are annotations, not values
-    /// supplied by Skyhook or a typed argument deserializer.
+    /// The input schema is externally supplied: see [`SchemaOrigin::External`].
     #[must_use]
-    pub fn preserve_required(mut self) -> Self {
-        self.preserve_required = true;
-        self
-    }
-
-    /// Retain declared JSON Schema dialects for externally supplied schemas.
-    #[must_use]
-    pub fn preserve_schema_dialect(mut self) -> Self {
-        self.preserve_schema_dialect = true;
+    pub fn external_schema(mut self) -> Self {
+        self.schema_origin = SchemaOrigin::External;
         self
     }
 
@@ -307,10 +300,16 @@ impl<A> ToolOptions<A> {
     }
 
     /// Describe results by `O`'s serialization contract: an absent field is a
-    /// skipped `Option<T>` whose schema is declared as a non-null `T`.
+    /// skipped `Option<T>`, described as `T`.
     #[must_use]
     pub(crate) fn result<O: JsonSchema>(self) -> Self {
         self.output_schema(result_schema::<O>())
+    }
+
+    /// Describe results as [`Self::result`] does, for a presentation that never shortens them.
+    #[must_use]
+    pub(crate) fn complete_result<O: JsonSchema>(self) -> Self {
+        self.output_schema(complete_result_schema::<O>())
     }
 
     #[must_use]

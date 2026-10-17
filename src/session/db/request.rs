@@ -10,27 +10,16 @@ use super::{
 };
 use crate::{
     agent::{CompactionFault, Failure, TodoItem},
-    named_enum::named_enum,
     provider::protocol::Usage,
     session::{
         AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
-        CompletedOutcome, EntryKind, SessionEvent,
+        CompletedOutcome, SessionEvent,
     },
 };
 
-named_enum! {
-    /// How a completed response ended; `cut` rows also name their `Truncation`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub(super) enum ResponseOutcome {
-        Answer = "answer",
-        ToolUse = "tool_use",
-        Cut = "cut",
-    }
-}
-
 impl Encoder {
     pub(super) fn request(&mut self, db: &Db, entry: Entry, event: &SessionEvent) -> DbResult<()> {
-        let Entry { seq, kind, .. } = entry;
+        let seq = entry.seq;
         match event {
             SessionEvent::ModelRequested {
                 context,
@@ -62,7 +51,7 @@ impl Encoder {
                 }
                 Ok(())
             }
-            SessionEvent::Compaction { checkpoint } => self.compaction(db, entry, checkpoint),
+            SessionEvent::Compaction { checkpoint } => self.compaction(db, seq, checkpoint),
             SessionEvent::ModelAttemptStarted(attempt) => db
                 .execute(
                     "INSERT INTO model_attempt (entry, request, attempt) VALUES (?1, ?2, ?3)",
@@ -70,21 +59,21 @@ impl Encoder {
                 )
                 .map(drop),
             SessionEvent::ModelFailed { attempt, failure } => {
-                outcome(db, entry, *attempt)?;
+                outcome(db, seq, *attempt)?;
                 let retry = match failure {
                     AttemptFailure::Final(_) => None,
                     AttemptFailure::Retrying { delay, .. } => Some(delay.millis()),
                 };
-                self::failure(db, entry, &failure.failure(), retry)
+                self::failure(db, seq, &failure.failure(), retry)
             }
-            SessionEvent::AgentFailed { failure } => self::failure(db, entry, failure, None),
-            SessionEvent::ModelAttemptInterrupted(attempt) => outcome(db, entry, *attempt),
+            SessionEvent::AgentFailed { failure } => self::failure(db, seq, failure, None),
+            SessionEvent::ModelAttemptInterrupted(attempt) => outcome(db, seq, *attempt),
             SessionEvent::ResponseCompleted {
                 attempt,
                 message,
                 outcome: ended,
             } => {
-                outcome(db, entry, *attempt)?;
+                outcome(db, seq, *attempt)?;
                 let message = db
                     .query_row(
                         "SELECT c.message FROM message_commit c \
@@ -94,15 +83,10 @@ impl Encoder {
                         |row| Ok(row.get::<i64>(0)?),
                     )?
                     .ok_or_else(|| rejected("response message is not a committed message"))?;
-                let (outcome, cut) = match ended {
-                    CompletedOutcome::Answer => (ResponseOutcome::Answer, None),
-                    CompletedOutcome::ToolUse => (ResponseOutcome::ToolUse, None),
-                    CompletedOutcome::Cut(truncation) => (ResponseOutcome::Cut, Some(*truncation)),
-                };
                 db.execute(
                     "INSERT INTO model_response (entry, message, outcome, cut_reason) \
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, message, outcome, cut],
+                    params![seq, message, ended.kind(), ended.parts().0],
                 )
                 .map(drop)
             }
@@ -123,23 +107,18 @@ impl Encoder {
                     ],
                 )
                 .map(drop),
-            _ => unreachable!("{kind} is not a request event"),
+            _ => unreachable!("{} is not a request event", event.kind()),
         }
     }
 
-    fn compaction(
-        &mut self,
-        db: &Db,
-        entry: Entry,
-        checkpoint: &CompactionCheckpoint,
-    ) -> DbResult<()> {
+    fn compaction(&mut self, db: &Db, seq: u64, checkpoint: &CompactionCheckpoint) -> DbResult<()> {
         let message = self.message(db, &checkpoint.message)?;
-        outcome(db, entry, checkpoint.attempt)?;
+        outcome(db, seq, checkpoint.attempt)?;
         db.execute(
             "INSERT INTO compaction (entry, frontier, message, reported_tokens) \
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                entry.seq,
+                seq,
                 checkpoint.frontier,
                 message,
                 match checkpoint.trigger {
@@ -151,19 +130,19 @@ impl Encoder {
         for source in &checkpoint.retained {
             db.execute(
                 "INSERT INTO compaction_retained (compaction, source) VALUES (?1, ?2)",
-                params![entry.seq, *source],
+                params![seq, *source],
             )?;
         }
-        super::message::todos(db, entry.seq, entry.kind, &checkpoint.todos)
+        super::message::todos(db, "todo_item", "entry", seq, &checkpoint.todos)
     }
 }
 
-fn failure(db: &Db, entry: Entry, failure: &Failure, retry_millis: Option<u64>) -> DbResult<()> {
+fn failure(db: &Db, seq: u64, failure: &Failure, retry_millis: Option<u64>) -> DbResult<()> {
     let (kind, (detail, class)) = (failure.kind(), failure.parts());
     db.execute(
-        "INSERT INTO failure (entry, kind, failure, detail, provider, retry_millis) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![entry.seq, entry.kind, kind, detail, class, retry_millis],
+        "INSERT INTO failure (entry, failure, detail, provider, retry_millis) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![seq, kind, detail, class, retry_millis],
     )
     .map(drop)
 }
@@ -188,12 +167,12 @@ fn model_attempt(db: &Db, attempt: AttemptRef) -> DbResult<i64> {
     })
 }
 
-/// Record that `attempt` ended with `entry`.
-fn outcome(db: &Db, entry: Entry, attempt: AttemptRef) -> DbResult<()> {
+/// Record that `attempt` ended with entry `seq`.
+fn outcome(db: &Db, seq: u64, attempt: AttemptRef) -> DbResult<()> {
     let attempt = model_attempt(db, attempt)?;
     db.execute(
-        "INSERT INTO attempt_outcome (entry, kind, attempt) VALUES (?1, ?2, ?3)",
-        params![entry.seq, entry.kind, attempt],
+        "INSERT INTO attempt_outcome (entry, attempt) VALUES (?1, ?2)",
+        params![seq, attempt],
     )
     .map(drop)
 }
@@ -227,11 +206,16 @@ fn attempt(row: &Row, at: i32) -> DbResult<AttemptRef> {
     })
 }
 
+/// The attempt the outcome entry `seq` ended.
+fn ended(outcomes: &mut HashMap<i64, AttemptRef>, seq: i64) -> DbResult<AttemptRef> {
+    (outcomes.remove(&seq)).ok_or_else(|| corrupt(format!("entry {seq} ends no attempt")))
+}
+
 /// Requests, attempts and their outcomes, usage, failures and compaction.
 pub(super) fn events(
     events: &mut Events,
     messages: &Messages,
-    todos: &HashMap<i64, Vec<TodoItem>>,
+    todos: &mut HashMap<i64, Vec<TodoItem>>,
 ) -> DbResult<()> {
     let db = events.db;
     let tails = grouped(
@@ -263,20 +247,25 @@ pub(super) fn events(
         "SELECT compaction, source FROM compaction_retained ORDER BY compaction, source",
         |row| Ok(sequence(row.get(1)?).message()),
     )?;
+    // The attempt each outcome ended; what a kind's own row leaves ended interrupted.
+    let mut outcomes = keyed(
+        db,
+        "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
+         JOIN model_attempt a ON a.entry = o.attempt",
+        |row| attempt(row, 1),
+    )?;
     events.load(
-        "SELECT c.entry, a.request, a.attempt, c.frontier, c.message, c.reported_tokens \
-         FROM compaction c \
-         JOIN attempt_outcome o ON o.entry = c.entry JOIN model_attempt a ON a.entry = o.attempt",
+        "SELECT entry, frontier, message, reported_tokens FROM compaction",
         |row| {
             let seq = row.get::<i64>(0)?;
             Ok(SessionEvent::Compaction {
                 checkpoint: CompactionCheckpoint {
-                    frontier: sequence(row.get(3)?),
-                    message: messages.message(row.get(4)?)?,
-                    todos: todos.get(&seq).cloned().unwrap_or_default(),
+                    frontier: sequence(row.get(1)?),
+                    message: messages.message(row.get(2)?)?,
+                    todos: take(todos, seq),
                     retained: retained.get(&seq).cloned().unwrap_or_default(),
-                    attempt: attempt(row, 1)?,
-                    trigger: match row.get::<Option<u64>>(5)? {
+                    attempt: ended(&mut outcomes, seq)?,
+                    trigger: match row.get::<Option<u64>>(3)? {
                         Some(tokens) => CompactionTrigger::Occupancy(tokens),
                         None => CompactionTrigger::Overflow,
                     },
@@ -287,60 +276,49 @@ pub(super) fn events(
     events.load("SELECT entry, request, attempt FROM model_attempt", |row| {
         Ok(SessionEvent::ModelAttemptStarted(attempt(row, 1)?))
     })?;
-    events.load_with(
-        "SELECT entry, failure, provider, detail FROM failure WHERE kind = ?1",
-        params![EntryKind::AgentFailed],
+    // A failure that ended an attempt is a model failure; any other, an agent's.
+    events.load(
+        "SELECT entry, failure, provider, detail, retry_millis FROM failure",
         |row| {
-            Ok(SessionEvent::AgentFailed {
-                failure: failure_at(row, 1)?,
-            })
-        },
-    )?;
-    events.load_with(
-        "SELECT f.entry, a.request, a.attempt, f.failure, f.provider, f.detail, f.retry_millis \
-         FROM failure f JOIN attempt_outcome o ON o.entry = f.entry \
-         JOIN model_attempt a ON a.entry = o.attempt WHERE f.kind = ?1",
-        params![EntryKind::ModelFailed],
-        |row| {
-            let failure = match (failure_at(row, 3)?, row.get::<Option<u64>>(6)?) {
-                (failure, None) => AttemptFailure::Final(failure),
-                (Failure::Provider(message, kind), Some(millis)) => AttemptFailure::Retrying {
-                    message,
-                    kind,
-                    delay: std::time::Duration::from_millis(millis).into(),
+            let attempt = outcomes.remove(&row.get(0)?);
+            Ok(
+                match (attempt, failure_at(row, 1)?, row.get::<Option<u64>>(4)?) {
+                    (None, failure, None) => SessionEvent::AgentFailed { failure },
+                    (Some(attempt), failure, None) => SessionEvent::ModelFailed {
+                        attempt,
+                        failure: AttemptFailure::Final(failure),
+                    },
+                    (Some(attempt), Failure::Provider(message, kind), Some(millis)) => {
+                        let delay = std::time::Duration::from_millis(millis).into();
+                        SessionEvent::ModelFailed {
+                            attempt,
+                            failure: AttemptFailure::Retrying {
+                                message,
+                                kind,
+                                delay,
+                            },
+                        }
+                    }
+                    _ => return Err(corrupt("only a model's provider failure retries")),
                 },
-                (_, Some(_)) => return Err(corrupt("only a provider failure retries")),
-            };
-            Ok(SessionEvent::ModelFailed {
-                attempt: attempt(row, 1)?,
-                failure,
-            })
+            )
         },
-    )?;
-    events.load_with(
-        "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
-         JOIN model_attempt a ON a.entry = o.attempt WHERE o.kind = ?1",
-        params![EntryKind::ModelAttemptInterrupted],
-        |row| Ok(SessionEvent::ModelAttemptInterrupted(attempt(row, 1)?)),
     )?;
     events.load(
-        "SELECT r.entry, a.request, a.attempt, m.entry, r.outcome, r.cut_reason \
-         FROM model_response r JOIN attempt_outcome o ON o.entry = r.entry \
-         JOIN model_attempt a ON a.entry = o.attempt \
+        "SELECT r.entry, m.entry, r.outcome, r.cut_reason FROM model_response r \
          JOIN message_commit m ON m.message = r.message",
         |row| {
             Ok(SessionEvent::ResponseCompleted {
-                attempt: attempt(row, 1)?,
-                message: sequence(row.get(3)?).message(),
-                outcome: match (enum_column(row, 4)?, optional_enum_column(row, 5)?) {
-                    (ResponseOutcome::Answer, None) => CompletedOutcome::Answer,
-                    (ResponseOutcome::ToolUse, None) => CompletedOutcome::ToolUse,
-                    (ResponseOutcome::Cut, Some(truncation)) => CompletedOutcome::Cut(truncation),
-                    _ => return Err(corrupt("response outcome does not match its cut reason")),
-                },
+                attempt: ended(&mut outcomes, row.get(0)?)?,
+                message: sequence(row.get(1)?).message(),
+                outcome: CompletedOutcome::from_parts(enum_column(row, 2)?, None, row.get(3)?)
+                    .ok_or_else(|| corrupt("response outcome does not match its cut reason"))?,
             })
         },
     )?;
+    for (entry, attempt) in outcomes {
+        events.insert(entry, SessionEvent::ModelAttemptInterrupted(attempt))?;
+    }
     events.load(
         "SELECT o.entry, o.request, a.attempt, o.fault, o.detail \
          FROM compaction_failure o LEFT JOIN model_attempt a ON a.entry = o.attempt",
@@ -385,7 +363,7 @@ mod tests {
     use super::*;
     use crate::agent::FaultKind;
     use crate::session::{
-        ModelContext, ModelPurpose,
+        EntryKind, ModelContext, ModelPurpose,
         db::tests::Fixture,
         tests::{attempt, profile, requested},
     };
@@ -409,27 +387,23 @@ mod tests {
             unreachable!()
         };
         let (checkpoint, stale) = (FaultKind::Checkpoint, Some("stale_todos"));
-        for (seq, attempt, detail, accepted) in [
-            (100_u64, other, stale, false),
-            (101, own, None, false),
-            (102, own, Some("not_a_checkpoint_error"), false),
-            (103, own, stale, true),
-        ] {
-            let kind = EntryKind::CompactionFailed;
-            fixture
-                .db
-                .execute(
-                    "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
-                     VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)",
-                    params![seq, kind],
-                )
-                .unwrap();
-            let inserted = fixture.db.execute(
-                "INSERT INTO compaction_failure (entry, request, attempt, fault, detail) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![seq, request, attempt, checkpoint, detail],
-            );
-            assert_eq!(inserted.is_ok(), accepted, "{seq}");
-        }
+        let failed = |seq: u64, attempt, detail: Option<&str>| {
+            fixture.file(
+                seq,
+                EntryKind::CompactionFailed,
+                &[
+                    "INSERT INTO compaction_failure (entry, request, attempt, fault, detail) \
+                   VALUES (?1, ?2, ?3, ?4, ?5)",
+                ],
+                params![request, attempt, checkpoint, detail],
+            )
+        };
+        assert!(failed(100, other, stale).is_err());
+        assert!(failed(101, own, Some("not_a_checkpoint_error")).is_err());
+        failed(102, own, stale).unwrap();
+        fixture.decode().unwrap();
+        // A fault missing its detail is stored, but never decodes.
+        failed(103, own, None).unwrap();
+        assert!(matches!(fixture.decode(), Err(DbError::Corrupt(_))));
     }
 }

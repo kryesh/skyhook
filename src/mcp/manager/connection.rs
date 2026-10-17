@@ -107,7 +107,6 @@ pub(super) async fn connect_one(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, failure, fixture_call, shutdown, wait_for_file};
     use super::super::{STARTUP_CONCURRENCY, StartupError};
@@ -203,12 +202,9 @@ server.serve_forever()
         with_env(config, "MCP_TEST_READY", fixture.path("ready"))
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn startup_timeout_reaps_owned_stdio_child() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let config: McpServerConfig = hanging(&fixture).try_into().unwrap();
         // The deadline expires once the child it must reap is running.
         let pid = fixture.directory.path().join("pid");
@@ -232,9 +228,7 @@ server.serve_forever()
         use crate::provider::http::transport::tests::{read_request, reply};
         use tokio::io::AsyncWriteExt;
 
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         // Authentication, application, and malformed-protocol failures must not be
         // confused with an unreachable endpoint that is eligible for launch.
         for status in [
@@ -272,12 +266,9 @@ server.serve_forever()
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn refused_http_port_launches_command_waits_for_readiness_and_reaps_child() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         // No request can succeed until the manager launches the HTTP subprocess.
         let port = crate::tests::RefusedPort::new();
         let manager = connect(http_fixture_config(&fixture, port.address().port())).await;
@@ -295,12 +286,9 @@ server.serve_forever()
         assert_process_reaped(pid).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_reaps_owned_server_without_waiting_for_session_close() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let port = crate::tests::RefusedPort::new();
         let config = http_fixture_config(&fixture, port.address().port());
         let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
@@ -328,9 +316,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn shutdown_does_not_terminate_an_externally_managed_http_server() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let mut config = http_fixture_config(&fixture, 0);
         let argv = config.start_command.as_ref().unwrap();
         let mut child = tokio::process::Command::new(&argv[0])
@@ -369,12 +355,10 @@ server.serve_forever()
         child.wait().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn startup_cancellation_reaps_child_and_does_not_launch_later_servers() {
-        let Some([queued, started @ ..]) = Fixture::batch::<{ STARTUP_CONCURRENCY + 1 }>() else {
-            return;
-        };
+        let [queued, started @ ..]: [Fixture; STARTUP_CONCURRENCY + 1] =
+            std::array::from_fn(|_| Fixture::new());
         // Fill every startup slot with hanging initialization, leaving one more
         // queued. Cancellation must drain/reap the started slots but never
         // launch the queued server.
@@ -411,12 +395,9 @@ server.serve_forever()
         shutdown(&manager).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_shutdown_waiter_does_not_discard_cleanup_task() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let manager = connect(fixture.config()).await;
         let pid = fixture.pid();
         // One poll stores the cleanup task; dropping the waiter then cancels it.
@@ -427,12 +408,9 @@ server.serve_forever()
         assert_process_reaped(pid).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn expired_http_session_never_reinitializes_or_replays_tool_call() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let port = crate::tests::RefusedPort::new();
         let config = http_fixture_config(&fixture, port.address().port());
         let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
@@ -445,13 +423,10 @@ server.serve_forever()
         shutdown(&manager).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_kills_entire_owned_process_group_not_unrelated_processes() {
         use std::os::unix::process::ExitStatusExt;
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let manager = connect(fixture.config()).await;
         let pid = fixture.pid();
         // Join a test-owned child to the server group. Retaining its Child handle
@@ -477,9 +452,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn oversized_unterminated_stdio_frame_is_rejected_and_process_cleaned_up() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
+        let fixture = Fixture::new();
         let config = with_env(fixture.config(), "MCP_TEST_OVERSIZED_FRAME", "1".into());
         let manager = connect(config).await;
         assert!(manager.catalog().is_empty());
@@ -488,7 +461,6 @@ server.serve_forever()
             !matches!(*error, StartupError::Mcp(McpError::Timeout)),
             "frame rejected before startup deadline"
         );
-        #[cfg(unix)]
         assert_process_reaped(fixture.pid()).await;
         shutdown(&manager).await;
     }

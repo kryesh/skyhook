@@ -40,9 +40,10 @@ providers:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
     # reasoning_summary: null
-    # Responses-only selections, sent only when set. Availability depends on the
-    # endpoint, model, and account; faster tiers can cost more.
+    # Sent only when set, on any codec. Availability depends on the endpoint, model,
+    # and account; faster tiers can cost more.
     # service_tier: "priority"         # wire tier ID, sent as written
+    # Responses-only selection, sent only when set.
     # Cybersecurity access program (standard, daybreak_blue, or daybreak_red); the
     # model and account must be eligible: https://developers.openai.com/api/docs/guides/daybreak
     # access_programs:
@@ -162,10 +163,8 @@ providers:
     base_url: "http://127.0.0.1:8080/v1"
     # A compatible entry may still place each dimension itself, for example a server
     # that spells the reasoning replay field differently or ignores max_completion_tokens:
-    # reasoning_replay:
-    #   field: "reasoning"
-    # output_limit:
-    #   field: "max_tokens"
+    # reasoning_replay: "reasoning"
+    # output_limit: "max_tokens"
     # Fixed request headers apply to every dialect (proxies, attribution); each value
     # takes the same three forms as api_key:
     # headers:

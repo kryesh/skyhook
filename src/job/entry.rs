@@ -17,7 +17,6 @@ pub(super) struct Finished {
     pub(super) end: JobEnd,
     pub(super) images: Vec<ImageRef>,
     pub(super) diagnostic: Option<Diagnostic>,
-    pub(super) output_diagnostic: Option<Diagnostic>,
 }
 
 /// A phase change: the journaled transitions, plus the question a live job asks
@@ -46,7 +45,6 @@ impl JobChange {
                 job,
                 state,
                 diagnostic,
-                output_diagnostic,
                 images,
             } => Some((
                 *job,
@@ -54,7 +52,6 @@ impl JobChange {
                     end: *state,
                     images: images.clone(),
                     diagnostic: diagnostic.clone(),
-                    output_diagnostic: output_diagnostic.clone(),
                 })),
             )),
             _ => None,
@@ -78,7 +75,6 @@ impl JobChange {
                     job,
                     state: finished.end,
                     diagnostic: finished.diagnostic.clone(),
-                    output_diagnostic: finished.output_diagnostic.clone(),
                     images: finished.images.clone(),
                 };
             }
@@ -276,9 +272,8 @@ pub(super) struct JobFacts {
     pub(super) delivery: DeliveryState,
     pub(super) background: bool,
     pub(super) location: ExecutionLocation,
-    /// Live only: what can restart it once it ends. The supervisor holds the
-    /// handler that does.
-    pub(super) resume: Option<Retained>,
+    /// Live only: what restarts it once it ends.
+    pub(super) resume: Option<Resume>,
     /// Live only: a finish holds the claim until its outcome applies or fails.
     pub(super) finishing: bool,
     /// Live only: the pending deliveries its runs read, which its finish
@@ -454,7 +449,7 @@ impl JobFacts {
                 // A new delivery even after an earlier question was acknowledged.
                 self.pend_delivery(stamps);
                 // A call asked for again restarts only from an interruption.
-                let relaunch = self.resume == Some(Retained::Call);
+                let relaunch = matches!(self.resume, Some(Resume::Call(_)));
                 if end == JobEnd::Cancelled || (relaunch && end != JobEnd::Interrupted) {
                     self.resume = None;
                 }
@@ -568,7 +563,6 @@ impl JobFacts {
             origin: self.origin.clone(),
             question: None,
             diagnostic,
-            output_diagnostic: finished.and_then(|finished| finished.output_diagnostic.clone()),
             location: self.location.clone(),
             resumable: self.accepts_input && self.resume.is_some(),
         }
@@ -598,8 +592,6 @@ pub(super) struct JobHandles {
     /// The worker attached to the invocation running it, which a forced abort
     /// or that invocation's finish stops.
     pub(super) task_abort: Option<(Invocation, AbortHandle)>,
-    /// What restarts it once it ends, while the core records that it can.
-    pub(super) resume: Option<Resume>,
     /// The process it runs, while that process runs.
     pub(super) process: Option<u32>,
 }
@@ -611,7 +603,6 @@ impl JobHandles {
             input,
             cancellation,
             task_abort: None,
-            resume: None,
             process: None,
         };
         (handles, receiver)

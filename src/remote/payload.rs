@@ -13,7 +13,7 @@ use crate::remote::{
     flow::{self, CHUNK_BYTES, Credits, WINDOW},
     protocol::{
         ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolResult, RequestId, Response,
-        Sequence, write_frame_within,
+        Sequence, write_frame,
     },
 };
 use crate::tool::output::{OutputContext, OutputEvent, OutputSink};
@@ -163,20 +163,18 @@ impl PayloadReceiver {
         self.credits.clone()
     }
 
-    /// Write the queued payloads as frames of at most `frame_limit` bytes.
+    /// Write the queued payloads as frames.
     pub(crate) async fn forward<W: AsyncWrite + Unpin + Send + 'static>(
         mut self,
         writer: Arc<Mutex<W>>,
-        frame_limit: usize,
     ) -> io::Result<()> {
         while let Some(event) = self.receiver.recv().await {
             match event {
                 Outgoing::Payload { request_id, event } => {
                     self.credits.take().await?;
-                    write_frame_within(
+                    write_frame(
                         &mut *writer.lock().await,
                         &Response::Payload { request_id, event },
-                        frame_limit,
                     )
                     .await?;
                 }
@@ -185,8 +183,7 @@ impl PayloadReceiver {
                     delivered,
                 } => {
                     let terminal = Response::Tool { request_id };
-                    let result =
-                        write_frame_within(&mut *writer.lock().await, &terminal, frame_limit).await;
+                    let result = write_frame(&mut *writer.lock().await, &terminal).await;
                     let receipt = result
                         .as_ref()
                         .copied()
@@ -225,9 +222,7 @@ impl Write for ChunkWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::protocol::{
-        MAX_FRAME_BYTES, PromptId, RemoteToolOutput, read_frame, write_frame,
-    };
+    use crate::remote::protocol::{PromptId, RemoteToolOutput, read_frame};
     use crate::tests::bounded;
     use crate::tool::output::{CaptureEvent, CaptureId};
 
@@ -242,9 +237,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        // The result is larger than a frame, so only chunking can carry it.
-        let frame_limit = 2 * CHUNK_BYTES;
-        let bytes = frame_limit + 1;
+        // The result spans several chunks.
+        let bytes = 2 * CHUNK_BYTES + 1;
         runtime.block_on(async {
             let (sender, receiver) = PayloadSender::new();
             let result = sender.request(RequestId::new(1));
@@ -258,11 +252,8 @@ mod tests {
                 .await
                 .unwrap();
             let completion = tokio::spawn(result.finish(Ok(RemoteToolOutput {
-                diagnostic: None,
                 value: serde_json::json!({"value": "x".repeat(bytes)}),
-                images: Vec::new(),
-                captures: Vec::new(),
-                streams: Default::default(),
+                ..Default::default()
             })));
             bounded(async {
                 while sender.0.capacity() == WINDOW {
@@ -287,7 +278,7 @@ mod tests {
             .await;
             let credits = receiver.credits();
             let (input, mut peer) = tokio::io::duplex(4096);
-            let forward = receiver.forward(Arc::new(Mutex::new(input)), frame_limit);
+            let forward = receiver.forward(Arc::new(Mutex::new(input)));
             let forward = tokio::spawn(forward);
             let received = tokio::spawn(async move {
                 let mut streamed_bytes = 0;
@@ -300,6 +291,7 @@ mod tests {
                                 data,
                             } = event
                             {
+                                assert!(data.len() <= CHUNK_BYTES);
                                 streamed_bytes += data.len();
                             }
                             credits.acknowledge().unwrap();
@@ -328,7 +320,7 @@ mod tests {
         let credits = receiver.credits();
         let (input, mut output) = tokio::io::duplex(4096);
         let writer = Arc::new(Mutex::new(input));
-        let forward = receiver.forward(writer.clone(), MAX_FRAME_BYTES);
+        let forward = receiver.forward(writer.clone());
         let forward = tokio::spawn(forward);
         let mut producers = Vec::new();
         for request_id in [RequestId::new(1), RequestId::new(2)] {

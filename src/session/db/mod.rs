@@ -31,7 +31,7 @@ pub use state::{SessionSummary, SessionTitle};
 pub(super) use state::{summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 22;
+pub(super) const USER_VERSION: i64 = 23;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -287,8 +287,7 @@ enum Seeding {
 struct Dictionaries<'a>(&'a Db, Seeding);
 
 impl Dictionaries<'_> {
-    /// Seed each dictionary with its enum's spellings and flags, and each subset
-    /// dictionary with the values its columns may take.
+    /// Seed each dictionary with its enum's spellings and flags.
     fn seed(&self) -> DbResult<()> {
         use crate::{
             agent::TodoStatus,
@@ -298,48 +297,17 @@ impl Dictionaries<'_> {
                 profile::StateMode,
                 protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
             },
-            session::{EntryKind as E, ModelPurpose, TitleSource, Truncation},
+            session::{EntryKind, ModelPurpose, TitleSource, Truncation, event::ResponseOutcome},
             target::{SshAuth, TargetSource},
             tool::{
-                diagnostic::{Effects, IoKind, Operation, PathRole},
+                diagnostic::{Effects, IoKind, Operation, PathRole, RequestEffects},
                 policy::Capability,
             },
         };
         self.names("capability", &Capability::ALL)?;
-        self.flagged("entry_kind", ["activity"], &E::ALL, |kind| {
+        self.flagged("entry_kind", ["activity"], &EntryKind::ALL, |kind| {
             [kind.is_activity()]
         })?;
-        // The entry kinds each subset dictionary admits to the subtype table it narrows.
-        for (table, kinds) in [
-            (
-                "targets_entry_kind",
-                &[E::SessionStarted, E::TargetsUpserted][..],
-            ),
-            ("mode_entry_kind", &[E::AgentStarted, E::ModeChanged]),
-            ("todos_entry_kind", &[E::TodosReplaced, E::Compaction]),
-            ("failure_entry_kind", &[E::AgentFailed, E::ModelFailed]),
-            (
-                "attempt_outcome_kind",
-                &[
-                    E::Compaction,
-                    E::ModelFailed,
-                    E::ModelAttemptInterrupted,
-                    E::ResponseCompleted,
-                ],
-            ),
-            (
-                "delivery_kind",
-                &[
-                    E::JobClaimed,
-                    E::JobReleased,
-                    E::JobMessageReleased,
-                    E::JobInjected,
-                    E::JobMessageDelivered,
-                ],
-            ),
-        ] {
-            self.names(table, kinds)?;
-        }
         self.names("title_source", &TitleSource::ALL)?;
         self.names("target_source", &TargetSource::ALL)?;
         self.names("ssh_auth", &SshAuth::ALL)?;
@@ -347,20 +315,14 @@ impl Dictionaries<'_> {
         self.names("model_purpose", &ModelPurpose::ALL)?;
         self.names("message_role", &message::MessageRole::ALL)?;
         self.names("image_format", &ImageFormat::ALL)?;
-        self.flagged(
-            "user_part_kind",
-            ["text"],
-            &message::UserPartKind::ALL,
-            |kind| [kind.text()],
-        )?;
+        self.names("user_part_kind", &message::UserPartKind::ALL)?;
         self.names("job_event_kind", &message::JobEventKind::ALL)?;
         self.names("item_kind", &ItemKind::ALL)?;
-        self.names("block_item_kind", &[ItemKind::Text, ItemKind::Reasoning])?;
         self.names("replay_binding", &Binding::ALL)?;
         self.names("replay_format", &ReplayFormat::ALL)?;
         self.names("todo_status", &TodoStatus::ALL)?;
         self.names("history_lifetime", &HistoryLifetime::ALL)?;
-        self.names("response_outcome", &request::ResponseOutcome::ALL)?;
+        self.names("response_outcome", &ResponseOutcome::ALL)?;
         self.names("cut_reason", &Truncation::ALL)?;
         self.names("job_role", &JobRole::ALL)?;
         self.names("capture_kind", &CaptureKind::ALL)?;
@@ -369,37 +331,21 @@ impl Dictionaries<'_> {
             "field_presentation",
             &crate::tool::output::FieldPresentation::ALL,
         )?;
-        self.names("diagnostic_slot", &diagnostic::Slot::ALL)?;
         self.names("diagnostic_operation", &Operation::ALL)?;
-        self.flagged(
-            "diagnostic_subject",
-            ["path", "text"],
-            &diagnostic::SubjectKind::ALL,
-            diagnostic::SubjectKind::stores,
-        )?;
+        self.names("diagnostic_subject", &diagnostic::SubjectKind::ALL)?;
         self.names("diagnostic_site", &diagnostic::SiteKind::ALL)?;
         self.names("diagnostic_effects", &Effects::ALL)?;
-        self.flagged(
-            "diagnostic_cause",
-            ["text", "job"],
-            &diagnostic::CauseKind::ALL,
-            diagnostic::CauseKind::stores,
-        )?;
+        self.names("diagnostic_request_effects", &RequestEffects::ALL)?;
+        self.names("diagnostic_cause", &diagnostic::CauseKind::ALL)?;
         self.names("diagnostic_io_kind", &IoKind::ALL)?;
         self.names("diagnostic_path_role", &PathRole::ALL)?;
-        self.flagged("job_state", ["terminal"], &JobState::ALL, |state| {
-            [state.is_terminal()]
-        })?;
-        self.flagged("failure_kind", ["detailed"], &FailureKind::ALL, |kind| {
-            [kind.detailed()]
-        })?;
+        self.names("job_state", &JobState::ALL)?;
+        self.names("failure_kind", &FailureKind::ALL)?;
         self.names(
             "provider_error_kind",
             &crate::provider::ProviderErrorKind::ALL,
         )?;
-        self.flagged("compaction_fault", ["detailed"], &FaultKind::ALL, |fault| {
-            [fault.detailed()]
-        })?;
+        self.names("compaction_fault", &FaultKind::ALL)?;
         self.names("checkpoint_error", &crate::session::CheckpointError::ALL)?;
         Ok(())
     }
@@ -577,17 +523,20 @@ mod tests {
     // encode -> decode round trips in encode.rs.
     use serde_json::json;
 
-    use super::{Db, DbError, Encoder, OpenMode, decode_records};
+    use super::{Db, DbError, Encoder, OpenMode, decode_records, state::SessionSummary};
     use crate::{
+        agent::TurnFailure,
         execution::ExecutionLocation,
         identity::{AgentId, EventId, JobId, SessionId},
-        job::{JobEnd, JobRole, JobTransition},
+        job::JobTransition,
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
         provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
-            EventRecord, Message, ModelCallOrigin, RecordSeq, SessionEvent, UserPart,
-            tests::{child_started, start_events},
+            EntryKind, EventRecord, Message, ModeSelection, ModelContext, ModelPurpose, RecordSeq,
+            SessionEvent, UserPart,
+            tests::{attempt, child_started, profile, requested, start_events},
         },
+        tool::policy::Mode,
     };
 
     pub(super) struct Fixture {
@@ -674,8 +623,35 @@ mod tests {
             assert_eq!(self.records.len(), before);
         }
 
+        /// Hand-write the root's entry `seq` of `kind` and the `rows` filed under it, or
+        /// none of them. Each row binds `?1` to `seq`, then `params`.
+        pub(super) fn file(
+            &self,
+            seq: u64,
+            kind: EntryKind,
+            rows: &[&str],
+            params: Vec<libsql::Value>,
+        ) -> Result<(), DbError> {
+            self.db.atomic(|| {
+                self.db.execute(
+                    "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
+                     VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)",
+                    params![seq, kind],
+                )?;
+                for row in rows {
+                    let params = params![seq].into_iter().chain(params.iter().cloned());
+                    self.db.execute(row, params.collect())?;
+                }
+                Ok(())
+            })
+        }
+
+        pub(super) fn decode(&self) -> Result<Vec<EventRecord>, DbError> {
+            decode_records(&self.db, self.session)
+        }
+
         pub(super) fn assert_round_trip(&self) {
-            let decoded = decode_records(&self.db, self.session).unwrap();
+            let decoded = self.decode().unwrap();
             assert_eq!(decoded.len(), self.records.len());
             for (decoded, expected) in decoded.iter().zip(&self.records) {
                 assert_eq!(decoded, expected);
@@ -697,13 +673,13 @@ mod tests {
 
     pub(super) fn result(id: &str, name: &str, images: Vec<ImageRef>) -> SessionEvent {
         SessionEvent::MessageCommitted {
-            message: Message::Tool(vec![ToolResult {
+            message: Message::Tool(ToolResult {
                 call_id: id.into(),
                 name: name.into(),
                 result: json!({"ok": true, "nested": [1, null]}),
                 images,
                 is_error: false,
-            }]),
+            }),
         }
     }
 
@@ -722,15 +698,15 @@ mod tests {
         }
         // A second root agent.
         fixture.reject(root.clone(), child_started(None, workspace));
-        // Results need an open committed call; messages carry one result.
+        // Results need an open committed call.
         fixture.reject(root.clone(), result("missing", "read", Vec::new()));
-        let assistant = one!(SessionEvent::MessageCommitted {
+        one!(SessionEvent::MessageCommitted {
             message: Message::Assistant(vec![call("a", "read")]),
         });
         fixture.reject(root.clone(), result("a", "write", Vec::new()));
         one!(result("a", "read", Vec::new()));
         fixture.reject(root.clone(), result("a", "read", Vec::new()));
-        // Unknown jobs and duplicate finishes.
+        // Unknown jobs.
         let job = JobId::new(1).unwrap();
         fixture.reject(
             root.clone(),
@@ -739,36 +715,6 @@ mod tests {
                 state: JobTransition::Running,
             },
         );
-        one!(SessionEvent::JobCreated {
-            job,
-            parent: None,
-            origin: Some(ModelCallOrigin {
-                message: assistant.message(),
-                call_id: "a".into(),
-            }),
-            tool: "read".into(),
-            role: JobRole::Tool,
-            name: None,
-            arguments: json!({}),
-            output_schema: None,
-            accepts_input: false,
-            background: false,
-            location: ExecutionLocation::root("/workspace".into()),
-        });
-        let finished = |state| SessionEvent::JobFinished {
-            job,
-            state,
-            diagnostic: None,
-            output_diagnostic: None,
-            images: Vec::new(),
-        };
-        one!(finished(JobEnd::Completed));
-        fixture.reject(root.clone(), finished(JobEnd::Failed));
-        one!(SessionEvent::JobStateChanged {
-            job,
-            state: JobTransition::Running,
-        });
-        one!(finished(JobEnd::Failed));
         // Unstored blobs cannot be referenced.
         let image = ImageRef {
             file: None,
@@ -791,7 +737,7 @@ mod tests {
                     message: "kept?".into(),
                 },
             ),
-            (root.clone(), finished(JobEnd::Completed)),
+            (root.clone(), result("missing", "read", Vec::new())),
         ]);
         assert!(batch.is_err());
         fixture.assert_round_trip();
@@ -816,9 +762,9 @@ mod tests {
                  DELETE FROM todo_status WHERE name = 'pending'",
             ),
             (
-                "job_state",
-                "DROP TRIGGER job_state_append_only_update; \
-                 UPDATE job_state SET terminal = 1 - terminal WHERE name = 'running'",
+                "entry_kind",
+                "DROP TRIGGER entry_kind_append_only_update; \
+                 UPDATE entry_kind SET activity = 1 - activity WHERE name = 'agent_interrupted'",
             ),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -848,76 +794,167 @@ mod tests {
         fixture.assert_round_trip();
     }
 
-    /// A model failure is its attempt's outcome; an agent failure has none.
+    /// A row filed under an entry of another kind never decodes, and the session list
+    /// never shows it: a title on a completion, a model failure that ended no attempt,
+    /// a todo list on an entry that holds none, capabilities or a mode edition on an
+    /// entry that applied no mode, status text beside a mode change, a user part in an
+    /// assistant message, a user message, model, start or mode under another kind's
+    /// entry, and an attempt or its outcome under another kind's entry. An agent failure
+    /// that retries never decodes either, though the session list reads it as filed.
     #[test]
-    fn only_agent_failures_stand_without_an_attempt_outcome() {
-        let mut fixture = Fixture::new();
-        fixture.start("/w");
-        for (seq, kind, accepted) in [
-            (100_i64, "agent_failed", true),
-            (101, "model_failed", false),
-        ] {
-            let entry = "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
-                         VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)";
-            fixture.db.execute(entry, params![seq, kind]).unwrap();
-            let failure = "INSERT INTO failure (entry, kind, failure) VALUES (?1, ?2, 'empty')";
-            let inserted = fixture.db.execute(failure, params![seq, kind]);
-            assert_eq!(inserted.is_ok(), accepted, "{kind}");
-        }
-    }
-
-    /// Only a run that restarts a finished job starts a new output generation; a
-    /// question answered mid-run, or a cancel after an interrupt, does not.
-    #[test]
-    fn job_generations_count_restarts_after_a_finish() {
-        let mut fixture = Fixture::new();
-        let root = fixture.start("/w");
-        let job = JobId::new(1).unwrap();
-        fixture.one(
-            root.clone(),
-            SessionEvent::JobCreated {
-                job,
-                parent: None,
-                origin: None,
-                tool: "agent".into(),
-                role: JobRole::Agent,
-                name: None,
-                arguments: json!({}),
-                output_schema: None,
-                accepts_input: true,
-                background: false,
-                location: ExecutionLocation::root("/w".into()),
-            },
-        );
-        let finished = |state| SessionEvent::JobFinished {
-            job,
-            state,
-            diagnostic: None,
-            output_diagnostic: None,
-            images: Vec::new(),
-        };
-        let state = |state| SessionEvent::JobStateChanged { job, state };
-        let generation = |fixture: &Fixture| {
-            let latest = "SELECT max(generation) FROM job_run WHERE job = ?1";
-            let latest = fixture
-                .db
-                .query_row(latest, params![job.get()], |row| Ok(row.get::<i64>(0)?));
-            latest.unwrap().unwrap()
-        };
-        for (event, expected) in [
-            (state(JobTransition::Running), 0),
-            (state(JobTransition::WaitingInput), 0),
-            (state(JobTransition::Running), 0),
-            (finished(JobEnd::Completed), 0),
-            (state(JobTransition::Running), 1),
-            (state(JobTransition::WaitingInput), 1),
-            (state(JobTransition::Running), 1),
-            (finished(JobEnd::Interrupted), 1),
-            (finished(JobEnd::Cancelled), 1),
-            (state(JobTransition::Running), 2),
-        ] {
-            fixture.one(root.clone(), event);
-            assert_eq!(generation(&fixture), expected);
+    fn rows_under_another_kinds_entry_are_corrupt() {
+        const STRAY_PROFILE: &str = "INSERT INTO model_profile (id, name, provider, model, \
+             max_context, max_output, supports_images, state_mode, digest) \
+             SELECT 99, 'stray', 'stray', 'm', 10, 1, 0, min(name), randomblob(32) FROM state_mode";
+        const RESPONSE: &str = "INSERT INTO model_response (entry, message, outcome) \
+             VALUES (?1, (SELECT max(message) FROM message_commit), 'answer')";
+        let stray_status = "INSERT INTO entry_text (entry, text) VALUES (?1, 'stray')";
+        let user_part = "INSERT INTO user_part (message, position, kind, text) \
+                         VALUES (?1 + 1000, 0, 'text', 'stray')";
+        let commit = "INSERT INTO message_commit (entry, message) VALUES (?1, ?1 + 1000)";
+        let cases: [(EntryKind, &[&str]); 14] = [
+            (
+                EntryKind::AgentCompleted,
+                &["INSERT INTO title (entry, source, text) VALUES (?1, 'user', 'stray')"],
+            ),
+            (
+                EntryKind::ModelFailed,
+                &["INSERT INTO failure (entry, failure) VALUES (?1, 'empty')"],
+            ),
+            (
+                EntryKind::AgentFailed,
+                &[
+                    "INSERT INTO failure (entry, failure, detail, provider, retry_millis) \
+                   VALUES (?1, 'provider', 'x', (SELECT min(name) FROM provider_error_kind), 5)",
+                ],
+            ),
+            (
+                EntryKind::AgentCompleted,
+                &["INSERT INTO todo_item (entry, position, text, status) \
+                   VALUES (?1, 0, 'stray', 'pending')"],
+            ),
+            (
+                EntryKind::AgentCompleted,
+                &["INSERT INTO agent_capability (entry, capability) VALUES (?1, 'read')"],
+            ),
+            (
+                EntryKind::AgentCompleted,
+                &["INSERT INTO mode (name, version, entry) VALUES ('stray', 1, ?1)"],
+            ),
+            (
+                EntryKind::ModeChanged,
+                &[
+                    stray_status,
+                    "INSERT INTO agent_mode (entry, mode_name, mode_version) \
+                     VALUES (?1, 'look', 1)",
+                ],
+            ),
+            (
+                EntryKind::MessageCommitted,
+                &[
+                    "INSERT INTO message (id, role) VALUES (?1 + 1000, 'assistant')",
+                    user_part,
+                    commit,
+                ],
+            ),
+            (
+                EntryKind::Status,
+                &[
+                    stray_status,
+                    "INSERT INTO message (id, role) VALUES (?1 + 1000, 'user')",
+                    user_part,
+                    commit,
+                ],
+            ),
+            (
+                EntryKind::AgentCompleted,
+                &[
+                    STRAY_PROFILE,
+                    "INSERT INTO model_selection (entry, profile) VALUES (?1, 99)",
+                ],
+            ),
+            (
+                EntryKind::ModeChanged,
+                &[
+                    STRAY_PROFILE,
+                    "INSERT INTO agent_start (entry, profile, location_target, location_workspace) \
+                     VALUES (?1, 99, (SELECT min(id) FROM target), x'2f')",
+                    "INSERT INTO agent_mode (entry, mode_name, mode_version) \
+                     VALUES (?1, 'look', 1)",
+                ],
+            ),
+            (
+                EntryKind::JobClaimed,
+                &[
+                    "INSERT INTO mode (name, version, entry) VALUES ('stray', 1, ?1)",
+                    "INSERT INTO agent_mode (entry, mode_name, mode_version) \
+                     VALUES (?1, 'stray', 1)",
+                ],
+            ),
+            (
+                EntryKind::Status,
+                &[
+                    stray_status,
+                    "INSERT INTO attempt_outcome (entry, attempt) \
+                     VALUES (?1, (SELECT max(entry) FROM model_attempt))",
+                    RESPONSE,
+                ],
+            ),
+            (
+                EntryKind::ResponseCompleted,
+                &[
+                    "INSERT INTO model_attempt (entry, request, attempt) \
+                     VALUES (?1, (SELECT max(entry) FROM model_request), 2)",
+                    "INSERT INTO attempt_outcome (entry, attempt) VALUES (?1, ?1)",
+                    RESPONSE,
+                ],
+            ),
+        ];
+        for (kind, rows) in cases {
+            // An interrupted turn with a mode and a model, and no title.
+            let mut fixture = Fixture::new();
+            let root = fixture.start("/w");
+            let look = ModeSelection {
+                name: "look".parse().unwrap(),
+                definition: Some(Mode {
+                    capabilities: Vec::new(),
+                    instructions: None,
+                    hint: None,
+                }),
+            };
+            fixture.one(
+                root.clone(),
+                SessionEvent::ModeChanged {
+                    mode: look,
+                    capabilities: Vec::new(),
+                },
+            );
+            let context = ModelContext::test(ModelPurpose::Agent, profile());
+            let context = fixture.one(root.clone(), SessionEvent::ModelContext { context });
+            let request = fixture.one(root.clone(), requested(context)).request();
+            fixture.one(root.clone(), attempt(request, 1));
+            let answer = Message::Assistant(vec![AssistantItem::text("answer", 0, "text")]);
+            fixture.one(root, SessionEvent::MessageCommitted { message: answer });
+            let summary = || super::state::summary(&fixture.db).unwrap();
+            let before = summary();
+            assert_eq!(before.stopped, Some(TurnFailure::Interrupted));
+            fixture.file(100, kind, rows, Vec::new()).unwrap();
+            assert!(
+                matches!(fixture.decode(), Err(DbError::Corrupt(_))),
+                "{rows:?}"
+            );
+            let after = summary();
+            let shown = |summary: &SessionSummary| {
+                (
+                    summary.title.clone(),
+                    summary.model.clone(),
+                    summary.mode.clone(),
+                )
+            };
+            assert_eq!(shown(&after), shown(&before), "{rows:?}");
+            if kind != EntryKind::AgentFailed {
+                assert_eq!(after.stopped, before.stopped, "{rows:?}");
+            }
         }
     }
 

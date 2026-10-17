@@ -1,4 +1,4 @@
-//! Relational encoding of terminal and output-persistence diagnostics.
+//! Relational encoding of terminal diagnostics.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -15,14 +15,6 @@ use crate::{
         Cause, Diagnostic, DiagnosticContext, FailureSite, IoKind, PathFact, Subject,
     },
 };
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
-    pub(super) enum Slot {
-        Diagnostic = "diagnostic",
-        OutputDiagnostic = "output_diagnostic",
-    }
-}
 
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -45,11 +37,10 @@ struct Columns {
 }
 
 /// Declare `$kind`, the journal's name for each `$enum` variant, beside the
-/// [`Columns`] each variant's fields fill: `split` and `join` convert between
-/// them, and `stores` flags which of `$flag` a kind fills, for its dictionary.
+/// [`Columns`] each variant's fields fill: `split` and `join` convert between them.
 macro_rules! stored_enum {
     (
-        $enum:ident / $kind:ident [$($flag:ident),+] {
+        $enum:ident / $kind:ident {
             $(
                 $variant:ident $(($tuple:ident))? $({ $($field:ident: $column:ident),+ })?
                     = $text:literal
@@ -59,19 +50,6 @@ macro_rules! stored_enum {
         named_enum! {
             #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
             pub(super) enum $kind { $($variant = $text),+ }
-        }
-
-        impl $kind {
-            pub(super) fn stores(self) -> [bool; crate::named_enum::count!($($flag)+)] {
-                let columns: &[&str] = match self {
-                    $(
-                        Self::$variant => {
-                            &[$(stringify!($tuple))? $($(stringify!($column)),+)?]
-                        }
-                    ),+
-                };
-                [$(columns.contains(&stringify!($flag))),+]
-            }
         }
 
         impl $enum {
@@ -104,7 +82,7 @@ macro_rules! stored_enum {
 }
 
 stored_enum! {
-    Subject / SubjectKind [path, text] {
+    Subject / SubjectKind {
         None = "none",
         Path(path) = "path",
         WorkingDirectory(path) = "working_directory",
@@ -120,7 +98,7 @@ stored_enum! {
 }
 
 stored_enum! {
-    Cause / CauseKind [text, job] {
+    Cause / CauseKind {
         Io { kind: io_kind, code: io_code, detail: io_detail } = "io",
         InvalidArguments(text) = "invalid_arguments",
         Denied(text) = "denied",
@@ -143,7 +121,6 @@ impl Encoder {
         &mut self,
         db: &Db,
         finish: u64,
-        slot: Slot,
         diagnostic: &Diagnostic,
     ) -> DbResult<()> {
         let context = &diagnostic.context;
@@ -159,13 +136,12 @@ impl Encoder {
         };
         let (cause, cause_columns) = diagnostic.cause.split();
         db.execute(
-            "INSERT INTO job_finish_diagnostic (finish, slot, operation, subject, subject_path, \
+            "INSERT INTO job_finish_diagnostic (finish, operation, subject, subject_path, \
              subject_text, subject_job, site, location_target, location_workspace, effects, \
-             cause, io_kind, io_code, cause_text, io_detail, cause_job) \
+             request, cause, io_kind, io_code, cause_text, io_detail, cause_job) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 finish,
-                slot,
                 context.operation,
                 subject,
                 subject_columns.path.as_deref().map(path_bytes),
@@ -175,6 +151,7 @@ impl Encoder {
                 target,
                 workspace,
                 context.effects,
+                context.request,
                 cause,
                 cause_columns.io_kind,
                 cause_columns.io_code.flatten().map(i64::from),
@@ -185,9 +162,9 @@ impl Encoder {
         )?;
         for (position, fact) in context.paths.iter().enumerate() {
             db.execute(
-                "INSERT INTO diagnostic_path (finish, slot, position, role, path) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![finish, slot, position, fact.role, path_bytes(&fact.path)],
+                "INSERT INTO diagnostic_path (finish, position, role, path) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![finish, position, fact.role, path_bytes(&fact.path)],
             )?;
         }
         Ok(())
@@ -202,21 +179,21 @@ fn job(row: &Row, index: i32) -> DbResult<Option<JobId>> {
 
 fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
     let subject = Subject::join(
-        enum_column(row, 3)?,
+        enum_column(row, 2)?,
         Columns {
-            path: row.get::<Option<Vec<u8>>>(4)?.map(path_from_bytes),
-            text: row.get(5)?,
-            job: job(row, 6)?,
+            path: row.get::<Option<Vec<u8>>>(3)?.map(path_from_bytes),
+            text: row.get(4)?,
+            job: job(row, 5)?,
             ..Columns::default()
         },
     )
     .ok_or_else(|| corrupt("diagnostic subject does not match its columns"))?;
-    let site = match enum_column(row, 7)? {
+    let site = match enum_column(row, 6)? {
         SiteKind::Invocation => FailureSite::Invocation,
         SiteKind::Host => FailureSite::Host,
         SiteKind::Execution => FailureSite::Execution(ExecutionLocation {
-            target: super::decode::parsed(row.get(8)?)?,
-            workspace: path_from_bytes(row.get(9)?),
+            target: super::decode::parsed(row.get(7)?)?,
+            workspace: path_from_bytes(row.get(8)?),
         }),
     };
     let cause = Cause::join(
@@ -233,27 +210,29 @@ fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
     .ok_or_else(|| corrupt("diagnostic cause does not match its columns"))?;
     Ok(Diagnostic {
         context: DiagnosticContext {
-            operation: enum_column(row, 2)?,
+            operation: enum_column(row, 1)?,
             subject,
             site,
-            effects: enum_column(row, 10)?,
+            effects: enum_column(row, 9)?,
+            request: enum_column(row, 10)?,
             paths,
         },
         cause,
     })
 }
 
-pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
-    let mut paths: HashMap<(i64, Slot), Vec<PathFact>> = HashMap::new();
+/// Each job finish's diagnostic, by its entry.
+pub(super) fn load(db: &Db) -> DbResult<HashMap<i64, Diagnostic>> {
+    let mut paths: HashMap<i64, Vec<PathFact>> = HashMap::new();
     for (key, fact) in db.query(
-        "SELECT finish, slot, role, path FROM diagnostic_path ORDER BY finish, slot, position",
+        "SELECT finish, role, path FROM diagnostic_path ORDER BY finish, position",
         Vec::new(),
         |row| {
             Ok((
-                (row.get(0)?, enum_column(row, 1)?),
+                row.get(0)?,
                 PathFact {
-                    role: enum_column(row, 2)?,
-                    path: path_from_bytes(row.get(3)?),
+                    role: enum_column(row, 1)?,
+                    path: path_from_bytes(row.get(2)?),
                 },
             ))
         },
@@ -262,14 +241,14 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
     }
     Ok(db
         .query(
-            "SELECT d.finish, d.slot, d.operation, d.subject, d.subject_path, d.subject_text, \
-             d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.cause, \
+            "SELECT d.finish, d.operation, d.subject, d.subject_path, d.subject_text, \
+             d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.request, d.cause, \
              d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job \
              FROM job_finish_diagnostic d \
              LEFT JOIN target t ON t.id = d.location_target",
             Vec::new(),
             |row| {
-                let key = (row.get(0)?, enum_column(row, 1)?);
+                let key = row.get(0)?;
                 Ok((key, decode(row, paths.remove(&key).unwrap_or_default())?))
             },
         )?
@@ -283,14 +262,10 @@ mod tests {
     use crate::{
         job::{JobEnd, JobRole},
         session::{SessionEvent, db::tests::Fixture},
-        tool::diagnostic::{Effects, IoKind, Operation, PartialContext, PathRole},
+        tool::diagnostic::{Effects, IoKind, Operation, PartialContext, PathRole, RequestEffects},
     };
 
-    fn finish(
-        fixture: &mut Fixture,
-        diagnostic: Option<Diagnostic>,
-        output_diagnostic: Option<Diagnostic>,
-    ) {
+    fn finish(fixture: &mut Fixture, diagnostic: Option<Diagnostic>) {
         let root = fixture.records[0].agent.clone();
         let job = JobId::new(fixture.records.len() as u64).unwrap();
         fixture.one(
@@ -315,20 +290,16 @@ mod tests {
                 job,
                 state: JobEnd::Completed,
                 diagnostic,
-                output_diagnostic,
                 images: Vec::new(),
             },
         );
     }
 
     #[test]
-    fn every_variant_native_path_and_independent_slot_round_trips() {
+    fn every_variant_and_native_path_round_trips() {
         let mut fixture = Fixture::new();
         fixture.start("/workspace");
-        #[cfg(unix)]
         let native = path_from_bytes(b"/remote-\xfe".to_vec());
-        #[cfg(not(unix))]
-        let native = path_from_bytes(b"/remote".to_vec());
         let subjects = [
             Subject::None,
             Subject::Path(native.clone()),
@@ -380,6 +351,7 @@ mod tests {
                     subject: subjects[index % subjects.len()].clone(),
                     site: sites[index % sites.len()].clone(),
                     effects: Effects::ALL[index % Effects::ALL.len()],
+                    request: RequestEffects::ALL[index % RequestEffects::ALL.len()],
                     // Caller order is retained, not grouped by role.
                     paths: vec![
                         PathFact {
@@ -394,7 +366,7 @@ mod tests {
                 },
                 cause: causes[index % causes.len()].clone(),
             };
-            let output_diagnostic = Diagnostic::new(
+            let io = Diagnostic::new(
                 PartialContext::new(Operation::FinishCapture, Subject::Label("stdout".into()))
                     .at(FailureSite::Host)
                     .effects(Effects::OutputIncomplete)
@@ -405,17 +377,10 @@ mod tests {
                     detail: None,
                 },
             );
-            finish(
-                &mut fixture,
-                Some(diagnostic.clone()),
-                Some(output_diagnostic.clone()),
-            );
-            if index == 0 {
-                finish(&mut fixture, None, Some(output_diagnostic));
-                finish(&mut fixture, Some(diagnostic), None);
-                finish(&mut fixture, None, None);
-            }
+            finish(&mut fixture, Some(diagnostic));
+            finish(&mut fixture, Some(io));
         }
+        finish(&mut fixture, None);
         fixture.assert_round_trip();
     }
 }

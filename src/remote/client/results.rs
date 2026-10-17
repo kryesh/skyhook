@@ -355,14 +355,7 @@ impl Ingestion {
         Ok(())
     }
 
-    fn output(
-        &mut self,
-        mut output: RemoteToolOutput,
-        location: &ExecutionLocation,
-    ) -> Result<ToolOutput, RemoteError> {
-        if let Some(diagnostic) = &mut output.diagnostic {
-            diagnostic.bind_worker(location);
-        }
+    fn output(&mut self, output: RemoteToolOutput) -> Result<ToolOutput, RemoteError> {
         let captures = self.captures.select(output.captures)?;
         let images = output
             .images
@@ -377,7 +370,6 @@ impl Ingestion {
             .with_images(images)
             .with_captures(captures);
         local.streams = output.streams;
-        local.diagnostic = output.diagnostic.map(Into::into);
         Ok(local)
     }
 
@@ -404,14 +396,14 @@ impl Ingestion {
         };
         Ok(match result {
             Ok(output) => Ok(Received {
-                output: self.output(output, location)?,
+                output: self.output(output)?,
                 source,
             }),
             Err(mut error) => {
                 let error_output = error
                     .output
                     .take()
-                    .map(|output| self.output(*output, location))
+                    .map(|output| self.output(*output))
                     .transpose()?;
                 // A shim's internal root (and any other claimed site) is relative
                 // to this routed invocation, not evidence of a host-side location.
@@ -427,7 +419,9 @@ impl Ingestion {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{fixture_context, route_fixture, wired_connection, write_result};
+    use super::super::tests::{
+        fixture_context, route_fixture, sink, wired_connection, write_result,
+    };
     use super::*;
     use crate::{
         job::output::CaptureKind,
@@ -477,11 +471,8 @@ mod tests {
                 ingest.receive(&context, event).await.unwrap();
             }
             let output = RemoteToolOutput {
-                diagnostic: None,
                 value: json!(null),
-                images: Vec::new(),
-                captures: Vec::new(),
-                streams: StreamEnd::Finished,
+                ..Default::default()
             };
             ingest.result = SpooledPayload::Finished(if failed {
                 Err(crate::remote::worker::remote_error(
@@ -522,61 +513,40 @@ mod tests {
                 "/forged".into(),
             )),
         ] {
-            for failed in [false, true] {
-                let diagnostic = Diagnostic::new(
-                    PartialContext::new(Operation::Read, Subject::path("missing"))
-                        .at(claimed.clone())
-                        .effects(Effects::Unchanged)
-                        .resolve(),
-                    Cause::Io {
-                        kind: IoKind::NotFound,
-                        code: Some(2),
-                        detail: None,
-                    },
-                );
-                let output = RemoteToolOutput {
-                    diagnostic: Some(diagnostic.clone()),
-                    value: json!({"kind":"error", "error":{"message":"unrendered"}}),
-                    images: Vec::new(),
-                    captures: Vec::new(),
+            let diagnostic = Diagnostic::new(
+                PartialContext::new(Operation::Read, Subject::path("missing"))
+                    .at(claimed.clone())
+                    .effects(Effects::Unchanged)
+                    .resolve(),
+                Cause::Io {
+                    kind: IoKind::NotFound,
+                    code: Some(2),
+                    detail: None,
+                },
+            );
+            let result: RemoteToolResult = Err(RemoteToolError {
+                diagnostic: Box::new(diagnostic),
+                output: Some(Box::new(RemoteToolOutput {
                     streams: StreamEnd::Cut,
-                };
-                let result = if failed {
-                    Err(RemoteToolError {
-                        diagnostic: Box::new(diagnostic),
-                        output: Some(Box::new(output)),
-                    })
-                } else {
-                    Ok(output)
-                };
-                let mut ingest = Ingestion::new(&context);
-                ingest.result = SpooledPayload::Finished(
-                    serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
-                );
-                let output = match ingest.finish(&trusted).unwrap() {
-                    Ok(received) => received.output,
-                    Err(error) => {
-                        let (diagnostic, output) = error.into_tool_error().into_parts();
-                        assert_eq!(diagnostic.context.operation, Operation::Read);
-                        assert_eq!(diagnostic.context.subject, Subject::path("missing"));
-                        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
-                        assert_eq!(
-                            diagnostic.context.site,
-                            FailureSite::Execution(trusted.clone())
-                        );
-                        output.unwrap()
-                    }
-                };
-                assert_eq!(output.streams, StreamEnd::Cut);
-                let diagnostic = output.diagnostic.unwrap().resolve();
-                assert_eq!(diagnostic.context.operation, Operation::Read);
-                assert_eq!(diagnostic.context.subject, Subject::path("missing"));
-                assert_eq!(diagnostic.context.effects, Effects::Unchanged);
-                assert_eq!(
-                    diagnostic.context.site,
-                    FailureSite::Execution(trusted.clone())
-                );
-            }
+                    ..Default::default()
+                })),
+            });
+            let mut ingest = Ingestion::new(&context);
+            ingest.result = SpooledPayload::Finished(
+                serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
+            );
+            let Err(error) = ingest.finish(&trusted).unwrap() else {
+                panic!("a failed result stays failed");
+            };
+            let (diagnostic, output) = error.into_tool_error().into_parts();
+            assert_eq!(diagnostic.context.operation, Operation::Read);
+            assert_eq!(diagnostic.context.subject, Subject::path("missing"));
+            assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+            assert_eq!(
+                diagnostic.context.site,
+                FailureSite::Execution(trusted.clone())
+            );
+            assert_eq!(output.unwrap().streams, StreamEnd::Cut);
         }
     }
 
@@ -680,7 +650,6 @@ mod tests {
                 String::new()
             };
             let output = RemoteToolOutput {
-                diagnostic: None,
                 value: json!({"content":"", "empty":"", "replaced":"", "partial":"", "large": large}),
                 images: vec![valid.clone(), invalid],
                 captures: selected
@@ -791,10 +760,13 @@ mod tests {
                     .unwrap(),
                 Some(Request::Cancel { .. })
             ));
-            assert!(matches!(
-                bounded(call).await.unwrap(),
-                Err(RemoteError::Cancelled)
-            ));
+            // The worker had the request: cancelling it does not prove it did nothing.
+            let Err(error) = bounded(call).await.unwrap() else {
+                panic!("a cancelled call returned a result");
+            };
+            let context = error.into_tool_error().diagnostic().context;
+            let may_have_executed = crate::tool::diagnostic::RequestEffects::MayHaveExecuted;
+            assert_eq!(context.request, may_have_executed);
             assert!(
                 connection
                     .state
@@ -805,7 +777,8 @@ mod tests {
             );
             let (mut peer, responses) = tokio::io::duplex(4096);
             let state = connection.state.clone();
-            let route = tokio::spawn(async move { route_fixture(responses, &state).await });
+            let route =
+                tokio::spawn(async move { route_fixture(responses, &state, &sink()).await });
             for event in [open(1, "/result/content"), data(1, b"late accepted prefix")] {
                 write_frame(
                     &mut peer,
@@ -822,11 +795,9 @@ mod tests {
                     &mut peer,
                     RequestId::new(1),
                     Ok(RemoteToolOutput {
-                        diagnostic: None,
                         value: json!({}),
-                        images: Vec::new(),
-                        captures: Vec::new(),
                         streams: StreamEnd::Cut,
+                        ..Default::default()
                     }),
                 )
                 .await;

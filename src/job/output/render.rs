@@ -282,7 +282,7 @@ pub(super) enum TextField {
 
 impl Resolved {
     /// The JSON value `json` is positioned at, which must be a container.
-    pub(super) fn json(mut json: Box<JsonField>) -> Result<Self, ToolError> {
+    fn json(mut json: Box<JsonField>) -> Result<Self, ToolError> {
         let container = match json.reader.peek().map_err(saved_json)? {
             ValueType::Object => Container::Object,
             ValueType::Array => Container::Array,
@@ -420,9 +420,7 @@ pub(super) fn resolve(
     let reader = &mut json.reader;
     let depth = ancestor.segments().count();
     for segment in field.segments().skip(depth) {
-        if cancellation.is_cancelled() {
-            return Err(ToolError::cancelled());
-        }
+        check_cancelled(cancellation)?;
         if !descend(reader, &segment, cancellation)? {
             return Err(missing());
         }
@@ -456,17 +454,11 @@ fn descend<R: Read>(
     segment: &str,
     cancellation: &crate::job::CancellationToken,
 ) -> Result<bool, ToolError> {
-    let cancelled = || {
-        cancellation
-            .is_cancelled()
-            .then(ToolError::cancelled)
-            .map_or(Ok(()), Err)
-    };
     match reader.peek().map_err(saved_json)? {
         ValueType::Object => {
             reader.begin_object().map_err(saved_json)?;
             while reader.has_next().map_err(saved_json)? {
-                cancelled()?;
+                check_cancelled(cancellation)?;
                 if reader.next_name().map_err(saved_json)? == segment {
                     return Ok(true);
                 }
@@ -480,7 +472,7 @@ fn descend<R: Read>(
             };
             reader.begin_array().map_err(saved_json)?;
             for _ in 0..index {
-                cancelled()?;
+                check_cancelled(cancellation)?;
                 if !reader.has_next().map_err(saved_json)? {
                     return Ok(false);
                 }

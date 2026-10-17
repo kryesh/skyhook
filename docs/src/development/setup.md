@@ -5,6 +5,7 @@
 - Rust 1.89 or newer via rustup, and [just](https://just.systems/) on `PATH`.
 - [Zig](https://ziglang.org/download/) on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) **only for
   building the SSH shims**.
+- `python3` on `PATH` for the test suite, whose MCP tests run a scripted server.
 
 ```sh
 git clone https://github.com/kryesh/skyhook.git

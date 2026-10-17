@@ -99,7 +99,6 @@ macro_rules! named_enum {
         impl $name {
             pub const ALL: [Self; $crate::named_enum::count!($($variant)+)] = [$(Self::$variant),+];
 
-            #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self { $(Self::$variant => $text),+ }
             }
@@ -172,8 +171,6 @@ impl<T: NamedEnum> Detail for T {
 /// followed by a [`NamedEnum`] class, journaled in a column of its own. A
 /// variant's serde name is its kind's, so the enum must derive `Serialize`.
 macro_rules! detailed_enum {
-    (@detailed) => { false };
-    (@detailed $detail:ty) => { true };
     (@bind $value:ident $detail:ty) => { $value };
     (@text) => { None };
     (@text $value:ident: $detail:ty) => {
@@ -211,15 +208,6 @@ macro_rules! detailed_enum {
             #[doc = concat!("A [`", stringify!($name), "`]'s kind, as the journal names it.")]
             #[derive(Clone, Copy, Debug, PartialEq, Eq, ::serde::Serialize)]
             $vis enum $kind { $( $variant = $text ),+ }
-        }
-
-        impl $kind {
-            /// Whether a value of this kind carries a detail.
-            pub(crate) const fn detailed(self) -> bool {
-                match self {
-                    $( Self::$variant => $crate::named_enum::detailed_enum!(@detailed $($detail)?) ),+
-                }
-            }
         }
 
         impl $name {

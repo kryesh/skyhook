@@ -89,19 +89,16 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        job::output::HostOutput,
-        tests::TestRuntime,
-        tool::output::{ProducedOutput, TextCaptureField},
+    use crate::tool::{
+        invocation::tests::CapturedOutput,
+        output::{OutputContext, TextCaptureField},
     };
+    use std::sync::Arc;
 
-    /// Writes `chunks` into a fresh stdout capture; returns the stored text, if published.
-    async fn written(runtime: &TestRuntime, chunks: &[&[u8]]) -> Option<String> {
-        let spec = crate::job::JobSpec::test(runtime.agent.clone(), "capture");
-        let job = runtime.jobs.test_create(spec).await;
-        let output = runtime.jobs.output(job);
-        let host = HostOutput::new(runtime.store.clone(), job);
-        let context = host.context();
+    /// Writes `chunks` into a fresh stdout capture; returns its text, if published.
+    async fn written(chunks: &[&[u8]]) -> Option<String> {
+        let sink = Arc::new(CapturedOutput::default());
+        let context = OutputContext::new(sink.clone());
         let writer = context
             .text_capture(TextCaptureField::Stdout)
             .await
@@ -112,22 +109,11 @@ mod tests {
         }
         let finished = capture.finish().await.unwrap();
         context.settle().await.unwrap();
-        let published = !host
-            .finish(
-                ProducedOutput::new(serde_json::Value::Null)
-                    .with_captures(finished.into_iter().collect()),
-            )
-            .unwrap()
-            .captures
-            .is_empty();
-        let bytes = output.test_bytes("/result/stdout");
-        assert_eq!(published, bytes.is_some());
-        bytes.map(|bytes| String::from_utf8(bytes).unwrap())
+        finished.map(|_| String::from_utf8(sink.bytes()).unwrap())
     }
 
     #[tokio::test]
     async fn decoder_matches_lossy_utf8_at_every_chunk_boundary() {
-        let runtime = TestRuntime::new().await;
         let corpus: &[&[u8]] = &[
             b"",
             b"plain\ntext",
@@ -143,13 +129,13 @@ mod tests {
             for split in 0..=bytes.len() {
                 let (head, tail) = bytes.split_at(split);
                 assert_eq!(
-                    written(&runtime, &[head, tail]).await,
+                    written(&[head, tail]).await,
                     expected,
                     "split {split} of {bytes:?}"
                 );
             }
             let single: Vec<&[u8]> = bytes.chunks(1).collect();
-            assert_eq!(written(&runtime, &single).await, expected);
+            assert_eq!(written(&single).await, expected);
         }
     }
 }

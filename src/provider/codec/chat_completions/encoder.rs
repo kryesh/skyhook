@@ -1,28 +1,24 @@
 //! Encode canonical history and provider-bound reasoning replay into Chat requests.
-use super::{
-    dialect::{Cache, Dialect, EmptyContent, ReasoningReplay, SystemRole, UsageRequest},
-    schema::validate_schema,
-};
+use super::dialect::{Dialect, EmptyContent, ReasoningReplay, SystemRole, UsageRequest};
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::InvalidRequest,
     codec::{
-        CodecName, SchemaConstraint, StateRole, ToolNames,
+        Cache, CacheControl, CodecName, ToolNames,
         common::{
-            check_tool, image_url, own_replay, signed_context, system_text, tool_text, user_parts,
+            StateWire, check_tool, image_url, is_sealed, own_replay, push_state, signed_context,
+            system_text, tool_text, user_parts,
         },
-        placement::breakpoint,
+        placement::{breakpoint, explicit_breakpoint, push_history},
         set_each,
     },
-    protocol::{
-        AssistantItem, Binding, Entry, HistoryLifetime, Message, ModelRequest, Replay, State, sent,
-    },
+    protocol::{AssistantItem, Entry, Message, ModelRequest, ReplayFormat},
 };
 use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
-/// The body fields this codec writes, routing included.
+/// The body fields this codec writes.
 pub(crate) const BODY_FIELDS: &[&str] = &[
     "model",
     "messages",
@@ -30,8 +26,7 @@ pub(crate) const BODY_FIELDS: &[&str] = &[
     "stream_options",
     "tools",
     "response_format",
-    "provider",
-    "models",
+    "prompt_cache_options",
 ];
 
 /// The assistant message fields this codec writes.
@@ -42,18 +37,22 @@ pub(crate) fn encode(
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
     let mut messages = Vec::new();
+    let marker = breakpoint_marker(dialect);
+    let cached = request
+        .system
+        .iter()
+        .filter(|segment| segment.cache)
+        .count();
     // One leading system message: many open-model chat templates reject
     // repeated or non-leading system turns.
     if let Some(text) = system_text(request) {
         let role = system_role(dialect);
-        let content = match dialect.cache {
-            Cache::ContentPartBreakpoints { ttl }
-                if request.system.iter().any(|segment| segment.cache) =>
-            {
+        let content = match &marker {
+            Some((key, marker)) if cached > 0 => {
                 let parts = request.system.iter().map(|segment| {
                     let mut part = json!({"type": "text", "text": segment.text});
                     if segment.cache {
-                        part["cache_control"] = breakpoint(ttl);
+                        part[*key] = marker.clone();
                     }
                     part
                 });
@@ -64,31 +63,41 @@ pub(crate) fn encode(
         messages.push(json!({"role": role, "content": content}));
     }
     let signed_only = signed_context(request, dialect.reasoning_replay.format().replay());
-    let (prefix, rest) = sent(&request.context);
+    let state_wire = StateWire {
+        system: system_role(dialect),
+        text: "text",
+        message: |role, content| json!({"role": role, "content": content}),
+    };
     let send = |messages: &mut Vec<Value>, entry: &Entry| match entry {
         Entry::Message(message) => push_message(request, dialect, signed_only, messages, message),
         Entry::State(state) => {
-            push_state(dialect, messages, state);
+            push_state(dialect.state_role, &state_wire, messages, state);
             Ok(())
         }
     };
-    for entry in prefix {
-        send(&mut messages, entry)?;
-    }
-    // The prefix is unchanged in later requests; a detached history never is.
-    if let Cache::ContentPartBreakpoints { ttl } = dialect.cache
-        && request.history_lifetime != HistoryLifetime::Detached
-    {
-        mark_last_cacheable(&mut messages, breakpoint(ttl));
-    }
-    for entry in rest {
-        send(&mut messages, entry)?;
-    }
-    flatten_text_content(&mut messages);
+    let budget = marker.as_ref().map(|_| dialect.breakpoints);
+    let key = marker.as_ref().map_or("", |(key, _)| key);
+    push_history(
+        &mut messages,
+        request,
+        budget,
+        cached,
+        send,
+        |messages| last_cacheable(messages, key),
+        |messages, at| {
+            if let Some((key, marker)) = &marker {
+                mark_cacheable(messages, at, key, marker);
+            }
+        },
+    )?;
+    flatten_text_content(&mut messages, marker.map(|(key, ..)| key));
     let mut root = Map::new();
     root.insert("model".into(), json!(request.model));
     root.insert("messages".into(), Value::Array(messages));
     root.insert("stream".into(), json!(true));
+    if let Some(options) = dialect.cache.options() {
+        root.insert("prompt_cache_options".into(), options);
+    }
     match dialect.usage_request {
         UsageRequest::StreamOptions => {
             root.insert("stream_options".into(), json!({"include_usage": true}));
@@ -96,7 +105,7 @@ pub(crate) fn encode(
         UsageRequest::Implicit => {}
     }
     if let Some(reasoning) = &request.reasoning {
-        dialect.effort.place(&mut root, reasoning)?;
+        CodecName::ChatCompletions.place_effort(&dialect.effort, &mut root, reasoning)?;
     }
     if let Some(limit) = request.max_output_tokens {
         set_each(dialect.output_limit.iter(), &mut root, json!(limit))?;
@@ -119,79 +128,31 @@ pub(crate) fn encode(
         root.insert("tools".into(), Value::Array(tools));
     }
     if let Some(schema) = &request.response_schema {
-        let format = match dialect.schema {
-            SchemaConstraint::OpenAiStrict => {
-                if !ToolNames::OpenAi.accepts(&schema.name) {
-                    return Err(InvalidRequest.error(format!(
-                        "Chat response schema requires a name of {}",
-                        ToolNames::OpenAi.rule()
-                    )));
-                }
-                if schema.schema.get("type").and_then(Value::as_str) != Some("object")
-                    || schema.schema.get("anyOf").is_some()
-                {
-                    return Err(InvalidRequest
-                        .error("Chat strict response schema root must be an object, not anyOf"));
-                }
-                validate_schema(&schema.schema, &schema.schema, 0)?;
-                json!({"name": schema.name, "strict": true, "schema": schema.schema})
-            }
-            // The server compiles the whole schema into a grammar; nothing is dropped.
-            SchemaConstraint::Grammar => {
-                if schema.name.trim().is_empty() || !schema.schema.is_object() {
-                    return Err(InvalidRequest
-                        .error("Chat response schema requires a name and a JSON Schema object"));
-                }
-                json!({"name": schema.name, "schema": schema.schema})
-            }
-        };
+        let format = dialect.schema.format(schema);
         root.insert(
             "response_format".into(),
             json!({"type": "json_schema", "json_schema": format}),
         );
     }
-    if let Some(routing) = &dialect.routing {
-        let mut provider = routing.provider.clone();
-        if request.response_schema.is_some() {
-            provider.require_parameters = Some(true);
-        }
-        if provider != Default::default() {
-            let provider = serde_json::to_value(provider).expect("preferences serialize");
-            root.insert("provider".into(), provider);
-        }
-        if !routing.fallback_models.is_empty() {
-            root.insert("models".into(), json!(routing.fallback_models));
-        }
-    }
     Ok(root)
+}
+
+/// The content-part field and value marking a prompt-cache breakpoint, where this
+/// request marks any.
+fn breakpoint_marker(dialect: &Dialect) -> Option<(&'static str, Value)> {
+    match (dialect.cache_control, dialect.cache) {
+        (CacheControl::Sent { ttl }, _) => Some(("cache_control", breakpoint(ttl))),
+        (CacheControl::Omitted, Cache::Explicit) => {
+            Some(("prompt_cache_breakpoint", explicit_breakpoint()))
+        }
+        (CacheControl::Omitted, Cache::Automatic) => None,
+    }
 }
 
 fn system_role(dialect: &Dialect) -> &'static str {
     match dialect.system {
         SystemRole::System => "system",
         SystemRole::Developer => "developer",
-    }
-}
-
-/// A state the model reads, in the dialect's role: a message of the system prompt's role,
-/// or user content joining the user turn before it. Chat cannot hide a superseded state,
-/// so it is omitted.
-fn push_state(dialect: &Dialect, messages: &mut Vec<Value>, state: &State) {
-    if !state.is_read() {
-        return;
-    }
-    let text = || json!({"type": "text", "text": state.text});
-    match dialect.state_role {
-        StateRole::System => {
-            messages.push(json!({"role": system_role(dialect), "content": [text()]}));
-        }
-        StateRole::User => match messages.last_mut() {
-            Some(previous) if previous["role"] == "user" => previous["content"]
-                .as_array_mut()
-                .expect("constructed array")
-                .push(text()),
-            _ => messages.push(json!({"role": "user", "content": [text()]})),
-        },
     }
 }
 
@@ -215,16 +176,22 @@ fn push_message(
             // Only the originating replay is sent. Visible reasoning (including
             // foreign summaries) is not provenance.
             let mut replays = Vec::new();
+            let mut plain = String::new();
             for item in parts {
                 match item {
                     AssistantItem::Text { blocks, .. } => {
                         blocks.iter().for_each(|block| text.push_str(&block.text));
                     }
-                    AssistantItem::Reasoning { replay, .. } => replays.extend(own_replay(
-                        replay.as_ref(),
-                        dialect.reasoning_replay.format().replay(),
-                        request.model.as_str(),
-                    )),
+                    AssistantItem::Reasoning { replay, .. } => {
+                        let own =
+                            |format| own_replay(replay.as_ref(), format, request.model.as_str());
+                        replays.extend(own(dialect.reasoning_replay.format().replay()));
+                        plain.extend(
+                            own(ReplayFormat::ChatText)
+                                .and_then(|replay| replay.payload.get("text"))
+                                .and_then(Value::as_str),
+                        );
+                    }
                     AssistantItem::ToolCall { call, .. } => {
                         // Results pair by call ID, so sanitizing an invalid name is safe.
                         calls.push(json!({
@@ -244,35 +211,31 @@ fn push_message(
             if !calls.is_empty() {
                 message.insert("tool_calls".into(), Value::Array(calls));
             }
-            // Once the context is signed, thinking blocks go back one by one if
-            // signed, and a detail sequence goes back whole if any detail is.
-            let signed = |replay: &&Replay| replay.binding == Binding::Conversation;
-            let payloads = |replays: Vec<&Replay>| -> Vec<Value> {
-                replays
-                    .into_iter()
-                    .map(|replay| replay.payload.clone())
-                    .collect()
-            };
-            let reasoning = match &dialect.reasoning_replay {
-                ReasoningReplay::Unsupported => None,
+            // Where unsigned reasoning does not go back (the context is signed, or the
+            // server takes none), only sealed objects do: a signed detail binds its
+            // whole sequence, so a sequence goes back whole or not at all.
+            match &dialect.reasoning_replay {
+                ReasoningReplay::Unsupported => {}
                 ReasoningReplay::Text(field) => {
-                    let text: String = replays
-                        .iter()
-                        .filter_map(|replay| replay.payload.get("text").and_then(Value::as_str))
-                        .collect();
-                    (!text.is_empty()).then(|| (field, Value::String(text)))
+                    if !plain.is_empty() {
+                        set_each(field.iter(), &mut message, Value::String(plain))?;
+                    }
                 }
-                ReasoningReplay::ThinkingBlocks(field) => {
-                    replays.retain(|replay| !signed_only || signed(replay));
-                    (!replays.is_empty()).then(|| (field, Value::Array(payloads(replays))))
+                ReasoningReplay::ThinkingBlocks(native) | ReasoningReplay::Details(native) => {
+                    let text = native.unsigned.replayed().filter(|_| !signed_only);
+                    if text.is_none() {
+                        replays.retain(|replay| is_sealed(replay));
+                    }
+                    if !replays.is_empty() {
+                        let objects = replays.into_iter().map(|replay| replay.payload.clone());
+                        set_each(native.objects.iter(), &mut message, objects.collect())?;
+                    }
+                    if let Some(text) = text
+                        && !plain.is_empty()
+                    {
+                        set_each(text.iter(), &mut message, Value::String(plain))?;
+                    }
                 }
-                ReasoningReplay::Details(field) => {
-                    let whole = !signed_only || replays.iter().any(signed);
-                    (whole && !replays.is_empty()).then(|| (field, Value::Array(payloads(replays))))
-                }
-            };
-            if let Some((field, reasoning)) = reasoning {
-                set_each(field.iter(), &mut message, reasoning)?;
             }
             messages.push(Value::Object(message));
         }
@@ -299,25 +262,40 @@ fn push_message(
     Ok(())
 }
 
-/// Mark the last nonempty text of history as a cache breakpoint, in parts form.
-fn mark_last_cacheable(messages: &mut [Value], breakpoint: Value) {
-    for message in messages.iter_mut().rev() {
-        if let Some(text) = message["content"].as_str() {
-            if text.is_empty() {
-                continue;
+/// The last nonempty text so far, by message and, in parts form, part; none where it
+/// already carries a breakpoint.
+fn last_cacheable(messages: &[Value], key: &str) -> Option<(usize, Option<usize>)> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if let Some(text) = message["content"].as_str() {
+                return (!text.is_empty()).then_some(Some((index, None)));
             }
-            let part = json!({"type": "text", "text": text, "cache_control": breakpoint});
-            message["content"] = Value::Array(vec![part]);
-            return;
-        }
-        let parts = message["content"].as_array_mut().into_iter().flatten();
-        if let Some(part) = parts
-            .rev()
-            .find(|part| part["type"] == "text" && part["text"] != "")
-        {
-            part["cache_control"] = breakpoint;
-            return;
-        }
+            let parts = message["content"].as_array()?;
+            let part =
+                (parts.iter()).rposition(|part| part["type"] == "text" && part["text"] != "")?;
+            Some(
+                parts[part]
+                    .get(key)
+                    .is_none()
+                    .then_some((index, Some(part))),
+            )
+        })?
+}
+
+/// Mark a text as a cache breakpoint, in parts form.
+fn mark_cacheable(
+    messages: &mut [Value],
+    (index, part): (usize, Option<usize>),
+    key: &str,
+    marker: &Value,
+) {
+    let content = &mut messages[index]["content"];
+    match part {
+        Some(part) => content[part][key] = marker.clone(),
+        None => *content = json!([{"type": "text", "text": content.take(), key: marker}]),
     }
 }
 
@@ -341,14 +319,14 @@ fn wire_name(name: &str, names: ToolNames) -> String {
 
 /// Text-only content is sent as a plain string, which every compatible server
 /// and chat template accepts; image turns and cache breakpoints keep the parts array.
-fn flatten_text_content(messages: &mut [Value]) {
+fn flatten_text_content(messages: &mut [Value], marker: Option<&str>) {
     for message in messages {
         let Some(parts) = message["content"].as_array() else {
             continue;
         };
         if parts
             .iter()
-            .all(|part| part["type"] == "text" && part.get("cache_control").is_none())
+            .all(|part| part["type"] == "text" && marker.is_none_or(|key| part.get(key).is_none()))
         {
             let text = parts
                 .iter()
@@ -361,7 +339,22 @@ fn flatten_text_content(messages: &mut [Value]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use super::super::decoder::tests::{delta, end, reduced_as};
+    use super::*;
+    use crate::provider::codec::common::tests::{
+        envelope, image, notes, request, tool_result, user,
+    };
+    use crate::provider::codec::{Locations, NonEmpty, SchemaConstraint, UnsignedReasoning};
+    use crate::provider::protocol::{entries, state};
+    use crate::{
+        media::AttachmentRef,
+        provider::protocol::{
+            AssistantItem, Binding, Replay, ReplayFormat, ResponseSchema, SystemSegment, ToolCall,
+            ToolDefinition, UserContent,
+        },
+    };
+
     /// A server that rejects unknown assistant keys, like the official API.
     fn unsupported() -> Dialect {
         Dialect {
@@ -369,6 +362,7 @@ mod tests {
             ..Dialect::compatible()
         }
     }
+
     /// A server spelling the replay field `reasoning`.
     fn reasoning_field() -> Dialect {
         Dialect {
@@ -378,21 +372,27 @@ mod tests {
             ..Dialect::compatible()
         }
     }
-    use super::super::{
-        decoder::tests::{delta, end, reduced_as},
-        dialect::{ProviderPreferences, Routing},
-    };
-    use super::*;
-    use crate::provider::codec::common::tests::{envelope, image, notes, request};
-    use crate::provider::codec::{Locations, NonEmpty};
-    use crate::provider::protocol::{entries, state};
-    use crate::{
-        media::AttachmentRef,
-        provider::protocol::{
-            AssistantItem, Binding, Replay, ReplayFormat, ResponseSchema, SystemSegment, ToolCall,
-            ToolDefinition, ToolResult, UserContent,
-        },
-    };
+
+    /// A server taking native objects under `objects`, and unsigned reasoning as `unsigned` says.
+    pub(in crate::provider::codec::chat_completions) fn native_dialect(
+        replay: fn(super::super::NativeReplay) -> ReasoningReplay,
+        objects: &'static str,
+        unsigned: UnsignedReasoning<Locations<crate::provider::codec::BodyPath>>,
+    ) -> Dialect {
+        Dialect {
+            reasoning_replay: replay(super::super::NativeReplay {
+                objects: NonEmpty::one(crate::provider::codec::path(objects)),
+                unsigned,
+            }),
+            ..Dialect::compatible()
+        }
+    }
+
+    /// Unsigned objects go back, plain reasoning stays local.
+    pub(in crate::provider::codec::chat_completions) fn replayed()
+    -> UnsignedReasoning<Locations<crate::provider::codec::BodyPath>> {
+        UnsignedReasoning::Replayed(Locations::NONE)
+    }
 
     #[test]
     fn dialect_places_each_selected_convention() {
@@ -403,10 +403,13 @@ mod tests {
             cache: false,
         }];
         request.reasoning = Some("high".into());
-        request.response_schema = Some(ResponseSchema {
-            name: "answer".into(),
-            schema: json!({"anyOf":[{"type":"object"}, {"type":"string"}]}),
-        });
+        request.response_schema = Some(
+            ResponseSchema::new(
+                "answer",
+                json!({"anyOf":[{"type":"object"}, {"type":"string"}]}),
+            )
+            .unwrap(),
+        );
         let developer = Dialect {
             system: SystemRole::Developer,
             output_limit: Locations::NONE,
@@ -428,25 +431,22 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "session");
         assert_eq!(body["metadata"]["user_id"], "session");
         assert!(encoded.headers.is_empty());
-        // A grammar server takes the schema as written, without the strict subset.
+        // The schema goes as written, flagged `strict` only where the dialect says.
+        let schema = request.response_schema.as_ref().unwrap().schema();
         let format = &body["response_format"]["json_schema"];
-        assert_eq!(
-            format["schema"],
-            request.response_schema.as_ref().unwrap().schema
-        );
+        assert_eq!(&format["schema"], schema);
         assert!(format.get("strict").is_none());
         let strict = Dialect {
-            schema: SchemaConstraint::OpenAiStrict,
+            schema: SchemaConstraint::Strict,
             empty_content: EmptyContent::Null,
             ..Dialect::compatible()
         };
-        assert!(encode(&request, &strict).is_err());
-        request.response_schema.as_mut().unwrap().schema = json!({
-            "type":"object", "properties":{"ok":{"type":"boolean"}},
-            "required":["ok"], "additionalProperties":false
-        });
         let body = encode(&request, &strict).unwrap();
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        let format = &body["response_format"]["json_schema"];
+        assert_eq!(
+            (&format["schema"], &format["strict"]),
+            (schema, &json!(true))
+        );
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["max_completion_tokens"], 8192);
         // A tool-call turn without text spells its absence as the dialect does.
@@ -467,14 +467,14 @@ mod tests {
 
     #[test]
     fn thinking_blocks_replay_and_cache_breakpoints_take_the_parts_form() {
-        use crate::provider::codec::path;
         use crate::provider::protocol::HistoryLifetime;
         let thinking_blocks = Dialect {
-            reasoning_replay: ReasoningReplay::ThinkingBlocks(NonEmpty::one(path(
+            cache_control: CacheControl::Sent { ttl: None },
+            ..native_dialect(
+                ReasoningReplay::ThinkingBlocks,
                 "thinking_blocks",
-            ))),
-            cache: Cache::ContentPartBreakpoints { ttl: None },
-            ..Dialect::compatible()
+                replayed(),
+            )
         };
         let block = json!({"type":"thinking","thinking":"private","signature":"sig"});
         let signed = envelope(
@@ -509,13 +509,7 @@ mod tests {
                 ),
                 AssistantItem::tool_call("c", 2, inspect("call", json!({}))),
             ]),
-            Message::Tool(vec![ToolResult {
-                call_id: "call".into(),
-                name: "inspect".into(),
-                result: json!("ok"),
-                is_error: false,
-                images: vec![],
-            }]),
+            tool_result("call", "inspect", json!("ok"), vec![], false),
         ]));
         let current = crate::provider::protocol::StateLifetime::Current;
         (request.context).push(state("<state>", current));
@@ -529,7 +523,11 @@ mod tests {
                 {"type":"text","text":"volatile"}
             ])
         );
-        assert_eq!(messages[1]["content"], "hello");
+        // The earlier request's prefix ended before the response, and is marked too.
+        assert_eq!(
+            messages[1]["content"],
+            json!([{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}])
+        );
         assert_eq!(messages[2]["thinking_blocks"], json!([block]));
         assert!(messages[2].get("reasoning_content").is_none());
         // The tool result ends the prefix and takes the breakpoint; the request's own
@@ -555,18 +553,45 @@ mod tests {
         assert_eq!(plain["messages"][0]["content"], "stable\n\nvolatile");
         assert!(plain["messages"][2].get("thinking_blocks").is_none());
         assert_eq!(plain["messages"][2]["reasoning_content"], "t");
+        assert!(plain.get("prompt_cache_options").is_none());
+        // Explicit mode marks the same parts with `prompt_cache_breakpoint`.
+        request.history_lifetime = HistoryLifetime::Extends;
+        let explicit = Dialect {
+            cache: Cache::Explicit,
+            ..Dialect::compatible()
+        };
+        let body = encode(&request, &explicit).unwrap();
+        let mark = json!({"mode":"explicit"});
+        assert_eq!(body["prompt_cache_options"], mark);
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"stable","prompt_cache_breakpoint":mark},
+                {"type":"text","text":"volatile"}
+            ])
+        );
+        for marked in [1, 3] {
+            let part = &body["messages"][marked]["content"][0];
+            assert_eq!(part["prompt_cache_breakpoint"], mark);
+        }
+        assert_eq!(body["messages"][4]["content"], "<state>");
     }
 
     #[test]
-    fn a_signed_context_filters_thinking_blocks_singly_and_detail_sequences_by_turn() {
+    fn a_signed_context_sends_only_sealed_objects_and_no_plain_reasoning() {
         use crate::provider::codec::path;
         let (free, bound) = (Binding::Free, Binding::Conversation);
-        let turn = |format, natives: &[(Value, Binding)], said: &str| {
+        let (detail, text, block) = (
+            ReplayFormat::ChatReasoningDetail,
+            ReplayFormat::ChatText,
+            ReplayFormat::ChatThinkingBlock,
+        );
+        let turn = |natives: &[(ReplayFormat, &Value, Binding)], said: &str| {
             let mut items: Vec<_> = natives
                 .iter()
                 .enumerate()
-                .map(|(index, (payload, binding))| {
-                    let replay = envelope(format, "test-model", payload.clone(), *binding);
+                .map(|(index, (format, payload, binding))| {
+                    let replay = envelope(*format, "test-model", (*payload).clone(), *binding);
                     AssistantItem::reasoning(index.to_string(), index as u32, "", Some(replay))
                 })
                 .collect();
@@ -582,12 +607,7 @@ mod tests {
         let encode_turns = |dialect: &Dialect, turns: Vec<Message>| {
             let mut request = request("test-model");
             for turn in turns {
-                request.context.extend(entries([
-                    turn,
-                    Message::User(vec![UserContent::Text {
-                        text: "next".into(),
-                    }]),
-                ]));
+                request.context.extend(entries([turn, user("next")]));
             }
             let body = encode(&request, dialect).unwrap();
             let assistant: Vec<_> = body["messages"]
@@ -603,84 +623,76 @@ mod tests {
             }
             assistant
         };
-        // Details: an unsigned conversation replays every sequence; once one is
-        // signed, a turn with a signed detail replays its sequence whole and in
+        // Details: an unsigned conversation replays every sequence, with the plain
+        // reasoning a response kept under the field the router declares. Once one is
+        // signed, a signed sequence (bound whole by its signed detail) replays in
         // order, and a turn without one keeps only its text and calls.
-        let router = Dialect {
-            reasoning_replay: ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
-            ..Dialect::compatible()
-        };
+        let router = native_dialect(
+            ReasoningReplay::Details,
+            "reasoning_details",
+            UnsignedReasoning::Replayed(Locations::one(path("reasoning"))),
+        );
         let summary = json!({"type":"reasoning.summary","summary":"Sum","index":0});
         let encrypted = json!({"type":"reasoning.encrypted","data":"opaque","index":1});
-        let detail = ReplayFormat::ChatReasoningDetail;
-        let unsigned = [(summary.clone(), free)];
-        let turns = encode_turns(
-            &router,
-            vec![
-                turn(detail, &unsigned, "one"),
-                turn(detail, &unsigned, "two"),
-            ],
+        let plain = json!({"text":"Plain."});
+        let unsigned = |said| turn(&[(detail, &summary, free), (text, &plain, free)], said);
+        let signed = turn(
+            &[(detail, &summary, bound), (detail, &encrypted, bound)],
+            "two",
         );
+        let turns = encode_turns(&router, vec![unsigned("one"), unsigned("two")]);
         for message in &turns {
             assert_eq!(message["reasoning_details"], json!([summary]));
+            assert_eq!(message["reasoning"], "Plain.");
         }
-        let mixed = [(summary.clone(), free), (encrypted.clone(), bound)];
-        let turns = encode_turns(
-            &router,
-            vec![turn(detail, &unsigned, "one"), turn(detail, &mixed, "two")],
-        );
+        let turns = encode_turns(&router, vec![unsigned("one"), signed.clone()]);
         assert!(turns[0].get("reasoning_details").is_none());
+        assert!(turns[0].get("reasoning").is_none());
+        assert_eq!(turns[1]["reasoning_details"], json!([summary, encrypted]));
+        // A router without a plain field keeps plain reasoning local, and one taking
+        // no unsigned reasoning sends only sealed objects in any context.
+        let objects = native_dialect(ReasoningReplay::Details, "reasoning_details", replayed());
+        let turns = encode_turns(&objects, vec![unsigned("one")]);
+        assert_eq!(turns[0]["reasoning_details"], json!([summary]));
+        assert!(turns[0].get("reasoning").is_none());
+        let sealed_only = native_dialect(
+            ReasoningReplay::Details,
+            "reasoning_details",
+            UnsignedReasoning::Dropped,
+        );
+        let turns = encode_turns(&sealed_only, vec![unsigned("one"), signed]);
+        assert!(turns[0].get("reasoning_details").is_none());
+        assert!(turns[0].get("reasoning").is_none());
         assert_eq!(turns[1]["reasoning_details"], json!([summary, encrypted]));
         // Thinking blocks are filtered one by one.
-        let thinking_blocks = Dialect {
-            reasoning_replay: ReasoningReplay::ThinkingBlocks(NonEmpty::one(path(
-                "thinking_blocks",
-            ))),
-            ..Dialect::compatible()
-        };
+        let thinking_blocks = native_dialect(
+            ReasoningReplay::ThinkingBlocks,
+            "thinking_blocks",
+            replayed(),
+        );
         let open = json!({"type":"thinking","thinking":"open"});
         let sealed = json!({"type":"thinking","thinking":"sealed","signature":"sig"});
-        let block = ReplayFormat::ChatThinkingBlock;
-        let turns = encode_turns(
-            &thinking_blocks,
-            vec![turn(block, &[(open.clone(), free)], "one")],
-        );
+        let turns = encode_turns(&thinking_blocks, vec![turn(&[(block, &open, free)], "one")]);
         assert_eq!(turns[0]["thinking_blocks"], json!([open]));
-        let blocks = [(open.clone(), free), (sealed.clone(), bound)];
+        let blocks = [(block, &open, free), (block, &sealed, bound)];
         let turns = encode_turns(
             &thinking_blocks,
-            vec![
-                turn(block, &[(open, free)], "one"),
-                turn(block, &blocks, "two"),
-            ],
+            vec![turn(&[(block, &open, free)], "one"), turn(&blocks, "two")],
         );
         assert!(turns[0].get("thinking_blocks").is_none());
         assert_eq!(turns[1]["thinking_blocks"], json!([sealed]));
     }
 
     #[test]
-    fn router_conventions_place_reasoning_object_details_ttl_and_routing() {
+    fn router_conventions_place_reasoning_object_details_and_ttl() {
         use crate::provider::codec::path;
-        let routing = Routing {
-            provider: ProviderPreferences {
-                order: vec!["anthropic".into()],
-                zdr: Some(true),
-                ..Default::default()
-            },
-            fallback_models: vec!["x/y".into()],
-        };
         let router = Dialect {
-            effort: crate::provider::codec::Effort {
-                path: NonEmpty::one(path("reasoning.effort")),
-                levels: crate::provider::codec::OPENAI_EFFORT,
-            },
-            reasoning_replay: ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
+            effort: NonEmpty::one(path("reasoning.effort")),
             usage_request: UsageRequest::Implicit,
-            cache: Cache::ContentPartBreakpoints {
+            cache_control: CacheControl::Sent {
                 ttl: Some(crate::provider::codec::CacheTtl::OneHour),
             },
-            routing: Some(routing),
-            ..Dialect::compatible()
+            ..native_dialect(ReasoningReplay::Details, "reasoning_details", replayed())
         };
         let details = [
             json!({"type":"reasoning.text","text":"t","signature":"s","index":0}),
@@ -724,15 +736,6 @@ mod tests {
             body["messages"][1]["content"][0]["cache_control"],
             json!({"type":"ephemeral","ttl":"1h"})
         );
-        assert_eq!(body["provider"], json!({"order":["anthropic"],"zdr":true}));
-        assert_eq!(body["models"], json!(["x/y"]));
-        // A schema forces parameter support on the routed endpoint.
-        request.response_schema = Some(ResponseSchema {
-            name: "answer".into(),
-            schema: json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
-        });
-        let body = encode(&request, &router).unwrap();
-        assert_eq!(body["provider"]["require_parameters"], true);
     }
 
     fn reasoning_envelope(format: ReplayFormat, model: &str, payload: serde_json::Value) -> Replay {
@@ -778,13 +781,13 @@ mod tests {
                 AssistantItem::text("text", 0, "Checking"),
                 AssistantItem::tool_call("call", 1, inspect("call-a", json!({"path":"a"}))),
             ]),
-            Message::Tool(vec![ToolResult {
-                call_id: "call-a".into(),
-                name: "inspect".into(),
-                result: json!({"ok":false, "error":null}),
-                is_error: true,
-                images: vec![image()],
-            }]),
+            tool_result(
+                "call-a",
+                "inspect",
+                json!({"ok":false, "error":null}),
+                vec![image()],
+                true,
+            ),
         ]);
         assert!(encode(&request, &unsupported()).is_err());
         // Load the fixture blobs as the session store would.
@@ -911,12 +914,8 @@ mod tests {
             unsupported["messages"],
             json!([{"role":"assistant","content":"ok"}])
         );
-        let mutations: [fn(&mut Replay); 3] = [
-            |envelope| envelope.provenance.model = "different-model".into(),
-            |envelope| envelope.provenance.format = ReplayFormat::Responses,
-            |envelope| envelope.payload = json!({"text":42}),
-        ];
-        for mutation in mutations.map(Some).into_iter().chain([None]) {
+        // A payload of another shape, or none, replays nothing.
+        for payload in [Some(json!({"text":42})), None] {
             let mut request = original.clone();
             let Some(Message::Assistant(items)) = request.messages_mut().next() else {
                 unreachable!()
@@ -924,8 +923,8 @@ mod tests {
             let AssistantItem::Reasoning { replay, .. } = &mut items[0] else {
                 unreachable!()
             };
-            match mutation {
-                Some(mutate) => mutate(replay.as_mut().unwrap()),
+            match payload {
+                Some(payload) => replay.as_mut().unwrap().payload = payload,
                 None => *replay = None,
             }
             let body = encode(&request, &Dialect::compatible()).unwrap();
@@ -970,13 +969,7 @@ mod tests {
     fn states_take_the_dialects_role_and_never_join_tool_output() {
         use crate::provider::protocol::{StateLifetime::*, state};
         let call = AssistantItem::tool_call("c", 0, inspect("call", json!({})));
-        let result = Message::Tool(vec![ToolResult {
-            call_id: "call".into(),
-            name: "inspect".into(),
-            result: json!("ok"),
-            images: vec![],
-            is_error: false,
-        }]);
+        let result = tool_result("call", "inspect", json!("ok"), vec![], false);
         let mut req = history(vec![call]);
         req.context.insert(0, state("earlier", Superseded));
         req.context.extend([result.into(), state("now", Current)]);
@@ -988,7 +981,7 @@ mod tests {
         assert_eq!(messages[2], json!({"role":"user","content":"now"}));
         assert!(!json!(body).to_string().contains("earlier"));
         let system = Dialect {
-            state_role: StateRole::System,
+            state_role: crate::provider::codec::StateRole::System,
             ..unsupported()
         };
         let body = encode(&req, &system).unwrap();

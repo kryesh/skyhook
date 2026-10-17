@@ -8,8 +8,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 
-use super::diagnostics::DiagnosticMessage;
-use super::{Auth, FetchArgs, HeaderValues, ResponseFormat};
+use super::{Auth, FetchArgs, HeaderValues, LocalError, ResponseFormat};
 
 /// Request endpoints are not proxy endpoints: credentials are never accepted.
 #[derive(Clone, Debug)]
@@ -25,13 +24,14 @@ impl HttpRequestUrl {
         url.set_fragment(None);
         Ok(Self(url))
     }
-    /// URL syntax versus scheme/credentials keep distinct redirect diagnostics.
-    pub(super) fn join(&self, location: &str) -> Result<Self, DiagnosticMessage> {
+    pub(super) fn join(&self, location: &str) -> Result<Self, LocalError> {
         let url = self
             .0
             .join(location)
-            .map_err(|_| DiagnosticMessage::InvalidRedirectUrl)?;
-        Self::admit(url).map_err(|_| DiagnosticMessage::RedirectUrlNotHttp)
+            .map_err(|_| LocalError::failed("invalid redirect URL"))?;
+        Self::admit(url).map_err(|_| {
+            LocalError::failed("redirect URL must be HTTP(S) without embedded credentials")
+        })
     }
     pub(super) fn as_str(&self) -> &str {
         self.0.as_str()
@@ -40,7 +40,7 @@ impl HttpRequestUrl {
         &self.0
     }
     pub(super) fn origin(&self) -> SanitizedOrigin {
-        SanitizedOrigin::from_url(&self.0)
+        SanitizedOrigin(self.0.origin().ascii_serialization())
     }
     fn append_query(&mut self, query: &[(String, String)]) {
         if !query.is_empty() {
@@ -51,21 +51,11 @@ impl HttpRequestUrl {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
-#[serde(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SanitizedOrigin(String);
 impl SanitizedOrigin {
     pub(super) fn as_str(&self) -> &str {
         &self.0
-    }
-    pub(super) fn from_url(url: &Url) -> Self {
-        Self(url.origin().ascii_serialization())
-    }
-    // Proxy schemes and credentials follow reqwest's distinct endpoint contract.
-    pub(super) fn proxy(value: &str) -> Self {
-        Url::parse(value)
-            .map(|url| Self::from_url(&url))
-            .unwrap_or_else(|_| Self("unknown origin".into()))
     }
 }
 
@@ -150,11 +140,6 @@ pub(super) struct ClientSettings {
     pub(super) connect_timeout: Duration,
     pub(super) proxy: Option<String>,
     pub(super) insecure: bool,
-}
-impl ClientSettings {
-    pub(super) fn proxy_origin(&self) -> Option<SanitizedOrigin> {
-        self.proxy.as_deref().map(SanitizedOrigin::proxy)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,10 +262,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(plan.url.as_str(), "https://example.org/p?x=first&x=second");
-        assert!(matches!(
-            plan.url.join("ftp://example.org/file"),
-            Err(DiagnosticMessage::RedirectUrlNotHttp)
-        ));
+        assert!(plan.url.join("ftp://example.org/file").is_err());
         assert_eq!(plan.headers.get_all("x-multi").iter().count(), 2);
         assert!(plan.headers.get("authorization").unwrap().is_sensitive());
         assert!(matches!(

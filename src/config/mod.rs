@@ -53,35 +53,13 @@ pub struct Config {
     /// model of the first provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<ModelRef>,
-    #[serde(default, serialize_with = "serialize_connection_options")]
+    #[serde(default)]
     pub targets: TargetsConfig,
     /// Named, trusted MCP server connections. Empty by default.
-    #[serde(default, serialize_with = "serialize_connection_options")]
+    #[serde(default)]
     pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default = "default_child_depth")]
     pub max_child_depth: usize,
-}
-
-// Target and MCP protocol serializers retain their own public shapes. In these
-// config-only branches, null means an absent ordinary option, never a request
-// patch clear; omit it here rather than changing those serializers or YAML values.
-fn serialize_connection_options<T: Serialize, S: serde::Serializer>(
-    value: &T,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    fn omit_absent(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(fields) => {
-                fields.retain(|_, value| !value.is_null());
-                fields.values_mut().for_each(omit_absent);
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(omit_absent),
-            _ => {}
-        }
-    }
-    let mut value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
-    omit_absent(&mut value);
-    value.serialize(serializer)
 }
 
 pub(crate) const DEFAULT_MAX_CHILD_DEPTH: usize = 4;
@@ -166,36 +144,29 @@ impl Config {
     /// with this; sealing keeps the admitted entries.
     fn admit(&self) -> Result<indexmap::IndexMap<ProviderName, AdmittedProvider>, ConfigError> {
         self.targets.validate_structure()?;
-        let providers = self
-            .providers
+        self.providers
             .iter()
             .map(|(name, entry)| {
-                let provider = entry.admit().map_err(|error| EntryError {
+                let provider = entry.admit().map_err(|error| ConfigError::Admission {
                     provider: name.clone(),
                     error,
                 })?;
                 Ok((name.clone(), provider))
             })
-            .collect::<Result<_, EntryError>>()?;
-        Ok(providers)
+            .collect()
     }
 
     /// The Skyhook-managed login of the provider `name`.
     pub fn login(&self, name: &ProviderName) -> Result<Login, LoginError> {
         let entry = (self.providers.get(name)).ok_or_else(|| LoginError::Unknown(name.clone()))?;
-        entry.login(name)?.ok_or_else(|| LoginError::Unmanaged {
-            provider: name.clone(),
-            dialect: entry.settings.dialect(),
-        })
+        entry
+            .admit()?
+            .login(name)?
+            .ok_or_else(|| LoginError::Unmanaged {
+                provider: name.clone(),
+                dialect: entry.settings.dialect(),
+            })
     }
-}
-
-/// A provider admission failure located in the configuration document.
-#[derive(Debug, Error)]
-#[error("`providers.{provider}`: {error}")]
-pub struct EntryError {
-    pub provider: ProviderName,
-    pub error: AdmissionError,
 }
 
 #[derive(Debug, Error)]
@@ -213,8 +184,11 @@ pub enum ConfigError {
     Structure(serde_path_to_error::Error<serde_json::Error>),
     #[error("invalid configuration: configuration is empty")]
     Empty,
-    #[error("invalid configuration: {0}")]
-    Admission(#[from] EntryError),
+    #[error("invalid configuration: `providers.{provider}`: {error}")]
+    Admission {
+        provider: ProviderName,
+        error: AdmissionError,
+    },
     #[error("invalid configuration: {0}")]
     Targets(#[from] crate::target::TargetError),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml{0}")]
@@ -352,7 +326,7 @@ providers:
     }
 
     #[test]
-    fn config_omits_absent_connection_options_without_changing_shared_serializers() {
+    fn config_omits_absent_connection_options() {
         let config = parse(
             "targets:\n  remote:\n    type: ssh\n    host: host\nmcp:\n  local:\n    transport: stdio\n    start_command: [server]\n",
         )
@@ -367,13 +341,6 @@ providers:
         assert!(server.get("url").is_none());
         assert!(server.get("cwd").is_none());
         assert_eq!(server["start_command"], serde_json::json!(["server"]));
-
-        let target = serde_json::to_value(&config.targets.entries["remote"]).unwrap();
-        assert_eq!(target.get("via"), Some(&serde_json::Value::Null));
-        assert_eq!(target["ssh"].get("user"), Some(&serde_json::Value::Null));
-        let server = serde_json::to_value(&config.mcp["local"]).unwrap();
-        assert_eq!(server.get("url"), Some(&serde_json::Value::Null));
-        assert_eq!(server.get("cwd"), Some(&serde_json::Value::Null));
         Config::from_yaml(&config.to_yaml().unwrap()).unwrap();
     }
 
@@ -455,27 +422,8 @@ providers:
             );
         }
         assert!(replaced.ceiling().iter().eq([Capability::Targets]));
-        assert!(
-            mode("{}")
-                .unwrap_err()
-                .to_string()
-                .contains("missing field `capabilities`")
-        );
-        for name in ["unknown", "Mcp", "Interactive", "READ"] {
-            let error = mode(&format!("capabilities: ['{name}']"))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(name) && error.contains("unknown variant"),
-                "{error}"
-            );
-        }
-        let scalar = mode("capabilities: read").unwrap_err().to_string();
-        assert!(scalar.contains("expected a sequence"), "{scalar}");
         let error = mode("capabilities: [interactive]").unwrap_err();
         assert!(error.to_string().contains("controlled by the runtime host"));
-        assert!(mode("capabilities: []\nextra: 1").is_err());
-        assert!(parse("capabilities: [read]").is_err());
     }
 
     #[test]

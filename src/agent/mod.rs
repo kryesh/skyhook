@@ -18,7 +18,8 @@ pub use observation::{
 };
 pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
-    QueuedPromptReceipt, Selection, SessionHandle, SessionMode, SessionModel,
+    QueuedPromptCommitted, QueuedPromptReceipt, Selection, SessionHandle, SessionMode,
+    SessionModel,
 };
 pub(crate) use todo::ReplaceError;
 pub use todo::{TodoItem, TodoStatus};
@@ -27,4 +28,4 @@ pub(crate) use interaction::QuestionOutput;
 pub(crate) use observation::{Responses, Views, live};
 #[cfg(test)]
 pub(crate) use runtime::stopped_turn;
-pub(crate) use runtime::{Agents, Catalog, ModelEntry, activities};
+pub(crate) use runtime::{Agents, ModelEntry, activities};

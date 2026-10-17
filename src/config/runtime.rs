@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 
 use super::{Config, ConfigError, ModeError};
 use crate::{
-    agent::{Catalog, HarnessBuilder, ModelEntry},
+    agent::{HarnessBuilder, ModelEntry},
     provider::{
         dialect::AdmittedProvider,
         profile::{ModelProfile, ModelRef, ProviderName},
@@ -202,7 +202,6 @@ impl ConfiguredModel {
 
     /// Construct providers only after pure admission and selection. Environment
     /// keys retain build-time lookup; command auth remains lazy until invocation.
-    /// The builder starts from this admitted catalog without checking it again.
     pub fn harness_builder(
         &self,
         workspace: impl Into<PathBuf>,
@@ -227,13 +226,11 @@ impl ConfiguredModel {
                 );
             }
         }
-        let catalog = Catalog {
-            models,
-            default_model: self.name(),
-            modes: config.modes.clone(),
-            mode: Some(self.config.default_mode().clone()),
-        };
-        let mut builder = HarnessBuilder::admitted(workspace, catalog)
+        let mut builder = HarnessBuilder::new(workspace)
+            .models(models)
+            .default_model(self.name())
+            .modes(config.modes.clone())
+            .mode(self.config.default_mode().clone())
             .max_child_depth(config.max_child_depth)
             .capabilities(config.ceiling())
             .mcp(config.mcp.clone())

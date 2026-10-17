@@ -65,7 +65,6 @@ chrono = { version = "0.4.42", default-features = false, features = [
 ] }
 dom_smoothie = "0.18.1"
 encoding_rs = "0.8"
-fs2 = "0.4.3"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
 grep-matcher = "0.1.8"
@@ -73,14 +72,10 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 http = "1.5.0"
 httpdate = "1.0.3"
-hyper-util = { version = "0.1", default-features = false, features = [
-    "client-legacy",
-    "client-proxy",
-    "tokio",
-] }
 ignore = "0.4.31"
 indexmap = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.58", default-features = false }
+libc = "0.2"
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 mimalloc = { version = "0.1", features = ["override"] }
 reqwest = { version = "0.13.4", default-features = false, features = [
@@ -138,7 +133,6 @@ tokio = { version = "1.53.1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7.17", features = ["io", "rt"] }
-tower-service = "0.3.3"
 zeroize = "1.8.2"
 
 # CLI-only dependencies.
@@ -159,9 +153,6 @@ syntect = { version = "5", default-features = false, features = [
 unicode-segmentation = { version = "1", optional = true }
 unicode-width = { version = "0.2", optional = true }
 serde_path_to_error = "0.1"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 rcgen = "0.14"

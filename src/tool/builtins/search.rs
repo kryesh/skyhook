@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use grep_matcher::Matcher as _;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
@@ -26,14 +25,14 @@ use crate::tool::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<SearchArgs, SearchOutput, _, _>(
         "search",
-        "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; details returns structured matches.",
+        "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut SearchArgs| {
                 vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
             }),
         |context, args| async move {
-            let value = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
+            let value = SearchOutput { matches: BTreeMap::new() };
             let value = serde_json::to_value(value)?;
             run_walker(context, "search", "matches", value, move |workspace, capture, cancel| {
                 search_blocking(workspace, Path::new(&args.path), &args, capture, cancel)
@@ -214,12 +213,7 @@ fn search_blocking(
         .binary_detection(BinaryDetection::quit(b'\0'))
         .heap_limit(Some(MAX_LINE_BYTES))
         .build();
-    let layout = if args.details {
-        Layout::List { count: 0 }
-    } else {
-        Layout::Grouped { open: None }
-    };
-    let mut matches = CapturedOutput::new(capture, layout)
+    let mut matches = CapturedOutput::new(capture, Layout::Grouped { open: None })
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for path in files {
         if cancellation.is_cancelled() {
@@ -228,11 +222,8 @@ fn search_blocking(
                 .effects(Effects::OutputIncomplete));
         }
         let path = path?;
-        let checkpoint = matches
-            .checkpoint()
-            .map_err(|error| capture_error(error, Operation::Capture))?;
+        let checkpoint = matches.checkpoint();
         let mut sink = SearchSink {
-            matcher: &matcher,
             path: relative_path(workspace, &path),
             matches: &mut matches,
             binary: false,
@@ -381,21 +372,15 @@ impl CapturedOutput {
         serde_json::to_writer(&mut self.file, &value)?;
         Ok(())
     }
-    fn checkpoint(&mut self) -> std::io::Result<Checkpoint> {
-        use std::io::Seek as _;
-        Ok(Checkpoint {
-            position: self.file.stream_position()?,
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            position: self.file.position(),
             layout: self.layout.clone(),
-        })
+        }
     }
     fn rollback(&mut self, checkpoint: Checkpoint) -> std::io::Result<()> {
-        use std::io::{Seek as _, Write as _};
         self.layout = checkpoint.layout;
-        self.file.flush()?;
-        self.file.truncate(checkpoint.position)?;
-        self.file
-            .seek(std::io::SeekFrom::Start(checkpoint.position))?;
-        Ok(())
+        self.file.truncate(checkpoint.position)
     }
     fn finish(mut self) -> std::io::Result<FinishedOutput> {
         use std::io::Write as _;
@@ -451,7 +436,6 @@ impl SearchStop {
 }
 
 struct SearchSink<'a> {
-    matcher: &'a grep_regex::RegexMatcher,
     path: String,
     matches: &'a mut CapturedOutput,
     binary: bool,
@@ -467,28 +451,12 @@ impl Sink for SearchSink<'_> {
         if self.cancellation.is_cancelled() {
             return Err(SearchStop::Cancelled);
         }
-        let bytes = matched.bytes();
         let line = matched.line_number().unwrap_or(1);
-        let text = String::from_utf8_lossy(bytes);
+        let text = String::from_utf8_lossy(matched.bytes());
         let text = text.trim_end_matches(['\r', '\n']);
-        let pushed = match self.matches.layout {
-            Layout::Grouped { .. } => {
-                (self.matches).push(&self.path, format_args!("{line}: {text}"))
-            }
-            Layout::List { .. } => {
-                let first = (self.matcher.find(bytes))
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                let Some(first) = first else { return Ok(true) };
-                let found = SearchMatch {
-                    path: self.path.clone(),
-                    line,
-                    column: first.start() + 1,
-                    text: text.to_owned(),
-                };
-                self.matches.push(&self.path, found)
-            }
-        };
-        pushed.map_err(SearchStop::Capture)?;
+        (self.matches)
+            .push(&self.path, format_args!("{line}: {text}"))
+            .map_err(SearchStop::Capture)?;
         Ok(true)
     }
     fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> Result<bool, Self::Error> {
@@ -511,9 +479,6 @@ enum Case {
 struct SearchArgs {
     /// Rust-regex pattern, using ripgrep syntax. Set `fixed` to match it literally.
     pattern: String,
-    /// Return structured matches including columns instead of grouping by file.
-    #[serde(default)]
-    details: bool,
     /// File or directory to search.
     #[serde(default = "super::default_dot")]
     path: String,
@@ -539,27 +504,7 @@ struct SearchArgs {
 
 #[derive(Serialize, JsonSchema)]
 struct SearchOutput {
-    matches: SearchMatches,
-}
-
-#[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
-enum SearchMatches {
-    Grouped(BTreeMap<String, Vec<String>>),
-    #[expect(
-        dead_code,
-        reason = "schema-only alternative; completed captures own detailed output"
-    )]
-    Detailed(Vec<SearchMatch>),
-}
-
-#[derive(Serialize, JsonSchema)]
-#[cfg_attr(test, derive(Deserialize))]
-struct SearchMatch {
-    path: String,
-    line: u64,
-    column: usize,
-    text: String,
+    matches: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -586,7 +531,6 @@ struct GlobOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::CancellationToken;
     use crate::tool::ToolRegistryBuilder;
     use crate::tool::diagnostic::{Cause, IoKind};
     use crate::tool::output::OutputSink;
@@ -648,9 +592,8 @@ mod tests {
         Ok(serde_json::from_slice(&fixture.sink.bytes())?)
     }
 
-    fn search(root: &Path, path: &Path, args: Value) -> Vec<SearchMatch> {
+    fn search(root: &Path, path: &Path, args: Value) -> BTreeMap<String, Vec<String>> {
         let args: SearchArgs = serde_json::from_value(args).unwrap();
-        assert!(args.details);
         captured(|capture, cancel| search_blocking(root, path, &args, capture, cancel)).unwrap()
     }
 
@@ -848,32 +791,6 @@ mod tests {
         assert_eq!(captured.output.value, grouped);
         let empty = search(json!({"path":"files","pattern":"absent"})).await;
         assert_eq!(empty.output.value, json!({"matches":{}}));
-        let detailed = search(json!({"path":"files","pattern":"needle","details":true})).await;
-        let first = json!({"path":"files/a.txt","line":1,"column":3,"text":"  needle  "});
-        assert_eq!(detailed.output.value["matches"][0], first);
-        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(5000)).unwrap();
-        let args = json!({"path":"files","pattern":"needle"});
-        let preview = executor
-            .run_model(&runtime.agent, "search", args)
-            .await
-            .unwrap();
-        let matches = serde_json::to_vec(&preview.output.value["result"]["matches"]).unwrap();
-        assert!(matches.len() <= crate::job::output::CONTENT_BYTES);
-        let cut = &preview.output.value["presentation"]["truncated"][0];
-        assert_eq!(cut["field"], "/result/matches/files~1a.txt");
-        assert_eq!(cut["total_elements"], 5000);
-        let mut query = crate::job::JobOutputQuery::new(preview.job);
-        query.field = Some("/result/matches/files~1a.txt".parse().unwrap());
-        (query.index, query.limit) = (Some(4999), Some(1));
-        let page = runtime
-            .jobs
-            .inspect_output(query, CancellationToken::new(), &Default::default())
-            .await
-            .unwrap();
-        let preview = &page["presentation"]["preview"];
-        assert_eq!(preview["elements"], json!(["5000: needle λ"]));
-        assert_eq!(preview["total_elements"], 5000);
-        assert!(preview.get("next_index").is_none());
     }
 
     #[test]
@@ -903,10 +820,10 @@ mod tests {
                     );
                     assert_eq!(has("build/generated"), no_ignore);
                     let args = json!({
-                        "pattern":"needle", "details":true, "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
+                        "pattern":"needle", "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
                     });
                     let matches = search(root, root, args);
-                    let has = |path: &str| matches.iter().any(|m| m.path == path);
+                    let has = |path: &str| matches.contains_key(path);
                     assert!(has("src/visible"));
                     assert_eq!(
                         (has(".git/config"), has("build/generated")),
@@ -956,12 +873,9 @@ mod tests {
             (vec!["!b.rs"], vec!["src/a.rs", "src/nested/file.rs"]),
             (vec!["*.rs", "!nested/"], vec!["src/a.rs", "src/b.rs"]),
         ] {
-            let args = json!({"pattern":"needle", "details":true, "path":"src", "glob":glob});
+            let args = json!({"pattern":"needle", "path":"src", "glob":glob});
             let matches = search(root, &src, args);
-            assert_eq!(
-                matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(matches.keys().collect::<Vec<_>>(), expected);
         }
     }
 
@@ -973,12 +887,11 @@ mod tests {
         std::fs::write(root.join("lower.rs"), "needle\n").unwrap();
         std::fs::write(root.join("skip.txt"), "Needle\n").unwrap();
         std::fs::write(root.join("binary.rs"), b"Needle\0hidden\n").unwrap();
-        let args = json!({"pattern":"Needle", "details":true, "glob":["*.rs", "!binary.rs"], "case":"smart"});
+        let args = json!({"pattern":"Needle", "glob":["*.rs", "!binary.rs"], "case":"smart"});
         let output = search(root, root, args);
-        assert_eq!(output.len(), 1);
         assert_eq!(
-            (output[0].path.as_str(), output[0].line, output[0].column),
-            ("upper.rs", 1, 1)
+            output,
+            BTreeMap::from([("upper.rs".into(), vec!["1: Needle".into()])])
         );
         let paths = glob(root, root, json!({"pattern":"*.rs"}));
         assert_eq!(paths, ["binary.rs", "lower.rs", "upper.rs"]);

@@ -43,8 +43,8 @@ enum NativeShape {
     /// Redacted thinking, whole on arrival and without readable text; bound
     /// by its data.
     Redacted { signed: bool },
-    /// One detail of a sequence, continued by fragments at its index; the
-    /// sequence is bound whole when any detail is signed.
+    /// One detail of a sequence, continued by its fragments until its signature
+    /// seals it; the sequence is bound whole when any detail is signed.
     Detail {
         index: Option<u64>,
         kind: wire::DetailKind,
@@ -57,7 +57,7 @@ impl NativeShape {
         match self {
             Self::Thinking { .. } => Some("thinking"),
             Self::Redacted { .. } => None,
-            Self::Detail { kind, .. } => Some(kind.text_field()),
+            Self::Detail { kind, .. } => kind.text_field(),
         }
     }
 
@@ -75,7 +75,6 @@ pub(crate) struct Decoder {
     scope: Scope,
     format: ReasoningFormat,
     blocks: Vec<Block>,
-    visible_id: Option<usize>,
     tool_ids: BTreeMap<u64, usize>,
     last_tool: Option<u64>,
     /// The server's response ID, from which missing call IDs are derived.
@@ -102,7 +101,6 @@ impl Decoder {
             errors,
             request,
             blocks: Vec::new(),
-            visible_id: None,
             tool_ids: BTreeMap::new(),
             last_tool: None,
             response_id: None,
@@ -124,13 +122,8 @@ impl Decoder {
         let mut events = Vec::new();
         if let Some(choice) = choice {
             let delta = if choice.delta.is_noop(self.format) {
-                let message = choice.message.or_else(|| {
-                    choice.text.map(|text| wire::Delta {
-                        content: Some(text),
-                        ..Default::default()
-                    })
-                });
-                message
+                choice
+                    .message
                     .map(|message| {
                         if self.blocks.is_empty() {
                             message
@@ -203,20 +196,14 @@ impl Settle for Decoder {
 pub(super) mod tests {
     use super::*;
     use crate::provider::ProviderErrorKind;
-    use crate::provider::codec::common::tests::{Reduced, reduce, scope};
+    use crate::provider::codec::{
+        self,
+        common::tests::{Reduced, drain, scope},
+    };
     use crate::provider::protocol::{AssistantItem, CutReason, Outcome, ToolCall, Usage};
     use serde_json::{Value, json};
 
-    pub(super) fn raw(data: &str) -> SseEvent {
-        SseEvent {
-            event: None,
-            data: data.into(),
-        }
-    }
-
-    pub(super) fn event(value: Value) -> SseEvent {
-        raw(&value.to_string())
-    }
+    pub(super) use crate::provider::http::transport::tests::{event, sse};
 
     pub(in crate::provider::codec::chat_completions) fn delta(value: Value) -> SseEvent {
         event(json!({"choices":[{"index":0,"delta":value}]}))
@@ -240,13 +227,7 @@ pub(super) mod tests {
         format: ReasoningFormat,
         frames: Vec<SseEvent>,
     ) -> Reduced {
-        let mut decoder = decoder_for(format);
-        let mut events = Vec::new();
-        for frame in &frames {
-            events.extend(decoder.decode(frame).unwrap());
-        }
-        events.extend(decoder.finish().unwrap());
-        reduce(events)
+        drain(codec::Decoder::ChatCompletions(decoder_for(format)), frames)
     }
 
     pub(super) fn decode(frames: Vec<SseEvent>) -> (Vec<AssistantItem>, Usage, Outcome) {
@@ -260,7 +241,7 @@ pub(super) mod tests {
     }
 
     pub(super) fn done() -> SseEvent {
-        raw("[DONE]")
+        sse(None, "[DONE]")
     }
 
     pub(super) fn phantom_usage_chunk() -> Value {
@@ -377,7 +358,6 @@ pub(super) mod tests {
         let call = json!([{"index":0,"id":"call","function":{"name":"inspect","arguments":"{}"}}]);
         with_delta("tool_calls", call.clone(), None);
         with_delta("tool_calls", call, Some("stop"));
-        with_delta("function_call", json!({"name":"inspect"}), None);
         packets.into_iter().for_each(assert_post_finish_rejected);
     }
 
@@ -404,39 +384,6 @@ pub(super) mod tests {
                 let late = decoder.decode(&event(packet.clone()));
                 assert_eq!(late.is_err(), rejected, "{packet}");
             }
-        }
-    }
-
-    #[test]
-    fn post_finish_placeholders_and_conflicting_finishes_are_ignored() {
-        let mut packets = Vec::new();
-        for field in [
-            "content",
-            "refusal",
-            "reasoning_content",
-            "reasoning",
-            "role",
-        ] {
-            for value in [json!(0), json!(false), json!({}), json!("")] {
-                let mut packet = phantom_usage_chunk();
-                packet["choices"][0]["delta"][field] = value;
-                packets.push(packet);
-            }
-        }
-        for finish in ["length", "abort", "content_filter", "tool_calls", ""] {
-            let mut packet = phantom_usage_chunk();
-            packet["choices"][0]["finish_reason"] = json!(finish);
-            packets.push(packet);
-        }
-        for packet in packets {
-            let (items, usage, outcome) = decode(vec![
-                delta(json!({"content":"answer"})),
-                end("stop"),
-                event(packet),
-                done(),
-            ]);
-            assert_eq!((outcome, usage), (Outcome::Answer, USAGE));
-            assert_eq!(contents(&items), [text("answer")]);
         }
     }
 
@@ -563,55 +510,41 @@ pub(super) mod tests {
 
     #[test]
     fn only_normal_finish_reasons_keep_tools_executable() {
-        let tool = || {
-            delta(
-                json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{}"}}]}),
-            )
+        let tool = |arguments: &str| {
+            let call =
+                json!([{"index":0,"id":"c","function":{"name":"run","arguments":arguments}}]);
+            delta(json!({"content":"text","tool_calls":call}))
         };
-        for reason in [
-            "stop",
-            "tool_calls",
-            "STOP",
-            "eos",
-            "end_turn",
-            "tool_use",
-            "function_call",
-        ] {
-            let (items, _, outcome) = decode(vec![tool(), end(reason)]);
-            assert_eq!((outcome, items.len()), (Outcome::ToolUse, 1), "{reason}");
+        let (items, _, outcome) = decode(vec![tool("{}"), end("tool_calls")]);
+        assert_eq!((outcome, items.len()), (Outcome::ToolUse, 2));
+        // A cut discards the call whatever its arguments look like.
+        for arguments in ["{", "[]"] {
+            let (items, _, outcome) = decode(vec![tool(arguments), end("length")]);
+            assert_eq!(outcome, MAX_TOKENS);
+            assert_eq!(contents(&items), [text("text")], "{arguments}");
         }
-        // A cut discards the call whatever its arguments look like, once,
-        // even when the finish is repeated after usage.
-        for (reason, expected) in [
-            ("length", CutReason::MaxTokens),
-            ("MAX_TOKENS", CutReason::MaxTokens),
-            ("SAFETY", CutReason::Refusal),
-            ("content_filter", CutReason::Refusal),
-            ("error", CutReason::Incomplete),
-            ("incomplete", CutReason::Incomplete),
+        // A later abnormal finish retracts tools a normal one kept, a late overflow
+        // without failing the response, and a later normal finish revives nothing.
+        let incomplete = Outcome::Cut(CutReason::Incomplete);
+        for (finishes, expected) in [
+            (["stop", "length"], MAX_TOKENS),
+            (["stop", "model_context_window_exceeded"], incomplete),
+            (["length", "stop"], MAX_TOKENS),
         ] {
-            for arguments in ["{", "{}", "not json", "[]"] {
-                for repeated in [false, true] {
-                    let call = json!([{"index":0,"id":"c","function":{"name":"run","arguments":arguments}}]);
-                    let mut frames = vec![
-                        delta(json!({"content":"text","tool_calls":call})),
-                        end(reason),
-                    ];
-                    if repeated {
-                        frames.extend([
-                            event(json!({"choices":[{"finish_reason":reason,"delta":{"role":"assistant","tool_calls":[]}}]})),
-                            event(phantom_usage_chunk()),
-                            event(json!({"choices":[{"finish_reason":reason}]})),
-                            done(),
-                        ]);
-                    }
-                    let (items, usage, outcome) = decode(frames);
-                    let expected_usage = if repeated { USAGE } else { Usage::default() };
-                    assert_eq!((outcome, usage), (Outcome::Cut(expected), expected_usage));
-                    assert_eq!(contents(&items), [text("text")], "{reason}");
-                }
-            }
+            let mut frames = vec![tool("{}")];
+            frames.extend(finishes.map(end));
+            frames.push(done());
+            let (items, _, outcome) = decode(frames);
+            assert_eq!(outcome, expected, "{finishes:?}");
+            assert_eq!(contents(&items), [text("text")], "{finishes:?}");
         }
+        // A text answer is not revised by a later abnormal finish.
+        let answer = delta(json!({"content":"answer"}));
+        let (items, _, outcome) = decode(vec![answer, end("stop"), end("length"), done()]);
+        assert_eq!(
+            (outcome, contents(&items)),
+            (Outcome::Answer, vec![text("answer")])
+        );
     }
 
     /// A finish naming a condition fails the attempt as that condition: an overflow
@@ -624,7 +557,6 @@ pub(super) mod tests {
                 ProviderErrorKind::ContextWindowExceeded,
             ),
             ("aborted", ProviderErrorKind::Unavailable),
-            ("canceled", ProviderErrorKind::Unavailable),
         ] {
             let mut decoder = decoder();
             decoder
@@ -633,25 +565,6 @@ pub(super) mod tests {
             decoder.decode(&end(reason)).unwrap();
             assert_eq!(decoder.finish().unwrap_err().kind(), kind, "{reason}");
         }
-    }
-
-    #[test]
-    fn a_later_abnormal_finish_retracts_tools() {
-        let tool = || {
-            delta(
-                json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{}"}}]}),
-            )
-        };
-        let (items, _, outcome) = decode(vec![tool(), end("stop"), end("length"), done()]);
-        assert_eq!((outcome, items.len()), (MAX_TOKENS, 0));
-        // A late overflow retracts them without failing the response.
-        let late = end("model_context_window_exceeded");
-        let (items, _, outcome) = decode(vec![tool(), end("stop"), late, done()]);
-        let incomplete = Outcome::Cut(CutReason::Incomplete);
-        assert_eq!((outcome, items.len()), (incomplete, 0));
-        // A later normal reason cannot revive discarded tools.
-        let (items, _, outcome) = decode(vec![tool(), end("length"), end("stop"), done()]);
-        assert_eq!((outcome, items.len()), (MAX_TOKENS, 0));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The placement dimensions an entry or a model may select, as configuration
 //! spells them, applied onto a family's conventions.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
     named_enum::named_enum,
@@ -10,29 +10,17 @@ use crate::{
             BodyPath, CacheKey, Codec, CodecName, Locations, NonEmpty, chat_completions, messages,
             overlaps, responses,
         },
+        http::Fields,
         settings::Nullable,
     },
 };
 
-/// A body location as configuration spells it: `{field: path}`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BodyField {
-    pub field: BodyPath,
-}
-
-impl From<BodyField> for BodyPath {
-    fn from(field: BodyField) -> Self {
-        field.field
-    }
-}
-
 /// Locations chosen in place of the preset, if any were: none for null.
-fn chosen<T: Clone, U: From<T>>(selection: &Nullable<NonEmpty<T>>) -> Option<Locations<U>> {
+fn chosen<T: Clone>(selection: &Nullable<NonEmpty<T>>) -> Option<Locations<T>> {
     match selection {
         Nullable::Default => None,
         Nullable::Null => Some(Locations::NONE),
-        Nullable::Value(locations) => Some(locations.clone().map(U::from).into()),
+        Nullable::Value(locations) => Some(locations.clone().into()),
     }
 }
 
@@ -63,7 +51,7 @@ pub enum PlacementError {
         key: PlacementKey,
         family: CodecName,
     },
-    #[error("{key} `{path}` is a field the {family} codec writes")]
+    #[error("{key} `{path}` is a field {family} requests already carry")]
     Reserved {
         key: PlacementKey,
         path: BodyPath,
@@ -92,19 +80,19 @@ crate::provider::settings::settings! {
     #[derive(Default)]
     pub struct Placements => PlacementsPatch {
         #[serde(default, skip_serializing_if = "Nullable::is_default")]
-        pub output_limit: Nullable<NonEmpty<BodyField>> => default,
+        pub output_limit: Nullable<NonEmpty<BodyPath>> => default,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reasoning_effort: Option<NonEmpty<BodyPath>> => optional(NonEmpty<BodyPath>),
         /// Chat Completions only. A field keeps the dialect's replay shape.
         #[serde(default, skip_serializing_if = "Nullable::is_default")]
-        pub reasoning_replay: Nullable<NonEmpty<BodyField>> => default,
+        pub reasoning_replay: Nullable<NonEmpty<BodyPath>> => default,
         /// Chat Completions only.
         #[serde(default, skip_serializing_if = "Nullable::is_default")]
-        pub tool_stream: Nullable<NonEmpty<BodyField>> => default,
+        pub tool_stream: Nullable<NonEmpty<BodyPath>> => default,
         #[serde(default, skip_serializing_if = "Nullable::is_default")]
         pub cache_key: Nullable<NonEmpty<CacheKey>> => default,
         #[serde(default, skip_serializing_if = "Nullable::is_default")]
-        pub user_id: Nullable<NonEmpty<BodyField>> => default,
+        pub user_id: Nullable<NonEmpty<BodyPath>> => default,
     }
 }
 
@@ -125,7 +113,7 @@ impl Placements {
             }
         }
         if let Some(effort) = &self.reasoning_effort {
-            codec.effort_mut().path = effort.clone();
+            *codec.effort_mut() = effort.clone();
         }
         match &mut codec {
             Codec::ChatCompletions(dialect) => {
@@ -138,9 +126,7 @@ impl Placements {
                         dialect.reasoning_replay = chat_completions::ReasoningReplay::Unsupported;
                     }
                     Nullable::Value(fields) => {
-                        dialect.reasoning_replay = dialect
-                            .reasoning_replay
-                            .at(fields.clone().map(BodyPath::from));
+                        dialect.reasoning_replay = dialect.reasoning_replay.at(fields.clone());
                     }
                 }
                 if let Some(stream) = chosen(&self.tool_stream) {
@@ -161,7 +147,7 @@ impl Placements {
                     });
                 }
                 Nullable::Value(fields) => {
-                    dialect.output_limit = fields.clone().map(BodyPath::from);
+                    dialect.output_limit = fields.clone();
                 }
             },
         }
@@ -177,8 +163,9 @@ impl Placements {
 }
 
 /// Every placement the conventions select stays clear of the fields the codec
-/// writes and of every other placement in the object they share.
-pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
+/// writes, of those the dialect adds, and of every other placement in the object
+/// they share.
+pub(crate) fn check(codec: &Codec, added: &Fields) -> Result<(), PlacementError> {
     use PlacementKey as Key;
     let family = codec.name();
     let mut body: Vec<(Key, &BodyPath)> = Vec::new();
@@ -187,14 +174,10 @@ pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
     let (body_fields, message_fields) = match codec {
         Codec::ChatCompletions(dialect) => {
             body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
-            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
+            body.extend(dialect.effort.iter().map(at(Key::ReasoningEffort)));
             body.extend(dialect.tool_stream.iter().map(at(Key::ToolStream)));
-            let replay = dialect.reasoning_replay.paths().into_iter();
-            message.extend(
-                replay
-                    .flat_map(NonEmpty::iter)
-                    .map(at(Key::ReasoningReplay)),
-            );
+            let replay = dialect.reasoning_replay.paths();
+            message.extend(replay.map(at(Key::ReasoningReplay)));
             (
                 chat_completions::BODY_FIELDS,
                 chat_completions::ASSISTANT_FIELDS,
@@ -202,12 +185,12 @@ pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
         }
         Codec::Responses(dialect) => {
             body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
-            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
+            body.extend(dialect.effort.iter().map(at(Key::ReasoningEffort)));
             (responses::BODY_FIELDS, &[][..])
         }
         Codec::Messages(dialect) => {
             body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
-            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
+            body.extend(dialect.effort.iter().map(at(Key::ReasoningEffort)));
             (messages::BODY_FIELDS, &[][..])
         }
     };
@@ -229,7 +212,9 @@ pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
         }
     }
     body.extend(identity.user_id.iter().map(at(Key::UserId)));
-    for (fields, placements) in [(body_fields, body), (message_fields, message)] {
+    let added = added.paths().map(BodyPath::as_str);
+    let body_fields: Vec<_> = body_fields.iter().copied().chain(added).collect();
+    for (fields, placements) in [(&body_fields[..], body), (message_fields, message)] {
         for (index, &(key, path)) in placements.iter().enumerate() {
             if fields.iter().any(|field| overlaps(field, path.as_str())) {
                 let path = path.clone();
@@ -262,7 +247,7 @@ mod tests {
     #[test]
     fn selections_apply_per_family_and_reject_foreign_ones() {
         let placements: Placements = crate::yaml::parse(
-            "output_limit: {field: max_tokens}\nreasoning_replay: null\ncache_key: {header: x-session-id}\nuser_id: {field: metadata.user}\n",
+            "output_limit: max_tokens\nreasoning_replay: null\ncache_key: {header: x-session-id}\nuser_id: metadata.user\n",
         )
         .unwrap();
         let Codec::ChatCompletions(chat) =
@@ -280,11 +265,10 @@ mod tests {
             Locations::one(header("x-session-id"))
         );
         assert_eq!(chat.identity.user_id, Locations::one(path("metadata.user")));
-        assert_eq!(chat.effort.path, NonEmpty::one(path("reasoning_effort")));
+        assert_eq!(chat.effort, NonEmpty::one(path("reasoning_effort")));
         // Placing no replay suits every family; naming a field only Chat.
         assert!(placements.apply(base(CodecName::Responses)).is_ok());
-        let replay: Placements =
-            crate::yaml::parse("reasoning_replay: {field: reasoning}").unwrap();
+        let replay: Placements = crate::yaml::parse("reasoning_replay: reasoning").unwrap();
         assert_eq!(
             replay.apply(base(CodecName::Responses)).unwrap_err(),
             PlacementError::Foreign {
@@ -313,7 +297,7 @@ mod tests {
         // `dump config` writes the tagged spelling back.
         assert_eq!(
             crate::yaml::to_string(&placements).unwrap().trim(),
-            "output_limit:\n  field: max_tokens\nreasoning_replay: null\ncache_key:\n  header: x-session-id\nuser_id:\n  field: metadata.user"
+            "output_limit: max_tokens\nreasoning_replay: null\ncache_key:\n  header: x-session-id\nuser_id: metadata.user"
         );
     }
 
@@ -321,9 +305,9 @@ mod tests {
     /// one another, and a bad location is refused for its own reason.
     #[test]
     fn lists_place_one_value_at_several_locations() {
-        let text = "output_limit: [{field: max_tokens}, {field: max_completion_tokens}]\n\
+        let text = "output_limit: [max_tokens, max_completion_tokens]\n\
             reasoning_effort: [reasoning_effort, reasoning.effort]\n\
-            reasoning_replay: [{field: reasoning}, {field: reasoning_content}]\n\
+            reasoning_replay: [reasoning, reasoning_content]\n\
             cache_key: [{header: x-session-id}, {body: prompt_cache_key}]\n";
         let placements: Placements = crate::yaml::parse(text).unwrap();
         let written = crate::yaml::to_string(&placements).unwrap();
@@ -332,7 +316,7 @@ mod tests {
             placements
         );
         let applied = placements.apply(base(CodecName::ChatCompletions)).unwrap();
-        assert_eq!(check(&applied), Ok(()));
+        assert_eq!(check(&applied, &Fields::default()), Ok(()));
         let Codec::ChatCompletions(chat) = applied else {
             panic!()
         };
@@ -342,7 +326,7 @@ mod tests {
             both("max_tokens", "max_completion_tokens")
         );
         assert_eq!(
-            Locations::from(chat.effort.path),
+            Locations::from(chat.effort),
             both("reasoning_effort", "reasoning.effort")
         );
         let chat_completions::ReasoningReplay::Text(replay) = chat.reasoning_replay else {
@@ -357,9 +341,12 @@ mod tests {
             Locations::one(header("x-session-id")).with(CacheKey::Body(path("prompt_cache_key")))
         );
         let nested: Placements =
-            crate::yaml::parse("output_limit: [{field: limits}, {field: limits.output}]").unwrap();
+            crate::yaml::parse("output_limit: [limits, limits.output]").unwrap();
         assert_eq!(
-            check(&nested.apply(base(CodecName::Responses)).unwrap()),
+            check(
+                &nested.apply(base(CodecName::Responses)).unwrap(),
+                &Fields::default()
+            ),
             Err(PlacementError::Overlap {
                 key: PlacementKey::OutputLimit,
                 path: path("limits"),
@@ -378,16 +365,25 @@ mod tests {
 
     #[test]
     fn a_replay_field_keeps_the_dialect_shape() {
-        use chat_completions::ReasoningReplay;
-        let field: Placements = crate::yaml::parse("reasoning_replay: {field: kept}").unwrap();
+        use crate::provider::codec::UnsignedReasoning;
+        use chat_completions::{NativeReplay, ReasoningReplay};
+        let field: Placements = crate::yaml::parse("reasoning_replay: kept").unwrap();
+        let native = |objects, unsigned| NativeReplay {
+            objects: NonEmpty::one(path(objects)),
+            unsigned,
+        };
+        let plain = || UnsignedReasoning::Replayed(Locations::one(path("reasoning")));
         for (preset, expected) in [
             (
-                ReasoningReplay::ThinkingBlocks(NonEmpty::one(path("thinking_blocks"))),
-                ReasoningReplay::ThinkingBlocks(NonEmpty::one(path("kept"))),
+                ReasoningReplay::ThinkingBlocks(native(
+                    "thinking_blocks",
+                    UnsignedReasoning::Dropped,
+                )),
+                ReasoningReplay::ThinkingBlocks(native("kept", UnsignedReasoning::Dropped)),
             ),
             (
-                ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
-                ReasoningReplay::Details(NonEmpty::one(path("kept"))),
+                ReasoningReplay::Details(native("reasoning_details", plain())),
+                ReasoningReplay::Details(native("kept", plain())),
             ),
             (
                 ReasoningReplay::Unsupported,
@@ -432,13 +428,17 @@ mod tests {
                 CodecName::Messages,
             ] {
                 if let Ok(profile) = settings.admit(family) {
-                    assert_eq!(check(&profile.codec), Ok(()), "preset {index} {family}");
+                    assert_eq!(
+                        check(&profile.codec, &profile.transport.fields),
+                        Ok(()),
+                        "preset {index} {family}"
+                    );
                 }
             }
         }
         let checked = |family, text: &str| {
             let placements: Placements = crate::yaml::parse(text).unwrap();
-            check(&placements.apply(base(family)).unwrap())
+            check(&placements.apply(base(family)).unwrap(), &Fields::default())
         };
         let chat = CodecName::ChatCompletions;
         let header = |name: &'static str, family| PlacementError::ReservedHeader {
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(
             checked(
                 chat,
-                "user_id: {field: metadata.user_id}\ncache_key: {body: metadata.session}\nreasoning_replay: {field: reasoning_effort}"
+                "user_id: metadata.user_id\ncache_key: {body: metadata.session}\nreasoning_replay: reasoning_effort"
             ),
             Ok(())
         );
@@ -479,7 +479,7 @@ mod tests {
             Err(reserved(PlacementKey::ReasoningEffort, "model", chat))
         );
         assert_eq!(
-            checked(chat, "reasoning_replay: {field: tool_calls.0}"),
+            checked(chat, "reasoning_replay: tool_calls.0"),
             Err(reserved(
                 PlacementKey::ReasoningReplay,
                 "tool_calls.0",
@@ -496,32 +496,21 @@ mod tests {
                 responses
             ))
         );
-        for path in [
-            "service_tier",
-            "service_tier.custom",
-            "access_programs",
-            "access_programs.cyber",
-            "access_programs.cyber.custom",
-            "access_programs.other",
-            "prompt_cache_options",
-            "prompt_cache_options.mode",
-            "prompt_cache_options.other.nested",
+        let path = "access_programs.cyber";
+        for (key, selection) in [
+            (
+                PlacementKey::ReasoningEffort,
+                format!("reasoning_effort: {path}"),
+            ),
+            (
+                PlacementKey::CacheKey,
+                format!("cache_key: {{body: {path}}}"),
+            ),
         ] {
-            for (key, selection) in [
-                (
-                    PlacementKey::ReasoningEffort,
-                    format!("reasoning_effort: {path}"),
-                ),
-                (
-                    PlacementKey::CacheKey,
-                    format!("cache_key: {{body: {path}}}"),
-                ),
-            ] {
-                assert_eq!(
-                    checked(responses, &selection),
-                    Err(reserved(key, path, responses))
-                );
-            }
+            assert_eq!(
+                checked(responses, &selection),
+                Err(reserved(key, path, responses))
+            );
         }
         let overlap = |key, path: &str, other, other_path: &str| PlacementError::Overlap {
             key,
@@ -530,7 +519,7 @@ mod tests {
             other_path: BodyPath::new(other_path).unwrap(),
         };
         assert_eq!(
-            checked(chat, "output_limit: {field: reasoning_effort}"),
+            checked(chat, "output_limit: reasoning_effort"),
             Err(overlap(
                 PlacementKey::OutputLimit,
                 "reasoning_effort",
@@ -541,7 +530,7 @@ mod tests {
         assert_eq!(
             checked(
                 CodecName::Messages,
-                "user_id: {field: metadata}\ncache_key: {body: metadata.session}"
+                "user_id: metadata\ncache_key: {body: metadata.session}"
             ),
             Err(overlap(
                 PlacementKey::CacheKey,
