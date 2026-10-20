@@ -204,7 +204,7 @@ impl App {
         let (peers, today) = (self.peers.clone(), self.clock.day());
         let tx = self.tx.clone();
         self.open("Switch session", MenuKind::Sessions(vec![]));
-        let id = self.menu().unwrap().id;
+        let id = self.menu.as_ref().unwrap().id;
         tokio::spawn(async move {
             let result = load_sessions(root, peers, today).await;
             let _ = tx.send(Work::MenuLoaded(MenuLoaded::Sessions(id, result)));
@@ -245,8 +245,7 @@ mod tests {
                 session.shutdown().await.unwrap();
                 session.close().await.unwrap();
             }
-            let records = session.observe().snapshot.records;
-            let last = skyhook::session::EventRecord::last_activity(records.values()).unwrap();
+            let last = session.store().observe().snapshot.last_activity.unwrap();
             stores.push((session, last));
         }
         let ids: Vec<_> = stores.iter().map(|(session, _)| session.id()).collect();
@@ -264,8 +263,8 @@ mod tests {
         let peer = |key, session, working| Peer {
             key,
             session,
-            state: AgentDisplayState::Ready,
             current: key == keys[0],
+            state: AgentDisplayState::Ready,
             attention: false,
             working,
         };

@@ -12,7 +12,7 @@ mod theme;
 mod tool_view;
 
 use super::cli::{InitialInput, InteractiveRequest};
-use app::{App, PreparedObservation};
+use app::App;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -34,7 +34,7 @@ use tokio::{sync::mpsc, time::Instant};
 
 pub(crate) use super::launch::Launch;
 
-/// The period of toasts, output polling, prompt cleanup and animation.
+/// The period of toasts, prompt cleanup and animation.
 const TICK: Duration = Duration::from_millis(100);
 
 pub struct TerminalGuard;
@@ -96,11 +96,10 @@ pub async fn run(
     let permissions = super::launch::Permissions::Mode(mode.clone());
     let launch = Launch::from_request(&request, model, permissions, None).await?;
     let (launch, prompts) = host::with_prompts(launch);
-    let session = match request.resume {
-        Some(id) => Some(launch.create(Some(id)).await?),
+    let observation = match request.resume {
+        Some(id) => Some(host::observed(launch.create(Some(id)).await?).await?),
         None => None,
     };
-    let observation = session.map(PreparedObservation::subscribe);
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(observation, launch, &mode, saved, tx);
     // An explicit mode outranks the one a resumed session was last in, if it has it.

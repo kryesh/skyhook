@@ -35,22 +35,81 @@ impl Read for Source {
     }
 }
 
-/// Reads one capture's chunks on demand, holding the connection only per fetch.
+/// Reads one capture's chunks on demand, each fetch in a snapshot of its own.
 pub(super) struct CaptureReader {
-    db: crate::session::SharedDb,
+    reads: crate::session::Reads,
     capture: i64,
     position: u64,
-    cached: (u64, Vec<u8>),
+    /// Nothing until the first fetch.
+    window: Option<Window>,
+}
+
+/// The chunks a reader holds, and the capture's extent its first fetch observed with
+/// them. It reads no further, so bytes appended later are left for the next reader
+/// and its end needs no fetch of its own.
+struct Window {
+    extent: crate::session::CaptureExtent,
+    start: u64,
+    data: Vec<u8>,
 }
 
 impl CaptureReader {
-    pub(super) fn new(db: crate::session::SharedDb, capture: i64) -> Self {
+    pub(super) fn new(reads: crate::session::Reads, capture: i64) -> Self {
         Self {
-            db,
+            reads,
             capture,
             position: 0,
-            cached: (0, Vec::new()),
+            window: None,
         }
+    }
+
+    /// The capture's extent as this reader observes it: what it reads up to.
+    pub(super) fn extent(&mut self) -> std::io::Result<crate::session::CaptureExtent> {
+        let window = match self.window.take() {
+            Some(window) => window,
+            None => self.fetch(None)?,
+        };
+        let extent = window.extent;
+        self.window = Some(window);
+        Ok(extent)
+    }
+
+    /// The window holding `position`, fetched unless `window` holds it already.
+    fn fetch(&self, window: Option<Window>) -> std::io::Result<Window> {
+        let (extent, chunks) = match window {
+            Some(window)
+                if self.position >= window.extent.bytes
+                    || (window.start..window.start + window.data.len() as u64)
+                        .contains(&self.position) =>
+            {
+                return Ok(window);
+            }
+            Some(Window { extent, .. }) => {
+                let chunks = self
+                    .reads
+                    .capture_chunks(self.capture, self.position, READ_AHEAD);
+                (extent, chunks.map_err(std::io::Error::other)?)
+            }
+            None => {
+                let window = self
+                    .reads
+                    .capture_window(self.capture, self.position, READ_AHEAD);
+                window.map_err(std::io::Error::other)?
+            }
+        };
+        let start = chunks.first().map_or(self.position, |(offset, _)| *offset);
+        let mut data = Vec::new();
+        for (offset, chunk) in chunks {
+            if offset != start + data.len() as u64 {
+                return Err(changed());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(Window {
+            extent,
+            start,
+            data,
+        })
     }
 
     /// The last bytes, up to `limit`, of the `bytes` the capture was observed
@@ -64,7 +123,7 @@ impl CaptureReader {
     }
 
     fn index(&self) -> Result<LineIndex, ToolError> {
-        let extent = (self.db.capture_extent(self.capture)).map_err(std::io::Error::other)?;
+        let extent = (self.reads.capture_extent(self.capture)).map_err(std::io::Error::other)?;
         Ok(LineIndex {
             bytes: extent.bytes,
             total_lines: usize::try_from(extent.newlines).unwrap_or(usize::MAX)
@@ -76,7 +135,7 @@ impl CaptureReader {
     /// that offset and its line number.
     fn checkpoint(&mut self, line: usize) -> Result<(u64, usize), ToolError> {
         let (offset, line) =
-            (self.db.capture_line(self.capture, line as u64)).map_err(std::io::Error::other)?;
+            (self.reads.capture_line(self.capture, line as u64)).map_err(std::io::Error::other)?;
         self.position = offset;
         Ok((offset, usize::try_from(line).unwrap_or(usize::MAX)))
     }
@@ -84,48 +143,39 @@ impl CaptureReader {
 
 impl Read for CaptureReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let (start, data) = &self.cached;
-        if self.position < *start || self.position >= start + data.len() as u64 {
-            let chunks = self
-                .db
-                .capture_chunks(self.capture, self.position, READ_AHEAD)
-                .map_err(std::io::Error::other)?;
-            let Some(first) = chunks.first() else {
-                return Ok(0);
-            };
-            let start = first.0;
-            let mut data = Vec::new();
-            for (offset, chunk) in chunks {
-                if offset != start + data.len() as u64 {
-                    return Err(std::io::Error::other("saved output changed while reading"));
-                }
-                data.extend_from_slice(&chunk);
-            }
-            self.cached = (start, data);
+        let held = self.window.take();
+        let window = self.fetch(held)?;
+        if self.position < window.start {
+            return Err(changed());
         }
-        let (start, data) = &self.cached;
-        if self.position < *start {
-            return Err(std::io::Error::other("saved output changed while reading"));
-        }
-        let available = data
-            .get((self.position - start) as usize..)
+        let remaining = window.extent.bytes.saturating_sub(self.position);
+        let available = (window.data)
+            .get((self.position - window.start) as usize..)
             .unwrap_or_default();
-        let count = available.len().min(buffer.len());
+        let count = available
+            .len()
+            .min(buffer.len())
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         buffer[..count].copy_from_slice(&available[..count]);
         self.position += count as u64;
+        self.window = Some(window);
         Ok(count)
     }
+}
+
+fn changed() -> std::io::Error {
+    std::io::Error::other("saved output changed while reading")
 }
 
 /// The first line of a capture's last page of up to `limit` lines: its trailing
 /// whole lines that such a page holds, or its last line when that alone is
 /// over one.
 pub(super) fn last_page_start(
-    db: &crate::session::SharedDb,
+    reads: &crate::session::Reads,
     capture: i64,
     limit: usize,
 ) -> Result<usize, ToolError> {
-    let reader = CaptureReader::new(db.clone(), capture);
+    let reader = CaptureReader::new(reads.clone(), capture);
     let index = reader.index()?;
     // A page's lines take no fewer bytes of it than they have.
     let end = reader.end(index.bytes, CONTENT_BYTES)?;
@@ -794,21 +844,25 @@ mod tests {
     /// A running job's capture, appended one chunk per string.
     async fn captured(
         chunks: &[&str],
-    ) -> (tempfile::TempDir, crate::job::JobManager, SharedDb, i64) {
+    ) -> (
+        tempfile::TempDir,
+        crate::job::JobManager,
+        super::super::Output,
+        i64,
+    ) {
         let (root, manager, id) = super::super::tests::fixture(None).await;
-        let output = manager.output(id);
-        let db = output.db.clone();
+        let output = manager.output(id).await;
         let field = FieldPointer::result().property("stdout");
-        let capture = db.create_capture(output.run(), &field, CaptureKind::Text);
+        let capture = (output.db).create_capture(output.run(), &field, CaptureKind::Text);
         let capture = capture.unwrap().unwrap();
-        append(&db, capture, chunks);
-        (root, manager, db, capture)
+        append(&output, capture, chunks);
+        (root, manager, output, capture)
     }
 
-    fn append(db: &SharedDb, capture: i64, chunks: &[&str]) {
-        let mut extent = db.capture_extent(capture).unwrap();
+    fn append(output: &super::super::Output, capture: i64, chunks: &[&str]) {
+        let mut extent = output.reads.capture_extent(capture).unwrap();
         for chunk in chunks {
-            extent = db
+            extent = (output.db)
                 .append_capture(capture, extent, chunk.as_bytes())
                 .unwrap();
         }
@@ -826,7 +880,7 @@ mod tests {
             &["one\n", "two\n", "three\n", "four\n"][..],
             &["one\nt", "wo\nthr", "ee\nfour\n"],
         ] {
-            let (_root, _manager, db, capture) = captured(chunks).await;
+            let (_root, _manager, output, capture) = captured(chunks).await;
             let read = |start, context, limit, pattern: bool| {
                 let query = Selection {
                     matcher: pattern.then(|| super::super::args::pattern_matcher(".").unwrap()),
@@ -834,7 +888,7 @@ mod tests {
                     limit,
                     ..selection(start, 0)
                 };
-                let source = Source::Capture(CaptureReader::new(db.clone(), capture));
+                let source = Source::Capture(CaptureReader::new(output.reads.clone(), capture));
                 page(
                     Some(TextField::Bytes(source)),
                     &query,
@@ -862,13 +916,13 @@ mod tests {
     /// ones holding lines it asks for, are left for the next page.
     #[tokio::test]
     async fn pages_stop_at_the_extent_observed_as_they_start() {
-        let (_root, _manager, db, capture) = captured(&[]).await;
-        let source = || CaptureReader::new(db.clone(), capture);
+        let (_root, _manager, output, capture) = captured(&[]).await;
+        let source = || CaptureReader::new(output.reads.clone(), capture);
         let cancellation = Default::default();
         let before = source().index().unwrap();
-        append(&db, capture, &["one\n", "tw"]);
+        append(&output, capture, &["one\n", "tw"]);
         let partial = source().index().unwrap();
-        append(&db, capture, &["o\n", "three\n", "four\n"]);
+        append(&output, capture, &["o\n", "three\n", "four\n"]);
         let read = |index, start, offset| {
             observed(
                 source(),
@@ -889,8 +943,8 @@ mod tests {
         assert_eq!((live.total_lines, live.next_start), (Some(2), Some(2)));
         assert_eq!(live.next_offset, Some(2));
         // A rewrite since the index checkpoints line 2 past the observed extent.
-        db.truncate_capture(capture, 0).unwrap();
-        append(&db, capture, &["aaaa", "bbbb", "cccc"]);
+        output.db.truncate_capture(capture, 0).unwrap();
+        append(&output, capture, &["aaaa", "bbbb", "cccc"]);
         let rewritten = read(partial, 2, 0).unwrap();
         assert!(rewritten.lines().is_empty());
         assert_eq!(rewritten.next_start, Some(2));

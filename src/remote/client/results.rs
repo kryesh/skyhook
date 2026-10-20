@@ -82,6 +82,7 @@ impl Results {
             let stopped = self.stopped.clone();
             self.tasks.spawn(async move {
                 let result = Ingestion::new(&context)
+                    .await
                     .run(context, location, writer, receiver, stopped)
                     .await
                     .map_err(|error| host_output_error(error, Operation::Receive));
@@ -208,12 +209,9 @@ struct Ingestion {
 }
 
 impl Ingestion {
-    fn new(context: &ToolContext) -> Self {
+    async fn new(context: &ToolContext) -> Self {
         Self {
-            captures: Arc::new(CaptureCollector::new(
-                context.store().clone(),
-                context.job(),
-            )),
+            captures: Arc::new(CaptureCollector::new(context.jobs(), context.job()).await),
             images: HashMap::new(),
             source: SpooledPayload::default(),
             result: SpooledPayload::default(),
@@ -460,7 +458,7 @@ mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
         for failed in [true, false] {
-            let mut ingest = Ingestion::new(&context);
+            let mut ingest = Ingestion::new(&context).await;
             for event in [
                 PayloadEvent::Open(PayloadOpen::Source),
                 PayloadEvent::Data {
@@ -531,7 +529,7 @@ mod tests {
                     ..Default::default()
                 })),
             });
-            let mut ingest = Ingestion::new(&context);
+            let mut ingest = Ingestion::new(&context).await;
             ingest.result = SpooledPayload::Finished(
                 serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
             );
@@ -567,8 +565,8 @@ mod tests {
                 .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                 .await;
             let context = fixture_context(&runtime);
-            let saved = runtime.jobs.output(context.job());
-            let mut ingest = Ingestion::new(&context);
+            let saved = runtime.jobs.output(context.job()).await;
+            let mut ingest = Ingestion::new(&context).await;
             for event in [
                 open(1, "/result/content"),
                 data(1, b"a unwanted"),
@@ -740,7 +738,7 @@ mod tests {
                 .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                 .await;
             let context = fixture_context(&runtime);
-            let saved = runtime.jobs.output(context.job());
+            let saved = runtime.jobs.output(context.job()).await;
             let (connection, mut requests) = wired_connection(4096).await;
             let call_connection = connection.clone();
             let call_context = context.clone();

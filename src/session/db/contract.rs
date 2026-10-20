@@ -22,7 +22,7 @@ fn digest(value: &impl serde::Serialize) -> DbResult<Vec<u8>> {
 
 fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
     db.query_row(
-        &format!("SELECT id FROM {table} WHERE digest = ?1"),
+        format!("SELECT id FROM {table} WHERE digest = ?1"),
         params![digest],
         |row| Ok(row.get::<i64>(0)?),
     )?
@@ -233,7 +233,7 @@ fn context(db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
     Ok(())
 }
 
-fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
+pub(super) fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
     let limit =
         |tokens: u64| std::num::NonZeroU64::new(tokens).ok_or_else(|| corrupt("zero model limit"));
     keyed(
@@ -257,59 +257,64 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
     )
 }
 
-/// The target revisions each entry journaled.
-pub(super) fn targets(db: &Db) -> DbResult<HashMap<i64, Vec<TargetDefinition>>> {
+/// The target revisions each entry in scope journaled.
+pub(super) fn targets(events: &Events) -> DbResult<HashMap<i64, Vec<TargetDefinition>>> {
+    let db = events.db;
     let options = grouped(
         db,
-        "SELECT revision, key, value FROM target_ssh_option ORDER BY revision, key",
+        events.scoped(
+            "SELECT revision, key, value FROM target_ssh_option \
+             WHERE revision IN (SELECT id FROM target_revision {scope}) ORDER BY revision, key",
+            "entry",
+        )?,
         |row| Ok((row.get::<String>(1)?, row.get::<String>(2)?)),
     )?;
     let mut targets: HashMap<i64, Vec<TargetDefinition>> = HashMap::new();
-    for (entry, target) in db.query(
+    let Query { sql, params } = events.scoped(
         "SELECT r.entry, r.id, t.name, r.revision, r.source, r.host, r.workspace, r.ssh_user, \
          r.ssh_port, r.ssh_auth, r.ssh_key_path, r.ssh_external_agent, v.name, o.name \
          FROM target_revision r JOIN target t ON t.id = r.target \
          LEFT JOIN target v ON v.id = r.via LEFT JOIN target o ON o.id = r.origin \
-         ORDER BY r.entry, r.id",
-        Vec::new(),
-        |row| {
-            let auth = match (enum_column(row, 9)?, row.get::<Option<Vec<u8>>>(10)?) {
-                (SshAuth::Default, None) => TargetAuth::Default,
-                (SshAuth::Agent, None) => TargetAuth::Agent,
-                (SshAuth::Key, Some(key)) => TargetAuth::Key {
-                    path: path_from_bytes(key),
+         {scope} ORDER BY r.entry, r.id",
+        "r.entry",
+    )?;
+    for (entry, target) in db.query(sql, params, |row| {
+        let auth = match (enum_column(row, 9)?, row.get::<Option<Vec<u8>>>(10)?) {
+            (SshAuth::Default, None) => TargetAuth::Default,
+            (SshAuth::Agent, None) => TargetAuth::Agent,
+            (SshAuth::Key, Some(key)) => TargetAuth::Key {
+                path: path_from_bytes(key),
+            },
+            _ => return Err(corrupt("target authentication is inconsistent")),
+        };
+        let port = row.get::<Option<u32>>(8)?;
+        Ok((
+            row.get::<i64>(0)?,
+            TargetDefinition {
+                name: parsed(row.get(2)?)?,
+                host: row.get(5)?,
+                ssh: SshOptions {
+                    user: row.get(7)?,
+                    port: port
+                        .and_then(|port| u16::try_from(port).ok())
+                        .and_then(std::num::NonZeroU16::new),
+                    auth,
+                    external_agent: row.get(11)?,
+                    options: options
+                        .get(&row.get::<i64>(1)?)
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                        .collect(),
                 },
-                _ => return Err(corrupt("target authentication is inconsistent")),
-            };
-            let port = row.get::<Option<u32>>(8)?;
-            Ok((
-                row.get::<i64>(0)?,
-                TargetDefinition {
-                    name: parsed(row.get(2)?)?,
-                    host: row.get(5)?,
-                    ssh: SshOptions {
-                        user: row.get(7)?,
-                        port: port
-                            .and_then(|port| u16::try_from(port).ok())
-                            .and_then(std::num::NonZeroU16::new),
-                        auth,
-                        external_agent: row.get(11)?,
-                        options: options
-                            .get(&row.get::<i64>(1)?)
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                            .collect(),
-                    },
-                    workspace: path_from_bytes(row.get(6)?),
-                    via: row.get::<Option<String>>(12)?.map(parsed).transpose()?,
-                    origin: row.get::<Option<String>>(13)?.map(parsed).transpose()?,
-                    source: enum_column(row, 4)?,
-                    revision: row.get(3)?,
-                },
-            ))
-        },
-    )? {
+                workspace: path_from_bytes(row.get(6)?),
+                via: row.get::<Option<String>>(12)?.map(parsed).transpose()?,
+                origin: row.get::<Option<String>>(13)?.map(parsed).transpose()?,
+                source: enum_column(row, 4)?,
+                revision: row.get(3)?,
+            },
+        ))
+    })? {
         targets.entry(entry).or_default().push(target);
     }
     Ok(targets)
@@ -327,17 +332,27 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
     };
     let mut capabilities = grouped(
         db,
-        "SELECT entry, capability FROM agent_capability",
+        events.scoped(
+            "SELECT entry, capability FROM agent_capability {scope}",
+            "entry",
+        )?,
         |row| enum_column(row, 1),
     )?;
     // Mode editions by the entry that recorded them.
     let mode_capabilities = grouped(
         db,
-        "SELECT m.entry, c.capability FROM mode_capability c \
-         JOIN mode m ON m.name = c.mode_name AND m.version = c.mode_version",
+        events.scoped(
+            "SELECT m.entry, c.capability FROM mode_capability c \
+             JOIN mode m ON m.name = c.mode_name AND m.version = c.mode_version {scope}",
+            "m.entry",
+        )?,
         |row| enum_column(row, 1),
     )?;
-    let mut editions = keyed(db, "SELECT entry, instructions, hint FROM mode", |row| {
+    let editions = events.scoped(
+        "SELECT entry, instructions, hint FROM mode {scope}",
+        "entry",
+    )?;
+    let mut editions = keyed(db, editions, |row| {
         let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
         Ok(Mode {
             capabilities: sorted(capabilities.cloned().unwrap_or_default()),
@@ -345,14 +360,14 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             hint: row.get::<Option<String>>(2)?.map(parsed).transpose()?,
         })
     })?;
-    let mut modes = keyed(db, "SELECT entry, mode_name FROM agent_mode", |row| {
-        parsed(row.get(1)?)
-    })?;
+    let modes = events.scoped("SELECT entry, mode_name FROM agent_mode {scope}", "entry")?;
+    let mut modes = keyed(db, modes, |row| parsed(row.get(1)?))?;
     events.load(
         "SELECT s.entry, a.owner_job, a.available_depth, t.name, s.location_workspace, \
          s.profile FROM agent_start s \
          JOIN entry e ON e.seq = s.entry JOIN agent a ON a.id = e.agent \
-         JOIN target t ON t.id = s.location_target",
+         JOIN target t ON t.id = s.location_target {scope}",
+        "s.entry",
         |row| {
             let entry = row.get(0)?;
             Ok(SessionEvent::AgentStarted {
@@ -378,14 +393,20 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
     if !editions.is_empty() || !capabilities.is_empty() {
         return Err(corrupt("mode rows belong to an entry that applied no mode"));
     }
-    events.load("SELECT entry, profile FROM model_selection", |row| {
+    let selections = "SELECT entry, profile FROM model_selection {scope}";
+    events.load(selections, "entry", |row| {
         Ok(SessionEvent::ModelChanged {
             profile: profile(row.get(1)?)?,
         })
     })?;
     let prompts = grouped(
         db,
-        "SELECT prompt, text, cache FROM system_segment ORDER BY prompt, position",
+        events.scoped(
+            "SELECT prompt, text, cache FROM system_segment \
+             WHERE prompt IN (SELECT c.system_prompt FROM model_context c {scope}) \
+             ORDER BY prompt, position",
+            "c.entry",
+        )?,
         |row| {
             Ok(SystemSegment {
                 text: row.get(1)?,
@@ -395,8 +416,13 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
     )?;
     let tools = grouped(
         db,
-        "SELECT t.context, d.name, d.description, d.input_schema FROM model_context_tool t \
-         JOIN tool_definition d ON d.id = t.tool ORDER BY t.context, t.position",
+        events.scoped(
+            "SELECT t.context, d.name, d.description, d.input_schema FROM model_context_tool t \
+             JOIN tool_definition d ON d.id = t.tool \
+             WHERE t.context IN (SELECT c.entry FROM model_context c {scope}) \
+             ORDER BY t.context, t.position",
+            "c.entry",
+        )?,
         |row| {
             Ok(ToolDefinition {
                 name: row.get(1)?,
@@ -406,8 +432,9 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         },
     )?;
     events.load(
-        "SELECT entry, purpose, profile, system_prompt, response_schema_name, response_schema \
-         FROM model_context",
+        "SELECT c.entry, c.purpose, c.profile, c.system_prompt, c.response_schema_name, \
+         c.response_schema FROM model_context c {scope}",
+        "c.entry",
         |row| {
             let response_schema =
                 match (row.get::<Option<String>>(4)?, row.get::<Option<String>>(5)?) {
@@ -421,10 +448,7 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
                 context: ModelContext {
                     purpose: enum_column(row, 1)?,
                     profile: profile(row.get(2)?)?,
-                    system: prompts
-                        .get(&row.get::<i64>(3)?)
-                        .cloned()
-                        .unwrap_or_default(),
+                    system: (prompts.get(&row.get::<i64>(3)?).cloned()).unwrap_or_default(),
                     tools: tools.get(&row.get::<i64>(0)?).cloned().unwrap_or_default(),
                     response_schema,
                 },

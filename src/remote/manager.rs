@@ -495,7 +495,7 @@ pub(crate) mod tests {
                     .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                     .await;
                 let context = fixture_context(&runtime);
-                let saved = runtime.jobs.output(context.job());
+                let saved = runtime.jobs.output(context.job()).await;
                 let (client, mut shim) = tokio::io::duplex(4096);
                 let (output, input) = tokio::io::split(client);
                 let (owner, dropped) = tokio::sync::oneshot::channel::<()>();

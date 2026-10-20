@@ -189,10 +189,9 @@ mod tests {
         let rows: Vec<Row> = layout
             .lines
             .into_iter()
-            .map(|line| fixture_row(line.line, line.layout, 0, width, 0))
+            .map(|line| fixture_row(line.line, line.layout, 0, width))
             .collect();
-        let mut blocks = RowBlocks::default();
-        blocks.replace_entry(0, rows.clone(), Vec::new());
+        let blocks = RowBlocks::entry(rows.clone());
         let end = TextPosition {
             row: rows.len() - 1,
             byte: usize::MAX,

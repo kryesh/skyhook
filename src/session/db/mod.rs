@@ -3,42 +3,76 @@
 //! Local libsql futures complete without suspending, so every operation is
 //! driven to completion in place and callers own their threading.
 
-use std::path::Path;
+use std::{cell::RefCell, collections::HashMap, path::Path};
 
 use futures_util::FutureExt;
-use libsql::{Builder, Connection, OpenFlags, Row, Value};
+use libsql::{Builder, Connection, OpenFlags, Row, Statement, Value};
 
 use crate::{
     agent::{FailureKind, FaultKind},
+    media::BlobDigest,
     named_enum::NamedEnum,
-    session::{MessageSeq, RecordSeq, RequestSeq},
+    session::{BlobError, MessageSeq, RecordSeq, RequestSeq},
 };
 
 mod contract;
 mod decode;
 mod diagnostic;
 mod encode;
+pub(super) mod history;
 mod job;
 mod message;
 mod output;
+mod pages;
+mod reads;
 mod request;
+mod resident;
 mod state;
+pub(super) mod stats;
+mod wal;
 
-pub(super) use decode::{decode_records, u64_of};
-pub(super) use encode::Encoder;
-pub(crate) use output::{CaptureExtent, CaptureRow, OffloadedCapture, OutputRows};
+pub(super) use decode::{Entries, agent_paths, decode_records, u64_of};
+pub(super) use encode::{Encoder, agent_row};
+pub(crate) use job::JobRow;
+pub(super) use job::{creations, job_rows, write_status};
+pub(super) use message::Scope;
+pub(super) use output::remove_staged;
+pub(crate) use output::{CaptureExtent, CaptureRow, OutputRows, SavedRows, StagedCapture};
+pub(super) use pages::{agent_summaries, child_jobs, failed_after, root_jobs, transcript};
+#[cfg(test)]
+pub(super) use reads::CONNECTIONS;
+pub(crate) use reads::{Own, ReadPool, Reads};
+pub(super) use request::requests;
+pub(crate) use resident::AgentRecords;
+pub(super) use resident::{Opening, agent, created_by, opening};
+#[cfg(debug_assertions)]
+pub(super) use state::decided;
 pub use state::{SessionSummary, SessionTitle};
-pub(super) use state::{summary, title};
+pub(super) use state::{counters, root_prompt, summary, title};
+#[cfg(test)]
+pub(super) use wal::{CHECKPOINT_FRAMES, Frames};
+pub(super) use wal::{Checkpointer, Log};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 23;
+pub(super) const USER_VERSION: i64 = 24;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
 const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
-/// Payload tables outside the append-only ledger: blobs, and captures, which stream
-/// before the output that references them is saved with its finish.
-const MUTABLE_TABLES: [&str; 3] = ["blob", "job_capture", "job_capture_chunk"];
+/// Tables outside the append-only ledger: blobs, captures, which are written before
+/// the output that references them is saved with its finish, and the jobs', requests'
+/// and agents' current state, which their folds write.
+const MUTABLE_TABLES: [&str; 9] = [
+    "blob",
+    "job_capture",
+    "job_capture_chunk",
+    "job_capture_staged",
+    "job_status",
+    "job_reply",
+    "request_state",
+    "agent_state",
+    "agent_context",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -54,6 +88,8 @@ pub enum DbError {
     Corrupt(String),
     #[error("session record rejected: {0}")]
     Rejected(String),
+    #[error("session database file failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub(super) type DbResult<T> = Result<T, DbError>;
@@ -71,6 +107,31 @@ pub(super) fn corrupt(message: impl Into<String>) -> DbError {
 
 pub(super) fn rejected(message: impl Into<String>) -> DbError {
     DbError::Rejected(message.into())
+}
+
+/// Store `bytes` under `digest`, their digest, once.
+pub(super) fn insert_blob(db: &Db, digest: BlobDigest, bytes: &[u8]) -> DbResult<()> {
+    db.execute(
+        SqlText::Once(
+            "INSERT INTO blob (sha256, bytes) VALUES (?1, ?2) ON CONFLICT (sha256) DO NOTHING",
+        ),
+        params![digest, bytes],
+    )
+    .map(drop)
+}
+
+/// The bytes stored under `digest`, checked against it.
+pub(super) fn verified_blob(db: &Db, digest: BlobDigest) -> DbResult<Result<Vec<u8>, BlobError>> {
+    let bytes = db.query_row(
+        "SELECT bytes FROM blob WHERE sha256 = ?1",
+        params![digest],
+        |row| Ok(row.get::<Vec<u8>>(0)?),
+    )?;
+    Ok(match bytes {
+        None => Err(BlobError::Missing),
+        Some(bytes) if BlobDigest::of(&bytes) != digest => Err(BlobError::HashMismatch),
+        Some(bytes) => Ok(bytes),
+    })
 }
 
 /// Bind a Rust value as an SQLite parameter. Unsigned values saturate at `i64::MAX`.
@@ -98,7 +159,7 @@ macro_rules! sql_sequence {
         }
     )*};
 }
-sql_sequence!(RecordSeq, RequestSeq, MessageSeq);
+sql_sequence!(RecordSeq, RequestSeq, MessageSeq, crate::identity::JobId);
 
 impl Sql for bool {
     fn sql(self) -> Value {
@@ -151,6 +212,12 @@ impl Sql for &[u8] {
 impl Sql for Vec<u8> {
     fn sql(self) -> Value {
         Value::Blob(self)
+    }
+}
+
+impl Sql for BlobDigest {
+    fn sql(self) -> Value {
+        Value::Blob(self.to_bytes().to_vec())
     }
 }
 
@@ -207,11 +274,79 @@ pub(super) enum OpenMode {
     Open,
     ReadOnly,
     Memory,
+    /// A connection that only checkpoints the write-ahead log.
+    Checkpoint,
 }
 
 pub(super) struct Db {
+    /// Statements of static SQL, prepared once and kept reset between uses. They come
+    /// first so that they are finalized before the connection closes.
+    statements: RefCell<HashMap<&'static str, Statement>>,
     conn: Connection,
     _database: libsql::Database,
+}
+
+/// The text of one SQL statement. Static text is prepared once per connection and
+/// kept with it; text built at run time is prepared for each use, since what it
+/// interpolates can differ every time.
+pub(super) enum SqlText {
+    Static(&'static str),
+    /// Static text prepared for each use: one binding a large payload, as a kept
+    /// statement keeps a copy of the values it last bound until it binds again, or
+    /// one a connection runs once, as a kept statement holds memory the connection's
+    /// later statements would allocate from.
+    Once(&'static str),
+    Built(String),
+}
+
+impl From<&'static str> for SqlText {
+    fn from(sql: &'static str) -> Self {
+        Self::Static(sql)
+    }
+}
+
+impl From<String> for SqlText {
+    fn from(sql: String) -> Self {
+        Self::Built(sql)
+    }
+}
+
+/// A statement out for use, reset when dropped and, if its SQL is static, kept.
+struct Prepared<'a> {
+    db: &'a Db,
+    kept: Option<&'static str>,
+    /// Present from prepare until drop.
+    statement: Option<Statement>,
+}
+
+impl std::ops::Deref for Prepared<'_> {
+    type Target = Statement;
+
+    fn deref(&self) -> &Statement {
+        self.statement
+            .as_ref()
+            .expect("a prepared statement is held until dropped")
+    }
+}
+
+impl Prepared<'_> {
+    /// Run it to completion and reset it, so it binds afresh.
+    fn execute(&self, params: Vec<Value>) -> DbResult<u64> {
+        let changes = ready((**self).execute(params));
+        self.reset();
+        changes.map(|changes| changes as u64)
+    }
+}
+
+impl Drop for Prepared<'_> {
+    fn drop(&mut self) {
+        let statement = self.statement.take();
+        if let (Some(sql), Some(statement)) = (self.kept, statement) {
+            // A statement stepped but not run to its end holds its snapshot until reset.
+            statement.reset();
+            self.db.statements.borrow_mut().insert(sql, statement);
+        }
+    }
 }
 
 impl Db {
@@ -221,12 +356,15 @@ impl Db {
             OpenMode::ReadOnly => Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_ONLY),
             OpenMode::Create => Builder::new_local(path)
                 .flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE),
-            OpenMode::Open => Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_WRITE),
+            OpenMode::Open | OpenMode::Checkpoint => {
+                Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_WRITE)
+            }
         };
         let database = ready(builder.build())?;
         let conn = database.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         let db = Self {
+            statements: RefCell::default(),
             conn,
             _database: database,
         };
@@ -236,11 +374,16 @@ impl Db {
                 db.check_version()?;
                 Dictionaries(&db, Seeding::Check).seed()?;
             }
+            OpenMode::Checkpoint => db.check_version()?,
         }
         db.batch(&match mode {
             OpenMode::ReadOnly => "PRAGMA foreign_keys = ON; PRAGMA query_only = 1;".to_owned(),
+            OpenMode::Checkpoint => return Ok(db),
+            // The writer neither syncs at its commits nor checkpoints: the core syncs
+            // once per group of commands, and a thread of its own checkpoints.
             _ => format!(
-                "PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; \
+                "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \
+                 PRAGMA wal_autocheckpoint = 0; \
                  PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT}; PRAGMA temp_store = MEMORY;"
             ),
         })?;
@@ -291,7 +434,7 @@ impl Dictionaries<'_> {
     fn seed(&self) -> DbResult<()> {
         use crate::{
             agent::TodoStatus,
-            job::{CaptureKind, JobRole, JobState},
+            job::{AnswerKind, CaptureKind, JobRole, JobState},
             media::ImageFormat,
             provider::{
                 profile::StateMode,
@@ -340,6 +483,10 @@ impl Dictionaries<'_> {
         self.names("diagnostic_io_kind", &IoKind::ALL)?;
         self.names("diagnostic_path_role", &PathRole::ALL)?;
         self.names("job_state", &JobState::ALL)?;
+        self.names("job_answer", &AnswerKind::ALL)?;
+        self.names("request_phase", &request::PhaseKind::ALL)?;
+        self.names("agent_last", &state::LastKind::ALL)?;
+        self.names("agent_outcome", &state::OutcomeKind::ALL)?;
         self.names("failure_kind", &FailureKind::ALL)?;
         self.names(
             "provider_error_kind",
@@ -372,18 +519,16 @@ impl Dictionaries<'_> {
         if let Seeding::Fill = seeding {
             let slots: String = (2..=N + 1).map(|slot| format!(", ?{slot}")).collect();
             let sql = format!("INSERT INTO {table} ({columns}) VALUES (?1{slots})");
-            let statement = ready(db.conn.prepare(&sql))?;
+            let statement = db.prepare(sql)?;
             for value in values {
                 let mut params = params![*value];
                 params.extend(expected[value.as_str()].map(Sql::sql));
-                ready(statement.execute(params))?;
-                // Local libsql statements must be reset before rebinding.
-                statement.reset();
+                statement.execute(params)?;
             }
         }
         // Each row consumes its expected entry, so a repeat or unknown row fails.
         db.query(
-            &format!("SELECT {columns} FROM {table}"),
+            format!("SELECT {columns} FROM {table}"),
             Vec::new(),
             |row| {
                 let Value::Text(name) = row.get_value(0)? else {
@@ -410,7 +555,7 @@ impl Dictionaries<'_> {
 impl Db {
     fn check_version(&self) -> DbResult<()> {
         let pragma = |name| {
-            self.query_row(&format!("PRAGMA {name}"), Vec::new(), |row| {
+            self.query_row(format!("PRAGMA {name}"), Vec::new(), |row| {
                 Ok(row.get::<i64>(0)?)
             })
             .map(Option::unwrap_or_default)
@@ -434,23 +579,45 @@ impl Db {
         ready(self.conn.execute_batch(sql)).map(drop)
     }
 
-    pub(super) fn execute(&self, sql: &str, params: Vec<Value>) -> DbResult<u64> {
-        ready(self.conn.execute(sql, params))
+    /// `sql`, prepared: kept from an earlier use if it is static and none is in use.
+    fn prepare(&self, sql: impl Into<SqlText>) -> DbResult<Prepared<'_>> {
+        let (kept, statement) = match sql.into() {
+            SqlText::Static(sql) => {
+                let statement = self.statements.borrow_mut().remove(sql);
+                let statement = match statement {
+                    Some(statement) => statement,
+                    None => ready(self.conn.prepare(sql))?,
+                };
+                (Some(sql), statement)
+            }
+            SqlText::Once(sql) => (None, ready(self.conn.prepare(sql))?),
+            SqlText::Built(sql) => (None, ready(self.conn.prepare(&sql))?),
+        };
+        Ok(Prepared {
+            db: self,
+            kept,
+            statement: Some(statement),
+        })
+    }
+
+    pub(super) fn execute(&self, sql: impl Into<SqlText>, params: Vec<Value>) -> DbResult<u64> {
+        self.prepare(sql)?.execute(params)
     }
 
     /// Execute an INSERT and return the new row's rowid.
-    pub(super) fn insert(&self, sql: &str, params: Vec<Value>) -> DbResult<i64> {
+    pub(super) fn insert(&self, sql: impl Into<SqlText>, params: Vec<Value>) -> DbResult<i64> {
         self.execute(sql, params)?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub(super) fn query<T>(
         &self,
-        sql: &str,
+        sql: impl Into<SqlText>,
         params: Vec<Value>,
         mut map: impl FnMut(&Row) -> DbResult<T>,
     ) -> DbResult<Vec<T>> {
-        let mut rows = ready(self.conn.query(sql, params))?;
+        let statement = self.prepare(sql)?;
+        let mut rows = ready(statement.query(params))?;
         let mut values = Vec::new();
         while let Some(row) = ready(rows.next())? {
             values.push(map(&row)?);
@@ -460,17 +627,21 @@ impl Db {
 
     pub(super) fn query_row<T>(
         &self,
-        sql: &str,
+        sql: impl Into<SqlText>,
         params: Vec<Value>,
         map: impl FnOnce(&Row) -> DbResult<T>,
     ) -> DbResult<Option<T>> {
-        let mut rows = ready(self.conn.query(sql, params))?;
+        let statement = self.prepare(sql)?;
+        let mut rows = ready(statement.query(params))?;
         ready(rows.next())?.as_ref().map(map).transpose()
     }
 
     /// Run `work` inside `BEGIN IMMEDIATE`; any error rolls back.
-    pub(super) fn transaction<T>(&self, work: impl FnOnce() -> DbResult<T>) -> DbResult<T> {
-        self.batch("BEGIN IMMEDIATE")?;
+    pub(super) fn transaction<T, E: From<DbError>>(
+        &self,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.execute("BEGIN IMMEDIATE", Vec::new())?;
         let result = work();
         if result.is_err() {
             let _ = self.rollback();
@@ -486,39 +657,112 @@ impl Db {
     }
 
     pub(super) fn commit(&self) -> DbResult<()> {
-        self.batch("COMMIT")
+        self.execute("COMMIT", Vec::new()).map(drop)
     }
 
     pub(super) fn rollback(&self) -> DbResult<()> {
-        self.batch("ROLLBACK")
+        self.execute("ROLLBACK", Vec::new()).map(drop)
     }
 }
 
 /// The session's one read-write connection, shared by the ledger writer and job output
-/// streams. Ledger transactions hold it from BEGIN through COMMIT; output operations
-/// hold it for one statement group, so neither observes the other's open transaction.
+/// streams, and the log that makes what it commits durable, which a session held in
+/// memory has none of. Every write holds it from BEGIN through COMMIT, so none observes
+/// another's open transaction.
 #[derive(Clone)]
-pub(crate) struct SharedDb(std::sync::Arc<std::sync::Mutex<Db>>);
+pub(crate) struct SharedDb {
+    db: std::sync::Arc<std::sync::Mutex<Db>>,
+    log: Option<std::sync::Arc<Log>>,
+}
+
+/// Why a write did not commit, or may not have.
+pub(super) enum WriteError<E = DbError> {
+    /// Its work failed, and its transaction rolled back.
+    Refused(E),
+    /// Its COMMIT failed, which leaves whether it committed unknown.
+    Unconfirmed(DbError),
+}
+
+impl From<WriteError> for DbError {
+    fn from(error: WriteError) -> Self {
+        match error {
+            WriteError::Refused(error) | WriteError::Unconfirmed(error) => error,
+        }
+    }
+}
 
 impl SharedDb {
-    pub(super) fn new(db: Db) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(db)))
+    pub(super) fn new(db: Db, log: Option<std::sync::Arc<Log>>) -> Self {
+        Self {
+            db: std::sync::Arc::new(std::sync::Mutex::new(db)),
+            log,
+        }
     }
 
     /// A holder that panicked may have left a transaction open; roll it back so
     /// later statements cannot join it.
     pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
-        self.0.lock().unwrap_or_else(|poisoned| {
-            self.0.clear_poison();
+        #[cfg(debug_assertions)]
+        super::core::assert_connection_first();
+        self.db.lock().unwrap_or_else(|poisoned| {
+            self.db.clear_poison();
             let db = poisoned.into_inner();
             let _ = db.rollback();
             db
         })
     }
+
+    /// Run `work` in one immediate transaction and commit it. What it commits becomes
+    /// durable with the next sync, and the log it grew is checkpointed as it grows.
+    pub(super) fn write<T, E: From<DbError>>(
+        &self,
+        work: impl FnOnce(&Db) -> Result<T, E>,
+    ) -> Result<T, WriteError<E>> {
+        let failed = |_: &Db, failed| match failed {
+            Ok((_, cause)) => WriteError::Unconfirmed(cause),
+            Err(error) => WriteError::Refused(error),
+        };
+        self.write_undoing(work, failed)
+    }
+
+    /// [`write`](Self::write) `work`; once a failed transaction rolled back, `undo` runs
+    /// on the connection still held, given `work`'s error, or its value with COMMIT's,
+    /// and returns the error.
+    pub(super) fn write_undoing<T, E: From<DbError>, F>(
+        &self,
+        work: impl FnOnce(&Db) -> Result<T, E>,
+        undo: impl FnOnce(&Db, Result<(T, DbError), E>) -> F,
+    ) -> Result<T, F> {
+        let db = self.lock();
+        let failed = match db.transaction(|| work(&db)) {
+            Ok(value) => match db.commit() {
+                Ok(()) => {
+                    drop(db);
+                    if let Some(log) = &self.log {
+                        log.wake();
+                    }
+                    return Ok(value);
+                }
+                Err(cause) => {
+                    let _ = db.rollback();
+                    Ok((value, cause))
+                }
+            },
+            Err(error) => Err(error),
+        };
+        Err(undo(&db, failed))
+    }
+
+    /// Make what every transaction committed through it so far durable. It does
+    /// not take the connection.
+    pub(super) fn sync(&self) -> std::io::Result<()> {
+        self.log.as_ref().map_or(Ok(()), |log| log.sync())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     // Schema-level rejection of inconsistent rows. The fixture also drives the
     // encode -> decode round trips in encode.rs.
     use serde_json::json;
@@ -542,8 +786,11 @@ mod tests {
     pub(super) struct Fixture {
         pub(super) db: Db,
         encoder: Encoder,
-        pub(super) records: Vec<EventRecord>,
+        pub(super) records: Vec<Arc<EventRecord>>,
         session: SessionId,
+        /// The folds whose rows each commit writes, as the core's do.
+        requests: crate::session::ResidentLedger,
+        agents: crate::session::agent_state::AgentStates,
     }
 
     impl Fixture {
@@ -553,6 +800,8 @@ mod tests {
                 encoder: Encoder::default(),
                 records: Vec::new(),
                 session: SessionId::from_bytes([3; 16]),
+                requests: Default::default(),
+                agents: Default::default(),
             }
         }
 
@@ -580,18 +829,31 @@ mod tests {
             let records: Vec<_> = events
                 .into_iter()
                 .enumerate()
-                .map(|(offset, (agent, event))| EventRecord {
-                    id: EventId::generate().unwrap(),
-                    sequence: (first + offset as u64).into(),
-                    timestamp_millis: 1_700_000_000_000 + offset as i64,
-                    agent,
-                    event,
+                .map(|(offset, (agent, event))| {
+                    Arc::new(EventRecord {
+                        id: EventId::generate().unwrap(),
+                        sequence: (first + offset as u64).into(),
+                        timestamp_millis: 1_700_000_000_000 + offset as i64,
+                        agent,
+                        event,
+                    })
                 })
                 .collect();
             let (db, encoder) = (&self.db, &mut self.encoder);
-            let result = db.transaction(|| encoder.records(db, &records));
+            let (mut requests, mut agents) = (self.requests.clone(), self.agents.clone());
+            let result = db.transaction(|| {
+                encoder.start(db, &records)?;
+                for record in &records {
+                    encoder.record(db, record)?;
+                    agents.apply(record, &mut requests);
+                }
+                encoder.write_rows(db, &agents.take_unwritten(), &requests)
+            });
             match result {
-                Ok(()) => db.commit().unwrap(),
+                Ok(()) => {
+                    db.commit().unwrap();
+                    (self.requests, self.agents) = (requests, agents);
+                }
                 Err(error) => {
                     encoder.reset();
                     return Err(error);
@@ -629,25 +891,27 @@ mod tests {
             &self,
             seq: u64,
             kind: EntryKind,
-            rows: &[&str],
+            rows: &[&'static str],
             params: Vec<libsql::Value>,
         ) -> Result<(), DbError> {
             self.db.atomic(|| {
                 self.db.execute(
-                    "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
-                     VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)",
+                    "INSERT INTO entry (seq, public_id, agent, agent_ordinal, created_millis, kind) \
+                     SELECT ?1, randomblob(16), a.id, \
+                       (SELECT count(*) FROM entry WHERE agent = a.id), 0, ?2 \
+                     FROM (SELECT min(id) AS id FROM agent) a",
                     params![seq, kind],
                 )?;
                 for row in rows {
                     let params = params![seq].into_iter().chain(params.iter().cloned());
-                    self.db.execute(row, params.collect())?;
+                    self.db.execute(*row, params.collect())?;
                 }
                 Ok(())
             })
         }
 
-        pub(super) fn decode(&self) -> Result<Vec<EventRecord>, DbError> {
-            decode_records(&self.db, self.session)
+        pub(super) fn decode(&self) -> Result<Vec<Arc<EventRecord>>, DbError> {
+            decode_records(&self.db, self.session, super::Entries::All)
         }
 
         pub(super) fn assert_round_trip(&self) {

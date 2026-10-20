@@ -1,6 +1,7 @@
-//! The lifecycle of every model request folded from the journal: how each request
-//! ended and which committed message answered it. Session statistics and host
-//! projections share this one fold instead of re-deriving it from attempt events.
+//! The lifecycle of model requests folded from the journal: how each request ended
+//! and which committed message answered it. The fold keeps only each agent's newest
+//! request and what its turn leaves open; the core writes each request's row as its
+//! records change it, and what it decides of a record as a [`Fact`].
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
@@ -98,7 +99,7 @@ impl RequestPhase {
         }
     }
 
-    fn last_attempt(&self) -> Option<u64> {
+    pub(crate) fn last_attempt(&self) -> Option<u64> {
         match self {
             Self::Requested => None,
             Self::Open { attempt, .. }
@@ -123,68 +124,116 @@ pub struct RequestRecord {
     /// Every usage report for the request, over all its attempts.
     pub usage: Usage,
     pub phase: RequestPhase,
-    /// The record that last changed the request.
-    revised: RecordSeq,
+    /// The record that moved it to its phase: the request itself, its attempt's start,
+    /// or what settled it or failed the attempt it retries, which the phase reads.
+    pub(crate) phased: RecordSeq,
 }
 
-/// Every model request of a journal, in sequence order.
+/// Each agent's newest request and what its turn leaves open: the part of the
+/// ledger live work reads, bounded by the session's agents rather than its history.
 #[derive(Clone, Debug, Default)]
-pub struct RequestLedger {
+pub struct ResidentLedger {
+    /// Each agent's newest request, whatever its phase.
+    latest: HashMap<AgentId, RequestSeq>,
+    /// Those requests.
     requests: BTreeMap<RequestSeq, RequestRecord>,
     /// Calls without a result, by agent and call id, with the message that made
     /// each and its tool name, in commit order.
     unanswered: indexmap::IndexMap<(AgentId, String), (MessageSeq, String)>,
-    /// Each answered call's result, by the message that made the call and its id.
-    results: HashMap<(MessageSeq, String), RecordSeq>,
-    /// The message whose call each result answered.
-    answers: HashMap<RecordSeq, MessageSeq>,
     /// Agents whose newest history is input their model has yet to answer: a
     /// prompt, a notification or results, until a response or the turn's end.
     awaiting: BTreeSet<AgentId>,
-    /// Each agent's newest request, whatever its phase.
-    latest: HashMap<AgentId, RequestSeq>,
-    /// The newest record that failed a request for good, with that request.
+    /// Each agent's newest model context of each purpose: the only one its next
+    /// request of that purpose may name.
+    contexts: HashMap<AgentId, HashMap<ModelPurpose, (RecordSeq, ProfileSnapshot)>>,
+    /// The previous record, when it failed a request for good, with that request.
     failure: Option<(RecordSeq, RequestSeq)>,
-    /// The request whose failure each failed turn ended on, by its `AgentFailed`.
-    failed_turns: HashMap<RecordSeq, RequestSeq>,
-    messages: HashMap<MessageSeq, RequestSeq>,
-    contexts: HashMap<RecordSeq, (ModelPurpose, ProfileSnapshot)>,
-    /// Each request under the record that last changed it.
-    revisions: BTreeSet<(RecordSeq, RequestSeq)>,
 }
 
-impl RequestLedger {
-    /// The fold of `records`.
-    pub fn of(records: &[EventRecord]) -> Self {
-        let mut ledger = Self::default();
-        records.iter().for_each(|record| ledger.observe(record));
-        ledger
+/// What folding a record decided that presenting it reads beyond the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fact {
+    /// An assistant message, committed under this request.
+    Answers(RequestSeq),
+    /// A tool result, answering a call of this assistant message.
+    Answered(MessageSeq),
+    /// A failed turn, ended on its request's failure, which reports it.
+    EndedOn,
+}
+
+/// What one record changed of a [`ResidentLedger`].
+#[derive(Default)]
+pub(crate) struct Folded {
+    /// The requests it changed: one it interrupted, then one it named.
+    pub(crate) changed: [Option<RequestSeq>; 2],
+    /// The agent's previous request, which a newer one replaced, as it left it.
+    pub(crate) superseded: Option<(RequestSeq, RequestRecord)>,
+    pub(crate) fact: Option<Fact>,
+}
+
+/// Ledgers are equal when they hold the same requests and turns; a failure is
+/// decided by the record right after it.
+impl PartialEq for ResidentLedger {
+    fn eq(&self, other: &Self) -> bool {
+        (self.latest == other.latest)
+            && (self.requests == other.requests)
+            && (self.unanswered == other.unanswered)
+            && (self.awaiting == other.awaiting)
+            && (self.contexts == other.contexts)
+    }
+}
+
+impl ResidentLedger {
+    /// The ledger the rows hold: each agent's newest `requests`, its newest model
+    /// contexts, the calls no result answers yet, and the agents `awaiting` their model.
+    pub(crate) fn opened(
+        requests: BTreeMap<RequestSeq, RequestRecord>,
+        contexts: HashMap<AgentId, HashMap<ModelPurpose, (RecordSeq, ProfileSnapshot)>>,
+        unanswered: indexmap::IndexMap<(AgentId, String), (MessageSeq, String)>,
+        awaiting: BTreeSet<AgentId>,
+    ) -> Self {
+        let latest = (requests.iter())
+            .map(|(request, record)| (record.agent.clone(), *request))
+            .collect();
+        Self {
+            latest,
+            requests,
+            unanswered,
+            awaiting,
+            contexts,
+            failure: None,
+        }
     }
 
-    /// Fold one record. Records must arrive in sequence order; a record for a
-    /// request the ledger never saw is ignored.
-    pub fn observe(&mut self, record: &EventRecord) {
-        let at = record.timestamp_millis;
+    /// Fold one record, returning what it changed.
+    pub(crate) fn fold(&mut self, record: &EventRecord) -> Folded {
+        let (at, agent, by) = (record.timestamp_millis, &record.agent, record.sequence);
+        let mut folded = Folded::default();
+        let failed = self.failure.take();
         // The request the record names, and a pending one it interrupted.
         let (mut named, mut interrupted) = (None, None);
         match &record.event {
             SessionEvent::ModelContext { context } => {
-                self.contexts
-                    .insert(record.sequence, (context.purpose, context.profile.clone()));
+                let newest = (record.sequence, context.profile.clone());
+                let contexts = self.contexts.entry(agent.clone()).or_default();
+                contexts.insert(context.purpose, newest);
             }
             SessionEvent::ModelRequested {
                 context, through, ..
             } => {
-                let Some((purpose, profile)) = self.contexts.get(context).cloned() else {
-                    return;
+                let named_context = (self.contexts.get(agent).into_iter().flatten())
+                    .find(|(_, (newest, _))| newest == context);
+                let Some((&purpose, (_, profile))) = named_context else {
+                    return folded;
                 };
+                let profile = profile.clone();
                 // A newer request supersedes whatever the previous one left pending.
-                interrupted = self.interrupt(&record.agent, at);
+                interrupted = self.interrupt(agent, record);
                 let request = record.sequence.request();
                 self.requests.insert(
                     request,
                     RequestRecord {
-                        agent: record.agent.clone(),
+                        agent: agent.clone(),
                         context: *context,
                         purpose,
                         profile,
@@ -193,10 +242,12 @@ impl RequestLedger {
                         attempts: 0,
                         usage: Usage::default(),
                         phase: RequestPhase::Requested,
-                        revised: record.sequence,
+                        phased: record.sequence,
                     },
                 );
-                self.latest.insert(record.agent.clone(), request);
+                if let Some(previous) = self.latest.insert(agent.clone(), request) {
+                    folded.superseded = self.requests.remove_entry(&previous);
+                }
                 named = Some(request);
             }
             SessionEvent::ModelAttemptStarted(attempt) => {
@@ -208,31 +259,30 @@ impl RequestLedger {
                         message: None,
                         usage: None,
                     };
+                    request.phased = record.sequence;
                 }
             }
             SessionEvent::MessageCommitted {
                 message: Message::Assistant(items),
             } => {
-                self.awaiting.remove(&record.agent);
+                self.awaiting.remove(agent);
                 for call in items.iter().filter_map(|item| item.call()) {
-                    let key = (record.agent.clone(), call.id().to_owned());
+                    let key = (agent.clone(), call.id().to_owned());
                     let made = (record.sequence.message(), call.name().to_owned());
                     self.unanswered.insert(key, made);
                 }
-                let Some(&request) = self.latest.get(&record.agent) else {
-                    return;
-                };
-                if let Some(open) = self.requests.get_mut(&request)
+                if let Some(&request) = self.latest.get(agent)
+                    && let Some(open) = self.requests.get_mut(&request)
                     && let RequestPhase::Open { message, .. } = &mut open.phase
                 {
                     *message = Some(record.sequence.message());
-                    self.messages.insert(record.sequence.message(), request);
+                    folded.fact = Some(Fact::Answers(request));
                     named = Some(request);
                 }
             }
             SessionEvent::ModelFailed { attempt, failure } => {
                 let (attempt, request) = (attempt.attempt, attempt.request);
-                named = self.settle(request, |_| match failure {
+                named = self.settle(request, by, |_| match failure {
                     AttemptFailure::Final(failure) => RequestPhase::Failed {
                         attempt: Some(attempt),
                         failure: failure.clone().into(),
@@ -249,45 +299,44 @@ impl RequestLedger {
                     },
                 });
                 if matches!(failure, AttemptFailure::Final(_)) {
-                    self.failure = Some((record.sequence, request));
+                    self.failure = Some((by, request));
                 }
             }
             SessionEvent::ModelAttemptInterrupted(attempt) => {
-                named = self.settle(attempt.request, |_| RequestPhase::Interrupted {
+                named = self.settle(attempt.request, by, |_| RequestPhase::Interrupted {
                     attempt: Some(attempt.attempt),
                     at,
                 });
             }
             // The response's commit, in the same transaction, attributed its message.
             SessionEvent::ResponseCompleted { attempt, .. } => {
-                named = self.complete(*attempt, at);
+                named = self.complete(*attempt, record);
             }
             SessionEvent::Compaction { checkpoint } => {
-                named = self.complete(checkpoint.attempt, at);
+                named = self.complete(checkpoint.attempt, record);
             }
             SessionEvent::CompactionFailed { failure, error } => {
                 let (request, attempt) = match failure {
-                    CompactionFailure::BeforeRequest => return,
+                    CompactionFailure::BeforeRequest => return folded,
                     CompactionFailure::Requested(request) => (*request, None),
                     CompactionFailure::Attempted(attempt) => {
                         (attempt.request, Some(attempt.attempt))
                     }
                 };
                 if *error != CompactionFault::Interrupted {
-                    self.failure = Some((record.sequence, request));
+                    self.failure = Some((by, request));
                 }
                 // What a summary attempt settled itself, such as its model failure, stands.
-                if self.open(&record.agent) != Some(request) {
-                    return;
+                if self.open(agent) == Some(request) {
+                    named = self.settle(request, by, |_| match error {
+                        CompactionFault::Interrupted => RequestPhase::Interrupted { attempt, at },
+                        error => RequestPhase::Failed {
+                            attempt,
+                            failure: error.clone().into(),
+                            at,
+                        },
+                    });
                 }
-                named = self.settle(request, |_| match error {
-                    CompactionFault::Interrupted => RequestPhase::Interrupted { attempt, at },
-                    error => RequestPhase::Failed {
-                        attempt,
-                        failure: error.clone().into(),
-                        at,
-                    },
-                });
             }
             SessionEvent::Usage { request, usage } => {
                 if let Some(record) = self.requests.get_mut(request) {
@@ -304,112 +353,110 @@ impl RequestLedger {
             SessionEvent::MessageCommitted {
                 message: Message::Tool(result),
             } => {
-                let key = (record.agent.clone(), result.call_id.clone());
+                let key = (agent.clone(), result.call_id.clone());
                 if let Some((message, _)) = self.unanswered.shift_remove(&key) {
-                    let call = (message, result.call_id.clone());
-                    self.results.insert(call, record.sequence);
-                    self.answers.insert(record.sequence, message);
+                    folded.fact = Some(Fact::Answered(message));
                 }
-                self.awaiting.insert(record.agent.clone());
+                self.awaiting.insert(agent.clone());
             }
             SessionEvent::MessageCommitted {
                 message: Message::User(_) | Message::State(_),
             } => {
-                self.awaiting.insert(record.agent.clone());
+                self.awaiting.insert(agent.clone());
             }
             SessionEvent::AgentFailed { failure } => {
-                self.awaiting.remove(&record.agent);
-                // A turn ends on a request's failure only in its record's commit,
-                // which places the record right ahead of the end, and only as that
-                // failure: one a turn recovered from can sit right ahead of the end
-                // of another, such as a refusal at the boundary after it.
-                let ended_on = self.failure.filter(|(failed, request)| {
-                    let request = self.requests.get(request);
-                    failed.next() == record.sequence
-                        && request.is_some_and(|request| {
-                            request.agent == record.agent
-                                && match &request.phase {
-                                    RequestPhase::Failed {
-                                        failure: RequestFailure::Model(ended),
-                                        ..
-                                    } => ended == failure,
-                                    RequestPhase::Failed { .. } => true,
-                                    _ => false,
-                                }
-                        })
+                self.awaiting.remove(agent);
+                let ended = failed.filter(|(failed, request)| {
+                    failed.next() == by && self.ended_on(agent, *request, failure)
                 });
-                (self.failed_turns).extend(ended_on.map(|(_, request)| (record.sequence, request)));
+                folded.fact = ended.map(|_| Fact::EndedOn);
             }
             SessionEvent::AgentInterrupted => {
-                self.awaiting.remove(&record.agent);
-                interrupted = self.interrupt(&record.agent, at);
+                self.awaiting.remove(agent);
+                interrupted = self.interrupt(agent, record);
             }
             _ => {}
         }
-        for request in [interrupted, named].into_iter().flatten() {
-            if let Some(changed) = self.requests.get_mut(&request) {
-                self.revisions.remove(&(changed.revised, request));
-                changed.revised = record.sequence;
-                self.revisions.insert((record.sequence, request));
-            }
-        }
+        folded.changed = [interrupted, named];
+        folded
     }
 
-    /// Requests changed by records after `through`, for observers that fold
-    /// records incrementally.
-    pub fn changed_after(&self, through: RecordSeq) -> impl Iterator<Item = RequestSeq> + '_ {
-        let revisions = self
-            .revisions
-            .range((through.next(), RequestSeq::default())..);
-        revisions.map(|(_, request)| *request)
-    }
-
-    /// Returns the request when the ledger has it.
+    /// Move `request` to `phase` as the record `by` does. Returns the request when the
+    /// ledger has it.
     fn settle(
         &mut self,
         request: RequestSeq,
+        by: RecordSeq,
         phase: impl FnOnce(&RequestPhase) -> RequestPhase,
     ) -> Option<RequestSeq> {
         let record = self.requests.get_mut(&request)?;
         record.phase = phase(&record.phase);
+        record.phased = by;
         Some(request)
     }
 
-    /// Complete `attempt` with the usage it reported.
-    fn complete(&mut self, attempt: AttemptRef, at: i64) -> Option<RequestSeq> {
-        self.settle(attempt.request, |phase| RequestPhase::Completed {
-            attempt: attempt.attempt,
-            at,
-            usage: match phase {
-                RequestPhase::Open { usage, .. } => *usage,
-                _ => None,
-            },
+    /// Complete `attempt` with the usage it reported, as `by` does.
+    fn complete(&mut self, attempt: AttemptRef, by: &EventRecord) -> Option<RequestSeq> {
+        self.settle(attempt.request, by.sequence, |phase| {
+            RequestPhase::Completed {
+                attempt: attempt.attempt,
+                at: by.timestamp_millis,
+                usage: match phase {
+                    RequestPhase::Open { usage, .. } => *usage,
+                    _ => None,
+                },
+            }
         })
     }
 
-    /// Close the agent's pending request, if any, as interrupted, returning it.
-    fn interrupt(&mut self, agent: &AgentId, at: i64) -> Option<RequestSeq> {
+    /// Close the agent's pending request, if any, as interrupted by `by`, returning it.
+    fn interrupt(&mut self, agent: &AgentId, by: &EventRecord) -> Option<RequestSeq> {
         let request = self.open(agent)?;
-        self.settle(request, |phase| RequestPhase::Interrupted {
+        self.settle(request, by.sequence, |phase| RequestPhase::Interrupted {
             attempt: phase.last_attempt(),
-            at,
+            at: by.timestamp_millis,
+        })
+    }
+
+    /// Whether `agent`'s turn, failing with `failure` right behind the record that
+    /// failed `request`, ended on that request's failure. A turn ends on a request's
+    /// failure only in its record's commit, and only as that failure: one a turn
+    /// recovered from can sit right ahead of the end of another, such as a refusal at
+    /// the boundary after it.
+    fn ended_on(&self, agent: &AgentId, request: RequestSeq, failure: &Failure) -> bool {
+        self.requests.get(&request).is_some_and(|request| {
+            &request.agent == agent
+                && match &request.phase {
+                    RequestPhase::Failed {
+                        failure: RequestFailure::Model(ended),
+                        ..
+                    } => ended == failure,
+                    RequestPhase::Failed { .. } => true,
+                    _ => false,
+                }
         })
     }
 
     /// Read every pending request as interrupted at `at`, as a session whose
     /// work stopped leaves it, returning those it changed.
     pub(crate) fn stop(&mut self, at: i64) -> Vec<RequestSeq> {
-        let agents = self.latest.keys().cloned().collect::<Vec<_>>();
-        (agents.iter())
-            .filter_map(|agent| self.interrupt(agent, at))
-            .collect()
+        let mut stopped = Vec::new();
+        for (request, record) in &mut self.requests {
+            if record.phase.settled_at().is_none() {
+                let attempt = record.phase.last_attempt();
+                record.phase = RequestPhase::Interrupted { attempt, at };
+                stopped.push(*request);
+            }
+        }
+        stopped
     }
 
+    /// `request`, while it is its agent's newest.
     pub fn get(&self, request: RequestSeq) -> Option<&RequestRecord> {
         self.requests.get(&request)
     }
 
-    /// Every request in sequence order.
+    /// Each agent's newest request, in sequence order.
     pub fn iter(&self) -> impl Iterator<Item = (RequestSeq, &RequestRecord)> {
         self.requests.iter().map(|(seq, record)| (*seq, record))
     }
@@ -425,9 +472,15 @@ impl RequestLedger {
             .filter(|request| self.requests[request].phase.settled_at().is_none())
     }
 
-    /// The request a committed assistant message answered.
-    pub fn request_of(&self, message: MessageSeq) -> Option<RequestSeq> {
-        self.messages.get(&message).copied()
+    /// The agent's newest model context of `purpose`.
+    pub(crate) fn context(&self, agent: &AgentId, purpose: ModelPurpose) -> Option<RecordSeq> {
+        let contexts = self.contexts.get(agent)?;
+        contexts.get(&purpose).map(|(context, _)| *context)
+    }
+
+    /// Whether the agent's newest history is input its model has yet to answer.
+    pub(crate) fn awaits(&self, agent: &AgentId) -> bool {
+        self.awaiting.contains(agent)
     }
 
     /// Calls committed responses made that no result answers yet, with their
@@ -435,23 +488,6 @@ impl RequestLedger {
     pub(crate) fn unanswered(&self) -> impl Iterator<Item = (&AgentId, &str, &str)> {
         let calls = self.unanswered.iter();
         calls.map(|((agent, call), (_, name))| (agent, call.as_str(), name.as_str()))
-    }
-
-    /// The record of the result that answered `call` of the assistant message `message`.
-    pub fn result_of(&self, message: MessageSeq, call: &str) -> Option<RecordSeq> {
-        self.results.get(&(message, call.to_owned())).copied()
-    }
-
-    /// The request whose failure ended the failed turn journaled at `record`:
-    /// that failure's record committed right ahead of it. None when the turn
-    /// failed otherwise, such as before its first request.
-    pub fn failed_by(&self, record: RecordSeq) -> Option<RequestSeq> {
-        self.failed_turns.get(&record).copied()
-    }
-
-    /// The assistant message whose call the result committed at `record` answered.
-    pub fn answered(&self, record: RecordSeq) -> Option<MessageSeq> {
-        self.answers.get(&record).copied()
     }
 
     /// The agents whose turn the journal leaves open: a request without its
@@ -471,14 +507,21 @@ mod tests {
         provider::{ProviderErrorKind, protocol::AssistantItem},
         session::{
             AttemptRef, CompactionCheckpoint, CompletedOutcome, ModelContext,
+            agent_state::AgentStates,
             tests::{self, usage},
         },
     };
 
-    /// Appends records for one agent, stamped `at(sequence)`.
+    /// Appends records for one agent, stamped `at(sequence)`, keeping every request
+    /// as the rows do and what the fold decided of each record.
     struct Journal {
         agent: AgentId,
-        ledger: RequestLedger,
+        ledger: ResidentLedger,
+        states: AgentStates,
+        requests: BTreeMap<RequestSeq, RequestRecord>,
+        facts: HashMap<RecordSeq, Fact>,
+        /// What the last record changed.
+        changed: Vec<RequestSeq>,
         next: u64,
     }
 
@@ -486,7 +529,11 @@ mod tests {
         fn new() -> Self {
             Self {
                 agent: AgentId::root(SessionId::from_bytes([7; 16])),
-                ledger: RequestLedger::default(),
+                ledger: ResidentLedger::default(),
+                states: AgentStates::default(),
+                requests: BTreeMap::new(),
+                facts: HashMap::new(),
+                changed: Vec::new(),
                 next: 1,
             }
         }
@@ -494,20 +541,23 @@ mod tests {
         fn record(&mut self, event: SessionEvent) -> RecordSeq {
             let sequence = RecordSeq::from(self.next);
             self.next += 1;
-            self.ledger.observe(&EventRecord {
+            let record = EventRecord {
                 id: EventId::generate().unwrap(),
                 sequence,
                 timestamp_millis: at(sequence),
                 agent: self.agent.clone(),
                 event,
-            });
+            };
+            let fact = self.states.apply(&record, &mut self.ledger);
+            self.facts.extend(fact.map(|fact| (sequence, fact)));
+            let changed = self.states.take_unwritten().requests;
+            self.changed = changed.keys().copied().collect();
+            self.requests.extend(changed);
             sequence
         }
 
-        /// What the last record changed.
         fn changed(&self) -> Vec<RequestSeq> {
-            let before = RecordSeq::from(self.next - 2);
-            self.ledger.changed_after(before).collect()
+            self.changed.clone()
         }
 
         /// A request against a fresh context for `purpose`.
@@ -567,7 +617,7 @@ mod tests {
         }
 
         fn record_of(&self, request: RequestSeq) -> &RequestRecord {
-            self.ledger.get(request).unwrap()
+            &self.requests[&request]
         }
 
         fn phase(&self, request: RequestSeq) -> &RequestPhase {
@@ -584,7 +634,10 @@ mod tests {
         }
 
         fn request_of(&self, message: MessageSeq) -> Option<RequestSeq> {
-            self.ledger.request_of(message)
+            match self.facts.get(&message.into())? {
+                Fact::Answers(request) => Some(*request),
+                _ => None,
+            }
         }
     }
 
@@ -690,11 +743,11 @@ mod tests {
         let recovered = journal.attempted(ModelPurpose::Agent);
         journal.failed(recovered, 1, Failure::Other);
         let refused = journal.record(failed("refused"));
-        assert_eq!(journal.ledger.failed_by(refused), None);
+        assert_eq!(journal.facts.get(&refused), None);
         let ending = journal.attempted(ModelPurpose::Agent);
         journal.failed(ending, 1, Failure::Other);
         let ended = journal.record(failed("boom"));
-        assert_eq!(journal.ledger.failed_by(ended), Some(ending));
+        assert_eq!(journal.facts[&ended], Fact::EndedOn);
     }
 
     #[test]
@@ -726,21 +779,18 @@ mod tests {
         journal.record(SessionEvent::ModelAttemptInterrupted(attempt_ref(cut, 1)));
         assert_eq!(journal.phase(cut), &after_attempt(&journal));
 
-        // A newer request supersedes whatever the previous one left open.
-        let through = RecordSeq::from(journal.next - 1);
+        // A newer request supersedes whatever the previous one left open, which the
+        // ledger then lets go of.
         let open = journal.attempted(ModelPurpose::Agent);
         let next = journal.request(ModelPurpose::Agent);
         assert_eq!(journal.changed(), [open, next]);
-        // Incremental observers see each request changed since, once.
-        let changed: Vec<_> = journal.ledger.changed_after(through).collect();
-        assert_eq!(changed, [open, next]);
+        assert!(journal.ledger.get(open).is_none());
         assert_eq!(journal.phase(open), &after_attempt(&journal));
         assert_eq!(journal.phase(next).settled_at(), None);
         assert_eq!(journal.open(), Some(next));
     }
 
-    /// A result answers its agent's unanswered call of that id, and the ledger
-    /// keeps where each answer lies.
+    /// A result answers its agent's unanswered call of that id, once.
     #[test]
     fn results_answer_the_calls_they_name() {
         use crate::provider::protocol::{ToolCall, ToolResult};
@@ -763,11 +813,8 @@ mod tests {
         };
         let answer = journal.record(result("b"));
         let stray = journal.record(result("b"));
-        let made = made.message();
-        assert_eq!(journal.ledger.result_of(made, "b"), Some(answer));
-        assert_eq!(journal.ledger.answered(answer), Some(made));
-        assert_eq!(journal.ledger.answered(stray), None);
-        assert_eq!(journal.ledger.result_of(made, "a"), None);
+        assert_eq!(journal.facts[&answer], Fact::Answered(made.message()));
+        assert_eq!(journal.facts.get(&stray), None);
         let unanswered: Vec<_> = journal.ledger.unanswered().collect();
         assert_eq!(unanswered, [(&journal.agent, "a", "exec")]);
     }

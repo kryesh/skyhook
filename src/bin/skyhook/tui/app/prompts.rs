@@ -373,7 +373,7 @@ impl App {
         prompt.shown = true;
         self.focus = Focus::Composer;
         self.leader = None;
-        self.overlay = None;
+        self.menu = None;
     }
     pub(super) fn scroll_prompt(&mut self, options: bool, delta: isize) {
         if self.prompts.is_empty() {
@@ -1005,10 +1005,9 @@ mod tests {
                 input.options_scrolled,
             ) = (3, 2, true);
             app.info("Details", "An open menu".into());
-            app.overlay = Some(Overlay::Search(Editor::default()));
             let response = authentication(&mut app, 100, SensitivePromptKind::Password);
             assert!(matches!(app.input_target(), InputTarget::Prompt));
-            assert!(app.overlay.is_none());
+            assert!(app.menu.is_none());
             assert_eq!(app.prompts.front().unwrap().id, 100);
             assert!(app.prompt_input_mut().editor.text().is_empty());
             assert!(confirmed_answers(&app).is_empty());
@@ -1170,10 +1169,10 @@ mod tests {
             assert_eq!(app.prompt_options().len(), if proposed { 4 } else { 3 });
             app.prompt_input_mut().choice = 2;
             app.answer();
-            assert!(app.menu().is_some());
+            assert!(app.menu.is_some());
             assert_eq!(app.prompts.len(), 1);
             assert!(pending(&mut response));
-            app.overlay = None;
+            app.menu = None;
             app.prompt_input_mut().choice = if proposed { 3 } else { 1 };
             app.answer();
             let expected = if proposed {

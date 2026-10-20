@@ -820,7 +820,7 @@ mod tests {
             builder(&runtime, fixture_skills().await),
             Arc::new(UnexpectedAuthorization),
         );
-        let before = runtime.jobs.list(agent).len();
+        let before = runtime.jobs.list(agent).await.unwrap().len();
         for args in [
             json!({"path":"."}),
             json!({"name":""}),
@@ -835,7 +835,7 @@ mod tests {
                 Cause::InvalidArguments(_)
             ));
         }
-        assert_eq!(runtime.jobs.list(agent).len(), before);
+        assert_eq!(runtime.jobs.list(agent).await.unwrap().len(), before);
 
         let executor = runtime.executor(builder(&runtime, fixture_skills().await));
         for path in ["../mixed-assets/SKILL.md", "/etc/passwd"] {

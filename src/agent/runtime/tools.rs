@@ -10,7 +10,7 @@ use crate::{
     agent::{ModelEntry, Question, ReplaceError, TodoItem},
     identity::{AgentId, JobId},
     provider::profile::ModelRef,
-    session::{Command, CoreState, Plan, UserPart},
+    session::{CoreState, Plan, UserPart},
     tool::{
         AdmissionError, RegistryError, TARGET, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::{Effects, FailureSite, Operation, Subject},
@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    AgentCommand, AgentLaunch, HarnessError, Invocation, Resumed, SessionRuntime, TurnFailure,
+    AgentCommand, AgentLaunch, HarnessError, Invocation, SessionRuntime, TurnFailure,
     dispatch::ChildAnswer, queue::QueuedInput,
 };
 
@@ -123,7 +123,7 @@ pub(super) fn register(
                 TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
                     let items = admit_todos("items", items)?;
-                    let issued_by = runtime.jobs.call_origin(context.job());
+                    let issued_by = runtime.jobs.call_origin(context.job()).await;
                     let subject = Subject::Label(format!("todos for agent {}", context.agent()));
                     runtime.store.replace_todos(context.agent(), items, issued_by).await.map_err(|error| match error {
                         ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
@@ -239,21 +239,16 @@ fn register_child_agent(
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let owner = context.agent();
-                let (model, depth) = runtime.delegation(owner)
-                    .ok_or_else(|| ToolError::failed("parent agent never started")
-                        .operation(Operation::Lookup, Subject::Label(format!("parent agent {owner}"))).effects(Effects::NotStarted))?;
+                let unstarted = || ToolError::failed("parent agent never started")
+                    .operation(Operation::Lookup, Subject::Label(format!("parent agent {owner}"))).effects(Effects::NotStarted);
+                let delegation = runtime.held(owner, |contract, depth, _| (contract.profile.name.clone(), depth));
+                let (model, depth) = delegation.ok_or_else(unstarted)?;
                 let caller = (context.capabilities(), model, depth);
                 let location = context.job_location().clone();
                 let (launch, prompt) = child_launch(&runtime, input, caller, location)?;
-                // Only this call may opt its job into resumption, as its child installs.
-                let handler = child_resume_handler(
-                    Arc::downgrade(&runtime),
-                    context.job_subject().clone(),
-                    context.execution_location().clone(),
-                    context.caller_location().clone(),
-                );
-                let (job, child) = (context.job(), runtime.next_child(owner).await);
-                let call = super::dispatch::Call { job, prompt, handler };
+                let child = runtime.next_child(owner).await.ok_or_else(unstarted)?;
+                let job = context.job();
+                let call = super::dispatch::Call { job, prompt };
                 let launched = runtime.launch_child(child.clone(), launch, call);
                 let answer = launched.await.map_err(|error| launch_error(error, &child))?;
                 run_child_request(&runtime, &context, &child, answer).await
@@ -267,11 +262,9 @@ fn register_child_agent(
 fn launch_error(error: HarnessError, child: &crate::identity::AgentId) -> ToolError {
     let subject = Subject::Label(format!("child agent {child}"));
     let error = match error {
-        // A session that no longer starts agents interrupted the call.
-        HarnessError::Session(crate::session::SessionError::Refused(_)) => {
-            (ToolError::interrupted().operation(Operation::Prepare, subject))
-                .effects(Effects::NotStarted)
-        }
+        error if stopped_starting(&error) => (ToolError::interrupted()
+            .operation(Operation::Prepare, subject))
+        .effects(Effects::NotStarted),
         // A reused name is a follow-up aimed at the wrong tool.
         HarnessError::Job(error @ crate::job::JobError::NameTaken { job, .. }) => {
             (ToolError::invalid_arguments(error).operation(Operation::Validate, Subject::Job(job)))
@@ -337,47 +330,56 @@ fn child_launch(
     Ok((launch, input.prompt))
 }
 
-/// Run an agent call's installed child again with owner input, started again
-/// under its journaled contract if its loop is gone, such as after a restart.
-/// The runtime reference is weak: jobs must not retain their own manager.
+/// Run an agent call's installed child again with owner input, its loop started
+/// again under its journaled contract if it parked or a restart left none, for
+/// its owner as its journaled contract now lets it act. The runtime reference is
+/// weak: jobs must not retain their own manager.
 pub(super) fn child_resume_handler(
     runtime: Weak<SessionRuntime>,
-    authorization: crate::tool::authorization::AuthorizationSubject,
-    execution_location: crate::execution::ExecutionLocation,
-    caller_location: crate::execution::ExecutionLocation,
+    restarting: crate::job::Restarting,
 ) -> crate::job::ResumeHandler {
     Arc::new(move |value, input| {
-        let runtime = runtime.upgrade();
-        let authorization = authorization.clone();
-        let execution_location = execution_location.clone();
-        let caller_location = caller_location.clone();
+        let (runtime, restarting) = (runtime.upgrade(), restarting.clone());
         Box::pin(async move {
             let runtime = runtime.ok_or_else(runtime_unavailable)?;
-            let context = crate::tool::ToolContext::new(
-                authorization,
-                execution_location,
-                caller_location,
-                input,
-                runtime.jobs.clone(),
-            );
-            let job = context.job();
-            let child = runtime.jobs.child_agent(job).ok_or_else(|| {
-                ToolError::failed("the call has no child to resume").at(FailureSite::Host)
-            })?;
-            if runtime.agents(|agents| agents.get(&child).is_none()) {
-                let resumed = AgentLaunch::Resume(Resumed::Idle);
-                let spawned = runtime.spawn_agent(child.clone(), Some(job), resumed);
-                spawned.await.map_err(|error| launch_error(error, &child))?;
-            }
-            let content = value.iter().map(owner_input).collect();
-            let started = restart_child(&runtime, job, &child, content).await;
-            let answer = started.map_err(|error| {
-                (error.operation(Operation::Send, Subject::Job(job)))
-                    .at(FailureSite::Host)
-                    .effects(Effects::NotStarted)
-            })?;
-            let text = run_child_request(&runtime, &context, &child, answer).await?;
-            Ok(crate::tool::ToolOutput::new(json!(text)))
+            let crate::job::Restarting {
+                job,
+                owner,
+                parent,
+                location,
+                cancellation,
+                restart: _,
+            } = restarting;
+            let cancelled = cancellation.clone();
+            let resumed = async {
+                let (journaled, capabilities) =
+                    (runtime.contract(&owner).await).map_err(|error| not_restarted(job, error))?;
+                let authorization = crate::tool::authorization::AuthorizationSubject {
+                    agent: owner,
+                    job,
+                    parent,
+                    capabilities,
+                    cancellation,
+                };
+                let context = crate::tool::ToolContext::new(
+                    authorization,
+                    location,
+                    journaled,
+                    input,
+                    runtime.jobs.clone(),
+                );
+                let child = runtime.jobs.child_agent(job).await.ok_or_else(|| {
+                    ToolError::failed("the call has no child to resume").at(FailureSite::Host)
+                })?;
+                let content = value.iter().map(owner_input).collect();
+                let answer = restart_child(&runtime, job, &child, content).await?;
+                let text = run_child_request(&runtime, &context, &child, answer).await?;
+                Ok(crate::tool::ToolOutput::new(json!(text)))
+            };
+            // As dispatch ran the call: a cancellation requested before the restart
+            // took its child stops the child starting, and is the outcome.
+            let result = resumed.await;
+            crate::tool::executor::cancellation_result(result, cancelled.is_cancelled())
         })
     })
 }
@@ -391,28 +393,31 @@ fn owner_input(value: &serde_json::Value) -> UserPart {
 /// releasing the answer the last one held as a reply. The receiver resolves with
 /// the new invocation's answer.
 async fn restart_child(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     job: JobId,
     child: &AgentId,
     content: Vec<UserPart>,
 ) -> Result<ChildAnswer, ToolError> {
-    let child = child.clone();
-    let restart = move |state: &CoreState| restart(state, job, child, content, |answer| answer);
-    let restarted = runtime.store.commit(Command::Journal, restart).await;
-    restarted.map_err(harness_error)
+    let started = child.clone();
+    let restart =
+        move |state: &CoreState| restart(state, job, started, content, std::convert::identity);
+    let restarted = runtime.with_loops(child, restart).await;
+    restarted.map_err(|error| not_restarted(job, error))
 }
 
 /// Give child agent `child` owner input: it joins the open invocation at its
 /// next request boundary, or, once that resolved, starts the next as
 /// [`restart_child`] does.
 async fn owner_update(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     job: JobId,
     child: &AgentId,
     content: Vec<UserPart>,
 ) -> Result<Option<ChildAnswer>, ToolError> {
-    let child = child.clone();
+    let updated = child.clone();
+    // A parked child has no facts until the change that starts its loop.
     let input = move |state: &CoreState| {
+        let child = updated;
         let facts = state.agents.get(&child);
         if facts.is_none_or(|facts| facts.invocation == Invocation::Resolved) {
             return restart(state, job, child, content, Some);
@@ -430,11 +435,12 @@ async fn owner_update(
             None
         }))
     };
-    let updated = runtime.store.commit(Command::Journal, input).await;
-    updated.map_err(harness_error)
+    let updated = runtime.with_loops(child, input).await;
+    updated.map_err(|error| not_restarted(job, error))
 }
 
-/// What [`restart_child`] commits, its answer's receiver passed `into` its result.
+/// What [`restart_child`] commits once `child`'s loop runs, its answer's
+/// receiver passed `into` its result.
 fn restart<T: Send + 'static>(
     state: &CoreState,
     job: JobId,
@@ -442,7 +448,6 @@ fn restart<T: Send + 'static>(
     content: Vec<UserPart>,
     into: fn(ChildAnswer) -> T,
 ) -> Result<Plan<T>, HarnessError> {
-    state.agents.get(&child).ok_or(HarnessError::AgentStopped)?;
     let released = crate::job::Jobs::release_answer(state, job)?;
     Ok(Plan::new(released, move |state, _| {
         crate::job::woken(state, job);
@@ -452,10 +457,7 @@ fn restart<T: Send + 'static>(
             content,
             done: Some(super::RequestCompletion::Child(done)),
         };
-        let facts = state
-            .agents
-            .get_mut(&child)
-            .expect("checked before the commit");
+        let facts = (state.agents.get_mut(&child)).expect("the change runs its loop");
         facts.invocation = Invocation::Open;
         state.agents.send(&child, input);
         into(received)
@@ -494,8 +496,8 @@ async fn run_child_request(
                 // Owner input continues this invocation instead of finishing the job, so
                 // the answer above, held for its result, is released as a reply.
                 let content = inputs.iter().map(owner_input).collect();
-                done_rx = restart_child(runtime, job, child, content).await.map_err(|error| failure(Operation::Send, Effects::NotStarted)(error)
-                    .with_result(crate::tool::ToolOutput::new(json!(text))))?;
+                done_rx = restart_child(runtime, job, child, content).await
+                    .map_err(|error| error.with_result(crate::tool::ToolOutput::new(json!(text))))?;
             }
             value = context.receive() => {
                 let value = match value {
@@ -512,7 +514,7 @@ async fn run_child_request(
                     // Owner updates join the open turn at its next request boundary, as
                     // queued root prompts do; once it resolved, they restart it.
                     let sent = owner_update(runtime, job, child, vec![owner_input(&value)]).await;
-                    if let Some(restarted) = sent.map_err(failure(Operation::Send, Effects::NotStarted))? {
+                    if let Some(restarted) = sent? {
                         done_rx = restarted;
                     }
                 }
@@ -539,6 +541,27 @@ fn runtime_unavailable() -> ToolError {
         // Also returned by resumption, which dispatch does not bind.
         .at(FailureSite::Host)
         .effects(Effects::NotStarted)
+}
+
+/// How job `job` reports that what runs it again could not start: an agent call
+/// whose child or owner could not be started, as either restart kind finds it.
+pub(super) fn not_restarted(job: JobId, error: crate::agent::HarnessError) -> ToolError {
+    let error = match error {
+        error if stopped_starting(&error) => ToolError::interrupted(),
+        error => harness_error(error),
+    };
+    error
+        .operation(Operation::Send, Subject::Job(job))
+        .at(FailureSite::Host)
+        .effects(Effects::NotStarted)
+}
+
+/// A session that no longer starts agents refused it, which interrupts the call.
+fn stopped_starting(error: &HarnessError) -> bool {
+    matches!(
+        error,
+        HarnessError::Session(crate::session::SessionError::Refused(_))
+    )
 }
 
 pub(super) fn harness_error(error: crate::agent::HarnessError) -> ToolError {
@@ -1031,9 +1054,8 @@ for line in sys.stdin:
         shutdown_session(resumed).await;
         // As decoded from the journal: the first child recorded `scout`'s first
         // edition, with its hint, and the new child its second.
-        let (_store, records) = crate::session::SessionStore::open(&sessions, id)
-            .await
-            .unwrap();
+        let opened = crate::session::SessionStore::open(&sessions, id).await;
+        let records = opened.unwrap().records();
         let recorded = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "scout" => mode.definition.clone());
         assert_eq!(recorded, [Some(scout), None, Some(widened)]);
     }
@@ -1221,7 +1243,7 @@ for line in sys.stdin:
             }
             assert_eq!(batches.lock().unwrap().len(), if enabled { 8 } else { 0 });
             if !enabled {
-                let jobs = session.runtime.jobs.list(&session.root);
+                let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
                 assert!(jobs.iter().all(|job| job.tool != "ask"));
             }
             shutdown_session(session).await;

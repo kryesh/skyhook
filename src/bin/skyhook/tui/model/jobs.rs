@@ -313,8 +313,10 @@ mod tests {
         let source = "throw new Error(['failed', 'exactly'].join(' '));";
         let failed = session.run_script(source).await;
         assert!(failed.is_err());
-        app.snapshot = session.observe().snapshot;
-        let job = app.snapshot.jobs[&job_named(&app, "script")].clone();
+        let job = job(&mut app, |job| {
+            job.tool == "script" && job.state.is_terminal()
+        })
+        .await;
         assert_eq!(job.state, JobState::Failed);
         let error = Projection::default().job_error(&job).unwrap();
         let card = |outputs: &OutputStore, open| card(&job, outputs, open);

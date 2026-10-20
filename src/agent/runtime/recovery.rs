@@ -190,7 +190,7 @@ mod tests {
         ProviderError, ProviderErrorKind,
         protocol::{AssistantItem, ContextId, ResponseEvent},
     };
-    use crate::session::{ModelPurpose, RequestSeq, project_history};
+    use crate::session::{ModelPurpose, RequestSeq};
 
     /// A context overflow at invocation, or after streaming text as a Messages stop does.
     fn overflow(streaming: bool) -> Step {
@@ -259,7 +259,7 @@ mod tests {
             }
         }
 
-        fn records(&self) -> Vec<EventRecord> {
+        fn records(&self) -> Vec<Arc<EventRecord>> {
             self.session.runtime.store.records()
         }
         fn requests(&self) -> Vec<Arc<Served>> {
@@ -273,8 +273,9 @@ mod tests {
         }
 
         /// Root history as JSON, plus its number of assistant messages.
-        fn history(&self, records: &[EventRecord]) -> (String, usize) {
-            let projection = project_history(records, &self.session.root);
+        async fn history(&self) -> (String, usize) {
+            let store = &self.session.runtime.store;
+            let projection = crate::session::tests::projected(store, &self.session.root).await;
             let history: Vec<_> = projection.history().map(|(message, _)| message).collect();
             let assistants = history
                 .iter()
@@ -285,7 +286,7 @@ mod tests {
     }
 
     /// Every retried failure as (request, next attempt, delay, error).
-    fn recoveries(records: &[EventRecord]) -> Vec<(RequestSeq, u64, u64, Failure)> {
+    fn recoveries(records: &[Arc<EventRecord>]) -> Vec<(RequestSeq, u64, u64, Failure)> {
         records
             .iter()
             .filter_map(|record| match &record.event {
@@ -303,7 +304,7 @@ mod tests {
             .collect()
     }
 
-    fn assert_schedule(records: &[EventRecord], expected_attempts: &[u64]) {
+    fn assert_schedule(records: &[Arc<EventRecord>], expected_attempts: &[u64]) {
         let scheduled = recoveries(records);
         let attempts = scheduled.iter().map(|entry| entry.1).collect::<Vec<_>>();
         assert_eq!(attempts, expected_attempts);
@@ -314,12 +315,9 @@ mod tests {
             let expected = recovery_delay(&recoverable(), *transient).as_millis() as u64;
             assert_eq!(delay, expected);
             assert_eq!(error, Failure::from(&recoverable()));
-            let requested = crate::session::record_at(records, request.into()).unwrap();
-            let context = crate::session::request_context(requested, |sequence| {
-                crate::session::record_at(records, sequence)
-            });
-            let purpose = context.expect("recovery names no request").purpose;
-            assert_eq!(purpose, ModelPurpose::Agent);
+            let requested = crate::session::tests::record_at(records, request.into()).unwrap();
+            let purpose = crate::session::tests::request_purpose(records, requested);
+            assert_eq!(purpose, Some(ModelPurpose::Agent));
         }
     }
 
@@ -378,7 +376,7 @@ mod tests {
                 SentPart::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
                     if requests[0].blobs.get(&image.blob).is_ok())))));
         assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
-        let (history, assistants) = fixture.history(&records);
+        let (history, assistants) = fixture.history().await;
         assert_eq!(assistants, 1);
         assert!(!history.contains("scripted throttle"));
         fixture.session.shutdown().await.unwrap();
@@ -410,7 +408,7 @@ mod tests {
         assert_eq!(journaled_usage(&fixture.session).await, observed_usage);
         let jobs = count!(&records, SessionEvent::JobCreated { .. });
         assert_eq!(jobs, 1, "only the successful attempt may execute tools");
-        let (history, _) = fixture.history(&records);
+        let (history, _) = fixture.history().await;
         assert!(!history.contains("DO NOT COMMIT") && !history.contains("discarded"));
         let requests = fixture.requests();
         assert_eq!(requests.len(), 3);
@@ -486,8 +484,8 @@ mod tests {
         let SessionEvent::ModelFailed { attempt, .. } = retrying.event else {
             unreachable!("a recovery is a retried failure")
         };
-        let ledger = fixture.session.observe().snapshot.ledger;
-        let phase = &ledger.get(attempt.request).unwrap().phase;
+        let requests = fixture.session.store().observe().snapshot.requests;
+        let phase = &requests.get(attempt.request).unwrap().phase;
         assert!(matches!(
             phase,
             crate::session::RequestPhase::Interrupted {
@@ -534,14 +532,14 @@ mod tests {
         let received = retrying(session, async {
             send(session, &child, recover).await;
             assert_eq!(next_recovery(&mut events).await.agent, child);
-            let state = session.runtime.jobs.snapshot(owner).unwrap().state;
+            let state = session.runtime.jobs.snapshot(owner).await.unwrap().state;
             assert_eq!(state, crate::job::JobState::Running);
             bounded(received).await
         });
         assert_eq!(received.await.unwrap().unwrap(), "child recovered");
         while let Ok(event) = events.try_recv() {
             assert!(
-                !matches!(event.event, RuntimeEvent::Activity { agent, activity } if agent == child && activity.state.is_retryable())
+                !matches!(event.event, RuntimeEvent::Activity { agent, activity: Some(activity) } if agent == child && activity.state.is_retryable())
             );
         }
         let requests = fixture.requests();
@@ -582,7 +580,7 @@ mod tests {
         assert!(!token_cancel.is_claimed());
         assert!(!receipt.is_finished());
         assert_eq!(fixture.requests().len(), 1);
-        let (history, _) = fixture.history(&fixture.records());
+        let (history, _) = fixture.history().await;
         assert!(!history.contains("queued input"));
         crate::tests::elapse(backoff).await;
         bounded(receipt).await.unwrap().unwrap();
@@ -666,7 +664,7 @@ mod tests {
                     .iter()
                     .all(|sent| !rendered(sent).contains("DO NOT"))
             );
-            assert_eq!(fixture.history(&records).1, 0);
+            assert_eq!(fixture.history().await.1, 0);
             fixture.session.shutdown().await.unwrap();
         }
     }
@@ -692,8 +690,8 @@ mod tests {
         else {
             panic!("attempt start must be durable before invocation");
         };
-        let reconstructed = crate::session::reconstruct_model_request(&records, sequence);
-        assert_eq!(reconstructed.unwrap(), (model_ref("test"), request));
+        let reconstructed = session.runtime.store.reconstruct_model_request(sequence);
+        assert_eq!(reconstructed.await.unwrap(), (model_ref("test"), request));
         provider.release(0);
         let error = bounded(prompt).await.unwrap().unwrap_err();
         assert!(error.to_string().contains("intentional provider failure"));

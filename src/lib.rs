@@ -30,6 +30,17 @@ pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     media::BlobDigest::of(bytes.as_ref()).to_string()
 }
 
+/// Run blocking `work` off the async workers.
+pub(crate) async fn blocking<T, E>(
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<tokio::task::JoinError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await?
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

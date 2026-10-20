@@ -1,13 +1,13 @@
--- Skyhook session database (application_id 0x534B5948, user_version 23). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 24). Tables are STRICT;
 -- subtype rows reference entry(seq), whose kind the decoder requires them to match.
 -- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
 -- saturate to i64::MAX.
 --
 -- Skyhook-typed data is normalized. The only JSON text columns hold shapes a model, a
 -- tool's own schema or a provider defines: tool_call.arguments, tool_result.result,
--- job.arguments, job.output_schema, tool_definition.input_schema,
--- model_context.response_schema, reasoning_replay.payload, job_output.result and
--- user_part_job_event.view.
+-- job.arguments, tool_definition.input_schema, model_context.response_schema,
+-- reasoning_replay.payload, job_output.result and user_part_job_event.view. Job output
+-- schemas are JSON blobs, stored once per distinct schema.
 
 -- ───────────────────────── Ledger, session, agents ─────────────────────────
 
@@ -48,12 +48,16 @@ CREATE TABLE entry (
   seq INTEGER PRIMARY KEY,                       -- insert NULL ... RETURNING seq
   public_id BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
   agent INTEGER NOT NULL REFERENCES agent(id),
+  -- The entry's place among its agent's entries, counting from 0 without gaps.
+  agent_ordinal INTEGER NOT NULL CHECK (agent_ordinal >= 0),
   created_millis INTEGER NOT NULL,
   kind TEXT NOT NULL REFERENCES entry_kind(name)
 ) STRICT;
 CREATE UNIQUE INDEX entry_one_agent_start ON entry(agent) WHERE kind = 'agent_started';
 -- An agent's latest entry of a kind, for state read without decoding the journal.
 CREATE INDEX entry_agent_kind ON entry(agent, kind);
+-- An agent's transcript in order: its pages and its outline.
+CREATE UNIQUE INDEX entry_agent_ordinal ON entry(agent, agent_ordinal);
 
 -- Status text. agent_completed / agent_interrupted / session_started / title_cleared carry
 -- no subtype row.
@@ -489,6 +493,102 @@ CREATE TABLE compaction_failure (              -- CompactionFailed only
   FOREIGN KEY (summary) REFERENCES failure_kind(name)
 ) STRICT;
 
+CREATE TABLE request_phase (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- Each request as the request fold leaves it, written in the transaction of the records
+-- that change it. `phased` moved it to its phase: the request itself, its attempt's start,
+-- or what settled it or failed the attempt it retries, whose time and failure the phase
+-- carries. Counts are NULL when no report gave them.
+CREATE TABLE request_state (
+  request INTEGER PRIMARY KEY REFERENCES model_request(entry),
+  phase TEXT NOT NULL REFERENCES request_phase(name),
+  phased INTEGER NOT NULL REFERENCES entry(seq),
+  attempts INTEGER NOT NULL CHECK (attempts >= 0),
+  -- The attempt its phase names.
+  attempt INTEGER CHECK (attempt > 0),
+  -- What the open attempt committed before its outcome.
+  message INTEGER REFERENCES message_commit(entry),
+  -- Every report, over all its attempts.
+  input_tokens INTEGER,
+  cached_input_tokens INTEGER,
+  cache_write_input_tokens INTEGER,
+  output_tokens INTEGER,
+  -- Whether the open or completed attempt reported, and what.
+  reported INTEGER NOT NULL CHECK (reported IN (0,1)),
+  reported_input_tokens INTEGER,
+  reported_cached_input_tokens INTEGER,
+  reported_cache_write_input_tokens INTEGER,
+  reported_output_tokens INTEGER,
+  CHECK (phase IN ('requested', 'failed', 'interrupted') OR attempt IS NOT NULL),
+  CHECK (phase <> 'requested' OR attempt IS NULL),
+  CHECK (message IS NULL OR phase = 'open'),
+  CHECK (reported = 0 OR phase IN ('open', 'completed')),
+  CHECK (reported = 1 OR coalesce(reported_input_tokens, reported_cached_input_tokens,
+    reported_cache_write_input_tokens, reported_output_tokens) IS NULL)
+) STRICT;
+
+CREATE TABLE agent_last (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE agent_outcome (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- Each started agent as the agent fold leaves it, written in the transaction of the
+-- records that change it. Pointers name the records whose rows hold each fact: the start
+-- or the latest model change (profile) and mode change (grants), the todos the latest
+-- replacement or checkpoint set, the message or failure its last turn stands on, and
+-- what ended its work since its latest request.
+CREATE TABLE agent_state (
+  agent INTEGER PRIMARY KEY REFERENCES agent(id),
+  profiled INTEGER NOT NULL REFERENCES entry(seq),
+  granted INTEGER NOT NULL REFERENCES entry(seq),
+  todos INTEGER REFERENCES entry(seq),
+  checkpoint INTEGER REFERENCES compaction(entry),
+  request INTEGER REFERENCES model_request(entry),
+  -- Its newest history is input its model has yet to answer.
+  awaiting INTEGER NOT NULL CHECK (awaiting IN (0,1)),
+  -- The completed request whose reported occupancy the next request compacts for, while
+  -- no checkpoint answered it and its model and mode are unchanged since.
+  occupancy INTEGER REFERENCES model_request(entry),
+  -- The completed request whose occupancy its context shows, until a checkpoint.
+  gauged INTEGER REFERENCES model_request(entry),
+  last TEXT REFERENCES agent_last(name),
+  last_entry INTEGER REFERENCES entry(seq),
+  outcome TEXT REFERENCES agent_outcome(name),
+  outcome_entry INTEGER REFERENCES entry(seq),
+  -- The agent request that began its open turn.
+  turn INTEGER REFERENCES model_request(entry),
+  -- The latest record that ended a turn, whether or not one was open.
+  ended INTEGER REFERENCES entry(seq),
+  -- Its latest finished turn: the agent request that began it and the record that ended it.
+  finished INTEGER REFERENCES model_request(entry),
+  finished_entry INTEGER REFERENCES entry(seq),
+  input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+  cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+  cache_write_input_tokens INTEGER NOT NULL CHECK (cache_write_input_tokens >= 0),
+  output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+  CHECK ((last IS NULL) = (last_entry IS NULL)),
+  CHECK ((outcome IS NULL) = (outcome_entry IS NULL)),
+  CHECK ((finished IS NULL) = (finished_entry IS NULL))
+) STRICT;
+
+-- Each agent's newest model context of each purpose: the only one its next request of
+-- that purpose may name.
+CREATE TABLE agent_context (
+  agent INTEGER NOT NULL REFERENCES agent(id),
+  purpose TEXT NOT NULL REFERENCES model_purpose(name),
+  context INTEGER NOT NULL REFERENCES model_context(entry),
+  PRIMARY KEY (agent, purpose)
+) STRICT, WITHOUT ROWID;
+
+-- An answer's request, and the agent request that began the turn it answers, as the
+-- fold decided them when it committed.
+CREATE TABLE answer_turn (
+  answer INTEGER PRIMARY KEY REFERENCES message_commit(entry),
+  request INTEGER NOT NULL REFERENCES model_request(entry),
+  turn INTEGER REFERENCES model_request(entry)
+) STRICT;
+
+-- A failed turn that ended on its request's failure, which reports it.
+CREATE TABLE failed_turn (entry INTEGER PRIMARY KEY REFERENCES entry(seq)) STRICT;
+
 -- ───────────────────────── Jobs and outputs ─────────────────────────
 
 CREATE TABLE job_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -503,13 +603,56 @@ CREATE TABLE job (
   tool TEXT NOT NULL,
   name TEXT,
   role TEXT NOT NULL REFERENCES job_role(name),
-  arguments TEXT NOT NULL CHECK (json_valid(arguments)),
-  output_schema TEXT CHECK (output_schema IS NULL OR json_valid(output_schema)),
+  -- NULL when they are the origin call's arguments; a model call's repaired
+  -- arguments, and a script's, are the job's own.
+  arguments TEXT CHECK (arguments IS NULL OR json_valid(arguments)),
+  output_schema BLOB REFERENCES blob(sha256),
   accepts_input INTEGER NOT NULL CHECK (accepts_input IN (0,1)),
   background INTEGER NOT NULL CHECK (background IN (0,1)),
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL
+  location_workspace BLOB NOT NULL,
+  CHECK (origin_call IS NOT NULL OR arguments IS NOT NULL)
 ) STRICT;
+-- A parent's children in id order, a page at a time.
+CREATE INDEX job_parent ON job(parent);
+
+CREATE TABLE job_answer (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- Each job as the job fold leaves it, written in the transaction of the records that
+-- change it. While its state is a finish's, the job's latest finish holds the outcome.
+CREATE TABLE job_status (
+  job INTEGER PRIMARY KEY REFERENCES job(id),
+  state TEXT NOT NULL REFERENCES job_state(name),
+  invocation INTEGER NOT NULL CHECK (invocation >= 0),
+  background INTEGER NOT NULL CHECK (background IN (0,1)),
+  cancel_recorded INTEGER NOT NULL CHECK (cancel_recorded IN (0,1)),
+  -- The record that made its delivery pending; NULL once acknowledged.
+  pending INTEGER REFERENCES entry(seq),
+  first_run_millis INTEGER,
+  ended_millis INTEGER,
+  -- A background child's text-only answer, held or released.
+  answer INTEGER REFERENCES message_commit(entry),
+  answer_kind TEXT REFERENCES job_answer(name),
+  -- An agent job's child progress, committed turns and jobs it created, set for agent jobs
+  -- alone.
+  turns INTEGER CHECK (turns >= 0),
+  tool_calls INTEGER CHECK (tool_calls >= 0),
+  -- A lifecycle rule can still change it without its being addressed.
+  resident INTEGER NOT NULL CHECK (resident IN (0,1)),
+  CHECK (ended_millis IS NULL OR first_run_millis IS NOT NULL),
+  CHECK ((answer IS NULL) = (answer_kind IS NULL)),
+  CHECK ((turns IS NULL) = (tool_calls IS NULL)),
+  CHECK (answer IS NULL OR turns IS NOT NULL)
+) STRICT;
+CREATE INDEX job_status_resident ON job_status(job) WHERE resident;
+
+-- A child's replies queued for its owner, each with the record that queued it.
+CREATE TABLE job_reply (
+  job INTEGER NOT NULL REFERENCES job_status(job),
+  message INTEGER NOT NULL REFERENCES message_commit(entry),
+  stamp INTEGER NOT NULL REFERENCES entry(seq),
+  PRIMARY KEY (job, message)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_transition (
   entry INTEGER PRIMARY KEY REFERENCES entry(seq),
@@ -558,6 +701,12 @@ CREATE TABLE job_capture_chunk (
 ) STRICT;
 CREATE INDEX job_capture_line ON job_capture_chunk(capture, first_line);
 
+-- Captures of a result's large parts, written ahead of the finish that references
+-- them; the finish removes the row, so a row left is a finish that never committed.
+CREATE TABLE job_capture_staged (
+  capture INTEGER PRIMARY KEY REFERENCES job_capture(id) ON DELETE CASCADE
+) STRICT;
+
 -- Captures the terminal document references; only these are complete results.
 CREATE TABLE job_output_field (
   job INTEGER NOT NULL,
@@ -587,6 +736,7 @@ CREATE TABLE job_finish (
   job INTEGER NOT NULL REFERENCES job(id),
   state TEXT NOT NULL REFERENCES job_state(name)
 ) STRICT;
+CREATE INDEX job_finish_job ON job_finish(job, entry);
 
 -- Diagnostics retain typed terminal facts, never rendered errors.
 CREATE TABLE diagnostic_operation (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -657,4 +807,10 @@ CREATE TABLE job_delivery (
   source INTEGER REFERENCES message_commit(entry),
   notification INTEGER REFERENCES message_commit(entry),
   CHECK ((source IS NULL) = (notification IS NULL))
+) STRICT;
+
+-- A cancellation requested of a finished job that could still restart.
+CREATE TABLE job_cancel (
+  entry INTEGER PRIMARY KEY REFERENCES entry(seq),
+  job INTEGER NOT NULL REFERENCES job(id)
 ) STRICT;

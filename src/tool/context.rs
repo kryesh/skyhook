@@ -41,6 +41,10 @@ impl ToolContext {
         self.jobs.store()
     }
 
+    pub(crate) fn jobs(&self) -> &crate::job::JobManager {
+        &self.jobs
+    }
+
     /// Construct a job-only context for resume operations, without invocation authority.
     pub(crate) fn new(
         subject: super::authorization::AuthorizationSubject,

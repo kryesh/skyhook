@@ -197,7 +197,7 @@ for line in sys.stdin:
             );
         }
         assert!(policy.requests.lock().unwrap().is_empty());
-        assert!(runtime.jobs.list(&runtime.agent).is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
         let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();
         let native_input =
             json!({"count":2,"title":"user title","format":"user format","$schema":"user data"});

@@ -1,8 +1,9 @@
 //! One journal-derived status block per failed, retrying or interrupted request,
 //! not per attempt, and per failed turn no such block reports.
+use super::entries::Inputs;
 use super::{Entry, EntryKey, Surface, Timing};
 use crate::text::brief;
-use skyhook::agent::{Failure, ObservationSnapshot};
+use skyhook::agent::Failure;
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::ItemKind;
 use skyhook::session::{RequestFailure, RequestPhase, RequestSeq};
@@ -27,11 +28,11 @@ pub(super) fn failure_entry(key: EntryKey, failure: &Failure) -> Entry {
 }
 
 pub(super) fn retry_entry(
-    snapshot: &ObservationSnapshot,
+    inputs: Inputs<'_>,
     agent: &AgentId,
     request: RequestSeq,
 ) -> Option<Entry> {
-    let phase = &snapshot.ledger.get(request)?.phase;
+    let phase = &inputs.request(request)?.phase;
     let mut timing = Timing::Untimed;
     let mut text = match phase {
         RequestPhase::Requested
@@ -75,7 +76,7 @@ pub(super) fn retry_entry(
     // A partial response that committed (an abort) or settled without a failure
     // (an interruption) renders at its journal position, not in the card.
     let partial = phase.has_status_card() && !phase.settled_in_place();
-    if partial && let Some(response) = snapshot.responses.get(&(agent.clone(), request)) {
+    if partial && let Some(response) = inputs.live.views.responses.get(&(agent.clone(), request)) {
         for block in response.blocks() {
             if block.kind == ItemKind::Text && !block.text.trim().is_empty() {
                 text.push('\n');

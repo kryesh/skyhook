@@ -59,6 +59,14 @@ impl Message {
         }
     }
 
+    /// An assistant message that makes no call, which answers its turn.
+    pub(crate) fn answers(&self) -> bool {
+        match self {
+            Self::Assistant(items) => !items.iter().any(|item| item.call().is_some()),
+            Self::User(_) | Self::Tool(_) | Self::State(_) => false,
+        }
+    }
+
     /// Drop replay bound to the conversation that produced it, keeping display text. Changing
     /// that conversation, as compaction or a mode switch does, invalidates such replay; other
     /// replay is kept.
@@ -165,6 +173,16 @@ impl StateJobKind {
 pub enum JobEvent {
     Message(AgentMessage),
     Job(Box<JobView>),
+}
+
+impl JobEvent {
+    /// The job it reports on.
+    pub fn job(&self) -> Option<JobId> {
+        match self {
+            Self::Message(message) => Some(message.id),
+            Self::Job(view) => view.id,
+        }
+    }
 }
 
 /// The text a job-events notification sends the model.

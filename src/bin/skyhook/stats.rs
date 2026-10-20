@@ -10,7 +10,7 @@ use skyhook::{
     provider::protocol::UsageTotals,
     session::{
         SessionError, SessionStore,
-        stats::{AgentStats, RequestStats, SessionStats, session_stats},
+        stats::{AgentStats, RequestStats, SessionStats},
     },
     tool::diagnostic::escape_controls,
 };
@@ -22,6 +22,9 @@ use std::{
 use unicode_width::UnicodeWidthStr;
 
 type Error = Box<dyn std::error::Error>;
+
+/// Sessions a listing summarises at once.
+const CONCURRENT_READS: usize = 4;
 
 pub(super) async fn run(request: StatsRequest) -> Result<(), Error> {
     let workspace = tokio::fs::canonicalize(&request.workspace)
@@ -36,7 +39,7 @@ pub(super) async fn run(request: StatsRequest) -> Result<(), Error> {
         }
         StatsTarget::Session(session, format) => (session, format),
     };
-    let stats = read(&sessions, session)
+    let stats = SessionStore::stats(&sessions, session)
         .await
         .map_err(|error| match error {
             SessionError::NotFound(_) => {
@@ -54,11 +57,6 @@ pub(super) async fn run(request: StatsRequest) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-async fn read(sessions: &Path, session: SessionId) -> Result<SessionStats, SessionError> {
-    let records = SessionStore::read_records(sessions, session).await?;
-    Ok(session_stats(session, &records))
 }
 
 /// Every session of the current format in the history, newest first. Earlier formats
@@ -79,8 +77,14 @@ async fn list(sessions: &Path) -> Result<Vec<SessionStats>, Error> {
                 .and_then(|name| name.parse::<SessionId>().ok()),
         );
     }
-    let reads = ids.iter().map(|session| read(sessions, *session));
-    for (session, result) in ids.iter().zip(futures_util::future::join_all(reads).await) {
+    // A few at a time: each holds what one session's summary reads.
+    let read =
+        |session: SessionId| async move { (session, SessionStore::stats(sessions, session).await) };
+    let mut ids = ids.into_iter();
+    let mut reads: futures_util::stream::FuturesUnordered<_> =
+        ids.by_ref().take(CONCURRENT_READS).map(read).collect();
+    while let Some((session, result)) = futures_util::StreamExt::next(&mut reads).await {
+        reads.extend(ids.next().map(read));
         match result {
             Ok(stats) => listed.push(stats),
             Err(SessionError::UnsupportedVersion(_)) => {}

@@ -28,24 +28,44 @@ impl CancelScope {
 impl JobManager {
     /// Request cancellation of this job and its descendants. The returned
     /// metadata is a snapshot, not proof that cancellation has completed; a
-    /// previously published terminal result is preserved. A turn an interrupt
+    /// previously published terminal result is preserved, and the request is
+    /// recorded of each finished job it stops restarting. A turn an interrupt
     /// left held on the job runs on with its result.
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
         let manager = self.clone();
-        let cancel = move |state: &mut CoreState| {
-            let jobs = &state.jobs.entries;
-            let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+        let cancel = move |state: &CoreState| {
+            let entry = state.job(id)?;
             let metadata = entry.metadata(id);
-            let held =
-                entry.child().is_some() && entry.live() && !views::effectively_background(jobs, id);
+            let held = entry.child().is_some()
+                && entry.live()
+                && !views::effectively_background(&state.jobs, id);
             let holder = held.then(|| entry.agent.clone());
-            manager.cancel_trees(state, vec![id], CancelScope::Outcome);
-            if let Some(holder) = holder {
-                state.agents.run_on(&holder);
-            }
-            Ok(metadata)
+            let jobs = &state.jobs;
+            // Recording a cancel drops the job's handles, so its token, which a
+            // child's running loop holds, is taken here.
+            let (recorded, tokens): (Vec<_>, Vec<_>) = (jobs.trees(vec![id]).into_iter())
+                .filter_map(|job| Some((job, jobs.get(job)?)))
+                .filter(|(_, entry)| entry.records_cancel())
+                .map(|(job, entry)| {
+                    let event = SessionEvent::JobCancelRequested { job };
+                    let token =
+                        (entry.handles.as_ref()).map(|handles| handles.cancellation.clone());
+                    ((entry.agent.clone(), event), token)
+                })
+                .unzip();
+            Ok(Plan::new(recorded, move |state, _| {
+                manager.cancel_trees(state, vec![id], CancelScope::Outcome);
+                state.defer(move || tokens.iter().flatten().for_each(CancellationToken::cancel));
+                if let Some(holder) = holder {
+                    state.agents.run_on(&holder);
+                }
+                metadata
+            }))
         };
-        self.inner.store.live(cancel).await
+        self.inner
+            .store
+            .commit_on([id], Command::Journal, cancel)
+            .await
     }
 
     /// Cancel `roots` and all their descendants, arming the forced-abort watchdog
@@ -55,31 +75,35 @@ impl JobManager {
     pub(crate) fn cancel_trees(
         &self,
         state: &mut CoreState,
-        mut worklist: Vec<JobId>,
+        roots: Vec<JobId>,
         scope: CancelScope,
     ) {
-        let jobs = &mut state.jobs.entries;
-        let mut children = HashMap::<JobId, Vec<JobId>>::new();
-        for (&id, entry) in jobs.iter() {
-            if let Some(parent) = entry.parent {
-                children.entry(parent).or_default().push(id);
-            }
-        }
+        let jobs = &mut state.jobs;
         let (mut tokens, mut watched) = (Vec::new(), Vec::new());
-        while let Some(job) = worklist.pop() {
-            worklist.extend(children.remove(&job).into_iter().flatten());
-            let Some(entry) = jobs.get_mut(&job) else {
+        for job in jobs.trees(roots) {
+            let cancelled = jobs.modify(job, |entry, _| {
+                let watch = scope.covers(entry) && !entry.cancelling();
+                entry.cancel = match entry.cancel {
+                    CancelState::Recorded => CancelState::Recorded,
+                    CancelState::Requested { watched } if !watch => {
+                        CancelState::Requested { watched }
+                    }
+                    _ => CancelState::Requested {
+                        watched: watch.then_some(entry.invocation),
+                    },
+                };
+                let token = entry
+                    .handles
+                    .as_ref()
+                    .map(|handles| handles.cancellation.clone());
+                // It cancels the invocation running now, not one a later input starts.
+                (token, watch.then_some(Run(job, entry.invocation)))
+            });
+            let Some((token, watch)) = cancelled else {
                 continue;
             };
-            let watch = scope.covers(entry) && !entry.cancelling();
-            let armed = match entry.cancel {
-                CancelState::Requested { watched } if !watch => watched,
-                _ => watch.then_some(entry.invocation),
-            };
-            entry.cancel = CancelState::Requested { watched: armed };
-            tokens.push(self.handles(job, |handles| handles.cancellation.clone()));
-            // It cancels the invocation running now, not one a later input starts.
-            watched.extend(watch.then_some(Run(job, entry.invocation)));
+            tokens.extend(token);
+            watched.extend(watch);
         }
         let manager = self.clone();
         state.defer(move || {
@@ -90,12 +114,12 @@ impl JobManager {
                 let grace = tokio::time::Instant::now() + CANCELLATION_GRACE;
                 // It ends with the cancellation it watches, so a drain does not
                 // outwait its grace.
-                let settled = move |state: &mut CoreState| {
-                    let entry = state.jobs.entries.get(&run.0);
+                let settled = move |state: &CoreState| {
+                    let entry = state.jobs.get(run.0);
                     (!entry.is_some_and(JobFacts::cancelling)).then_some(())
                 };
                 manager.inner.supervisor.spawn(async move {
-                    let settled = jobs.inner.store.until(settled);
+                    let settled = jobs.inner.store.until(Wait::on([Key::Job(run.0)], settled));
                     if tokio::time::timeout_at(grace, settled).await.is_err() {
                         jobs.force_cancel(run).await;
                     }
@@ -118,9 +142,11 @@ impl JobManager {
         owners: &[AgentId],
         scope: CancelScope,
     ) -> usize {
-        let ids = (state.jobs.entries.iter())
-            .filter(|(_, entry)| owners.contains(&entry.agent) && scope.covers(entry))
-            .map(|(id, _)| *id)
+        let jobs = &state.jobs;
+        let ids = (owners.iter())
+            .flat_map(|owner| jobs.cancellable(owner))
+            .filter(|(_, entry)| scope.covers(entry))
+            .map(|(id, _)| id)
             .collect::<Vec<_>>();
         let count = ids.len();
         self.cancel_trees(state, ids, scope);
@@ -130,9 +156,9 @@ impl JobManager {
     /// Cancel every job still running but child invocations, which closing leaves
     /// resumable, with its descendants: what a script launched ends with it.
     pub(crate) fn cancel_running(&self, state: &mut CoreState) {
-        let running = (state.jobs.entries.iter())
-            .filter(|(_, entry)| entry.child().is_none() && CancelScope::Running.covers(entry))
-            .map(|(id, _)| *id)
+        let running = (state.jobs.running())
+            .filter(|(_, entry)| entry.child().is_none())
+            .map(|(id, _)| id)
             .collect();
         self.cancel_trees(state, running, CancelScope::Running);
     }
@@ -146,25 +172,31 @@ impl JobManager {
             let manager = self.clone();
             let cancelling = self.inner.store.live(move |state| {
                 manager.cancel_running(state);
-                state.jobs.entries.values().any(JobFacts::cancelling)
+                let jobs = &state.jobs;
+                let cancellable = jobs.owners().flat_map(|owner| jobs.cancellable(owner));
+                let cancelling = cancellable.filter(|(_, entry)| entry.cancelling());
+                cancelling.map(|(id, _)| id).collect::<Vec<_>>()
             });
-            if !cancelling.await {
+            let cancelling = cancelling.await;
+            if cancelling.is_empty() {
                 // Terminal publication may precede supervisor cleanup.
                 self.inner.supervisor.drain().await;
                 return Ok(());
             }
-            let settled = |state: &mut CoreState| {
-                let entries = state.jobs.entries.values();
-                (!entries.clone().any(JobFacts::cancelling)).then_some(())
+            let keys: Vec<_> = cancelling.iter().copied().map(Key::Job).collect();
+            let settled = move |state: &CoreState| {
+                let still = |job: &JobId| state.jobs.get(*job).is_some_and(JobFacts::cancelling);
+                (!cancelling.iter().any(still)).then_some(())
             };
-            self.inner.store.until(settled).await?;
+            self.inner.store.until(Wait::on(keys, settled)).await?;
         }
     }
 
     /// Abort `run`'s worker and settle its cancellation, if that changes its outcome.
     pub(super) async fn force_cancel(&self, run: Run) {
         let Run(job, invocation) = run;
-        let worker = self.handles(job, |handles| handles.task_abort.clone());
+        let worker = self.entry(job, |entry| entry.handles.as_ref()?.task_abort.clone());
+        let worker = worker.await.ok().flatten();
         if let Some((running, task_abort)) = worker
             && running == invocation
         {
@@ -253,7 +285,7 @@ mod tests {
             let id = jobs
                 .test_create(JobSpec::test(agent.clone(), "finished"))
                 .await;
-            let saved = jobs.output(id);
+            let saved = jobs.output(id).await;
             let stdout = "/result/stdout".parse().unwrap();
             let mut writer = PendingCapture::create(&saved, &stdout, CaptureKind::Text)
                 .unwrap()
@@ -268,7 +300,7 @@ mod tests {
                 None => JobOutcome::Completed(output),
             };
             jobs.finish(id, outcome).await.unwrap();
-            let mut expected = jobs.snapshot(id).unwrap();
+            let mut expected = jobs.snapshot(id).await.unwrap();
             let document = saved.test_document();
             let fields = saved.test_fields();
             let view = jobs
@@ -284,7 +316,7 @@ mod tests {
                 expected.diagnostic.as_mut().unwrap().cause = Cause::Cancelled;
             }
             // Even a late watchdog must not overwrite output or denial metadata.
-            jobs.force_cancel(jobs.run(id)).await;
+            jobs.force_cancel(jobs.run(id).await).await;
             // Replayed after the live reads, which can themselves journal.
             for replay in [false, true] {
                 let manager = if replay {
@@ -292,9 +324,12 @@ mod tests {
                 } else {
                     jobs.clone()
                 };
-                assert_eq!(manager.snapshot(id).unwrap(), expected);
-                assert_eq!(manager.snapshot(id).unwrap().images, vec![image.clone()]);
-                let saved = manager.output(id);
+                assert_eq!(manager.snapshot(id).await.unwrap(), expected);
+                assert_eq!(
+                    manager.snapshot(id).await.unwrap().images,
+                    vec![image.clone()]
+                );
+                let saved = manager.output(id).await;
                 assert_eq!(saved.test_document(), document);
                 assert_eq!(saved.test_fields(), fields);
                 assert_eq!(saved.test_bytes("/result/stdout").unwrap(), text.as_bytes());
@@ -336,22 +371,54 @@ mod tests {
         let prompt = crate::job::tests::question("pending");
         jobs.request_input(question.id(), prompt).await.unwrap();
         assert_eq!(
-            jobs.snapshot(question.id()).unwrap().state,
+            jobs.snapshot(question.id()).await.unwrap().state,
             JobState::WaitingInput
         );
         bounded(jobs.cancel_and_drain()).await.unwrap();
         let records = jobs.store().records();
         let finished = |id| {
-            let finished = |record: &&crate::session::EventRecord| matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id);
+            let finished = |record: &&Arc<crate::session::EventRecord>| matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id);
             records.iter().filter(finished).count()
         };
-        assert_eq!(jobs.snapshot(kept).unwrap().state, JobState::Interrupted);
+        assert_eq!(
+            jobs.snapshot(kept).await.unwrap().state,
+            JobState::Interrupted
+        );
         assert_eq!(finished(kept), 1);
         for id in [parent.id(), question.id(), cancelling] {
-            assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Cancelled);
+            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
             let expected = if id == cancelling { 2 } else { 1 };
             // Journaled before shutdown returns.
             assert_eq!(finished(id), expected, "job {id:?}");
+        }
+    }
+
+    /// Cancelling a reopened tree reaches the descendants the stopped process
+    /// left interrupted, though nothing runs them any more.
+    #[tokio::test]
+    async fn cancelling_a_reopened_parent_reaches_descendants_nothing_runs() {
+        let TestRuntime {
+            root, jobs, agent, ..
+        } = TestRuntime::on_disk().await;
+        let parent = jobs
+            .test_running(JobSpec::test(agent.clone(), "script"))
+            .await;
+        let spec = child(parent.id(), agent.clone(), "script");
+        let nested = jobs.test_running(spec).await;
+        let leaf = jobs.test_running(child(nested.id(), agent, "exec")).await;
+        let tree = [parent.id(), nested.id(), leaf.id()];
+        // Gone the way a process exit leaves them: cancelled, never finalized.
+        std::thread::spawn(move || drop((parent, nested, leaf)))
+            .join()
+            .unwrap();
+        let restored = crate::job::tests::reopen(jobs, root.path()).await;
+        restored.cancel(tree[0]).await.unwrap();
+        bounded(restored.cancel_and_drain()).await.unwrap();
+        for id in tree {
+            assert_eq!(
+                restored.snapshot(id).await.unwrap().state,
+                JobState::Cancelled
+            );
         }
     }
 
@@ -445,7 +512,7 @@ mod tests {
         });
         let awaiting = bounded(asked_about.recv()).await.unwrap();
         assert_eq!(
-            jobs.snapshot(awaiting).unwrap().state,
+            jobs.snapshot(awaiting).await.unwrap().state,
             JobState::AwaitingApproval
         );
         jobs.cancel(awaiting).await.unwrap();
@@ -454,6 +521,9 @@ mod tests {
             result.unwrap_err().diagnostic().cause,
             crate::tool::diagnostic::Cause::Cancelled,
         );
-        assert_eq!(jobs.snapshot(awaiting).unwrap().state, JobState::Cancelled);
+        assert_eq!(
+            jobs.snapshot(awaiting).await.unwrap().state,
+            JobState::Cancelled
+        );
     }
 }

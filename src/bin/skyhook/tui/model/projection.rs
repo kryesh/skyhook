@@ -7,12 +7,22 @@ use serde_json::Value;
 use skyhook::agent::{AgentActivity, ObservationSnapshot, StoppedReading, TodoItem, TurnFailure};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobEnvelope, JobRole, JobState, JobTransition};
-use skyhook::provider::protocol::UsageTotals;
-use skyhook::session::{Message, MessageSeq, RecordSeq, SessionEvent, Turns};
+use skyhook::session::{AgentsPage, EventRecord, RecordSeq, ResidentLedger, SessionEvent, Turns};
 use skyhook::target::TargetRef;
 use std::collections::{HashMap, HashSet};
-use std::ops::Bound;
 use std::time::{Duration, Instant};
+
+/// Whether any job the session holds has yet to end.
+pub fn open_jobs(snapshot: &ObservationSnapshot) -> bool {
+    snapshot.jobs.values().any(|job| !job.state.is_terminal())
+}
+
+/// Whether continuing the session has something to try again: a turn that stopped
+/// short of its answer, or a job it would restart.
+pub fn continuable(snapshot: &ObservationSnapshot) -> bool {
+    (snapshot.activity.values()).any(|activity| activity.state.is_retryable())
+        || snapshot.jobs.values().any(JobEnvelope::retryable)
+}
 
 /// Keep newly completed agents discoverable briefly in the live tree.
 pub const COMPLETED_AGENT_GRACE: Duration = Duration::from_secs(2);
@@ -130,53 +140,114 @@ impl AgentInfo {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Projection {
     pub agents: Vec<AgentInfo>,
-    pub usage: UsageTotals,
-    pub agent_usage: HashMap<AgentId, UsageTotals>,
     pub todos: HashMap<AgentId, Vec<TodoItem>>,
-    pub(super) through: RecordSeq,
-    pub(super) records_by_agent: HashMap<AgentId, Vec<RecordSeq>>,
-    /// Calls that admitted a job, so the job card stands in for the call.
-    pub(super) tool_origins: HashSet<(AgentId, MessageSeq, String)>,
+    /// The newest record the agents' summaries read: updates through it repeat them.
+    through: RecordSeq,
     /// What records and job views folded since the last `take_changes` touched.
     changes: HashSet<Dep>,
     turns: Turns,
     /// Each agent's most recently finished turn.
     last_turn: HashMap<AgentId, Timing>,
-    /// When each assistant message's turn began.
-    pub(super) turn_starts: HashMap<MessageSeq, i64>,
+    /// The jobs the session let go of, as it left them, while the agents or the view
+    /// show them.
+    released: HashMap<JobId, JobEnvelope>,
+    /// The newest record folded that set what an agent runs under: a start or a mode
+    /// change.
+    pub contract: Option<RecordSeq>,
 }
-/// Whether any job the session holds has yet to end.
-pub fn open_jobs(snapshot: &ObservationSnapshot) -> bool {
-    snapshot.jobs.values().any(|job| !job.state.is_terminal())
-}
-
 impl Projection {
-    /// A projection of everything `snapshot` holds.
-    pub fn new(snapshot: &ObservationSnapshot) -> Self {
-        let mut projection = Self::default();
-        (snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
-        projection.rebuild(snapshot);
+    /// What `summaries` say of every agent, with the owner jobs `owners` read after
+    /// them, and the jobs `live` holds.
+    pub fn new(
+        summaries: AgentsPage,
+        owners: Vec<JobEnvelope>,
+        live: &ObservationSnapshot,
+    ) -> Self {
+        let mut projection = Self {
+            released: owners.into_iter().map(|job| (job.id, job)).collect(),
+            ..Self::default()
+        };
+        let mut turns = Vec::new();
+        for summary in summaries.agents {
+            for record in &summary.records {
+                projection.fold(record, &live.requests);
+            }
+            if let Some((since, until)) = summary.finished {
+                let finished = Timing::Took { since, until };
+                (projection.last_turn).insert(summary.agent.clone(), finished);
+            }
+            turns.extend(summary.turn.map(|turn| (summary.agent, turn)));
+        }
+        projection.turns = turns.into_iter().collect();
+        projection.through = summaries.through;
+        // A summary keeps a child's last ending while a follow-up it was given runs:
+        // its owner job, as read after the summaries, says it runs. The live slice
+        // may be older than they are.
+        let (agents, owners) = (&mut projection.agents, &projection.released);
+        for agent in agents {
+            let owner = agent.owner.and_then(|job| owners.get(&job));
+            if owner.is_some_and(|job| !job.state.is_terminal()) {
+                agent.lifecycle = AgentLifecycle::Active;
+            }
+        }
+        projection.reconcile(live);
         projection
     }
 
-    /// Fold a job's view as it arrives, before the record that moved it.
-    pub fn observe_job(&mut self, job: &JobEnvelope) {
-        self.changes.insert(Dep::Job(job.id));
+    /// A job as the session last showed it: as the live slice holds it, as the
+    /// session let go of it, or as `window`'s pages read it.
+    pub fn job<'a>(
+        &'a self,
+        live: &'a ObservationSnapshot,
+        window: Option<&'a super::Window>,
+        job: &JobId,
+    ) -> Option<&'a JobEnvelope> {
+        (live.jobs.get(job))
+            .or_else(|| self.released.get(job))
+            .or_else(|| window?.job(job))
     }
 
-    /// Fold the jobs and requests the session's stopped reading changed, which
-    /// no record reports, as their own updates would. Returns whether it changed
-    /// any: the projection then rebuilds as for a record, so agents reconcile
-    /// with their owner jobs.
+    /// Keep `jobs`, which the session let go of, as it left them. Returns whether
+    /// there were any.
+    pub fn release(&mut self, jobs: &[JobEnvelope]) -> bool {
+        (self.released).extend(jobs.iter().map(|job| (job.id, job.clone())));
+        !jobs.is_empty()
+    }
+
+    /// Let go of the jobs kept for being let go of that neither an agent nor `shown`
+    /// shows.
+    pub fn retain_released(&mut self, shown: &HashSet<JobId>) {
+        let owners: HashSet<_> = self.agents.iter().filter_map(|agent| agent.owner).collect();
+        (self.released).retain(|job, _| shown.contains(job) || owners.contains(job));
+    }
+
+    /// When `agent`'s open turn began.
+    pub fn turn_started(&self, agent: &AgentId) -> Option<i64> {
+        self.turns.started(agent)
+    }
+
+    /// Note a job's view as it arrives, before the record that moved it.
+    pub fn observe_job(&mut self, job: JobId) {
+        self.changes.insert(Dep::Job(job));
+    }
+
+    /// Fold the requests the session's stopped reading changed, which no record
+    /// reports. Returns whether it changed anything: the projection then
+    /// rebuilds as for a record, so agents reconcile with their owner jobs.
     pub fn observe_stopped(&mut self, reading: StoppedReading) -> bool {
         let changed = !(reading.jobs.is_empty() && reading.requests.is_empty());
-        self.changes.extend(reading.jobs.into_iter().map(Dep::Job));
         self.changes
             .extend(reading.requests.into_iter().map(Dep::Request));
         changed
+    }
+
+    /// Note the requests an update changed, which history shows.
+    pub fn observe_requests(&mut self, requests: &[skyhook::session::RequestSeq]) {
+        self.changes
+            .extend(requests.iter().copied().map(Dep::Request));
     }
 
     pub(super) fn agent_name(&self, agent: &AgentId) -> &str {
@@ -212,7 +283,7 @@ impl Projection {
     }
 
     /// Everything folded since the last call touched, for history to rebuild.
-    pub(super) fn take_changes(&mut self) -> HashSet<Dep> {
+    pub fn take_changes(&mut self) -> HashSet<Dep> {
         std::mem::take(&mut self.changes)
     }
 
@@ -224,129 +295,106 @@ impl Projection {
             Some(activity) if !agent.terminal() && activity.state.is_busy() => {
                 Timing::Since(activity.since)
             }
-            _ => match agent.owner.and_then(|job| snapshot.jobs.get(&job)) {
+            _ => match agent.owner.and_then(|job| self.job(snapshot, None, &job)) {
                 Some(job) => job.timing.into(),
                 None => (self.last_turn.get(&agent.id).copied()).unwrap_or(Timing::Untimed),
             },
         }
     }
 
-    pub fn rebuild(&mut self, snapshot: &ObservationSnapshot) {
-        let requests = snapshot.ledger.changed_after(self.through);
-        self.changes.extend(requests.map(Dep::Request));
-        let after = (Bound::Excluded(self.through), Bound::Unbounded);
-        for (_, record) in snapshot.records.range(after) {
-            self.through = record.sequence;
-            self.records_by_agent
-                .entry(record.agent.clone())
-                .or_default()
-                .push(record.sequence);
-            if let Some(since) = self.turns.observe(record, &snapshot.ledger) {
-                let until = record.timestamp_millis;
-                self.last_turn
-                    .insert(record.agent.clone(), Timing::Took { since, until });
-            }
-            match &record.event {
-                SessionEvent::AgentStarted {
-                    profile,
-                    mode,
-                    capabilities,
-                    location,
-                    owner_job,
-                    ..
-                } => {
-                    // The owner job's card shows where its agent runs.
-                    self.changes.extend(owner_job.map(Dep::Job));
-                    self.agents.retain(|agent| agent.id != record.agent);
-                    self.agents.push(AgentInfo {
-                        id: record.agent.clone(),
-                        name: if record.agent.path().is_empty() {
-                            "skyhook".into()
-                        } else {
-                            format!("agent {}", agent_label(&record.agent))
-                        },
-                        model: profile.name.clone(),
-                        mode: mode.as_ref().map(|mode| mode.name.clone()),
-                        capabilities: capabilities.clone(),
-                        target: location.target.clone(),
-                        owner: *owner_job,
-                        lifecycle: AgentLifecycle::Active,
-                    });
-                }
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(_),
-                } => {
-                    if let Some(started) = self.turns.started(&record.agent) {
-                        (self.turn_starts).insert(record.sequence.message(), started);
-                    }
-                }
-                SessionEvent::MessageCommitted {
-                    message: Message::Tool(result),
-                } => {
-                    // The call shows the result that answered it.
-                    let answered = snapshot.ledger.answered(record.sequence);
-                    let call = answered.map(|message| Dep::Call(message, result.call_id.clone()));
-                    self.changes.extend(call);
-                }
-                SessionEvent::JobCreated {
-                    origin: Some(origin),
-                    ..
-                } => {
-                    let call = origin.call_id.clone();
-                    self.changes.insert(Dep::Call(origin.message, call.clone()));
-                    (self.tool_origins).insert((record.agent.clone(), origin.message, call));
-                }
-                SessionEvent::JobStateChanged { job, state } => {
-                    // Resuming a retained child reuses its owner job and does not
-                    // emit AgentStarted again. Reopen its tree row on that job's
-                    // Running event, not on ordinary model/tool activity updates.
-                    if *state == JobTransition::Running {
-                        for agent in self
-                            .agents
-                            .iter_mut()
-                            .filter(|agent| agent.owner == Some(*job) && agent.terminal())
-                        {
-                            agent.lifecycle = AgentLifecycle::Active;
-                        }
-                    }
-                }
-                // Stopping the root ends its process, not the agent: a reopened
-                // session resumes it, and its activity says how.
-                SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted
-                    if record.agent.parent().is_some() =>
-                {
-                    self.complete_agent(&record.agent);
-                }
-                SessionEvent::ModelChanged { profile } => {
-                    if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
-                        agent.model = profile.name.clone();
-                    }
-                }
-                SessionEvent::ModeChanged { mode, capabilities } => {
-                    if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
-                        agent.mode = Some(mode.name.clone());
-                        agent.capabilities.clone_from(capabilities);
-                    }
-                }
-                SessionEvent::Usage { usage, .. } => {
-                    self.usage.add(*usage);
-                    self.agent_usage
-                        .entry(record.agent.clone())
-                        .or_default()
-                        .add(*usage);
-                }
-                SessionEvent::TodosReplaced { items } => {
-                    self.todos.insert(record.agent.clone(), items.clone());
-                }
-                SessionEvent::Compaction { checkpoint } => {
-                    self.todos
-                        .insert(record.agent.clone(), checkpoint.todos.clone());
-                }
-                _ => {}
-            }
+    /// Fold an update's record, after `snapshot` has; one a summary read is skipped.
+    pub fn observe(&mut self, record: &EventRecord, snapshot: &ObservationSnapshot) {
+        if record.sequence > self.through {
+            self.fold(record, &snapshot.requests);
         }
-        for agent in &mut self.agents {
-            if let Some(job) = agent.owner.and_then(|id| snapshot.jobs.get(&id)) {
+    }
+
+    fn fold(&mut self, record: &EventRecord, requests: &ResidentLedger) {
+        if let Some(since) = self.turns.observe(record, requests) {
+            let until = record.timestamp_millis;
+            (self.last_turn).insert(record.agent.clone(), Timing::Took { since, until });
+        }
+        match &record.event {
+            SessionEvent::AgentStarted {
+                profile,
+                mode,
+                capabilities,
+                location,
+                owner_job,
+                ..
+            } => {
+                self.contract = self.contract.max(Some(record.sequence));
+                // The owner job's card shows where its agent runs.
+                self.changes.extend(owner_job.map(Dep::Job));
+                self.agents.retain(|agent| agent.id != record.agent);
+                self.agents.push(AgentInfo {
+                    id: record.agent.clone(),
+                    name: if record.agent.path().is_empty() {
+                        "skyhook".into()
+                    } else {
+                        format!("agent {}", agent_label(&record.agent))
+                    },
+                    model: profile.name.clone(),
+                    mode: mode.as_ref().map(|mode| mode.name.clone()),
+                    capabilities: capabilities.clone(),
+                    target: location.target.clone(),
+                    owner: *owner_job,
+                    lifecycle: AgentLifecycle::Active,
+                });
+            }
+            SessionEvent::JobStateChanged { job, state } => {
+                // Resuming a retained child reuses its owner job and does not
+                // emit AgentStarted again. Reopen its tree row on that job's
+                // Running event, not on ordinary model/tool activity updates.
+                if *state == JobTransition::Running {
+                    for agent in self
+                        .agents
+                        .iter_mut()
+                        .filter(|agent| agent.owner == Some(*job) && agent.terminal())
+                    {
+                        agent.lifecycle = AgentLifecycle::Active;
+                    }
+                }
+            }
+            // Stopping the root ends its process, not the agent: a reopened
+            // session resumes it, and its activity says how.
+            SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted
+                if record.agent.parent().is_some() =>
+            {
+                self.complete_agent(&record.agent);
+            }
+            SessionEvent::ModelChanged { profile } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
+                    agent.model = profile.name.clone();
+                }
+            }
+            SessionEvent::ModeChanged { mode, capabilities } => {
+                self.contract = self.contract.max(Some(record.sequence));
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
+                    agent.mode = Some(mode.name.clone());
+                    agent.capabilities.clone_from(capabilities);
+                }
+            }
+            SessionEvent::TodosReplaced { items } => {
+                self.todos.insert(record.agent.clone(), items.clone());
+            }
+            SessionEvent::Compaction { checkpoint } => {
+                self.todos
+                    .insert(record.agent.clone(), checkpoint.todos.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// Bring agents in line with their owner jobs: named after them, and ended with them,
+    /// once `snapshot` has applied what the summaries read.
+    pub fn reconcile(&mut self, snapshot: &ObservationSnapshot) {
+        if snapshot.applied < self.through {
+            return;
+        }
+        let mut agents = std::mem::take(&mut self.agents);
+        for agent in &mut agents {
+            if let Some(job) = agent.owner.and_then(|id| self.job(snapshot, None, &id)) {
                 if let Some(name) = &job.name {
                     agent.name = name.to_string();
                 }
@@ -355,7 +403,8 @@ impl Projection {
                 }
             }
         }
-        self.agents.sort_by(|a, b| a.id.path().cmp(b.id.path()));
+        agents.sort_by(|a, b| a.id.path().cmp(b.id.path()));
+        self.agents = agents;
     }
     pub fn has_active_children(&self) -> bool {
         self.agents
@@ -402,8 +451,8 @@ impl Projection {
     }
     /// An agent's footer statistics.
     pub fn agent_stats(&self, snapshot: &ObservationSnapshot, agent: &AgentId) -> [String; 3] {
-        let usage = self.agent_usage.get(agent).copied().unwrap_or_default();
-        let context = snapshot.context.get(agent);
+        let usage = snapshot.usage.get(agent).copied().unwrap_or_default();
+        let context = snapshot.views.context.get(agent);
         super::super::format::footer_stats(usage, context.map(|c| (c.tokens, c.capacity)))
     }
     /// Indices of the agents the live tree shows.
@@ -419,7 +468,7 @@ impl Projection {
     }
     pub fn status(&self, agent: &AgentInfo, snapshot: &ObservationSnapshot) -> AgentDisplayState {
         use AgentDisplayState as State;
-        let owner = agent.owner.and_then(|id| snapshot.jobs.get(&id));
+        let owner = agent.owner.and_then(|id| self.job(snapshot, None, &id));
         if agent.terminal() {
             return State::Job(owner.map_or(JobState::Completed, |job| job.state));
         }
@@ -482,7 +531,9 @@ mod tests {
             observe_find, observe_record, observe_until, played_fixture, reached, recorded,
             requested, spawn_children,
         },
+        tests::viewing,
     };
+    use crate::tui::model::Tab;
     use serde_json::json;
     use skyhook::agent::ObservedActivity;
     use skyhook::provider::protocol::{AssistantItem, ContextId};
@@ -493,11 +544,17 @@ mod tests {
         agents.find(|agent| &agent.id == id).unwrap().clone()
     }
 
-    /// What `app` shows agent `id` doing, as a fresh projection of its snapshot,
-    /// as a resubscription builds, agrees.
-    fn status(app: &App, id: &AgentId) -> AgentDisplayState {
+    /// What `app` shows agent `id` doing, as a fresh projection of the agents'
+    /// summaries, as a resubscription builds, agrees.
+    async fn status(app: &App, id: &AgentId) -> AgentDisplayState {
         let state = (app.projection).status(&agent(&app.projection, id), &app.snapshot);
-        let fresh = Projection::new(&app.snapshot);
+        let session = app.session().unwrap();
+        let agents = bounded(session.store().agents()).await.unwrap();
+        let owners = agents.agents.iter().filter_map(|agent| agent.owner_job);
+        let owners = bounded(session.jobs().views(owners.collect()))
+            .await
+            .unwrap();
+        let fresh = Projection::new(agents, owners, &app.snapshot);
         assert_eq!(fresh.status(&agent(&fresh, id), &app.snapshot), state);
         state
     }
@@ -526,14 +583,18 @@ mod tests {
         exchange(&mut app, &mut model, "question", answer).await;
         observe_until(&mut app, |app| {
             activity(&app.snapshot, &root) == Some(&AgentActivity::Idle)
-                && recorded(&app.snapshot, completed)
+                && recorded(&app.journal, completed)
         })
         .await;
-        let since = at(&app.snapshot, requested, 0);
-        let until = at(&app.snapshot, completed, 0);
+        let since = at(&app.journal, requested, 0);
+        let until = at(&app.journal, completed, 0);
         let took = Timing::Took { since, until };
-        let root = agent(&app.projection, &root);
-        assert_eq!(app.projection.timing(&root, &app.snapshot), took);
+        let shown = agent(&app.projection, &root);
+        assert_eq!(app.projection.timing(&shown, &app.snapshot), took);
+        // An app opening the session later reads it from the root's summary.
+        let (_viewer, opened) = viewing(app.session().unwrap(), Tab::Conversation).await;
+        let shown = agent(&opened.projection, &root);
+        assert_eq!(opened.projection.timing(&shown, &opened.snapshot), took);
     }
 
     /// A child shows its turn while busy and its owner job's run otherwise, also
@@ -543,7 +604,7 @@ mod tests {
         let (_root, mut app, mut model, _session) = played_fixture().await;
         let (children, mut turns) = spawn_children(&mut app, &mut model, 1).await;
         turns.remove(0).answer("done");
-        let owner = observe_find(&mut app, |app| job_of_call(&app.snapshot, "agent-0")).await;
+        let owner = observe_find(&mut app, |app| job_of_call(&app.journal, "agent-0")).await;
         observe_record(&mut app, job_finished(owner)).await;
         // As it shows before its completion record lands.
         let mut child = AgentInfo {
@@ -585,7 +646,7 @@ mod tests {
         observe_until(&mut app, |app| app.snapshot.phase == SessionPhase::Closed).await;
         assert!(!app.peer(SlotKey::default(), true).working);
         let session = app.launch.create(Some(session.id())).await.unwrap();
-        attach(&mut app, session.clone());
+        attach(&mut app, session.clone()).await;
         let stopped = AgentDisplayState::stopped(&TurnFailure::Interrupted);
         assert_eq!(app.peer(SlotKey::default(), true).state, stopped);
         let root = app.root_agent().clone();
@@ -610,15 +671,18 @@ mod tests {
         let (_root, mut app, mut model, session, mut prompts) = attended_fixture().await;
         let root = app.root_agent().clone();
         let mut turns = delegate(&session, &mut model, &[json!({"prompt": "ask"})]).await;
-        observe_until(&mut app, |app| !children(&app.snapshot).is_empty()).await;
-        let child = children(&app.snapshot).remove(0);
+        observe_until(&mut app, |app| !children(&app.journal).is_empty()).await;
+        let child = children(&app.journal).remove(0);
         let doing = |app: &mut App, state| {
             let activity = ObservedActivity { state, since: 0 };
             app.snapshot.activity.insert(child.clone(), activity);
         };
         doing(&mut app, AgentActivity::Reconnecting { attempt: 2 });
-        assert_eq!(status(&app, &child), State::Reconnecting { attempt: 2 });
-        assert_eq!(status(&app, &root), State::Waiting(WaitReason::Child));
+        assert_eq!(
+            status(&app, &child).await,
+            State::Reconnecting { attempt: 2 }
+        );
+        assert_eq!(status(&app, &root).await, State::Waiting(WaitReason::Child));
 
         let sleep = json!({"command": ["sleep", "60"]});
         turns.remove(0).end(vec![
@@ -628,20 +692,23 @@ mod tests {
         let allow = approval(&mut prompts).await;
         let mut execs = Vec::new();
         for id in ["exec-0", "exec-1"] {
-            let exec = observe_find(&mut app, |app| job_of_call(&app.snapshot, id)).await;
+            let exec = observe_find(&mut app, |app| job_of_call(&app.journal, id)).await;
             reached(&mut app, exec, JobTransition::AwaitingApproval).await;
             execs.push(exec);
         }
-        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Permission));
+        assert_eq!(
+            status(&app, &child).await,
+            State::Waiting(WaitReason::Permission)
+        );
         // Allowed once, one call runs while the other still awaits approval.
         allow.send(Ok(ApprovalReply::Allow)).unwrap();
         let running = |app: &App| {
             let ran =
-                |exec: &JobId| recorded(&app.snapshot, job_state(*exec, JobTransition::Running));
+                |exec: &JobId| recorded(&app.journal, job_state(*exec, JobTransition::Running));
             execs.iter().any(ran)
         };
         observe_until(&mut app, running).await;
-        assert_eq!(status(&app, &child), State::RunningTools);
+        assert_eq!(status(&app, &child).await, State::RunningTools);
         for exec in execs {
             session.cancel_job(exec).await.unwrap();
         }
@@ -655,7 +722,10 @@ mod tests {
         let work = observe_find(&mut app, |app| job_for(app, "script")).await;
         let wait = observe_find(&mut app, |app| job_for(app, "wait")).await;
         reached(&mut app, wait, JobTransition::Running).await;
-        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Event));
+        assert_eq!(
+            status(&app, &child).await,
+            State::Waiting(WaitReason::Event)
+        );
         session.cancel_job(wait).await.unwrap();
 
         let turn = next_turn(&mut model, &child).await;
@@ -667,14 +737,14 @@ mod tests {
             .turn()
             .await
             .end(vec![call("hold", "wait", json!({}), 0)]);
-        let hold = observe_find(&mut app, |app| job_of_call(&app.snapshot, "hold")).await;
+        let hold = observe_find(&mut app, |app| job_of_call(&app.journal, "hold")).await;
         reached(&mut app, hold, JobTransition::Running).await;
         doing(&mut app, AgentActivity::Working);
         assert_eq!(
-            status(&app, &child),
+            status(&app, &child).await,
             State::Waiting(WaitReason::ParentInput)
         );
-        assert_eq!(status(&app, &root), State::Waiting(WaitReason::Input));
+        assert_eq!(status(&app, &root).await, State::Waiting(WaitReason::Input));
 
         answer_child(&session, owner, "{pick: 'this'}").await;
         let turn = next_turn(&mut model, &child).await;
@@ -682,14 +752,17 @@ mod tests {
         let waiting =
             |app: &App| activity(&app.snapshot, &child) == Some(&AgentActivity::WaitingChildren);
         observe_until(&mut app, waiting).await;
-        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Child));
+        assert_eq!(
+            status(&app, &child).await,
+            State::Waiting(WaitReason::Child)
+        );
 
         session.cancel_job(work).await.unwrap();
         let turn = next_turn(&mut model, &child).await;
         turn.answer("done");
         observe_record(&mut app, job_finished(owner)).await;
         doing(&mut app, AgentActivity::Working);
-        assert_eq!(status(&app, &child), State::Job(JobState::Completed));
+        assert_eq!(status(&app, &child).await, State::Job(JobState::Completed));
     }
 
     /// A wait pauses the agent even with other owned work still running; any
@@ -713,11 +786,11 @@ mod tests {
                 call("background", "exec", background, 0),
                 call("foreground", tool, arguments, 1),
             ]);
-            let job = observe_find(&mut app, |app| job_of_call(&app.snapshot, "foreground")).await;
+            let job = observe_find(&mut app, |app| job_of_call(&app.journal, "foreground")).await;
             reached(&mut app, job, JobTransition::Running).await;
-            assert_eq!(status(&app, &root), running, "{tool}");
+            assert_eq!(status(&app, &root).await, running, "{tool}");
             // Created first, but it starts beside the foreground call.
-            let background = job_of_call(&app.snapshot, "background").unwrap();
+            let background = job_of_call(&app.journal, "background").unwrap();
             reached(&mut app, background, JobTransition::Running).await;
             session.cancel_job(job).await.unwrap();
             observe_record(&mut app, job_finished(job)).await;
@@ -727,14 +800,14 @@ mod tests {
                 since: 0,
             };
             app.snapshot.activity.insert(root.clone(), idle);
-            assert_eq!(status(&app, &root), State::RunningTools, "{tool}");
+            assert_eq!(status(&app, &root).await, State::RunningTools, "{tool}");
             session.cancel_job(background).await.unwrap();
         }
     }
 
     /// A completed child stays briefly in the tree and retires once. Input to its
-    /// finished owner job runs it again, as open work its owner waits on, and its
-    /// next completion starts another grace.
+    /// finished owner job runs it again, as open work its owner waits on, also as a
+    /// fresh projection shows it, and its next completion starts another grace.
     #[tokio::test]
     async fn completion_grace_retires_once_and_running_owner_reopens() {
         let (_root, mut app, mut model, session) = played_fixture().await;
@@ -756,7 +829,7 @@ mod tests {
         let settled = |answers| {
             let root = &root;
             move |app: &App| {
-                count(&app.snapshot, answered) == answers
+                count(&app.journal, answered) == answers
                     && activity(&app.snapshot, root) == Some(&AgentActivity::Idle)
             }
         };
@@ -764,30 +837,29 @@ mod tests {
         child_turn.answer("done");
         model.turn().await.answer("noted");
         observe_until(&mut app, settled(3)).await;
-        assert!(recorded(&app.snapshot, agent_completed));
-        let child = children(&app.snapshot).remove(0);
-        let mut projection = Projection::new(&app.snapshot);
-        let index = projection
-            .agents
-            .iter()
-            .position(|agent| agent.id == child)
-            .unwrap();
-        assert!(projection.agents[index].terminal());
-        assert!(!projection.has_active_children());
-        let visible = |projection: &Projection, selected: &AgentId| {
-            let mut visible = projection.visible(selected);
-            visible.any(|visible| visible == index)
+        assert!(recorded(&app.journal, agent_completed));
+        let child = children(&app.journal).remove(0);
+        let index = |app: &App| {
+            let mut agents = app.projection.agents.iter();
+            agents.position(|agent| agent.id == child).unwrap()
         };
-        assert!(visible(&projection, &root));
-        let initial = projection.agents[index].lifecycle;
-        projection.complete_agent(&child);
-        assert_eq!(projection.agents[index].lifecycle, initial);
-        projection.agents[index].lifecycle = expired_grace();
-        assert!(projection.retire_completed_grace());
-        assert!(!projection.retire_completed_grace());
-        assert!(!visible(&projection, &root));
+        assert!(app.projection.agents[index(&app)].terminal());
+        assert!(!app.projection.has_active_children());
+        let visible = |projection: &Projection, at: usize, selected: &AgentId| {
+            let mut visible = projection.visible(selected);
+            visible.any(|visible| visible == at)
+        };
+        let at = index(&app);
+        assert!(visible(&app.projection, at, &root));
+        let initial = app.projection.agents[at].lifecycle;
+        app.projection.complete_agent(&child);
+        assert_eq!(app.projection.agents[at].lifecycle, initial);
+        app.projection.agents[at].lifecycle = expired_grace();
+        assert!(app.projection.retire_completed_grace());
+        assert!(!app.projection.retire_completed_grace());
+        assert!(!visible(&app.projection, at, &root));
         // A retired agent stays in the tree while a descendant is selected.
-        assert!(visible(&projection, &child.child(2)));
+        assert!(visible(&app.projection, at, &child.child(2)));
         // Ordinary activity cannot reopen a completed agent.
         app.snapshot.activity.insert(
             child.clone(),
@@ -796,27 +868,40 @@ mod tests {
                 since: 0,
             },
         );
-        projection.rebuild(&app.snapshot);
-        assert!(projection.agents[index].terminal());
-        let owner = projection.agents[index].owner.unwrap();
+        app.projection.reconcile(&app.snapshot);
+        assert!(app.projection.agents[index(&app)].terminal());
+        let owner = app.projection.agents[index(&app)].owner.unwrap();
+        let subscribed = app.snapshot.clone();
         answer_child(&session, owner, "'more'").await;
         let running = job_state(owner, JobTransition::Running);
-        observe_until(&mut app, |app| count(&app.snapshot, &running) == 2).await;
+        observe_until(&mut app, |app| count(&app.journal, &running) == 2).await;
+        // Subscribed before it ran again and summarised after: the updates since the
+        // subscription leave it running.
+        let agents = bounded(session.store().agents()).await.unwrap();
+        let owners = bounded(session.jobs().views(vec![owner])).await.unwrap();
+        let mut fresh = Projection::new(agents, owners, &subscribed);
+        fresh.reconcile(&subscribed);
+        let since = app.journal.iter();
+        for record in since.filter(|record| record.sequence > subscribed.applied) {
+            fresh.observe(record, &app.snapshot);
+        }
+        fresh.reconcile(&app.snapshot);
+        assert!(!agent(&fresh, &child).terminal());
         let sent = observe_find(&mut app, |app| job_for(app, "script")).await;
         observe_record(&mut app, job_finished(sent)).await;
-        (app.snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
-        projection.rebuild(&app.snapshot);
-        assert!(!projection.agents[index].terminal());
-        assert!(projection.has_active_children() && open_jobs(&app.snapshot));
-        let waiting = projection.status(&agent(&projection, &root), &app.snapshot);
+        assert!(!app.projection.agents[index(&app)].terminal());
+        // As an app opening the session now shows it.
+        status(&app, &child).await;
+        assert!(app.projection.has_active_children() && open_jobs(&app.snapshot));
+        let waiting = app
+            .projection
+            .status(&agent(&app.projection, &root), &app.snapshot);
         assert_eq!(waiting, AgentDisplayState::Waiting(WaitReason::Child));
 
         next_turn(&mut model, &child).await.answer("done again");
-        observe_until(&mut app, |app| count(&app.snapshot, agent_completed) == 2).await;
-        (app.snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
-        projection.rebuild(&app.snapshot);
-        assert!(projection.agents[index].terminal());
-        assert!(visible(&projection, &root));
+        observe_until(&mut app, |app| count(&app.journal, agent_completed) == 2).await;
+        assert!(app.projection.agents[index(&app)].terminal());
+        assert!(visible(&app.projection, index(&app), &root));
     }
 
     fn expired_grace() -> AgentLifecycle {

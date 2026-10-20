@@ -1,6 +1,7 @@
 //! Bounded response streaming, atomic downloads, and response decoding.
 use std::{collections::BTreeMap, path::PathBuf};
 
+use crate::blocking;
 use crate::fs::{CommitMode, PermissionPolicy};
 use crate::tool::diagnostic::{Operation, Subject};
 
@@ -29,14 +30,18 @@ struct PendingDownload {
 }
 
 impl PendingDownload {
-    fn new(
+    async fn new(
         destination: PathBuf,
         overwrite: bool,
         progress: &mut FetchProgress,
     ) -> Result<Self, LocalError> {
         progress.download_io(Operation::CreateCapture, &destination);
-        let staged = crate::fs::StagedFile::create(&destination, PermissionPolicy::Inherit)
-            .map_err(|error| LocalError::io(error.into()))?;
+        let staging = destination.clone();
+        let staged = blocking(move || {
+            crate::fs::StagedFile::create(&staging, PermissionPolicy::Inherit)
+                .map_err(|error| LocalError::io(error.into()))
+        })
+        .await?;
         let writer = tokio::fs::File::from_std(staged.as_file().try_clone()?);
         Ok(Self {
             writer,
@@ -51,8 +56,8 @@ impl PendingDownload {
     }
 
     /// Consuming commit: flush and sync before closing the writer and publishing.
-    /// Cancellation before publication preserves the destination. The commit is
-    /// synchronous: cancellation cannot undo a rename that has already completed.
+    /// Cancellation before publication preserves the destination. Once the commit
+    /// starts it runs to the end, so cancellation cannot undo a rename.
     async fn finish(
         mut self,
         context: &LocalContext,
@@ -69,7 +74,7 @@ impl PendingDownload {
         if context.is_cancelled() {
             return Err(LocalError::cancelled());
         }
-        // No await follows this split. Close the writer before publication.
+        // Close the writer before publication.
         let Self {
             writer,
             staged,
@@ -77,7 +82,12 @@ impl PendingDownload {
             commit,
         } = self;
         drop(writer);
-        staged.commit(commit).map_err(|error| {
+        // A cancellation or the timeout from here on may leave the rename to finish, so
+        // what it did to the destination is unknown.
+        let renaming = crate::fs::AtomicWriteStage::Commit;
+        progress.operation(atomic_write_context(&destination, renaming));
+        let committed = blocking(move || Ok::<_, LocalError>(staged.commit(commit))).await?;
+        committed.map_err(|error| {
             progress.operation(atomic_write_context(&destination, error.stage));
             LocalError::io(error.source)
         })?;
@@ -86,7 +96,7 @@ impl PendingDownload {
 }
 
 impl BodySink {
-    fn new(output: OutputPlan, progress: &mut FetchProgress) -> Result<Self, LocalError> {
+    async fn new(output: OutputPlan, progress: &mut FetchProgress) -> Result<Self, LocalError> {
         match output {
             OutputPlan::Inline(mode) => Ok(Self::Memory {
                 bytes: Vec::new(),
@@ -95,7 +105,8 @@ impl BodySink {
             OutputPlan::Download {
                 destination,
                 overwrite,
-            } => PendingDownload::new(destination.into(), overwrite, progress).map(Self::Download),
+            } => (PendingDownload::new(destination.into(), overwrite, progress).await)
+                .map(Self::Download),
         }
     }
 
@@ -176,7 +187,7 @@ pub(super) async fn read_body(
     {
         return Err(exceeds_max_bytes());
     }
-    let mut sink = BodySink::new(output, progress)?;
+    let mut sink = BodySink::new(output, progress).await?;
     let mut stream = response.bytes_stream();
     let mut received = 0;
     loop {
@@ -305,12 +316,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn download_staging_failure_identifies_destination_and_unchanged_effects() {
+    #[tokio::test]
+    async fn download_staging_failure_identifies_destination_and_unchanged_effects() {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("missing").join("download");
         let mut progress = FetchProgress::new();
         let error = PendingDownload::new(destination.clone(), false, &mut progress)
+            .await
             .err()
             .unwrap();
         let diagnostic = progress.failure(error).diagnostic();

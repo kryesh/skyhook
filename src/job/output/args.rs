@@ -13,7 +13,7 @@ pub(crate) const MAX_CONTEXT: usize = 20;
 /// Bounds what compiling an untrusted pattern may allocate.
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutputArgs {
     pub job: JobId,
     pub field: Option<FieldPointer>,

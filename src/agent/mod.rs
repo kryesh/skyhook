@@ -13,8 +13,8 @@ pub use interaction::{
     QuestionReply, RuntimeEvent,
 };
 pub use observation::{
-    AgentActivity, ContextGauge, ContextUsage, Observation, ObservationSnapshot, ObservedActivity,
-    ObservedEvent, ObservedResponse, Settlement, StoppedReading,
+    AgentActivity, Applied, ContextGauge, ContextUsage, Observation, ObservationSnapshot,
+    ObservedActivity, ObservedEvent, ObservedResponse, Settlement, StoppedReading, Views,
 };
 pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
@@ -25,7 +25,5 @@ pub(crate) use todo::ReplaceError;
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;
-pub(crate) use observation::{Responses, Views, live};
-#[cfg(test)]
-pub(crate) use runtime::stopped_turn;
-pub(crate) use runtime::{Agents, ModelEntry, activities};
+pub(crate) use observation::live;
+pub(crate) use runtime::{Agents, ModelEntry, activities, activity, observed_agents};

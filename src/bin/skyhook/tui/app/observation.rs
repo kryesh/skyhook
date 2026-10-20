@@ -1,29 +1,90 @@
 use super::*;
+use skyhook::agent::{HarnessError, Observation};
 use tokio::sync::broadcast;
 
 /// The attached handle remains authoritative even after its update stream closes.
 pub(super) struct ActiveObservation {
     pub(super) session: SessionHandle,
-    receiver: Option<broadcast::Receiver<ObservedEvent>>,
+    link: Link,
 }
 
-/// A snapshot and the receiver obtained from the same subscription boundary.
-/// Neither half can be installed separately by the event loop.
+/// How the app receives the session's updates.
+enum Link {
+    Live(broadcast::Receiver<ObservedEvent>),
+    /// Updates were lost: they wait for the observation being read again, after a
+    /// read that `failed` if one did.
+    Reading {
+        failed: bool,
+    },
+    /// Reading it failed: the next tick reads again.
+    Failed,
+    /// The session sends no more.
+    Closed,
+}
+
+/// A snapshot and the receiver obtained from the same subscription boundary, with
+/// what the app shows of the session read after it. Neither half can be installed
+/// separately by the event loop.
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
     pub(super) snapshot: Box<ObservationSnapshot>,
+    pub(super) projection: Box<Projection>,
+    /// The viewed agent's tab, its first page loaded around the view's top.
+    pub(super) window: Option<Box<model::Window>>,
+    /// Whether the root journaled a failed turn after the record the app last read.
+    pub(super) root_failed: bool,
 }
 impl PreparedObservation {
-    pub fn subscribe(session: SessionHandle) -> Self {
-        let observation = session.observe();
-        Self {
+    /// Observe `session` and read what the app shows of it first, off the event
+    /// loop: every agent's summary, and its root's conversation.
+    pub async fn load(session: SessionHandle) -> Result<Self, HarnessError> {
+        let root = session.root_agent().clone();
+        let view = (root, Tab::Conversation, None);
+        Self::view(session, Some(view), None).await
+    }
+
+    /// [`load`](Self::load), viewing `agent`'s `tab` around `focus` if a view is shown,
+    /// and whether the root failed a turn after `read`.
+    async fn view(
+        session: SessionHandle,
+        view: Option<(AgentId, Tab, Option<model::Focus>)>,
+        read: Option<skyhook::session::RecordSeq>,
+    ) -> Result<Self, HarnessError> {
+        let Observation { snapshot, updates } = session.store().observe();
+        let agents = session.store().agents().await?;
+        let owners = agents.agents.iter().filter_map(|agent| agent.owner_job);
+        let owners = session.jobs().views(owners.collect()).await?;
+        let projection = Projection::new(agents, owners, &snapshot);
+        let mut window = None;
+        if let Some((agent, tab, focus)) = view {
+            let mut shown = model::Window::new(agent, tab, super::pages::window_id(), focus);
+            for (direction, want) in shown.plan(&[], focus) {
+                let loaded = super::pages::load(&session, &shown.agent, want).await?;
+                shown.loaded(direction, loaded);
+            }
+            window = Some(Box::new(shown));
+        }
+        let root_failed = match read {
+            Some(read) => {
+                session
+                    .store()
+                    .failed_after(session.root_agent(), read)
+                    .await?
+            }
+            None => false,
+        };
+        Ok(Self {
             active: ActiveObservation {
                 session,
-                receiver: Some(observation.updates),
+                link: Link::Live(updates),
             },
-            snapshot: Box::new(observation.snapshot),
-        }
+            snapshot: Box::new(snapshot),
+            projection: Box::new(projection),
+            window,
+            root_failed,
+        })
     }
+
     pub fn session(&self) -> &SessionHandle {
         &self.active.session
     }
@@ -47,8 +108,15 @@ impl App {
 
     fn receiver_mut(&mut self) -> Option<&mut broadcast::Receiver<ObservedEvent>> {
         match &mut self.phase {
-            Phase::Open { observation, .. } => observation.receiver.as_mut(),
-            Phase::Draft { .. } => None,
+            Phase::Open {
+                observation:
+                    ActiveObservation {
+                        link: Link::Live(receiver),
+                        ..
+                    },
+                ..
+            } => Some(receiver),
+            _ => None,
         }
     }
 
@@ -70,19 +138,91 @@ impl App {
 
     pub fn close_observation(&mut self) {
         if let Phase::Open { observation, .. } = &mut self.phase {
-            observation.receiver = None;
+            observation.link = Link::Closed;
         }
     }
 
+    /// Observe the session again, once its last read failed.
+    pub(super) fn retry_observation(&mut self) {
+        if let Phase::Open { observation, .. } = &self.phase
+            && matches!(observation.link, Link::Failed)
+        {
+            self.resubscribe();
+        }
+    }
+
+    /// Observe the session again once updates were lost, off the event loop: the
+    /// updates after the loss are not read until the new observation lands, which
+    /// reads the viewed pages again.
     pub fn resubscribe(&mut self) {
         let Phase::Open { observation, .. } = &mut self.phase else {
             return;
         };
-        let prepared = PreparedObservation::subscribe(observation.session.clone());
-        *observation = prepared.active;
-        self.snapshot = *prepared.snapshot;
+        let failed = matches!(observation.link, Link::Failed);
+        observation.link = Link::Reading { failed };
+        let (session, tx) = (observation.session.clone(), self.tx.clone());
+        // A session out of view reads no view again; one in view reads it around its top.
+        let view = (self.window.as_ref())
+            .map(|window| (window.agent.clone(), window.tab, self.focus_of_view()));
+        let read = self.snapshot.applied;
+        tokio::spawn(async move {
+            let result = PreparedObservation::view(session, view, Some(read)).await;
+            let _ = tx.send(Work::Observed(result.map(Box::new)));
+        });
+    }
+
+    /// Install the observation a resubscription read, if this session still shows it.
+    pub(super) fn observed_again(
+        &mut self,
+        result: Result<Box<PreparedObservation>, HarnessError>,
+    ) {
+        let Phase::Open { observation, .. } = &mut self.phase else {
+            return;
+        };
+        let prepared = match result {
+            Ok(prepared) if prepared.session().id() == observation.session.id() => prepared,
+            Ok(_) => return,
+            Err(error) => {
+                let Link::Reading { failed } = observation.link else {
+                    return;
+                };
+                observation.link = Link::Failed;
+                // A failure repeated as it is read again is reported once.
+                if !failed {
+                    self.local_notice(error.to_string());
+                }
+                return;
+            }
+        };
+        let PreparedObservation {
+            active,
+            snapshot,
+            projection,
+            window,
+            root_failed,
+        } = *prepared;
+        *observation = active;
+        self.snapshot = *snapshot;
+        self.projection = *projection;
+        // A view read for what is still shown replaces it. One shown since, or kept
+        // through the loss, missed updates: it is read again.
+        let same = |read: &model::Window, shown: &model::Window| {
+            (&read.agent, read.tab) == (&shown.agent, shown.tab)
+        };
+        self.window = match (window, self.window.take()) {
+            (Some(read), Some(shown)) if same(&read, &shown) => Some(*read),
+            (_, Some(shown)) => {
+                let focus = self.focus_of_view();
+                let id = super::pages::window_id();
+                Some(model::Window::new(shown.agent, shown.tab, id, focus))
+            }
+            (_, None) => None,
+        };
+        self.root_failed |= root_failed;
+        // Notices of output written while lagging are lost with the updates.
+        self.outputs.changed_all();
         self.hold_after_root_failure();
-        self.reset_projection();
+        self.refresh();
         self.load_title();
     }
 }
@@ -97,14 +237,28 @@ mod tests {
         let Phase::Open { observation, .. } = &mut app.phase else {
             panic!("fixture has a session");
         };
-        observation.receiver = Some(receiver);
+        observation.link = Link::Live(receiver);
     }
 
-    fn has_status(app: &App, text: &str) -> bool {
-        let mut records = app.snapshot.records.values();
-        records.any(
-            |record| matches!(&record.event, SessionEvent::Status { message } if message == text),
-        )
+    /// Resubscribe as a lagged receiver does, and install what the work it sends reads.
+    async fn resubscribe(app: &mut App) {
+        let mut work = capture_work(app);
+        app.resubscribe();
+        assert!(
+            app.try_recv_observation().is_err(),
+            "nothing is read meanwhile"
+        );
+        let observed = crate::tests::bounded(work.recv()).await.unwrap();
+        assert!(matches!(observed, Work::Observed(Ok(_))));
+        app.work(observed);
+    }
+
+    /// Whether the app's conversation shows the status `text`.
+    fn has_status(app: &mut App, text: &str) -> bool {
+        app.content_dirty = true;
+        app.rebuild_content();
+        let status = format!("Status · {text}");
+        app.entries().iter().any(|entry| entry.text() == status)
     }
 
     #[tokio::test]
@@ -124,9 +278,9 @@ mod tests {
         // The interruption ends the live reply before stopping settles it.
         session.interrupt().await;
         observe_until(&mut app, |app| stopped(&app.snapshot, &app.selected)).await;
-        let request = latest_request(&app.snapshot).unwrap();
+        let request = latest_request(&app.journal).unwrap();
         assert!(
-            app.snapshot.responses[&(agent, request)]
+            app.snapshot.views.responses[&(agent, request)]
                 .settlement()
                 .is_some()
         );
@@ -150,8 +304,8 @@ mod tests {
             .record_status(root.clone(), "while closed".into())
             .await
             .unwrap();
-        app.resubscribe();
-        assert!(has_status(&app, "while closed"));
+        resubscribe(&mut app).await;
+        assert!(has_status(&mut app, "while closed"));
         session
             .record_status(root, "after subscription".into())
             .await
@@ -169,8 +323,8 @@ mod tests {
             lagged,
             Err(broadcast::error::RecvError::Lagged(_))
         ));
-        app.resubscribe();
-        assert!(has_status(&app, "after subscription"));
+        resubscribe(&mut app).await;
+        assert!(has_status(&mut app, "after subscription"));
         let empty = app.try_recv_observation();
         assert!(matches!(empty, Err(broadcast::error::TryRecvError::Empty)));
         session.shutdown().await.unwrap();

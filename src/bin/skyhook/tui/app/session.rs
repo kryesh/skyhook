@@ -66,6 +66,16 @@ pub struct Peer {
     pub working: bool,
 }
 
+/// What a session's peer summary is drawn from: it is summarized again only
+/// once this changes.
+#[derive(PartialEq)]
+pub(super) struct PeerKey {
+    session: Option<SessionId>,
+    revision: u64,
+    prompts: Vec<u64>,
+    working: bool,
+}
+
 impl App {
     pub fn session_id(&self) -> Option<SessionId> {
         self.session().map(SessionHandle::id)
@@ -140,7 +150,11 @@ impl App {
         self.title_ticket = ticket.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let title = session.title().await.map_err(|error| error.to_string());
+            let title = session
+                .store()
+                .title()
+                .await
+                .map_err(|error| error.to_string());
             let _ = tx.send(Work::Title { ticket, title });
         });
     }
@@ -165,11 +179,8 @@ impl App {
         self.push_local(self.selected.clone(), message.into());
     }
     pub(super) fn push_local(&mut self, agent: AgentId, message: String) {
-        let after = self
-            .snapshot
-            .records
-            .last_key_value()
-            .map(|(after, _)| *after);
+        let entries = self.snapshot.views.entries.get(&agent).copied();
+        let after = entries.and_then(|entries| entries.checked_sub(1));
         (self.unsaved_status).push(model::UnsavedStatus {
             agent,
             after,
@@ -205,15 +216,31 @@ impl App {
         }
         app
     }
-    pub fn peer(&self, key: SlotKey, current: bool) -> Peer {
+    /// This session as the others see it from `key`.
+    pub fn peer(&mut self, key: SlotKey, current: bool) -> Peer {
+        let drawn = PeerKey {
+            session: self.session_id(),
+            revision: self.snapshot.revision,
+            prompts: self.prompts.iter().map(|prompt| prompt.id).collect(),
+            working: self.active_work(),
+        };
+        if let Some((cached, peer)) = &self.peer
+            && *cached == drawn
+        {
+            return Peer {
+                key,
+                current,
+                ..peer.clone()
+            };
+        }
         let root = self.root_agent();
         let agent = self.projection.agents.iter().find(|a| &a.id == root);
-        let activity = EventRecord::last_activity(self.snapshot.records.values());
+        let activity = self.snapshot.last_activity;
         let activation = match self.snapshot.phase {
             skyhook::session::SessionPhase::Viewing => Activation::Viewed,
             _ => Activation::Activated,
         };
-        Peer {
+        let peer = Peer {
             key,
             session: match (self.session_id(), activity) {
                 (Some(id), Some(last)) => PeerSession::Open {
@@ -234,7 +261,9 @@ impl App {
                     Some(AgentActivity::Stopped(failure)) if *failure != TurnFailure::Interrupted
                 ),
             working: self.active_work(),
-        }
+        };
+        self.peer = Some((drawn, peer.clone()));
+        peer
     }
 }
 

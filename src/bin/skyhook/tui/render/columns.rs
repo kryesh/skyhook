@@ -509,7 +509,7 @@ mod tests {
         // On an 80-column terminal a live counter leaves statistics no room beside
         // the purpose and status, so they give way instead.
         let entry = model::Entry::request_entry(running.clone());
-        let width = EntryGeometry::new(&entry, 80, 0).body_width;
+        let width = EntryGeometry::new(&entry, 80).body_width;
         assert!(columns.header(width).is_none());
         let header_width = width - COUNTER_WIDTH - 1;
         for (row, status) in [(&running, "Running"), (&completed, "Completed")] {

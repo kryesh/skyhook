@@ -1,9 +1,9 @@
 use super::*;
 use crate::launch::{AttachmentError, LaunchError};
-use skyhook::job::{Invocation, PresentedOutput};
+use skyhook::job::PresentedOutput;
 
 // Query presence, capture selection and preview metadata belong to core.
-async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> LoadedOutput {
+pub(super) async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> LoadedOutput {
     session
         .inspect_output_with_captures(query)
         .await
@@ -33,8 +33,6 @@ pub enum Work {
     },
     Output {
         attempt: OutputAttempt,
-        /// The run the job had finished when the load began, whose output is final.
-        finished: Option<Invocation>,
         result: Box<LoadedOutput>,
     },
     MenuLoaded(menus::MenuLoaded),
@@ -46,6 +44,14 @@ pub enum Work {
     },
     Started {
         result: Result<PreparedObservation, LaunchError>,
+    },
+    /// The session observed again after its updates were lost.
+    Observed(Result<Box<PreparedObservation>, skyhook::agent::HarnessError>),
+    /// A page of the viewed history, read for the window `window` on `direction`.
+    Page {
+        window: u64,
+        direction: model::Direction,
+        result: Result<Box<model::Loaded>, skyhook::agent::HarnessError>,
     },
     /// Interface feedback from a task the app spawned.
     Toast(String),
@@ -82,6 +88,8 @@ pub(super) enum Gesture {
     /// Moved while held: the selection follows each motion of the pointer,
     /// and is copied when released.
     Dragging,
+    /// Held on the scrollbar: the view follows the pointer down the track.
+    Thumb,
 }
 
 #[derive(Clone)]
@@ -98,6 +106,8 @@ pub enum Hit {
     Queue,
     PromptChoice(usize),
     Latest,
+    /// The transcript's scrollbar track.
+    Scrollbar,
 }
 impl App {
     pub fn work(&mut self, work: Work) {
@@ -106,6 +116,12 @@ impl App {
                 result: Ok(prepared),
             } => self.session_started(prepared),
             Work::Started { result: Err(error) } => self.start_failed(error),
+            Work::Observed(result) => self.observed_again(result),
+            Work::Page {
+                window,
+                direction,
+                result,
+            } => self.page_loaded(window, direction, result),
             Work::QueueCommitted {
                 id,
                 generation,
@@ -140,17 +156,11 @@ impl App {
                     self.report(&error);
                 }
             }
-            Work::Output {
-                attempt,
-                finished,
-                result,
-            } => {
-                let job = attempt.job();
-                if !self.outputs.complete(attempt, finished, *result) {
-                    return;
+            Work::Output { attempt, result } => {
+                if let Some(job) = self.outputs.complete(attempt, *result) {
+                    self.content_cache.invalidate_job(job);
+                    self.content_dirty = true;
                 }
-                self.content_cache.invalidate_job(job);
-                self.content_dirty = true;
             }
             Work::MenuLoaded(loaded) => {
                 if !self.menu_loaded(loaded) {
@@ -235,30 +245,11 @@ impl App {
             self.dirty = true;
         }
         self.take_prompts(|prompt| prompt.is_closed());
+        self.retry_observation();
         self.deliver_queue();
-        if self.last_output.elapsed() >= OUTPUT_POLL {
-            self.last_output = Instant::now();
-            let view = self.views.get_mut(&self.selected, self.tab);
-            let jobs: Vec<_> = (self.snapshot.jobs.values())
-                .filter(|j| {
-                    j.agent == self.selected
-                        && view.is_expanded(&model::EntryKey::Job(j.id), self.details)
-                        && (!j.state.is_terminal() || !self.outputs.is_final(j.id, j.invocation))
-                })
-                .map(|j| j.id)
-                .collect();
-            for id in jobs {
-                self.fetch_output(id);
-            }
-        }
         self.dirty |= self.animating;
         // Retire completed child rows once, rather than redrawing forever while idle.
         self.dirty |= self.projection.retire_completed_grace();
-    }
-    pub(super) fn set_output_query(&mut self, query: JobOutputQuery) {
-        let job = query.job;
-        self.outputs.set_query(query);
-        self.fetch_output(job);
     }
     pub(super) fn fetch_output(&mut self, job: JobId) {
         let Some(session) = self.session().cloned() else {
@@ -267,15 +258,11 @@ impl App {
         let Some((attempt, query)) = self.outputs.begin(job) else {
             return;
         };
-        let finished = (self.snapshot.jobs.get(&job))
-            .filter(|job| job.state.is_terminal())
-            .map(|job| job.invocation);
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = load_output(&session, query).await;
             let _ = tx.send(Work::Output {
                 attempt,
-                finished,
                 result: Box::new(result),
             });
         });
@@ -291,7 +278,7 @@ impl App {
         if let Event::Mouse(mouse) = &event
             && mouse.kind == MouseEventKind::Moved
         {
-            if let Some(Overlay::Menu(menu)) = &mut self.overlay {
+            if let Some(menu) = &mut self.menu {
                 let point = (mouse.column, mouse.row);
                 self.hover = Some(point);
                 // Palettes own hover while open. Only real pointer movement
@@ -336,16 +323,12 @@ impl App {
             Event::Paste(text) => {
                 let text = model::clean(&text);
                 match self.input_target() {
-                    InputTarget::Menu | InputTarget::Search => match &mut self.overlay {
-                        Some(Overlay::Menu(menu)) => {
+                    InputTarget::Menu => {
+                        if let Some(menu) = &mut self.menu {
                             menu.input.insert(&text);
                             menu.select(0);
                         }
-                        Some(Overlay::Search(editor)) => {
-                            editor.insert(&text);
-                        }
-                        None => {}
-                    },
+                    }
                     InputTarget::Prompt
                         if self
                             .prompts
@@ -376,7 +359,7 @@ impl App {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = mouse.kind == MouseEventKind::ScrollUp;
                         let step = if up { -SCROLL_STEP } else { SCROLL_STEP };
-                        if self.menu().is_some() {
+                        if self.menu.is_some() {
                             let key = if up { KeyCode::Up } else { KeyCode::Down };
                             self.menu_key(KeyEvent::new(key, M::NONE));
                         } else if matches!(self.input_target(), InputTarget::Prompt)
@@ -400,7 +383,7 @@ impl App {
                         self.selection = None;
                         // An open palette owns the pointer, as it owns hover: the
                         // transcript beneath it is not selectable.
-                        let mut select_text = self.menu().is_none();
+                        let mut select_text = self.menu.is_none();
                         if let Some((_, hit)) = self
                             .hits
                             .iter()
@@ -412,7 +395,7 @@ impl App {
                                 Hit::Agent(agent) => self.select(agent),
                                 Hit::Entry(index, toggle) => {
                                     self.focus = Focus::Content;
-                                    self.view().row = index;
+                                    self.select_entry(index);
                                     if toggle {
                                         let key = self.entries().get(index);
                                         let toggle = key.map(|entry| entry.key().clone());
@@ -420,12 +403,16 @@ impl App {
                                     }
                                 }
                                 Hit::Menu(index) => {
-                                    if let Some(menu) = self.menu_mut() {
+                                    if let Some(menu) = self.menu.as_mut() {
                                         menu.point(index);
                                     }
                                     // Only the row clicked is chosen: a text page picks
                                     // nothing, and a stale hit misses.
-                                    if self.menu().is_some_and(|menu| menu.selected() == index) {
+                                    if self
+                                        .menu
+                                        .as_ref()
+                                        .is_some_and(|menu| menu.selected() == index)
+                                    {
                                         self.choose();
                                     }
                                 }
@@ -452,16 +439,21 @@ impl App {
                                     self.reveal_prompt();
                                 }
                                 Hit::Latest => {
-                                    self.view().scroll = None;
+                                    self.scroll_to(None);
                                     // The text-only overlay sits over selectable history.
                                     // Do not pin the viewport again by selecting beneath it.
+                                    select_text = false;
+                                }
+                                Hit::Scrollbar => {
+                                    self.gesture = Gesture::Thumb;
+                                    self.scroll_to_track(point.1);
                                     select_text = false;
                                 }
                             }
                         }
                         if select_text && let Some(position) = self.text_position(point) {
                             // Hold the viewport still while selecting a streaming reply.
-                            self.view().scroll = Some(self.scroll_offset());
+                            self.scroll_to(Some(self.scroll_offset()));
                             self.focus = Focus::Content;
                             self.selection =
                                 crate::tui::render::Selection::new(&self.render.rows, position);
@@ -487,12 +479,19 @@ impl App {
                                         .get(*index)
                                         .is_some_and(|entry| entry.key() == &key)
                                 {
-                                    self.view().row = *index;
+                                    self.select_entry(*index);
                                     self.toggle();
                                 }
                             }
-                            Gesture::Pressed { toggle: None } | Gesture::Released => {}
+                            Gesture::Pressed { toggle: None }
+                            | Gesture::Released
+                            | Gesture::Thumb => {}
                         }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                        if matches!(self.gesture, Gesture::Thumb) =>
+                    {
+                        self.scroll_to_track(point.1);
                     }
                     MouseEventKind::Drag(MouseButton::Left)
                         if self.content_rect.contains(point.into())
@@ -513,6 +512,18 @@ impl App {
             }
             _ => {}
         }
+    }
+    /// Scroll to where row `y` sits down the scrollbar track: the whole history's span
+    /// spread over the track.
+    fn scroll_to_track(&mut self, y: u16) {
+        let track = self.content_rect;
+        let height = track.height as usize;
+        let max = crate::tui::render::Track::of(self)
+            .len()
+            .saturating_sub(height);
+        let along = usize::from(y.saturating_sub(track.y)).min(height.saturating_sub(1));
+        let top = (along * max).div_ceil(height.saturating_sub(1).max(1));
+        self.scroll_to_span((top < max).then_some(top));
     }
     pub(super) fn text_position(
         &self,
@@ -538,7 +549,7 @@ mod tests {
     use super::super::played::*;
     use super::super::tests::*;
     use super::*;
-    use skyhook::job::{Continuation, OutputPreview};
+    use skyhook::job::Continuation;
 
     /// A viewed session's notices are shown for the agent they concern, a saved
     /// child included, and never journaled.
@@ -551,8 +562,8 @@ mod tests {
         session.close().await.unwrap();
 
         let viewed = app.launch.create(Some(session.id())).await.unwrap();
-        let before = viewed.observe().snapshot.records;
-        let prepared = PreparedObservation::subscribe(viewed.clone());
+        let before = journal(&viewed).await;
+        let prepared = prepared(viewed.clone()).await;
         let (tx, mut work) = mpsc::unbounded_channel();
         app = app.sibling(Some(prepared), app.launch.clone(), tx);
         app.select(child.clone());
@@ -563,7 +574,7 @@ mod tests {
             }
         })
         .await;
-        let after = viewed.observe().snapshot.records;
+        let after = journal(&viewed).await;
         bounded(viewed.shutdown()).await.unwrap();
         viewed.close().await.unwrap();
         assert_eq!(unsaved(&app, &child), ["about the child"]);
@@ -571,112 +582,6 @@ mod tests {
             before, after,
             "a viewed session's notices are never journaled"
         );
-    }
-
-    fn capture_text(output: &skyhook::job::JobView, field: &str) -> String {
-        let captures = output
-            .presentation
-            .as_ref()
-            .map_or(&[][..], |p| p.captures());
-        let capture = captures
-            .iter()
-            .find(|capture| capture.field.as_str() == field);
-        let page = capture.and_then(|capture| {
-            capture
-                .output
-                .as_ref()?
-                .presentation
-                .as_ref()?
-                .preview
-                .as_ref()
-        });
-        page.map_or_else(String::new, |page| match page {
-            OutputPreview::Lines(page) => page.lines().join("\n"),
-            page => panic!("capture pages are text: {page:?}"),
-        })
-    }
-
-    fn job_text(app: &App, job: JobId) -> String {
-        let mut entries = app.entries().iter();
-        entries
-            .find(|entry| entry.job_id() == Some(job))
-            .unwrap()
-            .text()
-            .into()
-    }
-
-    #[tokio::test]
-    async fn automatic_output_follows_live_captures_then_structured_completion() {
-        let (_root, mut app) = draft_fixture().await;
-        let mut config = app.launch.model.config().config().clone();
-        config.approve_all = true;
-        app.launch.model = config.into_runtime().unwrap().default_model();
-        let session = app.launch.create(None).await.unwrap();
-        attach(&mut app, session.clone());
-        let launched = session.run_script(format!("return await tool.exec({});", json!({
-            "command": "printf 'live stdout\\n'; printf 'live stderr\\n' >&2; while [ ! -e release ]; do sleep 0.01; done; exit 1",
-            "timeout": 10,
-            "bg": true,
-        }))).await.unwrap();
-        let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
-        let live = |output: &skyhook::job::JobView| {
-            capture_text(output, "/result/stdout").contains("live stdout")
-                && capture_text(output, "/result/stderr").contains("live stderr")
-        };
-        bounded(async {
-            while !live(
-                &load_output(&session, JobOutputQuery::new(job))
-                    .await
-                    .unwrap(),
-            ) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        app.snapshot = session.observe().snapshot;
-        app.refresh();
-        assert!(live(&fetch_output(&mut app, job).await));
-        let run = app.snapshot.jobs[&job].invocation;
-        assert!(app.outputs.query(job).is_none() && !app.outputs.is_final(job, run));
-        app.command(Command::Details);
-        draw(&mut app);
-        let text = job_text(&app, job);
-        assert!(
-            text.contains("live stdout") && text.contains("live stderr"),
-            "{text}"
-        );
-
-        std::fs::write(app.launch.workspace.join("release"), "").unwrap();
-        bounded(async {
-            while !app.snapshot.jobs[&job].state.is_terminal() {
-                let event = app.recv_observation().await.unwrap();
-                app.observe(event);
-            }
-        })
-        .await;
-        app.refresh();
-        let complete = fetch_output(&mut app, job).await;
-        assert!(app.outputs.query(job).is_none() && app.outputs.is_final(job, run));
-        let complete = complete.result.unwrap();
-        let result = json!({"exit_code": 1, "stdout": "live stdout\n", "stderr": "live stderr\n"});
-        for field in ["exit_code", "stdout", "stderr"] {
-            assert_eq!(complete[field], result[field]);
-        }
-
-        let stderr: skyhook::job::FieldPointer = "/result/stderr".parse().unwrap();
-        let mut query = JobOutputQuery::new(job);
-        query.field = Some(stderr.clone());
-        app.outputs.set_query(query);
-        let selected = fetch_output(&mut app, job).await;
-        let presentation = selected.presentation.unwrap();
-        assert_eq!(
-            presentation.preview.as_ref().unwrap().field(),
-            Some(&stderr)
-        );
-        let captures = presentation.captures();
-        assert!(captures.iter().all(|capture| capture.output.is_none()));
-        assert_eq!(app.outputs.query(job).unwrap().field, Some(stderr));
-        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -857,7 +762,7 @@ mod tests {
             AssistantItem::text("text", 1, &full),
         ]);
         bounded(asked).await.unwrap().unwrap();
-        observe_until(&mut app, |app| count(&app.snapshot, answered) > 0).await;
+        observe_until(&mut app, |app| count(&app.journal, answered) > 0).await;
         let settled = draw_buffer(&mut app);
         assert_eq!(selection(&app).as_deref(), Some(selected));
         let color = crate::tui::theme::THEME.selected;
@@ -961,7 +866,7 @@ mod tests {
         draw(&mut app);
         let left = MouseButton::Left;
         for scroll in [None, Some(5)] {
-            app.view().scroll = scroll;
+            app.scroll_to(scroll);
             draw(&mut app);
             let offset = app.scroll_offset();
             let content = app.content_rect;
@@ -988,9 +893,9 @@ mod tests {
             }
             assert!(app.clipboard.take().is_some());
         }
-        app.view().row = 0;
+        app.select_entry(0);
         key(&mut app, KeyCode::Down, M::NONE);
-        let row = app.view().row;
+        let row = app.selected_entry().unwrap();
         assert!(row > 0);
         assert_eq!(Some(app.scroll_offset()), app.render.rows.entry_start(row));
     }
@@ -1010,8 +915,8 @@ mod tests {
         draw(&mut app);
         let key = tool_cards(&app)[0].key().clone();
         observe_record(&mut app, committed(results)).await;
-        let error = tool_error(&app.snapshot).to_owned();
-        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        let error = tool_error(&app.journal).to_owned();
+        let records = serde_json::to_vec(&app.journal).unwrap();
         let buffer = draw_buffer(&mut app);
         let cards = tool_cards(&app);
         assert_eq!(
@@ -1041,7 +946,7 @@ mod tests {
         }
         assert!(cards[0].document().is_some());
         toggle(&mut app);
-        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        assert_eq!(serde_json::to_vec(&app.journal).unwrap(), records);
     }
 
     #[tokio::test]
@@ -1068,7 +973,7 @@ mod tests {
         draw(&mut app);
         select_job(&mut app, job);
         app.output_menu();
-        let menu = app.menu_mut().unwrap();
+        let menu = app.menu.as_mut().unwrap();
         let MenuKind::Output(_, items) = &menu.kind else {
             panic!("output menu")
         };

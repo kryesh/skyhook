@@ -36,6 +36,59 @@ pub(super) enum JobStep {
     Finish(JobEnd),
 }
 
+/// The job `event`, journaled by `agent`, changes once created, which a commit holds
+/// first: its own job events, a child's start in it, and a launched child's turn or
+/// job, which count toward the progress of the job `launched` names for its author.
+pub(super) fn addressed(
+    agent: &AgentId,
+    event: &SessionEvent,
+    launched: impl FnOnce(&AgentId) -> Option<JobId>,
+) -> Option<JobId> {
+    use crate::session::Message;
+    match event {
+        SessionEvent::JobStateChanged { job, .. }
+        | SessionEvent::JobFinished { job, .. }
+        | SessionEvent::JobClaimed { job }
+        | SessionEvent::JobCancelRequested { job }
+        | SessionEvent::JobInjected { job }
+        | SessionEvent::JobReleased { job }
+        | SessionEvent::JobMessageReleased { job }
+        | SessionEvent::JobMessageDelivered { job, .. }
+        | SessionEvent::AgentStarted {
+            owner_job: Some(job),
+            ..
+        } => Some(*job),
+        SessionEvent::MessageCommitted {
+            message: Message::Assistant(_),
+        }
+        | SessionEvent::JobCreated { .. } => launched(agent),
+        SessionEvent::SessionStarted { .. }
+        | SessionEvent::TitleSet { .. }
+        | SessionEvent::TitleCleared
+        | SessionEvent::TargetsUpserted { .. }
+        | SessionEvent::AgentStarted {
+            owner_job: None, ..
+        }
+        | SessionEvent::TodosReplaced { .. }
+        | SessionEvent::ModelChanged { .. }
+        | SessionEvent::ModeChanged { .. }
+        | SessionEvent::MessageCommitted { .. }
+        | SessionEvent::Status { .. }
+        | SessionEvent::ModelContext { .. }
+        | SessionEvent::ModelRequested { .. }
+        | SessionEvent::Compaction { .. }
+        | SessionEvent::ModelAttemptStarted(_)
+        | SessionEvent::ModelFailed { .. }
+        | SessionEvent::ModelAttemptInterrupted(_)
+        | SessionEvent::ResponseCompleted { .. }
+        | SessionEvent::CompactionFailed { .. }
+        | SessionEvent::Usage { .. }
+        | SessionEvent::AgentCompleted
+        | SessionEvent::AgentInterrupted
+        | SessionEvent::AgentFailed { .. } => None,
+    }
+}
+
 impl JobChange {
     /// The job and change a journaled event records, if it records one.
     pub(super) fn of(event: &SessionEvent) -> Option<(JobId, Self)> {
@@ -107,15 +160,6 @@ impl JobState {
             (_, JobStep::Advance(_) | JobStep::Answer) => false,
         }
     }
-
-    /// The state a step this state admits enters.
-    pub(super) fn after(step: JobStep) -> Self {
-        match step {
-            JobStep::Advance(transition) => transition.into(),
-            JobStep::Answer => Self::Running,
-            JobStep::Finish(end) => end.into(),
-        }
-    }
 }
 
 /// A change the current phase does not admit, and the state that refused it.
@@ -163,13 +207,12 @@ impl RoleState {
 pub(super) struct Child {
     /// Installed by the launch; a launch still in progress has none.
     pub(super) agent: Option<AgentId>,
-    /// Replies queued for delivery to the owner.
-    pub(super) messages: Vec<AgentMessage>,
-    /// When the newest queued reply was published; replies are delivered
-    /// oldest first, so it stays queued while any older one does.
-    pub(super) message_stamp: u64,
+    /// Replies queued for delivery to the owner, oldest first, as they are delivered.
+    pub(super) messages: Vec<Queued>,
     /// The latest text-only reply, which completing the job makes its result.
     pub(super) answer: Option<Answer>,
+    /// Its turns and the jobs it created, across every invocation.
+    pub(super) progress: AgentProgress,
     /// Live only: how far the current invocation got toward its child's turn.
     pub(super) start: Start,
 }
@@ -186,26 +229,47 @@ pub(super) enum Start {
     Begun,
 }
 
+/// A reply queued for delivery, stamped when it was queued.
+pub(super) struct Queued {
+    pub(super) stamp: u64,
+    pub(super) reply: AgentMessage,
+}
+
+named_enum! {
+    /// Whether a child's answer is held or released.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) parsed enum AnswerKind {
+        Held = "held",
+        Released = "released",
+    }
+}
+
 /// A background child's candidate answer.
 pub(super) enum Answer {
     /// Held until its invocation resolves: any end but completion, a later turn or
     /// `notify_owner` releases it.
     Held(AgentMessage),
-    /// Released to the owner early. Completion withdraws it while still queued:
+    /// Released to the owner early, and still queued: completion withdraws it, as
     /// the result delivers it.
     Released(MessageSeq),
 }
 
 impl Child {
     /// Queue a reply for delivery to the owner.
-    pub(super) fn queue(&mut self, message: AgentMessage, stamps: &mut Stamps) {
-        self.message_stamp = stamps.next();
-        self.messages.push(message);
+    pub(super) fn queue(&mut self, reply: AgentMessage, stamps: &Stamps) {
+        let stamp = stamps.now();
+        self.messages.push(Queued { stamp, reply });
+    }
+
+    /// When the newest queued reply was queued; replies are delivered oldest
+    /// first, so it stays queued while any older one does.
+    pub(super) fn queued(&self) -> Option<u64> {
+        self.messages.last().map(|queued| queued.stamp)
     }
 
     /// Queue the held answer, if any. An answer already released stays marked,
     /// so completion can still withdraw it.
-    pub(super) fn release(&mut self, stamps: &mut Stamps) {
+    pub(super) fn release(&mut self, stamps: &Stamps) {
         let held = self
             .answer
             .take_if(|answer| matches!(answer, Answer::Held(_)));
@@ -216,18 +280,19 @@ impl Child {
     }
 }
 
-/// Orders what becomes pending for delivery, so a wait floor covers exactly
-/// what its wait could see.
+/// When what becomes pending for delivery did so: the sequence of the record that
+/// made it pending, so a wait floor covers exactly what its wait could see, and a
+/// job folded from its own records alone is stamped as the whole journal stamps it.
 #[derive(Default)]
 pub(crate) struct Stamps(u64);
 
 impl Stamps {
-    pub(super) fn next(&mut self) -> u64 {
-        self.0 += 1;
-        self.0
+    /// Stamp what `record`, being applied, makes pending.
+    pub(super) fn applying(&mut self, record: RecordSeq) {
+        self.0 = record.get();
     }
 
-    pub(super) fn current(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         self.0
     }
 }
@@ -256,7 +321,7 @@ impl Rejected {
 
 pub(super) struct JobFacts {
     pub(super) origin: Option<crate::session::ModelCallOrigin>,
-    pub(super) output_schema: Option<Value>,
+    pub(super) output_schema: Option<Arc<Value>>,
     pub(super) agent: AgentId,
     pub(super) parent: Option<JobId>,
     pub(super) tool: String,
@@ -265,15 +330,15 @@ pub(super) struct JobFacts {
     /// Shared with every view of the job.
     pub(super) arguments: Arc<Value>,
     pub(super) created_at_millis: i64,
-    /// The record that created it.
-    pub(super) created: crate::session::RecordSeq,
     pub(super) phase: Phase,
     pub(super) accepts_input: bool,
     pub(super) delivery: DeliveryState,
     pub(super) background: bool,
     pub(super) location: ExecutionLocation,
-    /// Live only: what restarts it once it ends.
-    pub(super) resume: Option<Resume>,
+    /// Live only: what it runs with while it can still run. A job created
+    /// here has them until it ends with nothing to restart it; one replayed
+    /// from the journal gets them only once something restarts it.
+    pub(super) handles: Option<JobHandles>,
     /// Live only: a finish holds the claim until its outcome applies or fails.
     pub(super) finishing: bool,
     /// Live only: the pending deliveries its runs read, which its finish
@@ -290,9 +355,12 @@ pub(super) struct JobFacts {
 pub struct Invocation(u32);
 
 impl Invocation {
-    #[cfg(test)]
     pub(crate) fn nth(n: u32) -> Self {
         Self(n)
+    }
+
+    pub(crate) fn number(self) -> u32 {
+        self.0
     }
 }
 
@@ -408,7 +476,7 @@ impl JobFacts {
 
     /// Enter the phase a change moves to, with every effect on delivery it
     /// implies; the caller checked that the phase admits it.
-    pub(super) fn enter(&mut self, change: JobChange, stamps: &mut Stamps) {
+    pub(super) fn enter(&mut self, change: JobChange, stamps: &Stamps) {
         match change {
             JobChange::Advance(JobTransition::AwaitingApproval) => {
                 self.phase = Phase::AwaitingApproval;
@@ -448,16 +516,20 @@ impl JobFacts {
                 self.finishing = false;
                 // A new delivery even after an earlier question was acknowledged.
                 self.pend_delivery(stamps);
-                // A call asked for again restarts only from an interruption.
-                let relaunch = matches!(self.resume, Some(Resume::Call(_)));
-                if end == JobEnd::Cancelled || (relaunch && end != JobEnd::Interrupted) {
-                    self.resume = None;
+                // What still works for the invocation it ends stops with it.
+                let ended = self.invocation;
+                let attached = (self.handles.as_mut())
+                    .and_then(|handles| handles.task_abort.take_if(|(run, _)| *run == ended));
+                if let Some((_, worker)) = attached {
+                    worker.abort();
                 }
                 if let Some(child) = self.child_mut() {
                     if end != JobEnd::Completed {
                         child.release(stamps);
                     } else if let Some(Answer::Released(answer)) = child.answer {
-                        child.messages.retain(|message| message.message != answer);
+                        child
+                            .messages
+                            .retain(|queued| queued.reply.message != answer);
                     }
                     child.answer = None;
                 }
@@ -472,9 +544,30 @@ impl JobFacts {
         self.question().is_some() && !matches!(self.role, RoleState::Question)
     }
 
-    /// Interrupted with a handler that can restart it.
+    /// What runs it again once it ends, unless a cancellation was requested.
+    pub(super) fn restart(&self) -> Option<Restart> {
+        self.restart_shape().filter(|_| !self.cancel_requested())
+    }
+
+    /// What its journaled facts let run it again: the child its call installed,
+    /// until cancelled, or the call itself, asked for again, while it is stopped
+    /// before installing one. A cancellation counts here once recorded: one an
+    /// interrupt or a close requested of a finished job in a tree it cancels is
+    /// live only, so it cannot decide what reopening would read.
+    fn restart_shape(&self) -> Option<Restart> {
+        let child = (self.child())
+            .filter(|_| self.accepts_input && self.cancel != CancelState::Recorded)?;
+        match (self.end(), &child.agent) {
+            (Some(JobEnd::Cancelled), _) | (Some(JobEnd::Completed | JobEnd::Failed), None) => None,
+            (_, Some(_)) => Some(Restart::Child),
+            (None | Some(JobEnd::Interrupted), None) => Some(Restart::Call),
+        }
+    }
+
+    /// Interrupted, and something can restart it, or could until a cancellation
+    /// that has yet to end it.
     pub(super) fn suspended(&self) -> bool {
-        self.end() == Some(JobEnd::Interrupted) && self.resume.is_some()
+        self.end() == Some(JobEnd::Interrupted) && self.restart_shape().is_some()
     }
 
     /// Not finished, or finished but retained for resumption. `active_states`
@@ -483,13 +576,28 @@ impl JobFacts {
         self.end().is_none() || self.suspended()
     }
 
+    /// Whether a lifecycle rule can still change it without being addressed by id:
+    /// it is unfinished or interrupted, has a delivery or a reply pending, or is a
+    /// child agent input can resume. Only journaled facts decide it, so a reopened
+    /// session decides it alike.
+    pub(super) fn resident(&self) -> bool {
+        let replies = self.child().is_some_and(|child| !child.messages.is_empty());
+        self.cancellable() || self.unacknowledged() || replies || self.restart_shape().is_some()
+    }
+
     /// Still running, or interrupted: cancellation changes its outcome.
     pub(super) fn cancellable(&self) -> bool {
         self.end().is_none_or(|end| end == JobEnd::Interrupted)
     }
 
     pub(super) fn cancel_requested(&self) -> bool {
-        matches!(self.cancel, CancelState::Requested { .. })
+        self.cancel != CancelState::Open
+    }
+
+    /// Finished, and restartable until a cancellation is recorded: cancelling it
+    /// changes no outcome, so the journal records the request.
+    pub(super) fn records_cancel(&self) -> bool {
+        !self.cancellable() && self.restart_shape().is_some()
     }
 
     /// Its current invocation's watchdog is armed and still changes its outcome.
@@ -498,7 +606,13 @@ impl JobFacts {
             && self.cancellable()
     }
 
-    /// Finished in a way input can restart, given a handler.
+    /// Failed or interrupted and restartable: a session-wide retry restarts it.
+    /// Unlike an explicit send, it never restarts Completed.
+    pub(super) fn retryable(&self) -> bool {
+        matches!(self.end(), Some(JobEnd::Failed | JobEnd::Interrupted)) && self.restart().is_some()
+    }
+
+    /// Finished in a way input can restart, if anything restarts it.
     pub(super) fn resumable_end(&self) -> bool {
         matches!(
             self.end(),
@@ -506,9 +620,9 @@ impl JobFacts {
         )
     }
 
-    pub(super) fn pend_delivery(&mut self, stamps: &mut Stamps) {
+    pub(super) fn pend_delivery(&mut self, stamps: &Stamps) {
         self.delivery = DeliveryState::Pending {
-            stamp: stamps.next(),
+            stamp: stamps.now(),
         };
     }
 
@@ -564,7 +678,7 @@ impl JobFacts {
             question: None,
             diagnostic,
             location: self.location.clone(),
-            resumable: self.accepts_input && self.resume.is_some(),
+            resumable: self.restart().is_some(),
         }
     }
 
@@ -592,8 +706,6 @@ pub(super) struct JobHandles {
     /// The worker attached to the invocation running it, which a forced abort
     /// or that invocation's finish stops.
     pub(super) task_abort: Option<(Invocation, AbortHandle)>,
-    /// The process it runs, while that process runs.
-    pub(super) process: Option<u32>,
 }
 
 impl JobHandles {
@@ -603,19 +715,21 @@ impl JobHandles {
             input,
             cancellation,
             task_abort: None,
-            process: None,
         };
         (handles, receiver)
     }
 }
 
 /// Whether cancellation was requested, and for which invocation it armed the
-/// forced-abort watchdog that settles whatever outcome it still changes.
-#[derive(Clone, Copy, Default)]
+/// forced-abort watchdog that settles whatever outcome it still changes; or,
+/// requested of a finished job that could still restart, as the journal records
+/// it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum CancelState {
     #[default]
     Open,
     Requested {
         watched: Option<Invocation>,
     },
+    Recorded,
 }

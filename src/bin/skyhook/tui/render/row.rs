@@ -12,7 +12,6 @@ pub struct Row {
     pub(super) inset: u16,
     pub(super) text_width: u16,
     pub(super) surface: Surface,
-    pub entry: usize,
     pub(super) entry_key: std::sync::Arc<model::EntryKey>,
     pub selectable: bool,
     pub(super) layout: markdown::RowLayout,

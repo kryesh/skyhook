@@ -57,8 +57,8 @@ fn output_items(parent: &FieldPointer, listed: OutputFields) -> Vec<Item<OutputA
 
 impl App {
     pub(in crate::tui::app) fn output_menu(&mut self) {
-        let row = self.view().row;
-        let Some(job) = self.entries().get(row).and_then(|e| e.job_id()) else {
+        let row = self.selected_entry();
+        let Some(job) = row.and_then(|row| self.entries()[row].job_id()) else {
             return;
         };
         // Fields are listed a level at a time, below the one shown and from the
@@ -81,7 +81,7 @@ impl App {
         let Some(session) = self.session().cloned() else {
             return;
         };
-        let id = self.menu().unwrap().id;
+        let id = self.menu.as_ref().unwrap().id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
             // Discover saved pointers, not paths through presentation-only wrappers.
@@ -95,15 +95,12 @@ impl App {
     }
     pub(super) fn choose_output(&mut self, job: JobId, action: &OutputAction) {
         match action {
-            OutputAction::Automatic => {
-                self.outputs.clear_query(job);
-                self.fetch_output(job);
-            }
+            OutputAction::Automatic => self.outputs.clear_query(job),
             OutputAction::Search => {
                 self.open("Search saved output (regex)", MenuKind::OutputSearch(job));
             }
             OutputAction::Next => {
-                let output = self.outputs.get(&job);
+                let output = self.outputs.current(&job);
                 let next = output.and_then(|output| output.as_ref().ok()?.continuation());
                 let Some(next) = next else {
                     return;
@@ -117,17 +114,17 @@ impl App {
                     Continuation::Lines { start, offset, .. } => (Some(start), offset, None),
                     Continuation::Index { index, .. } => (None, None, Some(index)),
                 };
-                self.set_output_query(query);
+                self.outputs.set_query(query);
             }
             OutputAction::Field(field) => {
                 let mut query = JobOutputQuery::new(job);
                 query.field = Some(field.clone());
-                self.set_output_query(query);
+                self.outputs.set_query(query);
             }
             OutputAction::MoreFields { field, index } => {
                 let mut query = JobOutputQuery::new(job);
                 (query.field, query.index) = (Some(field.clone()), Some(*index));
-                self.set_output_query(query);
+                self.outputs.set_query(query);
             }
         }
     }
@@ -137,7 +134,7 @@ impl App {
         query.field = Some(field.unwrap_or_default());
         query.pattern = Some(pattern.to_owned());
         query.context = Some(OUTPUT_SEARCH_CONTEXT);
-        self.set_output_query(query);
+        self.outputs.set_query(query);
     }
 }
 
@@ -149,7 +146,7 @@ mod tests {
     use skyhook::job::OutputPreview;
 
     fn offered(app: &mut App, field: &str) -> Option<usize> {
-        let MenuKind::Output(_, items) = &app.menu_mut().unwrap().kind else {
+        let MenuKind::Output(_, items) = &app.menu.as_mut().unwrap().kind else {
             panic!("output menu")
         };
         let field = OutputAction::Field(field.parse().unwrap());
@@ -200,18 +197,15 @@ mod tests {
             assert!(offered(&mut app, absent).is_none());
         }
         // Choosing a field refreshes the card with that field's page.
-        let mut rx = capture_work(&mut app);
         let element = "/result/value/custom/a~1b~0c/0";
         let chosen = offered(&mut app, element).unwrap();
-        app.menu_mut().unwrap().select(chosen);
+        app.menu.as_mut().unwrap().select(chosen);
         app.choose();
         assert_eq!(
             app.outputs.query(job).unwrap().field,
             Some(element.parse().unwrap())
         );
-        let work = recv(&mut rx).await;
-        app.work(work);
-        let selected = app.outputs.get(&job).unwrap().as_ref().unwrap();
+        let selected = fetch_output(&mut app, job).await;
         let preview = selected
             .presentation
             .as_ref()
@@ -246,7 +240,7 @@ mod tests {
         open_menu(&mut app).await;
         assert!(offered(&mut app, "/result/value/k99").is_some());
         assert!(offered(&mut app, "/result/value/k100").is_none());
-        let MenuKind::Output(_, items) = &app.menu_mut().unwrap().kind else {
+        let MenuKind::Output(_, items) = &app.menu.as_mut().unwrap().kind else {
             panic!("output menu")
         };
         let more = OutputAction::MoreFields {
@@ -254,11 +248,9 @@ mod tests {
             index: 100,
         };
         let chosen = items.iter().position(|item| item.value == more).unwrap();
-        let mut rx = capture_work(&mut app);
-        app.menu_mut().unwrap().select(chosen);
+        app.menu.as_mut().unwrap().select(chosen);
         app.choose();
-        let work = recv(&mut rx).await;
-        app.work(work);
+        fetch_output(&mut app, job).await;
         open_menu(&mut app).await;
         assert!(offered(&mut app, "/result/value/k100").is_some());
         assert!(offered(&mut app, "/result/value/k0").is_none());

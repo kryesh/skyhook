@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::{
     agent::{CompactionFault, Failure},
@@ -24,7 +25,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
     pub enum ModelPurpose {
         Agent = "agent",
         Compaction = "compaction",
@@ -98,6 +99,14 @@ macro_rules! sequence {
             /// The number, for storage and wire formats that carry it as one.
             pub const fn get(self) -> u64 {
                 self.0
+            }
+
+            /// The sequence before this one, if any.
+            pub const fn preceding(self) -> Option<Self> {
+                match self.0.checked_sub(1) {
+                    Some(sequence) => Some(Self(sequence)),
+                    None => None,
+                }
             }
         }
 
@@ -429,7 +438,7 @@ pub enum SessionEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<JobName>,
         arguments: Value,
-        output_schema: Option<Value>,
+        output_schema: Option<Arc<Value>>,
         accepts_input: bool,
         background: bool,
         location: ExecutionLocation,
@@ -446,6 +455,11 @@ pub enum SessionEvent {
         images: Vec<ImageRef>,
     },
     JobClaimed {
+        job: JobId,
+    },
+    /// Cancellation was requested of a finished job something could still
+    /// restart, which it no longer can.
+    JobCancelRequested {
         job: JobId,
     },
     /// The job's foreground holder let go of it; it goes on in the background.
@@ -506,6 +520,7 @@ named_enum! {
         JobStateChanged = "job_state_changed",
         JobFinished = "job_finished",
         JobClaimed = "job_claimed",
+        JobCancelRequested = "job_cancel_requested",
         JobReleased = "job_released",
         JobMessageReleased = "job_message_released",
         JobInjected = "job_injected",
@@ -516,6 +531,17 @@ named_enum! {
 impl EntryKind {
     pub(crate) fn is_activity(self) -> bool {
         !matches!(self, Self::AgentInterrupted)
+    }
+
+    /// Whether an agent's history fold reads this kind after its checkpoint's frontier.
+    pub(crate) const fn history_folded(self) -> bool {
+        matches!(
+            self,
+            Self::ModelRequested
+                | Self::ResponseCompleted
+                | Self::MessageCommitted
+                | Self::ModeChanged
+        )
     }
 }
 
@@ -558,6 +584,7 @@ impl SessionEvent {
             Self::JobStateChanged { .. } => EntryKind::JobStateChanged,
             Self::JobFinished { .. } => EntryKind::JobFinished,
             Self::JobClaimed { .. } => EntryKind::JobClaimed,
+            Self::JobCancelRequested { .. } => EntryKind::JobCancelRequested,
             Self::JobReleased { .. } => EntryKind::JobReleased,
             Self::JobMessageReleased { .. } => EntryKind::JobMessageReleased,
             Self::JobInjected { .. } => EntryKind::JobInjected,
@@ -576,16 +603,4 @@ pub struct EventRecord {
     pub timestamp_millis: i64,
     pub agent: AgentId,
     pub event: SessionEvent,
-}
-
-impl EventRecord {
-    /// When a session whose journal is `records` last did something: its newest
-    /// activity record's time.
-    pub fn last_activity<'a>(
-        records: impl IntoIterator<Item = &'a Self, IntoIter: DoubleEndedIterator>,
-    ) -> Option<i64> {
-        let mut records = records.into_iter().rev();
-        let last = records.find(|record| record.event.is_activity());
-        last.map(|record| record.timestamp_millis)
-    }
 }

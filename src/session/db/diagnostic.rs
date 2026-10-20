@@ -5,7 +5,9 @@ use std::{collections::HashMap, path::PathBuf};
 use libsql::Row;
 
 use super::{
-    Db, DbResult, Encoder, corrupt, decode::u64_of, enum_column, optional_enum_column, params,
+    Db, DbResult, Encoder, corrupt,
+    decode::{Events, Query, u64_of},
+    enum_column, optional_enum_column, params,
 };
 use crate::{
     execution::{ExecutionLocation, path_bytes, path_from_bytes},
@@ -222,36 +224,37 @@ fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
 }
 
 /// Each job finish's diagnostic, by its entry.
-pub(super) fn load(db: &Db) -> DbResult<HashMap<i64, Diagnostic>> {
+pub(super) fn load(events: &Events) -> DbResult<HashMap<i64, Diagnostic>> {
+    let db = events.db;
     let mut paths: HashMap<i64, Vec<PathFact>> = HashMap::new();
-    for (key, fact) in db.query(
-        "SELECT finish, role, path FROM diagnostic_path ORDER BY finish, position",
-        Vec::new(),
-        |row| {
-            Ok((
-                row.get(0)?,
-                PathFact {
-                    role: enum_column(row, 1)?,
-                    path: path_from_bytes(row.get(2)?),
-                },
-            ))
-        },
-    )? {
+    let Query { sql, params } = events.scoped(
+        "SELECT finish, role, path FROM diagnostic_path {scope} ORDER BY finish, position",
+        "finish",
+    )?;
+    for (key, fact) in db.query(sql, params, |row| {
+        Ok((
+            row.get(0)?,
+            PathFact {
+                role: enum_column(row, 1)?,
+                path: path_from_bytes(row.get(2)?),
+            },
+        ))
+    })? {
         paths.entry(key).or_default().push(fact);
     }
+    let Query { sql, params } = events.scoped(
+        "SELECT d.finish, d.operation, d.subject, d.subject_path, d.subject_text, \
+         d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.request, d.cause, \
+         d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job \
+         FROM job_finish_diagnostic d \
+         LEFT JOIN target t ON t.id = d.location_target {scope}",
+        "d.finish",
+    )?;
     Ok(db
-        .query(
-            "SELECT d.finish, d.operation, d.subject, d.subject_path, d.subject_text, \
-             d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.request, d.cause, \
-             d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job \
-             FROM job_finish_diagnostic d \
-             LEFT JOIN target t ON t.id = d.location_target",
-            Vec::new(),
-            |row| {
-                let key = row.get(0)?;
-                Ok((key, decode(row, paths.remove(&key).unwrap_or_default())?))
-            },
-        )?
+        .query(sql, params, |row| {
+            let key = row.get(0)?;
+            Ok((key, decode(row, paths.remove(&key).unwrap_or_default())?))
+        })?
         .into_iter()
         .collect())
 }

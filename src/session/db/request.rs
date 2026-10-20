@@ -1,21 +1,255 @@
-//! Model requests, their attempts and outcomes, turn failures, and compaction.
+//! Model requests, their attempts and outcomes, turn failures, compaction, and the
+//! state rows the request fold writes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
+    contract::profiles,
     decode::*,
     encode::*,
     message::{MessageRole, Messages},
+    pages::{paged, paged_sql},
     *,
 };
 use crate::{
-    agent::{CompactionFault, Failure, TodoItem},
+    agent::{CompactionFault, Failure, FailureKind, TodoItem},
+    identity::AgentId,
     provider::protocol::Usage,
     session::{
         AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
-        CompletedOutcome, SessionEvent,
+        CompletedOutcome, EntryKind, Page, ProfileSnapshot, RequestPhase, RequestRecord,
+        RequestSeq, SessionEvent,
     },
 };
+
+crate::named_enum::named_enum! {
+    /// A request row's [`RequestPhase`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum PhaseKind {
+        Requested = "requested",
+        Open = "open",
+        Retrying = "retrying",
+        Failed = "failed",
+        Interrupted = "interrupted",
+        Completed = "completed",
+    }
+}
+
+/// Write each request's row as the request fold leaves it, in the transaction of the
+/// records that changed it.
+pub(super) fn write_requests(
+    db: &Db,
+    requests: &BTreeMap<RequestSeq, RequestRecord>,
+) -> DbResult<()> {
+    for (request, record) in requests {
+        let phase = &record.phase;
+        let (kind, message, reported) = match phase {
+            RequestPhase::Requested => (PhaseKind::Requested, None, None),
+            RequestPhase::Open { message, usage, .. } => (PhaseKind::Open, *message, *usage),
+            RequestPhase::Retrying { .. } => (PhaseKind::Retrying, None, None),
+            RequestPhase::Failed { .. } => (PhaseKind::Failed, None, None),
+            RequestPhase::Interrupted { .. } => (PhaseKind::Interrupted, None, None),
+            RequestPhase::Completed { usage, .. } => (PhaseKind::Completed, None, *usage),
+        };
+        let (usage, counts) = (record.usage, reported.unwrap_or_default());
+        db.execute(
+            "INSERT OR REPLACE INTO request_state (request, phase, phased, attempts, attempt, \
+               message, input_tokens, cached_input_tokens, cache_write_input_tokens, \
+               output_tokens, reported, reported_input_tokens, reported_cached_input_tokens, \
+               reported_cache_write_input_tokens, reported_output_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                *request,
+                kind,
+                record.phased,
+                record.attempts,
+                phase.last_attempt(),
+                message,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.output_tokens,
+                reported.is_some(),
+                counts.input_tokens,
+                counts.cached_input_tokens,
+                counts.cache_write_input_tokens,
+                counts.output_tokens
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The usage counts selected from column `at` on.
+pub(super) fn usage_at(row: &Row, at: i32) -> DbResult<Usage> {
+    Ok(Usage {
+        input_tokens: row.get(at)?,
+        cached_input_tokens: row.get(at + 1)?,
+        cache_write_input_tokens: row.get(at + 2)?,
+        output_tokens: row.get(at + 3)?,
+    })
+}
+
+/// What a row's open or completed attempt reported, selected as `reported` and its
+/// counts from column `at` on.
+pub(super) fn reported_at(row: &Row, at: i32) -> DbResult<Option<Usage>> {
+    let reported = row.get::<bool>(at)?;
+    reported.then(|| usage_at(row, at + 1)).transpose()
+}
+
+/// Requests' rows `s`, each with its requesting entry `e`, filtered by `$filter`, as
+/// [`request_record`] reads them.
+macro_rules! request_rows {
+    ($filter:literal) => {
+        concat!(
+            "SELECT e.seq, e.created_millis, r.context, c.purpose, c.profile, r.history_through, \
+               s.phase, s.phased, p.created_millis, s.attempts, s.attempt, s.message, \
+               f.failure, f.provider, f.detail, f.retry_millis, x.fault, x.detail, \
+               s.input_tokens, s.cached_input_tokens, s.cache_write_input_tokens, \
+               s.output_tokens, s.reported, s.reported_input_tokens, \
+               s.reported_cached_input_tokens, s.reported_cache_write_input_tokens, \
+               s.reported_output_tokens, e.agent \
+             FROM entry e JOIN request_state s ON s.request = e.seq \
+             JOIN model_request r ON r.entry = e.seq JOIN model_context c ON c.entry = r.context \
+             JOIN entry p ON p.seq = s.phased LEFT JOIN failure f ON f.entry = s.phased \
+             LEFT JOIN compaction_failure x ON x.entry = s.phased ",
+            $filter
+        )
+    };
+}
+
+/// Up to `limit` of `agent`'s requests at `page`, as the request fold leaves them.
+pub(in crate::session) fn requests(
+    db: &Db,
+    agent: &AgentId,
+    page: Page<RequestSeq>,
+    limit: usize,
+) -> DbResult<Vec<(RequestSeq, RequestRecord)>> {
+    let Some(row) = agent_row(db, agent)? else {
+        return Ok(Vec::new());
+    };
+    let profiles = profiles(db)?;
+    paged(
+        db,
+        page,
+        paged_sql!(
+            request_rows!(""),
+            "e.agent = ?3 AND e.kind = ?4",
+            "e.seq",
+            "?1"
+        ),
+        params![row, EntryKind::ModelRequested],
+        limit,
+        |row| request_record(row, agent, &profiles),
+    )
+}
+
+/// `agent`'s requests at `requests`, as the request fold leaves them.
+pub(super) fn requests_at(
+    db: &Db,
+    agent: &AgentId,
+    requests: &[RecordSeq],
+) -> DbResult<BTreeMap<RequestSeq, RequestRecord>> {
+    if requests.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let profiles = profiles(db)?;
+    let sql = request_rows!("WHERE e.seq IN (SELECT value FROM json_each(?1))");
+    let rows = db.query(sql, params![json(&requests)?], |row| {
+        request_record(row, agent, &profiles)
+    })?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Which request of each agent its state row names.
+#[derive(Clone, Copy)]
+pub(super) enum Named {
+    Latest,
+    Gauged,
+}
+
+/// The request of each agent `agents` names by row that its state row names `which`,
+/// as the request fold leaves it.
+pub(super) fn named_requests(
+    db: &Db,
+    agents: &HashMap<i64, AgentId>,
+    which: Named,
+) -> DbResult<Vec<(RequestSeq, RequestRecord)>> {
+    let profiles = profiles(db)?;
+    let sql = match which {
+        Named::Latest => request_rows!("JOIN agent_state g ON g.request = e.seq"),
+        Named::Gauged => request_rows!("JOIN agent_state g ON g.gauged = e.seq"),
+    };
+    db.query(sql, Vec::new(), |row| {
+        let agent = agents.get(&row.get::<i64>(27)?);
+        let agent = agent.ok_or_else(|| corrupt("a request names no agent"))?;
+        request_record(row, agent, &profiles)
+    })
+}
+
+/// A request of `agent` selected by [`request_rows`].
+fn request_record(
+    row: &Row,
+    agent: &AgentId,
+    profiles: &HashMap<i64, ProfileSnapshot>,
+) -> DbResult<(RequestSeq, RequestRecord)> {
+    let unlike = || corrupt("a request's row does not match its phase");
+    let (attempt, at) = (row.get::<Option<u64>>(10)?, row.get::<i64>(8)?);
+    let reported = reported_at(row, 22)?;
+    let failure = || match optional_enum_column::<FailureKind>(row, 12)? {
+        Some(_) => Ok(failure_at(row, 12)?.into()),
+        None => CompactionFault::from_parts(enum_column(row, 16)?, None, row.get(17)?)
+            .map(Into::into)
+            .ok_or_else(unlike),
+    };
+    let phase = match enum_column(row, 6)? {
+        PhaseKind::Requested => RequestPhase::Requested,
+        PhaseKind::Open => RequestPhase::Open {
+            attempt: attempt.ok_or_else(unlike)?,
+            message: row
+                .get::<Option<i64>>(11)?
+                .map(|commit| sequence(commit).message()),
+            usage: reported,
+        },
+        PhaseKind::Retrying => match (failure_at(row, 12)?, row.get::<Option<u64>>(15)?) {
+            (Failure::Provider(message, kind), Some(delay)) => RequestPhase::Retrying {
+                attempt: attempt.ok_or_else(unlike)?,
+                failure: kind.error(message),
+                due: at.saturating_add_unsigned(delay),
+            },
+            _ => return Err(unlike()),
+        },
+        PhaseKind::Failed => RequestPhase::Failed {
+            attempt,
+            failure: failure()?,
+            at,
+        },
+        PhaseKind::Interrupted => RequestPhase::Interrupted { attempt, at },
+        PhaseKind::Completed => RequestPhase::Completed {
+            attempt: attempt.ok_or_else(unlike)?,
+            at,
+            usage: reported,
+        },
+    };
+    let profile = profiles.get(&row.get(4)?);
+    let record = RequestRecord {
+        agent: agent.clone(),
+        context: sequence(row.get(2)?),
+        purpose: enum_column(row, 3)?,
+        profile: profile
+            .cloned()
+            .ok_or_else(|| corrupt("a context names no profile"))?,
+        through: row
+            .get::<Option<i64>>(5)?
+            .map(|through| sequence(through).message()),
+        requested_millis: row.get(1)?,
+        attempts: row.get(9)?,
+        usage: usage_at(row, 18)?,
+        phase,
+        phased: sequence(row.get(7)?),
+    };
+    Ok((sequence(row.get(0)?).request(), record))
+}
 
 impl Encoder {
     pub(super) fn request(&mut self, db: &Db, entry: Entry, event: &SessionEvent) -> DbResult<()> {
@@ -220,14 +454,17 @@ pub(super) fn events(
     let db = events.db;
     let tails = grouped(
         db,
-        "SELECT request, message FROM model_request_tail ORDER BY request, position",
+        events.scoped(
+            "SELECT request, message FROM model_request_tail {scope} ORDER BY request, position",
+            "request",
+        )?,
         |row| messages.message(row.get(1)?),
     )?;
     events.load(
         "SELECT entry, context, checkpoint, history_lifetime, history_through, history_from \
-         FROM model_request",
+         FROM model_request {scope}",
+        "entry",
         |row| {
-            let seq = row.get::<i64>(0)?;
             Ok(SessionEvent::ModelRequested {
                 context: sequence(row.get(1)?),
                 checkpoint: row.get::<Option<i64>>(2)?.map(sequence),
@@ -237,25 +474,33 @@ pub(super) fn events(
                 from: row
                     .get::<Option<i64>>(5)?
                     .map(|source| sequence(source).message()),
-                tail: tails.get(&seq).cloned().unwrap_or_default(),
+                tail: tails.get(&row.get::<i64>(0)?).cloned().unwrap_or_default(),
                 history_lifetime: enum_column(row, 3)?,
             })
         },
     )?;
     let retained = grouped(
         db,
-        "SELECT compaction, source FROM compaction_retained ORDER BY compaction, source",
+        events.scoped(
+            "SELECT compaction, source FROM compaction_retained {scope} \
+             ORDER BY compaction, source",
+            "compaction",
+        )?,
         |row| Ok(sequence(row.get(1)?).message()),
     )?;
     // The attempt each outcome ended; what a kind's own row leaves ended interrupted.
     let mut outcomes = keyed(
         db,
-        "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
-         JOIN model_attempt a ON a.entry = o.attempt",
+        events.scoped(
+            "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
+             JOIN model_attempt a ON a.entry = o.attempt {scope}",
+            "o.entry",
+        )?,
         |row| attempt(row, 1),
     )?;
     events.load(
-        "SELECT entry, frontier, message, reported_tokens FROM compaction",
+        "SELECT entry, frontier, message, reported_tokens FROM compaction {scope}",
+        "entry",
         |row| {
             let seq = row.get::<i64>(0)?;
             Ok(SessionEvent::Compaction {
@@ -273,12 +518,14 @@ pub(super) fn events(
             })
         },
     )?;
-    events.load("SELECT entry, request, attempt FROM model_attempt", |row| {
+    let attempts = "SELECT entry, request, attempt FROM model_attempt {scope}";
+    events.load(attempts, "entry", |row| {
         Ok(SessionEvent::ModelAttemptStarted(attempt(row, 1)?))
     })?;
     // A failure that ended an attempt is a model failure; any other, an agent's.
     events.load(
-        "SELECT entry, failure, provider, detail, retry_millis FROM failure",
+        "SELECT entry, failure, provider, detail, retry_millis FROM failure {scope}",
+        "entry",
         |row| {
             let attempt = outcomes.remove(&row.get(0)?);
             Ok(
@@ -306,7 +553,8 @@ pub(super) fn events(
     )?;
     events.load(
         "SELECT r.entry, m.entry, r.outcome, r.cut_reason FROM model_response r \
-         JOIN message_commit m ON m.message = r.message",
+         JOIN message_commit m ON m.message = r.message {scope}",
+        "r.entry",
         |row| {
             Ok(SessionEvent::ResponseCompleted {
                 attempt: ended(&mut outcomes, row.get(0)?)?,
@@ -321,7 +569,8 @@ pub(super) fn events(
     }
     events.load(
         "SELECT o.entry, o.request, a.attempt, o.fault, o.detail \
-         FROM compaction_failure o LEFT JOIN model_attempt a ON a.entry = o.attempt",
+         FROM compaction_failure o LEFT JOIN model_attempt a ON a.entry = o.attempt {scope}",
+        "o.entry",
         |row| {
             let request = row
                 .get::<Option<i64>>(1)?
@@ -343,16 +592,12 @@ pub(super) fn events(
     )?;
     events.load(
         "SELECT entry, request, input_tokens, cached_input_tokens, cache_write_input_tokens, \
-         output_tokens FROM usage",
+         output_tokens FROM usage {scope}",
+        "entry",
         |row| {
             Ok(SessionEvent::Usage {
                 request: sequence(row.get(1)?).request(),
-                usage: Usage {
-                    input_tokens: row.get(2)?,
-                    cached_input_tokens: row.get(3)?,
-                    cache_write_input_tokens: row.get(4)?,
-                    output_tokens: row.get(5)?,
-                },
+                usage: usage_at(row, 2)?,
             })
         },
     )

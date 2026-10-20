@@ -41,7 +41,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = match launch.create(None).await {
-                Ok(session) => Ok(PreparedObservation::subscribe(session)),
+                Ok(session) => crate::tui::host::observed(session).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = tx.send(Work::Started { result })
@@ -61,12 +61,20 @@ impl App {
             Phase::Draft { root } => Some(root.clone()),
             Phase::Open { attached_draft, .. } => attached_draft.clone(),
         };
+        let PreparedObservation {
+            active,
+            snapshot,
+            projection,
+            window,
+            ..
+        } = prepared;
         self.phase = Phase::Open {
-            observation: prepared.active,
+            observation: active,
             attached_draft,
         };
-        self.snapshot = *prepared.snapshot;
-        self.failures_read = last_record(&self.snapshot);
+        self.snapshot = *snapshot;
+        self.projection = *projection;
+        self.window = window.map(|window| *window);
         self.selected = self.root_agent().clone();
         self.views.transfer(&draft, self.selected.clone());
         for status in &mut self.unsaved_status {
@@ -76,7 +84,7 @@ impl App {
         }
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();
-        self.reset_projection();
+        self.refresh();
         self.show_warnings();
         self.load_title();
         if self.stopping {
@@ -297,11 +305,11 @@ mod tests {
         assert_eq!(pastes, ["unsent attachment"]);
         app.status.flush().await;
         let session = app.session().unwrap();
-        let snapshot = session.observe().snapshot;
+        let records = journal(session).await;
         assert!(!session.warnings().is_empty());
         for warning in session.warnings() {
             let status = format!("Startup warning: {warning}");
-            assert!(!snapshot.records.values().any(|record| matches!(
+            assert!(!records.iter().any(|record| matches!(
                 &record.event, SessionEvent::Status { message } if message == &status
             )));
             assert!(unsaved(&app, session.root_agent()).contains(&status));
@@ -437,6 +445,7 @@ mod tests {
         for tab in [model::Tab::Jobs, model::Tab::Requests] {
             let (_root, mut app, mut played, session) = played_fixture().await;
             app.tab = tab;
+            super::super::tests::settled(&mut app).await;
             let root = app.root_agent().clone();
             let _asked = ask(&session, "delegate");
             let task = json!({"prompt": "work", "bg": true});
@@ -463,7 +472,7 @@ mod tests {
             // Folded as the host folds, so only what the update changed rebuilds.
             observe_until(&mut app, |app| {
                 matches!(shown(app), Some(model::Timing::Since(_)))
-                    && count(&app.snapshot, answered) == 1
+                    && count(&app.journal, answered) == 1
             })
             .await;
             assert!(app.projection.has_active_children());
@@ -476,7 +485,7 @@ mod tests {
                 matches!(stopped, Some(model::Timing::Took { .. })),
                 "{tab:?}"
             );
-            let child = children(&app.snapshot).remove(0);
+            let child = children(&app.journal).remove(0);
             let mut agents = app.projection.agents.iter();
             let child = agents.find(|info| info.id == child).unwrap();
             let interrupted = AgentDisplayState::Job(JobState::Interrupted);

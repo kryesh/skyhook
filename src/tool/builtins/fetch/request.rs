@@ -79,7 +79,8 @@ async fn snapshot_file(
         Operation::CreateCapture,
         Subject::Label("upload snapshot".into()),
     );
-    let mut snapshot = tokio::fs::File::from_std(tempfile::tempfile()?);
+    let snapshot = crate::blocking(|| Ok::<_, LocalError>(tempfile::tempfile()?)).await?;
+    let mut snapshot = tokio::fs::File::from_std(snapshot);
     progress.step(Operation::Copy, Subject::path(path));
     let length = tokio::io::copy(&mut file.take(sentinel), &mut snapshot).await?;
     snapshot.flush().await?;
@@ -224,7 +225,7 @@ pub(super) async fn execute(
         }
     }
     progress.step(Operation::Prepare, Subject::Label("HTTP client".into()));
-    let client = client(&plan.client)?;
+    let client = client(&plan.client.client).await?;
     progress.step(
         Operation::Prepare,
         Subject::Label("HTTP request body".into()),

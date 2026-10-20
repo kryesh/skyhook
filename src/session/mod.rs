@@ -7,25 +7,31 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    identity::{AgentId, SessionId},
+    blocking,
+    identity::{AgentId, JobId, SessionId},
     provider::protocol::ModelRequest,
 };
 
+pub(crate) mod agent_state;
 mod content;
 mod core;
 mod db;
 mod event;
-mod ledger;
+pub(crate) mod ledger;
+mod pages;
 mod projection;
 mod request;
 pub mod stats;
-mod turns;
 
 pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
 pub use core::SessionPhase;
 
-pub(crate) use core::{Command, CoreState, Plan, Prepared, WeakCore};
-pub(crate) use db::{CaptureExtent, CaptureRow, OffloadedCapture, OutputRows, SharedDb};
+pub use agent_state::Turns;
+pub(crate) use core::{Command, CoreState, Dirty, Key, Plan, Prepared, Wait, WeakCore};
+pub(crate) use db::{
+    AgentRecords, CaptureExtent, CaptureRow, JobRow, OutputRows, Reads, SavedRows, SharedDb,
+    StagedCapture,
+};
 pub use db::{DbError, SessionSummary, SessionTitle};
 pub(crate) use event::EntryKind;
 pub use event::{
@@ -34,13 +40,12 @@ pub use event::{
     ModelPurpose, ProfileSnapshot, RecordSeq, Refused, RequestSeq, RetryDelay, SessionEvent,
     TitleSource, Truncation,
 };
-pub use ledger::{RequestFailure, RequestLedger, RequestPhase, RequestRecord};
-pub use projection::{Projected, Projection, project_history, render_history};
-pub(crate) use request::stale_todos;
-pub use request::{
-    CheckpointError, ReplayError, reconstruct_model_request, record_at, request_context,
-};
-pub use turns::Turns;
+pub use ledger::{Fact, RequestFailure, RequestPhase, RequestRecord, ResidentLedger};
+pub use pages::{AgentSummary, AgentsPage, Answer, Page, PageFacts, TranscriptPage};
+pub(crate) use projection::{CompletedRequest, OpenedHistory, Requested};
+pub use projection::{Projected, Projection, render_history};
+use request::Referenced;
+pub use request::{CheckpointError, ReplayError};
 
 const DATABASE_FILE: &str = "session.db";
 const LOCK_FILE: &str = "lock";
@@ -77,12 +82,87 @@ fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionE
 struct StoreInner {
     shared: Arc<core::Shared>,
     db: SharedDb,
+    journal: Journal,
     core: core::Core,
 }
 
 #[derive(Clone)]
 pub struct SessionStore {
     inner: Arc<StoreInner>,
+}
+
+/// Tells a session's observers when a run's captured output changes; see
+/// [`crate::agent::RuntimeEvent::OutputChanged`]. It keeps nothing of the
+/// session alive.
+#[derive(Clone)]
+pub(crate) struct OutputChanges(std::sync::Weak<core::Shared>);
+
+impl OutputChanges {
+    /// `run` captured output that is now readable.
+    pub(crate) fn changed(&self, run: crate::job::Run) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.output_changed(run);
+        }
+    }
+
+    /// `run`'s output is being read: what it captures from now on is news.
+    pub(crate) fn read(&self, run: crate::job::Run) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.observed().output_read(run);
+        }
+    }
+}
+
+/// The committed journal, read by index: what the core reads back of the jobs it
+/// no longer holds. Each read runs in one snapshot of what was committed.
+#[derive(Clone)]
+pub(crate) struct Journal {
+    session: SessionId,
+    reads: Reads,
+}
+
+impl Journal {
+    /// The status rows of those of `jobs` that exist, in id order.
+    pub(crate) fn jobs(&self, jobs: &[JobId]) -> Result<Vec<JobRow>, SessionError> {
+        let session = self.session;
+        Ok(self.reads.read(|db| db::job_rows(db, session, jobs))?)
+    }
+
+    /// The jobs `agent` created, in id order.
+    pub(crate) fn created_by(&self, agent: &AgentId) -> Result<Vec<JobId>, SessionError> {
+        Ok(self.reads.read(|db| db::created_by(db, agent))?)
+    }
+
+    /// The records `agent`'s contract is journaled in, as its loop starts: those of
+    /// the `profiled` and `granted` entries and the agent model `context` its state names.
+    pub(crate) fn agent(
+        &self,
+        agent: &AgentId,
+        entries: [RecordSeq; 2],
+        context: Option<RecordSeq>,
+    ) -> Result<Option<db::AgentRecords>, SessionError> {
+        let session = self.session;
+        Ok(self
+            .reads
+            .read(|db| db::agent(db, session, agent, entries, context))?)
+    }
+}
+
+/// The state the journal in `db` opens to, as its rows hold it.
+fn open_state(db: &db::Db, id: SessionId) -> Result<(CoreState, core::Observed), SessionError> {
+    core::CoreState::open(db::counters(db)?, db::opening(db, id)?)
+}
+
+/// `work` for the core, run once `jobs` are held, in the same call.
+fn held<T, E: From<SessionError>>(
+    jobs: impl IntoIterator<Item = JobId>,
+    work: impl FnOnce(&mut core::Writer) -> Result<T, E> + Send + 'static,
+) -> impl FnOnce(&mut core::Writer) -> Result<T, E> + Send + 'static {
+    let jobs: Vec<_> = jobs.into_iter().collect();
+    move |writer| {
+        writer.hold(jobs)?;
+        work(writer)
+    }
 }
 
 /// A store reference that keeps neither the session's core nor its lock.
@@ -122,21 +202,31 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
         let inherit = |writer: &mut core::Writer| {
-            (writer.lock.as_ref()).and_then(|lock| lock.0.try_clone().ok())
+            (writer.owner.as_ref()).and_then(|owner| owner.lock.0.try_clone().ok())
         };
         self.inner.core.call(inherit).await.unwrap()
     }
 
-    /// The journal as a reopen would replay it, over the same database. Its
-    /// appends do not reach this store's state.
+    /// The session as a reopen opens it, over the same database. Its appends do
+    /// not reach this store's state.
     #[cfg(test)]
     pub(crate) fn replica(&self) -> Self {
-        let state = core::CoreState::replay(&self.records()).unwrap();
+        let id = self.id();
+        let state = self.test_reads().read(|db| Ok(open_state(db, id)));
+        let state = state.unwrap().unwrap();
         let (db, directory) = (self.inner.db.clone(), self.directory().to_owned());
-        let started = core::Core::start(self.id(), directory, state, db.clone(), None);
+        let journal = self.test_journal();
+        // Its source owns the log they share.
+        let connections = (db.clone(), journal.clone());
+        let started = core::Core::start(self.id(), directory, state, connections, None);
         let (shared, core) = started.unwrap();
         Self {
-            inner: Arc::new(StoreInner { shared, db, core }),
+            inner: Arc::new(StoreInner {
+                shared,
+                db,
+                journal,
+                core,
+            }),
         }
     }
 
@@ -144,10 +234,12 @@ impl SessionStore {
     pub async fn read_records(
         root: &Path,
         id: SessionId,
-    ) -> Result<Vec<EventRecord>, SessionError> {
-        Self::read_only(root, id, move |db| db::decode_records(db, id))
-            .await
-            .and_then(request::admit_records)
+    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
+        let read = move |db: &db::Db| {
+            let records = db::decode_records(db, id, db::Entries::All)?;
+            Ok(request::admit_records(db, records))
+        };
+        Self::read_only(root, id, read).await?
     }
 
     /// Whether a store, in this process or another, holds the session open. The
@@ -169,7 +261,7 @@ impl SessionStore {
                 Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
             }
         })
-        .await?
+        .await
     }
 
     /// A session list row, without decoding the session or taking its lock.
@@ -177,7 +269,7 @@ impl SessionStore {
         Self::read_only(root, id, db::summary).await
     }
 
-    /// Run `read` against one snapshot: a live owner may commit between its queries.
+    /// Run `read` against one snapshot of a session that may not be open here.
     async fn read_only<T: Send + 'static>(
         root: &Path,
         id: SessionId,
@@ -188,13 +280,9 @@ impl SessionStore {
             if !path.is_file() {
                 return Err(SessionError::NotFound(id));
             }
-            let db = db::Db::open(&path, db::OpenMode::ReadOnly)?;
-            db.batch("BEGIN")?;
-            let value = read(&db);
-            db.batch("COMMIT")?;
-            Ok(value?)
+            Ok(Reads::Own(Arc::new(db::Own::new(path))).read(read)?)
         })
-        .await?
+        .await
     }
 
     pub(crate) async fn create(root: &Path) -> Result<Self, SessionError> {
@@ -217,15 +305,12 @@ impl SessionStore {
             std::fs::create_dir(&directory)?;
             Self::start(id, directory, durable, false)
         };
-        Ok(blocking(create).await??.0)
+        blocking(create).await
     }
 
-    pub async fn open(
-        root: &Path,
-        id: SessionId,
-    ) -> Result<(Self, Vec<EventRecord>), SessionError> {
+    pub async fn open(root: &Path, id: SessionId) -> Result<Self, SessionError> {
         let directory = root.join(id.to_string());
-        blocking(move || Self::start(id, directory, true, true)).await?
+        blocking(move || Self::start(id, directory, true, true)).await
     }
 
     fn start(
@@ -233,7 +318,7 @@ impl SessionStore {
         directory: PathBuf,
         durable: bool,
         existing: bool,
-    ) -> Result<(Self, Vec<EventRecord>), SessionError> {
+    ) -> Result<Self, SessionError> {
         let path = directory.join(DATABASE_FILE);
         if existing && !path.is_file() {
             return Err(SessionError::NotFound(id));
@@ -245,17 +330,45 @@ impl SessionStore {
             (true, false) => db::OpenMode::Create,
             (true, true) => db::OpenMode::Open,
         };
-        let db = SharedDb::new(db::Db::open(&path, mode)?);
-        let records = request::admit_records(db::decode_records(&db.lock(), id)?)?;
-        let (mut state, observed) = core::CoreState::replay(&records)?;
+        let log = durable.then(|| Arc::new(db::Log::of(&path)));
+        let db = SharedDb::new(db::Db::open(&path, mode)?, log.clone());
+        let owner = lock.zip(log).map(|(lock, log)| {
+            let checkpointer = db::Checkpointer::start(&path, log, db.clone())?;
+            Ok::<_, SessionError>(core::Owner { lock, checkpointer })
+        });
+        let owner = owner.transpose()?;
+        // The core reads on a connection of its own, so that it never waits behind
+        // other reads.
+        let (reads, core_reads) = match durable {
+            true => (
+                Reads::Pool(Arc::new(db::ReadPool::new(path.clone()))),
+                Reads::Own(Arc::new(db::Own::new(path))),
+            ),
+            false => {
+                let reads = Reads::writer(db.clone());
+                (reads.clone(), reads)
+            }
+        };
+        let (mut state, observed) = open_state(&db.lock(), id)?;
         // A reopened session runs nothing until something changes it.
         if existing {
-            state.phase = SessionPhase::Viewing;
+            state.set_phase(SessionPhase::Viewing);
         }
         let state = (state, observed);
-        let (shared, core) = core::Core::start(id, directory, state, db.clone(), lock)?;
-        let inner = Arc::new(StoreInner { shared, db, core });
-        Ok((Self { inner }, records))
+        let core_journal = Journal {
+            session: id,
+            reads: core_reads,
+        };
+        let journal = Journal { session: id, reads };
+        let connections = (db.clone(), core_journal);
+        let (shared, core) = core::Core::start(id, directory, state, connections, owner)?;
+        let inner = Arc::new(StoreInner {
+            shared,
+            db,
+            journal,
+            core,
+        });
+        Ok(Self { inner })
     }
 
     pub fn id(&self) -> SessionId {
@@ -266,15 +379,28 @@ impl SessionStore {
         &self.inner.shared.directory
     }
 
-    /// Observe without a gap between the snapshot and the updates after it.
+    /// The session's live part and the updates after it, without a gap between
+    /// them. It copies nothing of the history, which pages read.
     pub fn observe(&self) -> crate::agent::Observation {
         let shared = &self.inner.shared;
+        // The core publishes only under the state's write lock, and posts take
+        // only `observed`: subscribing under both, then copying the committed
+        // state before the read lock drops, leaves every update either in the
+        // snapshot or after it.
         let state = shared.read();
-        let observed = shared.observed();
-        crate::agent::Observation {
-            snapshot: state.snapshot(&observed),
-            updates: shared.events.subscribe(),
-        }
+        let (posted, updates) = {
+            let observed = shared.observed();
+            (observed.posted(), shared.events.subscribe())
+        };
+        let mut snapshot = state.snapshot(posted);
+        drop(state);
+        snapshot.read_phase();
+        crate::agent::Observation { snapshot, updates }
+    }
+
+    /// The committed journal, read by index.
+    pub(crate) fn journal(&self) -> Journal {
+        self.inner.journal.clone()
     }
 
     /// The revision of the newest update published to observers.
@@ -284,11 +410,10 @@ impl SessionStore {
 
     /// Fold and publish an update the journal does not carry. Nothing the core
     /// plans reads these views, so they wait neither behind its commands nor
-    /// behind readers of its state.
+    /// behind readers of its state, only on the observation's lock: a commit holds
+    /// it from its fold to its publication.
     pub(crate) fn post(&self, event: crate::agent::RuntimeEvent) {
-        let mut observed = self.inner.shared.observed();
-        observed.post(event.clone());
-        let _ = self.inner.shared.events.send(observed.publish(event));
+        self.inner.shared.post(event);
     }
 
     /// Read the core's state.
@@ -296,9 +421,57 @@ impl SessionStore {
         read(&self.inner.shared.read())
     }
 
-    /// A consistent snapshot of all successfully committed events, including ephemeral sessions.
-    pub fn records(&self) -> Vec<EventRecord> {
-        self.inner.shared.read().records.clone()
+    /// Every committed record, including an ephemeral session's.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> Vec<Arc<EventRecord>> {
+        let id = self.id();
+        let read = |db: &db::Db| db::decode_records(db, id, db::Entries::All);
+        self.test_reads().read(read).unwrap()
+    }
+
+    /// [`until`](Self::until) the wait `wait` builds from what `read` reads of the
+    /// journal on the core, in the command that registers it: a wait reads no journal
+    /// under the state's lock, and no change lands between the read and its first
+    /// decision.
+    #[cfg(test)]
+    pub(crate) async fn until_read<R: Send + 'static, T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Journal) -> R + Send + 'static,
+        wait: impl FnOnce(R) -> Wait<T> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let (journal, (reply, outcome)) = (self.test_journal(), tokio::sync::oneshot::channel());
+        let register = move |writer: &mut core::Writer| {
+            let wait = wait(read(&journal));
+            writer.hold(wait.jobs())?;
+            writer.change(|state| state.wait(wait, reply));
+            Ok::<_, SessionError>(())
+        };
+        self.inner.core.call(register).await??;
+        match outcome.await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => Err(self.behind(|state| state.phase().refusal()).await),
+        }
+    }
+
+    /// The committed journal, for a test reading it on any thread.
+    #[cfg(test)]
+    pub(crate) fn test_journal(&self) -> Journal {
+        Journal {
+            session: self.id(),
+            reads: self.test_reads(),
+        }
+    }
+
+    /// Reads a test may run on its own thread: a connection of their own, or an
+    /// in-memory session's writer.
+    #[cfg(test)]
+    pub(crate) fn test_reads(&self) -> Reads {
+        match self.reads() {
+            Reads::Pool(_) => {
+                Reads::Own(Arc::new(db::Own::new(self.directory().join(DATABASE_FILE))))
+            }
+            reads => reads,
+        }
     }
 
     /// Append one event; dropping this waiter does not cancel persistence.
@@ -306,7 +479,7 @@ impl SessionStore {
         &self,
         agent: AgentId,
         event: SessionEvent,
-    ) -> Result<EventRecord, SessionError> {
+    ) -> Result<Arc<EventRecord>, SessionError> {
         Ok(self.append_all(vec![(agent, event)]).await?.remove(0))
     }
 
@@ -314,8 +487,8 @@ impl SessionStore {
     pub(crate) async fn append_all(
         &self,
         events: Vec<(AgentId, SessionEvent)>,
-    ) -> Result<Vec<EventRecord>, SessionError> {
-        let records = |_: &mut CoreState, records: &[EventRecord]| records.to_vec();
+    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
+        let records = |_: &mut CoreState, records: &[Arc<EventRecord>]| records.to_vec();
         let plan = move |_: &CoreState| Ok(Plan::new(events, records));
         self.commit(Command::Journal, plan).await
     }
@@ -335,8 +508,8 @@ impl SessionStore {
         agent: AgentId,
         event: SessionEvent,
         follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
-    ) -> Result<Vec<EventRecord>, SessionError> {
-        let records = |_: &mut CoreState, records: &[EventRecord]| records.to_vec();
+    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
+        let records = |_: &mut CoreState, records: &[Arc<EventRecord>]| records.to_vec();
         self.commit(Command::Journal, move |state| {
             let mut events = vec![(agent, event)];
             events.extend(follow(state.next_sequence()));
@@ -352,8 +525,19 @@ impl SessionStore {
         command: Command,
         plan: impl FnOnce(&CoreState) -> Result<Plan<T>, E> + Send + 'static,
     ) -> Result<T, E> {
+        self.commit_on(None, command, plan).await
+    }
+
+    /// [`commit`](Self::commit) a plan that reads `jobs` by id: each is held first,
+    /// as the journal leaves it, if it was ever created.
+    pub(crate) async fn commit_on<T: Send + 'static, E: From<SessionError> + Send + 'static>(
+        &self,
+        jobs: impl IntoIterator<Item = JobId>,
+        command: Command,
+        plan: impl FnOnce(&CoreState) -> Result<Plan<T>, E> + Send + 'static,
+    ) -> Result<T, E> {
         let run = move |writer: &mut core::Writer| writer.run(command, plan);
-        self.inner.core.call(run).await?
+        self.inner.core.call(held(jobs, run)).await?
     }
 
     /// Change facts the journal does not record, in order with every commit.
@@ -372,35 +556,46 @@ impl SessionStore {
         self.inner.core.post(move |writer| writer.change(change));
     }
 
-    /// Resolve once `resolve` decides, as it reads the state when registered and
-    /// after every change, consuming what it decides on as it decides: its waiter
-    /// must lose nothing by abandoning the reply. Refused as closed, or with its
-    /// failure, once the session decides nothing more.
-    pub(crate) async fn until<T: Send + 'static>(
-        &self,
-        resolve: impl FnMut(&mut CoreState) -> Option<T> + Send + Sync + 'static,
-    ) -> Result<T, SessionError> {
-        self.until_after(|_| (), resolve).await
+    /// Resolve once `wait` decides, as it reads the state when registered and
+    /// after every change to what it declares, consuming what it decides on as
+    /// it decides: its waiter must lose nothing by abandoning the reply. Refused
+    /// as closed, or with its failure, once the session decides nothing more.
+    /// The jobs it declares are held as it registers, so it first decides on
+    /// their facts; one let go after is as it was then.
+    pub(crate) async fn until<T: Send + 'static>(&self, wait: Wait<T>) -> Result<T, SessionError> {
+        self.register(wait.jobs(), |_| (), |()| wait).await
     }
 
-    /// [`until`](Self::until), registered in the change that applies `first`, so
-    /// it and every other wait first read the state as `first` leaves it.
-    pub(crate) async fn until_after<T: Send + 'static>(
+    /// [`until`](Self::until) the wait `wait` builds from what `first` returns,
+    /// registered in the change that applies `first`, so it and every other wait
+    /// first read the state as `first` leaves it, which holds the jobs it reads.
+    pub(crate) async fn until_after<F: Send + 'static, T: Send + 'static>(
         &self,
-        first: impl FnOnce(&mut CoreState) + Send + 'static,
-        resolve: impl FnMut(&mut CoreState) -> Option<T> + Send + Sync + 'static,
+        first: impl FnOnce(&mut CoreState) -> F + Send + 'static,
+        wait: impl FnOnce(F) -> Wait<T> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        self.register(Vec::new(), first, wait).await
+    }
+
+    /// Hold `jobs`, then register the wait `wait` builds from what `first` returns.
+    async fn register<F: Send + 'static, T: Send + 'static>(
+        &self,
+        jobs: Vec<JobId>,
+        first: impl FnOnce(&mut CoreState) -> F + Send + 'static,
+        wait: impl FnOnce(F) -> Wait<T> + Send + 'static,
     ) -> Result<T, SessionError> {
         let (reply, outcome) = tokio::sync::oneshot::channel();
         let register = move |writer: &mut core::Writer| {
             writer.change(|state| {
-                first(state);
-                state.wait(resolve, reply);
+                let first = first(state);
+                state.wait(wait(first), reply);
             });
+            Ok::<_, SessionError>(())
         };
-        self.inner.core.call(register).await?;
+        self.inner.core.call(held(jobs, register)).await??;
         match outcome.await {
             Ok(outcome) => Ok(outcome),
-            Err(_) => Err(self.behind(|state| state.phase.refusal()).await),
+            Err(_) => Err(self.behind(|state| state.phase().refusal()).await),
         }
     }
 
@@ -425,8 +620,9 @@ impl SessionStore {
     /// Await accepted appends and report the failure that stopped the session,
     /// if its journal failed, without closing admission.
     pub(crate) async fn drain(&self) -> Result<(), SessionError> {
-        let drain = |writer: &mut core::Writer| writer.shared.read().phase.failed();
-        self.inner.core.call(drain).await?
+        // Its reply follows the sync of every commit queued before it.
+        self.inner.core.call(|_| ()).await?;
+        self.read(|state| state.phase().failed())
     }
 
     /// The token whose cancellation stops everything the session runs, as its
@@ -450,13 +646,45 @@ impl SessionStore {
 
     /// The title the session list shows: see [`SessionSummary::title`].
     pub async fn title(&self) -> Result<Option<SessionTitle>, SessionError> {
-        let db = self.inner.db.clone();
-        Ok(blocking(move || db::title(&db.lock())).await??)
+        self.snapshot(|db| Ok(db::title(db)?)).await
     }
 
-    /// The connection job output streams read and write through.
+    /// Run `read` against one snapshot of the committed session, off the async workers.
+    async fn snapshot<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&db::Db) -> Result<T, SessionError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let reads = self.reads();
+        self.reads()
+            .hold(move || reads.read(|db| Ok(read(db)))?)
+            .await
+    }
+
+    /// The entries that created those of `jobs` that `agent` created, with their
+    /// creations, in id order.
+    pub(crate) async fn job_creations(
+        &self,
+        jobs: Vec<JobId>,
+        agent: &AgentId,
+    ) -> Result<Vec<(RecordSeq, SessionEvent)>, SessionError> {
+        let session = self.id();
+        let read = move |db: &db::Db, row| db::creations(db, session, &jobs, row);
+        self.read_agent(agent, Vec::new(), read).await
+    }
+
+    /// The connection job output streams write through.
     pub(crate) fn outputs(&self) -> SharedDb {
         self.inner.db.clone()
+    }
+
+    /// Where reads that must not wait on the writer run.
+    pub(crate) fn reads(&self) -> Reads {
+        self.inner.journal.reads.clone()
+    }
+
+    /// What output streams tell observers through.
+    pub(crate) fn output_changes(&self) -> OutputChanges {
+        OutputChanges(Arc::downgrade(&self.inner.shared))
     }
 
     /// Store bytes in the content-addressed blob store.
@@ -468,12 +696,8 @@ impl SessionStore {
         let bytes = bytes.to_vec();
         // A blob the journal cannot take stops the session, as an append does.
         let insert = move |writer: &mut core::Writer| {
-            writer.shared.read().phase.admits(Command::Journal)?;
-            let inserted = writer.db.lock().execute(
-                "INSERT INTO blob (sha256, bytes) VALUES (?1, ?2) ON CONFLICT (sha256) DO NOTHING",
-                db::params![blob.sha256.to_bytes().to_vec(), bytes],
-            );
-            inserted.map_err(|cause| writer.fail(cause.into()))
+            writer.shared.read().phase().admits(Command::Journal)?;
+            writer.write(|db, _| Ok(db::insert_blob(db, blob.sha256, &bytes)?))
         };
         self.inner.core.call(insert).await??;
         Ok(blob)
@@ -486,8 +710,8 @@ impl SessionStore {
         blob: &crate::media::BlobRef,
         limit: usize,
     ) -> Result<Vec<u8>, SessionError> {
-        let (blob, db) = (*blob, self.inner.db.clone());
-        blocking(move || read_blob(&db, blob, limit)).await?
+        let blob = *blob;
+        self.snapshot(move |db| read_blob(db, blob, limit)).await
     }
 
     pub(crate) async fn store_image(
@@ -563,12 +787,11 @@ impl SessionStore {
         if !missing.is_empty() {
             // One bound for every blob loaded into a request, text or image.
             let limit = MAX_IMAGE_BYTES as usize;
-            let db = self.inner.db.clone();
-            let read = move || -> Result<Vec<_>, SessionError> {
-                let read = |blob| Ok((blob, read_blob(&db, blob, limit)?));
-                missing.into_iter().map(read).collect()
+            let read = move |db: &db::Db| {
+                let read = |blob| Ok((blob, read_blob(db, blob, limit)?));
+                missing.into_iter().map(read).collect::<Result<Vec<_>, _>>()
             };
-            for (blob, bytes) in blocking(read).await?? {
+            for (blob, bytes) in self.snapshot(read).await? {
                 cache.insert(blob, bytes);
             }
         }
@@ -587,7 +810,7 @@ impl SessionStore {
 }
 
 fn read_blob(
-    db: &SharedDb,
+    db: &db::Db,
     blob: crate::media::BlobRef,
     limit: usize,
 ) -> Result<Vec<u8>, SessionError> {
@@ -595,28 +818,12 @@ fn read_blob(
         .ok()
         .filter(|&length| length <= limit)
         .ok_or(BlobError::TooLarge.at(blob.sha256))?;
-    let bytes = db
-        .lock()
-        .query_row(
-            "SELECT bytes FROM blob WHERE sha256 = ?1",
-            db::params![blob.sha256.to_bytes().to_vec()],
-            |row| Ok(row.get::<Vec<u8>>(0)?),
-        )?
-        .ok_or(BlobError::Missing.at(blob.sha256))?;
-    if crate::media::BlobDigest::of(&bytes) != blob.sha256 {
-        return Err(BlobError::HashMismatch.at(blob.sha256));
-    }
+    let bytes = db::verified_blob(db, blob.sha256)?;
+    let bytes = bytes.map_err(|reason| reason.at(blob.sha256))?;
     if bytes.len() as u64 != blob.bytes {
         return Err(BlobError::LengthMismatch.at(blob.sha256));
     }
     Ok(bytes)
-}
-
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, SessionError> {
-    let joined = tokio::task::spawn_blocking(work).await;
-    joined.map_err(SessionError::Task)
 }
 
 /// Why a stored blob cannot be used.
@@ -669,7 +876,7 @@ pub enum SessionError {
     #[error("session writer was lost before accepting the append")]
     WriterLost,
     #[error("session task failed: {0}")]
-    Task(#[source] tokio::task::JoinError),
+    Task(#[from] tokio::task::JoinError),
     #[error("session {0} was not found")]
     NotFound(SessionId),
     #[error("session I/O failed: {0}")]
@@ -773,13 +980,83 @@ pub(crate) mod tests {
         JournalFailure(Arc::new(cause))
     }
 
-    /// Start `start`'s future in the change that applies the first record from
-    /// here on that `matches` accepts, before that commit's caller hears back or
-    /// its effects run, so what the future queues on the core first runs right
-    /// behind that commit, and returns the future's output. Its first poll runs
-    /// on the core, where it must queue work rather than read the state.
+    /// Every request `records` journal, as their rows leave it, and what folding each
+    /// record decided.
+    #[derive(Default)]
+    pub(crate) struct Folded {
+        pub(crate) requests: std::collections::BTreeMap<RequestSeq, RequestRecord>,
+        pub(crate) facts: std::collections::HashMap<RecordSeq, Fact>,
+    }
+
+    pub(crate) fn fold(records: &[Arc<EventRecord>]) -> Folded {
+        let mut ledger = ResidentLedger::default();
+        let mut agents = agent_state::AgentStates::default();
+        let facts = (records.iter())
+            .filter_map(|record| Some((record.sequence, agents.apply(record, &mut ledger)?)))
+            .collect();
+        let requests = agents.take_unwritten().requests;
+        Folded { requests, facts }
+    }
+
+    /// [`fold`] of `store`'s whole journal.
+    pub(crate) fn ledger(store: &SessionStore) -> Folded {
+        fold(&store.records())
+    }
+
+    /// The record journaled at `sequence`. Records must be in sequence order.
+    pub(crate) fn record_at(
+        records: &[Arc<EventRecord>],
+        sequence: RecordSeq,
+    ) -> Option<&EventRecord> {
+        let index = records
+            .binary_search_by_key(&sequence, |record| record.sequence)
+            .ok()?;
+        Some(&records[index])
+    }
+
+    /// The purpose of the context the request journaled as `record` was issued under,
+    /// as `records` hold it.
+    pub(crate) fn request_purpose(
+        records: &[Arc<EventRecord>],
+        record: &EventRecord,
+    ) -> Option<ModelPurpose> {
+        let SessionEvent::ModelRequested { context, .. } = &record.event else {
+            return None;
+        };
+        match &record_at(records, *context)?.event {
+            SessionEvent::ModelContext { context } => Some(context.purpose),
+            _ => None,
+        }
+    }
+
+    /// A wait on `agent`'s records, those journaled so far and each applied after,
+    /// that resolves with what `decide` makes of them once it decides.
+    pub(crate) fn on_records<T: Send + 'static>(
+        store: &SessionStore,
+        agent: &AgentId,
+        decide: impl Fn(&[Arc<EventRecord>]) -> Option<T> + Send + Sync + 'static,
+    ) -> Wait<T> {
+        let (through, feed) = store.inner.shared.observed().subscribe(agent, |_| true);
+        let journaled = (store.records().into_iter())
+            .filter(|record| record.sequence <= through && &record.agent == agent)
+            .collect::<Vec<_>>();
+        let fed = std::sync::Mutex::new((feed, journaled));
+        Wait::on([Key::Agent(agent.clone())], move |_| {
+            let (feed, records) = &mut *fed.lock().unwrap();
+            records.extend(feed.try_iter());
+            decide(records)
+        })
+    }
+
+    /// Start `start`'s future in the change that applies the first record of
+    /// `agent` from here on that `matches` accepts, before that commit's caller
+    /// hears back or its effects run, so what the future queues on the core
+    /// first runs right behind that commit, and returns the future's output. Its
+    /// first poll runs on the core, where it must queue work rather than read
+    /// the state.
     pub(crate) async fn on_commit<F, S>(
         store: &SessionStore,
+        agent: &AgentId,
         matches: fn(&SessionEvent) -> bool,
         start: S,
     ) -> impl std::future::Future<Output = F::Output> + use<F, S>
@@ -790,22 +1067,34 @@ pub(crate) mod tests {
         use tokio::sync::oneshot::channel;
         let ((armed, arming), (started, starting)) = (channel(), channel());
         let start = std::sync::Mutex::new(Some((start, started)));
-        let (mut armed, mut from) = (Some(armed), None);
-        let applied = move |state: &mut CoreState| {
-            let from = *from.get_or_insert(state.records.len());
-            armed.take().map(|armed| armed.send(()));
-            let records = &state.records[from..];
-            if !records.iter().any(|record| matches(&record.event)) {
-                return None;
-            }
-            let (start, started) = start.lock().unwrap().take()?;
-            let mut future = Box::pin(start());
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
-            started.send(future).ok()
+        let (_, feed) = store.inner.shared.observed().subscribe(agent, |_| true);
+        // What the agent's records applied so far hold, kept once one matched.
+        let fed = std::sync::Mutex::new((feed, false));
+        let from = move |_: &mut CoreState| {
+            let _ = armed.send(());
+        };
+        let key = Key::Agent(agent.clone());
+        let applied = move |()| {
+            let decide = move |_: &CoreState| {
+                let (feed, matched) = &mut *fed.lock().unwrap();
+                *matched |= feed.try_iter().any(|record| matches(&record.event));
+                matched.then_some(())
+            };
+            let take = move |_: &mut CoreState, ()| {
+                let Some((start, started)) = start.lock().unwrap().take() else {
+                    return;
+                };
+                // Erased, which keeps proving the wait `Send` and `Sync` shallow.
+                let mut future: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+                    Box::pin(start());
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+                let _ = started.send(future);
+            };
+            Wait::taking([key], decide, take)
         };
         let store = store.clone();
-        tokio::spawn(async move { store.until(applied).await });
+        tokio::spawn(async move { store.until_after(from, applied).await });
         arming.await.unwrap();
         async move { starting.await.unwrap().await }
     }
@@ -832,10 +1121,15 @@ pub(crate) mod tests {
 
     /// Reopen the session `id` and activate it, as a reopened session's first
     /// change does, so it takes appends.
-    pub(crate) async fn reopen(root: &Path, id: SessionId) -> (SessionStore, Vec<EventRecord>) {
-        let (store, records) = SessionStore::open(root, id).await.unwrap();
+    pub(crate) async fn reopen(root: &Path, id: SessionId) -> SessionStore {
+        let store = SessionStore::open(root, id).await.unwrap();
         store.enter(Command::Activate).await.unwrap();
-        (store, records)
+        store
+    }
+
+    /// `agent`'s history as the journal holds it now, read as an opening context reads it.
+    pub(crate) async fn projected(store: &SessionStore, agent: &AgentId) -> Projection {
+        store.open_history(agent).await.unwrap().projection
     }
 
     /// Journal a session start and its root agent; returns the root.
@@ -907,14 +1201,14 @@ pub(crate) mod tests {
         SessionEvent::ModelAttemptStarted(AttemptRef { request, attempt })
     }
 
-    pub(crate) fn record(agent: &AgentId, sequence: u64, event: SessionEvent) -> EventRecord {
-        EventRecord {
+    pub(crate) fn record(agent: &AgentId, sequence: u64, event: SessionEvent) -> Arc<EventRecord> {
+        Arc::new(EventRecord {
             id: crate::identity::EventId::generate().unwrap(),
             sequence: sequence.into(),
             timestamp_millis: 0,
             agent: agent.clone(),
             event,
-        }
+        })
     }
 
     /// Job `job` created for `role` in the root workspace; only an agent job
@@ -1016,6 +1310,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Whether the journal takes `event` as `agent`'s next record, by the rules an
+    /// append validates it with.
+    pub(crate) fn admitted(
+        store: &SessionStore,
+        agent: &AgentId,
+        event: SessionEvent,
+    ) -> Result<(), SessionError> {
+        let sequence = store.read(CoreState::next_sequence);
+        let record = record(agent, sequence.get(), event);
+        request::validate(&store.outputs().lock(), &record)
+    }
+
     pub(crate) fn sequences(projection: &Projection) -> Vec<u64> {
         projection
             .messages
@@ -1046,7 +1352,7 @@ pub(crate) mod tests {
         let replay = runtime()
             .unwrap()
             .block_on(SessionStore::open(&sessions, id));
-        let last = replay.unwrap().1.pop().unwrap();
+        let last = replay.unwrap().records().pop().unwrap();
         assert!(matches!(last.event, SessionEvent::AgentInterrupted));
     }
 
@@ -1068,7 +1374,6 @@ pub(crate) mod tests {
         let crate::agent::RuntimeEvent::Record(record) = events.recv().await.unwrap().event else {
             panic!("only records were published");
         };
-        let record = *record;
         assert_eq!(record.sequence, sequence);
         assert_eq!(store.records().last(), Some(&record));
         let closed = store.append(agent, SessionEvent::AgentCompleted).await;
@@ -1077,7 +1382,7 @@ pub(crate) mod tests {
             Err(SessionError::Refused(SessionPhase::Closed))
         ));
         drop(store);
-        let (_, replay) = SessionStore::open(&sessions, id).await.unwrap();
+        let replay = SessionStore::open(&sessions, id).await.unwrap().records();
         assert_eq!(replay.last(), Some(&record));
     }
 
@@ -1088,7 +1393,7 @@ pub(crate) mod tests {
         let (reached, publishing) = tokio::sync::oneshot::channel();
         let (resume, resumed) = tokio::sync::oneshot::channel::<()>();
         let entries = vec![(agent, SessionEvent::AgentInterrupted)];
-        let live = move |_: &mut CoreState, _: &[EventRecord]| {
+        let live = move |_: &mut CoreState, _: &[Arc<EventRecord>]| {
             let _ = reached.send(());
             let _ = resumed.blocking_recv();
         };
@@ -1103,19 +1408,154 @@ pub(crate) mod tests {
         appending.await.unwrap().unwrap();
     }
 
+    /// Park the core until the returned sender is used, which then leaves the
+    /// commands queued meanwhile to run as one group; the handle ends with the park.
+    async fn parked(
+        store: &SessionStore,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (parked, parking) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel::<()>();
+        let store = store.clone();
+        let park = tokio::spawn(async move {
+            let park = move |_: &mut CoreState| {
+                let _ = parked.send(());
+                let _ = resumed.recv();
+            };
+            store.live(park).await
+        });
+        parking.await.unwrap();
+        (resume, park)
+    }
+
+    /// The commands queued together commit as one group, which one sync makes
+    /// durable, each planned against the state the ones before it leave: one its
+    /// plan refuses is refused alone, and the others commit and reply in order.
+    #[tokio::test]
+    async fn a_refused_plan_in_a_group_leaves_its_neighbours_committed() {
+        let (_root, store, _id, agent) = fresh().await;
+        let syncs = || {
+            store
+                .inner
+                .core
+                .call(|writer: &mut core::Writer| writer.syncs)
+        };
+        let before = syncs().await.unwrap();
+        let (resume, park) = parked(&store).await;
+        // Each queues as it is first polled.
+        let mut first = Box::pin(store.append(agent.clone(), SessionEvent::AgentInterrupted));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let (seen, saw) = tokio::sync::oneshot::channel();
+        let refusing = move |state: &CoreState| {
+            let _ = seen.send(state.next_sequence());
+            Err::<Plan<()>, _>(SessionError::WrongSession)
+        };
+        let mut refused = Box::pin(store.commit(Command::Journal, refusing));
+        assert!(futures_util::poll!(&mut refused).is_pending());
+        let mut last = Box::pin(store.append(agent.clone(), SessionEvent::AgentCompleted));
+        assert!(futures_util::poll!(&mut last).is_pending());
+        resume.send(()).unwrap();
+        crate::tests::bounded(park).await.unwrap();
+        let first = crate::tests::bounded(first).await.unwrap();
+        assert!(matches!(
+            crate::tests::bounded(refused).await,
+            Err(SessionError::WrongSession)
+        ));
+        let last = crate::tests::bounded(last).await.unwrap();
+        assert_eq!(saw.await.unwrap(), first.sequence.next());
+        assert_eq!(last.sequence, first.sequence.next());
+        let records = store.records();
+        assert_eq!(&records[records.len() - 2..], [first, last]);
+        assert_eq!(syncs().await.unwrap(), before + 1);
+    }
+
+    /// A group whose sync fails stops the session: what committed in it reports
+    /// the failure, and so do a drain and a close queued behind it.
+    #[tokio::test]
+    async fn a_failed_group_sync_fails_the_drain_and_close_behind_its_commits() {
+        let (_root, store, _id, agent) = fresh().await;
+        let (resume, park) = parked(&store).await;
+        store.inner.db.fail_syncs();
+        let mut appended = Box::pin(store.append(agent, SessionEvent::AgentInterrupted));
+        assert!(futures_util::poll!(&mut appended).is_pending());
+        let mut drained = Box::pin(store.drain());
+        assert!(futures_util::poll!(&mut drained).is_pending());
+        let mut closed = Box::pin(store.close());
+        assert!(futures_util::poll!(&mut closed).is_pending());
+        resume.send(()).unwrap();
+        crate::tests::bounded(park).await.unwrap();
+        let Err(SessionError::JournalFailed(failure)) = crate::tests::bounded(appended).await
+        else {
+            panic!("the append reported success");
+        };
+        assert!(matches!(
+            failure.cause(),
+            SessionError::Unconfirmed(Some(_))
+        ));
+        let same =
+            |result| matches!(result, Err(SessionError::JournalFailed(later)) if later == failure);
+        assert!(same(crate::tests::bounded(drained).await));
+        assert!(same(crate::tests::bounded(closed).await));
+    }
+
+    /// Checkpoints run beside the writer and never block it below the restart threshold
+    /// or a reader: a read's snapshot keeps the frames committed after it in the log,
+    /// while every commit meanwhile completes; once it ends, the log is copied and
+    /// starts over.
+    #[tokio::test]
+    async fn checkpoints_keep_the_log_bounded_beside_a_held_reader() {
+        let (_root, store, _id, agent) = fresh().await;
+        let passed = || store.inner.db.test_passed();
+        let append = || store.append(agent.clone(), SessionEvent::AgentInterrupted);
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let reads = store.test_reads();
+        let reader = std::thread::spawn(move || {
+            reads.read(|db| {
+                db.query_row("SELECT count(*) FROM entry", Vec::new(), |_| Ok(()))?;
+                held.send(()).unwrap();
+                let _ = released.recv();
+                Ok(())
+            })
+        });
+        holding.recv().unwrap();
+        // Checkpoints keep running, and copy none of what the reader may still read.
+        let held_back = |frames: Option<db::Frames>| {
+            frames.is_some_and(|frames| frames.uncopied() > 2 * db::CHECKPOINT_FRAMES)
+        };
+        crate::tests::bounded(async {
+            while !held_back(passed()) {
+                append().await.unwrap();
+            }
+        })
+        .await;
+        release.send(()).unwrap();
+        reader.join().unwrap().unwrap();
+        // The next checkpoint copies the whole log, and a commit after it starts it over.
+        let restarted = |frames: Option<db::Frames>| {
+            frames.is_some_and(|frames| frames.logged < db::CHECKPOINT_FRAMES)
+        };
+        crate::tests::bounded(async {
+            while !restarted(passed()) {
+                append().await.unwrap();
+            }
+        })
+        .await;
+    }
+
     /// Every writer failure stops the session: the command that met it reports
     /// it, as does every later write, a blob's too, and closing, which still
     /// frees the session; every wait resolves with it. The connection takes no
     /// more writes, and the failed change applies nothing live, not even what it
-    /// deferred. Reopening sees exactly what committed, and a session whose only
-    /// append failed is kept exactly when that append committed.
+    /// deferred. Reopening sees exactly what committed, which the failed session
+    /// already shows, and a session whose only append failed is kept exactly when
+    /// that append committed.
     #[tokio::test]
     async fn every_writer_failure_stops_the_journal_and_reopen_sees_what_committed() {
         use std::sync::atomic::{AtomicBool, Ordering};
         enum Fault {
             /// Committed, then failed before it applied.
             Unconfirmed,
-            /// A child that never started owns no rows: the schema rejects it.
+            /// A row its fold writes is refused, after the fold.
             Rejected,
             /// Lost while planning, before it was accepted.
             Lost,
@@ -1139,15 +1579,15 @@ pub(crate) mod tests {
             let (root, store, id, agent) = fresh().await;
             let sessions = root.path().join("sessions");
             let before = store.records();
+            let mut attached = store.observe().updates;
             let interrupted = || SessionEvent::AgentInterrupted;
-            let waiting = store.until(|_| None::<()>);
+            let waiting = store.until(Wait::on([], |_| None::<()>));
             let mut waiting = Box::pin(waiting);
             assert!(futures_util::poll!(&mut waiting).is_pending());
-            let applied = matches!(fault, Fault::Applied);
             let live = Arc::new(AtomicBool::new(false));
             let journal = |agent: AgentId| {
                 let (ran, entries) = (live.clone(), vec![(agent, interrupted())]);
-                let live = move |_: &mut CoreState, _: &[EventRecord]| {
+                let live = move |_: &mut CoreState, _: &[Arc<EventRecord>]| {
                     ran.store(true, Ordering::SeqCst);
                 };
                 store.commit::<(), SessionError>(Command::Journal, move |_| {
@@ -1159,7 +1599,10 @@ pub(crate) mod tests {
                     store.fail_committed().await;
                     (journal(agent.clone()).await, true)
                 }
-                Fault::Rejected => (journal(agent.child(9)).await, false),
+                Fault::Rejected => {
+                    let _refused = refuse(&store, "BEFORE INSERT ON agent_state");
+                    (journal(agent.clone()).await, false)
+                }
                 Fault::Lost => {
                     let lost = |_| panic!("injected loss before acceptance");
                     let failed = store.append_then(agent.clone(), interrupted(), lost).await;
@@ -1205,12 +1648,28 @@ pub(crate) mod tests {
             assert!(written.is_err(), "the connection still takes writes");
             assert!(!live.load(Ordering::SeqCst), "a failed change applied live");
             assert_eq!(
-                store.read(|state| state.phase.clone()),
+                store.read(|state| state.phase().clone()),
                 SessionPhase::Failed(failure.clone())
             );
-            assert_eq!(store.records().len(), before.len() + usize::from(applied));
+            // An observation attached before the failure is told it no longer follows
+            // the session; observing again shows what reopening does.
+            let told = std::iter::from_fn(|| attached.try_recv().ok()).any(|update| {
+                matches!(
+                    update.event,
+                    crate::agent::RuntimeEvent::Phase(SessionPhase::Failed(_))
+                )
+            });
+            assert!(told, "the failure is published");
+            let shown = |store: &SessionStore| {
+                let root = |state: &CoreState| state.agent_states.get(&agent).cloned();
+                let snapshot = store.observe().snapshot;
+                (store.read(root), snapshot.applied, snapshot.requests)
+            };
+            let failed = shown(&store);
             assert!(same(store.close().await));
-            let (reopened, replay) = reopen(&sessions, id).await;
+            let reopened = reopen(&sessions, id).await;
+            assert_eq!(shown(&reopened), failed);
+            let replay = reopened.records();
             assert_eq!(replay.len(), before.len() + usize::from(durable));
             let appended = reopened.append(agent.clone(), interrupted()).await.unwrap();
             assert_eq!(appended.sequence.get(), replay.len() as u64 + 1);
@@ -1243,7 +1702,7 @@ pub(crate) mod tests {
             }
         }
         let (_root, store, _, agent) = tests::fresh().await;
-        let mut waiting = Box::pin(store.until(|_| None::<()>));
+        let mut waiting = Box::pin(store.until(Wait::on([], |_| None::<()>)));
         assert!(futures_util::poll!(&mut waiting).is_pending());
         store.drain().await.unwrap();
         let woken = Arc::new(Woken(tokio::sync::Notify::new()));
@@ -1251,7 +1710,7 @@ pub(crate) mod tests {
         let mut poll = || (waiting.as_mut()).poll(&mut std::task::Context::from_waker(&waker));
         assert!(poll().is_pending(), "registered");
         // The predicate holds the connection, from another thread, before it panics.
-        let (db, before) = (store.outputs(), store.records().len());
+        let (db, before) = (store.outputs(), store.read(CoreState::next_sequence));
         let held = Arc::new(std::sync::Barrier::new(2));
         let (release, released) = std::sync::mpsc::channel::<()>();
         let holding = held.clone();
@@ -1261,14 +1720,17 @@ pub(crate) mod tests {
             holding.wait();
             let _ = released.recv();
         });
-        let mut panicking = Box::pin(store.until(move |state: &mut CoreState| {
-            if state.records.len() > before {
-                held.wait();
-                held.wait();
-                panic!("injected predicate panic");
-            }
-            None::<()>
-        }));
+        let mut panicking = Box::pin(store.until(Wait::on(
+            [Key::Agent(agent.clone())],
+            move |state| {
+                if state.next_sequence() > before {
+                    held.wait();
+                    held.wait();
+                    panic!("injected predicate panic");
+                }
+                None::<()>
+            },
+        )));
         assert!(futures_util::poll!(&mut panicking).is_pending());
         store.drain().await.unwrap();
         let mut appending = Box::pin(store.append(agent, SessionEvent::AgentInterrupted));
@@ -1303,8 +1765,8 @@ pub(crate) mod tests {
             late,
             Err(SessionError::Refused(SessionPhase::Closed))
         ));
-        let (reopened, records) = reopen(&sessions, id).await;
-        assert_eq!(records.len(), 5);
+        let reopened = reopen(&sessions, id).await;
+        assert_eq!(reopened.records().len(), 5);
         let late = store.store_blob(b"late").await;
         assert!(matches!(
             late,
@@ -1343,10 +1805,10 @@ pub(crate) mod tests {
         // Model a descriptor briefly inherited by a concurrently spawned process.
         let inherited_lock = store.inherit_lock().await.unwrap();
         drop(store);
-        let (store, records) = reopen(&sessions, id).await;
+        let store = reopen(&sessions, id).await;
         drop(inherited_lock);
         assert!(SessionStore::is_open(&sessions, id).await.unwrap());
-        assert_eq!(records, read);
+        assert_eq!(store.records(), read);
         let appended = store
             .append(agent, SessionEvent::AgentCompleted)
             .await
@@ -1368,7 +1830,7 @@ pub(crate) mod tests {
         // The core, as resume reads it, agrees with the session list throughout.
         let stopped = async || {
             let listed = SessionStore::summary(&sessions, id).await.unwrap();
-            let read = store.read(|state| crate::agent::stopped_turn(state, &agent));
+            let read = store.read(|state| state.stopped_turn(&agent));
             assert_eq!(read, listed.stopped);
             listed.stopped
         };
@@ -1456,6 +1918,44 @@ pub(crate) mod tests {
         assert_eq!(stopped().await, Some(TurnFailure::Failed(failure.clone())));
     }
 
+    /// The core validates a request on a connection of its own, so the request
+    /// commits while long reads hold every pooled connection and more wait behind them.
+    #[tokio::test]
+    async fn a_request_commits_while_long_reads_hold_every_read_connection() {
+        let (_root, store, _, agent) = fresh().await;
+        let context = ModelContext::test(ModelPurpose::Agent, profile());
+        let event = SessionEvent::ModelContext { context };
+        let context = store.append(agent.clone(), event).await.unwrap().sequence;
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let closed = gate.clone().write_owned().await;
+        let (started, mut reading) = tokio::sync::mpsc::unbounded_channel();
+        let long_reads: Vec<_> = (0..=db::CONNECTIONS)
+            .map(|_| {
+                let (reads, gate, started) = (store.reads(), gate.clone(), started.clone());
+                let read = move |_: &db::Db| {
+                    started.send(()).unwrap();
+                    drop(gate.blocking_read());
+                    Ok(())
+                };
+                let held = reads.clone();
+                tokio::spawn(async move {
+                    held.hold(move || Ok::<_, SessionError>(reads.read(read)?))
+                        .await
+                })
+            })
+            .collect();
+        for _ in 0..db::CONNECTIONS {
+            crate::tests::bounded(reading.recv()).await.unwrap();
+        }
+        crate::tests::bounded(store.append(agent, requested(context)))
+            .await
+            .unwrap();
+        drop(closed);
+        for read in long_reads {
+            read.await.unwrap().unwrap();
+        }
+    }
+
     /// The user's title holds until cleared, whatever automatic titles follow;
     /// otherwise the newest automatic title shows, and before any, the first prompt.
     /// Each reports where it came from.
@@ -1502,7 +2002,7 @@ pub(crate) mod tests {
         drop(store);
         let path = sessions.join(id.to_string()).join(DATABASE_FILE);
         for pragma in [
-            "user_version = 11",
+            "user_version = 23",
             "user_version = 3",
             "application_id = 1",
         ] {
@@ -1526,6 +2026,82 @@ pub(crate) mod tests {
                 Err(SessionError::UnsupportedVersion(_))
             ));
             assert_eq!(std::fs::read(&path).unwrap(), archive);
+        }
+    }
+
+    /// A job's status row says whether it stays resident from the transaction that
+    /// changes it, through a restart, and the next open holds only the jobs it names.
+    #[tokio::test]
+    async fn status_rows_name_the_jobs_reopening_holds() {
+        use crate::job::{JobEnd, JobRole, JobTransition};
+        let (root, store, id, agent) = fresh().await;
+        let resident = |store: &SessionStore| {
+            let sql = "SELECT job FROM job_status WHERE resident ORDER BY job";
+            let read = |db: &db::Db| db.query(sql, Vec::new(), |row| Ok(row.get::<u64>(0)?));
+            store.test_reads().read(read).unwrap()
+        };
+        let held =
+            |store: &SessionStore, job| store.read(|state| state.jobs.unheld([job]).is_empty());
+        let job = JobId::new(1).unwrap();
+        let append = async |event| store.append(agent.clone(), event).await.unwrap();
+        let moved = |state| SessionEvent::JobStateChanged { job, state };
+        let completed = || SessionEvent::JobFinished {
+            job,
+            state: JobEnd::Completed,
+            diagnostic: None,
+            images: Vec::new(),
+        };
+        append(job_created(job, JobRole::Tool)).await;
+        append(moved(JobTransition::AwaitingApproval)).await;
+        append(moved(JobTransition::Running)).await;
+        append(completed()).await;
+        assert_eq!(resident(&store), [1]);
+        append(SessionEvent::JobClaimed { job }).await;
+        assert_eq!(resident(&store), Vec::<u64>::new());
+        assert!(!held(&store, job));
+        append(moved(JobTransition::Running)).await;
+        assert_eq!(resident(&store), [1]);
+        append(completed()).await;
+        append(SessionEvent::JobClaimed { job }).await;
+        let running = JobId::new(2).unwrap();
+        append(job_created(running, JobRole::Tool)).await;
+        store.close().await.unwrap();
+        let reopened = reopen(&root.path().join("sessions"), id).await;
+        assert_eq!(resident(&reopened), [2]);
+        assert!(!held(&reopened, job) && held(&reopened, running));
+    }
+
+    /// Each agent's entries count from 0 without gaps, across a reopen.
+    #[tokio::test]
+    async fn agent_ordinals_count_each_agents_entries_across_reopening() {
+        let (root, store, id, agent) = fresh().await;
+        let status = || SessionEvent::Status {
+            message: "status".into(),
+        };
+        let child = start_child(&store, &agent, 1, None, root.path()).await;
+        for agent in [&agent, &child, &agent] {
+            store.append(agent.clone(), status()).await.unwrap();
+        }
+        store.close().await.unwrap();
+        let store = reopen(&root.path().join("sessions"), id).await;
+        let both = vec![(child, status()), (agent, status())];
+        store.append_all(both).await.unwrap();
+        let ordinals = "SELECT agent, agent_ordinal FROM entry ORDER BY seq";
+        let read = |db: &db::Db| {
+            db.query(ordinals, Vec::new(), |row| {
+                Ok((row.get::<i64>(0)?, row.get::<u64>(1)?))
+            })
+        };
+        let mut by_agent = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (agent, ordinal) in store.test_reads().read(read).unwrap() {
+            by_agent.entry(agent).or_default().push(ordinal);
+        }
+        assert_eq!(by_agent.len(), 2);
+        for ordinals in by_agent.values() {
+            assert!(
+                ordinals.iter().copied().eq(0..ordinals.len() as u64),
+                "{ordinals:?}"
+            );
         }
     }
 }

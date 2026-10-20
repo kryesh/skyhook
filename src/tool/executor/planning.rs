@@ -926,8 +926,8 @@ pub(super) mod tests {
                 }
             };
             // How listing every job shows the latest, but for its id.
-            let latest = || {
-                let jobs = executor.jobs().list(&runtime.agent);
+            let latest = async || {
+                let jobs = executor.jobs().list(&runtime.agent).await.unwrap();
                 let job = jobs.into_iter().max_by_key(|job| job.id)?;
                 let mut view = job.metadata_view(executor.diagnostic_viewer()).into_value();
                 view.as_object_mut()?.remove("id");
@@ -956,7 +956,7 @@ pub(super) mod tests {
             for (tool, arguments, made, kind) in &calls {
                 let _ = std::fs::remove_dir_all(made);
                 let _ = std::fs::remove_file(made);
-                let (missing, missing_job) = (call(tool, arguments).await, latest());
+                let (missing, missing_job) = (call(tool, arguments).await, latest().await);
                 match kind {
                     Made::File => std::fs::write(made, "outside").unwrap(),
                     Made::Directory => std::fs::create_dir(made).unwrap(),
@@ -971,7 +971,7 @@ pub(super) mod tests {
                     // Nor does its refused job, however its path is spelled.
                     (_, Err((denied, Cause::Denied(_)))) => {
                         let missing = (missing.map_err(|(output, _)| output), missing_job);
-                        assert_eq!(missing, (Err(denied), latest()), "{arguments}");
+                        assert_eq!(missing, (Err(denied), latest().await), "{arguments}");
                     }
                     (_, existing) => panic!("{arguments} was not denied: {existing:?}"),
                 }
@@ -1090,6 +1090,6 @@ pub(super) mod tests {
             "{error:?}"
         );
         assert!(policy.requests.lock().unwrap().is_empty());
-        assert!(runtime.jobs.list(&runtime.agent).is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
     }
 }

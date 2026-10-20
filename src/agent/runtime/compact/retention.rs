@@ -1,19 +1,15 @@
 //! Preserve whole available tool exchanges and identify outputs already carried by history.
 use crate::{
-    agent::CompactionError,
-    identity::{AgentId, JobId},
+    identity::JobId,
     job::JobView,
-    session::{
-        CheckpointError, EventRecord, Message, MessageSeq, ModelCallOrigin, Projected, RecordSeq,
-        RequestLedger, SessionEvent,
-    },
+    session::{CompletedRequest, Message, MessageSeq, Projected, Projection, RecordSeq},
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// An original message selected from one immutable journal snapshot.
-/// Only retention can construct the sequence/payload pair; no payload is cloned.
+/// An original message the checkpoint retains, and its payload, borrowed from the
+/// history it was selected from.
 pub(super) struct RetainedSource<'a> {
     sequence: MessageSeq,
     message: &'a Message,
@@ -48,101 +44,60 @@ pub(super) enum Retain {
     LastExchange,
 }
 
-/// Select complete original exchanges, including creators no longer in the visible tail,
-/// with sizes inferred from what the provider reported. Within a budget, the messages
-/// after the last reported request are kept whole; older exchanges join them while the
-/// growth between the prompts of the requests around them fits. The walk stops at the
-/// first exchange the reports cannot size: one between requests of different model
-/// contexts, or whose prompts did not grow, as when a smaller state replaced a larger one.
+/// Select complete original exchanges of `projected`, the agent's history, with sizes
+/// inferred from what the provider reported for `requests`, those completed since its
+/// checkpoint, beside `exchanges`, those of creators the checkpoint must keep, wherever
+/// they are. Within a budget, the messages after the last reported request are kept
+/// whole; older exchanges join them while the growth between the prompts of the
+/// requests around them fits. The walk stops at the first exchange the reports cannot
+/// size: one between requests of different model contexts, or whose prompts did not
+/// grow, as when a smaller state replaced a larger one.
 pub(super) fn retained_sources<'a>(
-    records: &'a [EventRecord],
-    agent: &AgentId,
-    projected: &[Projected],
-    origins: &[ModelCallOrigin],
+    projected: &'a Projection,
+    requests: &[CompletedRequest],
+    exchanges: &'a [(MessageSeq, Message)],
     retain: Retain,
-) -> Result<Vec<RetainedSource<'a>>, CompactionError> {
-    let originals: Vec<_> = records
-        .iter()
-        .filter_map(|record| {
-            if &record.agent != agent {
-                return None;
-            }
-            // Retention keeps conversation: a committed state is stale once the next
-            // request sends its own, and must not stand for the latest exchange.
-            match &record.event {
-                SessionEvent::MessageCommitted { message }
-                    if !matches!(message, Message::State(_)) =>
-                {
-                    Some((record.sequence, message))
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    let original_ids: BTreeSet<_> = originals.iter().map(|(id, _)| *id).collect();
-    let visible: Vec<_> = projected
-        .iter()
-        .filter(|projected| original_ids.contains(&projected.sequence))
+) -> Vec<RetainedSource<'a>> {
+    // Retention keeps conversation: a committed state is stale once the next request
+    // sends its own, and must not stand for the latest exchange.
+    let visible: Vec<_> = (projected.commits().iter())
+        .filter(|projected| !matches!(projected.message, Message::State(_)))
         .collect();
     // At least the last message stays, however large.
     let last = visible.len().saturating_sub(1);
     let mut start = match retain {
-        Retain::Within(budget) => reported_start(records, agent, &visible, budget).min(last),
+        Retain::Within(budget) => reported_start(requests, &visible, budget).min(last),
         Retain::LastExchange => last,
     };
-    let mut retained = BTreeSet::new();
     // Per-call results follow their assistant call; keep the whole exchange.
     while start < visible.len() && start > 0 && matches!(visible[start].message, Message::Tool(_)) {
         start -= 1;
     }
-    retained.extend(visible[start..].iter().map(|projected| projected.sequence));
-    // The store rejects a checkpoint whose retained exchange is incomplete.
-    for origin in origins {
-        let index = originals
-            .iter()
-            .position(|(id, _)| *id == RecordSeq::from(origin.message))
-            .ok_or(CheckpointError::RetainedSource)?;
-        let exchange = originals[index + 1..]
-            .iter()
-            .take_while(|(_, message)| matches!(message, Message::Tool(_)));
-        retained.insert(RecordSeq::from(origin.message));
-        retained.extend(exchange.map(|(sequence, _)| *sequence));
-    }
-    let mut sources: Vec<_> = originals
-        .into_iter()
-        .filter(|(sequence, _)| retained.contains(sequence))
-        .map(|(sequence, message)| RetainedSource {
-            sequence: sequence.message(),
-            message,
-        })
+    let mut sources: BTreeMap<_, _> = (visible[start..].iter())
+        .map(|projected| (projected.sequence.message(), &projected.message))
         .collect();
-    sources.sort_unstable_by_key(|source| source.sequence);
-    Ok(sources)
+    // The store rejects a checkpoint whose retained exchange is incomplete.
+    sources.extend(
+        exchanges
+            .iter()
+            .map(|(sequence, message)| (*sequence, message)),
+    );
+    (sources.into_iter())
+        .map(|(sequence, message)| RetainedSource { sequence, message })
+        .collect()
 }
 
 /// Where the retained messages begin among `visible` within `budget`: after the last
 /// reported request, or earlier while the reports size the exchanges before it.
-fn reported_start(
-    records: &[EventRecord],
-    agent: &AgentId,
-    visible: &[&Projected],
-    budget: u64,
-) -> usize {
-    let checkpoint = records.iter().rev().find(|record| {
-        &record.agent == agent && matches!(record.event, SessionEvent::Compaction { .. })
-    });
-    let since = checkpoint.map_or(RecordSeq::default(), |record| record.sequence);
+fn reported_start(requests: &[CompletedRequest], visible: &[&Projected], budget: u64) -> usize {
     // The prompts the agent's requests since its checkpoint reported for the responses
     // they committed, in order, each with where its new messages begin among the visible
     // ones and the model context it was sent under: requests under one share their
     // system prompt, tools and model, so only their prompts are comparable.
-    let ledger = RequestLedger::of(records);
-    let own = (ledger.iter()).filter(|(request, requested)| {
-        &requested.agent == agent && RecordSeq::from(*request) > since
-    });
-    let boundaries: Vec<_> = own
-        .filter_map(|(_, requested)| {
-            let prompt = requested.phase.completed_usage()?.prompt_tokens()?;
+    let boundaries: Vec<_> = requests
+        .iter()
+        .filter_map(|requested| {
+            let prompt = requested.usage?.prompt_tokens()?;
             let through = requested
                 .through
                 .map_or(RecordSeq::default(), RecordSeq::from);
@@ -263,50 +218,63 @@ mod tests {
     use super::*;
     use crate::provider::codec::common::tests::envelope;
     use crate::provider::protocol::{AssistantItem, Binding, ReplayFormat, ToolCall, ToolResult};
-    use crate::session::{ModelPurpose, UserPart};
+    use crate::session::{SessionEvent, UserPart};
     use serde_json::json;
-
-    fn committed(agent: &AgentId, messages: impl IntoIterator<Item = Message>) -> Vec<EventRecord> {
-        let committed = |(i, message)| {
-            let event = SessionEvent::MessageCommitted { message };
-            crate::session::tests::record(agent, i as u64 + 1, event)
-        };
-        messages.into_iter().enumerate().map(committed).collect()
-    }
 
     fn user(text: String) -> Message {
         Message::User(vec![UserPart::Text { text }])
+    }
+
+    /// History holding `messages`, committed at the sequences each names.
+    fn history(messages: impl IntoIterator<Item = (u64, Message)>) -> Projection {
+        let messages = messages.into_iter();
+        Projection {
+            checkpoint: None,
+            messages: messages
+                .map(|(sequence, message)| Projected::unbound(sequence.into(), message))
+                .collect(),
+        }
+    }
+
+    fn sequences(retained: Vec<RetainedSource<'_>>) -> Vec<u64> {
+        (retained.into_iter())
+            .map(|source| source.into_sequence().get())
+            .collect()
+    }
+
+    fn call(id: &str, index: u32) -> AssistantItem {
+        AssistantItem::tool_call(id, index, ToolCall::new(id, "read", json!({})).unwrap())
+    }
+
+    fn result(id: &str) -> Message {
+        Message::Tool(ToolResult {
+            call_id: id.into(),
+            name: "read".into(),
+            result: json!("ok"),
+            images: vec![],
+            is_error: false,
+        })
     }
 
     /// A state committed before a request that then overflowed is not the latest
     /// exchange: the input before it is.
     #[test]
     fn committed_state_is_never_the_retained_exchange() {
-        let agent = AgentId::root(crate::identity::SessionId::from_bytes([1; 16]));
         let state = crate::session::RuntimeState {
             date: "2026-10-11".into(),
             jobs: vec![],
             todos: vec![],
             location: crate::execution::ExecutionLocation::root("/".into()),
         };
-        let messages = [user("look".into()), Message::State(state)];
-        let records = committed(&agent, messages.clone());
-        let projected: Vec<_> = (1u64..)
-            .zip(messages)
-            .map(|(sequence, message)| Projected::unbound(sequence.into(), message))
-            .collect();
+        let projected = history([(1, user("look".into())), (2, Message::State(state))]);
         for retain in [Retain::LastExchange, Retain::Within(8_000)] {
-            let retained = retained_sources(&records, &agent, &projected, &[], retain).unwrap();
-            let retained: Vec<_> = (retained.into_iter())
-                .map(|source| source.into_sequence().get())
-                .collect();
-            assert_eq!(retained, [1], "{retain:?}");
+            let retained = retained_sources(&projected, &[], &[], retain);
+            assert_eq!(sequences(retained), [1], "{retain:?}");
         }
     }
 
     #[test]
     fn active_exchange_retains_complete_reasoning_bundle_outside_visible_tail() {
-        let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
         for format in ReplayFormat::ALL {
             let payload = json!({"opaque":"must survive", "signature":"signed"});
             let replay = envelope(format, "model", payload, Binding::Free);
@@ -322,29 +290,14 @@ mod tests {
                 images: vec![],
                 is_error: false,
             });
-            let tail = user("tail".repeat(10_000));
-            let records = committed(&agent, [exchange.clone(), results.clone(), tail.clone()]);
             // Active creator is no longer visible after an earlier compaction.
-            let origin = ModelCallOrigin {
-                message: 1.into(),
-                call_id: "call".into(),
-            };
-            let retained = retained_sources(
-                &records,
-                &agent,
-                &[Projected::unbound(3.into(), tail)],
-                &[origin],
-                Retain::Within(8_000),
-            )
-            .unwrap();
-            let sequences = retained
-                .iter()
-                .map(|source| source.sequence.get())
-                .collect::<Vec<_>>();
-            assert_eq!(sequences, vec![1, 2, 3]);
+            let projected = history([(3, user("tail".repeat(10_000)))]);
+            let exchanges = [(1.into(), exchange.clone()), (2.into(), results.clone())];
+            let retained = retained_sources(&projected, &[], &exchanges, Retain::Within(8_000));
             // Original message identity is retained, not a visible-only reconstruction.
             assert_eq!(retained[0].message(), &exchange);
             assert_eq!(retained[1].message(), &results);
+            assert_eq!(sequences(retained), [1, 2, 3]);
         }
     }
 
@@ -353,210 +306,129 @@ mod tests {
     /// at an exchange the reports cannot size.
     #[test]
     fn retention_sizes_exchanges_by_reported_prompt_growth() {
-        use crate::session::{AttemptRef, CompletedOutcome, ModelContext, tests};
-        let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
-        let call = |id: &str| {
-            let call = ToolCall::new(id, "read", json!({})).unwrap();
-            Message::Assistant(vec![AssistantItem::tool_call(id, 0, call)])
-        };
-        let result = |id: &str| {
-            Message::Tool(ToolResult {
-                call_id: id.into(),
-                name: "read".into(),
-                result: json!("ok"),
-                images: vec![],
-                is_error: false,
-            })
-        };
-        let commit = |message| SessionEvent::MessageCommitted { message };
-        let requested = |through: u64| SessionEvent::ModelRequested {
+        let projected = history([
+            (1, user("start".into())),
+            (6, Message::Assistant(vec![call("a", 0)])),
+            (8, result("a")),
+            (12, Message::Assistant(vec![call("b", 0)])),
+            (14, result("b")),
+            (18, user("answer".into())),
+        ]);
+        let reported = |through: u64, prompt| CompletedRequest {
             context: 2.into(),
-            checkpoint: None,
             through: Some(RecordSeq::from(through).message()),
-            from: None,
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
+            usage: Some(crate::session::tests::usage(prompt, 0, 0)),
         };
-        let attempt = |request: u64| AttemptRef {
-            request: RecordSeq::from(request).request(),
-            attempt: 1,
+        let requests = [reported(1, 1_000), reported(8, 5_000), reported(14, 6_000)];
+        let kept = |requests: &[CompletedRequest], projected: &Projection, budget| {
+            sequences(retained_sources(
+                projected,
+                requests,
+                &[],
+                Retain::Within(budget),
+            ))
         };
-        let usage = |request: u64, prompt| SessionEvent::Usage {
-            request: RecordSeq::from(request).request(),
-            usage: tests::usage(prompt, 0, 0),
-        };
-        let completed = |request: u64, message: u64| SessionEvent::ResponseCompleted {
-            attempt: attempt(request),
-            message: RecordSeq::from(message).message(),
-            outcome: CompletedOutcome::Answer,
-        };
-        let context = ModelContext::test(ModelPurpose::Agent, tests::profile());
-        let events = [
-            commit(user("start".into())),
-            SessionEvent::ModelContext { context },
-            requested(1),
-            SessionEvent::ModelAttemptStarted(attempt(3)),
-            usage(3, 1_000),
-            commit(call("a")),
-            completed(3, 6),
-            commit(result("a")),
-            requested(8),
-            SessionEvent::ModelAttemptStarted(attempt(9)),
-            usage(9, 5_000),
-            commit(call("b")),
-            completed(9, 12),
-            commit(result("b")),
-            requested(14),
-            SessionEvent::ModelAttemptStarted(attempt(15)),
-            usage(15, 6_000),
-            commit(user("answer".into())),
-            completed(15, 18),
-        ];
-        let records: Vec<_> = (events.into_iter().enumerate())
-            .map(|(index, event)| tests::record(&agent, index as u64 + 1, event))
-            .collect();
-        let mut projected: Vec<_> = (records.iter())
-            .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted { message } => {
-                    Some(Projected::unbound(record.sequence, message.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let sequences = |records: &[EventRecord], projected: &[Projected], budget| {
-            let retain = Retain::Within(budget);
-            let retained = retained_sources(records, &agent, projected, &[], retain).unwrap();
-            (retained.into_iter())
-                .map(|source| source.into_sequence().get())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(sequences(&records, &projected, 8_000), [6, 8, 12, 14, 18]);
-        assert_eq!(sequences(&records, &projected, 2_000), [12, 14, 18]);
-        assert_eq!(sequences(&records, &projected, 500), [18]);
-        let last = retained_sources(&records, &agent, &projected, &[], Retain::LastExchange);
-        let last: Vec<_> = (last.unwrap().into_iter())
-            .map(|source| source.into_sequence().get())
-            .collect();
-        assert_eq!(last, [18], "whatever the reports would size");
-        // A synthetic projected continuation is not an original message source.
-        projected.push(Projected::unbound(99.into(), user("synthetic".into())));
-        assert_eq!(sequences(&records, &projected, 500), [18]);
+        assert_eq!(kept(&requests, &projected, 8_000), [6, 8, 12, 14, 18]);
+        assert_eq!(kept(&requests, &projected, 2_000), [12, 14, 18]);
+        assert_eq!(kept(&requests, &projected, 500), [18]);
+        let last = retained_sources(&projected, &requests, &[], Retain::LastExchange);
+        assert_eq!(sequences(last), [18], "whatever the reports would size");
         // Without reports only the last message stays, with its exchange.
-        let unreported: Vec<_> = (records.iter())
-            .filter(|record| !matches!(record.event, SessionEvent::Usage { .. }))
-            .cloned()
-            .collect();
-        assert_eq!(sequences(&unreported, &projected, 8_000), [18]);
-        assert!(sequences(&records, &[], 8_000).is_empty());
+        let unreported = requests.clone().map(|request| CompletedRequest {
+            usage: None,
+            ..request
+        });
+        assert_eq!(kept(&unreported, &projected, 8_000), [18]);
+        assert!(kept(&requests, &Projection::default(), 8_000).is_empty());
         // A prompt that did not grow sizes nothing: the walk stops there.
-        let mut shrunk = records.clone();
-        shrunk[10].event = usage(9, 500);
-        assert_eq!(sequences(&shrunk, &projected, 8_000), [12, 14, 18]);
+        let mut shrunk = requests.clone();
+        shrunk[1] = reported(8, 500);
+        assert_eq!(kept(&shrunk, &projected, 8_000), [12, 14, 18]);
         // Prompts under different model contexts are not compared.
-        let mut switched = records.clone();
-        let other = ModelContext::test(ModelPurpose::Agent, tests::profile());
-        switched[0].event = SessionEvent::ModelContext { context: other };
-        let SessionEvent::ModelRequested { context, .. } = &mut switched[14].event else {
-            unreachable!("the third request")
-        };
-        *context = 1.into();
-        assert_eq!(sequences(&switched, &projected, 8_000), [18]);
+        let mut switched = requests.clone();
+        switched[2].context = 1.into();
+        assert_eq!(kept(&switched, &projected, 8_000), [18]);
     }
 
     /// A retried request is sized by the attempt that answered it, not by what a
     /// failed attempt reported; per-call results committed out of call order stay
     /// with their exchange, whichever of them the retained tail starts at.
-    #[test]
-    fn retention_sizes_a_retried_request_by_its_answer_and_keeps_reordered_results() {
+    #[tokio::test]
+    async fn retention_sizes_a_retried_request_by_its_answer_and_keeps_reordered_results() {
         use crate::provider::ProviderErrorKind;
-        use crate::session::{AttemptFailure, AttemptRef, CompletedOutcome, ModelContext, tests};
-        let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
-        let call = |id: &str, index| {
-            let call = ToolCall::new(id, "read", json!({})).unwrap();
-            AssistantItem::tool_call(id, index, call)
+        use crate::session::{
+            AttemptFailure, AttemptRef, CompletedOutcome, ModelContext, ModelPurpose, tests,
         };
-        let result = |id: &str| {
-            Message::Tool(ToolResult {
-                call_id: id.into(),
-                name: "read".into(),
-                result: json!("ok"),
-                images: vec![],
-                is_error: false,
-            })
-        };
+        let runtime = crate::tests::TestRuntime::new().await;
+        let (store, agent) = (&runtime.store, &runtime.agent);
+        let append = async |event| store.append(agent.clone(), event).await.unwrap().sequence;
         let commit = |message| SessionEvent::MessageCommitted { message };
-        let requested = |through: u64| SessionEvent::ModelRequested {
-            context: 2.into(),
+        let attempt = |request: RecordSeq, attempt| AttemptRef {
+            request: request.request(),
+            attempt,
+        };
+        let usage = |request: RecordSeq, prompt| SessionEvent::Usage {
+            request: request.request(),
+            usage: tests::usage(prompt, 0, 0),
+        };
+        let completed = |attempt, message: RecordSeq| SessionEvent::ResponseCompleted {
+            attempt,
+            message: message.message(),
+            outcome: CompletedOutcome::Answer,
+        };
+        let context = ModelContext::test(ModelPurpose::Agent, tests::profile());
+        let start = append(commit(user("start".into()))).await;
+        let context = append(SessionEvent::ModelContext { context }).await;
+        let requested = |through: RecordSeq| SessionEvent::ModelRequested {
+            context,
             checkpoint: None,
-            through: Some(RecordSeq::from(through).message()),
+            through: Some(through.message()),
             from: None,
             tail: Vec::new(),
             history_lifetime: Default::default(),
         };
-        let attempt = |request: u64, attempt| AttemptRef {
-            request: RecordSeq::from(request).request(),
-            attempt,
-        };
-        let usage = |request: u64, prompt| SessionEvent::Usage {
-            request: RecordSeq::from(request).request(),
-            usage: tests::usage(prompt, 0, 0),
-        };
-        let completed = |request: u64, number, message: u64| SessionEvent::ResponseCompleted {
-            attempt: attempt(request, number),
-            message: RecordSeq::from(message).message(),
-            outcome: CompletedOutcome::Answer,
-        };
-        let retried = SessionEvent::ModelFailed {
-            attempt: attempt(10, 1),
+        let first = append(requested(start)).await;
+        append(SessionEvent::ModelAttemptStarted(attempt(first, 1))).await;
+        append(usage(first, 1_000)).await;
+        let calls = append(commit(Message::Assistant(vec![call("a", 0), call("b", 1)]))).await;
+        append(completed(attempt(first, 1), calls)).await;
+        let first = append(commit(result("b"))).await;
+        let second = append(commit(result("a"))).await;
+        let retried = append(requested(second)).await;
+        append(SessionEvent::ModelAttemptStarted(attempt(retried, 1))).await;
+        append(usage(retried, 9_000)).await;
+        append(SessionEvent::ModelFailed {
+            attempt: attempt(retried, 1),
             failure: AttemptFailure::Retrying {
                 message: "dropped".into(),
                 kind: ProviderErrorKind::Transport,
                 delay: std::time::Duration::from_millis(1).into(),
             },
-        };
-        let context = ModelContext::test(ModelPurpose::Agent, tests::profile());
-        let events = [
-            commit(user("start".into())),
-            SessionEvent::ModelContext { context },
-            requested(1),
-            SessionEvent::ModelAttemptStarted(attempt(3, 1)),
-            usage(3, 1_000),
-            commit(Message::Assistant(vec![call("a", 0), call("b", 1)])),
-            completed(3, 1, 6),
-            commit(result("b")),
-            commit(result("a")),
-            requested(9),
-            SessionEvent::ModelAttemptStarted(attempt(10, 1)),
-            usage(10, 9_000),
-            retried,
-            SessionEvent::ModelAttemptStarted(attempt(10, 2)),
-            usage(10, 5_000),
-            commit(user("answer".into())),
-            completed(10, 2, 16),
-        ];
-        let records: Vec<_> = (events.into_iter().enumerate())
-            .map(|(index, event)| tests::record(&agent, index as u64 + 1, event))
-            .collect();
-        let projected: Vec<_> = (records.iter())
-            .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted { message } => {
-                    Some(Projected::unbound(record.sequence, message.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let sequences = |projected: &[Projected], retain| {
-            let retained = retained_sources(&records, &agent, projected, &[], retain).unwrap();
+        })
+        .await;
+        append(SessionEvent::ModelAttemptStarted(attempt(retried, 2))).await;
+        append(usage(retried, 5_000)).await;
+        let answer = Message::Assistant(vec![AssistantItem::text("text", 0, "answer")]);
+        let answer = append(commit(answer)).await;
+        let last = append(completed(attempt(retried, 2), answer)).await;
+        let projected = tests::projected(store, agent).await;
+        let retention = store.retention(agent, RecordSeq::default(), last, Vec::new());
+        let requests = retention.await.unwrap().unwrap().requests;
+        let retained = |projected: &Projection, retain| {
+            let retained = retained_sources(projected, &requests, &[], retain);
             (retained.into_iter())
-                .map(|source| source.into_sequence().get())
+                .map(|source| RecordSeq::from(source.into_sequence()))
                 .collect::<Vec<_>>()
         };
         // The answering attempt grew the prompt by 4,000; the failed one by 8,000.
-        assert_eq!(sequences(&projected, Retain::Within(6_000)), [6, 8, 9, 16]);
-        assert_eq!(sequences(&projected, Retain::Within(3_000)), [16]);
+        let within = |budget| retained(&projected, Retain::Within(budget));
+        assert_eq!(within(6_000), [calls, first, second, answer]);
+        assert_eq!(within(3_000), [answer]);
         // Ending on the later-committed result, the tail starts at its call.
-        let unanswered = &projected[..projected.len() - 1];
-        assert_eq!(sequences(unanswered, Retain::LastExchange), [6, 8, 9]);
+        let mut unanswered = projected.clone();
+        unanswered.messages.pop();
+        let last = retained(&unanswered, Retain::LastExchange);
+        assert_eq!(last, [calls, first, second]);
     }
 
     #[test]

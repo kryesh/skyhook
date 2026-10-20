@@ -7,6 +7,14 @@ use super::*;
 /// Once a later invocation runs, nothing it holds applies to that one.
 pub(super) struct FinishClaim(Run);
 
+impl FinishClaim {
+    /// Hold the finish of `run`, which `claimable` just admitted.
+    fn hold(state: &mut CoreState, run: Run) -> Self {
+        state.jobs.modify(run.0, |entry, _| entry.finishing = true);
+        Self(run)
+    }
+}
+
 pub(super) enum Unclaimed {
     /// Another finish holds the claim; the phase it leaves may still admit this end.
     InFlight,
@@ -15,66 +23,81 @@ pub(super) enum Unclaimed {
 }
 
 impl JobManager {
-    pub async fn create(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
-        if spec.agent.session() != self.inner.store.id() {
+    pub async fn create(&self, spec: JobSpec) -> Result<JobLease, JobError> {
+        let mut leases = self.create_all(vec![spec]).await?;
+        Ok(leases.pop().expect("a lease per created job"))
+    }
+
+    /// Create every job `specs` describes in one commit, in order, with
+    /// contiguous ids: all of them, each with its lease, or none.
+    pub(crate) async fn create_all(&self, specs: Vec<JobSpec>) -> Result<Vec<JobLease>, JobError> {
+        let session = self.inner.store.id();
+        if specs.iter().any(|spec| spec.agent.session() != session) {
             return Err(SessionError::WrongSession.into());
         }
         let manager = self.clone();
+        let parents: Vec<_> = specs.iter().filter_map(|spec| spec.parent).collect();
         self.inner
             .store
-            .commit::<_, JobError>(Command::CreateJob, move |state| {
-                if let Some(parent) = spec.parent
-                    && !state.jobs.entries.contains_key(&parent)
-                {
-                    return Err(JobError::Unknown(parent));
-                }
-                // Only a busy turn makes calls.
-                if spec.origin.is_some() && !state.agents.busy(&spec.agent) {
-                    return Err(JobError::Interrupted);
-                }
-                let id = state.jobs.next_id()?;
-                let created = SessionEvent::JobCreated {
-                    origin: spec.origin,
-                    job: id,
-                    parent: spec.parent,
-                    tool: spec.tool,
-                    role: spec.role,
-                    name: spec.name,
-                    arguments: std::mem::take(&mut spec.arguments),
-                    output_schema: spec.output_schema,
-                    accepts_input: spec.accepts_input,
-                    background: spec.background,
-                    location: spec.location,
-                };
-                let parent = spec.parent;
-                // A caller that gives up drops the lease wherever it lands, which
-                // cancels the job.
-                Ok(Plan::new(vec![(spec.agent, created)], move |state, _| {
-                    let cancellation = manager.token_under(parent);
-                    let (handles, input) = JobHandles::new(cancellation.clone());
-                    manager
-                        .inner
-                        .handles
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(id, handles);
-                    // Created under a cancelled parent, it is cancelled with it.
-                    let jobs = &state.jobs.entries;
-                    let parent = parent.and_then(|parent| jobs.get(&parent));
-                    if parent.is_some_and(JobFacts::cancel_requested) {
-                        manager.cancel_trees(state, vec![id], CancelScope::Outcome);
+            .commit_on::<_, JobError>(parents, Command::CreateJob, move |state| {
+                for spec in &specs {
+                    if let Some(parent) = spec.parent
+                        && !state.jobs.contains(parent)
+                    {
+                        return Err(JobError::Unknown(parent));
                     }
-                    let run = Run(id, Invocation::default());
-                    JobLease::new(manager, run, cancellation, input)
+                    // Only a busy turn makes calls.
+                    if spec.origin.is_some() && !state.agents.busy(&spec.agent) {
+                        return Err(JobError::Interrupted);
+                    }
+                }
+                let ids = state.jobs.next_ids(specs.len())?;
+                let (created, journaled): (Vec<_>, Vec<_>) = (ids.into_iter().zip(specs))
+                    .map(|(job, spec)| {
+                        let created = SessionEvent::JobCreated {
+                            origin: spec.origin,
+                            job,
+                            parent: spec.parent,
+                            tool: spec.tool,
+                            role: spec.role,
+                            name: spec.name,
+                            arguments: spec.arguments,
+                            output_schema: spec.output_schema.map(Arc::new),
+                            accepts_input: spec.accepts_input,
+                            background: spec.background,
+                            location: spec.location,
+                        };
+                        ((job, spec.parent), (spec.agent, created))
+                    })
+                    .unzip();
+                // A caller that gives up drops a lease wherever it lands, which
+                // cancels its job.
+                Ok(Plan::new(journaled, move |state, _| {
+                    let lease = |(id, parent): (JobId, Option<JobId>)| {
+                        let cancellation = manager.token_under(&state.jobs, parent);
+                        let (handles, input) = JobHandles::new(cancellation.clone());
+                        state
+                            .jobs
+                            .modify(id, |entry, _| entry.handles = Some(handles));
+                        // Created under a cancelled parent, it is cancelled with it.
+                        let parent = parent.and_then(|parent| state.jobs.get(parent));
+                        if parent.is_some_and(JobFacts::cancel_requested) {
+                            manager.cancel_trees(state, vec![id], CancelScope::Outcome);
+                        }
+                        let run = Run(id, Invocation::default());
+                        JobLease::new(manager.clone(), run, cancellation, input)
+                    };
+                    created.into_iter().map(lease).collect()
                 }))
             })
             .await
     }
 
-    /// A new token under `parent`'s, or the session root's.
-    pub(super) fn token_under(&self, parent: Option<JobId>) -> CancellationToken {
+    /// A new token under `parent`'s while it can still run, or the session root's.
+    pub(super) fn token_under(&self, jobs: &Jobs, parent: Option<JobId>) -> CancellationToken {
+        let parent = parent.and_then(|parent| jobs.get(parent)?.handles.as_ref());
         match parent {
-            Some(parent) => self.handles(parent, |parent| parent.cancellation.child_token()),
+            Some(parent) => parent.cancellation.child_token(),
             None => self.inner.supervisor.token(),
         }
     }
@@ -90,23 +113,27 @@ impl JobManager {
         // A question is delivered, so it wakes a background owner.
         let wakes = matches!(change, JobChange::Ask(_));
         let changed = move |state: &CoreState| {
-            let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
+            let entry = state.job(id)?;
             entry
                 .steps(change.step())
                 .map_err(|rejected| refused(rejected, id))?;
             let journaled = vec![(entry.agent.clone(), change.event(id))];
             Ok(Plan::new(journaled, move |state, _| {
-                let entry = state.jobs.entries.get_mut(&id).expect("jobs stay");
                 // The journal records only that it asked.
                 if let JobChange::Ask(question) = change {
-                    entry.phase = Phase::WaitingInput(question);
+                    state
+                        .jobs
+                        .modify(id, |entry, _| entry.phase = Phase::WaitingInput(question));
                 }
                 if wakes {
                     woken(state, id);
                 }
             }))
         };
-        self.inner.store.commit(Command::Journal, changed).await
+        self.inner
+            .store
+            .commit_on([id], Command::Journal, changed)
+            .await
     }
 
     /// A lease's startup transition. Its stage guarantees the order, so the only
@@ -122,15 +149,15 @@ impl JobManager {
     /// closing session's abort abandons it.
     pub(super) async fn settle(&self, run: Run, outcome: JobOutcome) {
         let end = outcome.end();
-        let claimed = self
-            .inner
-            .store
-            .until(move |state| match claim(state, run, end) {
-                Ok(claim) => Some(Some(claim)),
-                Err(Unclaimed::Ended) => Some(None),
-                Err(Unclaimed::InFlight) => None,
-            });
-        if let Ok(Some(claim)) = claimed.await {
+        let decide = move |state: &CoreState| match claimable(state, run, end) {
+            Err(Unclaimed::InFlight) => None,
+            claimable => Some(claimable),
+        };
+        let take = move |state: &mut CoreState, claimable: Result<(), Unclaimed>| {
+            claimable.map(|()| FinishClaim::hold(state, run))
+        };
+        let claimed = Wait::taking([Key::Job(run.0)], decide, take);
+        if let Ok(Ok(claim)) = self.inner.store.until(claimed).await {
             self.publish_claimed(claim, outcome).await;
         }
     }
@@ -141,9 +168,7 @@ impl JobManager {
         let FinishClaim(Run(id, _)) = claim;
         if self.publish(&claim, outcome).await.is_err() {
             let released = move |state: &mut CoreState| {
-                if let Some(entry) = state.jobs.entries.get_mut(&id) {
-                    entry.finishing = false;
-                }
+                state.jobs.modify(id, |entry, _| entry.finishing = false);
             };
             self.inner.store.live(released).await;
         }
@@ -153,27 +178,16 @@ impl JobManager {
     /// acknowledgement of what the job read, refused once a later invocation
     /// runs. An output that cannot be prepared stops the session.
     async fn publish(&self, claim: &FinishClaim, outcome: JobOutcome) -> Result<(), JobError> {
-        let FinishClaim(run @ Run(id, invocation)) = *claim;
+        let FinishClaim(run @ Run(id, _)) = *claim;
         let end = outcome.end();
         let (finish, output) = self.finished(run, outcome).await?;
-        let manager = self.clone();
         let finished = move |state: &CoreState| {
-            let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
+            let entry = state.jobs.get(id).ok_or(JobError::Unknown(id))?;
             (entry.ends(run, end).then_some(())).ok_or(JobError::AlreadyTerminal(id))?;
             let mut journaled = vec![(entry.agent.clone(), finish.event(id))];
             journaled.extend(Delivery::claims(entry.reads.clone(), state));
             let acknowledged = Plan::new(journaled, move |state, _| {
-                if let Some(entry) = state.jobs.entries.get_mut(&id) {
-                    entry.reads.clear();
-                }
-                let attached = |handles: &mut JobHandles| {
-                    handles
-                        .task_abort
-                        .take_if(|(attached, _)| *attached == invocation)
-                };
-                if let Some((_, worker)) = manager.handles(id, attached) {
-                    worker.abort();
-                }
+                state.jobs.modify(id, |entry, _| entry.reads.clear());
                 woken(state, id)
             });
             Ok(acknowledged.saving(output))
@@ -217,9 +231,13 @@ impl JobManager {
         });
         let (previous, schema) = self
             .entry(id, |entry| {
-                let schema = entry.output_schema.clone().unwrap_or(Value::Bool(true));
+                let schema = entry
+                    .output_schema
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(Value::Bool(true)));
                 (entry.ends(run, end)).then(|| (entry.finished().cloned(), schema))
-            })?
+            })
+            .await?
             .ok_or(JobError::AlreadyTerminal(id))?;
         let rows = if let Some(previous) = previous {
             // Cancelling an interruption ends resumability, not its published
@@ -234,13 +252,15 @@ impl JobManager {
             // Captures have independent pointer/type metadata. A failed tool need not
             // produce a result, and unfinished JSON captures are not valid result trees.
             let product = (output, capture_complete);
-            let rows = tokio::task::spawn_blocking(move || {
-                output::prepare_completed(&saved, &schema, product, captures, presented)
-            });
-            Some(match rows.await {
-                Ok(rows) => rows.map_err(SessionError::Io),
-                Err(panicked) => Err(SessionError::Task(panicked)),
-            })
+            Some(
+                self.store()
+                    .reads()
+                    .hold(move || {
+                        output::prepare_completed(&saved, &schema, product, captures, presented)
+                            .map_err(SessionError::Io)
+                    })
+                    .await,
+            )
         };
         finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
         Ok((JobChange::Finish(finished), rows))
@@ -251,10 +271,17 @@ impl JobManager {
 /// the one rule for every change that can make an outcome, a question or a
 /// reply pending. A wake only opens its owner's coalescing window.
 pub(crate) fn woken(state: &mut CoreState, id: JobId) {
-    let entry = &state.jobs.entries[&id];
-    if entry.has_pending() {
-        state.agents.wake(&entry.agent);
+    let pending = (state.jobs.get(id)).filter(|entry| entry.has_pending());
+    if let Some(owner) = pending.map(|entry| entry.agent.clone()) {
+        state.agents.wake(&owner);
     }
+}
+
+/// Whether the finish of `run` with `end` may be claimed now.
+fn claimable(state: &CoreState, run: Run, end: JobEnd) -> Result<(), Unclaimed> {
+    let entry = state.jobs.get(run.0).ok_or(Unclaimed::Ended)?;
+    entry.ends(run, end).then_some(()).ok_or(Unclaimed::Ended)?;
+    (!entry.finishing).then_some(()).ok_or(Unclaimed::InFlight)
 }
 
 /// Claim the finish of `run` with `end` before any output is saved, unless
@@ -264,10 +291,7 @@ pub(super) fn claim(
     run: Run,
     end: JobEnd,
 ) -> Result<FinishClaim, Unclaimed> {
-    let entry = state.jobs.entries.get_mut(&run.0).ok_or(Unclaimed::Ended)?;
-    entry.ends(run, end).then_some(()).ok_or(Unclaimed::Ended)?;
-    let free = !std::mem::replace(&mut entry.finishing, true);
-    free.then_some(FinishClaim(run)).ok_or(Unclaimed::InFlight)
+    claimable(state, run, end).map(|()| FinishClaim::hold(state, run))
 }
 
 #[cfg(test)]
@@ -291,14 +315,14 @@ mod tests {
 
         /// Finish a job's current invocation, unless another finish holds its claim.
         pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
-            let claim = self.claim(self.run(id), outcome.end()).await;
+            let claim = self.claim(self.run(id).await, outcome.end()).await;
             let claim = claim.map_err(|_| JobError::AlreadyTerminal(id))?;
             self.publish(&claim, outcome).await
         }
 
         /// Job `id`'s current invocation.
-        pub(in crate::job) fn run(&self, id: JobId) -> Run {
-            Run(id, self.entry(id, |entry| entry.invocation).unwrap())
+        pub(in crate::job) async fn run(&self, id: JobId) -> Run {
+            Run(id, self.entry(id, |entry| entry.invocation).await.unwrap())
         }
     }
 
@@ -321,7 +345,7 @@ mod tests {
             Err(JobError::Session(SessionError::WrongSession))
         ));
         assert_eq!(jobs.store().records().len(), before);
-        assert!(jobs.facts(|jobs| jobs.entries.is_empty()));
+        assert!(jobs.facts(|jobs| jobs.iter().next().is_none()));
         assert_eq!(
             jobs.test_create(JobSpec::test(agent, "valid")).await.get(),
             1
@@ -338,7 +362,7 @@ mod tests {
         for unreadable in [false, true] {
             let (_root, jobs, agent) = super::super::tests::runtime().await;
             let id = jobs.test_create(JobSpec::test(agent, "capture")).await;
-            let output = jobs.output(id);
+            let output = jobs.output(id).await;
             let field = "/result/stdout".parse().unwrap();
             let mut writer = PendingCapture::create(&output, &field, CaptureKind::Text)
                 .unwrap()
@@ -351,7 +375,7 @@ mod tests {
             let product =
                 ToolOutput::new(serde_json::json!({"exit_code": 0})).with_captures(vec![capture]);
             jobs.test_complete(id, product).await;
-            assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Completed);
+            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Completed);
             let journaled = jobs.store().records().into_iter().any(|record| {
                 matches!(
                     record.event,
@@ -404,7 +428,7 @@ mod tests {
             let lease = jobs
                 .test_running(JobSpec::test(agent.clone(), "raced"))
                 .await;
-            let (id, run) = (lease.id(), jobs.run(lease.id()));
+            let (id, run) = (lease.id(), jobs.run(lease.id()).await);
             let (_input, _worker) = lease.split();
             let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")));
             let outcomes = [
@@ -437,19 +461,24 @@ mod tests {
         let lease = jobs.test_running(JobSpec::test(agent, "interrupted")).await;
         let id = lease.id();
         let (_input, _worker) = lease.split();
-        let claim = jobs.claim(jobs.run(id), JobEnd::Interrupted).await;
+        let claim = jobs.claim(jobs.run(id).await, JobEnd::Interrupted).await;
         let claim = claim.unwrap_or_else(|_| panic!("a running job's finish is unclaimed"));
         // The watchdog aborts this past the grace, then settles the cancellation.
         let worker = tokio::spawn(std::future::pending::<()>());
-        jobs.handles(id, |handles| {
-            handles.task_abort = Some((jobs.run(id).1, worker.abort_handle()))
-        });
+        let (abort, invocation) = (worker.abort_handle(), jobs.run(id).await.1);
+        jobs.store()
+            .live(move |state| {
+                state.jobs.modify(id, |entry, _| {
+                    entry.handles.as_mut().unwrap().task_abort = Some((invocation, abort))
+                })
+            })
+            .await;
         jobs.cancel(id).await.unwrap();
         assert!(bounded(worker).await.unwrap_err().is_cancelled());
         let interrupted = ToolError::interrupted().into();
         jobs.publish(&claim, interrupted).await.unwrap();
         bounded(jobs.cancel_and_drain()).await.unwrap();
-        assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Cancelled);
+        assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
     }
 
     /// A finish bound to an earlier invocation never ends a later one: neither a
@@ -465,12 +494,12 @@ mod tests {
             ..JobSpec::test(agent, "resumed")
         };
         let lease = jobs.test_running(spec).await;
-        let (id, run) = (lease.id(), jobs.run(lease.id()));
+        let (id, run) = (lease.id(), jobs.run(lease.id()).await);
         let (_input, _worker) = lease.split();
         let handler: ResumeHandler = Arc::new(|_, mut input| {
             Box::pin(async move { Ok(ToolOutput::new(input.recv().await.unwrap())) })
         });
-        jobs.set_resume_handler(id, handler).await.unwrap();
+        jobs.test_resume_with(id, handler);
         let stale = || JobOutcome::Completed(ToolOutput::new(serde_json::json!("stale")));
         let (release, released) = tokio::sync::oneshot::channel();
         let late = super::super::supervisor::spawn_completion(jobs.clone(), run, async move {
@@ -494,7 +523,7 @@ mod tests {
         bounded(waiting).await;
         release.send(()).unwrap();
         bounded(late).await.unwrap();
-        assert_eq!(jobs.metadata(id).unwrap().state, JobState::Running);
+        assert_eq!(jobs.metadata(id).await.unwrap().state, JobState::Running);
         jobs.send(id, serde_json::json!("own")).await.unwrap();
         let own = bounded(jobs.wait(id, true)).await.unwrap();
         assert_eq!(own.state, JobState::Completed);
@@ -540,6 +569,7 @@ mod tests {
         let cancelling = jobs.clone();
         let cancelled = crate::session::tests::on_commit(
             jobs.store(),
+            &agent,
             |_| true,
             move || async move { cancelling.cancel(parent).await },
         );
@@ -554,6 +584,48 @@ mod tests {
         let settled = bounded(jobs.wait(child.id(), false)).await;
         assert_eq!(settled.unwrap().state, JobState::Cancelled);
         assert_eq!(creation_count(&jobs), 2);
+    }
+
+    /// A parent the session let go of once it finished still parents a new job,
+    /// which its ancestry's cancellation reaches: here its own parent's, cancelled
+    /// after the parent was let go, and let go of too; and a finished parent's own,
+    /// requested before it was claimed.
+    #[tokio::test]
+    async fn creation_under_a_parent_let_go_inherits_its_ancestry_cancellation() {
+        let (_root, jobs, agent) = crate::job::tests::runtime().await;
+        let grandparent = jobs
+            .test_create(JobSpec::test(agent.clone(), "grandparent"))
+            .await;
+        let spec = JobSpec {
+            parent: Some(grandparent),
+            ..JobSpec::test(agent.clone(), "parent")
+        };
+        let parent = jobs.test_create(spec).await;
+        jobs.test_finish(parent, serde_json::json!("done")).await;
+        bounded(jobs.wait(parent, true)).await.unwrap();
+        jobs.cancel(grandparent).await.unwrap();
+        let cancelled = bounded(jobs.wait(grandparent, true)).await.unwrap();
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        let let_go = |jobs: &Jobs| jobs.get(parent).is_none() && jobs.get(grandparent).is_none();
+        assert!(jobs.facts(let_go), "let go");
+        let spec = JobSpec {
+            parent: Some(parent),
+            ..JobSpec::test(agent.clone(), "child")
+        };
+        let child = jobs.create(spec).await.unwrap();
+        assert!(child.cancellation_token().is_cancelled());
+        let finished = jobs
+            .test_create(JobSpec::test(agent.clone(), "finished"))
+            .await;
+        jobs.test_finish(finished, serde_json::json!("done")).await;
+        jobs.cancel(finished).await.unwrap();
+        bounded(jobs.wait(finished, true)).await.unwrap();
+        let spec = JobSpec {
+            parent: Some(finished),
+            ..JobSpec::test(agent, "child")
+        };
+        let child = jobs.create(spec).await.unwrap();
+        assert!(child.cancellation_token().is_cancelled());
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -581,10 +653,11 @@ mod tests {
             Op::Transition => Box::new(jobs.test_approving(spec).await),
             Op::Claim | Op::Send => {
                 assert_eq!(jobs.test_create(spec).await, id);
+                jobs.test_install(id).await;
                 let handler: ResumeHandler = Arc::new(|value, _| {
                     Box::pin(async move { Ok(ToolOutput::new(value.unwrap())) })
                 });
-                jobs.set_resume_handler(id, handler).await.unwrap();
+                jobs.test_resume_with(id, handler);
                 jobs.test_finish(id, serde_json::json!("previous")).await;
                 Box::new(())
             }
@@ -626,20 +699,24 @@ mod tests {
         for op in [Create, Transition, Claim, Send, RequestInput, ResumeInput] {
             let case = format!("{op:?}");
             let (_root, jobs, agent, id, _lease) = owned_job(op).await;
-            let state = |jobs: &JobManager| jobs.metadata(id).ok().map(|m| m.state);
-            let acknowledged =
-                |jobs: &JobManager| jobs.entry(id, |entry| !entry.unacknowledged()).unwrap();
-            let before = state(&jobs);
+            let state = async |jobs: &JobManager| jobs.metadata(id).await.ok().map(|m| m.state);
+            let acknowledged = async |jobs: &JobManager| {
+                jobs.entry(id, |entry| !entry.unacknowledged())
+                    .await
+                    .unwrap()
+            };
+            let before = state(&jobs).await;
             let mut updates = jobs.store().observe().updates;
+            let journaled = count(&jobs, |_| true);
             // The held connection parks the change its first poll queues, so the
             // caller is gone before it could hear back.
             let held = crate::session::tests::hold_connection(jobs.store());
             let mut caller = Box::pin(run(op, jobs.clone(), agent, id));
             assert!(futures_util::poll!(&mut caller).is_pending(), "{case}");
             drop(caller);
-            assert_eq!(state(&jobs), before, "{case}");
+            assert_eq!(state(&jobs).await, before, "{case}");
             if op == Claim {
-                assert!(!acknowledged(&jobs));
+                assert!(!acknowledged(&jobs).await);
             }
             drop(held);
             let expected = match op {
@@ -665,18 +742,29 @@ mod tests {
             } else {
                 1
             };
+            // Counted as published, which the state reflects, not as committed.
+            let records = jobs.store().records();
+            let mut published = (records.iter())
+                .filter(|record| record.sequence.get() <= journaled as u64 && last(&record.event))
+                .count();
             bounded(async {
-                while count(&jobs, last) < total {
-                    updates.recv().await.unwrap();
+                while published < total {
+                    let update = updates.recv().await.unwrap();
+                    if let crate::agent::RuntimeEvent::Record(record) = update.event
+                        && record.sequence.get() > journaled as u64
+                        && last(&record.event)
+                    {
+                        published += 1;
+                    }
                 }
             })
             .await;
-            assert_eq!(state(&jobs), Some(expected), "{case}");
+            assert_eq!(state(&jobs).await, Some(expected), "{case}");
             let replay = jobs.test_replay();
-            assert_eq!(state(&replay), Some(expected), "{case}");
+            assert_eq!(state(&replay).await, Some(expected), "{case}");
             assert_eq!(count(&jobs, last), total, "{case}");
             if op == Claim {
-                assert!(acknowledged(&jobs) && acknowledged(&replay));
+                assert!(acknowledged(&jobs).await && acknowledged(&replay).await);
             }
             if op == Create {
                 assert_eq!(creation_count(&jobs), 1);

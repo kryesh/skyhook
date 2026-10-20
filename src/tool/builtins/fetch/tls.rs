@@ -1,21 +1,57 @@
-//! Per-call HTTP client configuration and opt-in insecure TLS.
+//! Fetch's HTTP clients, each shared by every call with the same client settings,
+//! and opt-in insecure TLS.
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use reqwest::Client;
 
 use super::LocalError;
-use super::validation::ClientSettings;
+use super::validation::ClientIdentity;
 
-pub(super) fn client(settings: &ClientSettings) -> Result<Client, LocalError> {
+/// How many clients of distinct settings are kept before the cache starts over.
+const CLIENTS: usize = 8;
+
+static CLIENTS_BUILT: Mutex<Vec<(ClientIdentity, Client)>> = Mutex::new(Vec::new());
+
+fn clients() -> MutexGuard<'static, Vec<(ClientIdentity, Client)>> {
+    CLIENTS_BUILT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The client for `identity`, with the connections it keeps open. A miss builds one
+/// off the async workers, since that loads the platform's trusted roots; calls that
+/// miss together each build one, and the first built is kept.
+pub(super) async fn client(identity: &ClientIdentity) -> Result<Client, LocalError> {
+    let built = |clients: &[(ClientIdentity, Client)]| {
+        let found = clients.iter().find(|(built, _)| built == identity);
+        found.map(|(_, client)| client.clone())
+    };
+    if let Some(client) = built(&clients()) {
+        return Ok(client);
+    }
+    let building = identity.clone();
+    let client = crate::blocking(move || build(&building)).await?;
+    let mut clients = clients();
+    if let Some(kept) = built(&clients) {
+        return Ok(kept);
+    }
+    if clients.len() == CLIENTS {
+        clients.clear();
+    }
+    clients.push((identity.clone(), client.clone()));
+    Ok(client)
+}
+
+fn build(identity: &ClientIdentity) -> Result<Client, LocalError> {
     let mut builder = Client::builder()
         .user_agent(concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         // The tool's outer deadline is the only total limit: an equal client
         // timeout would race it and could report the timeout without its limit.
-        .connect_timeout(settings.connect_timeout)
-        .danger_accept_invalid_certs(settings.insecure);
+        .connect_timeout(identity.connect_timeout)
+        .danger_accept_invalid_certs(identity.insecure);
     // Proxy schemes and URL credentials intentionally differ from HttpRequestUrl admission.
-    if let Some(proxy) = &settings.proxy {
+    if let Some(proxy) = &identity.proxy {
         builder = builder.proxy(
             reqwest::Proxy::all(proxy)
                 .map_err(|_| LocalError::invalid_arguments("invalid proxy URL"))?,

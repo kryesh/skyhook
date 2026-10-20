@@ -12,7 +12,7 @@ use skyhook::provider::protocol::{
     AssistantItem, BlockRef, Completion, ContextId, ItemKind, ModelRequest, ResponseEvent, ToolCall,
 };
 use skyhook::provider::{Provider, ProviderContext, ProviderError, ResponseStream};
-use skyhook::session::{RequestSeq, SessionEvent, UserPart};
+use skyhook::session::{EventRecord, RequestSeq, SessionEvent, UserPart};
 use skyhook::tool::policy::{AllowAll, Policy};
 use std::sync::Arc;
 
@@ -197,7 +197,7 @@ async fn played_fixture_under(
 ) -> (tempfile::TempDir, App, Model, SessionHandle) {
     let (root, mut app) = draft_fixture().await;
     let (session, model) = played_under(&app.launch, policy).await;
-    attach(&mut app, session.clone());
+    attach(&mut app, session.clone()).await;
     (root, app, model, session)
 }
 
@@ -227,9 +227,8 @@ pub(in crate::tui) fn ask(
 pub(in crate::tui) async fn observe_next(app: &mut App) -> RuntimeEvent {
     let event = bounded(app.recv_observation()).await;
     let event = event.expect("observation open");
-    if app.observe(event.clone()) {
-        app.rebuild_projection();
-    }
+    let records = app.observe(event.clone());
+    app.observed(records);
     event.event
 }
 
@@ -254,7 +253,7 @@ pub(in crate::tui) async fn observe_find<T>(app: &mut App, find: impl Fn(&App) -
 
 /// Fold observed updates as the host does until a record whose event `matches` commits.
 pub(in crate::tui) async fn observe_record(app: &mut App, matches: impl Fn(&SessionEvent) -> bool) {
-    observe_until(app, |app| recorded(&app.snapshot, &matches)).await;
+    observe_until(app, |app| recorded(&app.journal, &matches)).await;
 }
 
 /// Prompt `app`'s played session and end its turn with `items`, observing
@@ -265,11 +264,11 @@ pub(in crate::tui) async fn exchange(
     prompt: &str,
     items: Vec<AssistantItem>,
 ) {
-    let before = count(&app.snapshot, answered);
+    let before = count(&app.journal, answered);
     let asked = ask(app.session().unwrap(), prompt);
     model.turn().await.end(items);
     bounded(asked).await.unwrap().unwrap();
-    observe_until(app, |app| count(&app.snapshot, answered) > before).await;
+    observe_until(app, |app| count(&app.journal, answered) > before).await;
 }
 
 /// Have the root of `session` start a child for each of `tasks`, its agent
@@ -315,11 +314,10 @@ pub(in crate::tui) async fn asking_child(
     model.turn().await.answer("later");
 }
 
-/// The agents `snapshot` saw start other than the root, in id order, as the
+/// The agents `records` saw start other than the root, in id order, as the
 /// projection lists them: concurrent launches start in any order.
-pub(in crate::tui) fn children(snapshot: &ObservationSnapshot) -> Vec<AgentId> {
-    let records = snapshot.records.values();
-    let started = records.filter(|record| {
+pub(in crate::tui) fn children(records: &[Arc<EventRecord>]) -> Vec<AgentId> {
+    let started = records.iter().filter(|record| {
         record.agent.parent().is_some() && matches!(record.event, SessionEvent::AgentStarted { .. })
     });
     let mut children: Vec<_> = started.map(|record| record.agent.clone()).collect();
@@ -338,37 +336,35 @@ pub(in crate::tui) async fn spawn_children(
         .map(|index| json!({"prompt": format!("child task {index}")}))
         .collect();
     let turns = delegate(app.session().unwrap(), model, &tasks).await;
-    observe_until(app, |app| children(&app.snapshot).len() == tasks.len()).await;
-    (children(&app.snapshot), turns)
+    observe_until(app, |app| children(&app.journal).len() == tasks.len()).await;
+    (children(&app.journal), turns)
 }
 
-/// Whether `snapshot` holds a record whose event `matches`.
+/// Whether `records` hold one whose event `matches`.
 pub(in crate::tui) fn recorded(
-    snapshot: &ObservationSnapshot,
+    records: &[Arc<EventRecord>],
     matches: impl Fn(&SessionEvent) -> bool,
 ) -> bool {
-    snapshot
-        .records
-        .values()
-        .any(|record| matches(&record.event))
+    records.iter().any(|record| matches(&record.event))
 }
 
-/// How many records `snapshot` holds whose event `matches`.
+/// How many of `records` have an event that `matches`.
 pub(in crate::tui) fn count(
-    snapshot: &ObservationSnapshot,
+    records: &[Arc<EventRecord>],
     matches: impl Fn(&SessionEvent) -> bool,
 ) -> usize {
-    let records = snapshot.records.values();
-    records.filter(|record| matches(&record.event)).count()
+    (records.iter())
+        .filter(|record| matches(&record.event))
+        .count()
 }
 
-/// The timestamp of the `nth` record whose event `matches`.
+/// The timestamp of the `nth` of `records` whose event `matches`.
 pub(in crate::tui) fn at(
-    snapshot: &ObservationSnapshot,
+    records: &[Arc<EventRecord>],
     matches: impl Fn(&SessionEvent) -> bool,
     nth: usize,
 ) -> i64 {
-    let mut records = (snapshot.records.values()).filter(|record| matches(&record.event));
+    let mut records = (records.iter()).filter(|record| matches(&record.event));
     records.nth(nth).unwrap().timestamp_millis
 }
 
@@ -389,44 +385,37 @@ pub(in crate::tui) async fn reached(app: &mut App, job: JobId, state: JobTransit
 }
 
 /// The job started for the call `id`, once there is one.
-pub(in crate::tui) fn job_of_call(snapshot: &ObservationSnapshot, id: &str) -> Option<JobId> {
-    snapshot
-        .records
-        .values()
-        .find_map(|record| match &record.event {
-            SessionEvent::JobCreated {
-                job,
-                origin: Some(origin),
-                ..
-            } if origin.call_id == id => Some(*job),
-            _ => None,
-        })
+pub(in crate::tui) fn job_of_call(records: &[Arc<EventRecord>], id: &str) -> Option<JobId> {
+    records.iter().find_map(|record| match &record.event {
+        SessionEvent::JobCreated {
+            job,
+            origin: Some(origin),
+            ..
+        } if origin.call_id == id => Some(*job),
+        _ => None,
+    })
 }
 
 /// The sequence of the latest `ModelRequested` record.
-pub(in crate::tui) fn latest_request(snapshot: &ObservationSnapshot) -> Option<RequestSeq> {
-    let mut records = snapshot.records.values().rev();
-    let request = records.find(|record| requested(&record.event));
+pub(in crate::tui) fn latest_request(records: &[Arc<EventRecord>]) -> Option<RequestSeq> {
+    let request = records.iter().rev().find(|record| requested(&record.event));
     request.map(|record| record.sequence.request())
 }
 
-/// The error text of the first tool result `snapshot` holds.
-pub(in crate::tui) fn tool_error(snapshot: &ObservationSnapshot) -> &str {
-    let error = snapshot
-        .records
-        .values()
-        .find_map(|record| match &record.event {
-            SessionEvent::MessageCommitted {
-                message: Message::Tool(result),
-            } => result.result["error"].as_str(),
-            _ => None,
-        });
+/// The error text of the first tool result `records` hold.
+pub(in crate::tui) fn tool_error(records: &[Arc<EventRecord>]) -> &str {
+    let error = records.iter().find_map(|record| match &record.event {
+        SessionEvent::MessageCommitted {
+            message: Message::Tool(result),
+        } => result.result["error"].as_str(),
+        _ => None,
+    });
     error.unwrap()
 }
 
 /// Whether a response in `snapshot` streamed a block reading `text`.
 pub(in crate::tui) fn streamed(snapshot: &ObservationSnapshot, text: &str) -> bool {
-    let mut responses = snapshot.responses.values();
+    let mut responses = snapshot.views.responses.values();
     responses.any(|response| response.blocks().iter().any(|block| block.text == text))
 }
 

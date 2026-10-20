@@ -70,8 +70,9 @@ impl SessionRuntime {
                 let prompt =
                     self.system_prompt(agent, turn.location, change.depth, mode, capabilities);
                 let system = prompt.await?;
-                let context =
-                    self.open_agent_context(agent, snapshot.clone(), system, capabilities, None)?;
+                let context = self
+                    .open_agent_context(agent, snapshot.clone(), system, capabilities, None)
+                    .await?;
                 Some(context)
             } else if model.is_some() {
                 let system = context.model.system.clone();
@@ -80,7 +81,7 @@ impl SessionRuntime {
                 let capabilities = &settings.capabilities;
                 let opening =
                     self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
-                Some(opening?)
+                Some(opening.await?)
             } else {
                 None
             };
@@ -186,7 +187,7 @@ impl SessionRuntime {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use crate::agent::runtime::tests::{answer, inbox, scripted_provider};
+    use crate::agent::runtime::tests::{answer, inbox, scripted_provider, until_parked};
 
     #[tokio::test]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
@@ -255,7 +256,7 @@ mod tests {
             assert!(next.messages().any(|message| matches!(message,
                 Sent::Assistant(items) if items == &vec![AssistantItem::text("text/0", 0, "answer-0")])));
         }
-        let state = runtime.jobs.snapshot(job).unwrap().state;
+        let state = runtime.jobs.snapshot(job).await.unwrap().state;
         // The child must answer the parent updates first.
         assert!(!state.is_terminal());
 
@@ -311,7 +312,7 @@ mod tests {
         .await;
         assert_eq!(invalid["state"], "failed");
         assert!(invalid["error"].as_str().unwrap().contains("depth"));
-        assert!(runtime.jobs.snapshot(id(&invalid)).is_ok());
+        assert!(runtime.jobs.snapshot(id(&invalid)).await.is_ok());
         let first = call(&session.root, &launch("worker")).await;
         assert_ne!(first["state"], "failed", "{first}");
         let first = id(&first);
@@ -350,6 +351,8 @@ mod tests {
         tracking.release(0);
         let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
         assert_eq!(completed.state, crate::job::JobState::Completed);
+        // A parked child keeps its name.
+        until_parked(&session, &runtime.jobs.child_agent(first).await.unwrap()).await;
         refused(&call(&session.root, duplicate).await, first);
         // Rejecting a duplicate does not interfere with the intended follow-up
         // path: the original child resumes under its existing ID and history.

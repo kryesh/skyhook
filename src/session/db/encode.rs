@@ -1,6 +1,7 @@
 //! Decompose session events into normalized rows inside the caller's transaction.
 //! Each schema section's module writes the rows of its own events.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -28,17 +29,24 @@ pub(super) struct Entry {
 pub(in crate::session) struct Encoder {
     agents: HashMap<Vec<u32>, i64>,
     targets: HashMap<TargetRef, i64>,
+    /// Each agent's next entry ordinal, seeded from the journal on its first entry.
+    ordinals: HashMap<i64, i64>,
 }
 
 impl Encoder {
     pub(in crate::session) fn reset(&mut self) {
         self.agents.clear();
         self.targets.clear();
+        self.ordinals.clear();
     }
 
-    /// Encode one transaction's records. Agents started by the batch get their rows
-    /// first, since every entry, including a session start, references its agent.
-    pub(in crate::session) fn records(&mut self, db: &Db, records: &[EventRecord]) -> DbResult<()> {
+    /// Start the agents `records`, one transaction's, start, ahead of encoding any of
+    /// them: every entry, including a session start, references its agent.
+    pub(in crate::session) fn start(
+        &mut self,
+        db: &Db,
+        records: &[Arc<EventRecord>],
+    ) -> DbResult<()> {
         for record in records {
             if let SessionEvent::SessionStarted { .. } = &record.event {
                 db.execute(
@@ -48,32 +56,36 @@ impl Encoder {
             }
             self.start_agent(db, record)?;
         }
-        for record in records {
-            let kind = record.event.kind();
-            let entry = Entry {
-                seq: record.sequence.get(),
-                agent: self.agent(db, &record.agent)?,
-            };
-            db.execute(
-                "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    entry.seq,
-                    record.id.to_bytes().to_vec(),
-                    entry.agent,
-                    record.timestamp_millis,
-                    kind
-                ],
-            )
-            .and_then(|_| self.subtype(db, entry, &record.event))
-            .map_err(|error| match error {
-                super::DbError::Sql(error) => {
-                    rejected(format!("{kind} entry {}: {error}", record.sequence))
-                }
-                error => error,
-            })?;
-        }
         Ok(())
+    }
+
+    /// Encode `record`, in sequence order after the records ahead of it.
+    pub(in crate::session) fn record(&mut self, db: &Db, record: &EventRecord) -> DbResult<()> {
+        let kind = record.event.kind();
+        let entry = Entry {
+            seq: record.sequence.get(),
+            agent: self.agent(db, &record.agent)?,
+        };
+        let ordinal = self.ordinal(db, entry.agent)?;
+        db.execute(
+            "INSERT INTO entry (seq, public_id, agent, agent_ordinal, created_millis, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.seq,
+                record.id.to_bytes().to_vec(),
+                entry.agent,
+                ordinal,
+                record.timestamp_millis,
+                kind
+            ],
+        )
+        .and_then(|_| self.subtype(db, entry, &record.event))
+        .map_err(|error| match error {
+            super::DbError::Sql(error) => {
+                rejected(format!("{kind} entry {}: {error}", record.sequence))
+            }
+            error => error,
+        })
     }
 
     fn start_agent(&mut self, db: &Db, record: &EventRecord) -> DbResult<()> {
@@ -148,6 +160,7 @@ impl Encoder {
             | E::JobStateChanged { .. }
             | E::JobFinished { .. }
             | E::JobClaimed { .. }
+            | E::JobCancelRequested { .. }
             | E::JobReleased { .. }
             | E::JobMessageReleased { .. }
             | E::JobInjected { .. }
@@ -156,26 +169,25 @@ impl Encoder {
         }
     }
 
-    fn agent(&mut self, db: &Db, agent: &AgentId) -> DbResult<i64> {
+    /// The ordinal `agent`'s next entry takes.
+    fn ordinal(&mut self, db: &Db, agent: i64) -> DbResult<i64> {
+        let next = match self.ordinals.entry(agent) {
+            std::collections::hash_map::Entry::Occupied(next) => next.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let seeded = super::pages::transcript_length(db, agent)?;
+                slot.insert(i64::try_from(seeded).unwrap_or(i64::MAX))
+            }
+        };
+        *next += 1;
+        Ok(*next - 1)
+    }
+
+    pub(super) fn agent(&mut self, db: &Db, agent: &AgentId) -> DbResult<i64> {
         if let Some(id) = self.agents.get(agent.path()) {
             return Ok(*id);
         }
-        let mut id = db
-            .query_row(
-                "SELECT id FROM agent WHERE parent IS NULL",
-                Vec::new(),
-                |row| Ok(row.get::<i64>(0)?),
-            )?
+        let id = agent_row(db, agent)?
             .ok_or_else(|| rejected(format!("agent {agent} has not started")))?;
-        for segment in agent.path() {
-            id = db
-                .query_row(
-                    "SELECT id FROM agent WHERE parent = ?1 AND child_index = ?2",
-                    params![id, *segment],
-                    |row| Ok(row.get::<i64>(0)?),
-                )?
-                .ok_or_else(|| rejected(format!("agent {agent} has not started")))?;
-        }
         self.agents.insert(agent.path().to_vec(), id);
         Ok(id)
     }
@@ -198,6 +210,24 @@ impl Encoder {
         self.targets.insert(target.clone(), id);
         Ok(id)
     }
+}
+
+/// `agent`'s row, once it has started.
+pub(in crate::session) fn agent_row(db: &Db, agent: &AgentId) -> DbResult<Option<i64>> {
+    let mut id = db.query_row(
+        "SELECT id FROM agent WHERE parent IS NULL",
+        Vec::new(),
+        |row| Ok(row.get::<i64>(0)?),
+    )?;
+    for segment in agent.path() {
+        let Some(parent) = id else { break };
+        id = db.query_row(
+            "SELECT id FROM agent WHERE parent = ?1 AND child_index = ?2",
+            params![parent, *segment],
+            |row| Ok(row.get::<i64>(0)?),
+        )?;
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -369,22 +399,28 @@ mod tests {
             outcome: CompletedOutcome::Cut(Truncation::MaxTokens),
         });
         let job = JobId::new(1).unwrap();
-        one!(SessionEvent::JobCreated {
-            job,
-            parent: None,
-            origin: Some(ModelCallOrigin {
+        // A model call's job keeps no copy of its call's arguments, unless they were
+        // repaired; a script's call has its own. Equal schemas are stored once.
+        let schema = std::sync::Arc::new(json!({"type": "object"}));
+        let read = |id, parent, call: Option<&str>, arguments| SessionEvent::JobCreated {
+            job: JobId::new(id).unwrap(),
+            parent,
+            origin: call.map(|call| ModelCallOrigin {
                 message: assistant.message(),
-                call_id: "b".into(),
+                call_id: call.into(),
             }),
             tool: "read".into(),
             role: JobRole::Tool,
             name: Some("reader".parse().unwrap()),
-            arguments: json!({"path": "b"}),
-            output_schema: Some(json!({"type": "object"})),
+            arguments,
+            output_schema: Some(schema.clone()),
             accepts_input: false,
             background: true,
             location: ExecutionLocation::named("build".parse().unwrap(), "/srv".into()),
-        });
+        };
+        one!(read(1, None, Some("b"), json!({"path": "b"})));
+        one!(read(3, None, Some("a"), json!({"path": "a/"})));
+        one!(read(4, Some(job), None, json!({"path": "b"})));
         one!(SessionEvent::JobStateChanged {
             job,
             state: JobTransition::Running,
@@ -407,6 +443,7 @@ mod tests {
             targets: vec![TargetDefinition::test("build", "/srv", None)],
         });
         one!(SessionEvent::JobClaimed { job });
+        one!(SessionEvent::JobCancelRequested { job });
         one!(SessionEvent::JobReleased { job });
         one!(SessionEvent::JobMessageReleased { job });
         one!(SessionEvent::JobInjected { job });
@@ -602,6 +639,44 @@ mod tests {
             one!(event);
         }
         fixture.assert_round_trip();
+        let jobs = fixture.db.query(
+            "SELECT arguments IS NULL, output_schema IS NOT NULL FROM job ORDER BY id",
+            Vec::new(),
+            |row| Ok((row.get::<bool>(0)?, row.get::<bool>(1)?)),
+        );
+        let (from_call, own) = ((true, true), (false, true));
+        assert_eq!(jobs.unwrap(), [from_call, (false, false), own, own]);
+        let schemas = fixture.db.query(
+            "SELECT count(DISTINCT output_schema) FROM job",
+            Vec::new(),
+            |row| Ok(row.get::<i64>(0)?),
+        );
+        assert_eq!(schemas.unwrap(), [1]);
+        let decoded = fixture.decode().unwrap();
+        let schemas: Vec<_> = (decoded.iter())
+            .filter_map(|record| match &record.event {
+                SessionEvent::JobCreated { output_schema, .. } => output_schema.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            schemas
+                .windows(2)
+                .all(|pair| std::sync::Arc::ptr_eq(&pair[0], &pair[1]))
+        );
+        // Per-message decode reads what the whole journal's decode does.
+        let committed: Vec<_> = (decoded.iter())
+            .filter(|record| record.agent == root)
+            .filter_map(|record| match &record.event {
+                SessionEvent::MessageCommitted { message } => {
+                    Some((record.sequence.message(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let commits: Vec<_> = committed.iter().map(|(commit, _)| *commit).collect();
+        let by_commit = super::super::message::committed(&fixture.db, &commits).unwrap();
+        assert_eq!(by_commit, committed.into_iter().collect());
         let look = fixture.db.query(
             "SELECT mode_version FROM agent_mode WHERE mode_name = 'look' ORDER BY entry",
             Vec::new(),

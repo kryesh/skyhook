@@ -1,7 +1,7 @@
 //! Public session submission, inspection, and shutdown API.
 
 use super::*;
-use crate::session::{SessionTitle, TitleSource};
+use crate::session::TitleSource;
 
 impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
@@ -21,14 +21,15 @@ impl SessionHandle {
         &self.root
     }
 
-    /// Observe without a gap between the initial snapshot and subsequent updates.
-    pub fn observe(&self) -> Observation {
-        self.runtime.store.observe()
+    /// The session's journal: its observation, and its history, read in pages after
+    /// observing.
+    pub fn store(&self) -> &SessionStore {
+        &self.runtime.store
     }
 
-    /// The revision of the newest update published to observers.
-    pub fn revision(&self) -> u64 {
-        self.runtime.store.revision()
+    /// The session's jobs, which a host reads in pages or by id.
+    pub fn jobs(&self) -> &JobManager {
+        &self.runtime.jobs
     }
 
     /// Host-only startup diagnostics, never inserted into agent context.
@@ -49,7 +50,7 @@ impl SessionHandle {
 
     /// What sending the root agent into `mode` would grant it.
     pub fn mode_capabilities(&self, mode: &ModeName) -> Option<crate::tool::policy::CapabilitySet> {
-        let depth = (self.runtime.delegation(&self.root)).map_or(0, |(_, depth)| depth);
+        let depth = (self.runtime.held(&self.root, |_, depth, _| depth)).unwrap_or(0);
         let granted = self.runtime.mode_capabilities(mode).ok()?;
         Some(granted.for_agent(depth))
     }
@@ -58,7 +59,10 @@ impl SessionHandle {
     /// another mode, a configured redefinition of its own, or different grants. An
     /// unknown mode counts as a change, which sending it would refuse.
     pub fn changes_mode(&self, mode: &ModeName) -> bool {
-        let Some((current, capabilities)) = self.runtime.resumed_mode(&self.root) else {
+        let held = (self.runtime).held(&self.root, |contract, _, granted| {
+            (contract.mode.clone(), granted)
+        });
+        let Some((current, capabilities)) = held else {
             return true;
         };
         let change = (self.runtime).mode_change(&self.root, current.as_ref(), &capabilities, mode);
@@ -71,18 +75,16 @@ impl SessionHandle {
         &self,
         agent: &AgentId,
     ) -> Option<crate::tool::policy::CapabilitySet> {
-        let resumed = self.runtime.resumed_mode(agent);
-        resumed.map(|(_, capabilities)| capabilities)
+        let runtime = &self.runtime;
+        runtime
+            .store
+            .read(|state| Some(runtime.granted(state, agent)?.1))
     }
 
     /// Model configuration, instruction, and skill diagnostics that must not
     /// write directly to a terminal.
     pub fn warnings(&self) -> &[String] {
         &self.runtime.harness.warnings
-    }
-
-    pub fn directory(&self) -> &Path {
-        self.runtime.store.directory()
     }
 
     /// Name a session that has neither a title nor a first prompt to take one
@@ -112,11 +114,6 @@ impl SessionHandle {
         };
         self.runtime.store.append(self.root.clone(), event).await?;
         Ok(())
-    }
-
-    /// The title the session list shows.
-    pub async fn title(&self) -> Result<Option<SessionTitle>, HarnessError> {
-        Ok(self.runtime.store.title().await?)
     }
 
     /// Persist a host-facing status without adding it to the agent's model context.
@@ -199,7 +196,7 @@ impl SessionHandle {
         let restart = move |state: &CoreState| {
             let (running, restart) = runtime.jobs.continue_resumable(state);
             Ok::<_, HarnessError>(Plan::new(running, move |state, _| {
-                state.agents.flow = Flow::Open;
+                state.agents.set_flow(Flow::Open);
                 let resumed = restart(state);
                 // A held wait resumes with its children: busy as they restart.
                 let waiting = state.agents.turned(&Turn::Held);
@@ -268,7 +265,7 @@ impl SessionHandle {
         let root = self.root.clone();
         let send = move |state: &mut CoreState| state.agents.send(&root, command);
         if !self.runtime.store.live(send).await {
-            return Err((self.runtime.store).read(|state| super::refused_input(&state.phase)));
+            return Err((self.runtime.store).read(|state| super::refused_input(state.phase())));
         }
         adopted.await.map_err(|_| HarnessError::AgentStopped)?
     }
@@ -283,16 +280,13 @@ impl SessionHandle {
             self.running().await?;
             self.adopt_configured_mode().await?;
             // A host script is the root agent's work: it runs under the root's current mode.
-            let root = (self.runtime).agents(|agents| {
-                agents.get(&self.root)?;
-                Some(
-                    self.runtime
-                        .resumed_contract(agents, &self.root)?
-                        .capabilities,
-                )
-            });
+            let running = self
+                .runtime
+                .agents(|agents| agents.contains_key(&self.root));
+            let root = running.then(|| self.runtime.held(&self.root, |_, _, granted| granted));
+            let root = root.flatten();
             let capabilities = root.ok_or_else(|| {
-                (self.runtime.store).read(|state| super::refused_input(&state.phase))
+                (self.runtime.store).read(|state| super::refused_input(state.phase()))
             })?;
             let executor = self
                 .runtime
@@ -317,7 +311,7 @@ impl SessionHandle {
         let submitted = async {
             self.runtime.admit_message(attachments, &options)?;
             self.running().await?;
-            (self.runtime.store).read(|state| state.phase.admits(Command::Submit).map(drop))?;
+            (self.runtime.store).read(|state| state.phase().admits(Command::Submit).map(drop))?;
             let text = vec![UserPart::Text { text: text.into() }];
             let content = self.runtime.with_attachments(text, attachments).await?;
             let (done, answer) = oneshot::channel();
@@ -335,13 +329,13 @@ impl SessionHandle {
     /// What a call the session's failure cut short returns: that failure,
     /// however the call itself ended.
     fn outcome<T>(&self, result: Result<T, HarnessError>) -> Result<T, HarnessError> {
-        let failed = || self.runtime.store.read(|state| state.phase.failed());
+        let failed = || self.runtime.store.read(|state| state.phase().failed());
         result.map_err(|error| failed().map_or_else(Into::into, |()| error))
     }
 
     /// Where the session is in its life.
     pub fn phase(&self) -> crate::session::SessionPhase {
-        self.runtime.store.read(|state| state.phase.clone())
+        self.runtime.store.read(|state| state.phase().clone())
     }
 
     /// The selection a message or continued turn can carry: a `provider/model` the
@@ -386,14 +380,14 @@ impl SessionHandle {
         let (runtime, root) = (self.runtime.clone(), self.root.clone());
         let stop = move |state: &CoreState| {
             // A viewed session runs nothing, so it stops nothing.
-            if !state.phase.runs() {
+            if !state.phase().runs() {
                 return Ok(Plan::new(Vec::new(), |_, _| true));
             }
             let agents = state.agents.within(&root);
             let released = crate::job::release_records(&state.jobs.releases(&root, &agents));
             Ok::<_, SessionError>(Plan::new(released, move |state, _| {
                 runtime.stop_turns(state, &root);
-                drop(runtime.jobs.conclude(state, crate::job::Concluding::Every));
+                runtime.jobs.conclude(state, crate::job::Concluding::Every);
                 runtime.jobs.cancel_running(state);
                 state.agents.cancel_turns(&agents);
                 false
@@ -407,8 +401,12 @@ impl SessionHandle {
                 return Ok(());
             }
             // Each loop ends as it finds its turn refused, and each cancellation settles.
-            let quiescent = |state: &mut CoreState| state.agents.is_empty().then_some(());
-            self.runtime.store.until(quiescent).await?;
+            let running = |state: &mut CoreState| state.agents.keys().cloned().collect::<Vec<_>>();
+            let quiescent = |running: Vec<AgentId>| {
+                let quiescent = |state: &CoreState| state.agents.is_empty().then_some(());
+                Wait::on(running.into_iter().map(Key::Agent), quiescent)
+            };
+            self.runtime.store.until_after(running, quiescent).await?;
             Ok::<_, HarnessError>(self.runtime.jobs.cancel_and_drain().await?)
         };
         // A failed session's work is already stopped; its connections still close.
@@ -1117,13 +1115,9 @@ mod tests {
     /// resumed turn is busy again, so a second interrupt stops it.
     #[tokio::test]
     async fn continue_resumes_nested_holders_so_a_second_interrupt_stops_them() {
-        let delegate = |id: &str, depth: u32| {
-            let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
-            response(vec![tool_call(0, id, "agent", arguments)])
-        };
         let steps = [
-            Step::new(delegate("child", 1)),
-            Step::new(delegate("grandchild", 0)),
+            Step::new(response(vec![delegation("child", 1)])),
+            Step::new(response(vec![delegation("grandchild", 0)])),
             Step::new(Vec::new()).midstream(),
             Step::new(answer("grandchild recovered")),
             Step::new(Vec::new()).midstream(),

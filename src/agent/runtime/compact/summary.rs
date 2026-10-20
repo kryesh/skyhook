@@ -62,7 +62,7 @@ mod tests {
     use crate::{
         agent::TodoStatus,
         agent::runtime::HarnessError,
-        session::{Message, RequestPhase, SessionEvent, project_history},
+        session::{Message, RequestPhase, SessionEvent},
     };
 
     /// A summary that overflows the context window is retried smaller: with half the
@@ -107,7 +107,12 @@ mod tests {
                 .rev()
                 .find(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
             let last = last.unwrap().sequence.request();
-            let (_, replayed) = crate::session::reconstruct_model_request(&records, last).unwrap();
+            let replayed = fixture
+                .session
+                .runtime
+                .store
+                .reconstruct_model_request(last);
+            let (_, replayed) = replayed.await.unwrap();
             assert_eq!(&replayed, trimmed);
             fixture.session.shutdown().await.unwrap();
         }
@@ -213,12 +218,12 @@ mod tests {
         let fixture = Fixture::new((0..5).map(|_| failing_stream(None))).await;
         fixture.add_history(20_000).await;
         let root = &fixture.session.root;
-        let before = crate::session::project_history(&fixture.records(), root);
+        let before = fixture.history(root).await;
         let mut events = fixture.session.runtime.store.observe().updates;
         let (result, ()) = bounded(async {
             tokio::join!(fixture.compact(), async {
                 for _ in 0..3 {
-                    elapse_backoff(&next_recovery(&mut events).await).await;
+                    elapse_backoff(&*next_recovery(&mut events).await).await;
                 }
                 next_recovery(&mut events).await;
                 assert_eq!(fixture.session.interrupt().await, 1);
@@ -228,13 +233,15 @@ mod tests {
         assert!(matches!(result, Err(HarnessError::Interrupted)));
         assert_eq!(fixture.script.remaining(), 1);
         let records = fixture.records();
-        let found = crate::session::project_history(&records, root);
+        let found = fixture.history(root).await;
         assert_eq!(found, before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
         // The interruption during a retry's backoff settles the summary request
         // on its last attempt.
-        let ledger = fixture.session.observe().snapshot.ledger;
-        let summary = ledger.latest(root).and_then(|request| ledger.get(request));
+        let requests = fixture.session.store().observe().snapshot.requests;
+        let summary = requests
+            .latest(root)
+            .and_then(|request| requests.get(request));
         assert!(matches!(
             summary.unwrap().phase,
             RequestPhase::Interrupted {
@@ -260,7 +267,7 @@ mod tests {
                     .replace_todos(agent, todos.clone(), None)
                     .await
                     .unwrap();
-                let history = project_history(&fixture.records(), agent);
+                let history = fixture.history(agent).await;
                 kept = Some((history, todos));
                 let (result, ()) = bounded(async {
                     tokio::join!(fixture.compact(), async {
@@ -287,8 +294,8 @@ mod tests {
             let requested = requested.unwrap().sequence.request();
             let observed_events = events!(&records, SessionEvent::Usage { request, usage } if *request == requested => *usage);
             assert_eq!(observed_events, vec![observed]);
-            let ledger = fixture.session.observe().snapshot.ledger;
-            let phase = &ledger.get(requested).unwrap().phase;
+            let ledger = crate::session::tests::ledger(&fixture.session.runtime.store);
+            let phase = &ledger.requests[&requested].phase;
             let at = phase.settled_at().unwrap();
             assert_eq!(
                 *phase,
@@ -302,7 +309,7 @@ mod tests {
                 if items.iter().any(|item| item.id().as_str() == "interrupted-tool"));
             assert_eq!(committed, 0);
             if let Some((history, todos)) = kept {
-                assert_eq!(project_history(&records, agent), history);
+                assert_eq!(fixture.history(agent).await, history);
                 assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
                 assert_eq!(store.inspect_todos(agent, None).unwrap(), todos);
             }

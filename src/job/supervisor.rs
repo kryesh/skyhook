@@ -74,12 +74,14 @@ impl<S> JobLease<S> {
         let run = self.worker.run;
         let (jobs, cancellation) = self.worker.into_owned();
         jobs.clone().inner.supervisor.spawn(async move {
-            let finished = jobs.inner.store.until(move |state| {
-                let entry = state.jobs.entries.get(&run.0);
-                entry
-                    .is_none_or(|entry| entry.end().is_some())
-                    .then_some(())
-            });
+            let finished = move |state: &crate::session::CoreState| {
+                let entry = state.jobs.get(run.0);
+                (entry.is_none_or(|entry| entry.end().is_some())).then_some(())
+            };
+            let finished = (jobs.inner.store).until(crate::session::Wait::on(
+                [crate::session::Key::Job(run.0)],
+                finished,
+            ));
             tokio::select! {
                 () = cancellation.cancelled() => {
                     jobs.settle(run, ToolError::cancelled().into()).await;
@@ -172,12 +174,15 @@ impl JobWorker {
             Some(future.await)
         }));
         let abort = worker.abort_handle();
-        let attaching = jobs.clone();
         // A refused attach drops `attach`, ending the worker before its body.
         jobs.inner.store.enqueue(move |state| {
-            let entry = state.jobs.entries.get(&id);
-            if entry.is_some_and(|entry| entry.invocation == invocation && entry.end().is_none()) {
-                attaching.handles(id, |handles| handles.task_abort = Some((invocation, abort)));
+            let attached = state.jobs.modify(id, |entry, _| {
+                let running = entry.invocation == invocation && entry.end().is_none();
+                let handles = entry.handles.as_mut().filter(|_| running)?;
+                handles.task_abort = Some((invocation, abort));
+                Some(())
+            });
+            if attached.flatten().is_some() {
                 let _ = attach.send(());
             }
         });
@@ -243,6 +248,15 @@ impl Supervisor {
             .spawn(self.root.clone().run_until_cancelled_owned(task))
     }
 
+    /// Run blocking `task` on `runtime` to its end, which draining waits for.
+    pub(crate) fn spawn_blocking(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+        runtime: &tokio::runtime::Handle,
+    ) -> JoinHandle<()> {
+        self.tasks.spawn_blocking_on(task, runtime)
+    }
+
     /// A token the root's cancellation cancels.
     pub(crate) fn token(&self) -> CancellationToken {
         self.root.child_token()
@@ -293,8 +307,8 @@ mod tests {
         (root, jobs, lease, id)
     }
 
-    fn state(jobs: &JobManager, id: JobId) -> JobState {
-        jobs.metadata(id).unwrap().state
+    async fn state(jobs: &JobManager, id: JobId) -> JobState {
+        jobs.metadata(id).await.unwrap().state
     }
 
     /// Every startup obligation is consumed exactly once: abandonment at any
@@ -356,7 +370,7 @@ mod tests {
                 }
             }
             crate::tests::bounded(jobs.supervisor().drain()).await;
-            let result = jobs.metadata(id).unwrap();
+            let result = jobs.metadata(id).await.unwrap();
             assert_eq!(result.state, expected, "{tool}");
             if let Some(error) = error {
                 assert!(
@@ -369,7 +383,7 @@ mod tests {
                 assert!(!cancellation.is_cancelled());
             }
             if tool.starts_with("abandoned") {
-                assert_eq!(state(&jobs.test_replay(), id), expected);
+                assert_eq!(state(&jobs.test_replay(), id).await, expected);
             }
         }
     }
@@ -389,6 +403,6 @@ mod tests {
         assert!(futures_util::poll!(&mut drain).is_pending());
         release.send(()).unwrap();
         crate::tests::bounded(drain).await;
-        assert_eq!(state(&jobs, id), JobState::Completed);
+        assert_eq!(state(&jobs, id).await, JobState::Completed);
     }
 }

@@ -14,10 +14,14 @@ mod sidebar;
 mod wrapping;
 
 pub use cache::RenderState;
+#[cfg(test)]
+pub(crate) use cache::visible_entries as visible;
+pub(crate) use cache::{Spot, Top, Track, anchor};
 pub use frame::draw;
 pub(super) use markdown::{Section, sections};
 pub(super) use panels::scroll_to;
 pub use row::Row;
+use rows::Laid;
 pub use rows::RowBlocks;
 pub use selection::{Selection, TextPosition};
 
@@ -31,9 +35,7 @@ use sidebar::*;
 use wrapping::*;
 
 use super::{
-    app::{
-        App, Emphasis, Focus, Hit, InputTarget, ItemRef, MenuKind, Overlay, SavedState, SessionRef,
-    },
+    app::{App, Emphasis, Focus, Hit, InputTarget, ItemRef, MenuKind, SavedState, SessionRef},
     editor::TextField,
     model::{self, Surface, Tab},
     theme::THEME,
@@ -58,7 +60,6 @@ mod tests {
         layout: markdown::RowLayout,
         x: u16,
         width: u16,
-        entry: usize,
     ) -> Row {
         Row {
             line: std::sync::Arc::new(line),
@@ -67,8 +68,7 @@ mod tests {
             inset: 0,
             text_width: width,
             surface: Surface::Tool,
-            entry,
-            entry_key: std::sync::Arc::new(model::EntryKey::UnsavedStatus(entry)),
+            entry_key: std::sync::Arc::new(model::EntryKey::UnsavedStatus(0)),
             selectable: true,
             layout,
             spinner: None,
@@ -106,7 +106,7 @@ mod tests {
         let mut rows = Vec::new();
         let highlights = super::super::tool_view::HighlightCache::default();
         let columns = RequestColumns::default();
-        update_entry_rows(&mut rows, entry, 0, width, &highlights, columns);
+        update_entry_rows(&mut rows, entry, width, &highlights, columns);
         rows
     }
 }

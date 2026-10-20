@@ -19,8 +19,8 @@ use crate::{
     media::ImageRef,
     named_enum::named_enum,
     session::{
-        Command, CoreState, MessageSeq, Plan, Prepared, RecordSeq, SessionError, SessionEvent,
-        SessionStore,
+        Command, CoreState, Key, MessageSeq, Plan, Prepared, RecordSeq, SessionError, SessionEvent,
+        SessionStore, Wait,
     },
     tool::{
         ToolError, ToolOutput,
@@ -44,26 +44,32 @@ mod error;
 mod input;
 mod lifecycle;
 mod messages;
+mod pages;
 mod process;
 pub(super) mod views;
 
 pub(crate) use delivery::{Delivery, Notification};
-pub(crate) use entry::Run;
-pub(crate) use entry::WaitFloor;
 use entry::{
     Answer, CancelState, Child, DeliveryState, Finished, JobChange, JobFacts, JobHandles, Phase,
-    Rejected, RoleState, Stamps, Start,
+    Queued, Rejected, RoleState, Stamps, Start, addressed,
 };
+pub(crate) use entry::{AnswerKind, Run, WaitFloor};
 pub use entry::{Invocation, RunTiming};
 pub use error::{InputUnavailableReason, JobError};
 pub(crate) use input::Concluding;
 pub(crate) use lifecycle::woken;
+pub use pages::JobScope;
 pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
 pub(crate) use views::{JOB_VIEW_SCHEMAS, ViewKind, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
+mod index;
+use index::Lookup;
+pub(crate) use index::{JobSeeds, Jobs};
+#[cfg(debug_assertions)]
+pub(crate) use persistence::assert_folded;
+pub(crate) use persistence::{ChildStatus, JobStatus, Settled};
 mod persistence;
-pub(crate) use persistence::Jobs;
 mod progress;
 mod supervisor;
 #[cfg(test)]
@@ -72,6 +78,13 @@ pub(crate) use supervisor::Supervisor;
 pub use supervisor::{JobLease, stage};
 
 const JOB_INPUT_CAPACITY: usize = 32;
+
+/// Whether a job shows under its parent, as one its owner's script issued: a job a
+/// model call launched names the calling agent's own job as its parent, so it is a
+/// root of the calling agent's view, as is one without a parent.
+pub fn nests(parent: Option<JobId>, origin: &Option<crate::session::ModelCallOrigin>) -> bool {
+    parent.is_some() && origin.is_none()
+}
 
 named_enum! {
     /// Semantic execution role, independent of extensible tool names.
@@ -211,23 +224,32 @@ impl From<Result<ToolOutput, crate::tool::ToolError>> for JobOutcome {
     }
 }
 
-/// A restored agent job that can run again: its owner, and what runs it.
-pub(crate) struct RetainedChild {
+/// An agent job that restarts: its owner, where it runs, the token its
+/// invocations run under, and what runs it.
+#[derive(Clone)]
+pub(crate) struct Restarting {
     pub job: JobId,
     pub owner: AgentId,
+    pub parent: Option<JobId>,
+    pub location: ExecutionLocation,
+    pub cancellation: CancellationToken,
     pub restart: Restart,
 }
 
-/// What runs a restored agent job again.
+/// What runs an agent job again, as its own facts decide.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Restart {
-    /// The child its call installed, under the authority its invocations ran under.
-    Child {
-        parent: Option<JobId>,
-        location: ExecutionLocation,
-        cancellation: CancellationToken,
-    },
+    /// The child its call installed, under its owner's authority.
+    Child,
     /// The call itself, asked for again.
     Call,
+}
+
+/// Builds what runs a restarting agent job, as it restarts: the session's agent
+/// runtime, which runs it under its owner's journaled contract.
+pub(crate) trait Restarter: Send + Sync {
+    /// What runs `restarting`, if anything can.
+    fn resume(self: Arc<Self>, restarting: Restarting) -> Option<Resume>;
 }
 
 /// What restarts a finished agent job; ordinary input-capable tools cannot restart.
@@ -238,12 +260,6 @@ pub(crate) enum Resume {
     /// Asks again for a call interrupted before it installed its child, then
     /// runs it, from its approval on.
     Call(Relaunch),
-}
-
-impl From<ResumeHandler> for Resume {
-    fn from(handler: ResumeHandler) -> Self {
-        Self::Child(handler)
-    }
 }
 
 /// Starts a call's restarted invocation, from the lease that runs it.
@@ -264,8 +280,10 @@ pub(crate) type ResumeHandler = Arc<
 
 struct JobManagerInner {
     store: SessionStore,
-    /// Taken after the core's state, never before it.
-    handles: std::sync::Mutex<HashMap<JobId, JobHandles>>,
+    /// Set once the session's agent runtime is built: without it, nothing restarts.
+    restarter: std::sync::OnceLock<std::sync::Weak<dyn Restarter>>,
+    /// The job each attached process belongs to.
+    processes: std::sync::Mutex<HashMap<u32, JobId>>,
     supervisor: Supervisor,
 }
 
@@ -275,7 +293,7 @@ pub(crate) struct Issuing(SessionStore, JobId);
 impl Drop for Issuing {
     fn drop(&mut self) {
         let parent = self.1;
-        self.0.enqueue(move |state| state.jobs.calls.issued(parent));
+        self.0.enqueue(move |state| state.jobs.issued(parent));
     }
 }
 
@@ -337,9 +355,15 @@ impl JobManager {
             inner: Arc::new(JobManagerInner {
                 supervisor: Supervisor::new(store.root()),
                 store,
-                handles: std::sync::Mutex::default(),
+                restarter: std::sync::OnceLock::new(),
+                processes: std::sync::Mutex::default(),
             }),
         }
+    }
+
+    /// Let `restarter` build what runs agent jobs that restart.
+    pub(crate) fn restart_with(&self, restarter: std::sync::Weak<dyn Restarter>) {
+        let _ = self.inner.restarter.set(restarter);
     }
 
     /// Read the jobs as the core last applied them.
@@ -347,44 +371,46 @@ impl JobManager {
         self.inner.store.read(|state| read(&state.jobs))
     }
 
-    /// Read job `id`'s facts.
-    fn entry<T>(&self, id: JobId, read: impl FnOnce(&JobFacts) -> T) -> Result<T, JobError> {
-        self.facts(|jobs| jobs.entries.get(&id).map(read).ok_or(JobError::Unknown(id)))
-    }
-
-    /// Use job `id`'s handles. A job this manager did not create, as one
-    /// replayed from the journal, runs with fresh ones.
-    fn handles<T>(&self, id: JobId, use_: impl FnOnce(&mut JobHandles) -> T) -> T {
-        let mut handles = self
-            .inner
-            .handles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let fresh = || JobHandles::new(self.inner.supervisor.token()).0;
-        use_(handles.entry(id).or_insert_with(fresh))
+    /// Read job `id`'s facts, held or read back from its status row once no longer held.
+    async fn entry<T>(&self, id: JobId, read: impl FnOnce(&JobFacts) -> T) -> Result<T, JobError> {
+        let lookup = self.facts(move |jobs| match jobs.lookup(id) {
+            Lookup::Held(entry) => Lookup::Held(read(entry)),
+            Lookup::Unheld(()) => Lookup::Unheld(read),
+            Lookup::Unknown => Lookup::Unknown,
+        });
+        match lookup {
+            Lookup::Held(value) => Ok(value),
+            Lookup::Unheld(read) => {
+                let journal = self.store().journal();
+                let settled = move || Settled::read(&journal, &[id]);
+                let mut settled = self.store().reads().hold(settled).await?;
+                Ok(read(&settled.take(id)?))
+            }
+            Lookup::Unknown => Err(JobError::Unknown(id)),
+        }
     }
 
     /// Count a call `parent` issued, synchronously, until its job is published:
     /// the count is queued ahead of every command its caller issues after it.
     pub(crate) fn issue(&self, parent: JobId) -> Issuing {
         let store = self.inner.store.clone();
-        store.enqueue(move |state| state.jobs.calls.issue(parent));
+        store.enqueue(move |state| state.jobs.issue(parent));
         Issuing(store, parent)
     }
 
     /// Wait until every call `parent` has issued so far has its job published.
     pub(crate) async fn issued(&self, parent: JobId) {
-        let published = move |state: &mut CoreState| state.jobs.calls.published(parent);
-        let _ = self.inner.store.until(published).await;
+        let published = move |state: &CoreState| state.jobs.published(parent);
+        let _ = (self.inner.store)
+            .until(Wait::on([Key::Job(parent)], published))
+            .await;
     }
 
     /// Record that a call of `agent`'s response committed at `response` ended
     /// without a job.
     pub(crate) fn settled_jobless(&self, agent: &AgentId, response: MessageSeq) {
         let agent = agent.clone();
-        let settled = move |state: &mut CoreState| {
-            state.jobs.calls.jobless.insert(agent, response);
-        };
+        let settled = move |state: &mut CoreState| state.jobs.settled_jobless(agent, response);
         self.inner.store.enqueue(settled);
     }
 
@@ -407,13 +433,35 @@ pub(crate) mod tests {
         (runtime.root, runtime.jobs, runtime.agent)
     }
 
+    /// What tests run as their agent jobs' children, by session and job: the
+    /// restarter of every job manager a test gives one.
+    static HANDLERS: std::sync::LazyLock<Arc<Handlers>> = std::sync::LazyLock::new(Arc::default);
+
+    #[derive(Default)]
+    struct Handlers(std::sync::Mutex<HashMap<(crate::identity::SessionId, JobId), ResumeHandler>>);
+
+    impl Restarter for Handlers {
+        fn resume(self: Arc<Self>, restarting: Restarting) -> Option<Resume> {
+            let key = (restarting.owner.session(), restarting.job);
+            let handlers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            handlers.get(&key).cloned().map(Resume::Child)
+        }
+    }
+
+    /// Hold, or let go, the finish of the job `child` answers through, as a
+    /// finish in flight holds it: its own publication waits until let go.
+    pub(crate) fn hold_finish(state: &mut CoreState, child: &AgentId, held: bool) {
+        let job = state.jobs.launched(child).expect("a launched child");
+        state.jobs.modify(job, |entry, _| entry.finishing = held);
+    }
+
     /// Drain owners, drop the manager, and replay the durable journal of the
     /// runtime at `root`.
     pub(crate) async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
         let session = jobs.store().id();
         jobs.supervisor().drain().await;
         drop(jobs);
-        let (store, _) = SessionStore::open(&root.join("sessions"), session)
+        let store = SessionStore::open(&root.join("sessions"), session)
             .await
             .unwrap();
         reopened(store).await
@@ -497,7 +545,7 @@ pub(crate) mod tests {
         let id = JobId::new(1).unwrap();
         let created = crate::session::tests::job_created(id, JobRole::Agent);
         // Applies a change as the journal does, when the phase admits it.
-        let apply = |entry: &mut JobFacts, stamps: &mut Stamps, change: &JobChange| {
+        let apply = |entry: &mut JobFacts, stamps: &Stamps, change: &JobChange| {
             entry.admits(change.step()).ok()?;
             let (_, journaled) = JobChange::of(&change.event(id)).unwrap();
             entry.enter(journaled, stamps);
@@ -505,12 +553,13 @@ pub(crate) mod tests {
         };
         let at = |changes: &[JobChange]| {
             let mut jobs = Jobs::default();
-            jobs.apply(&crate::session::tests::record(&agent, 1, created.clone()));
-            let mut entry = jobs.entries.remove(&id).unwrap();
-            for change in changes {
-                apply(&mut entry, &mut jobs.stamps, change).expect("fixture prefix is legal");
-            }
-            (entry, jobs.stamps)
+            (jobs.apply(&crate::session::tests::record(&agent, 1, created.clone()))).unwrap();
+            jobs.modify(id, |entry, stamps| {
+                for change in changes {
+                    apply(entry, stamps, change).expect("fixture prefix is legal");
+                }
+            });
+            jobs
         };
         let running = [Advance(AwaitingApproval), Advance(Running)];
         let waiting = [
@@ -625,19 +674,13 @@ pub(crate) mod tests {
                 None,
             ),
         ];
-        let handler: ResumeHandler = Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::default()) }));
         for (case, prefix, change, expected) in cases {
-            let (mut entry, mut stamps) = at(prefix);
-            entry.resume = Some(Resume::Child(handler.clone()));
-            let before = entry.state();
-            let applied = apply(&mut entry, &mut stamps, &change);
-            assert_eq!(applied.is_some(), expected.is_some(), "{case}");
-            assert_eq!(entry.state(), expected.unwrap_or(before), "{case}");
-            assert_eq!(
-                entry.resume.is_none(),
-                expected == Some(JobState::Cancelled),
-                "{case}"
-            );
+            at(prefix).modify(id, |entry, stamps| {
+                let before = entry.state();
+                let applied = apply(entry, stamps, &change);
+                assert_eq!(applied.is_some(), expected.is_some(), "{case}");
+                assert_eq!(entry.state(), expected.unwrap_or(before), "{case}");
+            });
         }
         // A restart reports through delivery unless the interruption kept its waiter;
         // a question always does.
@@ -646,12 +689,13 @@ pub(crate) mod tests {
             ("interrupted", &interrupted[..], Advance(Running), false),
             ("asked", &running[..], Ask(question("q")), true),
         ] {
-            let (mut entry, mut stamps) = at(prefix);
-            entry.background = false;
-            entry.acknowledge();
-            apply(&mut entry, &mut stamps, &change).unwrap();
-            assert_eq!(entry.background, background, "{case}");
-            assert!(entry.unacknowledged(), "{case}");
+            at(prefix).modify(id, |entry, stamps| {
+                entry.background = false;
+                entry.acknowledge();
+                apply(entry, stamps, &change).unwrap();
+                assert_eq!(entry.background, background, "{case}");
+                assert!(entry.unacknowledged(), "{case}");
+            });
         }
     }
 
@@ -710,7 +754,7 @@ pub(crate) mod tests {
 
         /// Job `id`'s envelope, [`hydrated`](Self::hydrated).
         pub(crate) async fn test_snapshot(&self, id: JobId) -> Result<Hydrated, JobError> {
-            self.hydrated(self.snapshot(id)?).await
+            self.hydrated(self.snapshot(id).await?).await
         }
 
         /// Commit a child's assistant history and publish its visible text in one
@@ -727,7 +771,10 @@ pub(crate) mod tests {
             let commit = move |state: &CoreState| {
                 Jobs::message_plan(state, child, message, Some((job, &text)), follow, |_| {})
             };
-            self.inner.store.commit(Command::Journal, commit).await
+            self.inner
+                .store
+                .commit_on([job], Command::Journal, commit)
+                .await
         }
 
         /// Release `owner`'s suspended foreground jobs, as a redirect does.
@@ -749,7 +796,7 @@ pub(crate) mod tests {
 
         /// Acknowledge the job's current delivery, as a read presenting it does.
         pub(crate) async fn test_claim(&self, job: JobId) -> Result<(), JobError> {
-            let delivery = self.entry(job, |entry| entry.delivery(job))?;
+            let delivery = self.entry(job, |entry| entry.delivery(job)).await?;
             self.acknowledge(delivery).await
         }
 
@@ -766,12 +813,31 @@ pub(crate) mod tests {
                 ..JobSpec::test(agent, tool)
             };
             let id = self.test_running(spec).await.into_test_id();
+            self.test_install(id).await;
             let handler: ResumeHandler = Arc::new(move |_, _| {
                 let answer = answer.clone();
                 Box::pin(async move { Ok(ToolOutput::new(answer)) })
             });
-            self.set_resume_handler(id, handler).await.unwrap();
+            self.test_resume_with(id, handler);
             id
+        }
+
+        /// Install a child in running agent job `id`, as its call would.
+        pub(crate) async fn test_install(&self, id: JobId) -> AgentId {
+            let owner = self.metadata(id).await.unwrap().agent;
+            let index = u32::try_from(id.get()).unwrap();
+            let workspace = std::path::Path::new(".");
+            crate::session::tests::start_child(self.store(), &owner, index, Some(id), workspace)
+                .await
+        }
+
+        /// Run `handler` as the installed child of agent job `id` whenever the
+        /// job restarts, as the agent runtime would run it.
+        pub(crate) fn test_resume_with(&self, id: JobId, handler: ResumeHandler) {
+            let handlers: Arc<dyn Restarter> = HANDLERS.clone();
+            self.restart_with(Arc::downgrade(&handlers));
+            let mut registered = HANDLERS.0.lock().unwrap_or_else(PoisonError::into_inner);
+            registered.insert((self.store().id(), id), handler);
         }
 
         pub(super) async fn test_finish(&self, job: JobId, output: Value) {
@@ -788,8 +854,8 @@ pub(crate) mod tests {
             self.store().append(agent, event).await.unwrap().sequence
         }
 
-        /// The jobs as a reopen replays them, before it settles what was running.
-        /// Live commits and replay share one fold, so what the journal records of
+        /// The jobs as a reopen opens them, before it settles what was running.
+        /// Live commits and opening share one fold, so what the journal records of
         /// every job, delivery stamps included, is the same both ways.
         pub(crate) fn test_replay(&self) -> Self {
             let replay = Self::new(self.store().replica());
@@ -799,33 +865,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// What a host inspecting held job `id` is shown. A wait keyed on the job reads it
+    /// held whenever it changes, and once unheld it changes no more.
+    pub(crate) fn job_snapshot(state: &CoreState, id: JobId) -> Option<JobEnvelope> {
+        Some(state.jobs.get(id)?.envelope(id))
+    }
+
+    /// What a host inspecting each job `owner` created is shown, for a wait keyed on
+    /// `owner`, which reads no journal: as the journal left each job when it
+    /// registered, then as each change to it, which journals under `owner`, leaves it.
+    pub(crate) struct Shown {
+        owner: AgentId,
+        jobs: std::sync::Mutex<std::collections::BTreeMap<JobId, JobEnvelope>>,
+    }
+
+    impl Shown {
+        pub(crate) fn read(journal: &crate::session::Journal, owner: AgentId) -> Self {
+            let created = journal.created_by(&owner).expect("the journal reads");
+            let settled = Settled::read(journal, &created).expect("the journal reads");
+            let jobs = settled
+                .into_iter()
+                .map(|(id, entry)| (id, entry.envelope(id)));
+            let jobs = std::sync::Mutex::new(jobs.collect());
+            Self { owner, jobs }
+        }
+
+        /// The jobs in id order.
+        pub(crate) fn jobs(&self, state: &CoreState) -> Vec<JobEnvelope> {
+            let mut jobs = self.jobs.lock().unwrap();
+            let held = state
+                .jobs
+                .iter()
+                .filter(|(_, entry)| entry.agent == self.owner);
+            jobs.extend(held.map(|(id, entry)| (id, entry.envelope(id))));
+            jobs.values().cloned().collect()
+        }
+    }
+
     /// What the journal records of each job.
     fn journaled(jobs: &Jobs) -> Vec<String> {
-        let mut facts = (jobs.entries.iter())
-            .map(|(id, entry)| {
-                let child = entry.child().map(|child| {
-                    let answer = child.answer.as_ref().map(|answer| match answer {
-                        Answer::Held(message) => message.message,
-                        Answer::Released(message) => *message,
-                    });
-                    let messages = &child.messages;
-                    format!(
-                        "{:?} {messages:?} {} {answer:?}",
-                        child.agent, child.message_stamp
-                    )
-                });
-                let finished = entry
-                    .finished()
-                    .map(|finished| (finished.images.clone(), finished.diagnostic.clone()));
-                format!(
-                    "{id} {:?} {:?} {} {:?} {} {finished:?} {child:?}",
-                    entry.state(),
-                    entry.delivery,
-                    entry.background,
-                    entry.parent,
-                    entry.created_at_millis,
-                )
-            })
+        let mut facts = (jobs.iter())
+            .map(|(id, entry)| entry.journaled(id))
             .collect::<Vec<_>>();
         facts.sort();
         facts

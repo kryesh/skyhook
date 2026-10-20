@@ -51,11 +51,17 @@ that has not run anything yet, `/retry` always starts it and continues whatever 
 unfinished, or reports that there was nothing.
 Automatic model retries display the attempt number, a countdown to the next attempt, and the
 latest diagnostic in one error block. Partial output from the failed attempt clears when the next
-attempt starts; successful replies have no retry labels. Retries continue until success or
-cancellation for [transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
+attempt starts, and partial output a failed or interrupted turn left clears when the agent's next
+turn begins, as reopening the session shows it; successful replies have no retry labels. Retries
+continue until success or cancellation for
+[transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
 
 The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
-tab, while reading positions and expanded rows remain separate for each agent and tab. Requests
+tab, while reading positions and expanded rows remain separate for each agent and tab. However
+long a conversation grows, its whole history scrolls and the scrollbar spans all of it: what is
+far from view is read as the view nears it, with **Loading…** at its edge until it arrives, and
+it arrives without moving what you are reading. Drag the scrollbar to move through the history
+quickly. Requests
 include compaction requests, when each was sent, token summaries, and how long each took; transient
 retries appear under the same request, which reads **Retrying** while the next attempt is pending.
 Full request bodies are available in the session log, not rendered in the UI. Status messages,
@@ -63,15 +69,17 @@ such as interruptions and errors, appear in the conversation and are saved with 
 are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
 describe this installation rather than the session, so the terminal shows them but does not save
 them. Unsaved notices appear where they arrived in the conversation and scroll away as it grows.
-Feedback on an action, such as an attached file, a search without matches, an export, or a
-setting that could not be saved, shows briefly on the notice line instead.
+Feedback on an action, such as an attached file, an export, or a setting that could not be saved,
+shows briefly on the notice line instead. An export finishes even if you switch away from its
+session meanwhile.
 
 Job output is paged and searchable without acknowledging the agent's pending notifications.
 Select a job and press `o` for output fields, regex search, and the next page; `c` requests
 cancellation (useful for background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
 cards. Earlier progress messages remain readable after the job completes or resumes. Remote
-output becomes available as it is transferred to the host.
+output becomes available as it is transferred to the host. An expanded job card loads its output
+while it is on screen and follows what a running job writes.
 
 Provider-supplied reasoning streams in a separate expanded block and collapses when answer text
 starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
@@ -173,7 +181,6 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `PageUp`, `PageDown` | Scroll history; page through a draft taller than its box |
 | `Ctrl+Alt+U`, `Ctrl+Alt+D` | Half-page scrolling |
 | `Home`, `End` in content | Beginning, latest |
-| `/`, `n`, `N` in content | Search, next/previous match |
 | `[`, `]` in content | Previous/next inspector tab |
 | `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool |
 | `Ctrl+C` | Clear draft, otherwise interrupt (as `Esc`)/quit; in a prompt, clear its text, otherwise as `Esc` |
@@ -225,7 +232,7 @@ single editing units; pasting the same text again right after its item expands i
 text. Sending or copying expands their original contents in place. Shorter pastes
 remain ordinary editable text. Use `/attachments` to inspect or remove pasted items and attachments.
 Questions and permissions open even while inspecting the agent tree or
-conversation; open menus and search keep input focus until closed. `Esc` dismisses foreground
+conversation; open menus keep input focus until closed. `Esc` dismisses foreground
 questions and permissions without answering them; reopen pending requests with `Ctrl+X R`
 (or `/attention`, labelled **Reopen questions and permissions** in the palette).
 Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
@@ -242,7 +249,7 @@ asked for, and treat one that names a program you don't expect (a script, a shel
 itself) or an `unknown program` as raised by the agent's command.
 For background questions and authentication prompts, `Esc` cancels the request;
 cancelled requests cannot be reopened. Authentication prompts take priority over questions,
-permissions, menus, and search; interrupted question drafts resume afterward.
+permissions, and menus; interrupted question drafts resume afterward.
 
 Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you
 set ready to edit, or empty while the title is automatic; the composer and its draft are left

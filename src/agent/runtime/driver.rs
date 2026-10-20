@@ -137,7 +137,19 @@ enum Taken {
     Settle,
     /// The session refuses new turns, and the commands the agent held with them.
     Refused(crate::session::SessionPhase, Vec<AgentCommand>),
+    /// A quiescent child's loop was let go: its job runs it again.
+    Parked,
     Gone,
+}
+
+/// What an agent waiting for work decided to take: what it is given, or what
+/// taking it consumes.
+enum Taking {
+    Given(Taken),
+    Park,
+    Refused,
+    Command,
+    Jobs,
 }
 
 /// Whether `id`, between turns, takes the deliveries pending for it: only while
@@ -145,14 +157,14 @@ enum Taken {
 /// its first turn carries them.
 pub(super) fn takes_deliveries(state: &CoreState, id: &AgentId) -> bool {
     let unbegun = state.jobs.unbegun(id).is_some();
-    state.agents.flow == Flow::Open && state.jobs.has_pending(id) && !unbegun
+    state.agents.flow() == Flow::Open && state.jobs.has_pending(id) && !unbegun
 }
 
 /// Whether live jobs, queued input or pending deliveries keep `id`'s answered
 /// invocation open.
 fn kept_open(state: &CoreState, id: &AgentId) -> bool {
     let queued = state.agents.get(id).is_some_and(agents::AgentFacts::queued);
-    queued || state.jobs.has_running(id) || state.jobs.has_pending(id)
+    queued || state.jobs.has_live(id) || state.jobs.has_pending(id)
 }
 
 impl SessionRuntime {
@@ -173,29 +185,62 @@ impl SessionRuntime {
     /// `continue` or new input opens it. An `answered` invocation is settled once
     /// nothing keeps it open, however its last work went. Only the owner's
     /// cancellation abandons what this takes, and that ends the loop, dropping
-    /// the inbox with it.
-    async fn take_work(&self, id: &AgentId, answered: bool) -> Taken {
+    /// the inbox with it. A child that `parks` lets its loop go once quiescent,
+    /// in the change that decides it.
+    async fn take_work(&self, id: &AgentId, answered: bool, parks: bool) -> Taken {
         let (id, supervisor) = (id.clone(), self.jobs.supervisor().clone());
-        let take = move |state: &mut CoreState| {
-            let deliveries = takes_deliveries(state, &id);
-            let (phase, open) = (state.phase.clone(), kept_open(state, &id));
-            let Some(facts) = state.agents.get_mut(&id) else {
-                return Some(Taken::Gone);
+        let (keys, decided) = ([Key::Agent(id.clone())], id.clone());
+        let decide = move |state: &CoreState| {
+            let id = &decided;
+            let Some(facts) = state.agents.get(id) else {
+                return Some(Taking::Given(Taken::Gone));
             };
-            if phase.admits(Command::BeginTurn).is_err() {
-                return Some(Taken::Refused(phase, facts.inbox.drain(..).collect()));
+            if state.phase().admits(Command::BeginTurn).is_err() {
+                return Some(Taking::Refused);
             }
             // A cancelled turn takes no work: what it was sent waits for its loop
             // to end with its owner's cancellation.
             let cancelled = matches!(facts.turn, Turn::Cancelled(_));
-            let work = match (!cancelled).then(|| facts.inbox.pop_front()).flatten() {
-                Some(command) => Work::Command(command),
-                // A parked turn leaves deliveries pending, as a paused session does:
-                // the next input's request carries them.
-                None if deliveries && facts.turn == Turn::Idle => Work::Jobs,
-                None if answered && !open => return Some(Taken::Settle),
-                None => return None,
+            if !cancelled && !facts.inbox.is_empty() {
+                return Some(Taking::Command);
+            }
+            // A parked turn leaves deliveries pending, as a paused session does:
+            // the next input's request carries them.
+            if facts.turn == Turn::Idle && takes_deliveries(state, id) {
+                return Some(Taking::Jobs);
+            }
+            if answered {
+                return (!kept_open(state, id)).then_some(Taking::Given(Taken::Settle));
+            }
+            (parks && agents::quiescent(state, id)).then_some(Taking::Park)
+        };
+        let take = move |state: &mut CoreState, taking| {
+            fn facts<'a>(
+                agents: &'a mut agents::Agents,
+                id: &AgentId,
+            ) -> &'a mut agents::AgentFacts {
+                agents.get_mut(id).expect("decided on the agent's facts")
+            }
+            let work = match taking {
+                Taking::Given(taken) => return taken,
+                Taking::Park => {
+                    state.agents.remove(&id);
+                    return Taken::Parked;
+                }
+                Taking::Refused => {
+                    let phase = state.phase().clone();
+                    return Taken::Refused(
+                        phase,
+                        facts(&mut state.agents, &id).inbox.drain(..).collect(),
+                    );
+                }
+                Taking::Jobs => Work::Jobs,
+                Taking::Command => {
+                    let input = facts(&mut state.agents, &id).inbox.pop_front();
+                    Work::Command(input.expect("decided on a command"))
+                }
             };
+            let facts = facts(&mut state.agents, &id);
             // Input that begins an invocation an interrupt stopped first runs as a
             // turn interrupted on taking it: its input commits, and nothing requests.
             // The token is cancelled before anyone holds it.
@@ -212,8 +257,9 @@ impl SessionRuntime {
                 }
                 _ => facts.set_turn(Turn::Busy),
             };
-            Some(Taken::Work(work, token, resting))
+            Taken::Work(work, token, resting)
         };
+        let take = Wait::taking(keys, decide, take);
         self.store.until(take).await.unwrap_or(Taken::Gone)
     }
 
@@ -291,11 +337,11 @@ impl SessionRuntime {
             let interrupted = failure == Some(TurnFailure::Interrupted);
             let last = interrupted && (owner_cancelled || !stopped);
             let ends = (last && id.parent().is_some())
-                || state.ledger.open(&id).is_some()
+                || state.requests.open(&id).is_some()
                 || events.is_some()
                 || refused.is_some();
             let unanswered = state
-                .ledger
+                .requests
                 .unanswered()
                 .filter(|(agent, ..)| **agent == id);
             let error = "no result: the turn ended before the call returned one";
@@ -315,7 +361,7 @@ impl SessionRuntime {
                 Some(_) if ends => Some((id.clone(), SessionEvent::AgentInterrupted)),
                 _ => None,
             });
-            let ended = move |state: &mut CoreState, _: &[EventRecord]| {
+            let ended = move |state: &mut CoreState, _: &[Arc<EventRecord>]| {
                 rest_ended(
                     state,
                     &id,
@@ -380,7 +426,23 @@ impl SessionRuntime {
         }
     }
 
+    /// Run `agent_loop` with the window that releases its bursts, until it
+    /// parks or ends: neither outlives the other.
     pub(super) async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
+        let (store, window) = (self.store.clone(), self.harness.coalescing.clone());
+        let coalesce = wait::coalesce(store, agent_loop.id.clone(), window);
+        let coalescing = async {
+            coalesce.await;
+            std::future::pending().await
+        };
+        let drive: futures_util::future::BoxFuture<'static, ()> = Box::pin(self.drive(agent_loop));
+        tokio::select! {
+            () = drive => {}
+            () = coalescing => {}
+        }
+    }
+
+    async fn drive(self: Arc<Self>, agent_loop: AgentLoop) {
         let AgentLoop {
             id,
             owner_job,
@@ -391,9 +453,11 @@ impl SessionRuntime {
         let mut phase =
             owner_job.map_or(DriverPhase::Root, |_| DriverPhase::Child(ChildPhase::Idle));
         let child = phase.is_child();
-        let owner_cancellation = match owner_job.map(|job| self.jobs.cancellation_token(job)) {
-            Some(Ok(token)) => token,
-            Some(Err(_)) => return self.exited(&id, owner_job).await,
+        let owner_cancellation = match owner_job {
+            Some(job) => match self.jobs.cancellation_token(job).await {
+                Ok(token) => token,
+                Err(_) => return self.exited(&id).await,
+            },
             None => self.jobs.supervisor().token(),
         };
         loop {
@@ -409,7 +473,7 @@ impl SessionRuntime {
                     let _ = self.store.append(id.clone(), SessionEvent::AgentInterrupted).await;
                     break;
                 }
-                taken = self.take_work(&id, phase.answered_open()) => taken,
+                taken = self.take_work(&id, phase.answered_open(), child) => taken,
             };
             let (work, cancellation, resting) = match taken {
                 Taken::Work(work, cancellation, resting) => (work, cancellation, resting),
@@ -428,6 +492,7 @@ impl SessionRuntime {
                         .await;
                     break;
                 }
+                Taken::Parked => return,
                 Taken::Gone => break,
             };
             let _ = self.flush_events(&id, &cancellation).await;
@@ -575,28 +640,23 @@ impl SessionRuntime {
                     break;
                 }
                 // A provider/turn failure is terminal for this invocation, not for
-                // the retained child. Keep its loop, provider session, and projected
-                // history alive so the owning job can restart it. The failing job
-                // wakes the owner for it, and a parked child without a waiter needs
-                // the explicit wake.
+                // the retained child, which its owning job can restart. The failing
+                // job wakes the owner for it, and a parked turn without a waiter
+                // needs the explicit wake.
                 if !phase.fail(failure) {
                     self.wake_owner(owner_job).await;
                 }
                 continue;
             }
-            // Retain the provider session and full projected history while idle. A
-            // fresh owner request resumes this same child, never a new agent.
+            // A fresh owner request resumes this same child and its history, never
+            // a new agent, whether its loop waits idle or parked meanwhile.
             self.settle_answered(&id, owner_job, &mut phase).await;
         }
-        self.exited(&id, owner_job).await;
+        self.exited(&id).await;
     }
 
-    /// The loop is gone: its owning job can no longer resume it, and input to it
-    /// is refused as stopped.
-    async fn exited(&self, id: &AgentId, owner_job: Option<JobId>) {
-        if let Some(job) = owner_job {
-            self.jobs.clear_resume_handler(job).await;
-        }
+    /// The loop is gone: only its job, if that can still run it, starts it again.
+    async fn exited(&self, id: &AgentId) {
         let id = id.clone();
         // What its inbox held is dropped: those waiting on it see it stopped.
         self.store
@@ -638,7 +698,8 @@ fn rest_ended(
             None
         }
     };
-    let open = super::agents::stopped_turn(state, id)
+    let open = state
+        .stopped_turn(id)
         .or_else(|| super::agents::held_deliveries(state, id))
         .is_some();
     let parks = match failure {
@@ -690,7 +751,7 @@ mod tests {
         }).await;
         let jobs = &session.runtime.jobs;
         let find = async |agent: &AgentId, tool: &str| {
-            let mut listed = jobs.list(agent).into_iter();
+            let mut listed = jobs.list(agent).await.unwrap().into_iter();
             listed.find(|job| job.tool == tool).unwrap()
         };
         let agent_job = find(&session.root, "agent").await;
@@ -772,7 +833,7 @@ mod tests {
             .await
             .unwrap();
         let taking = child.clone();
-        found(&session, move |state| {
+        found(&session, [Key::Agent(taking.clone())], move |state| {
             (state.agents.get(&taking)?.turn == Turn::Busy).then_some(())
         })
         .await;
@@ -801,7 +862,7 @@ mod tests {
         // Its model change journals while the loop holds the input it took.
         let selection = session.selection(Some(&model_ref("other")), None);
         // Queued behind that append, ahead of the loop's next step.
-        let interrupted = interrupt_on(&session, |_| true).await;
+        let interrupted = interrupt_on(&session, &session.root, |_| true).await;
         let prompt = tokio::spawn({
             let session = session.clone();
             async move {
@@ -846,7 +907,7 @@ mod tests {
         let parent = spawn_prompt(&session, "delegate");
         provider.request(2).await;
         root_waiting(&session).await;
-        let original_jobs = session.runtime.jobs.list(&session.root);
+        let original_jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         assert_eq!(original_jobs.len(), 2);
         // The children are interrupted; the parent holding them shows interrupted
         // but keeps its wait.
@@ -862,7 +923,7 @@ mod tests {
         assert!(!parent.is_finished());
         assert_eq!(turn(&session, &session.root), Turn::Busy);
         assert_eq!(
-            session.observe().snapshot.activity[&session.root].state,
+            session.store().observe().snapshot.activity[&session.root].state,
             crate::agent::AgentActivity::WaitingChildren
         );
         let records = session.runtime.store.records();
@@ -880,7 +941,7 @@ mod tests {
         let owned =
             count!(&records, SessionEvent::AgentStarted { owner_job, .. } if owner_job.is_some());
         assert_eq!(owned, 2);
-        let resumed_jobs = session.runtime.jobs.list(&session.root);
+        let resumed_jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         let resumed = resumed_jobs.iter().map(|job| job.id);
         assert!(resumed.eq(original_jobs.iter().map(|job| job.id)));
         assert!(resumed_jobs.iter().all(|j| j.state == JobState::Running));
@@ -917,7 +978,7 @@ mod tests {
             "redirected"
         );
         assert!(bounded(parent).await.unwrap().is_err());
-        let jobs = session.runtime.jobs.list(&session.root);
+        let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].state, JobState::Interrupted);
         // The redirected request carries the interrupted result and the prompt.
@@ -963,9 +1024,53 @@ mod tests {
             "{history}"
         );
         assert_eq!(
-            session.runtime.jobs.list(&session.root)[0].state,
+            session.runtime.jobs.list(&session.root).await.unwrap()[0].state,
             JobState::Interrupted
         );
+        session.shutdown().await.unwrap();
+    }
+
+    /// A child whose turn failed parks as a finished one does, with no activity yet
+    /// still shown as something to continue; `continue` starts it again stopped on that failure,
+    /// and it asks again for what failed, on its own context and history.
+    #[tokio::test]
+    async fn a_failed_child_parks_and_continue_asks_again() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let arguments = json!({"prompt": "child task", "depth": 0});
+        let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
+        let steps = [
+            Step::new(response(vec![tool_call(0, "child", "agent", arguments)])),
+            Step::fail(failure),
+            Step::new(answer("root done")),
+            Step::new(answer("child recovered")),
+            Step::new(answer("root again")),
+        ];
+        let provider = Script::new(steps, &requests);
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = ephemeral_session(&harness).await;
+        let child = session.root.child(1);
+        let mut observed = session.store().observe();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        until_parked(&session, &child).await;
+        // Parked, it has no activity, as its observers are told.
+        while let Ok(update) = observed.updates.try_recv() {
+            observed.snapshot.apply(update);
+        }
+        assert!(!observed.snapshot.activity.contains_key(&child));
+        let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
+        assert!(
+            jobs.iter()
+                .any(|job| job.tool == "agent" && job.retryable())
+        );
+        let continued = bounded(session.continue_turn_with(Selection::default())).await;
+        assert_eq!(continued.unwrap().children_resumed, 1);
+        provider.request(4).await;
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured[3].context_id, ContextId::from(&child));
+        assert_eq!(captured[1], captured[3]);
+        until_parked(&session, &child).await;
         session.shutdown().await.unwrap();
     }
 
@@ -1032,7 +1137,7 @@ mod tests {
         assert_eq!(recovered.output, Some(json!("child recovered")));
         // A child retry must not complete the parent's wait.
         assert!(!parent.is_finished());
-        let state = jobs.snapshot(wait_job).unwrap().state;
+        let state = jobs.snapshot(wait_job).await.unwrap().state;
         assert_eq!(state, JobState::Running);
         let records = session.runtime.store.records();
         let root_records = records.iter().filter(|record| record.agent == session.root);
@@ -1048,6 +1153,8 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// Between follow-ups the completed child parks; each starts its loop again
+    /// on the same context and history, under the same job.
     #[tokio::test]
     async fn completed_child_resumes_same_history_and_job_repeatedly() {
         let answers = ["first answer", "second answer", "third answer"].map(answer);
@@ -1068,6 +1175,7 @@ mod tests {
             ("follow-up two", "third answer"),
         ];
         for (instruction, answer) in follow_ups {
+            until_parked(&session, &child).await;
             let value = json!(instruction);
             let send = format!("return tool.job({job}).send({{value:{value}}});");
             session.run_script(send).await.unwrap();
@@ -1077,7 +1185,7 @@ mod tests {
             assert_eq!(sent.value["value"]["id"], job.get());
             assert_eq!(sent.value["value"]["state"], "completed");
             assert_eq!(sent.value["value"]["result"], answer);
-            assert_eq!(jobs.metadata(job).unwrap().state, JobState::Completed);
+            assert_eq!(jobs.metadata(job).await.unwrap().state, JobState::Completed);
         }
         {
             let requests = requests.lock().unwrap();
@@ -1108,6 +1216,163 @@ mod tests {
         let output = restored.test_snapshot(job).await.unwrap().output;
         assert_eq!(output, Some(json!("third answer")));
         // Shutdown waits for agent receivers to close: restore the real root loop.
+        drop(root_inbox);
+        session.shutdown().await.unwrap();
+    }
+
+    /// Input to a parked child starts its loop again on a context of its own,
+    /// under its job: cancelling the job ends the woken turn, and the child, whose
+    /// job can no longer run it, is never started again.
+    #[tokio::test]
+    async fn a_woken_child_ends_with_its_cancelled_job() {
+        let steps = [
+            Step::new(answer("first")),
+            Step::new(Vec::new()).midstream(),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = ephemeral_session(&harness).await;
+        let root_inbox = quiet_root(&session);
+        let (jobs, child) = (&session.runtime.jobs, session.root.child(1));
+        let arguments = json!({"prompt": "work", "depth": 0});
+        let executor = &session.runtime.executor;
+        let first = executor.execute(session.root.clone(), "agent", arguments, None);
+        let job = first.await.unwrap().job;
+        until_parked(&session, &child).await;
+        provider.released(&ContextId::from(&child)).await;
+        let opened = provider.opened.load(std::sync::atomic::Ordering::SeqCst);
+        jobs.send(job, json!("again")).await.unwrap();
+        provider.held(1).await;
+        let reopened = provider.opened.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reopened, opened + 1);
+        let woken = requests.lock().unwrap().last().unwrap().clone();
+        assert_eq!(woken.context_id, ContextId::from(&child));
+        assert!(rendered(&woken).contains("first"));
+        jobs.cancel(job).await.unwrap();
+        assert_eq!(terminal(&session, job).await.state, JobState::Cancelled);
+        until_stopped(&session, &child).await;
+        let refused = jobs.send(job, json!("once more")).await;
+        assert!(matches!(
+            refused,
+            Err(crate::job::JobError::InputUnavailable {
+                reason: crate::job::InputUnavailableReason::State(JobState::Cancelled),
+                ..
+            })
+        ));
+        drop(root_inbox);
+        session.shutdown().await.unwrap();
+    }
+
+    /// A cancellation requested of a parked child's job right behind the restart
+    /// input commits ends the child cancelled before it requests again.
+    #[tokio::test]
+    async fn a_cancel_requested_of_a_parked_childs_job_stops_it() {
+        let (_root, requests, session) = scripted_session([answer("first")]).await;
+        let root_inbox = quiet_root(&session);
+        let (jobs, executor) = (&session.runtime.jobs, &session.runtime.executor);
+        let arguments = json!({"prompt": "work", "depth": 0});
+        let launched = executor.execute(session.root.clone(), "agent", arguments, None);
+        let restarted = launched.await.unwrap().job;
+        until_parked(&session, &session.root.child(1)).await;
+        let restart: fn(&SessionEvent) -> bool =
+            |event| matches!(event, SessionEvent::JobStateChanged { .. });
+        let cancelling = jobs.clone();
+        let store = &session.runtime.store;
+        let cancelled =
+            crate::session::tests::on_commit(store, &session.root, restart, move || async move {
+                cancelling.cancel(restarted).await.map(drop)
+            });
+        let cancelled = cancelled.await;
+        jobs.send(restarted, json!("again")).await.unwrap();
+        bounded(cancelled).await.unwrap();
+        assert_eq!(
+            terminal(&session, restarted).await.state,
+            JobState::Cancelled
+        );
+        until_stopped(&session, &session.root.child(1)).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a cancelled child requested"
+        );
+        drop(root_inbox);
+        session.shutdown().await.unwrap();
+    }
+
+    /// A failed child whose own work still runs keeps its loop; cancelling its
+    /// job, which records the cancel, ends that loop before it takes another turn.
+    #[tokio::test]
+    async fn a_cancel_of_a_failed_childs_job_ends_its_running_loop() {
+        let script = json!({"source":"return await receive();", "bg":true});
+        let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
+        let steps = [
+            Step::new(response(vec![tool_call(0, "script", "script", script)])),
+            Step::fail(failure),
+            Step::new(answer("unrequested")),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
+        let session = ephemeral_session(&harness).await;
+        let root_inbox = quiet_root(&session);
+        let (jobs, child) = (&session.runtime.jobs, session.root.child(1));
+        let arguments = json!({"prompt": "work", "bg": true});
+        let executor = &session.runtime.executor;
+        let launched = executor.execute(session.root.clone(), "agent", arguments, None);
+        let job = launched.await.unwrap().job;
+        until(&session, job, |job| job.state == JobState::Failed).await;
+        job_found(&session, &child, |job| job.tool == "script").await;
+        let read = |state: &CoreState| agents::child_loop(state, &child);
+        assert_eq!(session.runtime.store.read(read), agents::ChildLoop::Running);
+        jobs.cancel(job).await.unwrap();
+        until_stopped(&session, &child).await;
+        let records = session.runtime.store.records();
+        let interrupted = records.iter().filter(|record| record.agent == child);
+        assert_eq!(count!(interrupted, SessionEvent::AgentInterrupted), 1);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "a cancelled child requested"
+        );
+        drop(root_inbox);
+        session.shutdown().await.unwrap();
+    }
+
+    /// Input racing a completed child's parking, and racing itself, runs one loop
+    /// at a time: each input either starts it or joins the invocation another
+    /// started, all on one context and history, and the child parks once nothing
+    /// is left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inputs_racing_a_childs_parking_run_one_loop() {
+        let answers = ["first", "second", "third", "fourth"].map(answer);
+        let (_root, requests, session) = scripted_session(answers).await;
+        let root_inbox = quiet_root(&session);
+        let (jobs, child) = (&session.runtime.jobs, session.root.child(1));
+        let arguments = json!({"prompt": "work", "depth": 0});
+        let executor = &session.runtime.executor;
+        let first = executor.execute(session.root.clone(), "agent", arguments, None);
+        let job = first.await.unwrap().job;
+        let (a, b) = tokio::join!(
+            jobs.send(job, json!("follow-up a")),
+            jobs.send(job, json!("follow-up b"))
+        );
+        a.unwrap();
+        b.unwrap();
+        // Both were taken, so the job completes only once it answered both.
+        until(&session, job, |job| job.state == JobState::Completed).await;
+        until_parked(&session, &child).await;
+        let requests = requests.lock().unwrap().clone();
+        let context = ContextId::from(&child);
+        assert!(requests.iter().all(|request| request.context_id == context));
+        let last = rendered(requests.last().unwrap());
+        assert!(
+            last.contains("follow-up a") && last.contains("follow-up b"),
+            "{last}"
+        );
         drop(root_inbox);
         session.shutdown().await.unwrap();
     }
@@ -1198,7 +1463,7 @@ mod tests {
 
     /// Rejected input does not keep an answered invocation open: once the job that
     /// did ends, the invocation completes with its latest answer, without another
-    /// turn. The completed child is idle, so a later interrupt leaves it alone, and
+    /// turn. The completed child parks, so a later interrupt leaves it alone, and
     /// it resumes with a fresh completion rather than the consumed one.
     #[tokio::test]
     async fn rejected_input_leaves_the_latest_child_answer_to_complete() {
@@ -1236,17 +1501,16 @@ mod tests {
         assert_eq!(completion_count(&session, &child), 0);
         claim_completed(&session, work).await;
         assert_eq!(bounded(received).await.unwrap().unwrap(), "latest answer");
-        mailbox_barrier(&session, &child).await;
+        // It parks once its completion is journaled.
+        until_parked(&session, &child).await;
         assert_eq!(completion_count(&session, &child), 1);
-        assert_eq!(turn(&session, &child), Turn::Idle);
         assert_eq!(session.interrupt().await, 0);
-        assert_eq!(turn(&session, &child), Turn::Idle);
         // Rejected input must not run another model turn.
         assert_eq!(requests.lock().unwrap().len(), 2);
-        // Idle stays resumable: input without a waiter completes afresh, once.
-        child_input(&session, &child, None).await;
+        // Parked stays resumable: input without a waiter completes afresh, once.
+        unpark(&session, &child, input("task", Selection::default(), None)).await;
         wait_for_child_answer(&mut events, &child).await;
-        mailbox_barrier(&session, &child).await;
+        until_parked(&session, &child).await;
         assert_eq!(completion_count(&session, &child), 2);
         assert_eq!(requests.lock().unwrap().len(), 3);
         drop(root_inbox);
@@ -1275,17 +1539,20 @@ mod tests {
             tokio::spawn(async move { executor.execute(owner, "agent", arguments, None).await });
         provider.held(0).await;
         let jobs = &session.runtime.jobs;
-        let child = jobs.list(&session.root)[0].id;
-        assert!(jobs.metadata(child).unwrap().origin.is_none());
+        let child = jobs.list(&session.root).await.unwrap()[0].id;
+        assert!(jobs.metadata(child).await.unwrap().origin.is_none());
         assert_eq!(session.interrupt().await, 1);
         assert_eq!(
             bounded(session.prompt("new direction")).await.unwrap(),
             "redirected"
         );
         assert!(bounded(host).await.unwrap().is_err());
-        assert_eq!(jobs.snapshot(child).unwrap().state, JobState::Interrupted);
+        assert_eq!(
+            jobs.snapshot(child).await.unwrap().state,
+            JobState::Interrupted
+        );
         let replayed = jobs.test_replay();
-        assert!(replayed.is_background(child).unwrap());
+        assert!(replayed.is_background(child).await.unwrap());
 
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         provider.request(2).await;
@@ -1311,11 +1578,9 @@ mod tests {
         let context = |event: &SessionEvent| matches!(event, SessionEvent::ModelContext { .. });
         // Closing commits ahead of the request the turn makes once its context publishes.
         let closing = session.clone();
-        let shutdown = on_commit(
-            store,
-            context,
-            move || async move { closing.shutdown().await },
-        );
+        let shutdown = on_commit(store, &session.root, context, move || async move {
+            closing.shutdown().await
+        });
         let shutdown = shutdown.await;
         let prompt = spawn_prompt(&session, "hello");
         let (prompted, shut) = bounded(async { tokio::join!(prompt, shutdown) }).await;
@@ -1325,7 +1590,7 @@ mod tests {
             count!(&store.records(), SessionEvent::AgentFailed { .. }),
             0
         );
-        let stopped = store.read(|state| super::agents::stopped_turn(state, &session.root));
+        let stopped = store.read(|state| state.stopped_turn(&session.root));
         assert_eq!(stopped, Some(TurnFailure::Interrupted));
         session.close().await.unwrap();
     }
@@ -1339,14 +1604,15 @@ mod tests {
     #[tokio::test]
     async fn a_final_failure_commits_with_its_turns_end_either_side_of_an_interrupt() {
         use crate::provider::protocol::CutReason;
-        use crate::session::{RequestLedger, RequestPhase};
+        use crate::session::{Fact, RequestPhase, tests::Folded};
         // Whether a request's failure reports each failed turn of the root.
-        let reports = |ledger: &RequestLedger, records: &[EventRecord]| {
+        let reports = |ledger: &Folded, records: &[Arc<EventRecord>]| {
             let failed = records
                 .iter()
                 .filter(|record| matches!(record.event, SessionEvent::AgentFailed { .. }));
+            let reported = |record: &Arc<EventRecord>| ledger.facts.get(&record.sequence);
             failed
-                .map(|record| ledger.failed_by(record.sequence).is_some())
+                .map(|record| matches!(reported(record), Some(Fact::EndedOn)))
                 .collect::<Vec<_>>()
         };
         for overtaken in [false, true] {
@@ -1358,7 +1624,7 @@ mod tests {
             let harness = test_harness(root.path(), &sessions, provider.clone()).await;
             let session = harness.new_session().await.unwrap();
             let (store, agent) = (&session.runtime.store, session.root.clone());
-            let mut updates = session.observe().updates;
+            let mut updates = session.store().observe().updates;
             let prompt = spawn_prompt(&session, "refused");
             provider.request(0).await;
             // An image the root's model cannot take fails its next turn before
@@ -1426,10 +1692,10 @@ mod tests {
                 true => vec![false],
                 false => vec![true, false],
             };
-            let ledger = session.observe().snapshot.ledger;
+            let ledger = crate::session::tests::ledger(store);
             assert_eq!(reports(&ledger, &store.records()), expected);
             assert!(matches!(
-                ledger.get(request).unwrap().phase,
+                ledger.requests[&request].phase,
                 RequestPhase::Failed { .. }
             ));
             assert_eq!(requests.lock().unwrap().len(), 1);
@@ -1437,7 +1703,7 @@ mod tests {
             shutdown_session(session).await;
 
             let resumed = harness.resume_session(id).await.unwrap();
-            let ledger = resumed.observe().snapshot.ledger;
+            let ledger = crate::session::tests::ledger(&resumed.runtime.store);
             let records = resumed.runtime.store.records();
             assert_eq!(reports(&ledger, &records), expected, "{overtaken}");
             shutdown_session(resumed).await;
@@ -1512,9 +1778,7 @@ mod tests {
         let receipt = bounded(receipt).await.unwrap();
         assert!(matches!(receipt, Err(HarnessError::Interrupted)));
         assert_eq!(turn(&session, &root), Turn::Idle);
-        let read = runtime
-            .store
-            .read(|state| agents::stopped_turn(state, &root));
+        let read = runtime.store.read(|state| state.stopped_turn(&root));
         assert_eq!(read, None);
         let outcome = bounded(session.continue_turn_with(Selection::default())).await;
         assert_eq!(outcome.unwrap().answer, None);

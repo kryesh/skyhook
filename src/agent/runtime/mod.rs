@@ -22,8 +22,8 @@ use crate::{
     provider::{Provider, ProviderError},
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{
-        Command, CoreState, EventRecord, Message, MessageSeq, Plan, RecordSeq, SessionError,
-        SessionEvent, SessionStore, UserPart,
+        Command, CoreState, EventRecord, Key, Message, MessageSeq, Plan, RecordSeq, SessionError,
+        SessionEvent, SessionStore, UserPart, Wait,
     },
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
@@ -32,19 +32,17 @@ use crate::{
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
+use super::Settlement;
 use super::TodoItem;
 pub use super::error::{Failure, HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
-use super::{Observation, Settlement};
 
 #[cfg(test)]
 use crate::provider::protocol::ModelRequest;
 
 mod agents;
-#[cfg(test)]
-pub(crate) use agents::stopped_turn;
 use agents::{Activation, AppliedMode, Flow, Invocation, RecordedContract, Turn, Was};
-pub(crate) use agents::{Agents, activities};
+pub(crate) use agents::{Agents, activities, activity, observed_agents};
 use modes::Selected;
 mod compact;
 mod context;
@@ -299,7 +297,7 @@ enum AgentLaunch {
     },
     /// An agent that started before, under its journaled contract narrowed to the
     /// live configuration.
-    Resume(Resumed),
+    Resume,
 }
 
 /// The turn state an agent resumes in.
@@ -349,7 +347,7 @@ fn refused_input(phase: &crate::session::SessionPhase) -> HarnessError {
 
 /// Why input whose reply was dropped was not taken.
 async fn dropped_input(store: &SessionStore) -> HarnessError {
-    store.behind(|state| refused_input(&state.phase)).await
+    store.behind(|state| refused_input(state.phase())).await
 }
 
 impl SessionRuntime {
@@ -376,7 +374,7 @@ impl SessionRuntime {
             let entries = events(state)
                 .into_iter()
                 .map(|event| (agent.clone(), event));
-            let journaled = |_: &mut CoreState, records: &[EventRecord]| {
+            let journaled = |_: &mut CoreState, records: &[Arc<EventRecord>]| {
                 records.last().expect("a turn journals events").sequence
             };
             Ok(Plan::new(entries.collect(), journaled))
@@ -395,8 +393,8 @@ impl SessionRuntime {
     ) -> Result<crate::session::RequestSeq, HarnessError> {
         let author = agent.clone();
         let events = move |state: &CoreState| {
-            let latest = (state.agents.contract(&author))
-                .and_then(|contract| contract.context.as_ref())
+            let latest = (state.agents.journaled(&author))
+                .and_then(|journaled| journaled.contract.context.as_ref())
                 .filter(|(_, latest)| *latest == context);
             match latest {
                 Some((recorded, _)) => vec![requested(*recorded)],
@@ -421,10 +419,7 @@ impl SessionRuntime {
         let message = Message::Tool(result);
         let mut entries = vec![(agent.clone(), SessionEvent::MessageCommitted { message })];
         let commit = move |state: &CoreState| {
-            let claim = acknowledges
-                .map(|delivery| delivery.claim(state))
-                .transpose()?;
-            entries.extend(claim.flatten());
+            entries.extend(acknowledges.and_then(|delivery| delivery.claim(state)));
             Ok::<_, crate::job::JobError>(Plan::journal(entries))
         };
         Ok(self.store.commit(Command::Journal, commit).await?)
@@ -865,9 +860,9 @@ mod tests {
 
     /// Every usage report the session journaled, as its requests' ledger folds it.
     pub(super) async fn journaled_usage(session: &SessionHandle) -> Usage {
-        let ledger = session.observe().snapshot.ledger;
+        let ledger = crate::session::tests::ledger(&session.runtime.store);
         let mut usage = Usage::default();
-        for (_, request) in ledger.iter() {
+        for request in ledger.requests.values() {
             usage.accumulate(request.usage);
         }
         usage
@@ -879,6 +874,7 @@ mod tests {
             .agents(|agents| agents.get(agent).unwrap().turn.clone())
     }
 
+    use super::agents::ChildLoop;
     pub(super) use super::agents::INTERRUPTED;
 
     /// Queue `command` for `agent`, as an owner or the host would.
@@ -886,6 +882,38 @@ mod tests {
         let agent = agent.clone();
         let send = move |state: &mut CoreState| state.agents.send(&agent, command);
         assert!(session.runtime.store.live(send).await, "the agent runs");
+    }
+
+    /// Queue `command` for child `agent` in the change that starts its parked loop.
+    pub(super) async fn unpark(session: &SessionHandle, agent: &AgentId, command: AgentCommand) {
+        let target = agent.clone();
+        let send = move |_: &CoreState| {
+            Ok(Plan::new(Vec::new(), move |state, _| {
+                state.agents.send(&target, command)
+            }))
+        };
+        let sent = bounded(session.runtime.with_loops(agent, send)).await;
+        assert!(sent.unwrap(), "the agent runs");
+    }
+
+    /// Wait until child `agent`'s loop parks.
+    pub(super) async fn until_parked(session: &SessionHandle, agent: &AgentId) {
+        until_loop(session, agent, |found| {
+            matches!(found, ChildLoop::Parked(..))
+        })
+        .await;
+    }
+
+    /// Wait until child `agent`'s loop has stopped for good.
+    pub(super) async fn until_stopped(session: &SessionHandle, agent: &AgentId) {
+        until_loop(session, agent, |found| found == ChildLoop::Stopped).await;
+    }
+
+    async fn until_loop(session: &SessionHandle, agent: &AgentId, wanted: fn(ChildLoop) -> bool) {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        let found_loop =
+            move |state: &CoreState| wanted(super::agents::child_loop(state, &agent)).then_some(());
+        found(session, [key], found_loop).await;
     }
 
     impl SessionRuntime {
@@ -918,8 +946,8 @@ mod tests {
 
     /// Wait until `agent` has deliveries pending.
     pub(super) async fn until_pending(session: &SessionHandle, agent: &AgentId) {
-        let agent = agent.clone();
-        found(session, move |state| {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        found(session, [key], move |state| {
             state.jobs.has_pending(&agent).then_some(())
         })
         .await;
@@ -927,14 +955,14 @@ mod tests {
 
     /// Wait until input waits in `agent`'s inbox.
     pub(super) async fn until_queued(session: &SessionHandle, agent: &AgentId) {
-        let agent = agent.clone();
-        found(session, move |state| {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        found(session, [key], move |state| {
             (!state.agents.get(&agent)?.inbox.is_empty()).then_some(())
         })
         .await;
     }
 
-    pub(super) fn assistant_commits(records: &[EventRecord]) -> usize {
+    pub(super) fn assistant_commits(records: &[Arc<EventRecord>]) -> usize {
         count!(
             records,
             SessionEvent::MessageCommitted {
@@ -1016,18 +1044,19 @@ mod tests {
         root_waiting(&session).await;
         assert_eq!(session.interrupt().await, 2);
         assert_eq!(turn(&session, &session.root), Turn::Held);
-        let job = session.runtime.jobs.list(&session.root)[0].id;
+        let job = session.runtime.jobs.list(&session.root).await.unwrap()[0].id;
         (harness, session, provider, requests, parent, job)
     }
 
-    /// Interrupt right behind the commit of the first record from here on that
-    /// `matches` accepts; how many it stopped.
+    /// Interrupt right behind the commit of the first record of `agent` from
+    /// here on that `matches` accepts; how many it stopped.
     pub(super) async fn interrupt_on(
         session: &SessionHandle,
+        agent: &AgentId,
         matches: fn(&SessionEvent) -> bool,
     ) -> impl Future<Output = usize> + use<> {
         let (interrupting, store) = (session.clone(), &session.runtime.store);
-        on_commit(store, matches, move || async move {
+        on_commit(store, agent, matches, move || async move {
             interrupting.interrupt().await
         })
         .await
@@ -1075,12 +1104,15 @@ mod tests {
         tokio::spawn(async move { session.prompt(text).await })
     }
 
-    /// Wait until `find` finds what it looks for in the session's core state.
+    /// Wait until `find` finds what it looks for in the session's core state,
+    /// which only what `keys` names changes.
     pub(super) async fn found<T: Send + 'static>(
         session: &SessionHandle,
-        find: impl FnMut(&mut CoreState) -> Option<T> + Send + Sync + 'static,
+        keys: impl IntoIterator<Item = Key>,
+        find: impl Fn(&CoreState) -> Option<T> + Send + Sync + 'static,
     ) -> T {
-        bounded(session.runtime.store.until(find)).await.unwrap()
+        let wait = Wait::on(keys, find);
+        bounded(session.runtime.store.until(wait)).await.unwrap()
     }
 
     /// Wait until `agent`'s activity is one `wanted` accepts.
@@ -1089,12 +1121,12 @@ mod tests {
         agent: &AgentId,
         wanted: fn(&crate::agent::AgentActivity) -> bool,
     ) {
-        let agent = agent.clone();
-        let activity = move |state: &mut CoreState| {
-            let activity = crate::agent::activities(state).remove(&agent)?;
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        let activity = move |state: &CoreState| {
+            let activity = crate::agent::activity(state, &agent)?;
             wanted(&activity.state).then_some(())
         };
-        found(session, activity).await;
+        found(session, [key], activity).await;
     }
 
     /// Wait until the root runs tools or waits on children.
@@ -1110,8 +1142,8 @@ mod tests {
         job: JobId,
         predicate: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
     ) -> crate::job::JobEnvelope {
-        found(session, move |state| {
-            state.jobs.snapshot(job).filter(&predicate)
+        found(session, [Key::Job(job)], move |state| {
+            crate::job::tests::job_snapshot(state, job).filter(&predicate)
         })
         .await
     }
@@ -1122,13 +1154,31 @@ mod tests {
         owner: &AgentId,
         find: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
     ) -> JobId {
-        let owner = owner.clone();
-        let first = move |state: &mut CoreState| {
-            let mut jobs = state.jobs.views().into_values();
-            jobs.find(|job| job.agent == owner && find(job))
-                .map(|job| job.id)
+        let first = move |_: &CoreState, jobs: Vec<crate::job::JobEnvelope>| {
+            jobs.into_iter().find(|job| find(job)).map(|job| job.id)
         };
-        found(session, first).await
+        jobs_found(session, owner, [], first).await
+    }
+
+    /// Wait until `find` finds what it looks for in the session's core state and
+    /// what `owner`'s jobs are shown as, which only `owner` and what `keys` name
+    /// change.
+    pub(super) async fn jobs_found<T: Send + 'static>(
+        session: &SessionHandle,
+        owner: &AgentId,
+        keys: impl IntoIterator<Item = Key>,
+        find: impl Fn(&CoreState, Vec<crate::job::JobEnvelope>) -> Option<T> + Send + Sync + 'static,
+    ) -> T {
+        let owner = owner.clone();
+        let keys: Vec<_> = std::iter::once(Key::Agent(owner.clone()))
+            .chain(keys)
+            .collect();
+        let read = move |journal: &_| crate::job::tests::Shown::read(journal, owner);
+        let wait = move |shown: crate::job::tests::Shown| {
+            Wait::on(keys, move |state| find(state, shown.jobs(state)))
+        };
+        let found = session.runtime.store.until_read(read, wait);
+        bounded(found).await.unwrap()
     }
 
     pub(super) async fn terminal(
@@ -1243,7 +1293,7 @@ mod tests {
 
     pub(super) async fn next_recovery(
         events: &mut tokio::sync::broadcast::Receiver<crate::agent::ObservedEvent>,
-    ) -> crate::session::EventRecord {
+    ) -> Arc<crate::session::EventRecord> {
         bounded(async {
             loop {
                 if let RuntimeEvent::Record(record) = events.recv().await.unwrap().event
@@ -1255,7 +1305,7 @@ mod tests {
                         }
                     )
                 {
-                    return *record;
+                    return record;
                 }
             }
         })
@@ -1280,6 +1330,12 @@ mod tests {
     ) -> AssistantItem {
         let call = ToolCall::new(id, name, arguments).unwrap();
         AssistantItem::tool_call(format!("tool-{position}"), position, call)
+    }
+
+    /// An `agent` call `id` delegating "`id` task" with `depth` levels below it.
+    pub(super) fn delegation(id: &str, depth: u32) -> AssistantItem {
+        let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
+        tool_call(0, id, "agent", arguments)
     }
 
     pub(super) fn todo(text: &str, status: crate::agent::TodoStatus) -> TodoItem {
@@ -1311,7 +1367,7 @@ mod tests {
         session: &SessionHandle,
         operation: impl Future<Output = T>,
     ) -> T {
-        let mut updates = session.observe().updates;
+        let mut updates = session.store().observe().updates;
         let mut operation = std::pin::pin!(operation);
         loop {
             tokio::select! {

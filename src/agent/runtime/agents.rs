@@ -1,6 +1,10 @@
-//! What the core keeps of each agent: what it runs under, and of each running
-//! one its turn, inbox and wake window.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+//! What the core keeps of each running agent: its turn, inbox and wake window,
+//! and what its journal leaves of it. A parked child holds nothing; its journal
+//! is read again as its loop starts.
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    ops::Bound,
+};
 
 use super::{
     AgentCommand, HarnessError, TurnFailure,
@@ -11,47 +15,45 @@ use crate::{
     execution::ExecutionLocation,
     identity::AgentId,
     session::{
-        CoreState, EventRecord, Message, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq,
-        RequestLedger, RequestPhase, SessionEvent,
+        CoreState, Dirty, EventRecord, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq,
+        RequestPhase, SessionEvent, agent_state::Last,
     },
-    tool::policy::{CapabilitySet, Mode, ModeName},
+    tool::policy::{Mode, ModeName},
 };
 
-/// The agents whose loops run, and whether they take deliveries.
+/// The agents whose loops run, and whether they take deliveries. Every change
+/// to a running agent's facts marks it for the waits that read it.
 #[derive(Default)]
 pub(crate) struct Agents {
     running: BTreeMap<AgentId, AgentFacts>,
-    pub(super) flow: Flow,
-    pub(super) activation: Activation,
-    /// The highest child index each agent has started or reserved. A launch
-    /// the session refuses leaves its index unused.
-    children: HashMap<AgentId, u32>,
-    /// What each agent's journal says it runs under, whether it runs or not.
-    contracts: HashMap<AgentId, RecordedContract>,
+    flow: Flow,
+    activation: Activation,
+    /// What the journal leaves of the root, and of each child while its loop
+    /// runs: only those facts' changes.
+    journaled: HashMap<AgentId, Journaled>,
     /// Each mode's latest journaled edition.
     editions: HashMap<ModeName, std::sync::Arc<Mode>>,
-    /// Where each agent's journal leaves its last turn, and when.
-    last: HashMap<AgentId, (Last, i64)>,
+    /// How many loops of each child have ended.
+    ended: HashMap<AgentId, u64>,
+    dirty: Dirty,
 }
 
-/// Where an agent's journal leaves its last turn: its newest message awaits the
-/// model or answers it, a failure since stopped it, or one was reported with
-/// nothing open to continue.
-enum Last {
-    Awaiting,
-    Answered,
-    Failed(TurnFailure),
-    Refused(TurnFailure),
+/// What an agent's journal leaves of its contract that its loop, its owner and
+/// the host read.
+#[derive(Clone)]
+pub(super) struct Journaled {
+    pub(super) contract: RecordedContract,
+    /// The highest child index it has started or reserved. A launch the
+    /// session refuses leaves its index unused.
+    children: u32,
 }
 
 /// The contract an agent runs under. A journaled one is its start, latest applied
-/// profile, and its latest agent model context.
+/// profile, and its latest agent model context; its grants are its state's.
 #[derive(Clone)]
 pub(super) struct RecordedContract {
     pub(super) profile: ProfileSnapshot,
-    pub(super) available_depth: usize,
     pub(super) mode: Option<AppliedMode>,
-    pub(super) capabilities: CapabilitySet,
     pub(super) location: ExecutionLocation,
     /// The latest agent model context and its record, while the mode is unchanged:
     /// a mode pins its prompt and tools with a context of its own.
@@ -99,6 +101,78 @@ fn applied(
     })
 }
 
+/// Fold `record` into what `journaled` holds of its agent: its start begins that
+/// where it `begins`, and a child's start counts in its parent's children. Every
+/// record keeps the mode editions it records.
+fn fold(
+    editions: &mut HashMap<ModeName, std::sync::Arc<Mode>>,
+    journaled: &mut HashMap<AgentId, Journaled>,
+    begins: bool,
+    record: &EventRecord,
+) {
+    let agent = &record.agent;
+    let mode = match &record.event {
+        SessionEvent::AgentStarted {
+            mode: Some(mode), ..
+        }
+        | SessionEvent::ModeChanged { mode, .. } => applied(editions, mode),
+        _ => None,
+    };
+    if let SessionEvent::AgentStarted {
+        profile, location, ..
+    } = &record.event
+    {
+        if let (Some(parent), Some(index)) = (agent.parent(), agent.path().last())
+            && let Some(parent) = journaled.get_mut(&parent)
+        {
+            parent.children = parent.children.max(*index);
+        }
+        let contract = RecordedContract {
+            profile: profile.clone(),
+            mode,
+            location: location.clone(),
+            context: None,
+        };
+        if begins {
+            let started = Journaled {
+                contract,
+                children: 0,
+            };
+            journaled.insert(agent.clone(), started);
+        }
+        return;
+    }
+    let Some(held) = journaled.get_mut(agent) else {
+        return;
+    };
+    match &record.event {
+        SessionEvent::ModeChanged { .. } => {
+            held.contract.mode = mode;
+            // The mode's prompt and tools are pinned by its next model context.
+            held.contract.context = None;
+        }
+        SessionEvent::ModelChanged { profile } => held.contract.profile = profile.clone(),
+        SessionEvent::ModelContext { context } if context.purpose == ModelPurpose::Agent => {
+            held.contract.context = Some((record.sequence, context.clone()));
+        }
+        _ => {}
+    }
+}
+
+impl Journaled {
+    /// What `read` leaves of `agent`'s contract.
+    pub(super) fn read(agent: &AgentId, read: &crate::session::AgentRecords) -> Option<Self> {
+        let (mut editions, mut journaled) = (HashMap::new(), HashMap::new());
+        for record in &read.records {
+            let begins = &record.agent == agent;
+            fold(&mut editions, &mut journaled, begins, record);
+        }
+        let mut held = journaled.remove(agent)?;
+        held.children = held.children.max(read.children);
+        Some(held)
+    }
+}
+
 /// Whether agents take their deliveries. An interrupt that stops anything pauses
 /// the session until `continue` or new input opens it: what jobs deliver
 /// meanwhile stays pending, and the next request carries it.
@@ -122,12 +196,6 @@ impl std::ops::Deref for Agents {
     type Target = BTreeMap<AgentId, AgentFacts>;
     fn deref(&self) -> &Self::Target {
         &self.running
-    }
-}
-
-impl std::ops::DerefMut for Agents {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.running
     }
 }
 
@@ -211,69 +279,57 @@ impl Turn {
     }
 }
 
-/// Each agent's activity as the session's state reads: a running agent's from
-/// its turn, its open request and its jobs; any other's as its journal leaves
-/// it, since its last turn. A session that no longer runs reads every busy one
-/// as interrupted at its last activity.
+/// Each agent's activity as the session's state reads: see [`activity`].
 pub(crate) fn activities(state: &CoreState) -> HashMap<AgentId, ObservedActivity> {
+    let activity = |agent: &AgentId| Some((agent.clone(), activity(state, agent)?));
+    observed_agents(state).filter_map(activity).collect()
+}
+
+/// The agents with an activity: those that run, and the root, as its journal
+/// leaves its last turn.
+pub(crate) fn observed_agents(state: &CoreState) -> impl Iterator<Item = &AgentId> {
     let agents = &state.agents;
-    let stopped = state.phase.stopped_at(&state.records);
-    let journaled = (agents.last.iter()).filter(|(agent, _)| !agents.running.contains_key(*agent));
-    let journaled = journaled.map(|(agent, &(_, since))| {
-        let state = stopped_turn(state, agent).map_or(AgentActivity::Idle, AgentActivity::Stopped);
-        (agent.clone(), ObservedActivity { state, since })
-    });
-    let running = (agents.running.iter()).map(|(agent, facts)| {
-        let activity = match (running(state, agent, facts), stopped) {
-            (state, Some(since)) if state.is_busy() => ObservedActivity {
-                state: interrupted(),
-                since,
-            },
-            (state, _) => ObservedActivity {
-                state,
-                since: facts.since,
-            },
-        };
-        (agent.clone(), activity)
-    });
-    journaled.chain(running).collect()
+    let journaled = (agents.journaled.keys()).filter(|agent| !agents.running.contains_key(*agent));
+    agents.running.keys().chain(journaled)
+}
+
+/// `agent`'s activity as the session's state reads: a running agent's from its
+/// turn, its open request and its jobs; the root's, before it runs, as its
+/// journal leaves it, since its last turn. A parked child has none. A session
+/// that no longer runs reads a busy one as interrupted at its last activity.
+pub(crate) fn activity(state: &CoreState, agent: &AgentId) -> Option<ObservedActivity> {
+    let agents = &state.agents;
+    let Some(facts) = agents.running.get(agent) else {
+        agents.journaled.get(agent)?;
+        let since = state.agent_states.get(agent)?.last.as_ref()?.millis;
+        let state = (state.stopped_turn(agent)).map_or(AgentActivity::Idle, AgentActivity::Stopped);
+        return Some(ObservedActivity { state, since });
+    };
+    let stopped = state.phase().stopped_at(state.last_activity());
+    Some(match (running(state, agent, facts), stopped) {
+        (state, Some(since)) if state.is_busy() => ObservedActivity {
+            state: interrupted(),
+            since,
+        },
+        (state, _) => ObservedActivity {
+            state,
+            since: facts.since,
+        },
+    })
 }
 
 fn interrupted() -> AgentActivity {
     AgentActivity::Stopped(TurnFailure::Interrupted)
 }
 
-/// Why `agent`'s journal leaves its last turn short of an answer, so resuming
-/// has something to continue: a failure since its newest message, or that
-/// message, or its newest request, still awaiting the model.
-pub(crate) fn stopped_turn(state: &CoreState, agent: &AgentId) -> Option<TurnFailure> {
-    turn_stopped(state.agents.last.get(agent), &state.ledger, agent)
-}
-
-fn turn_stopped(
-    last: Option<&(Last, i64)>,
-    ledger: &RequestLedger,
-    agent: &AgentId,
-) -> Option<TurnFailure> {
-    let incomplete = (ledger.latest(agent).and_then(|request| ledger.get(request)))
-        .is_some_and(|request| !matches!(request.phase, RequestPhase::Completed { .. }));
-    match last.map(|(last, _)| last) {
-        Some(Last::Failed(failure)) => Some(failure.clone()),
-        Some(Last::Awaiting) => Some(TurnFailure::Interrupted),
-        Some(Last::Answered | Last::Refused(_)) | None => {
-            incomplete.then_some(TurnFailure::Interrupted)
-        }
-    }
-}
-
 /// Rest `agent`'s parked turn once nothing is left for `continue` to try again:
 /// the journal reads it answered, no delivery waits, and any batch it held was
 /// withdrawn. One its owner cancelled stays parked. Whether it stays parked.
 pub(super) fn settle_held(state: &mut CoreState, agent: &AgentId) -> bool {
-    let open = stopped_turn(state, agent)
+    let open = (state.stopped_turn(agent))
         .or_else(|| held_deliveries(state, agent))
         .is_some();
-    let Some(facts) = state.agents.running.get_mut(agent) else {
+    let Some(facts) = state.agents.get_mut(agent) else {
         return false;
     };
     let holds = facts.held.as_mut().is_some_and(queue::Batch::holds);
@@ -294,8 +350,12 @@ pub(super) fn settle_held(state: &mut CoreState, agent: &AgentId) -> bool {
 /// Why `agent`, with no turn to continue, rests parked on the deliveries
 /// pending for it: the failure last reported since its turn, or an interruption.
 pub(crate) fn held_deliveries(state: &CoreState, agent: &AgentId) -> Option<TurnFailure> {
-    let held = match state.agents.last.get(agent) {
-        Some((Last::Refused(failure), _)) => failure.clone(),
+    let last = state
+        .agent_states
+        .get(agent)
+        .and_then(|held| held.last.as_ref());
+    let held = match last.map(|last| &last.value) {
+        Some(Last::Refused(failure)) => TurnFailure::Failed(failure.clone()),
         _ => TurnFailure::Interrupted,
     };
     state.jobs.has_pending(agent).then_some(held)
@@ -307,12 +367,12 @@ fn running(state: &CoreState, agent: &AgentId, facts: &AgentFacts) -> AgentActiv
         Turn::Parked(failure) => AgentActivity::Stopped(failure.clone()),
         Turn::Held | Turn::Cancelled(Was::Held) => AgentActivity::WaitingChildren,
         Turn::Idle | Turn::Cancelled(Was::Idle)
-            if agent.parent().is_some() && state.jobs.has_running(agent) =>
+            if agent.parent().is_some() && state.jobs.has_live(agent) =>
         {
             AgentActivity::WaitingChildren
         }
         Turn::Idle | Turn::Cancelled(Was::Idle) => AgentActivity::Idle,
-        Turn::Busy => match state.ledger.open(agent).and_then(|r| state.ledger.get(r)) {
+        Turn::Busy => match (state.requests.open(agent)).and_then(|r| state.requests.get(r)) {
             Some(request) => match (&request.phase, request.purpose) {
                 (RequestPhase::Retrying { attempt, .. }, _) => AgentActivity::Reconnecting {
                     attempt: attempt.saturating_add(1),
@@ -324,7 +384,7 @@ fn running(state: &CoreState, agent: &AgentId, facts: &AgentFacts) -> AgentActiv
                 let work = state.jobs.live_work(agent);
                 if work.children && work.blocking.is_empty() {
                     AgentActivity::WaitingChildren
-                } else if state.jobs.has_running(agent) {
+                } else if state.jobs.has_live(agent) {
                     AgentActivity::Tools
                 } else {
                     AgentActivity::Working
@@ -332,6 +392,48 @@ fn running(state: &CoreState, agent: &AgentId, facts: &AgentFacts) -> AgentActiv
             }
         },
     }
+}
+
+/// Where a child's loop is, as work that needs it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChildLoop {
+    Running,
+    /// Let go while it had nothing to do: the job it answers through, which can
+    /// still run it, runs it again, and how many of its loops have ended, which
+    /// what a launch prepared for it reads.
+    Parked(crate::identity::JobId, u64),
+    /// The job it answers through can no longer run it.
+    Stopped,
+}
+
+/// Where child `agent`'s loop is.
+pub(super) fn child_loop(state: &CoreState, agent: &AgentId) -> ChildLoop {
+    if state.agents.running.contains_key(agent) {
+        return ChildLoop::Running;
+    }
+    let ended = state.agents.ended(agent);
+    (state.jobs.resumes(agent)).map_or(ChildLoop::Stopped, |job| ChildLoop::Parked(job, ended))
+}
+
+/// Whether child `agent`'s loop has nothing to do until its job runs it again,
+/// so it parks: its invocation resolved, its turn idle or failed with nothing in
+/// its inbox, window or held batch, and it neither owns work nor runs a child,
+/// either of which would deliver to it. Its journal tells a failed one apart
+/// when it starts again.
+pub(super) fn quiescent(state: &CoreState, agent: &AgentId) -> bool {
+    let agents = &state.agents;
+    let Some(facts) = agents.running.get(agent) else {
+        return false;
+    };
+    let idle = facts.invocation == Invocation::Resolved
+        && matches!(
+            facts.turn,
+            Turn::Idle | Turn::Parked(TurnFailure::Failed(_))
+        )
+        && facts.inbox.is_empty()
+        && facts.held.is_none()
+        && facts.window.settled();
+    idle && !state.jobs.owns_work(agent) && !agents.runs_within(agent)
 }
 
 /// Where owner input to a child goes: into its open invocation, or, once that
@@ -379,76 +481,95 @@ impl Window {
 }
 
 impl Agents {
-    /// Fold what `record` says of its agent, after `ledger` has: a start's index
-    /// into its parent's count, what the agent runs under, and where its last
-    /// turn stands.
-    pub(crate) fn observe(&mut self, record: &EventRecord, ledger: &RequestLedger) {
-        let agent = &record.agent;
-        let contract = self.contracts.get_mut(agent);
-        match (&record.event, contract) {
-            (
-                SessionEvent::AgentStarted {
-                    profile,
-                    available_depth,
-                    mode,
-                    capabilities,
-                    location,
-                    ..
-                },
-                _,
-            ) => {
-                if let (Some(parent), Some(index)) = (agent.parent(), agent.path().last()) {
-                    let taken = self.children.entry(parent).or_default();
-                    *taken = (*taken).max(*index);
-                }
-                let contract = RecordedContract {
-                    profile: profile.clone(),
-                    available_depth: *available_depth as usize,
-                    mode: (mode.as_ref()).and_then(|mode| applied(&mut self.editions, mode)),
-                    capabilities: capabilities.iter().copied().collect(),
-                    location: location.clone(),
-                    context: None,
-                };
-                self.contracts.insert(agent.clone(), contract);
-            }
-            (SessionEvent::ModelChanged { profile }, Some(contract)) => {
-                contract.profile = profile.clone();
-            }
-            (SessionEvent::ModeChanged { mode, capabilities }, Some(contract)) => {
-                contract.mode = applied(&mut self.editions, mode);
-                contract.capabilities = capabilities.iter().copied().collect();
-                // The mode's prompt and tools are pinned by its next model context.
-                contract.context = None;
-            }
-            (SessionEvent::ModelContext { context }, Some(contract))
-                if context.purpose == ModelPurpose::Agent =>
-            {
-                contract.context = Some((record.sequence, context.clone()));
-            }
-            (SessionEvent::MessageCommitted { message }, _) => {
-                let answers = match message {
-                    Message::Assistant(items) => !items.iter().any(|item| item.call().is_some()),
-                    _ => false,
-                };
-                let last = if answers {
-                    Last::Answered
-                } else {
-                    Last::Awaiting
-                };
-                (self.last).insert(agent.clone(), (last, record.timestamp_millis));
-            }
-            // Only a failure that ends an open turn stops it: one with nothing
-            // left to continue is reported, and the agent rests.
-            (SessionEvent::AgentFailed { failure }, _) => {
-                let failure = TurnFailure::from(failure.clone());
-                let last = match turn_stopped(self.last.get(agent), ledger, agent) {
-                    Some(_) => Last::Failed(failure),
-                    None => Last::Refused(failure),
-                };
-                (self.last).insert(agent.clone(), (last, record.timestamp_millis));
-            }
-            _ => {}
+    /// `agent`'s running facts, to change: the agent is marked for the waits
+    /// that read it.
+    pub(crate) fn get_mut(&mut self, agent: &AgentId) -> Option<&mut AgentFacts> {
+        let facts = self.running.get_mut(agent)?;
+        self.dirty.agent(agent);
+        Some(facts)
+    }
+
+    /// Run `agent` with `facts`, under what its journal leaves of it, `read` for
+    /// one that resumes unless that is held, as the root's always is: only the
+    /// change that finds it without a loop starts one.
+    pub(super) fn insert(&mut self, agent: AgentId, facts: AgentFacts, read: Option<Journaled>) {
+        self.dirty.agent(&agent);
+        if let Some(read) = read {
+            self.journaled.entry(agent.clone()).or_insert(read);
         }
+        debug_assert!(
+            self.journaled.contains_key(&agent),
+            "a loop runs under its journal"
+        );
+        let replaced = self.running.insert(agent, facts);
+        debug_assert!(replaced.is_none(), "one loop per agent");
+    }
+
+    /// `agent`'s loop is gone, which its owner's parking reads, and with a
+    /// child's what its journal left of it.
+    pub(super) fn remove(&mut self, agent: &AgentId) -> Option<AgentFacts> {
+        self.dirty.agent(agent);
+        if let Some(owner) = agent.parent() {
+            self.dirty.agent(&owner);
+            self.journaled.remove(agent);
+            *self.ended.entry(agent.clone()).or_default() += 1;
+        }
+        self.running.remove(agent)
+    }
+
+    /// Whether a descendant of `agent` runs its loop.
+    fn runs_within(&self, agent: &AgentId) -> bool {
+        let after = (Bound::Excluded(agent), Bound::Unbounded);
+        let next = self.running.range::<AgentId, _>(after).next();
+        next.is_some_and(|(next, _)| next.is_within(agent))
+    }
+
+    pub(super) fn flow(&self) -> Flow {
+        self.flow
+    }
+
+    /// Let agents take their deliveries, or not: every wait decides again.
+    pub(super) fn set_flow(&mut self, flow: Flow) {
+        if self.flow != flow {
+            self.flow = flow;
+            self.dirty.session();
+        }
+    }
+
+    pub(super) fn activation(&self) -> Activation {
+        self.activation
+    }
+
+    pub(super) fn set_activation(&mut self, activation: Activation) {
+        if self.activation != activation {
+            self.activation = activation;
+            self.dirty.session();
+        }
+    }
+
+    /// What every change since the last take touched.
+    pub(crate) fn take_dirty(&mut self) -> Dirty {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// What `records` leave of the root's contract, its highest child index being
+    /// `children`, and of the mode editions they record, as a session opens.
+    pub(crate) fn opened(records: &[std::sync::Arc<EventRecord>], children: u32) -> Self {
+        let mut agents = Self::default();
+        for record in records {
+            let begins = record.agent.parent().is_none();
+            fold(&mut agents.editions, &mut agents.journaled, begins, record);
+        }
+        for held in agents.journaled.values_mut() {
+            held.children = held.children.max(children);
+        }
+        agents
+    }
+
+    /// Fold what a committed `record` says of its agent, if its journal is held: a
+    /// start begins it, as the agent's loop starts in that commit.
+    pub(crate) fn observe(&mut self, record: &EventRecord) {
+        fold(&mut self.editions, &mut self.journaled, true, record);
     }
 
     /// The latest journaled edition of mode `name`.
@@ -456,21 +577,26 @@ impl Agents {
         self.editions.get(name).map(|mode| &**mode)
     }
 
-    /// What `agent`'s journal says it runs under.
-    pub(super) fn contract(&self, agent: &AgentId) -> Option<&RecordedContract> {
-        self.contracts.get(agent)
+    /// How many of `agent`'s loops have ended.
+    pub(super) fn ended(&self, agent: &AgentId) -> u64 {
+        self.ended.get(agent).copied().unwrap_or_default()
     }
 
-    /// Reserve `parent`'s next child id.
-    pub(super) fn next_child(&mut self, parent: &AgentId) -> AgentId {
-        let taken = self.children.entry(parent.clone()).or_default();
-        *taken = taken.saturating_add(1);
-        parent.child(*taken)
+    /// What `agent`'s journal leaves of it, while that is held.
+    pub(super) fn journaled(&self, agent: &AgentId) -> Option<&Journaled> {
+        self.journaled.get(agent)
+    }
+
+    /// Reserve `parent`'s next child id, while `parent` runs.
+    pub(super) fn next_child(&mut self, parent: &AgentId) -> Option<AgentId> {
+        let held = self.journaled.get_mut(parent)?;
+        held.children = held.children.saturating_add(1);
+        Some(parent.child(held.children))
     }
 
     /// Schedule `agent`'s window for work to collect.
     pub(crate) fn wake(&mut self, agent: &AgentId) {
-        if let Some(facts) = self.running.get_mut(agent) {
+        if let Some(facts) = self.get_mut(agent) {
             facts.window.schedule(false);
         }
     }
@@ -478,7 +604,7 @@ impl Agents {
     /// Queue `command` for `agent`; false once its loop is gone, when the command's
     /// waiters see it stopped.
     pub(super) fn send(&mut self, agent: &AgentId, command: AgentCommand) -> bool {
-        let Some(facts) = self.running.get_mut(agent) else {
+        let Some(facts) = self.get_mut(agent) else {
             return false;
         };
         // Input reaching a failed turn that holds a batch waits with it for
@@ -497,7 +623,7 @@ impl Agents {
 
     /// Take `agent`'s queued inputs, leaving every other command in order.
     pub(super) fn take_queued(&mut self, agent: &AgentId) -> Vec<QueuedInput> {
-        let Some(facts) = self.running.get_mut(agent) else {
+        let Some(facts) = self.get_mut(agent) else {
             return Vec::new();
         };
         let (queued, kept) = std::mem::take(&mut facts.inbox)
@@ -525,7 +651,7 @@ impl Agents {
     /// `agent` committed a response without calls. Its turn does no more model
     /// work, so an interrupt finds it between turns.
     pub(crate) fn answered(&mut self, agent: &AgentId) {
-        if let Some(facts) = self.running.get_mut(agent)
+        if let Some(facts) = self.get_mut(agent)
             && facts.turn == Turn::Busy
         {
             facts.set_turn(Turn::Idle);
@@ -537,7 +663,7 @@ impl Agents {
     /// for it, or `deliveries` it takes. One whose tree was cancelled ends
     /// instead.
     pub(super) fn rejoin(&mut self, agent: &AgentId, deliveries: bool) -> bool {
-        let Some(facts) = self.running.get_mut(agent) else {
+        let Some(facts) = self.get_mut(agent) else {
             return false;
         };
         let answered = matches!(facts.turn, Turn::Idle | Turn::Busy);
@@ -557,7 +683,7 @@ impl Agents {
     /// the input that begins its invocation yet to begin: that runs as the
     /// invocation's first turn. Whether it handed any back.
     pub(crate) fn hand_back(&mut self, agent: &AgentId, jobs: &crate::job::Jobs) -> bool {
-        let Some(facts) = self.running.get_mut(agent) else {
+        let Some(facts) = self.get_mut(agent) else {
             return false;
         };
         let begins = jobs.unbegun(agent).is_some()
@@ -572,7 +698,7 @@ impl Agents {
 
     /// A job `agent` held was cancelled on request: its held turn runs on.
     pub(crate) fn run_on(&mut self, agent: &AgentId) {
-        if let Some(facts) = self.running.get_mut(agent)
+        if let Some(facts) = self.get_mut(agent)
             && facts.turn == Turn::Held
         {
             facts.set_turn(Turn::Busy);
@@ -587,7 +713,9 @@ impl Agents {
 
     /// Stop every agent, refusing what each had yet to take with `error`.
     pub(crate) fn stop(&mut self, error: impl Fn() -> HarnessError) {
-        for facts in std::mem::take(&mut self.running).into_values() {
+        self.journaled.retain(|agent, _| agent.parent().is_none());
+        for (agent, facts) in std::mem::take(&mut self.running) {
+            self.dirty.agent(&agent);
             facts
                 .inbox
                 .into_iter()
@@ -600,7 +728,7 @@ impl Agents {
     /// held one is never made busy again.
     pub(super) fn cancel_turns(&mut self, agents: &[AgentId]) {
         for agent in agents {
-            let Some(facts) = self.running.get_mut(agent) else {
+            let Some(facts) = self.get_mut(agent) else {
                 continue;
             };
             let cancelled = match facts.turn {

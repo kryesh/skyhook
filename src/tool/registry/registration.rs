@@ -408,7 +408,7 @@ impl AdmittedInput<ToolContext, ToolOutput> for HostedInput {
             result_policy: admitted.result_policy(),
             ..Invocation::new(move |context: ToolContext| async move {
                 let output =
-                    crate::job::output::HostOutput::new(context.store().clone(), context.job());
+                    crate::job::output::HostOutput::new(context.jobs(), context.job()).await;
                 let local = LocalContext::new(
                     context.execution_location().clone(),
                     context.capabilities().clone(),

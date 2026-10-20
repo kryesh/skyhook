@@ -24,16 +24,14 @@ pub(crate) struct Delivery {
 
 impl Delivery {
     /// The claim acknowledging this delivery, unless its job has a newer one since.
-    pub(crate) fn claim(
-        self,
-        state: &CoreState,
-    ) -> Result<Option<(AgentId, SessionEvent)>, JobError> {
+    pub(crate) fn claim(self, state: &CoreState) -> Option<(AgentId, SessionEvent)> {
         let Self { job, stamp } = self;
-        let entry = state.jobs.entries.get(&job).ok_or(JobError::Unknown(job))?;
+        // A pending delivery keeps its job resident: one no longer held was claimed.
+        let entry = state.jobs.get(job)?;
         let current = entry
             .delivery(job)
             .is_some_and(|delivery| delivery.stamp == stamp);
-        Ok(current.then(|| (entry.agent.clone(), SessionEvent::JobClaimed { job })))
+        current.then(|| (entry.agent.clone(), SessionEvent::JobClaimed { job }))
     }
 
     /// The claims acknowledging `reads` that are still current: each job's
@@ -44,7 +42,7 @@ impl Delivery {
     ) -> impl Iterator<Item = (AgentId, SessionEvent)> {
         reads.sort_by_key(|read| (read.job, std::cmp::Reverse(read.stamp)));
         reads.dedup_by_key(|read| read.job);
-        (reads.into_iter()).filter_map(|read| read.claim(state).ok().flatten())
+        (reads.into_iter()).filter_map(|read| read.claim(state))
     }
 }
 
@@ -91,15 +89,17 @@ impl Notification {
             if !state.agents.busy(&owner) {
                 return Err(JobError::Interrupted);
             }
-            let jobs = &state.jobs.entries;
+            let jobs = &state.jobs;
             let current = deliveries.iter().all(|Delivery { job, stamp }| {
-                jobs.get(job).is_some_and(|entry| {
+                jobs.get(*job).is_some_and(|entry| {
                     entry.agent == owner && entry.lifecycle_pending() == Some(*stamp)
                 })
             });
             let queued = messages.iter().all(|reply| {
-                let child = jobs.get(&reply.id).and_then(JobFacts::child);
-                child.is_some_and(|child| child.messages.iter().any(|m| m.message == reply.message))
+                let child = jobs.get(reply.id).and_then(JobFacts::child);
+                child.is_some_and(|child| {
+                    (child.messages.iter()).any(|m| m.reply.message == reply.message)
+                })
             });
             if !(current && queued) {
                 return Err(JobError::Stale);
@@ -157,11 +157,18 @@ impl JobManager {
         id: JobId,
         ready: fn(&JobFacts) -> bool,
     ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
-        let resolve = move |state: &mut CoreState| match state.jobs.entries.get(&id) {
-            None => Some(Err(JobError::Unknown(id))),
-            Some(entry) => ready(entry).then(|| Ok((entry.envelope(id), entry.delivery(id)))),
+        let resolve = move |state: &CoreState| match state.jobs.lookup(id) {
+            Lookup::Held(entry) => {
+                ready(entry).then(|| Ok((entry.envelope(id), entry.delivery(id))))
+            }
+            // Let go since the wait last decided, so as it was then.
+            Lookup::Unheld(()) => None,
+            Lookup::Unknown => Some(Err(JobError::Unknown(id))),
         };
-        self.inner.store.until(resolve).await?
+        self.inner
+            .store
+            .until(Wait::on([Key::Job(id)], resolve))
+            .await?
     }
 
     /// Acknowledge what a read presented, unless the job has a newer delivery since.
@@ -170,7 +177,7 @@ impl JobManager {
             return Ok(());
         };
         let claim = move |state: &CoreState| {
-            Ok::<_, JobError>(Plan::journal(delivery.claim(state)?.into_iter().collect()))
+            Ok::<_, JobError>(Plan::journal(delivery.claim(state).into_iter().collect()))
         };
         self.inner.store.commit(Command::Journal, claim).await
     }
@@ -181,9 +188,7 @@ impl JobManager {
             return;
         };
         let record = move |state: &mut CoreState| {
-            if let Some(entry) = state.jobs.entries.get_mut(&reader) {
-                entry.reads.push(read);
-            }
+            state.jobs.modify(reader, |entry, _| entry.reads.push(read));
         };
         self.inner.store.live(record).await;
     }
@@ -191,38 +196,40 @@ impl JobManager {
     /// Read a bounded pending batch without acknowledging it.
     pub(crate) async fn pending_delivery(&self, owner: &AgentId) -> Result<Notification, JobError> {
         let (messages, candidates) = self.facts(|jobs| {
-            let messages = messages::pending_messages(&jobs.entries, owner);
-            let candidates = self.lifecycle_candidates(&jobs.entries, owner, &messages);
+            let messages = messages::pending_messages(jobs, owner);
+            let candidates = self.lifecycle_candidates(jobs, owner, &messages);
             (messages, candidates)
         });
         let envelopes = if candidates.is_empty() {
             Vec::new()
         } else {
             // Sized off the core.
-            output::blocking(move || {
-                let mut remaining = LIFECYCLE_BATCH_BYTES;
-                let mut pending = Vec::new();
-                for (envelope, delivery, output) in candidates {
-                    if remaining == 0 {
-                        break;
+            self.store()
+                .reads()
+                .hold(move || {
+                    let mut remaining = LIFECYCLE_BATCH_BYTES;
+                    let mut pending = Vec::new();
+                    for (envelope, delivery, output) in candidates {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let metadata = envelope.metadata_view(&CapabilitySet::default());
+                        let metadata = serde_json::to_vec(&metadata)
+                            .map_or(output::PAGE_BYTES, |bytes| bytes.len());
+                        let cost = output::presented_size(&output)
+                            .saturating_add(metadata)
+                            .saturating_add(ENVELOPE_OVERHEAD);
+                        if cost > remaining && !pending.is_empty() {
+                            // A later completion may still fit; an oversized first one is admitted.
+                            continue;
+                        }
+                        pending.push((envelope, delivery));
+                        remaining = remaining.saturating_sub(cost);
                     }
-                    let metadata = envelope.metadata_view(&CapabilitySet::default());
-                    let metadata = serde_json::to_vec(&metadata)
-                        .map_or(output::PAGE_BYTES, |bytes| bytes.len());
-                    let cost = output::presented_size(&output)
-                        .saturating_add(metadata)
-                        .saturating_add(ENVELOPE_OVERHEAD);
-                    if cost > remaining && !pending.is_empty() {
-                        // A later completion may still fit; an oversized first one is admitted.
-                        continue;
-                    }
-                    pending.push((envelope, delivery));
-                    remaining = remaining.saturating_sub(cost);
-                }
-                Ok(pending)
-            })
-            .await
-            .map_err(|error| JobError::Output(Box::new(error)))?
+                    Ok(pending)
+                })
+                .await
+                .map_err(|error| JobError::Output(Box::new(error)))?
         };
         let (envelopes, deliveries) = envelopes.into_iter().unzip();
         Ok(Notification {
@@ -239,7 +246,7 @@ impl JobManager {
     /// of its own job.
     fn lifecycle_candidates(
         &self,
-        jobs: &HashMap<JobId, JobFacts>,
+        jobs: &Jobs,
         owner: &AgentId,
         messages: &[AgentMessage],
     ) -> Vec<(JobEnvelope, Delivery, output::Output)> {
@@ -247,16 +254,18 @@ impl JobManager {
             .last()
             .map_or(MessageSeq::default(), |message| message.message);
         let mut candidates = jobs
-            .iter()
+            .pending(owner)
+            // Filter before budgeting: a blocked low-ID child must not consume
+            // the lifecycle budget of an unrelated completion.
             .filter(|(_, entry)| {
-                &entry.agent == owner
-                    // Filter before budgeting: a blocked low-ID child must not
-                    // consume the lifecycle budget of an unrelated completion.
-                    && entry.child().is_none_or(|child| {
-                        child.messages.iter().all(|message| message.message <= messages_through)
-                    })
+                entry.child().is_none_or(|child| {
+                    child
+                        .messages
+                        .iter()
+                        .all(|queued| queued.reply.message <= messages_through)
+                })
             })
-            .filter_map(|(&id, entry)| {
+            .filter_map(|(id, entry)| {
                 let stamp = entry.lifecycle_pending()?;
                 Some((
                     entry.envelope(id),
@@ -431,7 +440,10 @@ mod tests {
     #[tokio::test]
     async fn stale_acknowledgement_leaves_the_later_delivery_pending() {
         let presented = async |manager: &JobManager, job| {
-            manager.entry(job, |entry| entry.delivery(job)).unwrap()
+            manager
+                .entry(job, |entry| entry.delivery(job))
+                .await
+                .unwrap()
         };
         for asks_again in [false, true] {
             let (_root, manager, owner, job) = question_job().await;

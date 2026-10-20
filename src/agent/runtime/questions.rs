@@ -200,7 +200,7 @@ impl QuestionCoordinator {
 
     async fn owning_agent_job(&self, mut job: JobId) -> Result<JobId, HarnessError> {
         loop {
-            let envelope = self.jobs.snapshot(job)?;
+            let envelope = self.jobs.snapshot(job).await?;
             if envelope.role == crate::job::JobRole::Agent {
                 return Ok(job);
             }
@@ -241,11 +241,10 @@ impl QuestionCoordinator {
             // A response's calls are all created before any runs, and a script's
             // issued calls are published above: a new batch waits for the issuer's
             // other live asks.
-            let jobs = self.jobs.list(&agent).into_iter();
+            let jobs = self.jobs.active(&agent).into_iter();
             jobs.filter(|sibling| {
                 sibling.parent == key.1
                     && sibling.role == crate::job::JobRole::Question
-                    && !sibling.state.is_terminal()
                     && sibling.id != job
                     && newest < Some(sibling.id)
             })
@@ -320,6 +319,7 @@ impl QuestionCoordinator {
             if self
                 .jobs
                 .is_background(pending.context.job())
+                .await
                 .unwrap_or(false)
                 && let Err(error) = self
                     .jobs
@@ -392,7 +392,11 @@ impl QuestionCoordinator {
         if self.handler.is_none() {
             for item in &mut pending {
                 if let Some(ask) = item.as_ref()
-                    && !self.jobs.is_background(ask.context.job()).unwrap_or(false)
+                    && !self
+                        .jobs
+                        .is_background(ask.context.job())
+                        .await
+                        .unwrap_or(false)
                 {
                     item.take().unwrap().finish(
                         Err(ToolError::failed(QuestionError::Unavailable.to_string())
@@ -908,12 +912,12 @@ mod tests {
             let output = terminal(&session, asks[index]).await.output;
             assert_eq!(output, Some(json!(value)));
             if index == 0 {
-                let remaining = jobs.snapshot(owner).unwrap();
+                let remaining = jobs.snapshot(owner).await.unwrap();
                 assert_eq!(remaining.state, JobState::WaitingInput);
                 assert_eq!(remaining.question.unwrap().questions[0].id, "second");
             }
         }
-        assert_eq!(jobs.snapshot(owner).unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
         jobs.cancel(owner).await.unwrap();
         shutdown_session(session).await;
     }
@@ -938,7 +942,7 @@ mod tests {
         let pending = pending_questions(&[("first", asks[0].id()), ("second", asks[1].id())]);
         let opened = coordinator.open_child_questions(pending).await.unwrap();
         assert_eq!(opened, owner);
-        let state = jobs.snapshot(owner).unwrap().state;
+        let state = jobs.snapshot(owner).await.unwrap().state;
         assert_eq!(state, JobState::WaitingInput);
         let answered = coordinator.answer_child_question(owner, json!({"first":"yes", "second":2}));
         assert!(answered.await.unwrap());
@@ -961,7 +965,7 @@ mod tests {
         assert_eq!(second_input.recv().await.unwrap(), json!(2));
         let resolve = coordinator.resolve_child_question(owner, &resolved);
         resolve.await.unwrap();
-        assert_eq!(jobs.snapshot(owner).unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
         let pending = pending_questions(&[("cancel", resolved[0])]);
         coordinator.open_child_questions(pending).await.unwrap();
         bounded(async {
@@ -1136,7 +1140,7 @@ mod tests {
                     error.diagnostic().cause,
                     crate::tool::diagnostic::Cause::Denied(_)
                 ));
-                let state = jobs.snapshot(job).unwrap().state;
+                let state = jobs.snapshot(job).await.unwrap().state;
                 assert_ne!(state, JobState::WaitingInput);
                 jobs.cancel(job).await.unwrap();
             }

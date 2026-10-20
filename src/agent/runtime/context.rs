@@ -8,10 +8,11 @@ use crate::{
         protocol::{ModelRequest, Usage},
     },
     session::{
-        CompactionTrigger, CoreState, EventRecord, Message, ModelContext, Projection, RecordSeq,
-        RequestLedger, RuntimeState, SessionEvent, UserPart, project_history,
+        CompactionTrigger, EventRecord, Message, ModelContext, OpenedHistory, Projection,
+        RecordSeq, Requested, RuntimeState, SessionError, SessionEvent, SessionStore, UserPart,
     },
 };
+use std::sync::{Arc, mpsc::Receiver};
 
 pub(super) struct AgentContext {
     /// What its requests are sent under: the profile it was opened for, which a
@@ -21,81 +22,71 @@ pub(super) struct AgentContext {
     pub provider: Box<dyn ProviderContext>,
     /// The last request's blobs, which the next request reuses.
     pub blobs: crate::media::LoadedBlobs,
-    /// What the journal leaves for the next request to compact for.
-    reported: Reported,
+    /// What the agent's last completed response reported, which the next request
+    /// compacts for, as of the last refresh.
+    reported: Option<Usage>,
+    /// The agent's latest request and the state ending its tail, which its response
+    /// carries.
+    requested: Requested,
     /// The last journal sequence reflected in `projected`.
     through: RecordSeq,
-}
-
-/// The occupancy the agent's last committed response reported, while no compaction
-/// has answered it and its model and mode are unchanged since: a fold of its journal,
-/// so a reopened context decides as the live one would.
-#[derive(Default)]
-struct Reported {
-    pending: Option<Usage>,
-}
-
-impl Reported {
-    /// Fold `record`, which `ledger` has observed.
-    fn fold(&mut self, ledger: &RequestLedger, record: &EventRecord) {
-        match &record.event {
-            SessionEvent::ResponseCompleted { attempt, .. } => {
-                let requested = ledger.get(attempt.request);
-                if let Some(usage) = requested.and_then(|request| request.phase.completed_usage()) {
-                    self.pending = Some(usage);
-                }
-            }
-            SessionEvent::CompactionFailed { error, .. } if error.keeps_need() => {}
-            SessionEvent::Compaction { .. }
-            | SessionEvent::CompactionFailed { .. }
-            | SessionEvent::ModelChanged { .. }
-            | SessionEvent::ModeChanged { .. } => self.pending = None,
-            _ => {}
-        }
-    }
+    /// The agent's records its history folds, applied after `through`.
+    feed: Receiver<Arc<EventRecord>>,
 }
 
 impl AgentContext {
-    pub fn open(
+    pub async fn open(
         agent: &AgentId,
         model: ModelContext,
         provider: Box<dyn ProviderContext>,
-        state: &CoreState,
-    ) -> Self {
-        let records = &state.records;
-        let mut reported = Reported::default();
-        for record in records.iter().filter(|record| &record.agent == agent) {
-            reported.fold(&state.ledger, record);
-        }
-        Self {
+        store: &SessionStore,
+    ) -> Result<Self, SessionError> {
+        let OpenedHistory {
+            projection,
+            through,
+            feed,
+        } = store.open_history(agent).await?;
+        Ok(Self {
             model,
-            projected: project_history(records, agent),
+            projected: projection,
             provider,
             blobs: Default::default(),
-            reported,
-            through: records
-                .last()
-                .map_or(RecordSeq::default(), |record| record.sequence),
-        }
+            reported: store.reported(agent),
+            requested: None,
+            through,
+            feed,
+        })
     }
 
-    /// Project what the journal committed since the last refresh, from any producer.
-    /// A compaction among it replaces this agent's history, so all is re-projected.
-    pub fn refresh(&mut self, store: &crate::session::SessionStore, agent: &AgentId) {
-        store.read(|state| {
-            let window = state.records_after(self.through);
-            let mut compacted = false;
-            for record in window.iter().filter(|record| &record.agent == agent) {
-                self.reported.fold(&state.ledger, record);
-                compacted |= matches!(record.event, SessionEvent::Compaction { .. });
+    /// The last journal sequence the history reflects.
+    pub fn through(&self) -> RecordSeq {
+        self.through
+    }
+
+    /// Fold what the journal committed for the agent since the last refresh, from any
+    /// producer. A compaction among it replaces the history, which is read again.
+    pub async fn refresh(
+        &mut self,
+        store: &SessionStore,
+        agent: &AgentId,
+    ) -> Result<(), SessionError> {
+        // Read first: the feed then holds every record it takes through `applied`, and
+        // the agent's other records change nothing the context folds.
+        let applied = store.applied();
+        let mut compacted = false;
+        for record in self.feed.try_iter() {
+            self.through = record.sequence;
+            match &record.event {
+                SessionEvent::Compaction { .. } => compacted = true,
+                _ => self.projected.apply(&mut self.requested, &record),
             }
-            if compacted {
-                self.projected = project_history(&state.records, agent);
-            } else {
-                (self.projected).extend(&state.ledger, &state.records, window, agent);
-            }
-            self.through = window.last().map_or(self.through, |record| record.sequence);
-        });
+        }
+        self.through = self.through.max(applied);
+        self.reported = store.reported(agent);
+        if compacted {
+            self.projected = store.history(agent, self.through).await?;
+        }
+        Ok(())
     }
 
     /// Build the runtime-state tail only when the profile sends it. A persisting
@@ -119,7 +110,7 @@ impl AgentContext {
     /// The reported occupancy the next request compacts for first, if over the threshold:
     /// the completed response's, including cached input and generated output.
     pub fn compaction_due(&self) -> Option<CompactionTrigger> {
-        let tokens = self.reported.pending?.occupancy()?;
+        let tokens = self.reported?.occupancy()?;
         needs_compaction(&self.model.profile.profile, tokens)
             .then_some(CompactionTrigger::Occupancy(tokens))
     }
@@ -153,7 +144,6 @@ mod tests {
         Requests, Script, Step, answer, child_launch, ephemeral_session, send, test_harness,
     };
     use crate::provider::{ProviderErrorKind, protocol::ContextId};
-    use crate::session::ModelPurpose;
 
     #[test]
     fn completed_usage_compacts_at_ninety_percent_after_reserving_configured_output() {
@@ -193,60 +183,8 @@ mod tests {
         }
     }
 
-    /// A committed response over the threshold leaves the need through failed summary
-    /// rounds a fresh summary could pass, but not through an overflowing one: that
-    /// round already shrank its summary, so the next request decides.
-    #[test]
-    fn only_a_summary_failure_a_retry_could_pass_keeps_the_need() {
-        use super::super::context::Reported;
-        use crate::session::{
-            AttemptRef, CompactionFailure, CompletedOutcome, ModelContext, RequestLedger,
-            tests::{self, attempt, record, requested},
-        };
-        use crate::{agent::CompactionFault, identity::SessionId};
-        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
-        let request = 2.into();
-        let completed = [
-            SessionEvent::ModelContext {
-                context: ModelContext::test(ModelPurpose::Agent, tests::profile()),
-            },
-            requested(1.into()),
-            attempt(request, 1),
-            SessionEvent::Usage {
-                request,
-                usage: tests::usage(1_000, 0, 10),
-            },
-            SessionEvent::ResponseCompleted {
-                attempt: AttemptRef {
-                    request,
-                    attempt: 1,
-                },
-                message: 3.into(),
-                outcome: CompletedOutcome::Answer,
-            },
-        ];
-        let failed = |error| SessionEvent::CompactionFailed {
-            failure: CompactionFailure::BeforeRequest,
-            error,
-        };
-        let (mut ledger, mut reported) = (RequestLedger::default(), Reported::default());
-        for (sequence, event) in (1..).zip(completed) {
-            let record = record(&agent, sequence, event);
-            ledger.observe(&record);
-            reported.fold(&ledger, &record);
-        }
-        for (error, keeps) in [
-            (CompactionFault::Interrupted, true),
-            (CompactionFault::Truncated, true),
-            (CompactionFault::Overflowed, false),
-        ] {
-            reported.fold(&ledger, &record(&agent, 9, failed(error.clone())));
-            assert_eq!(reported.pending.is_some(), keeps, "{error:?}");
-        }
-    }
-
     #[tokio::test]
-    async fn cancelled_children_release_but_failed_children_retain_their_context() {
+    async fn cancelled_and_failed_children_release_their_context() {
         let root = tempfile::tempdir().unwrap();
         let steps = [
             Step::new(answer("done")).gated(),
@@ -286,17 +224,9 @@ mod tests {
                 session.runtime.interrupt_tree(&child).await;
             }
             assert!(received.await.unwrap().is_err());
-            let context = ContextId::from(&child);
-            if fail {
-                // Failed child turns are retained for retry with their provider
-                // session/history; explicit interruption still tears one down.
-                assert!(
-                    !script.dropped(&context),
-                    "failed child context must remain live for retry"
-                );
-            } else {
-                script.released(&context).await;
-            }
+            // A cancelled child's loop ends; a failed one parks, and its retry
+            // opens a context again from its history.
+            script.released(&ContextId::from(&child)).await;
             session.prompt("root still usable").await.unwrap();
             assert!(!script.dropped(&root_context));
         }

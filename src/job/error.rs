@@ -14,22 +14,27 @@ impl std::fmt::Display for InputUnavailableReason {
         match self {
             Self::State(state) => write!(formatter, "job is {}", state.presented()),
             Self::CancellationRequested => formatter.write_str("cancellation has been requested"),
-            Self::ResumeUnavailable => {
-                formatter.write_str("no retained resume handler is available")
-            }
+            Self::ResumeUnavailable => formatter.write_str("the job can no longer be resumed"),
         }
     }
 }
 
 impl<O> From<JobError> for crate::tool::invocation::OperationError<O> {
     fn from(error: JobError) -> Self {
+        Self::from(&error)
+    }
+}
+
+/// By reference, so one refusal of several calls fails each of them alike.
+impl<O> From<&JobError> for crate::tool::invocation::OperationError<O> {
+    fn from(error: &JobError) -> Self {
         use crate::tool::diagnostic::Cause;
         match error {
-            JobError::Session(error) => error.into(),
+            JobError::Session(error) => Self::session(error),
             JobError::InputClosed(_) => Self::input_closed(),
-            JobError::Output(error) => Self::from_facts(error.into_facts().0, None),
-            JobError::Unknown(job) => Self::cause(Cause::UnknownJob { job }),
-            JobError::AlreadyTerminal(job) => Self::cause(Cause::JobAlreadyTerminal { job }),
+            JobError::Output(error) => Self::from_facts(error.facts().clone(), None),
+            JobError::Unknown(job) => Self::cause(Cause::UnknownJob { job: *job }),
+            JobError::AlreadyTerminal(job) => Self::cause(Cause::JobAlreadyTerminal { job: *job }),
             JobError::Interrupted => Self::interrupted(),
             error => Self::failed(error),
         }

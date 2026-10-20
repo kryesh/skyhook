@@ -3,7 +3,7 @@ pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
 use lifecycle::PendingStart;
 pub use menus::{
-    ConfirmAction, Emphasis, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef,
+    ConfirmAction, Emphasis, Item, ItemRef, Menu, MenuId, MenuKind, SavedState, SessionRef,
 };
 use prompts::UiPrompt;
 pub use queue::{Delivered, Paused, QueuedInput, QueuedInputId};
@@ -17,6 +17,7 @@ use observation::ActiveObservation;
 pub use observation::PreparedObservation;
 mod menus;
 mod output;
+mod pages;
 mod projection;
 pub use output::OutputStore;
 use output::{LoadedOutput, OutputAttempt};
@@ -47,7 +48,7 @@ use skyhook::{
     },
     identity::{AgentId, JobId, SessionId},
     job::JobOutputQuery,
-    session::{EventRecord, Message, RecordSeq, SessionEvent, SessionTitle},
+    session::{Message, SessionEvent, SessionTitle},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -62,8 +63,6 @@ const TITLE_CHARS: usize = 100;
 const SCROLL_STEP: isize = 3;
 /// How long a toast stays up.
 const TOAST_TTL: Duration = Duration::from_secs(2);
-/// How often expanded, unsettled job output is refreshed.
-const OUTPUT_POLL: Duration = Duration::from_millis(500);
 /// Pasted text with more lines than this becomes one inline paste item.
 const PASTE_COLLAPSE_LINES: usize = 12;
 
@@ -116,21 +115,6 @@ enum Phase {
     },
 }
 
-/// The newest record `snapshot` holds.
-fn last_record(snapshot: &ObservationSnapshot) -> Option<RecordSeq> {
-    snapshot.records.keys().next_back().copied()
-}
-
-/// Whether `root` journaled a failed turn after record `after`.
-fn root_failed(snapshot: &ObservationSnapshot, root: &AgentId, after: Option<RecordSeq>) -> bool {
-    use std::ops::Bound;
-    let after = after.map_or(Bound::Unbounded, Bound::Excluded);
-    let mut records = snapshot.records.range((after, Bound::Unbounded));
-    records.any(|(_, record)| {
-        &record.agent == root && matches!(record.event, SessionEvent::AgentFailed { .. })
-    })
-}
-
 pub struct App {
     phase: Phase,
     pub launch: Launch,
@@ -143,6 +127,8 @@ pub struct App {
     pub sidebar: bool,
     pub snapshot: ObservationSnapshot,
     pub projection: Projection,
+    /// The viewed agent's tab, loaded around the view; none while out of view.
+    pub window: Option<model::Window>,
     pub selected: AgentId,
     /// Shared across agents; reading and expansion state remain in `views`.
     pub tab: Tab,
@@ -157,10 +143,10 @@ pub struct App {
     next_queued_id: QueuedInputId,
     queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
     queue_activity_revision: u64,
-    /// The newest journal record, of any kind, already checked for a failed root
-    /// turn. Failures journaled before the session was shown hold nothing: no
-    /// input queued behind them.
-    failures_read: Option<RecordSeq>,
+    /// The root journaled a failed turn the queue has not been held for. Failures
+    /// journaled before the session was shown hold nothing: no input queued
+    /// behind them.
+    root_failed: bool,
     /// Creation owns its pending action until the asynchronous task completes.
     creating: Option<PendingStart>,
     /// Why queue delivery is paused, if it is.
@@ -171,11 +157,14 @@ pub struct App {
     pub prompt_options_rect: Rect,
     pub prompt_body_rows: usize,
     pub prompt_option_rows: usize,
-    pub overlay: Option<Overlay>,
+    /// The menu over the conversation, which takes the keys.
+    pub menu: Option<Menu>,
     /// Taken by the host after each event.
     pub host: Option<HostRequest>,
     /// Every open session not closing, this one included; kept current by the host.
     pub peers: Vec<Peer>,
+    /// This session as the others last saw it, and what that was drawn from.
+    peer: Option<(session::PeerKey, Peer)>,
     next_menu_id: MenuId,
     // Pending attachment reads belong to one composer draft, not the next submission/session.
     // Local edits, clear, and composer-only history navigation preserve it.
@@ -190,7 +179,8 @@ pub struct App {
     pub animating: bool,
     pub details: bool,
     pub outputs: OutputStore,
-    last_output: Instant,
+    /// Held by each export in flight.
+    exports: std::sync::Arc<()>,
     pub tx: mpsc::UnboundedSender<Work>,
     pub keys: KeyMap,
     pub leader: Option<KeyEvent>,
@@ -214,6 +204,12 @@ pub struct App {
     gesture: Gesture,
     pub hover: Option<(u16, u16)>,
     pub render: super::render::RenderState,
+    /// Every record observed, in order, for tests to read what the session journaled.
+    #[cfg(test)]
+    pub journal: Vec<std::sync::Arc<skyhook::session::EventRecord>>,
+    /// Page loads asked for, for tests.
+    #[cfg(test)]
+    pub loads: usize,
 }
 impl App {
     pub fn entries(&self) -> &[Entry] {
@@ -240,20 +236,29 @@ impl App {
         saved: state::SavedState,
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
-        let (phase, snapshot) = match observation {
-            Some(PreparedObservation { active, snapshot }) => (
+        let (phase, snapshot, projection, window) = match observation {
+            Some(PreparedObservation {
+                active,
+                snapshot,
+                projection,
+                window,
+                ..
+            }) => (
                 Phase::Open {
                     observation: active,
                     attached_draft: None,
                 },
                 *snapshot,
+                *projection,
+                window.map(|window| *window),
             ),
             None => (
                 Phase::Draft { root: draft_root() },
                 ObservationSnapshot::default(),
+                Projection::default(),
+                None,
             ),
         };
-        let failures_read = last_record(&snapshot);
         let selected = match &phase {
             Phase::Draft { root } => root.clone(),
             Phase::Open { observation, .. } => observation.session.root_agent().clone(),
@@ -267,7 +272,8 @@ impl App {
             phase,
             launch,
             snapshot,
-            projection: Projection::default(),
+            projection,
+            window,
             selected: selected.clone(),
             tab: Tab::default(),
             views: Views::default(),
@@ -281,7 +287,7 @@ impl App {
             next_queued_id: QueuedInputId::default(),
             queue_sender: None,
             queue_activity_revision: 0,
-            failures_read,
+            root_failed: false,
             creating: None,
             paused: None,
             operation: false,
@@ -290,9 +296,10 @@ impl App {
             prompt_options_rect: Rect::default(),
             prompt_body_rows: 0,
             prompt_option_rows: 0,
-            overlay: None,
+            menu: None,
             host: None,
             peers: Vec::new(),
+            peer: None,
             next_menu_id: MenuId::default(),
             draft_ticket: Token::default(),
             status: super::status::StatusLog::new(tx.clone()),
@@ -303,7 +310,7 @@ impl App {
             animating: false,
             details: false,
             outputs: OutputStore::default(),
-            last_output: Instant::now(),
+            exports: Default::default(),
             tx: tx.clone(),
             keys: KeyMap::default(),
             leader: None,
@@ -324,8 +331,12 @@ impl App {
             gesture: Gesture::Released,
             hover: None,
             render: super::render::RenderState::new(selected, tx),
+            #[cfg(test)]
+            journal: Vec::new(),
+            #[cfg(test)]
+            loads: 0,
         };
-        app.reset_projection();
+        app.refresh();
         app.select_mode(mode);
         let mut agents = app.projection.agents.iter();
         let root = agents.find(|agent| agent.id == app.selected);
@@ -380,21 +391,137 @@ pub(super) mod tests {
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
         let session = app.launch.create(None).await.unwrap();
-        attach(&mut app, session);
+        attach(&mut app, session).await;
         (root, app)
     }
-    /// Refresh `job`'s output as the UI does, returning what it shows.
+    /// A session that approves every tool call, attached.
+    pub(in crate::tui) async fn approving_fixture() -> (tempfile::TempDir, App, SessionHandle) {
+        let (root, mut app) = draft_fixture().await;
+        let mut config = app.launch.model.config().config().clone();
+        config.approve_all = true;
+        app.launch.model = config.into_runtime().unwrap().default_model();
+        let session = app.launch.create(None).await.unwrap();
+        attach(&mut app, session.clone()).await;
+        (root, app, session)
+    }
+    /// Load `job`'s output as the UI does, shown or not, returning what it shows.
     pub(in crate::tui) async fn fetch_output(app: &mut App, job: JobId) -> skyhook::job::JobView {
         let mut rx = capture_work(app);
+        draw(app);
+        // A no-op once drawing began this job's load.
         app.fetch_output(job);
-        let work = recv(&mut rx).await;
-        assert!(matches!(work, Work::Output { ref attempt, .. } if attempt.job() == job));
-        app.work(work);
-        app.outputs.get(&job).unwrap().clone().unwrap()
+        loop {
+            let work = recv(&mut rx).await;
+            let loaded = matches!(&work, Work::Output { attempt, .. } if attempt.job() == job);
+            app.work(work);
+            if loaded {
+                break app.outputs.get(&job).unwrap().clone().unwrap();
+            }
+        }
+    }
+    /// `session` observed, as opening it reads it.
+    pub(in crate::tui) async fn prepared(session: SessionHandle) -> PreparedObservation {
+        crate::tests::bounded(PreparedObservation::load(session))
+            .await
+            .unwrap()
+    }
+    /// Every record `session` journaled, in order, read from its store.
+    pub(in crate::tui) async fn journal(
+        session: &SessionHandle,
+    ) -> Vec<std::sync::Arc<skyhook::session::EventRecord>> {
+        crate::tests::bounded(async {
+            let agents = session.store().agents().await.unwrap();
+            let mut records = Vec::new();
+            for agent in agents.agents {
+                let window = pages::whole(session, &agent.agent).await.unwrap();
+                records.extend(window.transcript().unwrap().loaded_records());
+            }
+            records.sort_unstable_by_key(|record| record.sequence);
+            records
+        })
+        .await
+    }
+    /// What the app shows of one agent's conversation, read whole from a store.
+    pub(in crate::tui) struct Whole {
+        pub(in crate::tui) live: skyhook::agent::ObservationSnapshot,
+        pub(in crate::tui) window: model::Window,
+        pub(in crate::tui) projection: Projection,
+    }
+
+    impl Whole {
+        /// The entries a fresh build shows, every detail `open` or none.
+        pub(in crate::tui) fn entries(&self, outputs: &OutputStore, open: bool) -> Vec<Entry> {
+            let view = View::default();
+            let presentation = model::EntryView {
+                agent: &self.window.agent,
+                tab: self.window.tab,
+                view: &view,
+                all_details: open,
+                today: Default::default(),
+            };
+            model::entries(self.inputs(presentation, outputs), true)
+        }
+
+        pub(in crate::tui) fn inputs<'a>(
+            &'a self,
+            presentation: model::EntryView<'a>,
+            outputs: &'a OutputStore,
+        ) -> model::Inputs<'a> {
+            model::Inputs {
+                live: &self.live,
+                window: &self.window,
+                projection: &self.projection,
+                presentation,
+                outputs,
+                unsaved: &[],
+            }
+        }
+    }
+
+    /// What the app shows of `agent`'s conversation, read whole from `session`'s store:
+    /// its live slice, every page of it, and every agent's summary.
+    pub(in crate::tui) async fn read(session: &SessionHandle, agent: &AgentId) -> Whole {
+        crate::tests::bounded(async {
+            let prepared = PreparedObservation::load(session.clone()).await.unwrap();
+            Whole {
+                live: *prepared.snapshot,
+                window: pages::whole(session, agent).await.unwrap(),
+                projection: *prepared.projection,
+            }
+        })
+        .await
+    }
+
+    /// The viewed conversation as a fresh build shows it once `app` has applied every
+    /// record: its pages read whole from the store, beside what `app` holds live.
+    pub(in crate::tui) async fn whole_entries(app: &mut App, details: bool) -> Vec<Entry> {
+        let session = app.session().unwrap().clone();
+        let newest = journal(&session).await.last().map(|record| record.sequence);
+        let applied = |app: &App| Some(app.snapshot.applied) >= newest;
+        played::observe_until(app, applied).await;
+        let mut read = read(&session, &app.selected).await;
+        read.live = app.snapshot.clone();
+        read.entries(&app.outputs, details)
+    }
+    /// Observe the session again as a lagged app does, installing what it reads.
+    pub(in crate::tui) async fn resubscribed(app: &mut App) {
+        let mut rx = capture_work(app);
+        app.resubscribe();
+        bounded(async {
+            loop {
+                let work = rx.recv().await.expect("work channel open");
+                let observed = matches!(work, Work::Observed(_));
+                app.work(work);
+                if observed {
+                    break;
+                }
+            }
+        })
+        .await;
     }
     /// Replace a draft fixture with one opened on `session`.
-    pub(in crate::tui) fn attach(app: &mut App, session: SessionHandle) {
-        let observation = PreparedObservation::subscribe(session);
+    pub(in crate::tui) async fn attach(app: &mut App, session: SessionHandle) {
+        let observation = prepared(session).await;
         *app = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
     }
     /// An image attachment whose bytes are a minimal PNG signature.
@@ -404,7 +531,54 @@ pub(super) mod tests {
             image: skyhook::media::Image::new(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap(),
         }
     }
-    pub(super) fn capture_work(app: &mut App) -> mpsc::UnboundedReceiver<Work> {
+    /// The entries a fresh build of `app`'s view shows from what the app holds.
+    pub(in crate::tui) fn fresh(app: &App) -> Vec<Entry> {
+        let view = View::default();
+        let presentation = model::EntryView {
+            agent: &app.selected,
+            tab: app.tab,
+            view: app.viewed().unwrap_or(&view),
+            all_details: app.details,
+            today: app.clock.day(),
+        };
+        let inputs = model::Inputs {
+            live: &app.snapshot,
+            window: app.window.as_ref().expect("a viewed window"),
+            projection: &app.projection,
+            presentation,
+            outputs: &app.outputs,
+            unsaved: &app.unsaved_status,
+        };
+        model::entries(inputs, true)
+    }
+    /// An app of its own viewing `session`'s `tab`, its first page loaded.
+    pub(in crate::tui) async fn viewing(
+        session: &SessionHandle,
+        tab: Tab,
+    ) -> (tempfile::TempDir, App) {
+        let (root, mut app) = draft_fixture().await;
+        attach(&mut app, session.clone()).await;
+        app.tab = tab;
+        settled(&mut app).await;
+        (root, app)
+    }
+    /// Draw until the viewed tab has loaded what the view shows, applying the work
+    /// its loads send.
+    pub(in crate::tui) async fn settled(app: &mut App) {
+        let mut rx = capture_work(app);
+        bounded(async {
+            loop {
+                draw(app);
+                if !app.window.as_ref().is_some_and(model::Window::loading) {
+                    break;
+                }
+                let work = rx.recv().await.expect("work channel open");
+                app.work(work);
+            }
+        })
+        .await;
+    }
+    pub(in crate::tui) fn capture_work(app: &mut App) -> mpsc::UnboundedReceiver<Work> {
         let (tx, rx) = mpsc::unbounded_channel();
         app.tx = tx;
         rx
@@ -519,7 +693,7 @@ pub(super) mod tests {
         mouse(app, rect, MouseEventKind::Down(MouseButton::Left));
         mouse(app, rect, MouseEventKind::Up(MouseButton::Left));
     }
-    pub(super) async fn recv(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
+    pub(in crate::tui) async fn recv(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
         bounded(rx.recv()).await.expect("work channel open")
     }
     pub(super) fn pending<T>(response: &mut oneshot::Receiver<T>) -> bool {
@@ -539,12 +713,18 @@ pub(super) mod tests {
             key(app, *code, M::NONE);
         }
     }
-    /// Run a script to completion and install the resulting journal snapshot.
+    /// Run a script to completion and observe what the app is told of it.
     pub(in crate::tui) async fn run_script(app: &mut App, source: &str) {
         let session = app.session().unwrap().clone();
-        session.run_script(source).await.unwrap();
-        app.snapshot = session.observe().snapshot;
-        app.refresh();
+        let script = session.run_script(source).await.unwrap();
+        drop(script);
+        let done = |app: &App| {
+            app.snapshot
+                .jobs
+                .values()
+                .all(|job| job.state.is_terminal())
+        };
+        played::observe_until(app, |app| !app.snapshot.jobs.is_empty() && done(app)).await;
     }
     pub(in crate::tui) fn job_named(app: &App, tool: &str) -> JobId {
         let mut jobs = app.snapshot.jobs.values();
@@ -553,7 +733,18 @@ pub(super) mod tests {
     /// Select the content row that renders `job`.
     pub(super) fn select_job(app: &mut App, job: JobId) {
         let row = app.entries().iter().position(|e| e.job_id() == Some(job));
-        app.view().row = row.unwrap();
+        app.select_entry(row.unwrap());
+    }
+    /// Show `message` unsaved in `app`'s root conversation, after its entry `after`.
+    pub(in crate::tui) fn unsaved_at(app: &mut App, after: Option<u64>, message: &str) {
+        let agent = app.root_agent().clone();
+        let message = message.to_owned();
+        app.unsaved_status.push(model::UnsavedStatus {
+            agent,
+            after,
+            message,
+        });
+        app.content_dirty = true;
     }
     /// The unsaved statuses shown in `agent`'s conversation.
     pub(in crate::tui) fn unsaved(app: &App, agent: &AgentId) -> Vec<String> {
@@ -584,7 +775,7 @@ pub(super) mod tests {
             }
         }
         app.status.flush().await;
-        let records = session.observe().snapshot.records;
+        let records = journal(&session).await;
         let records = serde_json::to_string(&records).unwrap();
         for warning in &warnings {
             let encoded = serde_json::to_string(warning).unwrap();
@@ -609,7 +800,7 @@ pub(super) mod tests {
         let session = draft.launch.create(None).await.unwrap();
         let id = session.id();
         let (tx, _) = mpsc::unbounded_channel();
-        let observation = PreparedObservation::subscribe(session.clone());
+        let observation = prepared(session.clone()).await;
         let mut initial = App::new(
             Some(observation),
             draft.launch.clone(),
@@ -618,7 +809,7 @@ pub(super) mod tests {
             tx,
         );
         assert_startup_warnings_ui_only(&mut initial).await;
-        draft.session_started(PreparedObservation::subscribe(session.clone()));
+        draft.session_started(prepared(session.clone()).await);
         assert_startup_warnings_ui_only(&mut draft).await;
         session.shutdown().await.unwrap();
         session.close().await.unwrap();
@@ -626,7 +817,7 @@ pub(super) mod tests {
         drop((initial, draft, session));
 
         let session = resumed.launch.create(Some(id)).await.unwrap();
-        attach(&mut resumed, session);
+        attach(&mut resumed, session).await;
         assert_startup_warnings_ui_only(&mut resumed).await;
         resumed.session().unwrap().shutdown().await.unwrap();
     }

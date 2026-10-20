@@ -38,7 +38,7 @@ impl App {
     /// Open the workspace file picker; `at` follows an `@` typed in the composer.
     pub(in crate::tui::app) fn open_files(&mut self, at: Option<usize>) {
         self.open("Attach workspace file", MenuKind::Files(vec![], at));
-        let id = self.menu().unwrap().id;
+        let id = self.menu.as_ref().unwrap().id;
         let root = self.launch.workspace.clone();
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -90,7 +90,7 @@ mod tests {
         for (path, expected) in [(relative, text), (image, png)] {
             app.open("Files", MenuKind::Files(items.clone(), None));
             let selected = items.iter().position(|item| item.value == path);
-            app.menu_mut().unwrap().select(selected.unwrap());
+            app.menu.as_mut().unwrap().select(selected.unwrap());
             app.choose();
             let Work::File { result, .. } = recv(&mut rx).await else {
                 panic!("file read")
@@ -127,13 +127,16 @@ mod tests {
         let mut rx = capture_work(&mut app);
         app.editor.set("mail user".into());
         key(&mut app, KeyCode::Char('@'), M::SHIFT);
-        assert!(matches!(app.menu().unwrap().kind, MenuKind::Files(..)));
+        assert!(matches!(
+            app.menu.as_ref().unwrap().kind,
+            MenuKind::Files(..)
+        ));
         key(&mut app, KeyCode::Esc, M::NONE);
-        assert!(app.menu().is_none());
+        assert!(app.menu.is_none());
         assert_eq!(app.editor.text(), "mail user@");
         key(&mut app, KeyCode::Char('@'), M::SHIFT);
-        app.menu_mut().unwrap().input.set("notes".into());
-        while app.menu().unwrap().filtered().is_empty() {
+        app.menu.as_mut().unwrap().input.set("notes".into());
+        while app.menu.as_ref().unwrap().filtered().is_empty() {
             let work = recv(&mut rx).await;
             app.work(work);
         }

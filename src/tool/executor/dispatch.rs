@@ -165,7 +165,7 @@ impl ToolExecutor {
         let job = context.job();
         // The handle shows the job as launched, before its worker can finish it.
         let started = if plan.launch.background {
-            let launched = self.shared.jobs.metadata(job).map_err(job_error)?;
+            let launched = self.shared.jobs.metadata(job).await.map_err(job_error)?;
             StartedExecution::Background(Box::new(launched))
         } else {
             StartedExecution::Foreground(job)
@@ -227,7 +227,7 @@ impl ToolExecutor {
     /// journaled and admitted once, unless the location its job journaled no
     /// longer holds.
     async fn replan(&self, id: JobId) -> Result<InvocationPlan, ToolError> {
-        let call = self.shared.jobs.metadata(id).map_err(job_error)?;
+        let call = self.shared.jobs.metadata(id).await.map_err(job_error)?;
         let (agent, tool, parent) = (call.agent, call.tool, call.parent);
         let arguments = std::sync::Arc::unwrap_or_clone(call.arguments);
         let planned = self.plan_registered(InvocationKind::Host, agent, &tool, arguments, parent);
@@ -353,7 +353,7 @@ fn run(
 
 /// Cancellation determines the outcome, not whether already observed effects or
 /// output happened. Apply its precedence once, before binding failure facts.
-fn cancellation_result(
+pub(crate) fn cancellation_result(
     result: Result<ToolOutput, ToolError>,
     cancelled: bool,
 ) -> Result<ToolOutput, ToolError> {
@@ -488,7 +488,7 @@ mod tests {
             let (_, output) = bounded(running).await.unwrap().unwrap_err().into_parts();
             assert!(output.is_none());
         }
-        let jobs = runtime.jobs.list(&runtime.agent);
+        let jobs = runtime.jobs.list(&runtime.agent).await.unwrap();
         assert_eq!(jobs.len(), 2);
         for job in jobs {
             assert_eq!(
@@ -575,7 +575,7 @@ mod tests {
             (&"build".into(), &"build".into())
         );
         assert!(arguments.get("workspace").is_none());
-        let state = runtime.jobs.snapshot(tool_request.job).unwrap().state;
+        let state = runtime.jobs.snapshot(tool_request.job).await.unwrap().state;
         assert_eq!(state, JobState::AwaitingApproval);
         runtime.jobs.cancel(tool_request.job).await.unwrap();
         assert!(running.await.unwrap().is_err());
@@ -661,7 +661,7 @@ mod tests {
             assert_ne!(current.permissions, stale.permissions, "a new revision");
             // It asks again awaiting approval, having run only if it was admitted
             // to connect.
-            let state = runtime.jobs.snapshot(current.job).unwrap().state;
+            let state = runtime.jobs.snapshot(current.job).await.unwrap().state;
             assert_eq!(state, JobState::AwaitingApproval);
             let ran = runtime.store.records().into_iter().filter(|record| {
                 let running = crate::job::JobTransition::Running;

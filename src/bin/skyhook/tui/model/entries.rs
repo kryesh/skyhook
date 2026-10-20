@@ -1,31 +1,23 @@
 //! Tab selection and ordered conversation projection, including call/result provenance.
 //!
-//! History is a fold over sources: journal records and unsaved statuses, or jobs on
-//! the Jobs tab. Each source owns a contiguous segment of entries, rebuilt only when
-//! something it was built from changes, so a new record costs its own entries, not
-//! the history's.
+//! History is a fold over sources in place order: the loaded records of the viewed
+//! agent's transcript, unsaved statuses, requests, jobs with the children loaded under
+//! them, and what is not loaded past either end. Each source owns a contiguous segment of
+//! entries, rebuilt only when something it was built from changes, so a new record
+//! costs its own entries, not the history's.
+mod build;
+
 use crate::tui::app::OutputStore;
 
-use super::jobs::{call_entry, job_entry};
-use super::live::{
-    ReasoningStatus, block_key, live_tail, live_tail_responses, reasoning_entries, response_entries,
-};
-use super::notifications::job_event_entries;
-use super::requests::{request_entry, request_timing};
-use super::{
-    Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Timing, Title,
-    UnsavedStatus, number, pretty, span,
-};
+use super::changes::Changes;
+use super::live::{live_tail, live_tail_responses};
+use super::window::{Content, Window};
+use super::{Entry, EntryKey, EntryView, Focus, Gap, Projection, Surface, Tab, UnsavedStatus};
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
-use skyhook::job::JobEnvelope;
-use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
-use skyhook::session::{
-    CompactionTrigger, EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestSeq,
-    SessionEvent, UserPart,
-};
+use skyhook::job::{JobEnvelope, JobRole};
+use skyhook::session::{MessageSeq, RecordSeq, RequestRecord, RequestSeq, SessionEvent};
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,18 +41,39 @@ pub enum Dep {
     Entry(EntryKey),
 }
 
-/// Declaration order is sort order: an unsaved status sorts before the records
-/// that follow its anchor, and one with no anchor before them all.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// What a segment is built from. Sources sort by place: transcript entries by
+/// ordinal, unsaved statuses before the entries after their anchor, and a parent's
+/// children after it, then its next page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Source {
+    /// What lies before the first entry a list loaded.
+    Earlier,
     Unsaved(usize),
-    Record(RecordSeq),
+    /// A transcript entry by ordinal.
+    Transcript(u64),
+    Request(RequestSeq),
     Job(JobId),
+    /// A parent's children after those loaded.
+    More(JobId),
+    /// What lies after the last entry a list loaded.
+    Later,
 }
 
-/// Where a source's segment sorts: its parent job's place, then its own source, so
-/// a script's children sit directly under it even while scripts run in parallel.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+impl Source {
+    /// What the window has not loaded at this source.
+    fn gap(self) -> Option<Gap> {
+        match self {
+            Self::Earlier => Some(Gap::Earlier),
+            Self::More(parent) => Some(Gap::More(parent)),
+            Self::Later => Some(Gap::Later),
+            _ => None,
+        }
+    }
+}
+
+/// Where a source's segment sorts: its parent's place, then its own source, so a
+/// script's children sit directly under it even while scripts run in parallel.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Place(Vec<Source>);
 impl Place {
     fn under(parent: Option<&Self>, source: Source) -> Self {
@@ -76,23 +89,34 @@ impl Place {
     fn depth(&self) -> usize {
         self.0.len() - 1
     }
+
+    /// The cells a card at this place is indented by.
+    fn indent(&self) -> u16 {
+        (self.depth().min(MAX_NESTING) * NEST_INDENT) as u16
+    }
+
+    /// The tab's own entry this place belongs to, which anchors the view.
+    fn focus(&self) -> Option<Focus> {
+        match *self.0.first()? {
+            Source::Transcript(ordinal) => Some(Focus::Ordinal(ordinal)),
+            Source::Request(request) => Some(Focus::Request(request)),
+            Source::Job(job) => Some(Focus::Job(job)),
+            _ => None,
+        }
+    }
 }
 
 struct Segment {
     place: Place,
     start: usize,
     len: usize,
+    /// What it was built from.
+    deps: Vec<Dep>,
 }
 
 /// Job cards indent this many cells per level, up to `MAX_NESTING` levels.
 const NEST_INDENT: usize = 2;
 const MAX_NESTING: usize = 8;
-
-/// A job card's place and tool group, kept so its children can inherit them.
-struct Placed {
-    place: Place,
-    group: ToolGroup,
-}
 
 /// One source's entries, their tool groups, and what they were built from.
 #[derive(Default)]
@@ -112,40 +136,109 @@ impl Built {
 /// Everything history is built from.
 #[derive(Clone, Copy)]
 pub struct Inputs<'a> {
-    pub snapshot: &'a ObservationSnapshot,
+    pub live: &'a ObservationSnapshot,
+    pub window: &'a Window,
     pub projection: &'a Projection,
     pub presentation: EntryView<'a>,
     pub outputs: &'a OutputStore,
     pub unsaved: &'a [UnsavedStatus],
 }
 
-/// What an update changed: entries replaced in place, and the first entry from
-/// which later entries moved.
-#[derive(Default)]
-pub struct Changed {
-    pub dirty: Vec<usize>,
-    pub shifted: Option<usize>,
-}
-impl Changed {
-    fn shift(&mut self, from: usize) {
-        self.shifted = Some(self.shifted.map_or(from, |shifted| shifted.min(from)));
+impl<'a> Inputs<'a> {
+    /// `request` as the session reads it: each agent's newest as the live slice holds
+    /// it, which a session that stopped settles; any other as the window has it.
+    pub fn request(&self, request: RequestSeq) -> Option<&'a RequestRecord> {
+        (self.live.requests.get(request)).or_else(|| self.window.request(request))
+    }
+
+    /// A job as the session last showed it.
+    pub fn job(&self, job: &JobId) -> Option<&'a JobEnvelope> {
+        self.projection.job(self.live, Some(self.window), job)
+    }
+
+    /// Every source the window holds for the viewed tab, in place order.
+    fn places(&self) -> Vec<Place> {
+        let mut places = Vec::new();
+        let content = &self.window.content;
+        let (earlier, later) = content.ends();
+        places.extend(earlier.then(|| Place::under(None, Source::Earlier)));
+        places.extend(later.then(|| Place::under(None, Source::Later)));
+        match content {
+            Content::Conversation(transcript) => {
+                for (ordinal, record) in transcript.records() {
+                    let place = Place::under(None, Source::Transcript(ordinal));
+                    places.push(place.clone());
+                    if let SessionEvent::JobCreated { job, .. } = &record.event {
+                        self.children(&place, *job, &mut places);
+                    }
+                }
+                // A status shows where its anchor is loaded.
+                let agent = self.presentation.agent;
+                let unsaved = self.unsaved.iter().enumerate();
+                let unsaved = unsaved.filter(|(_, status)| {
+                    &status.agent == agent
+                        && status
+                            .after
+                            .map_or(!earlier, |after| transcript.record(after).is_some())
+                });
+                places.extend(unsaved.map(|(index, status)| {
+                    let anchor =
+                        (status.after).map(|after| Place::under(None, Source::Transcript(after)));
+                    Place::under(anchor.as_ref(), Source::Unsaved(index))
+                }));
+            }
+            Content::Requests(list) => {
+                let requests = list.keys.iter();
+                places
+                    .extend(requests.map(|request| Place::under(None, Source::Request(*request))));
+            }
+            Content::Jobs(list) => {
+                for job in &list.keys {
+                    let place = Place::under(None, Source::Job(*job));
+                    places.push(place.clone());
+                    self.children(&place, *job, &mut places);
+                }
+            }
+        }
+        places.sort_unstable();
+        places.dedup();
+        places
+    }
+
+    /// The places of `job`'s loaded children under `parent`, and theirs, then of what
+    /// is left to load of them: a script's whose children were not read yet included.
+    fn children(&self, parent: &Place, job: JobId, places: &mut Vec<Place>) {
+        let Some(children) = self.window.children.get(&job) else {
+            let script = self
+                .job(&job)
+                .is_some_and(|job| job.role == JobRole::Script);
+            places.extend(script.then(|| Place::under(Some(parent), Source::More(job))));
+            return;
+        };
+        for child in &children.keys {
+            let place = Place::under(Some(parent), Source::Job(*child));
+            places.push(place.clone());
+            if place.depth() < 2 * MAX_NESTING {
+                self.children(&place, *child, places);
+            }
+        }
+        if children.later {
+            places.push(Place::under(Some(parent), Source::More(job)));
+        }
     }
 }
 
 /// Retained history for one agent and tab.
 #[derive(Default)]
 pub struct History {
-    /// How many of the agent's records have been folded.
-    folded: usize,
-    /// How many unsaved statuses, of every agent, have been folded.
-    unsaved: usize,
     segments: Vec<Segment>,
     index: HashMap<Source, usize>,
     deps: HashMap<Dep, Vec<Source>>,
     /// Each entry's tool group, for the spacing between siblings.
     groups: Vec<Option<ToolGroup>>,
-    /// Each job card's place and group.
-    jobs: HashMap<JobId, Placed>,
+    /// The window shape and how many unsaved statuses there were when the places
+    /// were last read.
+    shape: Option<(u64, usize)>,
 }
 
 impl History {
@@ -155,224 +248,227 @@ impl History {
 
     /// A fresh history and its entries.
     pub fn build(inputs: Inputs<'_>) -> (Self, Vec<Entry>) {
-        let mut history = Self::default();
+        let mut history = Self {
+            shape: Some((inputs.window.shape, inputs.unsaved.len())),
+            ..Self::default()
+        };
         let mut entries = Vec::new();
-        let candidates = inputs.snapshot.jobs.keys().copied().collect();
-        // Every record is folded before any segment is built: a call's segment
-        // shows the result that arrives after it.
-        let places = history.fold(inputs, candidates);
-        for place in places {
-            history.insert(place, inputs, &mut entries, &mut Changed::default());
+        for place in inputs.places() {
+            let built = build::source(&place, inputs);
+            history.push(place, built, &mut entries);
         }
+        let all = 0..entries.len();
+        history.compact(inputs, &mut entries, all, &mut Changes::default());
         (history, entries)
     }
 
-    /// Fold the agent's new records and rebuild what `changed` names. `entries` holds
-    /// exactly this history's entries.
+    /// Bring the places up to the window's and rebuild what `changed` names, reporting
+    /// to `changes`. `entries` holds exactly this history's entries.
     pub fn update(
         &mut self,
         inputs: Inputs<'_>,
         entries: &mut Vec<Entry>,
         changed: HashSet<Dep>,
-    ) -> Changed {
-        let candidates = changed
-            .iter()
-            .filter_map(|dep| match dep {
-                Dep::Job(job) => Some(*job),
-                _ => None,
-            })
-            .collect();
-        let places = self.fold(inputs, candidates);
-        let mut result = Changed::default();
-        let mut positions: Vec<_> = changed
+        changes: &mut Changes,
+    ) {
+        let shape = (inputs.window.shape, inputs.unsaved.len());
+        let reshaped = self.shape != Some(shape);
+        let mut rebuilt: Vec<_> = changed
             .iter()
             .filter_map(|dep| self.deps.get(dep))
             .flatten()
             .filter_map(|source| self.index.get(source).copied())
             .collect();
-        positions.sort_unstable();
-        positions.dedup();
-        for position in positions {
-            self.rebuild(position, inputs, entries, &mut result);
-        }
-        for place in places {
-            self.insert(place, inputs, entries, &mut result);
-        }
-        result
+        rebuilt.sort_unstable();
+        rebuilt.dedup();
+        let places = reshaped.then(|| inputs.places());
+        self.shape = Some(shape);
+        self.apply(inputs, entries, rebuilt, places, changes);
     }
 
-    /// Places of new sources: the agent's unfolded records and unsaved statuses, or
-    /// its jobs among `candidates` on the Jobs tab.
-    fn fold(&mut self, inputs: Inputs<'_>, candidates: Vec<JobId>) -> Vec<Place> {
-        let Inputs {
-            snapshot,
-            projection,
-            presentation,
-            ..
-        } = inputs;
-        let agent = presentation.agent;
-        if presentation.tab == Tab::Jobs {
-            let mut jobs: Vec<_> = candidates
-                .into_iter()
-                .filter(|job| !self.index.contains_key(&Source::Job(*job)))
-                .filter_map(|job| snapshot.jobs.get(&job))
-                .filter(|job| &job.agent == agent)
-                .collect();
-            // IDs follow creation, so a script is placed before its children.
-            jobs.sort_unstable_by_key(|job| job.id);
-            return jobs
-                .into_iter()
-                .map(|job| self.place_job(Source::Job(job.id), job, None))
-                .collect();
-        }
-        let records = projection.records_by_agent.get(agent);
-        let records = records.map_or(&[][..], Vec::as_slice);
-        let new = &records[self.folded.min(records.len())..];
-        self.folded = records.len();
-        let mut places = Vec::new();
-        for record in new
-            .iter()
-            .filter_map(|sequence| snapshot.records.get(sequence))
-        {
-            let source = Source::Record(record.sequence);
-            if presentation.tab == Tab::Requests
-                && !matches!(record.event, SessionEvent::ModelRequested { .. })
-            {
+    /// Rebuild the segments at `rebuilt`, and when `places` is given, take its places:
+    /// a rebuilt segment that keeps its length is replaced in place; the rest merge in
+    /// one pass from the first segment that moves.
+    fn apply(
+        &mut self,
+        inputs: Inputs<'_>,
+        entries: &mut Vec<Entry>,
+        rebuilt: Vec<usize>,
+        places: Option<Vec<Place>>,
+        changes: &mut Changes,
+    ) {
+        let mut touched = Vec::new();
+        let mut resized = HashMap::new();
+        for position in rebuilt {
+            let place = self.segments[position].place.clone();
+            let built = build::source(&place, inputs);
+            let segment = &mut self.segments[position];
+            let (start, len) = (segment.start, segment.len);
+            touched.push(place.source());
+            if built.entries.len() != len {
+                resized.insert(position, built);
                 continue;
             }
-            let job = match &record.event {
-                SessionEvent::JobCreated { job, origin, .. }
-                    if presentation.tab == Tab::Conversation =>
-                {
-                    snapshot.jobs.get(job).map(|job| (job, origin))
+            self.register(position, built.deps);
+            let old = entries[start..start + len].iter_mut();
+            for (offset, (old, mut new)) in old.zip(built.entries).enumerate() {
+                // Compaction below decides this from the neighbours as they end up.
+                new.compact_after = old.compact_after;
+                if *old != new {
+                    *old = new;
+                    changes.changed(start + offset);
                 }
-                _ => None,
-            };
-            places.push(match job {
-                Some((job, origin)) => {
-                    let origin = origin.as_ref().map(|origin| origin.message);
-                    self.place_job(source, job, origin)
-                }
-                None => Place::under(None, source),
-            });
-        }
-        if presentation.tab == Tab::Conversation {
-            let new = inputs.unsaved.iter().enumerate().skip(self.unsaved);
-            let new = new.filter(|(_, status)| &status.agent == agent);
-            places.extend(new.map(|(index, status)| {
-                let anchor = status
-                    .after
-                    .map(|after| Place::under(None, Source::Record(after)));
-                Place::under(anchor.as_ref(), Source::Unsaved(index))
-            }));
-            self.unsaved = inputs.unsaved.len();
-        }
-        places
-    }
-
-    /// A child job follows its parent and shares its tool group, so children sit
-    /// tight under their script and the script's block against its siblings.
-    /// Other jobs group with the response that called them, if any.
-    fn place_job(
-        &mut self,
-        source: Source,
-        job: &JobEnvelope,
-        origin: Option<MessageSeq>,
-    ) -> Place {
-        let parent = job.parent.and_then(|parent| self.jobs.get(&parent));
-        let group = parent.map_or_else(
-            || origin.map_or(ToolGroup::Job(job.id), ToolGroup::Response),
-            |parent| parent.group,
-        );
-        let place = Place::under(parent.map(|parent| &parent.place), source);
-        let placed = Placed {
-            place: place.clone(),
-            group,
-        };
-        self.jobs.insert(job.id, placed);
-        place
-    }
-
-    /// Place a new source's segment in place order.
-    fn insert(
-        &mut self,
-        place: Place,
-        inputs: Inputs<'_>,
-        entries: &mut Vec<Entry>,
-        result: &mut Changed,
-    ) {
-        let source = place.source();
-        let position = self
-            .segments
-            .partition_point(|segment| segment.place < place);
-        let start = self
-            .segments
-            .get(position)
-            .map_or(entries.len(), |segment| segment.start);
-        let built = self.build_source(source, inputs);
-        self.register(source, &built.deps);
-        let len = built.entries.len();
-        entries.splice(start..start, built.entries);
-        self.groups.splice(start..start, built.groups);
-        self.segments
-            .insert(position, Segment { place, start, len });
-        for later in &mut self.segments[position + 1..] {
-            later.start += len;
-        }
-        for (offset, segment) in self.segments[position..].iter().enumerate() {
-            self.index.insert(segment.place.source(), position + offset);
-        }
-        if position + 1 < self.segments.len() && len > 0 {
-            result.shift(start);
-        }
-        self.compact(
-            inputs,
-            entries,
-            start.saturating_sub(1)..start + len,
-            result,
-        );
-    }
-
-    fn rebuild(
-        &mut self,
-        position: usize,
-        inputs: Inputs<'_>,
-        entries: &mut Vec<Entry>,
-        result: &mut Changed,
-    ) {
-        let segment = &self.segments[position];
-        let (source, start, len) = (segment.place.source(), segment.start, segment.len);
-        let built = self.build_source(source, inputs);
-        self.register(source, &built.deps);
-        let new_len = built.entries.len();
-        let old: Vec<_> = entries.splice(start..start + len, built.entries).collect();
-        self.groups.splice(start..start + len, built.groups);
-        self.compact(
-            inputs,
-            entries,
-            start.saturating_sub(1)..start + new_len,
-            result,
-        );
-        if new_len == len {
-            let changed = old.iter().zip(&entries[start..]).enumerate();
-            let changed = changed.filter(|(_, (old, new))| old != new);
-            result
-                .dirty
-                .extend(changed.map(|(offset, _)| start + offset));
-        } else {
-            self.segments[position].len = new_len;
-            for later in &mut self.segments[position + 1..] {
-                later.start = later.start - len + new_len;
             }
-            result.shift(start);
+            self.groups[start..start + len].copy_from_slice(&built.groups);
+        }
+        // The first segment whose place the window no longer holds there.
+        let moved = places.as_ref().map(|places| {
+            let same = self.segments.iter().zip(places);
+            let same = same
+                .take_while(|(segment, place)| segment.place == **place)
+                .count();
+            (same < self.segments.len().max(places.len())).then_some(same)
+        });
+        let from = resized.keys().copied().chain(moved.flatten()).min();
+        if let Some(from) = from {
+            let places =
+                places.unwrap_or_else(|| self.segments.iter().map(|s| s.place.clone()).collect());
+            let new = places[from.min(places.len())..].to_vec();
+            touched.extend(new.iter().map(Place::source));
+            // The entry before one removed may no longer sit tight against what follows.
+            for at in self.merge(from, new, resized, inputs, entries, changes) {
+                self.compact(inputs, entries, at.saturating_sub(1)..at, changes);
+            }
+        }
+        for source in touched {
+            if let Some(segment) = self.index.get(&source).map(|index| &self.segments[*index]) {
+                let range = segment.start.saturating_sub(1)..segment.start + segment.len;
+                self.compact(inputs, entries, range, changes);
+            }
         }
     }
 
-    fn register(&mut self, source: Source, deps: &[Dep]) {
-        for dep in deps {
+    /// Lay the segments from position `from` out again as `places` lists them, with
+    /// `resized` rebuilt to another length, moving those kept and dropping the rest.
+    /// Returns where entries were dropped.
+    fn merge(
+        &mut self,
+        from: usize,
+        places: Vec<Place>,
+        mut resized: HashMap<usize, Built>,
+        inputs: Inputs<'_>,
+        entries: &mut Vec<Entry>,
+        changes: &mut Changes,
+    ) -> Vec<usize> {
+        let mut dropped = Vec::new();
+        let start = self.segments.get(from).map_or(entries.len(), |s| s.start);
+        let mut moved_entries = entries.split_off(start).into_iter();
+        let mut moved_groups = self.groups.split_off(start).into_iter();
+        let old = self.segments.split_off(from);
+        for segment in &old {
+            self.index.remove(&segment.place.source());
+        }
+        let mut old = (from..).zip(old).peekable();
+        let mut places = places.into_iter().peekable();
+        loop {
+            // Old segments before the next place are gone; one at it is kept.
+            let step = match (places.peek(), old.peek()) {
+                (None, None) => break dropped,
+                (Some(place), Some((_, segment))) => place.cmp(&segment.place),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+            };
+            let at = entries.len();
+            match step {
+                std::cmp::Ordering::Greater => {
+                    let (_, segment) = old.next().expect("peeked");
+                    moved_entries.by_ref().take(segment.len).for_each(drop);
+                    moved_groups.by_ref().take(segment.len).for_each(drop);
+                    self.unregister(&segment);
+                    changes.splice(at, segment.len, 0);
+                    dropped.push(at);
+                }
+                std::cmp::Ordering::Less => {
+                    let place = places.next().expect("peeked");
+                    let built = build::source(&place, inputs);
+                    changes.splice(at, 0, built.entries.len());
+                    self.push(place, built, entries);
+                }
+                std::cmp::Ordering::Equal => {
+                    let (position, segment) = old.next().expect("peeked");
+                    let place = places.next().expect("peeked");
+                    let old_entries = moved_entries.by_ref().take(segment.len);
+                    let old_groups = moved_groups.by_ref().take(segment.len);
+                    match resized.remove(&position) {
+                        Some(built) => {
+                            old_entries.for_each(drop);
+                            old_groups.for_each(drop);
+                            self.unregister(&segment);
+                            changes.splice(at, segment.len, built.entries.len());
+                            self.push(place, built, entries);
+                        }
+                        None => {
+                            entries.extend(old_entries);
+                            self.groups.extend(old_groups);
+                            self.index.insert(place.source(), self.segments.len());
+                            self.segments.push(Segment {
+                                start: at,
+                                ..segment
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append a segment built for `place`.
+    fn push(&mut self, place: Place, built: Built, entries: &mut Vec<Entry>) {
+        let (start, len) = (entries.len(), built.entries.len());
+        entries.extend(built.entries);
+        self.groups.extend(built.groups);
+        let position = self.segments.len();
+        self.index.insert(place.source(), position);
+        let source = place.source();
+        for dep in &built.deps {
             let sources = self.deps.entry(dep.clone()).or_default();
             if !sources.contains(&source) {
                 sources.push(source);
+            }
+        }
+        self.segments.push(Segment {
+            place,
+            start,
+            len,
+            deps: built.deps,
+        });
+    }
+
+    /// Register the segment at `position` under `deps` instead of what it had.
+    fn register(&mut self, position: usize, deps: Vec<Dep>) {
+        let segment = std::mem::take(&mut self.segments[position].deps);
+        let source = self.segments[position].place.source();
+        self.forget(source, &segment);
+        for dep in &deps {
+            let sources = self.deps.entry(dep.clone()).or_default();
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+        self.segments[position].deps = deps;
+    }
+
+    fn unregister(&mut self, segment: &Segment) {
+        self.forget(segment.place.source(), &segment.deps);
+    }
+
+    fn forget(&mut self, source: Source, deps: &[Dep]) {
+        for dep in deps {
+            if let Some(sources) = self.deps.get_mut(dep) {
+                sources.retain(|kept| *kept != source);
+                if sources.is_empty() {
+                    self.deps.remove(dep);
+                }
             }
         }
     }
@@ -385,7 +481,7 @@ impl History {
         inputs: Inputs<'_>,
         entries: &mut [Entry],
         range: Range<usize>,
-        result: &mut Changed,
+        changes: &mut Changes,
     ) {
         if inputs.presentation.tab != Tab::Conversation {
             return;
@@ -395,326 +491,35 @@ impl History {
             let compact = self.groups[index].is_some_and(|group| next == Some(group));
             if entries[index].compact_after != compact {
                 entries[index].compact_after = compact;
-                result.dirty.push(index);
+                changes.changed(index);
             }
         }
     }
 
-    /// A job's card, indented under its parents, and its tool group.
-    fn job_card(
-        &self,
-        job: JobId,
-        inputs: Inputs<'_>,
-        built: &mut Built,
-    ) -> Option<(Entry, ToolGroup)> {
-        built.deps.push(Dep::Job(job));
-        let info = inputs.snapshot.jobs.get(&job)?;
-        let placed = self.jobs.get(&job)?;
-        let mut entry = job_entry(info, inputs.projection, inputs.outputs, inputs.presentation);
-        entry.indent = (placed.place.depth().min(MAX_NESTING) * NEST_INDENT) as u16;
-        Some((entry, placed.group))
+    /// The entries the loaded tab's own entry `focus` shows, with those placed under
+    /// it.
+    pub fn place(&self, focus: Focus) -> Option<Range<usize>> {
+        let own = match focus {
+            Focus::Ordinal(ordinal) => Source::Transcript(ordinal),
+            Focus::Request(request) => Source::Request(request),
+            Focus::Job(job) => Source::Job(job),
+        };
+        let position = *self.index.get(&own)?;
+        let first = (self.segments.get(position)).filter(|first| first.place.depth() == 0)?;
+        let under = self.segments[position + 1..].iter();
+        let under = under.take_while(|segment| segment.place.0[0] == own);
+        let end = under
+            .last()
+            .map_or(first.start + first.len, |s| s.start + s.len);
+        Some(first.start..end)
     }
 
-    fn build_source(&self, source: Source, inputs: Inputs<'_>) -> Built {
-        let Inputs {
-            snapshot,
-            presentation,
-            ..
-        } = inputs;
-        let mut built = Built::default();
-        match source {
-            Source::Unsaved(index) => {
-                if let Some(status) = inputs.unsaved.get(index) {
-                    let key = EntryKey::UnsavedStatus(index);
-                    built.push(status_entry(key, &status.message), None);
-                }
-            }
-            Source::Job(job) => {
-                if let Some((mut entry, _)) = self.job_card(job, inputs, &mut built) {
-                    // The Jobs tab is a dense list; conversation grouping owns its
-                    // spacing separately, and expanded documents stay unchanged.
-                    entry.compact_after = true;
-                    built.push(entry, None);
-                }
-            }
-            Source::Record(sequence) => {
-                if let Some(record) = snapshot.records.get(&sequence) {
-                    if presentation.tab == Tab::Requests {
-                        let request = sequence.request();
-                        built.deps.push(Dep::Request(request));
-                        if let Some(record) = snapshot.ledger.get(request) {
-                            built.push(request_entry(request, record, presentation.today), None);
-                        }
-                    } else {
-                        self.conversation(record, inputs, &mut built);
-                    }
-                }
-            }
-        }
-        built
-    }
-
-    fn conversation(&self, record: &EventRecord, inputs: Inputs<'_>, built: &mut Built) {
-        let Inputs {
-            snapshot,
-            projection,
-            presentation,
-            ..
-        } = inputs;
-        let EntryView {
-            agent,
-            view,
-            all_details,
-            ..
-        } = presentation;
-        let agent_name = projection.agent_name(agent);
-        let key = EntryKey::Record(record.sequence);
-        match &record.event {
-            SessionEvent::ModelRequested { .. } => {
-                let request = record.sequence.request();
-                built.deps.push(Dep::Request(request));
-                if let Some(entry) = super::retry::retry_entry(snapshot, agent, request) {
-                    built.push(entry, None);
-                }
-                // A settled response no commit replaced (an interrupted attempt)
-                // stays at its journal position; a failure's is part of its card.
-                if let Some(requested) = snapshot.ledger.get(request)
-                    && requested.phase.settled_in_place()
-                    && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
-                    && response.settlement().is_some()
-                {
-                    let since = requested.requested_millis;
-                    for entry in response_entries(request, response, view, agent_name, since) {
-                        built.push(entry, None);
-                    }
-                }
-            }
-            SessionEvent::MessageCommitted { message } => match message {
-                Message::User(blocks) => {
-                    for (i, block) in blocks.iter().enumerate() {
-                        let (title, text, surface) = match block {
-                            UserPart::Text { text } => (
-                                if agent.path().is_empty() {
-                                    "You"
-                                } else {
-                                    "Parent"
-                                },
-                                text.clone(),
-                                Surface::User,
-                            ),
-                            UserPart::ParentInput { text } => {
-                                ("Parent", text.clone(), Surface::User)
-                            }
-                            UserPart::Attachment { attachment } => {
-                                ("Attachment", pretty(attachment), Surface::User)
-                            }
-                            UserPart::JobEvents { events } => {
-                                built.deps.extend(events.iter().filter_map(|event| {
-                                    match event {
-                                        JobEvent::Message(message) => Some(message.id),
-                                        JobEvent::Job(job) => job.id,
-                                    }
-                                    .map(Dep::Job)
-                                }));
-                                let group = ToolGroup::Notification(record.sequence, i);
-                                let entries = job_event_entries(
-                                    record.sequence,
-                                    i,
-                                    events,
-                                    snapshot,
-                                    view,
-                                    all_details,
-                                );
-                                for entry in entries {
-                                    built.push(entry, Some(group));
-                                }
-                                continue;
-                            }
-                            UserPart::Compaction { text } => {
-                                ("Compaction", text.clone(), Surface::Muted)
-                            }
-                        };
-                        let key = EntryKey::UserBlock {
-                            record: record.sequence,
-                            index: i,
-                        };
-                        let entry = Entry::titled(key, Title::plain(title), text, surface);
-                        built.push(entry, None);
-                    }
-                }
-                Message::Assistant(items) => {
-                    self.assistant(record, items, inputs, built);
-                }
-                // Persisted runtime state is model context, not conversation.
-                Message::State(_) => {}
-                Message::Tool(result) => {
-                    if snapshot.ledger.answered(record.sequence).is_none() {
-                        let result_key = EntryKey::ToolResult(record.sequence);
-                        let open = view.is_expanded(&result_key, all_details);
-                        let call = (result.name.as_str(), None, Some(result));
-                        let entry = call_entry(result_key, call, agent, projection, open);
-                        built.push(entry, None);
-                    }
-                }
-            },
-            SessionEvent::JobCreated { job, .. } => {
-                if let Some((entry, group)) = self.job_card(*job, inputs, built) {
-                    built.push(entry, Some(group));
-                }
-            }
-            SessionEvent::Compaction { checkpoint } => {
-                let open = view.is_expanded(&key, false);
-                let title = match checkpoint.trigger {
-                    CompactionTrigger::Occupancy(tokens) => {
-                        format!("Context compacted at {} tokens", number(tokens))
-                    }
-                    CompactionTrigger::Overflow => {
-                        "Context compacted after it overflowed".to_owned()
-                    }
-                };
-                let body = if open {
-                    format!("Summary and retained sources\n{}", pretty(checkpoint))
-                } else {
-                    String::new()
-                };
-                let title = Title::disclosed(title, open);
-                built.push(Entry::titled(key, title, body, Surface::Muted), None);
-            }
-            SessionEvent::Status { message } => built.push(status_entry(key, message), None),
-            // A failure its request's card reports is not repeated.
-            SessionEvent::AgentFailed { failure }
-                if snapshot.ledger.failed_by(record.sequence).is_none() =>
-            {
-                built.push(super::retry::failure_entry(key, failure), None);
-            }
-            SessionEvent::CompactionFailed { error, .. } => {
-                let text = format!("Compaction failed; previous context retained\n{error}");
-                built.push(Entry::new(key, text, Surface::Error), None);
-            }
-            _ => {}
-        }
-    }
-
-    fn assistant(
-        &self,
-        record: &EventRecord,
-        items: &[AssistantItem],
-        inputs: Inputs<'_>,
-        built: &mut Built,
-    ) {
-        let Inputs {
-            snapshot,
-            projection,
-            presentation,
-            ..
-        } = inputs;
-        let EntryView {
-            agent,
-            view,
-            all_details,
-            ..
-        } = presentation;
-        let agent_name = projection.agent_name(agent);
-        let message = record.sequence.message();
-        let request = snapshot.ledger.request_of(message);
-        built.deps.extend(request.map(Dep::Request));
-        let response = request.map_or(ResponseRef::Message(message), ResponseRef::Request);
-        let footer = request
-            .and_then(|request| snapshot.ledger.get(request))
-            .map(|request| {
-                let mut footer = request.profile.profile.model.as_str().to_owned();
-                // Once the answer settles: how long it took, and its whole turn
-                // when that began with an earlier request.
-                if let Timing::Took { since, until } = request_timing(request) {
-                    let _ = write!(footer, " · {}", span(since, until));
-                    if let Some(&turn) = projection.turn_starts.get(&message)
-                        && turn < since
-                    {
-                        let _ = write!(footer, " · turn {}", span(turn, until));
-                    }
-                }
-                Clean::from(footer)
-            });
-        // The model footer sits under the last visible text of an answer; a working
-        // turn (one with calls) has none.
-        let final_text = (!items.iter().any(|item| item.call().is_some()))
-            .then(|| {
-                items.iter().rev().find_map(|item| match item {
-                    AssistantItem::Text { blocks, .. } => {
-                        blocks.iter().rfind(|block| !block.text.trim().is_empty())
-                    }
-                    _ => None,
-                })
-            })
-            .flatten();
-        for item in items {
-            match item {
-                AssistantItem::Text { id, blocks, .. } => {
-                    for block in blocks.iter().filter(|block| !block.text.trim().is_empty()) {
-                        let block_ref = BlockRef {
-                            item: id.clone(),
-                            block: block.id.clone(),
-                        };
-                        let mut entry = Entry::titled(
-                            block_key(response, &block_ref),
-                            Title::plain(agent_name),
-                            block.text.clone(),
-                            Surface::Agent,
-                        );
-                        if final_text.is_some_and(|last| std::ptr::eq(last, block)) {
-                            entry.footer.clone_from(&footer);
-                        }
-                        built.push(entry, None);
-                    }
-                }
-                AssistantItem::Reasoning { id, blocks, .. } => {
-                    for block in blocks {
-                        let block_ref = BlockRef {
-                            item: id.clone(),
-                            block: block.id.clone(),
-                        };
-                        let status = ReasoningStatus::Complete;
-                        for entry in
-                            reasoning_entries(response, &block_ref, &block.text, view, status)
-                        {
-                            built.push(entry, None);
-                        }
-                    }
-                }
-                AssistantItem::ToolCall { call, .. } => {
-                    let id = call.id().to_owned();
-                    built.deps.push(Dep::Call(message, id.clone()));
-                    // An admitted call is shown by its job's card instead.
-                    let admitted = (agent.clone(), message, id);
-                    if !projection.tool_origins.contains(&admitted) {
-                        let key = EntryKey::ToolCall {
-                            message,
-                            call: admitted.2,
-                        };
-                        let open = view.is_expanded(&key, all_details);
-                        let result = answer(snapshot, message, call.id());
-                        let call = (call.name(), Some(call.arguments()), result);
-                        let entry = call_entry(key, call, agent, projection, open);
-                        built.push(entry, Some(ToolGroup::Response(message)));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The result that answered `call` of the assistant message `message`.
-fn answer<'a>(
-    snapshot: &'a ObservationSnapshot,
-    message: MessageSeq,
-    call: &str,
-) -> Option<&'a ToolResult> {
-    let record = snapshot.ledger.result_of(message, call)?;
-    match &snapshot.records.get(&record)?.event {
-        SessionEvent::MessageCommitted {
-            message: Message::Tool(result),
-        } => Some(result),
-        _ => None,
+    /// The tab's own entry the entry at `index` belongs to.
+    pub fn place_of(&self, index: usize) -> Option<Focus> {
+        let at = self
+            .segments
+            .partition_point(|segment| segment.start + segment.len <= index);
+        self.segments.get(at)?.place.focus()
     }
 }
 
@@ -723,77 +528,40 @@ pub(super) fn status_entry(key: EntryKey, message: &dyn std::fmt::Display) -> En
 }
 
 /// Shared by retained UI content and fresh export construction.
-pub fn entries(
-    snapshot: &ObservationSnapshot,
-    projection: &Projection,
-    presentation: EntryView<'_>,
-    outputs: &OutputStore,
-    unsaved: &[UnsavedStatus],
-    include_live: bool,
-) -> Vec<Entry> {
-    let inputs = Inputs {
-        snapshot,
-        projection,
-        presentation,
-        outputs,
-        unsaved,
-    };
+pub fn entries(inputs: Inputs<'_>, include_live: bool) -> Vec<Entry> {
     let (_, mut entries) = History::build(inputs);
-    if include_live && presentation.tab == Tab::Conversation {
-        let requests = live_tail_responses(snapshot, presentation.agent);
-        live_tail(snapshot, projection, presentation, requests, &mut entries);
+    if include_live && inputs.presentation.tab == Tab::Conversation {
+        let requests = live_tail_responses(inputs, inputs.presentation.agent);
+        live_tail(inputs, requests, &mut entries);
     }
     entries
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::View;
     use super::super::tests::{replay, update};
     use super::*;
     use crate::tests::bounded;
-    use crate::tui::app::played::{
-        answered, ask, at, call, committed, count, exchange, failing_call, latest_request,
-        model_failed, observe_until, played_fixture, recorded, requested, results, stopped,
-        streamed,
+    use crate::tui::app::{
+        App,
+        played::{
+            answered, ask, at, call, committed, completed, count, exchange, failing_call,
+            latest_request, model_failed, observe_until, played_fixture, recorded, requested,
+            results, stopped, streamed,
+        },
+        tests::{journal, whole_entries},
     };
     use serde_json::json;
     use skyhook::agent::RuntimeEvent;
-    use skyhook::identity::AgentId;
     use skyhook::provider::ProviderErrorKind;
     use skyhook::provider::protocol::{AssistantItem, Completion, CutReason, ItemKind};
     use skyhook::session::AttemptFailure;
-
-    fn render(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
-        let projection = Projection::new(snapshot);
-        let (view, outputs) = (View::default(), OutputStore::default());
-        let view = EntryView {
-            agent,
-            tab: Tab::Conversation,
-            view: &view,
-            all_details: details,
-            today: Default::default(),
-        };
-        entries(snapshot, &projection, view, &outputs, &[], true)
-    }
-
-    /// `snapshot` replayed with each record `sequence` seconds past the epoch.
-    fn stamped(snapshot: &ObservationSnapshot) -> ObservationSnapshot {
-        let mut stamped = ObservationSnapshot::default();
-        for record in snapshot.records.values() {
-            let mut record = record.clone();
-            record.timestamp_millis = record.sequence.get() as i64 * 1000;
-            update(&mut stamped, RuntimeEvent::Record(Box::new(record)));
-        }
-        stamped
-    }
 
     /// An answer's footer times its response, and the turn when a tool round began
     /// it; an answer that is a turn of its own shows only its response.
     #[tokio::test]
     async fn answer_footers_time_their_response_and_a_longer_turn() {
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let first = ask(&session, "first");
         let exec = call("call", "exec", json!({"command": ["true"]}), 0);
         model.turn().await.end(vec![exec]);
@@ -801,23 +569,26 @@ mod tests {
         bounded(first).await.unwrap().unwrap();
         let answer = vec![AssistantItem::text("text", 0, "done")];
         exchange(&mut app, &mut model, "second", answer).await;
-        observe_until(&mut app, |app| count(&app.snapshot, answered) == 2).await;
-        let snapshot = stamped(&app.snapshot);
-        let seconds = |since: i64, until: i64| format!("{:.1}s", (until - since) as f64 / 1000.0);
-        let response = seconds(at(&snapshot, requested, 1), at(&snapshot, answered, 0));
-        let turn = seconds(at(&snapshot, requested, 0), at(&snapshot, answered, 0));
-        let alone = seconds(at(&snapshot, requested, 2), at(&snapshot, answered, 1));
-        let footers: Vec<_> = render(&snapshot, &agent, false)
-            .into_iter()
-            .filter_map(|entry| entry.footer.as_deref().map(str::to_owned))
-            .collect();
-        assert_eq!(
-            footers,
-            [
-                format!("fixture · {response} · turn {turn}"),
-                format!("fixture · {alone}")
-            ]
-        );
+        observe_until(&mut app, |app| count(&app.journal, answered) == 2).await;
+        let records = journal(&session).await;
+        let seconds = super::super::span;
+        let response = seconds(at(&records, requested, 1), at(&records, completed, 1));
+        let turn = seconds(at(&records, requested, 0), at(&records, completed, 1));
+        let alone = seconds(at(&records, requested, 2), at(&records, completed, 2));
+        let footers = |entries: &[Entry]| -> Vec<_> {
+            let footers = entries.iter().filter_map(|entry| entry.footer.as_deref());
+            footers.map(str::to_owned).collect()
+        };
+        // The tool round between the turn's requests ran a process.
+        assert!(at(&records, requested, 0) < at(&records, requested, 1));
+        let expected = [
+            format!("fixture · {response} · turn {turn}"),
+            format!("fixture · {alone}"),
+        ];
+        assert_eq!(footers(&whole_entries(&mut app, false).await), expected);
+        // As the updates showed them.
+        app.rebuild_content();
+        assert_eq!(footers(app.entries()), expected);
     }
 
     /// A tool card follows its job by the job's exact call, so a call ID reused
@@ -826,24 +597,21 @@ mod tests {
     #[tokio::test]
     async fn admitted_results_use_exact_job_provenance() {
         let (_root, mut app, mut model, _session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let asked = ask(app.session().unwrap(), "run");
         let admitted = call("reused", "exec", json!({"command": ["true"]}), 0);
         model.turn().await.end(vec![admitted]);
         model.turn().await.end(vec![failing_call("reused")]);
         model.turn().await.answer("done");
         bounded(asked).await.unwrap().unwrap();
-        observe_until(&mut app, |app| {
-            count(&app.snapshot, committed(results)) == 2
-        })
-        .await;
-        let job = (app.snapshot.records.values())
+        observe_until(&mut app, |app| count(&app.journal, committed(results)) == 2).await;
+        let job = (app.journal.iter())
             .find_map(|record| match &record.event {
                 SessionEvent::JobCreated { job, .. } => Some(*job),
                 _ => None,
             })
             .unwrap();
-        let cards: Vec<_> = render(&app.snapshot, &agent, false)
+        let cards: Vec<_> = whole_entries(&mut app, false)
+            .await
             .into_iter()
             .filter(|card| card.surface == Surface::Tool)
             .collect();
@@ -860,7 +628,6 @@ mod tests {
     #[tokio::test]
     async fn whitespace_only_turns_neither_create_agent_cards_nor_steal_the_answer_footer() {
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let _asked = ask(&session, "look");
         let reasoning = "Inspect the repository.";
         let whitespace = ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"];
@@ -877,9 +644,9 @@ mod tests {
             AssistantItem::text("answer", 0, answer),
             AssistantItem::text("separator", 1, "\n\n"),
         ]);
-        observe_until(&mut app, |app| recorded(&app.snapshot, answered)).await;
+        observe_until(&mut app, |app| recorded(&app.journal, answered)).await;
 
-        let cards = render(&app.snapshot, &agent, true);
+        let cards = whole_entries(&mut app, true).await;
         let surfaced = |surface, text| {
             let cards = cards.iter();
             cards
@@ -888,7 +655,7 @@ mod tests {
         };
         assert_eq!(surfaced(Surface::Reasoning, reasoning), whitespace.len());
         assert_eq!(surfaced(Surface::Tool, "read"), whitespace.len());
-        let cards = render(&app.snapshot, &agent, false);
+        let cards = whole_entries(&mut app, false).await;
         let answers: Vec<_> = cards
             .iter()
             .filter(|card| card.surface == Surface::Agent)
@@ -905,26 +672,21 @@ mod tests {
         // failure would restore the silent-failure UX this classification exists
         // to prevent.
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let asked = ask(&session, "question");
         let refusal = Completion::cut(Vec::new(), CutReason::Refusal).unwrap();
         model.turn().await.complete(refusal);
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 1).await;
-        let refused_request = latest_request(&app.snapshot).unwrap();
-        let detail = app
-            .snapshot
-            .records
-            .values()
-            .find_map(|record| match &record.event {
-                SessionEvent::ModelFailed {
-                    failure: AttemptFailure::Final(skyhook::agent::Failure::Refused(detail)),
-                    ..
-                } => Some(detail.clone()),
-                _ => None,
-            });
+        observe_until(&mut app, |app| count(&app.journal, model_failed) == 1).await;
+        let refused_request = latest_request(&app.journal).unwrap();
+        let detail = (app.journal.iter()).find_map(|record| match &record.event {
+            SessionEvent::ModelFailed {
+                failure: AttemptFailure::Final(skyhook::agent::Failure::Refused(detail)),
+                ..
+            } => Some(detail.clone()),
+            _ => None,
+        });
         let detail = detail.expect("a refusal is journaled as one");
-        let entries = render(&app.snapshot, &agent, false);
+        let entries = whole_entries(&mut app, false).await;
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(refused_request))
@@ -937,14 +699,13 @@ mod tests {
         assert_eq!(lines.next(), None);
         // An ordinary failure keeps the muted presentation and gains no hint.
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let asked = ask(&session, "question");
         let rejected = ProviderErrorKind::Protocol.error("rejected");
         model.turn().await.fail(rejected);
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 1).await;
-        let failed_request = latest_request(&app.snapshot).unwrap();
-        let entries = render(&app.snapshot, &agent, false);
+        observe_until(&mut app, |app| count(&app.journal, model_failed) == 1).await;
+        let failed_request = latest_request(&app.journal).unwrap();
+        let entries = whole_entries(&mut app, false).await;
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(failed_request))
@@ -956,16 +717,25 @@ mod tests {
         );
     }
 
+    /// A partial attempt shows where it settled until its agent's next turn begins,
+    /// which lets go of it as a reopen does; the current stream stays last.
     #[tokio::test]
-    async fn partial_attempts_stay_before_retry_and_followup_while_current_stream_stays_last() {
+    async fn partial_attempts_show_until_the_next_turn_while_the_current_stream_stays_last() {
         let (_root, mut app, mut model, session) = played_fixture().await;
         let agent = app.root_agent().clone();
+        let shown = async |app: &mut App| {
+            let entries = whole_entries(app, false).await;
+            let text = entries.iter().map(Entry::text).collect::<Vec<_>>();
+            (text.join("\n"), entries)
+        };
         let asked = ask(&session, "first");
         let turn = model.turn().await;
         turn.delta("text", ItemKind::Text, "failed partial");
         observe_until(&mut app, |app| streamed(&app.snapshot, "failed partial")).await;
         turn.fail(ProviderErrorKind::Protocol.error("stream lost"));
         let _ = bounded(asked).await.unwrap();
+        observe_until(&mut app, |app| count(&app.journal, model_failed) == 1).await;
+        assert_eq!(shown(&mut app).await.0.matches("failed partial").count(), 1);
         let continued = tokio::spawn({
             let session = session.clone();
             async move { session.continue_turn().await }
@@ -983,36 +753,12 @@ mod tests {
         session.interrupt().await;
         let _ = bounded(asked).await.unwrap();
         observe_until(&mut app, |app| stopped(&app.snapshot, &agent)).await;
-        let _continued = tokio::spawn(async move { session.continue_turn().await });
-        let turn = model.turn().await;
-        turn.delta("text", ItemKind::Text, "current stream");
-        observe_until(&mut app, |app| streamed(&app.snapshot, "current stream")).await;
-        // A child's stream on the same request never shows in its parent's conversation.
-        let child = RuntimeEvent::ResponseEvent {
-            agent: agent.child(1),
-            request: latest_request(&app.snapshot).unwrap(),
-            event: skyhook::provider::protocol::ResponseEvent::Delta {
-                block: skyhook::provider::protocol::BlockRef::single("text"),
-                kind: ItemKind::Text,
-                text: "child only".into(),
-            },
-        };
-        update(&mut app.snapshot, child);
-
-        let entries = render(&app.snapshot, &agent, false);
-        let text = entries
-            .iter()
-            .map(Entry::text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (text, _) = shown(&mut app).await;
         let order = [
-            "failed partial",
             "successful retry",
             "new followup",
-            "Interrupted · attempt 1",
             "interrupted thinking",
             "Incomplete response\ninterrupted partial",
-            "current stream",
         ];
         for pair in order.windows(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -1021,8 +767,24 @@ mod tests {
                 "{a} must precede {b}: {text}"
             );
         }
-        assert_eq!(text.matches("failed partial").count(), 1);
-        assert_eq!(text.matches("interrupted partial").count(), 1);
+        assert!(!text.contains("failed partial"), "{text}");
+        let _continued = tokio::spawn(async move { session.continue_turn().await });
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, "current stream");
+        observe_until(&mut app, |app| streamed(&app.snapshot, "current stream")).await;
+        // A child's stream on the same request never shows in its parent's conversation.
+        let child = RuntimeEvent::ResponseEvent {
+            agent: agent.child(1),
+            request: latest_request(&app.journal).unwrap(),
+            event: skyhook::provider::protocol::ResponseEvent::Delta {
+                block: skyhook::provider::protocol::BlockRef::single("text"),
+                kind: ItemKind::Text,
+                text: "child only".into(),
+            },
+        };
+        update(&mut app.snapshot, child);
+        let (text, entries) = shown(&mut app).await;
+        assert!(!text.contains("interrupted partial"), "{text}");
         assert!(!text.contains("child only"));
         let last = entries
             .iter()
@@ -1034,7 +796,6 @@ mod tests {
     #[tokio::test]
     async fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
         let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let _asked = ask(&session, "question");
         let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
         let overloaded = ProviderErrorKind::Unavailable.error(error.clone());
@@ -1048,9 +809,9 @@ mod tests {
                 }
             )
         };
-        observe_until(&mut app, |app| recorded(&app.snapshot, scheduled)).await;
-        let request = latest_request(&app.snapshot).unwrap();
-        let cards = render(&app.snapshot, &agent, false);
+        observe_until(&mut app, |app| recorded(&app.journal, scheduled)).await;
+        let request = latest_request(&app.journal).unwrap();
+        let cards = whole_entries(&mut app, false).await;
         let mut retries = cards
             .iter()
             .filter(|card| card.key() == &EntryKey::Retry(request));
@@ -1064,12 +825,12 @@ mod tests {
                 failure: AttemptFailure::Retrying { message, .. }, ..
             } if *message == error)
         };
-        assert!(recorded(&app.snapshot, stored));
+        assert!(recorded(&app.journal, stored));
         // Interrupting the backoff ends the turn, and with it the retry's countdown.
         session.interrupt().await;
         let ended = |event: &SessionEvent| matches!(event, SessionEvent::AgentInterrupted);
-        observe_until(&mut app, |app| recorded(&app.snapshot, ended)).await;
-        let cards = render(&app.snapshot, &agent, false);
+        observe_until(&mut app, |app| recorded(&app.journal, ended)).await;
+        let cards = whole_entries(&mut app, false).await;
         let card = cards
             .iter()
             .find(|card| card.key() == &EntryKey::Retry(request));

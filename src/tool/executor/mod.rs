@@ -4,6 +4,7 @@ mod dispatch;
 mod planning;
 mod results;
 
+pub(crate) use dispatch::cancellation_result;
 pub use results::ExecutionResult;
 pub(crate) use results::failure_response;
 pub(crate) use results::{Reported, StartedExecution};
@@ -90,6 +91,13 @@ enum InvocationDispatch<R> {
 struct PlannedRemote {
     route: Route,
     router: TargetRouter,
+}
+
+/// A call planned for its job, before the job exists.
+pub(crate) struct PlannedInvocation {
+    kind: InvocationKind,
+    plan: InvocationPlan,
+    spec: JobSpec,
 }
 
 /// A planned invocation whose job is published: the caller's outstanding work
@@ -228,11 +236,7 @@ impl ToolExecutor {
         self.run(created).await
     }
 
-    /// Plan a call and publish its job without running it, so the calls of one
-    /// response can all be outstanding before any of them runs.
-    ///
-    /// Boxed, so agent loops prove the creation future `Send` at this boundary
-    /// rather than through every type planning and publishing hold.
+    /// Plan a call and publish its job without running it.
     pub(crate) fn create<'a>(
         &'a self,
         kind: InvocationKind,
@@ -241,37 +245,89 @@ impl ToolExecutor {
         arguments: Value,
         parent: Option<JobId>,
     ) -> futures_util::future::BoxFuture<'a, Result<CreatedInvocation, ToolError>> {
-        Box::pin(self.plan_and_publish(kind, agent, name, arguments, parent))
+        Box::pin(async move {
+            let planned = self.plan(kind, agent, name, arguments, parent).await;
+            let mut created = self.publish(vec![planned]).await;
+            created.pop().expect("a creation per plan")
+        })
     }
 
-    async fn plan_and_publish(
-        &self,
+    /// Plan a call for its job without publishing it. Plans share nothing, so
+    /// the calls of one response plan concurrently.
+    ///
+    /// Boxed, as [`publish`](Self::publish) is, so agent loops prove these
+    /// futures `Send` at this boundary rather than through every type planning
+    /// and publishing hold.
+    pub(crate) fn plan<'a>(
+        &'a self,
         kind: InvocationKind,
         agent: AgentId,
-        name: &str,
+        name: &'a str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ToolError> {
-        let plan = self
-            .plan_registered(kind, agent, name, arguments, parent)
-            .await
-            .map_err(|error| {
-                let placement = (self.shared.registry.get(name))
-                    .map_or(ToolPlacement::Host, |tool| tool.placement());
-                error.or(
-                    PartialContext::new(Operation::Validate, Subject::Tool(name.to_owned()))
-                        .at(FailureSite::bound(&self.caller_location, placement)),
-                )
-            })?;
-        // The plan's borrow ends before the append: admitted handlers are not `Sync`.
-        let (spec, fallback) = (self.job_spec(&plan), prepare_fallback(&plan));
-        let lease = self
-            .shared
-            .jobs
-            .create(spec)
-            .await
-            .map_err(|error| job_error(error).or(fallback))?;
-        Ok(CreatedInvocation { kind, plan, lease })
+    ) -> futures_util::future::BoxFuture<'a, Result<PlannedInvocation, ToolError>> {
+        Box::pin(async move {
+            let plan = self
+                .plan_registered(kind, agent, name, arguments, parent)
+                .await
+                .map_err(|error| {
+                    let placement = (self.shared.registry.get(name))
+                        .map_or(ToolPlacement::Host, |tool| tool.placement());
+                    error.or(PartialContext::new(
+                        Operation::Validate,
+                        Subject::Tool(name.to_owned()),
+                    )
+                    .at(FailureSite::bound(&self.caller_location, placement)))
+                })?;
+            let spec = self.job_spec(&plan);
+            Ok(PlannedInvocation { kind, plan, spec })
+        })
+    }
+
+    /// Publish the jobs of `planned`'s plans, in order, in one commit, so the
+    /// calls of one response are all outstanding before any of them runs. A
+    /// failed plan passes through as its call's result; a refusal refuses each
+    /// planned call as it would have refused it alone.
+    pub(crate) fn publish(
+        &self,
+        planned: Vec<Result<PlannedInvocation, ToolError>>,
+    ) -> futures_util::future::BoxFuture<'_, Vec<Result<CreatedInvocation, ToolError>>> {
+        Box::pin(async move {
+            let mut specs = Vec::with_capacity(planned.len());
+            let calls: Vec<_> = (planned.into_iter())
+                .map(|planned| {
+                    planned.map(|PlannedInvocation { kind, plan, spec }| {
+                        specs.push(spec);
+                        (kind, plan)
+                    })
+                })
+                .collect();
+            let leases = match specs.is_empty() {
+                true => Ok(Vec::new()),
+                false => self.shared.jobs.create_all(specs).await,
+            };
+            match leases {
+                Ok(leases) => {
+                    let mut leases = leases.into_iter();
+                    (calls.into_iter())
+                        .map(|call| {
+                            call.map(|(kind, plan)| CreatedInvocation {
+                                kind,
+                                plan,
+                                lease: leases.next().expect("a lease per planned call"),
+                            })
+                        })
+                        .collect()
+                }
+                Err(error) => (calls.into_iter())
+                    .map(|call| {
+                        call.and_then(
+                            |(_, plan)| Err(job_error(&error).or(prepare_fallback(&plan))),
+                        )
+                    })
+                    .collect(),
+            }
+        })
     }
 
     /// Authorize, launch and collect a created invocation for the host,
@@ -319,8 +375,8 @@ impl ToolExecutor {
 }
 
 /// Job state lives on the session host; the caller names the failed stage.
-fn job_error(error: crate::job::JobError) -> ToolError {
-    ToolError::from(error).or(PartialContext::default().at(FailureSite::Host))
+fn job_error(error: impl std::borrow::Borrow<crate::job::JobError>) -> ToolError {
+    ToolError::from(error.borrow()).or(PartialContext::default().at(FailureSite::Host))
 }
 
 fn prepare_fallback(plan: &InvocationPlan) -> PartialContext {

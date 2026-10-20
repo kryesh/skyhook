@@ -288,6 +288,7 @@ mod tests {
                 let expected_error = runtime
                     .jobs
                     .metadata(target)
+                    .await
                     .unwrap()
                     .rendered_error(executor.diagnostic_viewer())
                     .unwrap();
@@ -343,7 +344,7 @@ mod tests {
             ..JobSpec::test(runtime.agent.clone(), "fast")
         };
         let job = runtime.jobs.test_running(spec).await.into_test_id();
-        let launched = Box::new(runtime.jobs.metadata(job).unwrap());
+        let launched = Box::new(runtime.jobs.metadata(job).await.unwrap());
         let payload = json!({"data": null});
         complete(&runtime, job, payload.clone()).await;
         let started = || StartedExecution::Background(launched.clone());

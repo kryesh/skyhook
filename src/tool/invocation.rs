@@ -48,6 +48,11 @@ impl<O> From<std::sync::Arc<crate::session::SessionError>> for OperationError<O>
         Self::session(&error)
     }
 }
+impl<O> From<tokio::task::JoinError> for OperationError<O> {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::failed(error)
+    }
+}
 impl<O> From<serde_json::Error> for OperationError<O> {
     fn from(_: serde_json::Error) -> Self {
         Self::cause(Cause::Json)
@@ -119,7 +124,7 @@ impl<O> OperationError<O> {
     pub fn io(error: io::Error) -> Self {
         Self::cause(Cause::io(&error))
     }
-    fn session(error: &crate::session::SessionError) -> Self {
+    pub(crate) fn session(error: &crate::session::SessionError) -> Self {
         let mut this = Self::from_facts(PartialDiagnostic::session(error), None);
         if let crate::session::SessionError::Refused(phase) = error {
             this.0.refused = Some(phase.clone());

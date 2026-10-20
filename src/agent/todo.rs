@@ -43,6 +43,20 @@ pub(crate) struct AgentTodos {
     items: Vec<TodoItem>,
     /// The latest checkpoint's frontier: its summary reconciled every response up to it.
     reconciled: RecordSeq,
+    /// The record that last set the list.
+    set: RecordSeq,
+}
+
+impl AgentTodos {
+    /// The empty list of an agent `owner_job` owns, whose latest checkpoint reconciled
+    /// every response up to `reconciled`, to fold the record that last set it into.
+    pub(crate) fn opened(owner_job: Option<JobId>, reconciled: RecordSeq) -> Self {
+        Self {
+            owner_job,
+            reconciled,
+            ..Self::default()
+        }
+    }
 }
 
 /// Fold one committed record into every agent's list.
@@ -53,15 +67,28 @@ pub(crate) fn apply(agents: &mut BTreeMap<AgentId, AgentTodos>, record: &EventRe
             agents.entry(agent).or_default().owner_job = *owner_job;
         }
         SessionEvent::TodosReplaced { items } => {
-            agents.entry(agent).or_default().items.clone_from(items);
+            let state = agents.entry(agent).or_default();
+            state.items.clone_from(items);
+            state.set = record.sequence;
         }
         SessionEvent::Compaction { checkpoint } => {
             let state = agents.entry(agent).or_default();
             state.items.clone_from(&checkpoint.todos);
             state.reconciled = checkpoint.frontier;
+            state.set = record.sequence;
         }
         _ => {}
     }
+}
+
+/// Whether `agent`'s list changed after `frontier`, which makes the list a summary up
+/// to it reconciled stale.
+pub(crate) fn changed_after(
+    agents: &BTreeMap<AgentId, AgentTodos>,
+    agent: &AgentId,
+    frontier: RecordSeq,
+) -> bool {
+    agents.get(agent).is_some_and(|state| state.set > frontier)
 }
 
 /// Why a replacement was not applied.
@@ -144,7 +171,10 @@ mod tests {
     async fn rejections_identify_the_rejected_job() {
         let fixture = crate::tests::TestRuntime::new().await;
         let (todos, jobs) = (&fixture.store, &fixture.jobs);
-        let spec = crate::job::JobSpec::test(fixture.agent.clone(), "agent");
+        let spec = crate::job::JobSpec {
+            role: crate::job::JobRole::Agent,
+            ..crate::job::JobSpec::test(fixture.agent.clone(), "agent")
+        };
         let job = jobs.create(spec).await.unwrap().into_test_id();
         let missing = todos.inspect_todos(&fixture.agent, Some(job)).unwrap_err();
         let workspace = fixture.root.path();

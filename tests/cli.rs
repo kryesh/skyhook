@@ -1,5 +1,6 @@
 //! End-to-end behaviour of the `skyhook` binary: dotenv loading, `dump`, `stats`, and
 //! headless runs, each observed from outside the process.
+use std::sync::Arc;
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -88,8 +89,9 @@ impl Fixture {
         let id = session_id(output);
         let sessions = self.path(".skyhook/sessions");
         block_on(async {
-            let opened = skyhook::session::SessionStore::open(&sessions, id);
-            let (store, records) = opened.await.unwrap();
+            use skyhook::session::SessionStore;
+            let store = SessionStore::open(&sessions, id).await.unwrap();
+            let records = SessionStore::read_records(&sessions, id).await.unwrap();
             let jobs = skyhook::job::JobManager::new(store);
             let (mut text, all) = (String::new(), <_>::default());
             for record in &records {
@@ -110,7 +112,7 @@ impl Fixture {
         journal(&self.records(output))
     }
     /// The committed records of the session whose id `output` printed.
-    fn records(&self, output: &Output) -> Vec<skyhook::session::EventRecord> {
+    fn records(&self, output: &Output) -> Vec<Arc<skyhook::session::EventRecord>> {
         let id = session_id(output);
         let sessions = self.path(".skyhook/sessions");
         block_on(skyhook::session::SessionStore::read_records(&sessions, id)).unwrap()
@@ -132,7 +134,7 @@ fn session_id(output: &Output) -> skyhook::identity::SessionId {
     id.parse().expect("stdout contains only one session ID")
 }
 
-fn journal(records: &[skyhook::session::EventRecord]) -> String {
+fn journal(records: &[Arc<skyhook::session::EventRecord>]) -> String {
     let lines = records
         .iter()
         .map(|record| serde_json::to_string(record).unwrap());
@@ -885,8 +887,9 @@ mod headless {
             &["--resume", id, "-m", "test/first"],
         );
         assert!(resumed.status.success());
-        let records = f.records(&resumed);
-        let stats = skyhook::session::stats::session_stats(id.parse().unwrap(), &records);
+        let sessions = f.path(".skyhook/sessions");
+        let stats = skyhook::session::SessionStore::stats(&sessions, session_id(&resumed));
+        let stats = block_on(stats).unwrap();
         let root = stats.agents[0].model.as_ref().unwrap();
         assert_eq!(root.to_string(), "test/second");
         f.write(".skyhook/state.json", "invalid JSON");

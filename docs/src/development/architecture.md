@@ -60,12 +60,12 @@ models of one provider build share its HTTP client, credential sources, command 
 OAuth state.
 
 The runtime retains the provider context across turns, tool work, questions, retries, and
-compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model change prepares its
-replacement before committing the selection and preserves journal history. Reselecting the
-current model keeps the current context. A mode change also replaces the prompt and tool surface
-and invalidates earlier bound reasoning. Resume opens a fresh provider context under the same
-context identity.
+compaction. A child whose invocation has resolved, with nothing left for it to take, parks: its
+loop and context are released, and the input that resumes it opens a fresh context under the
+same identity from its history. A model change prepares its replacement before committing the
+selection and preserves journal history. Reselecting the current model keeps the current
+context. A mode change also replaces the prompt and tool surface and invalidates earlier bound
+reasoning. Resume opens a fresh provider context under the same context identity.
 
 The session owns the durable conversation (`session::Message`): user text and attachments, job
 events (child replies and presented job views), parent input and compaction summaries, assistant
@@ -92,7 +92,7 @@ it. Only a state whose request produced no response later drops out of it, since
 to it.
 
 The journal records each request's tail. The projection gives each committed response the state
-its request sent, attributed as the request ledger attributes responses, and later requests send
+its request sent, the request of the attempt that completed with it, and later requests send
 it again before that response as `superseded` state, back to the latest checkpoint or mode switch
 (where bound reasoning ends). A superseded state never reaches the model, so the model always
 reads only the latest dynamic state. Each codec places state in its dialect's `StateRole`: the
@@ -137,16 +137,25 @@ gives that form only to a tool output it marks.
    observers the same provisional view of the deltas until the end arrives. Observers then see
    each response settle as committed or failed, keyed by the journal sequence it produced.
 3. Only an accepted response becomes model-visible history. Its message, usage, and outcome
-   commit together before tool dispatch. Each tool result commits as its call finishes; request
+   commit together before tool dispatch. The response's calls are then planned concurrently and
+   their jobs created together, in call order, in one commit: after a crash either every job of
+   the response exists or none does, and a call that fails planning settles without a job and
+   without affecting its siblings. Each tool result commits as its call finishes; request
    projection merges results back into the original call order. This preserves completed work
    after a crash without making completion order part of the next model request.
 4. Once a tool exchange is closed, the runtime can compact history or build the next request.
-   An agent with no further work returns to its idle loop rather than discarding its context.
+   An agent with no further work returns to its idle loop rather than discarding its context,
+   until, as a child, it parks.
 
-`session::RequestLedger` folds these records into one `RequestPhase` per request, and
-`session::Turns` folds each agent's turns. Statistics, observation snapshots, resume settlement
-and the terminal read requests, retries, usage and turns from these two folds rather than
-deriving them again.
+The session core keeps each agent's newest request with its `RequestPhase`, the calls its
+responses left without results and whether its input awaits the model; that is what turns,
+activity, resume settlement and the observation read, and `session::Turns` folds each agent's
+turns. The fold also decides what presenting a record reads beyond it (`session::Fact`): the
+request an answer committed under, the call a result answered, and that a failed turn ended on
+its request's failure. The core folds requests and each agent's state as records commit, and
+writes their rows, with what it decided of answers and failed turns, in that transaction, so
+request pages, statistics, the session list, agent summaries, compaction's retention and opening
+a session read lifecycles from those rows rather than deriving them again.
 
 The core admits every command by the session's `SessionPhase` (viewing, running, shutting down,
 failed, closed) in one table in `session/core/phase.rs`, which also decides when what a command
@@ -189,11 +198,17 @@ schema and no callable tools. Its checkpoint installs the replacement history an
 todos in one commit, which is refused when it would overwrite newer todo state, and replay uses
 the stored continuation rather than rerunning the summary.
 
-`agent/runtime/context.rs` folds the need to compact from the journal. `agent/runtime/compact/`
-owns the summary request and how it shrinks after an overflow (`mod.rs`), the retained tail
-(`retention.rs`), and the checkpoint (`checkpoint.rs`). The user-visible behavior is under
+An agent's context (`agent/runtime/context.rs`) opens with its history, read from the journal by
+index: its latest checkpoint with the retained sources, then its records after the frontier
+folded by `Projection::apply`, the fold that goes on to apply the records the core feeds it, and
+reads its history again after a checkpoint. The occupancy it compacts for is the core's. Compaction retains from that history, with indexed reads of the agent's
+requests completed since its checkpoint and of the exchanges its live calls opened, so neither
+reads the whole journal. `agent/runtime/compact/` owns the summary request and how it shrinks
+after an overflow (`mod.rs`), the retained tail (`retention.rs`), and the checkpoint
+(`checkpoint.rs`). The user-visible behavior is under
 [conversation compaction](../guide/sessions-and-context.md#conversation-compaction), and the
-durable reference contract under [model-call reconstruction](embedding.md#reconstructing-model-calls).
+durable reference contract under
+[model-call reconstruction](embedding.md#reconstructing-model-calls).
 
 ## Tools, jobs, and execution
 
@@ -247,9 +262,12 @@ sees.
 
 Saved output and model-visible presentation are separate. A finished result is saved once, as a
 compact document with its large parts in captures (`job/output/saved.rs`), and read back through
-bounded streaming readers (`job/output/json.rs`). JavaScript receives complete results, while the
-journal retains the exact previews delivered to the model.
-[Saved job output](../reference/job-output.md) documents the user-facing limits.
+bounded streaming readers (`job/output/json.rs`). The large parts are written before the finish,
+staged: no reader lists them until the finish that references them commits, so that transaction
+stays small whatever the result's size, and opening a session removes those a finish never
+committed. JavaScript receives complete results, while the journal retains the exact previews
+delivered to the model. [Saved job output](../reference/job-output.md) documents the user-facing
+limits.
 
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
@@ -269,15 +287,32 @@ returns otherwise. The helper, its environment and prompt attribution are descri
 Each durable session is one SQLite database, `session.db`, holding the append-only, normalized
 event ledger beside its blobs, saved job results and captures; `session/schema.sql` documents the
 tables and the few JSON columns. Each open session has one core thread (`session/core/mod.rs`)
-that owns the only writer and the one in-memory fold of the journal: its records, request ledger,
-jobs, todos and targets and, never journaled, each running agent's turn and inbox and every
-registered wait. Commands run on that thread in order. Each plans against the current state: a
-`Plan` names the entries it journals, the output it saves with them, and what it changes live.
-The writer journals a plan in one `BEGIN IMMEDIATE … COMMIT` transaction, then applies and
-publishes it in one critical section before the next command runs, so no reader sees a record the
-state does not reflect, and a rule a concurrent change can break, such as the stale-todos check on
-a compaction checkpoint, is decided against the state it commits to. Reopening folds the journal
-with the same apply.
+that owns the only writer and the one in-memory fold of what live work reads of the journal (each
+agent's newest request, the resident jobs and agents, todos and targets, the next sequence and the
+last activity, never the records themselves) and, never journaled, each running agent's turn and
+inbox and every registered wait.
+
+Commands run on that thread in order. Each plans against the current state: a `Plan` names the
+entries it journals, the output it saves with them, and what it changes live. The writer
+journals them in one transaction, validating each record by index against the journal ahead of
+it, so no append reads the whole journal. In that transaction it folds them into the state,
+refusing a transition the state does not admit, and writes the current-state rows of the jobs,
+requests and agents they changed; the ledger stays the only source of history and exports. No
+reader sees the state ahead of the journal or a record the state does not reflect, and a rule a
+concurrent change can break, such as the stale-todos check on a compaction checkpoint, is decided
+against the state it commits to.
+
+The commands already queued when the core takes one run with it as a group, and one sync of the
+write-ahead log after the last makes the group durable; the core never waits for more to arrive.
+Each command still plans against the state the ones before it leave and commits its own
+transaction, so a refused plan leaves the rest of the group as it would be without it. What a
+command leaves to happen once it commits, such as its reply, the waits it resolves and its
+deferred effects, runs after the sync: until then the state and observers may reflect a commit,
+but nothing the session does in response has happened. A failed sync stops the session; each
+command of the group that committed, and any drain or close behind it, reports that failure. A
+stopped session holds what reopening it reads, so a transaction that failed leaves nothing of its
+fold. A committed record is shared, not copied, by the observation stream, the agent contexts and every
+observer, and an agent's context is fed only the records of its own agent that its history folds.
 
 One user-visible operation is one plan. A submission is admitted when its messages commit, a
 queued batch commits with its model and mode selection in one transaction, and the commit that
@@ -289,16 +324,113 @@ authority for model work: an interrupt changes it in the core, and every commit 
 call starts) is refused unless the agent's turn is busy. A turn's cancellation token decides
 nothing; it only aborts the I/O in flight, such as a provider stream or a process.
 
+A registered wait declares the agents and jobs it reads, and decides from the state alone before
+it takes anything. A change decides again only the waits whose agents or jobs it touched,
+repeating while what they take touches more, and every wait on a session-wide change (phase, flow
+or activation); each agent's activity is likewise read again only when the change touched that
+agent.
+
+### Resident set
+
+The core holds only the resident set, so what it holds and what a change, a request or a tool
+call reads of it are bounded by live work, not by the session's history. A job is resident while
+it is unfinished or interrupted, has a delivery or a reply pending, is a child that input can
+resume, or launched a resident job; the resident jobs are indexed by owner and by parent. A job
+let go of keeps a cancellation requested of it that the journal does not record for the rest of
+the session, so a job created under it is cancelled whenever it is made; a reopen forgets it.
+Every
+agent's state is held; its contract and the children it has started are held while it is the
+root or its loop runs, and read from the records its state names as its loop starts. A job that
+leaves the set is let go with its indexes and handles: a job holds its input mailbox and
+cancellation token only while it can still run, and what runs an agent job again is built only as
+it restarts. Whatever addresses a job by id reads it as the core last held it, from its status
+row, which is final once the core lets the job go. Opening a session reads the state rows and a
+few counts by index; nothing is folded from history.
+
+### Parking
+
+A child's loop runs only while it has something to do or something to deliver to. Once its
+invocation has resolved, its turn is idle or failed with nothing queued or held, it owns no live,
+interrupted or pending job and none of its children runs, it parks in the change that finds it
+so. The next change that needs it (input to its job, a `continue` that restarts it, or the restart of a job it
+owns) starts its loop again, and that of each parked child above it, in that same change, so an
+agent never runs two loops and none parks between that check and the work it was started for. It
+starts as its journal leaves it: under the contract it ran under, with the children it started,
+stopped on its failure if its last turn failed, and with a fresh context opened at a request
+boundary under the same identity, so `continue` and input go on as they would have had it never
+parked. A child whose job was cancelled, or whose cancellation was requested, is not started
+again, and its name stays its owner's. A cancellation requested of a finished child's job itself
+(the `jobs` tool or the host's `cancel_job`) is journaled, so it holds after a reopen too; a
+reopen forgets one that an interrupt, an abandonment or a close requested of a finished
+descendant.
+
+### Log and reads
+
 The ledger is only appended to: triggers refuse updates and deletes on every ledger and dictionary
-table. A write the journal cannot take stops the session as a crash does. A writer lock excludes
-competing session owners, not read-only inspection. Observation is a host view of durable records,
-the jobs the session state folds from them, and live state; it is not a second source of
-conversation history or job state.
+table. A write the journal cannot take stops the session as a crash does. No commit checkpoints
+the log, since a pass would hold the commits behind it while it syncs the database file: a thread
+with its own connection copies the log into the database every so many commits,
+without blocking the writer or a reader, except that once the log has grown well past its bound
+under commits that never pause, one pass holds the writer so the log can start over. A read holds
+its snapshot for that read alone, so the log stays bounded by what commits between passes plus
+what commits during the longest read. Closing a session copies the log into the
+database and empties it without waiting for a reader; frames a reader still holds stay for the
+next open to recover. A writer lock excludes competing session owners, not read-only inspection.
+
+Reads that do not belong to the core, such as job output, the blobs a request sends, an agent's
+history, history pages, request reconstruction, the title, the session list, statistics and
+exports, run on read-only connections, each in one snapshot, so they never wait on the writer's
+transactions; a session held in memory reads through its writer's connection instead. A session
+keeps a fixed few read connections, each on a thread of its own, and a read waits for one rather
+than opening another. Reads are async, and one waiting for
+a connection holds no thread. The core reads on a connection of its own, so its reads never wait
+behind other reads.
+
+### Observation
+
+Observation is a host view of durable records, the jobs the session state folds from them, and
+live state; it is not a second source of conversation history or job state. An observation copies
+only what the core holds live: the phase, each agent's newest request and activity, the resident
+jobs, the responses of each agent's latest turn, context gauges, and each agent's transcript
+length and usage. It costs the same however long the session is, and since the core reports the
+jobs it lets go of, an observer holds what the core holds. History is read in pages on read-only
+snapshots, by index. A page reads at least what the observation applied, and every later record
+is an update at the next ordinal of its agent, so a host placing updates by ordinal misses nothing
+and repeats nothing; a lagging host observes again and reads its pages again, never the history.
+Live updates the journal does not carry, such as streamed deltas and capture notices, never wait
+on the core's commands or its state lock, only on the observation's lock, which a commit holds
+from its fold through COMMIT to its publication and a subscriber holds while it copies the views.
+A capture write notifies observers of its run once, then again only after something reads that
+run's output or the run finishes, so a burst of writes costs a bounded number of updates.
 
 Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/src/agent/runtime),
 [providers](https://github.com/kryesh/skyhook/tree/main/src/provider),
 [tools](https://github.com/kryesh/skyhook/tree/main/src/tool), and
 [sessions](https://github.com/kryesh/skyhook/tree/main/src/session).
+
+## Terminal history window
+
+The terminal shows the viewed agent's tab from a window of its history, so drawing reads only
+memory and what the terminal holds is bounded by the view, not by the history. Each tab is one
+run of a list loaded a page at a time from either end: the conversation's entries by ordinal,
+each page with the facts presenting it reads, which later updates extend, so an entry shows the
+same whatever else is loaded; requests, an owner's jobs, and a card's children. Loads run off
+the event loop, at most one in flight above the view and one below, and land as work; what is
+not loaded past either end of the run shows as a loading row. The scrollbar spans the whole
+transcript, counting the entries not loaded at the loaded rows' average per entry, and a
+position beyond the run (the scrollbar, `Home`, `End`) reads there instead, at once, in a window
+of its own: what the one it replaces had in flight lands unused, and until the position is laid
+out, scrolling moves it rather than the rows shown. A reading position is an anchor (an entry key
+and rows into it, and the tab's own entry it belongs to: a transcript entry, a request or a root
+job), never a row, so it is found again whatever a new page, width or recovered observation lays
+out; the children still to read where it belongs load whatever their distance, and it is given up
+only once a page read where it lies shows it is not there. Entries far from the view are let go with what presenting them read, and
+with the outputs of the cards they show. A job the session lets go of, and a request a newer one
+replaces, keep the view they were left with while the window shows them, whatever order that and
+the pages reading them arrive in. A frame lays out only what the window holds, and the sidebar
+asks the session what the viewed agent holds only once an agent's start or mode change, or the
+chosen agent or mode, changes it, so a frame never waits on a commit. A session out of view keeps
+only its live part, its agents' summaries and the job output selections chosen.
 
 ## Terminal transcript selection
 

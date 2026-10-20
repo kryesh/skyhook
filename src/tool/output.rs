@@ -260,7 +260,9 @@ pub(crate) enum OutputEvent {
 }
 
 pub(crate) enum Abandonment {
-    Handled,
+    /// The sink is writing it already; settling waits for the write.
+    Writing(tokio::task::JoinHandle<()>),
+    /// Settling writes it.
     Deferred(OutputEvent),
 }
 
@@ -269,7 +271,7 @@ pub(crate) trait OutputSink: Send + Sync {
     fn send(&self, event: OutputEvent) -> io::Result<()>;
 
     /// Handle cleanup once, or return ownership for the settlement barrier.
-    fn abandon(&self, event: OutputEvent) -> Abandonment {
+    fn abandon(self: Arc<Self>, event: OutputEvent) -> Abandonment {
         Abandonment::Deferred(event)
     }
 }
@@ -291,6 +293,8 @@ struct EmitterState {
     next: Option<CaptureId>,
     active: usize,
     abandoned: Vec<OutputEvent>,
+    /// Abandoned output its sink is writing.
+    writing: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl OutputContext {
@@ -303,6 +307,7 @@ impl OutputContext {
                     next: Some(CaptureId::FIRST),
                     active: 0,
                     abandoned: Vec::new(),
+                    writing: Vec::new(),
                 }),
                 changed: tokio::sync::Notify::new(),
                 settling: Arc::new(tokio::sync::Mutex::new(())),
@@ -358,7 +363,7 @@ impl OutputContext {
     /// Drain accepted operations and abandoned output before publishing a terminal result.
     pub(crate) async fn settle(&self) -> io::Result<()> {
         let settling = self.inner.settling.clone().lock_owned().await;
-        let abandoned = loop {
+        let (writing, abandoned) = loop {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -369,11 +374,18 @@ impl OutputContext {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 if state.active == 0 {
-                    break std::mem::take(&mut state.abandoned);
+                    let writing = std::mem::take(&mut state.writing);
+                    break (writing, std::mem::take(&mut state.abandoned));
                 }
             }
             changed.await;
         };
+        for written in writing {
+            written.await.map_err(io::Error::other)?;
+        }
+        if abandoned.is_empty() {
+            return Ok(());
+        }
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let _settling = settling;
@@ -549,19 +561,15 @@ impl CaptureTarget for EventCapture {
             },
             Abandon::Retain => return,
         };
-        if let Abandonment::Deferred(event) = self
-            .activity
-            .inner
-            .sink
-            .abandon(OutputEvent::Capture(event))
-        {
-            self.activity
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .abandoned
-                .push(event);
+        let inner = &self.activity.inner;
+        let abandonment = Arc::clone(&inner.sink).abandon(OutputEvent::Capture(event));
+        let mut state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match abandonment {
+            Abandonment::Writing(written) => {
+                state.writing.retain(|written| !written.is_finished());
+                state.writing.push(written);
+            }
+            Abandonment::Deferred(event) => state.abandoned.push(event),
         }
     }
 }

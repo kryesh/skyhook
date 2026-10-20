@@ -1,12 +1,11 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
-use super::entries::status_entry;
+use super::entries::{Inputs, status_entry};
 use super::{
-    AgentDisplayState, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Timing, Title,
-    View,
+    AgentDisplayState, Entry, EntryKey, EntryView, ResponseRef, Surface, Timing, Title, View,
 };
 use crate::tui::render::{Section, sections};
-use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
+use skyhook::agent::{AgentActivity, ObservedResponse};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::{BlockRef, ItemKind};
 use skyhook::session::{RequestPhase, RequestRecord, RequestSeq, SessionError};
@@ -21,20 +20,17 @@ pub(super) enum ReasoningStatus {
     Incomplete,
 }
 
-fn working_entry(
-    snapshot: &ObservationSnapshot,
-    agent: &AgentId,
-    streaming: bool,
-) -> Option<Entry> {
+fn working_entry(inputs: Inputs<'_>, agent: &AgentId, streaming: bool) -> Option<Entry> {
     if streaming {
         return None;
     }
+    let snapshot = inputs.live;
     // A request's own status card carries failure and recovery at its journal
     // position, including the short transition between the two.
     let latest = snapshot
-        .ledger
+        .requests
         .latest(agent)
-        .and_then(|request| snapshot.ledger.get(request))
+        .and_then(|request| inputs.request(request))
         .map(|record| &record.phase);
     if latest.is_some_and(RequestPhase::has_status_card) {
         return None;
@@ -143,28 +139,26 @@ pub(super) fn block_key(response: ResponseRef, block: &BlockRef) -> EntryKey {
 /// The live tail after history: the responses of `requests` still streaming there,
 /// then the working indicator unless reasoning streams. Returns the requests shown.
 pub(super) fn live_tail(
-    snapshot: &ObservationSnapshot,
-    projection: &Projection,
-    presentation: EntryView<'_>,
+    inputs: Inputs<'_>,
     requests: impl IntoIterator<Item = RequestSeq>,
     entries: &mut Vec<Entry>,
 ) -> Vec<RequestSeq> {
-    let EntryView { agent, view, .. } = presentation;
-    let agent_name = projection.agent_name(agent);
+    let EntryView { agent, view, .. } = inputs.presentation;
+    let agent_name = inputs.projection.agent_name(agent);
     let start = entries.len();
     let mut shown = Vec::new();
     for request in requests {
-        if let Some((record, response)) = live_tail_response(snapshot, agent, request) {
+        if let Some((record, response)) = live_tail_response(inputs, agent, request) {
             shown.push(request);
             let since = record.requested_millis;
             entries.extend(response_entries(request, response, view, agent_name, since));
         }
     }
     let streaming = entries[start..].iter().any(|entry| entry.timing.live());
-    entries.extend(working_entry(snapshot, agent, streaming));
+    entries.extend(working_entry(inputs, agent, streaming));
     // The session's conversation, and only it, shows what stopped it.
     if agent.path().is_empty()
-        && let Some(failure) = snapshot.phase.failure()
+        && let Some(failure) = inputs.live.phase.failure()
     {
         let failed = SessionError::JournalFailed(failure.clone());
         entries.push(status_entry(EntryKey::JournalFailed, &failed));
@@ -175,23 +169,25 @@ pub(super) fn live_tail(
 /// A response streams at the tail until its commit is observed; failures and
 /// interruptions move it into the request's status card at its journal position.
 fn live_tail_response<'a>(
-    snapshot: &'a ObservationSnapshot,
+    inputs: Inputs<'a>,
     agent: &AgentId,
     request: RequestSeq,
 ) -> Option<(&'a RequestRecord, &'a ObservedResponse)> {
-    let record = (snapshot.ledger.get(request)).filter(|record| record.phase.is_live_tail())?;
-    Some((record, snapshot.responses.get(&(agent.clone(), request))?))
+    let record = (inputs.request(request)).filter(|record| record.phase.is_live_tail())?;
+    Some((
+        record,
+        inputs.live.views.responses.get(&(agent.clone(), request))?,
+    ))
 }
 
-pub(super) fn live_tail_responses(
-    snapshot: &ObservationSnapshot,
-    agent: &AgentId,
-) -> Vec<RequestSeq> {
-    let mut requests: Vec<_> = snapshot
+pub(super) fn live_tail_responses(inputs: Inputs<'_>, agent: &AgentId) -> Vec<RequestSeq> {
+    let mut requests: Vec<_> = inputs
+        .live
+        .views
         .responses
         .keys()
         .filter(|(owner, request)| {
-            owner == agent && live_tail_response(snapshot, agent, *request).is_some()
+            owner == agent && live_tail_response(inputs, agent, *request).is_some()
         })
         .map(|(_, request)| *request)
         .collect();
@@ -257,7 +253,7 @@ mod tests {
     /// A settled answer of `text`, observed for a request that is never journaled.
     fn response(text: &str) -> ObservedResponse {
         let agent = root(1);
-        let mut snapshot = ObservationSnapshot::default();
+        let mut snapshot = skyhook::agent::ObservationSnapshot::default();
         let ended = Completion::answer(vec![AssistantItem::text("text", 0, text)]).unwrap();
         let event = RuntimeEvent::ResponseEvent {
             agent: agent.clone(),
@@ -266,6 +262,7 @@ mod tests {
         };
         update(&mut snapshot, event);
         snapshot
+            .views
             .responses
             .remove(&(agent, RequestSeq::default()))
             .unwrap()

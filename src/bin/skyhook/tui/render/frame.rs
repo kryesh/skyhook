@@ -27,12 +27,7 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
     }
     // Advertise continuing only while something can be continued, so a refusal
     // names the key that resolves it.
-    if app
-        .snapshot
-        .activity
-        .values()
-        .any(|activity| activity.state.is_retryable())
-    {
+    if model::continuable(&app.snapshot) {
         hints.push((Command::Retry, "Continue"));
     }
     hints
@@ -90,10 +85,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let height = area.height;
     let context = app
         .snapshot
+        .views
         .context
         .get(&app.selected)
         .map(|c| (c.tokens, c.capacity));
-    let stats = model::footer(app.projection.usage, context);
+    let mut usage = skyhook::provider::protocol::UsageTotals::default();
+    app.snapshot
+        .usage
+        .values()
+        .for_each(|agent| usage.merge(*agent));
+    let stats = model::footer(usage, context);
     let stat_lines = wrap_plain(&stats, width.saturating_sub(2) as usize);
     let footer_height = if width < 70 {
         1 + stat_lines.len() as u16
@@ -176,19 +177,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_header(frame, app, width);
     prepare_rows(app, content_width);
+    app.load_shown_output(visible_entries(app));
+    let near = near_view(app);
+    app.load_near(&near, app.focus_of_view());
     let navigation_active = matches!(target, InputTarget::Composer | InputTarget::None);
     draw_content(frame, app, navigation_active);
     // The popup and any notice share the row above the tree and composer.
     let latest_width = draw_scrollbar(frame, app);
-    if let Some(Overlay::Search(search)) = &app.overlay {
-        text(
-            frame,
-            r(2, app.content_rect.y, content_width.saturating_sub(4), 1),
-            format!("Find: {}▏", search.text()),
-            THEME.fg,
-            THEME.input,
-        );
-    }
     if let Some((message, hit)) = notice {
         let taken = if latest_width > 0 {
             latest_width + 3
@@ -261,7 +256,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         && app.content_rect.height > 1
         && let Some(entry) = app.entries().iter().find(|entry| entry.request().is_some())
     {
-        let geometry = EntryGeometry::new(entry, content_width, 0);
+        let geometry = EntryGeometry::new(entry, content_width);
         if let Some(header) = app.render.request_columns.header(geometry.body_width) {
             text(
                 frame,
@@ -281,12 +276,8 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         .rows
         .len()
         .saturating_sub(app.content_rect.height as usize);
-    let view = app.view();
-    let scroll = view.scroll.map_or(max, |n| n.min(max));
-    if view.scroll.is_some() {
-        view.scroll = Some(scroll);
-    }
-    let selected_entry = view.row;
+    let scroll = app.render.scroll().map_or(max, |n| n.min(max));
+    let selected_entry = app.selected_entry();
     if app.entries().is_empty() {
         text(
             frame,
@@ -298,13 +289,13 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
     }
     // A job card's glyph gives way to the spinner only while it runs; waiting
     // for input keeps its glyph beside the counter.
-    let jobs = &app.snapshot.jobs;
+    let (projection, live, window) = (&app.projection, &app.snapshot, app.window.as_ref());
     let running = |job| {
-        jobs.get(&job)
-            .is_none_or(|job| job.state == JobState::Running)
+        let job = projection.job(live, window, &job);
+        job.is_none_or(|job| job.state == JobState::Running)
     };
     let mut cursor_drawn = false;
-    for (offset, row) in app
+    for (offset, (index, row)) in app
         .render
         .rows
         .iter_from(scroll)
@@ -317,14 +308,14 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         let selection = selection.filter(|selection| selection.covers(scroll + offset));
         let view = selection.map(|_| row.text_view());
         let selected = (selection.zip(view.as_ref()))
-            .map(|(selection, view)| selection.highlights(row, view.text()))
+            .map(|(selection, view)| selection.highlights(index, row, view.text()))
             .unwrap_or_default();
-        let entry = app.content_cache.entries().get(row.entry);
+        let entry = app.content_cache.entries().get(index);
         let expandable = entry.is_some_and(model::Entry::expandable);
         let focused = navigation_active
             && app.focus == Focus::Content
             && row.selectable
-            && row.entry == selected_entry;
+            && Some(index) == selected_entry;
         let hovered =
             navigation_active && app.hover.is_some_and(|point| rect.contains(point.into()));
         let bg = row.background(
@@ -397,7 +388,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         }
         if row.selectable {
             let toggles = row.layout.header() || expandable;
-            app.hits.push((rect, Hit::Entry(row.entry, toggles)));
+            app.hits.push((rect, Hit::Entry(index, toggles)));
         }
     }
 }
@@ -406,13 +397,16 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
 /// width the tail link takes from the notice row.
 fn draw_scrollbar(frame: &mut Frame, app: &mut App) -> u16 {
     let content = app.content_rect;
-    let total = app.render.rows.len();
+    let whole = Track::of(app);
+    let total = whole.len();
     if total <= content.height as usize || content.height == 0 {
         return 0;
     }
-    let scroll = app.view().scroll;
+    let scroll = app.render.scroll();
     let track = r(content.width - 1, content.y, 1, content.height);
-    scroll_thumb(frame, track, scroll.unwrap_or(total), total, THEME.base);
+    let top = scroll.map_or(total, |scroll| whole.before + scroll);
+    scroll_thumb(frame, track, top, total, THEME.base);
+    app.hits.push((track, Hit::Scrollbar));
     if scroll.is_none() {
         return 0;
     }
@@ -578,7 +572,10 @@ mod tests {
                 failing_call, observe_find, observe_record, observe_until, played_fixture,
                 recorded, sleeping_script, spawn_children, user,
             },
-            tests::{draw_sized, draw_sized_buffer, fetch_output, fixture, job_named, run_script},
+            tests::{
+                draw_sized, draw_sized_buffer, fetch_output, fixture, job_named, run_script,
+                settled,
+            },
         },
         keys::Command,
         theme::THEME,
@@ -700,7 +697,7 @@ mod tests {
             turn.delta("thinking", ItemKind::Reasoning, more);
             thought.push_str(more);
             observe_until(&mut app, |app| {
-                let mut responses = app.snapshot.responses.values();
+                let mut responses = app.snapshot.views.responses.values();
                 responses.any(|response| response.blocks().iter().any(|b| b.text == thought))
             })
             .await;
@@ -801,10 +798,11 @@ mod tests {
         }
         model.turn().await.answer("done");
         app.tab = Tab::Requests;
-        observe_until(&mut app, |app| recorded(&app.snapshot, answered)).await;
+        observe_until(&mut app, |app| recorded(&app.journal, answered)).await;
+        settled(&mut app).await;
         for (width, header) in [(140, true), (40, false)] {
             for scroll in [0, 5] {
-                app.view().scroll = Some(scroll);
+                app.scroll_to(Some(scroll));
                 let buffer = draw_sized_buffer(&mut app, width, 25);
                 let line: String = (0..width).map(|x| buffer[(x, 2)].symbol()).collect();
                 assert_eq!(line.contains("Input (uncached)"), header);
@@ -848,7 +846,7 @@ mod tests {
             // Halfway down the card, the viewport is clipped inside the body.
             let scroll = (app.render.rows.len() - app.content_rect.height as usize) / 2;
             assert!(scroll > 0, "exercise a viewport clipped inside the body");
-            app.view().scroll = Some(scroll);
+            app.scroll_to(Some(scroll));
             let buffer = draw_sized_buffer(&mut app, width, 18);
             let mut empty_body_rows = 0;
             let rows = app.render.rows.iter().skip(scroll);
@@ -880,7 +878,7 @@ mod tests {
             "# Example\n\n```rust\nlet answer = 42;\n```\n\n**Done**",
         )
         .await;
-        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        let records = serde_json::to_vec(&app.journal).unwrap();
         let accent = THEME.accent;
         // A cold frame, an explicit reset at unchanged dimensions, then resizes
         // with warm highlights at different widths.
@@ -899,7 +897,7 @@ mod tests {
                 // Its retained rows must repaint when the worker wakes the UI,
                 // without manually invalidating content or rebuilding layout.
                 assert!(!number_is_painted(&buffer, "let answer = 42;", accent));
-                assert!(!app.render.reset && app.render.dirty.is_empty());
+                assert!(!app.render.reset && app.content_cache.take_changes().is_empty());
                 assert!(!app.content_dirty);
                 let work = crate::tests::bounded(ready.recv()).await.unwrap();
                 assert!(matches!(work, Work::HighlightsReady));
@@ -910,7 +908,7 @@ mod tests {
                 number_is_painted(&buffer, "let answer = 42;", accent),
                 "completed highlights did not reach the frame: width={width}, reset={reset}"
             );
-            assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+            assert_eq!(serde_json::to_vec(&app.journal).unwrap(), records);
         }
     }
 
@@ -932,7 +930,7 @@ mod tests {
         exchange(&mut app, &mut model, "question", sections.collect()).await;
         let accent = THEME.accent;
         for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
-            app.view().scroll = scroll;
+            app.scroll_to(scroll);
             crate::tests::bounded(async {
                 loop {
                     let buffer = draw_sized_buffer(&mut app, 60, 20);
@@ -974,11 +972,11 @@ mod tests {
             let mut hits = app.hits.iter();
             hits.find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
         };
-        app.view().scroll = None;
+        app.scroll_to(None);
         draw_sized_buffer(&mut app, 80, 25);
         assert!(latest(&app).is_none());
 
-        app.view().scroll = Some(0);
+        app.scroll_to(Some(0));
         let buffer = draw_sized_buffer(&mut app, 80, 25);
         let rect = latest(&app).expect("scrolled history should offer Latest activity");
         let buffer = &buffer;
@@ -986,7 +984,7 @@ mod tests {
             .map(|x| buffer[(x, rect.y)].symbol())
             .collect();
         assert_eq!(label, "↓ Latest activity");
-        assert_eq!(app.view().scroll, Some(0));
+        assert_eq!(app.render.scroll(), Some(0));
         // A notice shares that row without moving the popup, and gives way to it.
         app.toast = Some(("notice ".repeat(30), std::time::Instant::now()));
         let buffer = draw_sized_buffer(&mut app, 80, 25);
@@ -1009,9 +1007,9 @@ mod tests {
                 modifiers,
             }));
         }
-        assert!(app.view().scroll.is_none() && app.selection.is_none());
+        assert!(app.render.scroll().is_none() && app.selection.is_none());
         draw_sized_buffer(&mut app, 80, 25);
-        assert!(app.view().scroll.is_none());
+        assert!(app.render.scroll().is_none());
         assert!(latest(&app).is_none());
     }
 }

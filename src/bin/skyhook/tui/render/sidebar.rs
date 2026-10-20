@@ -30,14 +30,24 @@ impl Sidebar {
     /// The sidebar narrows only the transcript. None when it is turned off, or
     /// a cramped terminal or having nothing to list hides it without changing
     /// the setting.
-    pub(super) fn of(app: &App, width: u16) -> Option<Self> {
+    pub(super) fn of(app: &mut App, width: u16) -> Option<Self> {
         if !app.sidebar || width < SIDEBAR_MIN_TERMINAL {
             return None;
         }
-        let grants = Grants::of(app);
+        // The session is asked again only once the key changes, so a draw waits on no
+        // commit holding the session's state.
+        let key = (
+            app.selected.clone(),
+            app.mode.clone(),
+            app.projection.contract,
+        );
+        if (app.render.grants.as_ref()).is_none_or(|(read, _)| *read != key) {
+            app.render.grants = Some((key, Grants::of(app)));
+        }
+        let (_, grants) = app.render.grants.as_ref().expect("read above");
         let shown = grants.shown().map(|granted| granted.iter().collect());
         let capabilities: Vec<_> = shown.unwrap_or_default();
-        let servers = mcp_servers(app, &grants);
+        let servers = mcp_servers(app, grants);
         let todos = app.projection.todos.get(&app.selected);
         let listed = app.title.is_some()
             || !servers.is_empty()
@@ -173,10 +183,18 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, sidebar: Sidebar, r
     );
 }
 
+/// What grants are read for: the viewed agent, the chosen mode, and the newest start
+/// or mode change the projection folded.
+pub(super) type GrantsKey = (
+    skyhook::identity::AgentId,
+    ModeName,
+    Option<skyhook::session::RecordSeq>,
+);
+
 /// What the viewed agent holds now, and what the root agent's next message
 /// would hold when it goes out in another mode. A draft has no agent yet, so
 /// only its chosen mode counts.
-struct Grants {
+pub(super) struct Grants {
     running: Option<CapabilitySet>,
     pending: Option<CapabilitySet>,
 }
@@ -403,7 +421,7 @@ mod tests {
         for (running, kept, pending, changed) in cases {
             app.launch.permissions = Permissions::Mode(running.parse().unwrap());
             let session = app.launch.create(None).await.unwrap();
-            attach(&mut app, session);
+            attach(&mut app, session).await;
             assert_eq!(listed(&mut app, running), kept, "{running}");
             assert_eq!(listed(&mut app, pending), changed, "{running}");
             app.session().unwrap().shutdown().await.unwrap();
@@ -431,7 +449,7 @@ mod tests {
             configure(&mut app, general, tools);
             app.launch.permissions = Permissions::Mode("general".parse().unwrap());
             let session = app.launch.create(Some(id)).await.unwrap();
-            attach(&mut app, session);
+            attach(&mut app, session).await;
             reopened.push((listed(&mut app, "tools"), listed(&mut app, "general")));
             app.session().unwrap().shutdown().await.unwrap();
         }

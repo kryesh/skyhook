@@ -38,8 +38,9 @@ impl Reply {
         })
     }
 
-    /// Live commits and replay decide alike, from the committed turn itself.
-    pub(super) fn publish(&self, jobs: &HashMap<JobId, JobFacts>, job: JobId) -> Publish {
+    /// Live commits, opening and reading back decide alike, from the committed turn
+    /// itself.
+    pub(super) fn publish(&self, jobs: &Jobs, job: JobId) -> Publish {
         if !views::effectively_background(jobs, job) {
             Publish::Record
         } else if self.progress {
@@ -57,8 +58,7 @@ impl JobFacts {
 
     /// Whether anything still pending became pending after stamp `floor`.
     pub(super) fn pending_since(&self, floor: u64) -> bool {
-        self.child()
-            .is_some_and(|child| !child.messages.is_empty() && child.message_stamp > floor)
+        (self.child().and_then(Child::queued)).is_some_and(|stamp| stamp > floor)
             || self.lifecycle_pending().is_some_and(|stamp| stamp > floor)
     }
 
@@ -70,7 +70,7 @@ impl JobFacts {
         sequence: MessageSeq,
         text: String,
         publish: Publish,
-        stamps: &mut Stamps,
+        stamps: &Stamps,
     ) -> bool {
         let name = self.name.clone();
         let finished = self.end().is_some();
@@ -105,10 +105,16 @@ impl JobFacts {
         }
     }
 
-    /// Drop the reply committed at `source`: its owner has it.
+    /// Drop the reply committed at `source`: its owner has it, so an answer
+    /// released as it is nothing for completion to withdraw.
     pub(super) fn deliver_message(&mut self, source: MessageSeq) {
         if let Some(child) = self.child_mut() {
-            child.messages.retain(|message| message.message != source);
+            child
+                .messages
+                .retain(|queued| queued.reply.message != source);
+            child.answer.take_if(
+                |answer| matches!(answer, Answer::Released(released) if *released == source),
+            );
         }
     }
 }
@@ -170,7 +176,7 @@ impl Jobs {
         Reply::of(message)
             .filter(|reply| reply.text == text)
             .ok_or(JobError::ChildTextMismatch)?;
-        let entry = state.jobs.entries.get(&job).ok_or(JobError::Unknown(job))?;
+        let entry = state.job(job)?;
         let launched = entry.child().ok_or(JobError::NoChild(job))?;
         if launched.agent.as_ref() != Some(child) {
             return Err(JobError::ChildOwnerMismatch(job));
@@ -183,7 +189,7 @@ impl Jobs {
         state: &CoreState,
         job: JobId,
     ) -> Result<Vec<(AgentId, SessionEvent)>, JobError> {
-        let entry = state.jobs.entries.get(&job).ok_or(JobError::Unknown(job))?;
+        let entry = state.jobs.get(job).ok_or(JobError::Unknown(job))?;
         let held = entry.child().and_then(|child| child.answer.as_ref());
         let released = matches!(held, Some(Answer::Held(_))).then(|| {
             (
@@ -209,15 +215,11 @@ pub(super) fn batch_size(messages: &[AgentMessage]) -> usize {
 }
 
 /// Replies in sequence order, bounded by count and by their own byte budget.
-pub(super) fn pending_messages(
-    jobs: &HashMap<JobId, JobFacts>,
-    owner: &AgentId,
-) -> Vec<AgentMessage> {
+pub(super) fn pending_messages(jobs: &Jobs, owner: &AgentId) -> Vec<AgentMessage> {
     let mut messages: Vec<_> = jobs
-        .values()
-        .filter(|entry| &entry.agent == owner)
-        .filter_map(JobFacts::child)
-        .flat_map(|child| &child.messages)
+        .pending(owner)
+        .filter_map(|(_, entry)| entry.child())
+        .flat_map(|child| child.messages.iter().map(|queued| &queued.reply))
         .collect();
     messages.sort_by_key(|message| message.message);
     let mut budget: usize = 0;

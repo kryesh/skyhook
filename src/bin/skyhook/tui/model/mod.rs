@@ -1,6 +1,7 @@
 //! Presentation state and the stable interface to journal-derived content.
 
 mod cache;
+mod changes;
 mod entries;
 mod jobs;
 mod live;
@@ -8,15 +9,27 @@ mod notifications;
 mod projection;
 mod requests;
 mod retry;
+mod transcript;
+mod window;
 
 pub use super::format::{Clean, Clock, Timing, clean, footer, number, pretty, span};
 pub use cache::ContentCache;
+pub use changes::{Changes, Splice};
 pub use entries::entries;
 pub use jobs::{state_glyph, state_name, state_role, target_suffix};
-pub use projection::{AgentDisplayState, AgentInfo, Projection, WaitReason, open_jobs};
+pub use projection::{
+    AgentDisplayState, AgentInfo, Projection, WaitReason, continuable, open_jobs,
+};
 pub use requests::RequestRow;
+pub use transcript::shown;
+#[cfg(test)]
+pub use window::KEPT;
+pub use window::{
+    CHILD_PAGE, ChildPage, Direction, Focus, LIST_PAGE, Loaded, Near, PAGE, Read, Want, Window,
+};
 
 use super::tool_view::{Document, Run};
+pub use entries::Inputs;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::provider::protocol::BlockRef;
 use skyhook::session::{MessageSeq, RecordSeq, RequestSeq};
@@ -67,7 +80,6 @@ pub enum EntryKey {
         message: MessageSeq,
         call: String,
     },
-    ToolResult(RecordSeq),
     Notification {
         record: RecordSeq,
         block: usize,
@@ -81,24 +93,65 @@ pub enum EntryKey {
     UnsavedStatus(usize),
     /// The failure that stopped the session.
     JournalFailed,
+    /// What the window has not loaded there.
+    Gap(Gap),
 }
 
-/// A status shown but never journaled. It follows the record that was newest
-/// when it arrived, so it scrolls away with the history around it.
+/// Where a tab's history is not loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Gap {
+    /// What lies before a list's first loaded entry.
+    Earlier,
+    /// What lies after a list's last loaded entry.
+    Later,
+    /// A parent card's children after those loaded.
+    More(JobId),
+}
+
+/// A status shown but never journaled. It follows its agent's entry that was newest
+/// when it arrived, by ordinal, so it scrolls away with the history around it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsavedStatus {
     pub agent: AgentId,
-    pub after: Option<RecordSeq>,
+    pub after: Option<u64>,
     pub message: String,
+}
+
+/// A reading position that holds across layouts: on an entry by key, rows into it,
+/// and on the tab's own entry it belongs to (a transcript entry, a request or a root
+/// job), rows into what that shows, so it is found again when the entry is not. One
+/// with no key is a place not loaded, which is read where it is.
+#[derive(Clone, Debug)]
+pub struct Anchor {
+    pub key: Option<EntryKey>,
+    pub offset: usize,
+    pub place: Option<(Focus, usize)>,
+}
+
+impl Anchor {
+    /// The top of the transcript entry `ordinal`.
+    pub fn ordinal(ordinal: u64) -> Self {
+        Self {
+            key: None,
+            offset: 0,
+            place: Some((Focus::Ordinal(ordinal), 0)),
+        }
+    }
+
+    /// Where a window loads to show the anchor; none for the newest entries.
+    pub fn focus(&self) -> Option<Focus> {
+        self.place.map(|(focus, _)| focus)
+    }
 }
 
 #[derive(Default)]
 pub struct View {
-    pub scroll: Option<usize>,
-    pub row: usize,
+    /// Where the view's top sits; none while it follows the newest entries.
+    pub top: Option<Anchor>,
+    /// The selected entry.
+    pub selected: Option<EntryKey>,
     /// Explicit expansion overrides; absent keys follow the caller's default.
     overrides: HashMap<EntryKey, bool>,
-    pub query: String,
 }
 impl View {
     pub fn is_expanded(&self, key: &EntryKey, default: bool) -> bool {
@@ -365,10 +418,12 @@ impl Entry {
         self.disclosure() == Some(Disclosure::Open)
     }
 
-    /// Inline reasoning and the working indicator are not navigable or copyable.
+    /// Inline reasoning, the working indicator and what stands for entries not loaded
+    /// are not navigable or copyable.
     pub fn selectable(&self) -> bool {
         self.expandable()
-            || !(self.surface == Surface::Reasoning || matches!(self.key, EntryKey::Working(_)))
+            || !(self.surface == Surface::Reasoning
+                || matches!(self.key, EntryKey::Working(_) | EntryKey::Gap(_)))
     }
 
     /// Projection chooses key variants from semantic source kinds; untrusted
@@ -441,15 +496,14 @@ mod tests {
     use super::super::tool_view::Run;
     use super::*;
     use crate::tui::{app::OutputStore, tool_view::tests::view};
-    use skyhook::agent::{ObservationSnapshot, ObservedEvent, RuntimeEvent};
+    use skyhook::agent::{ObservedEvent, RuntimeEvent};
     use skyhook::identity::SessionId;
     use skyhook::provider::protocol::{Binding, Provenance, Replay, ReplayFormat, Scope};
 
     /// Install a job view of `fields` as `job`'s output through the store's refresh path.
     pub(super) fn loaded(outputs: &mut OutputStore, job: JobId, fields: serde_json::Value) {
         let (attempt, _) = outputs.begin(job).unwrap();
-        let first = skyhook::job::Invocation::default();
-        outputs.complete(attempt, Some(first), Ok(view(fields)));
+        outputs.complete(attempt, Ok(view(fields)));
     }
 
     pub(super) fn header_text(runs: &[Run]) -> String {
@@ -461,7 +515,7 @@ mod tests {
     }
 
     /// Apply one runtime event as the next revision.
-    pub(super) fn update(snapshot: &mut ObservationSnapshot, event: RuntimeEvent) {
+    pub(super) fn update(snapshot: &mut skyhook::agent::ObservationSnapshot, event: RuntimeEvent) {
         snapshot.apply(ObservedEvent {
             revision: snapshot.revision + 1,
             event,

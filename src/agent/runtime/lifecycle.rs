@@ -38,7 +38,7 @@ impl SessionRuntime {
         let (mcp, mut startup_warnings) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
         let root = AgentId::root(store.id());
-        let running = store.read(|state| state.agents.contract(&root)?.mode.clone());
+        let running = store.read(|state| state.agents.journaled(&root)?.contract.mode.clone());
         let default = harness.mode.as_ref();
         startup_warnings.extend(modes::drift_warning(running.as_ref(), &modes, default));
         let executor = ToolExecutor::with_authorization(
@@ -69,12 +69,8 @@ impl SessionRuntime {
             questions,
         });
         let _ = runtime_slot.set(Arc::downgrade(&runtime));
-        let retained = runtime.clone();
-        let install = move |state: &mut CoreState| {
-            let children = retained.jobs.retained_children(state);
-            retained.install_retained(state, children);
-        };
-        runtime.store.live(install).await;
+        let restarter: Arc<dyn crate::job::Restarter> = runtime.clone();
+        runtime.jobs.restart_with(Arc::downgrade(&restarter));
         Ok(runtime)
     }
 
@@ -94,7 +90,7 @@ impl SessionRuntime {
     ) -> Result<(), HarnessError> {
         let (mut events, outputs) = self.jobs.interrupt_running().await?;
         let activate = move |state: &crate::session::CoreState| {
-            let ledger = &state.ledger;
+            let ledger = &state.requests;
             for (request, record) in ledger.iter() {
                 if let crate::session::RequestPhase::Open { attempt, .. } = record.phase {
                     let attempt = crate::session::AttemptRef { request, attempt };
@@ -110,7 +106,7 @@ impl SessionRuntime {
             // A reopened session waits for `continue` or a prompt, as an interrupted
             // one does: what it stopped, and the deliveries it closed with.
             let paused = move |state: &mut CoreState, _: &[_]| {
-                state.agents.flow = Flow::Paused;
+                state.agents.set_flow(Flow::Paused);
                 resume(state);
             };
             Ok::<_, SessionError>(Plan::new(events, paused).saving(outputs))
@@ -157,8 +153,8 @@ impl SessionRuntime {
     /// and pause the session if that stopped anything. Each agent's part depends
     /// only on its own turn and work. A busy turn holding foreground child
     /// invocations is held on them, and any other is stopped. A child invocation
-    /// yet to begin is stopped before it does: the input that begins it runs as
-    /// an interrupted turn. An agent between turns gives up the input it had yet
+    /// yet to begin is stopped before it does, whether or not its owner's loop
+    /// runs: the input that begins it runs as an interrupted turn. An agent between turns gives up the input it had yet
     /// to take, as a stopped turn gives up what was queued for it, and leaves its
     /// deliveries pending. Each of those counts once.
     ///
@@ -170,9 +166,8 @@ impl SessionRuntime {
     /// it launched.
     pub(super) fn stop_turns(&self, state: &mut CoreState, root: &AgentId) -> usize {
         let (mut stopped, mut blocking) = (Vec::new(), Vec::new());
-        let mut count = 0;
+        let mut count = state.jobs.preempt_unbegun();
         for agent in state.agents.within(root) {
-            count += state.jobs.preempt(&agent);
             let work = state.jobs.live_work(&agent);
             let takes = driver::takes_deliveries(state, &agent);
             let facts = state.agents.get_mut(&agent).expect("listed agents run");
@@ -202,7 +197,7 @@ impl SessionRuntime {
         (self.jobs).cancel_trees(state, blocking, CancelScope::Outcome);
         count += stopped.len();
         if count > 0 {
-            state.agents.flow = Flow::Paused;
+            state.agents.set_flow(Flow::Paused);
         }
         count
     }
@@ -211,16 +206,36 @@ impl SessionRuntime {
     /// an interrupt cancels model futures before their owning job has finished
     /// journaling. Each such turn's token is cancelled and nothing admits it
     /// further, so it always ends. A held turn is not among them: it unwinds
-    /// only once `continue` or new input moves it on.
+    /// only once `continue` or new input moves it on. A launch the interrupt
+    /// stopped before it began can still begin, parked interrupted, after this
+    /// registers: its job is waited for too once it has.
     pub(super) async fn settle_interrupts(&self) {
-        let published = |state: &mut CoreState| {
-            let interrupted = (state.agents).turned(&Turn::Parked(TurnFailure::Interrupted));
-            state
-                .jobs
-                .interruptions_published(&interrupted)
-                .then_some(())
+        let running = |state: &mut CoreState| {
+            let agents = state.agents.keys().cloned().collect::<Vec<_>>();
+            (agents, state.jobs.preempted().collect::<Vec<_>>())
         };
-        let _ = self.store.until(published).await;
+        let published = |(agents, preempted): (Vec<AgentId>, Vec<JobId>)| {
+            let agent_keys = agents.iter().cloned().map(Key::Agent);
+            let keys = agent_keys.chain(preempted.iter().copied().map(Key::Job));
+            let keys = keys.collect::<Vec<_>>();
+            let published = move |state: &CoreState| {
+                let interrupted = |agent: &&AgentId| {
+                    (state.agents.get(*agent))
+                        .is_some_and(|facts| facts.turn == agents::INTERRUPTED)
+                };
+                let interrupted = agents
+                    .iter()
+                    .filter(interrupted)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                state
+                    .jobs
+                    .interruptions_published(&interrupted, &preempted)
+                    .then_some(())
+            };
+            Wait::on(keys, published)
+        };
+        let _ = self.store.until_after(running, published).await;
     }
 
     /// Queue `command` for the root, in one commit with the release of every
@@ -239,11 +254,10 @@ impl SessionRuntime {
     ) -> Result<(), HarnessError> {
         self.settle_interrupts().await;
         let (root, jobs) = (root.clone(), self.jobs.clone());
-        let runtime = self.clone();
         let queue = move |state: &CoreState| {
-            let admitted = state.phase.admits(Command::Submit);
+            let admitted = state.phase().admits(Command::Submit);
             let Some(facts) = state.agents.get(&root).filter(|_| admitted.is_ok()) else {
-                let refusal = || refused_input(&state.phase);
+                let refusal = || refused_input(state.phase());
                 command.refuse(refusal);
                 return Err(refusal());
             };
@@ -254,7 +268,7 @@ impl SessionRuntime {
                 !joins && facts.turn == Turn::Busy && links.iter().any(|(_, owner)| owner == &root);
             let released = crate::job::release_records(&links);
             Ok(Plan::new(released, move |state, _| {
-                state.agents.flow = Flow::Open;
+                state.agents.set_flow(Flow::Open);
                 let mut stopped = Vec::new();
                 for agent in held.into_iter().chain(ends.then(|| root.clone())) {
                     let facts = state.agents.get_mut(&agent).expect("agents stay");
@@ -270,8 +284,7 @@ impl SessionRuntime {
                 }
                 // Each link the interrupt stopped ends interrupted now, so its
                 // released wait returns that, and `continue` resumes it.
-                let unaccepted = jobs.conclude(state, crate::job::Concluding::Released(&links));
-                runtime.install_retained(state, unaccepted);
+                jobs.conclude(state, crate::job::Concluding::Released(&links));
                 state.agents.send(&root, command);
             }))
         };
@@ -380,14 +393,10 @@ mod tests {
         SessionHandle,
         tokio::task::JoinHandle<Result<String, HarnessError>>,
     ) {
-        let delegate = |id: &str, depth: u32| {
-            let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
-            tool_call(0, id, "agent", arguments)
-        };
         let sleep = tool_call(1, "sleep", "exec", json!({"command": "sleep 30"}));
         let steps = [
-            Step::new(response(vec![delegate("child", 1)])),
-            Step::new(response(vec![delegate("grandchild", 0), sleep])),
+            Step::new(response(vec![delegation("child", 1)])),
+            Step::new(response(vec![delegation("grandchild", 0), sleep])),
             Step::new(Vec::new()).midstream(),
         ];
         let requests = Requests::default();
@@ -425,6 +434,7 @@ mod tests {
         let exec = executor.execute(session.root.clone(), "exec", launch, None);
         let exec = exec.await.unwrap().job;
         until(&session, exec, |job| job.state == JobState::Running).await;
+        let cancellation = jobs.cancellation_token(exec).await.unwrap();
         // Nothing commits once the next commit fails.
         let _refused = crate::session::tests::refuse(store, "BEFORE INSERT ON entry");
         let records = store.records();
@@ -449,9 +459,9 @@ mod tests {
         assert!(failed(bounded(parent).await.unwrap()));
         assert!(failed(session.continue_turn().await));
         assert!(session.runtime.agents(|agents| agents.is_empty()));
-        assert!(jobs.cancellation_token(exec).unwrap().is_cancelled());
+        assert!(cancellation.is_cancelled());
         assert_eq!(store.records(), records);
-        let viewed = session.observe().snapshot;
+        let viewed = session.store().observe().snapshot;
         assert!(viewed.phase.failure().is_some());
         let interrupted = crate::agent::AgentActivity::Stopped(TurnFailure::Interrupted);
         assert_eq!(viewed.activity[&session.root].state, interrupted);
@@ -469,7 +479,7 @@ mod tests {
         resumed.running().await.unwrap();
         let records = resumed.runtime.store.records();
         let released = events!(&records, SessionEvent::JobReleased { job } => *job);
-        let held = resumed.runtime.jobs.list(&resumed.root);
+        let held = resumed.runtime.jobs.list(&resumed.root).await.unwrap();
         let held = held.into_iter().find(|job| job.tool == "agent").unwrap();
         assert!(released.contains(&held.id));
         assert_eq!(held.state, JobState::Interrupted);
@@ -507,7 +517,7 @@ mod tests {
         let resumed = harness.resume_session(id).await.unwrap();
         let child = resumed.root.child(1);
         let delegated = async |owner: &AgentId| {
-            let jobs = resumed.runtime.jobs.list(owner);
+            let jobs = resumed.runtime.jobs.list(owner).await.unwrap();
             jobs.into_iter().find(|job| job.tool == "agent").unwrap()
         };
         for owner in [&resumed.root, &child] {
@@ -537,7 +547,7 @@ mod tests {
         assert!(bounded(parent).await.unwrap().is_err());
         let child = session.root.child(1);
         for owner in [&session.root, &child] {
-            let jobs = session.runtime.jobs.list(owner);
+            let jobs = session.runtime.jobs.list(owner).await.unwrap();
             let agent = jobs.iter().find(|job| job.tool == "agent").unwrap();
             until(&session, agent.id, |job| job.state == JobState::Interrupted).await;
         }
@@ -594,7 +604,7 @@ mod tests {
             held_on_interrupted_child(root.path(), after).await;
         session.runtime.jobs.cancel(job).await.unwrap();
         provider.request(3).await;
-        let jobs = session.runtime.jobs.list(&session.root);
+        let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         assert!(jobs.iter().any(|job| job.tool == "script"), "{jobs:?}");
         assert_eq!(session.interrupt().await, 1);
         let ended = bounded(parent).await.unwrap();
@@ -648,7 +658,7 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let delegated: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::JobCreated { .. });
-        let interrupted = interrupt_on(&session, delegated).await;
+        let interrupted = interrupt_on(&session, &session.root, delegated).await;
         let parent = spawn_prompt(&session, "delegate");
         assert_eq!(bounded(interrupted).await, 2);
         let ended = bounded(parent).await.unwrap();
@@ -692,7 +702,7 @@ mod tests {
         assert_eq!(session.interrupt().await, 1);
         assert_eq!(turn(&session, &session.root), Turn::Held);
         let jobs = &session.runtime.jobs;
-        let work = jobs.list(&child)[0].id;
+        let work = jobs.list(&child).await.unwrap()[0].id;
         jobs.send(work, json!("released")).await.unwrap();
         until_pending(&session, &child).await;
         assert_eq!(turn(&session, &child), Turn::Idle, "it took a delivery");
@@ -708,23 +718,30 @@ mod tests {
     /// prompt its launch committed.
     #[tokio::test]
     async fn interrupt_stops_a_child_that_has_yet_to_begin() {
-        type Landing = fn(&SessionEvent) -> bool;
-        let delegated: Landing =
-            |event| matches!(event, SessionEvent::JobCreated { tool, .. } if tool == "agent");
-        let launched: Landing = |event| matches!(event, SessionEvent::AgentStarted { .. });
+        // The record the interrupt lands behind, and whose record it is.
+        type Landing = (fn(&SessionEvent) -> bool, fn(&AgentId) -> AgentId);
+        let delegated: Landing = (
+            |event| matches!(event, SessionEvent::JobCreated { tool, .. } if tool == "agent"),
+            AgentId::clone,
+        );
+        let launched: Landing = (
+            |event| matches!(event, SessionEvent::AgentStarted { .. }),
+            |root| root.child(1),
+        );
         let child = json!({"prompt": "child task", "depth": 0});
         let script =
             |position, id| tool_call(position, id, "script", json!({"source": "return 1;"}));
         let alone = || vec![tool_call(0, "child", "agent", child.clone())];
         let beside = || [alone(), vec![script(1, "first"), script(2, "second")]].concat();
-        // The calls made before the interrupt lands, which alone exist, and what
-        // it stops: an installed child also gives up its owner's input.
-        for (calls, landing, created, stopped) in [
-            (alone(), delegated, 1, 2),
-            (beside(), delegated, 1, 2),
-            (alone(), launched, 1, 3),
-            (beside(), launched, 3, 3),
+        // What the interrupt stops: an installed child also gives up its
+        // owner's input.
+        for (calls, (landing, lander), stopped) in [
+            (alone(), delegated, 2),
+            (beside(), delegated, 2),
+            (alone(), launched, 3),
+            (beside(), launched, 3),
         ] {
+            let count = calls.len();
             let steps = [
                 Step::new(response(calls)),
                 Step::new(answer("child done")),
@@ -751,7 +768,8 @@ mod tests {
             );
             // Both queued behind the landing commit, ahead of the child's first take.
             let interrupting = session.clone();
-            let interrupted = on_commit(&session.runtime.store, landing, move || {
+            let lander = lander(&session.root);
+            let interrupted = on_commit(&session.runtime.store, &lander, landing, move || {
                 interrupting.runtime.store.enqueue(move |state| {
                     state.agents.send(&child, queued);
                 });
@@ -762,15 +780,15 @@ mod tests {
             assert_eq!(bounded(interrupted).await, stopped);
             assert!(!matches!(bounded(owner_input).await, Ok(Ok(_))));
             assert_eq!(turn(&session, &session.root), Turn::Held);
-            let jobs = session.runtime.jobs.list(&session.root);
+            let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
             let delegation = jobs.iter().find(|job| job.tool == "agent").unwrap().id;
             until(&session, delegation, |job| {
                 job.state == JobState::Interrupted
             })
             .await;
             // A response's calls all exist before any runs.
-            let jobs = session.runtime.jobs.list(&session.root);
-            assert_eq!(jobs.len(), created, "calls made after the interrupt");
+            let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
+            assert_eq!(jobs.len(), count, "a response's jobs exist together");
             assert!(!provider.requested_from(1), "the child requested");
             assert_eq!(turn(&session, &session.root.child(1)), INTERRUPTED);
             assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
@@ -822,9 +840,15 @@ mod tests {
                 std::iter::successors(Some(session.root.clone()), |link| Some(link.child(1)))
                     .take(depth as usize)
                     .collect();
+            let last = links.last().unwrap();
+            let lander = if accepted {
+                last.child(1)
+            } else {
+                last.clone()
+            };
             if redirect {
                 // Queued behind the last delegation, ahead of its launch.
-                let interrupted = interrupt_on(&session, landing).await;
+                let interrupted = interrupt_on(&session, &lander, landing).await;
                 let parent = spawn_prompt(&session, "delegate");
                 assert_eq!(bounded(interrupted).await, depth as usize + 1);
                 for link in &links {
@@ -837,11 +861,9 @@ mod tests {
             }
             let closing = session.clone();
             let store = &session.runtime.store;
-            let shutdown = on_commit(
-                store,
-                landing,
-                move || async move { closing.shutdown().await },
-            );
+            let shutdown = on_commit(store, &lander, landing, move || async move {
+                closing.shutdown().await
+            });
             let shutdown = shutdown.await;
             let parent = spawn_prompt(&session, "delegate");
             bounded(shutdown).await.unwrap();
@@ -850,12 +872,12 @@ mod tests {
             session.close().await.unwrap();
             drop(session);
             let resumed = harness.resume_session(id).await.unwrap();
-            let delegation = |owner: &AgentId| {
-                let jobs = resumed.runtime.jobs.list(owner).into_iter();
+            let delegation = async |owner: &AgentId| {
+                let jobs = resumed.runtime.jobs.list(owner).await.unwrap().into_iter();
                 jobs.into_iter().find(|job| job.tool == "agent").unwrap()
             };
             for link in &links {
-                let delegated = delegation(link);
+                let delegated = delegation(link).await;
                 assert_eq!(delegated.state, JobState::Interrupted, "{link}");
                 assert!(delegated.resumable, "{link}");
             }
@@ -863,10 +885,10 @@ mod tests {
             bounded(resumed.continue_turn()).await.unwrap();
             let (last, above) = links.split_last().unwrap();
             for link in above {
-                let state = terminal(&resumed, delegation(link).id).await.state;
+                let state = terminal(&resumed, delegation(link).await.id).await.state;
                 assert_eq!(state, JobState::Completed, "{link}");
             }
-            let state = terminal(&resumed, delegation(last).id).await.state;
+            let state = terminal(&resumed, delegation(last).await.id).await.state;
             assert_eq!(state, JobState::Completed, "{last}");
             let records = resumed.runtime.store.records();
             let started = count!(&records, SessionEvent::AgentStarted { .. });
@@ -964,7 +986,7 @@ mod tests {
         resumed.running().await.unwrap();
         assert!(pending(&resumed, &resumed.root));
         assert_eq!(turn(&resumed, &resumed.root), INTERRUPTED);
-        let activity = resumed.observe().snapshot.activity;
+        let activity = resumed.store().observe().snapshot.activity;
         assert!(activity[&resumed.root].state.is_retryable());
         let held = Turn::Parked(TurnFailure::from(&HarnessError::ImageLimit));
         let resumed = refuse_and_reopen(&harness, resumed, held.clone()).await;
@@ -1069,8 +1091,8 @@ mod tests {
         (root, session, prepared, parent)
     }
 
-    fn delegated(session: &SessionHandle) -> Option<crate::job::JobEnvelope> {
-        let jobs = session.runtime.jobs.list(&session.root);
+    async fn delegated(session: &SessionHandle) -> Option<crate::job::JobEnvelope> {
+        let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         jobs.into_iter().find(|job| job.tool == "delegate")
     }
 
@@ -1091,7 +1113,7 @@ mod tests {
         let receipts = bounded(enqueue_prompts(&session, vec![redirect])).await;
         assert!(receipts[0].is_ok());
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "redirected");
-        let job = delegated(&session).unwrap();
+        let job = delegated(&session).await.unwrap();
         assert_eq!(job.state, JobState::Interrupted);
         let continued = bounded(session.continue_turn_with(Selection::default())).await;
         assert_eq!(continued.unwrap().children_resumed, 1);
@@ -1141,7 +1163,7 @@ mod tests {
         let restarted: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::JobStateChanged { .. });
         // Queued behind the restart, ahead of the child taking its input.
-        let interrupted = interrupt_on(&session, restarted).await;
+        let interrupted = interrupt_on(&session, &session.root, restarted).await;
         let continued = tokio::spawn({
             let session = session.clone();
             async move { session.continue_turn().await }
@@ -1153,5 +1175,108 @@ mod tests {
         bounded(session.continue_turn()).await.unwrap();
         assert_eq!(terminal(&session, job).await.state, JobState::Completed);
         session.shutdown().await.unwrap();
+    }
+
+    /// So is a restarted grandchild whose owner has parked, so that no loop of
+    /// either runs when the interrupt lands.
+    #[tokio::test]
+    async fn interrupt_stops_a_restarted_grandchild_under_a_parked_owner() {
+        let answers = [
+            "grandchild done",
+            "child done",
+            "root done",
+            "grandchild again",
+        ];
+        let delegations = [delegation("child", 1), delegation("grandchild", 0)];
+        let steps = (delegations.map(|call| Step::new(response(vec![call]))))
+            .into_iter()
+            .chain(answers.map(|text| Step::new(answer(text))));
+        let provider = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        let child = session.root.child(1);
+        // A child parks only once nothing below it runs.
+        until_parked(&session, &child).await;
+        let owned = session.runtime.jobs.list(&child).await.unwrap();
+        let job = owned.iter().find(|job| job.tool == "agent").unwrap().id;
+        let restarted: fn(&SessionEvent) -> bool =
+            |event| matches!(event, SessionEvent::JobStateChanged { .. });
+        let interrupted = interrupt_on(&session, &child, restarted).await;
+        session.runtime.jobs.send(job, json!("more")).await.unwrap();
+        assert_eq!(bounded(interrupted).await, 1);
+        until(&session, job, |job| job.state == JobState::Interrupted).await;
+        assert!(!provider.requested_from(5), "the grandchild requested");
+        session.shutdown().await.unwrap();
+    }
+
+    /// A launch an interrupt stopped before it began can begin, parked
+    /// interrupted, after that interrupt's settling registered and while another
+    /// child's interruption is still publishing: settling waits for the
+    /// launch's interruption too.
+    #[tokio::test]
+    async fn settling_an_interrupt_waits_for_a_preempted_launch_that_begins_later() {
+        use crate::agent::runtime::wait::tests::{answer, call, start, tracking};
+        use crate::job::tests::hold_finish;
+        use futures_util::FutureExt;
+        let child = |prompt, bg| json!({"prompt": prompt, "model": "wait-test/child", "bg": bg});
+        let tracking = tracking(vec![
+            ("root", call("first", "agent", child("first", true))),
+            ("child", answer()),
+            ("root", call("second", "agent", child("second", false))),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let parent = spawn_prompt(&session, "delegate");
+        tracking.pass(0).await;
+        tracking.request(1).await;
+        let (first, second) = (session.root.child(1), session.root.child(2));
+        let store = &session.runtime.store;
+        let hold = |child: &AgentId, held| {
+            let child = child.clone();
+            store.live(move |state| hold_finish(state, &child, held))
+        };
+        // The first child's interruption publishes only once let go, and so does
+        // the second's once it begins parked: that wait registers ahead of it.
+        hold(&first, true).await;
+        let parked = {
+            let (parked, held) = (second.clone(), second.clone());
+            let decide = move |state: &CoreState| {
+                (state.agents.get(&parked)?.turn == INTERRUPTED).then_some(())
+            };
+            let take = move |state: &mut CoreState, ()| hold_finish(state, &held, true);
+            let (wait, store) = (
+                Wait::taking([Key::Agent(second.clone())], decide, take),
+                store.clone(),
+            );
+            let mut parked = Box::pin(async move { store.until(wait).await });
+            assert!(parked.as_mut().now_or_never().is_none());
+            tokio::spawn(parked)
+        };
+        // Interrupt, and register its settling, right behind the second call's
+        // creation and ahead of its launch.
+        let created = |event: &SessionEvent| matches!(event, SessionEvent::JobCreated { arguments, .. } if arguments["prompt"] == "second");
+        let (interrupting, runtime) = (session.clone(), session.runtime.clone());
+        let interrupted = on_commit(store, &session.root, created, move || {
+            let mut interrupted = Box::pin(async move { interrupting.interrupt().await });
+            assert!(interrupted.as_mut().now_or_never().is_none());
+            let mut settled = Box::pin(async move { runtime.settle_interrupts().await });
+            assert!(settled.as_mut().now_or_never().is_none());
+            async move { (interrupted.await, settled) }
+        })
+        .await;
+        tracking.release(2);
+        let (_, mut settled) = bounded(interrupted).await;
+        bounded(parked).await.unwrap().unwrap();
+        let delegated = session.runtime.jobs.list(&session.root).await.unwrap()[0].id;
+        hold(&first, false).await;
+        until(&session, delegated, |job| job.state.is_terminal()).await;
+        let early = settled.as_mut().now_or_never().is_some();
+        hold(&second, false).await;
+        assert!(!early, "settled before the preempted launch published");
+        bounded(settled).await;
+        session.shutdown().await.unwrap();
+        let _ = bounded(parent).await;
     }
 }

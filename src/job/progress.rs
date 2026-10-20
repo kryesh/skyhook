@@ -1,15 +1,13 @@
-//! Incremental projection of durable, exclusive child-agent progress.
+//! Durable, exclusive child-agent progress, which the job fold counts.
 //!
 //! Count committed assistant messages, not requests/usage (which include retries and
 //! compaction), and owned job creations, not assistant tool-call blocks (which miss
 //! calls launched inside scripts). Retained resumes keep the same agent identity.
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    identity::{AgentId, JobId},
-    session::{EventRecord, Message, SessionEvent, StateJob, StateJobKind},
+    identity::JobId,
+    session::{StateJob, StateJobKind},
 };
 
 /// A child agent's durable progress: committed turns and jobs it created.
@@ -19,80 +17,39 @@ pub struct AgentProgress {
     pub tool_calls: u64,
 }
 
-#[derive(Default)]
-pub(super) struct Progress {
-    counts: HashMap<AgentId, AgentProgress>,
-}
-
-impl Progress {
-    pub fn project(&mut self, record: &EventRecord) {
-        let (turns, tool_calls) = match &record.event {
-            SessionEvent::MessageCommitted {
-                message: Message::Assistant(_),
-            } => (1, 0),
-            SessionEvent::JobCreated { .. } => (0, 1),
-            _ => return,
-        };
-        let counts = self.counts.entry(record.agent.clone()).or_default();
-        counts.turns += turns;
-        counts.tool_calls += tool_calls;
-    }
-
-    pub fn for_agent(&self, agent: &AgentId) -> AgentProgress {
-        self.counts.get(agent).copied().unwrap_or_default()
-    }
-}
-
 /// Children follow agent ownership, not job parentage: scripts may launch agent
 /// jobs on their owner's behalf. Only active agent jobs appear below the root list.
 pub(super) fn active_job(
     id: JobId,
-    jobs: &HashMap<JobId, super::JobFacts>,
-    progress: &Progress,
+    jobs: &super::Jobs,
     capabilities: &crate::tool::policy::CapabilitySet,
     now_millis: i64,
     path: &mut std::collections::HashSet<JobId>,
 ) -> StateJob {
-    let entry = &jobs[&id];
+    let entry = jobs.get(id).expect("an active job is held");
     let child = entry.child();
     let launched = child.and_then(|child| child.agent.as_ref());
     let mut children = Vec::new();
     path.insert(id);
     if let Some(agent) = launched {
-        let mut child_ids = jobs
-            .iter()
-            .filter(|(job, child)| {
-                &child.agent == agent
-                    && child.end().is_none()
-                    && child.child().is_some()
-                    && !path.contains(job)
-            })
-            .map(|(job, _)| *job)
+        let child_ids = (jobs.unfinished(agent))
+            .filter(|(job, child)| child.child().is_some() && !path.contains(job))
+            .map(|(job, _)| job)
             .collect::<Vec<_>>();
-        child_ids.sort_unstable();
         for child in child_ids {
-            children.push(active_job(
-                child,
-                jobs,
-                progress,
-                capabilities,
-                now_millis,
-                path,
-            ));
+            children.push(active_job(child, jobs, capabilities, now_millis, path));
         }
     }
     path.remove(&id);
     StateJob {
         job: id,
-        kind: if child.is_some() {
-            StateJobKind::Agent {
-                progress: launched
-                    .map_or_else(AgentProgress::default, |agent| progress.for_agent(agent)),
-            }
-        } else {
-            StateJobKind::Tool {
+        kind: match child {
+            Some(child) => StateJobKind::Agent {
+                progress: child.progress,
+            },
+            None => StateJobKind::Tool {
                 tool: entry.tool.clone(),
-            }
+            },
         },
         name: entry.name.clone(),
         state: entry.state().presented(),
@@ -268,9 +225,7 @@ mod tests {
                 })
             }
         });
-        jobs.set_resume_handler(delegated.id(), handler)
-            .await
-            .unwrap();
+        jobs.test_resume_with(delegated.id(), handler);
         let turns = |jobs: &[StateJob]| progress_of(&jobs[0]).map(|progress| progress.turns);
         assert_eq!(turns(&snapshot(&jobs, &root, false)), Some(1));
         jobs.test_finish(delegated.id(), Value::Null).await;
@@ -283,12 +238,11 @@ mod tests {
         crate::tests::bounded(jobs.wait(delegated.id(), true))
             .await
             .unwrap();
-        jobs.clear_resume_handler(delegated.id()).await;
 
         let restored = jobs.test_replay();
         // Completed agents remain omitted after replay, but retain progress for resumption.
         assert!(snapshot(&restored, &root, false).is_empty());
-        let retained = restored.facts(|jobs| jobs.progress.for_agent(&child));
-        assert_eq!(retained, progress(2, 2).unwrap());
+        let retained = restored.facts(|jobs| jobs.get(delegated.id())?.child().map(|c| c.progress));
+        assert_eq!(retained, progress(2, 2));
     }
 }

@@ -6,7 +6,7 @@ mod delivery;
 use crate::{
     identity::AgentId,
     job::{CancellationToken, WaitFloor, Waiting},
-    session::{CoreState, SessionStore},
+    session::{CoreState, Key, SessionStore, Wait},
     tool::{
         ToolContext, ToolError,
         diagnostic::{Effects, Operation, Subject},
@@ -62,19 +62,16 @@ impl Default for Coalescing {
 
 /// The newest revision `agent` scheduled once its window passes `since`, if
 /// any; None once the agent is gone.
-fn scheduled(
-    agent: &AgentId,
-    since: Option<u64>,
-) -> impl Fn(&mut CoreState) -> Option<Option<u64>> + Send + Sync + 'static {
-    let agent = agent.clone();
-    move |state: &mut CoreState| match state.agents.get(&agent) {
+fn scheduled(agent: &AgentId, since: Option<u64>) -> Wait<Option<u64>> {
+    let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+    Wait::on([key], move |state| match state.agents.get(&agent) {
         None => Some(None),
         Some(facts) => {
             let window = &facts.window;
             let since = since.unwrap_or(window.released);
             (window.scheduled > since).then_some(Some(window.scheduled))
         }
-    }
+    })
 }
 
 /// Release each burst of `agent`'s inputs and wakes as `window` decides: the
@@ -107,11 +104,11 @@ impl Coalescing {
             }
             #[cfg(test)]
             Self::Held(gate) => {
-                let agent = agent.clone();
-                let input = move |state: &mut CoreState| match state.agents.get(&agent) {
+                let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+                let input = Wait::on([key], move |state| match state.agents.get(&agent) {
                     None => Some(false),
                     Some(facts) => facts.window.holds_input().then_some(true),
-                };
+                });
                 tokio::select! {
                     permit = gate.acquire() => permit.map(tokio::sync::SemaphorePermit::forget).is_ok(),
                     input = store.until(input) => input.unwrap_or(false),
@@ -176,19 +173,33 @@ impl SessionRuntime {
         cancellation: &CancellationToken,
     ) -> Result<(), HarnessError> {
         let agent = agent.clone();
-        let mut requested = None;
-        let released = move |state: &mut CoreState| {
-            let Some(facts) = state.agents.get_mut(&agent) else {
-                return Some(());
+        let scheduled = {
+            let agent = agent.clone();
+            move |state: &mut CoreState| {
+                state.agents.get(&agent).map(|facts| facts.window.scheduled)
+            }
+        };
+        let released = move |requested: Option<u64>| {
+            let (key, decided) = (Key::Agent(agent.clone()), agent.clone());
+            // Without the agent there is nothing to wait out: it was gone when
+            // this registered, in the change that first decides it.
+            let decide = move |state: &CoreState| match (state.agents.get(&decided), requested) {
+                (Some(facts), Some(requested)) => {
+                    (facts.window.released >= requested).then_some(())
+                }
+                _ => Some(()),
             };
-            let window = &mut facts.window;
-            let requested = *requested.get_or_insert(window.scheduled);
-            (window.released >= requested).then(|| window.observed_inputs = window.ready_inputs)
+            let take = move |state: &mut CoreState, ()| {
+                if let Some(facts) = state.agents.get_mut(&agent) {
+                    facts.window.observed_inputs = facts.window.ready_inputs;
+                }
+            };
+            Wait::taking([key], decide, take)
         };
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(HarnessError::Interrupted),
-            released = self.store.until(released) => Ok(released?),
+            released = self.store.until_after(scheduled, released) => Ok(released?),
         }
     }
 
@@ -221,7 +232,8 @@ impl SessionRuntime {
         // The agent cannot act while its foreground work is outstanding, so that
         // takes precedence; the next request carries every event together. Waiting
         // for any open batch to release keeps a burst in one report.
-        let decided = move |state: &mut CoreState| {
+        let keys = [Key::Agent(agent.clone()), Key::Job(caller)];
+        let decided = move |state: &CoreState| {
             let waiting = state.jobs.waiting(&agent, caller);
             let Some(facts) = state.agents.get(&agent) else {
                 return Some(None);
@@ -251,6 +263,7 @@ impl SessionRuntime {
         // decided before its timeout can pass. An event ready with the timeout is
         // reported; one lost to it stays unseen.
         let park = move |state: &mut CoreState| state.jobs.park(caller);
+        let decided = move |()| Wait::on(keys, decided);
         tokio::select! {
             biased;
             decided = self.store.until_after(park, decided) => match decided {
@@ -271,7 +284,7 @@ impl SessionRuntime {
 // thread works. A timeout under test fires through `time_out` once nothing else
 // can end its wait.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use serde_json::Value;
@@ -280,7 +293,8 @@ mod tests {
     use super::{CAP, Coalescing, QUIET, WaitFloor, Waiting, burst};
     pub(super) use crate::agent::runtime::tests::{
         AssistantItem, Script, Step, activity_is, bounded, enqueue_prompts, ephemeral_session,
-        found, job_found, models, provider_name, rendered, response, spawn_prompt, until,
+        found, job_found, jobs_found, models, provider_name, rendered, response, spawn_prompt,
+        until,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     use crate::{
@@ -296,11 +310,13 @@ mod tests {
         Script::new(steps, &Default::default())
     }
 
-    pub(super) fn tracking(steps: Vec<(&'static str, AssistantItem)>) -> Arc<Script> {
+    pub(in crate::agent::runtime) fn tracking(
+        steps: Vec<(&'static str, AssistantItem)>,
+    ) -> Arc<Script> {
         tracking_all(steps.into_iter().map(|(m, c)| (m, vec![c])).collect())
     }
 
-    pub(super) fn call(id: &str, name: &str, arguments: Value) -> AssistantItem {
+    pub(in crate::agent::runtime) fn call(id: &str, name: &str, arguments: Value) -> AssistantItem {
         call_at(0, id, name, arguments)
     }
 
@@ -308,12 +324,14 @@ mod tests {
         AssistantItem::tool_call(id, position, ToolCall::new(id, name, arguments).unwrap())
     }
 
-    pub(super) fn answer() -> AssistantItem {
+    pub(in crate::agent::runtime) fn answer() -> AssistantItem {
         AssistantItem::text("answer", 0, "done".to_owned())
     }
 
     /// A session whose "root" and "child" profiles are answered by `tracking`.
-    pub(super) async fn start(tracking: &Arc<Script>) -> (tempfile::TempDir, Arc<SessionHandle>) {
+    pub(in crate::agent::runtime) async fn start(
+        tracking: &Arc<Script>,
+    ) -> (tempfile::TempDir, Arc<SessionHandle>) {
         start_coalescing(tracking, Coalescing::NONE).await
     }
 
@@ -357,12 +375,8 @@ mod tests {
         nth: usize,
         seconds: u64,
     ) {
-        let owner = owner.clone();
-        found(session, move |state| {
-            let mut waits = state.jobs.views().into_values();
-            let mut waits = waits
-                .by_ref()
-                .filter(|job| job.agent == owner && job.tool == "wait");
+        jobs_found(session, owner, [], move |state, jobs| {
+            let mut waits = jobs.into_iter().filter(|job| job.tool == "wait");
             waits
                 .nth(nth - 1)
                 .filter(|job| state.jobs.parked(job.id))
@@ -627,7 +641,7 @@ mod tests {
         let request = tracking.request(2).await;
         bounded(queued).await.unwrap().unwrap();
         assert_reason(&request, "hold", "event");
-        let state = session.runtime.jobs.snapshot(exec).unwrap().state;
+        let state = session.runtime.jobs.snapshot(exec).await.unwrap().state;
         assert_eq!(state, JobState::Running);
         tracking.release(2);
         bounded(turn).await.unwrap().unwrap();
@@ -660,13 +674,13 @@ mod tests {
         let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let scripts = async || {
-            let jobs = session.runtime.jobs.list(&session.root);
+            let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
             jobs.into_iter()
                 .filter(|job| job.tool == "script")
                 .collect::<Vec<_>>()
         };
         let wait = running_job(&session, &session.root, "wait").await;
-        let deferring = session.runtime.jobs.snapshot(wait).unwrap().parent;
+        let deferring = session.runtime.jobs.snapshot(wait).await.unwrap().parent;
         let queued = tokio::spawn({
             let session = session.clone();
             async move {
@@ -678,10 +692,11 @@ mod tests {
         });
         // The input's batch releases, yet the wait defers to the sleeping script.
         let root = session.root.clone();
-        let released = move |state: &mut CoreState| {
+        let key = Key::Agent(root.clone());
+        let released = Wait::on([key], move |state| {
             let window = &state.agents.get(&root)?.window;
             (window.ready_inputs != window.observed_inputs).then_some(())
-        };
+        });
         bounded(session.runtime.store.until(released))
             .await
             .unwrap();
@@ -785,7 +800,7 @@ mod tests {
         let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let root = session.root.clone();
-        found(&session, move |state| {
+        found(&session, [Key::Agent(root.clone())], move |state| {
             let waits = state
                 .jobs
                 .views()
@@ -877,10 +892,10 @@ mod tests {
         let wait = running_job(&session, root, "wait").await;
         // Parked, the wait has set its deadline.
         let owner = root.clone();
-        let parked = move |state: &mut CoreState| {
+        let parked = Wait::on([Key::Agent(owner.clone())], move |state| {
             let held = state.jobs.live_work(&owner).holding.is_some();
             (state.jobs.parked(wait) && !held).then_some(())
-        };
+        });
         bounded(store.until(parked)).await.unwrap();
         // Input arrives in the timer pass that fires the wait's timeout, ahead of
         // the wait, which then finds both ready.
@@ -915,19 +930,17 @@ mod tests {
         // Whichever wait reported it, the other only times out.
         let mut elapsed = false;
         loop {
-            let owner = root.clone();
-            let settled = move |state: &mut CoreState| {
-                if state.jobs.snapshot(script)?.state.is_terminal() {
+            let settled = move |state: &CoreState, jobs: Vec<crate::job::JobEnvelope>| {
+                let script = crate::job::tests::job_snapshot(state, script)?;
+                if script.state.is_terminal() {
                     return Some(true);
                 }
-                let views = state.jobs.views();
-                let mut waits =
-                    (views.values()).filter(|job| job.agent == owner && job.tool == "wait");
+                let mut waits = jobs.iter().filter(|job| job.tool == "wait");
                 // Parked, its deadline is set: time let pass sooner would not count.
                 let second = waits.nth(1)?.id;
                 (!elapsed && state.jobs.parked(second)).then_some(false)
             };
-            if found(&session, settled).await {
+            if jobs_found(&session, root, [Key::Job(script)], settled).await {
                 break;
             }
             crate::tests::elapse(std::time::Duration::from_secs(1)).await;
@@ -990,7 +1003,13 @@ mod tests {
             assert!(bounded(result).await.is_err(), "accepted {invalid}");
         }
         let source = "const direct = (await tool.wait({timeout:1})).result; const builder = (await tool.wait().timeout(1)).result; return [direct, builder];";
-        let jobs = session.runtime.jobs.list(&session.root).into_iter();
+        let jobs = session
+            .runtime
+            .jobs
+            .list(&session.root)
+            .await
+            .unwrap()
+            .into_iter();
         let refused = jobs.filter(|job| job.tool == "wait").count();
         let timeouts = async {
             time_out(&session, &session.root, refused + 1, 1).await;
@@ -1017,7 +1036,7 @@ mod tests {
         let next = tracking.request(1).await;
         let text = rendered(&next);
         assert!(text.contains("cancel"), "{text}");
-        let state = session.runtime.jobs.snapshot(job).unwrap().state;
+        let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
         assert_eq!(state, JobState::Cancelled);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
@@ -1046,7 +1065,7 @@ mod tests {
         assert_eq!(bounded(session.interrupt()).await, 1);
         assert!(bounded(turn).await.unwrap().is_err());
         for job in [script, waiting] {
-            let state = session.runtime.jobs.snapshot(job).unwrap().state;
+            let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
             assert_eq!(state, JobState::Cancelled, "job {job:?}");
         }
         // The unwinding turn must not reach another request boundary.

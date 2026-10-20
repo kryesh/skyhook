@@ -1,5 +1,5 @@
 //! Where a session is in its life, and what each phase admits.
-use super::{EventRecord, JournalFailure, SessionError};
+use super::{JournalFailure, SessionError};
 
 /// Where an open session is in its life.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -13,7 +13,9 @@ pub enum SessionPhase {
     /// new starts or resumes.
     ShuttingDown,
     /// Stopped by a write its journal could not take, as a crash stops it:
-    /// nothing more is journaled, and every later write reports the failure.
+    /// nothing more is journaled, and every later write reports the failure. Its
+    /// state is replaced by what reopening shows, so an observation that folds
+    /// this phase no longer follows the session: observe it again.
     Failed(JournalFailure),
     /// Its writer is closed and its lock released.
     Closed,
@@ -44,8 +46,6 @@ pub(crate) enum Command {
     Submit,
     Continue,
     Send,
-    /// Settle a child agent's job as its loop ends.
-    AgentExited,
     /// Record what running work does.
     Journal,
     BeginShutdown,
@@ -80,27 +80,24 @@ impl SessionPhase {
             (Running | ShuttingDown, BeginShutdown) | (ShuttingDown, Journal) => ShuttingDown,
             (
                 Running,
-                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send
-                | AgentExited | Journal,
+                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send | Journal,
             ) => Running,
             // Closing leaves an interruption suspended, as the journal leaves it for
             // the next process: settling it would let a released owner claim it.
             (
                 Viewing,
-                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send
-                | AgentExited | Journal,
+                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send | Journal,
             )
             | (Running, Activate)
             | (
                 ShuttingDown | Closed,
-                Activate | CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send
-                | AgentExited,
+                Activate | CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send,
             )
             | (Closed, Journal)
             | (
                 Failed(_),
                 Activate | CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send
-                | AgentExited | Journal | BeginShutdown | Close,
+                | Journal | BeginShutdown | Close,
             ) => return Err(self.refusal()),
         };
         let dated = match (self, &next) {
@@ -139,12 +136,9 @@ impl SessionPhase {
     }
 
     /// When the work a session that no longer runs left going stopped, as it is
-    /// read: at its last activity in `records`.
-    pub(crate) fn stopped_at<'a>(
-        &self,
-        records: impl IntoIterator<Item = &'a EventRecord, IntoIter: DoubleEndedIterator>,
-    ) -> Option<i64> {
-        (!self.runs()).then(|| EventRecord::last_activity(records).unwrap_or_default())
+    /// read: at its last activity.
+    pub(crate) fn stopped_at(&self, last_activity: Option<i64>) -> Option<i64> {
+        (!self.runs()).then(|| last_activity.unwrap_or_default())
     }
 }
 
@@ -165,7 +159,7 @@ mod tests {
                 let id = store.id();
                 drop(store);
                 let sessions = root.path().join("sessions");
-                let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
+                let store = SessionStore::open(&sessions, id).await.unwrap();
                 return (root, store, agent);
             }
             Running => {}
@@ -197,7 +191,6 @@ mod tests {
             Submit,
             Continue,
             Send,
-            AgentExited,
             Journal,
             BeginShutdown,
             Close,
@@ -277,7 +270,7 @@ mod tests {
                 let now = matches!(admitted, Some((_, Dated::Now)));
                 assert_eq!(dated_now, now, "{phase} {command:?}");
             }
-            assert_eq!(store.read(|state| state.phase.clone()), next);
+            assert_eq!(store.read(|state| state.phase().clone()), next);
         }
     }
 }

@@ -273,26 +273,7 @@ impl Menu {
     }
 }
 
-/// What sits over the conversation and takes the keys.
-pub enum Overlay {
-    Menu(Menu),
-    /// The query being typed for `/` search.
-    Search(Editor),
-}
-
 impl App {
-    pub fn menu(&self) -> Option<&Menu> {
-        match &self.overlay {
-            Some(Overlay::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
-    pub fn menu_mut(&mut self) -> Option<&mut Menu> {
-        match &mut self.overlay {
-            Some(Overlay::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
     /// Rows name their agent; the menu draws its live status and statistics.
     /// The status is also searchable, so the rows follow every change to it.
     fn agent_items(&self) -> Vec<Item<AgentId>> {
@@ -305,24 +286,20 @@ impl App {
     }
     /// Rebuild an open menu that lists live state, keeping its selection.
     pub(in crate::tui) fn refresh_menu(&mut self) {
-        let kind = match self.menu().map(|menu| &menu.kind) {
+        let kind = match self.menu.as_ref().map(|menu| &menu.kind) {
             Some(MenuKind::Agents(_)) => MenuKind::Agents(self.agent_items()),
             Some(MenuKind::Attachments(_)) => MenuKind::Attachments(self.attachment_items()),
             Some(MenuKind::Queue(_)) => MenuKind::Queue(self.queue_items()),
             _ => return,
         };
-        self.menu_mut().unwrap().replace_items(kind);
+        self.menu.as_mut().unwrap().replace_items(kind);
     }
     pub(super) fn open(&mut self, title: &str, kind: MenuKind) {
         self.next_menu_id.0 = self.next_menu_id.0.wrapping_add(1);
-        self.overlay = Some(Overlay::Menu(Menu::new(
-            self.next_menu_id,
-            title.into(),
-            kind,
-        )));
+        self.menu = Some(Menu::new(self.next_menu_id, title.into(), kind));
     }
     pub(super) fn menu_loaded(&mut self, loaded: MenuLoaded) -> bool {
-        let Some(menu) = self.menu_mut() else {
+        let Some(menu) = self.menu.as_mut() else {
             return false;
         };
         let (id, result) = match (loaded, &menu.kind) {
@@ -370,7 +347,7 @@ impl App {
                 key.code = KeyCode::Down;
             }
         }
-        let Some(menu) = self.menu_mut() else {
+        let Some(menu) = self.menu.as_mut() else {
             return;
         };
         let last = menu.filtered().len().saturating_sub(1);
@@ -390,7 +367,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc => self.overlay = None,
+            KeyCode::Esc => self.menu = None,
             KeyCode::Enter | KeyCode::Tab => self.choose(),
             KeyCode::Delete => self.delete_draft_item(),
             _ => {
@@ -400,18 +377,13 @@ impl App {
         }
     }
     pub(super) fn choose(&mut self) {
-        let menu = self
-            .overlay
-            .take_if(|overlay| matches!(overlay, Overlay::Menu(_)));
-        let Some(Overlay::Menu(menu)) = menu else {
+        let Some(menu) = self.menu.take() else {
             return;
         };
         let index = menu.selected_index();
         match (menu.kind, index) {
             (MenuKind::OutputSearch(job), _) => self.search_output(job, menu.input.text()),
-            (kind @ MenuKind::Info(_), _) => {
-                self.overlay = Some(Overlay::Menu(Menu { kind, ..menu }))
-            }
+            (kind @ MenuKind::Info(_), _) => self.menu = Some(Menu { kind, ..menu }),
             (_, None) => {}
             (MenuKind::Commands(items), Some(index)) => self.command(items[index].value),
             (MenuKind::Models(items), Some(index)) => self.model.clone_from(&items[index].value),
@@ -493,39 +465,39 @@ mod tests {
             (MenuKind::Output(JobId::new(42).unwrap(), vec![]), true),
         ] {
             app.open("Loading", kind.clone());
-            let complete = |app: &App, error| menu_completion(app.menu().unwrap(), error);
+            let complete = |app: &App, error| menu_completion(app.menu.as_ref().unwrap(), error);
             let closed_success = complete(&app, None);
             let closed_failure = complete(&app, Some("obsolete failure"));
             let stale_success = complete(&app, None);
             key(&mut app, KeyCode::Esc, M::NONE);
             app.dirty = false;
             app.work(closed_success);
-            assert!(app.menu().is_none());
+            assert!(app.menu.is_none());
             assert!(!app.dirty);
 
             app.open("Newer request", kind);
-            app.menu_mut().unwrap().input.insert("query");
+            app.menu.as_mut().unwrap().input.insert("query");
             app.work(closed_failure);
             app.work(stale_success);
-            assert!(app.menu().unwrap().kind.items().is_empty());
+            assert!(app.menu.as_ref().unwrap().kind.items().is_empty());
             assert!(!app.dirty && app.toast.is_none());
             // A current failure keeps the menu and reports a toast.
             if fallible {
                 app.work(complete(&app, Some("current failure")));
-                assert_eq!(app.menu().unwrap().title, "Newer request");
-                assert!(app.menu().unwrap().kind.items().is_empty());
+                assert_eq!(app.menu.as_ref().unwrap().title, "Newer request");
+                assert!(app.menu.as_ref().unwrap().kind.items().is_empty());
                 let toast = app.toast.take().map(|(toast, _)| toast);
                 assert_eq!(toast.as_deref(), Some("current failure"));
             }
             let (current, replaced) = (complete(&app, None), complete(&app, None));
             app.work(current);
-            let menu = app.menu().unwrap();
+            let menu = app.menu.as_ref().unwrap();
             assert_eq!(menu.kind.items()[0].label, "current");
             assert_eq!(menu.input.text(), "query");
 
             app.info("Replacement overlay", "Keep me".into());
             app.work(replaced);
-            assert_eq!(app.menu().unwrap().title, "Replacement overlay");
+            assert_eq!(app.menu.as_ref().unwrap().title, "Replacement overlay");
         }
     }
 
@@ -566,7 +538,7 @@ mod tests {
             ]),
         );
         let second = row(&mut app, 1);
-        let selected = |app: &App| app.menu().unwrap().selected();
+        let selected = |app: &App| app.menu.as_ref().unwrap().selected();
         mouse(&mut app, second, MouseEventKind::Moved);
         assert_eq!(selected(&app), 1);
         key(&mut app, KeyCode::Down, M::NONE);
@@ -590,7 +562,7 @@ mod tests {
         assert_eq!(app.selected, selected_agent);
         assert!(!app.dirty);
         key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(app.menu().is_none());
+        assert!(app.menu.is_none());
         assert_eq!(app.model, "test/second".parse().unwrap());
         let filtered = [
             ("test/hidden", "Hidden"),
@@ -598,7 +570,7 @@ mod tests {
             ("test/second", "Visible second"),
         ];
         app.open("Models", models(filtered));
-        app.menu_mut().unwrap().input.set("Visible".into());
+        app.menu.as_mut().unwrap().input.set("Visible".into());
         let visible_second = row(&mut app, 1);
         mouse(&mut app, visible_second, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
@@ -650,7 +622,7 @@ mod tests {
             mouse(&mut app, shown[row].1, MouseEventKind::Moved);
             mouse(&mut app, shown[row].1, MouseEventKind::Drag(left));
             assert_eq!(top(&mut app), first);
-            assert_eq!(app.menu().unwrap().selected(), first + row);
+            assert_eq!(app.menu.as_ref().unwrap().selected(), first + row);
         }
         // Up moves within the rows shown, then scrolls one at a time.
         for _ in 0..5 {
@@ -664,7 +636,7 @@ mod tests {
         // Clicking a row still chooses it.
         let shown = rows(&mut app);
         click(&mut app, shown[2].1);
-        assert!(app.menu().is_none());
+        assert!(app.menu.is_none());
         assert_eq!(app.model.to_string(), format!("test/model-{}", first + 2));
 
         let lines: Vec<_> = (0..60).map(|line| format!("line {line}")).collect();
@@ -674,7 +646,7 @@ mod tests {
         assert_eq!(shown[0].0, MENU_PAGE);
         drag(&mut app, &shown);
         assert_eq!(top(&mut app), MENU_PAGE);
-        assert!(app.menu().is_some_and(Menu::page));
+        assert!(app.menu.as_ref().is_some_and(Menu::page));
         assert!(app.selection.is_none() && app.clipboard.is_none());
         key(&mut app, KeyCode::Down, M::NONE);
         assert_eq!(top(&mut app), MENU_PAGE + 1);
@@ -709,7 +681,7 @@ mod tests {
         let tall = shown(&mut app, 32);
         let short = shown(&mut app, 22);
         assert!(short.len() < tall.len());
-        assert_eq!(app.menu().unwrap().selected(), 29);
+        assert_eq!(app.menu.as_ref().unwrap().selected(), 29);
         assert_eq!(short.last(), Some(&29));
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.model.to_string(), "test/model-29");

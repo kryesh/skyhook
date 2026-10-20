@@ -226,13 +226,12 @@ mod tests {
         let columns = width as usize;
         let layout = markdown::layout_highlighted(input, false, columns, cache);
         let rows = layout.lines.into_iter();
-        rows.map(|line| fixture_row(line.line, line.layout, 1, width, 0))
+        rows.map(|line| fixture_row(line.line, line.layout, 1, width))
             .collect()
     }
 
     fn copy_rows(rows: &[Row]) -> String {
-        let mut blocks = RowBlocks::default();
-        blocks.replace_entry(0, rows.to_vec(), Vec::new());
+        let blocks = RowBlocks::entry(rows.to_vec());
         let end = TextPosition {
             row: rows.len() - 1,
             byte: usize::MAX,

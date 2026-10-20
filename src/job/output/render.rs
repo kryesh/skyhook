@@ -99,20 +99,20 @@ impl Spliced {
                         .captures
                         .get(field)
                         .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
-                    let db = &saved.output.db;
-                    let extent = db.capture_extent(capture.id).map_err(database)?;
+                    let mut source =
+                        reader::CaptureReader::new(saved.output.reads.clone(), capture.id);
+                    let extent = source.extent()?;
+                    let mut prefix = Vec::new();
+                    // One byte more, so that a cut sees what follows it.
+                    let limit = preview::STRING_BYTES as u64 + 1;
+                    (&mut source).take(limit).read_to_end(&mut prefix)?;
                     let end = if presented.ends().contains(field) {
-                        reader::CaptureReader::new(db.clone(), capture.id)
-                            .end(extent.bytes, preview::TEXT_BYTES)?
+                        source.end(extent.bytes, preview::TEXT_BYTES)?
                     } else {
                         Vec::new()
                     };
                     self.clipped
                         .insert(field.clone(), ClippedText { extent, end });
-                    let mut prefix = Vec::new();
-                    // One byte more, so that a cut sees what follows it.
-                    let limit = preview::STRING_BYTES as u64 + 1;
-                    source.take(limit).read_to_end(&mut prefix)?;
                     // Cut at a character boundary, so the prefix is still text.
                     let whole = std::str::from_utf8(&prefix)
                         .map_or_else(|error| error.valid_up_to(), str::len);

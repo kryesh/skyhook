@@ -233,7 +233,7 @@ mod tests {
                 .test_running(JobSpec::test(agent.clone(), name))
                 .await
                 .into_test_id();
-            outputs.push(manager.output(id));
+            outputs.push(manager.output(id).await);
         }
         let second = outputs.pop().unwrap();
         let first = outputs.pop().unwrap();

@@ -3,7 +3,6 @@ use super::*;
 #[derive(Clone, Copy)]
 pub enum InputTarget {
     Menu,
-    Search,
     Prompt,
     Composer,
     None,
@@ -20,7 +19,7 @@ impl App {
     /// Drop any text selection and follow the viewed tab's latest activity.
     pub(super) fn follow_latest(&mut self) {
         self.selection = None;
-        self.view().scroll = None;
+        self.view().top = None;
     }
 
     /// View the agent above or below the viewed one in the tree, wrapping, at its
@@ -39,7 +38,7 @@ impl App {
             .visible(selected)
             .position(|i| &agents[i].id == selected);
         self.tree_cursor = cursor.unwrap_or(0);
-        self.view().scroll = None;
+        self.view().top = None;
         self.focus = Focus::Tree;
     }
 
@@ -71,11 +70,8 @@ impl App {
 
 impl App {
     pub fn input_target(&self) -> InputTarget {
-        if let Some(overlay) = &self.overlay {
-            match overlay {
-                Overlay::Menu(_) => InputTarget::Menu,
-                Overlay::Search(_) => InputTarget::Search,
-            }
+        if self.menu.is_some() {
+            InputTarget::Menu
         } else if self.prompt_shown() {
             InputTarget::Prompt
         } else if !self.selected.path().is_empty() {
@@ -91,21 +87,6 @@ impl App {
         }
         if matches!(target, InputTarget::Menu) {
             self.menu_key(key);
-            return;
-        }
-        if let Some(Overlay::Search(editor)) = &mut self.overlay {
-            match key.code {
-                KeyCode::Esc => self.overlay = None,
-                KeyCode::Enter => {
-                    let query = editor.text().to_owned();
-                    self.overlay = None;
-                    self.view().query = query;
-                    self.find(false);
-                }
-                _ => {
-                    editor.handle(key);
-                }
-            }
             return;
         }
         if matches!(target, InputTarget::Prompt) {
@@ -346,10 +327,10 @@ impl App {
                 _ => {}
             },
             Focus::Content => match key.code {
-                KeyCode::Home => self.view().scroll = Some(0),
-                KeyCode::End => self.view().scroll = None,
+                KeyCode::Home => self.scroll_to_span(Some(0)),
+                KeyCode::End => self.scroll_to(None),
                 KeyCode::Up | KeyCode::Down => {
-                    let current = self.view().row;
+                    let current = self.selected_entry().unwrap_or(0);
                     let next = if key.code == KeyCode::Up {
                         (0..current.min(self.entries().len()))
                             .rev()
@@ -359,7 +340,7 @@ impl App {
                             .find(|&index| self.entries()[index].selectable())
                     };
                     if let Some(next) = next {
-                        self.view().row = next;
+                        self.select_entry(next);
                         self.reveal_row();
                     }
                 }
@@ -367,13 +348,11 @@ impl App {
                 KeyCode::Char('[' | ']') => {
                     self.set_tab(self.tab.next(key.code == KeyCode::Char('[')));
                 }
-                KeyCode::Char('/') => self.overlay = Some(Overlay::Search(Editor::default())),
-                KeyCode::Char('n' | 'N') => self.find(key.code == KeyCode::Char('N')),
                 KeyCode::Char('y') => self.copy(),
                 KeyCode::Char('o') => self.output_menu(),
                 KeyCode::Char('c') => {
-                    let row = self.view().row;
-                    if let Some(job) = self.entries().get(row).and_then(|e| e.job_id()) {
+                    let row = self.selected_entry();
+                    if let Some(job) = row.and_then(|row| self.entries()[row].job_id()) {
                         self.confirm(ConfirmAction::CancelJob(job));
                     }
                 }
@@ -404,41 +383,89 @@ impl App {
         rows.saturating_sub(self.content_rect.height as usize)
     }
     /// The first transcript row in view: the pinned one, else the latest page.
-    pub(super) fn scroll_offset(&self) -> usize {
-        let view = self.viewed().and_then(|view| view.scroll);
-        view.unwrap_or(self.latest_row())
+    pub(in crate::tui) fn scroll_offset(&self) -> usize {
+        let latest = self.latest_row();
+        (self.render.scroll()).map_or(latest, |scroll| scroll.min(latest))
+    }
+    /// Pin the view's top at `row` of the rows laid out, or follow the newest entries.
+    pub(in crate::tui) fn scroll_to(&mut self, row: Option<usize>) {
+        let top = row.and_then(|row| crate::tui::render::anchor(self, row));
+        self.render.top = match (&top, row) {
+            (Some(_), Some(row)) => crate::tui::render::Top::Row(row),
+            _ => crate::tui::render::Top::Latest,
+        };
+        self.view().top = top;
+    }
+    /// Pin the view's top at `row` of the whole history's span, read there when it is
+    /// not loaded, or follow the newest entries.
+    pub(in crate::tui) fn scroll_to_span(&mut self, row: Option<usize>) {
+        match row.map(|row| crate::tui::render::Track::of(self).locate(row)) {
+            Some(crate::tui::render::Spot::Ordinal(ordinal)) => {
+                self.view().top = Some(model::Anchor::ordinal(ordinal));
+                self.render.top = crate::tui::render::Top::Pending;
+            }
+            Some(crate::tui::render::Spot::Row(row)) => self.scroll_to(Some(row)),
+            None => self.scroll_to(None),
+        }
     }
     pub(super) fn scroll(&mut self, delta: isize) {
+        // Until the view's anchor is laid out, or while only a window's loading rows
+        // are, the rows shown are not where it is: one read by ordinal moves by entries,
+        // a row each, as the track spans what is not loaded; any other stays. Only a
+        // page read there finds the end, and gives up a place past it for the newest.
+        if self.render.top == crate::tui::render::Top::Pending
+            || self.window.as_ref().is_some_and(model::Window::opening)
+        {
+            if let Some(top) = self.view().top.as_mut()
+                && let Some((model::Focus::Ordinal(ordinal), _)) = top.place
+            {
+                *top = model::Anchor::ordinal(ordinal.saturating_add_signed(delta as i64));
+            }
+            return;
+        }
         let latest = self.latest_row();
         let next = self
             .scroll_offset()
             .saturating_add_signed(delta)
             .min(latest);
-        self.view().scroll = (next != latest).then_some(next);
+        // The newest rows follow the newest entries once those are loaded.
+        let later = self.window.as_ref().is_some_and(|w| w.content.ends().1);
+        self.scroll_to((next != latest || later).then_some(next));
+    }
+    /// The selected entry, as the content shows it now.
+    pub(in crate::tui) fn selected_entry(&self) -> Option<usize> {
+        let key = self.viewed()?.selected.as_ref()?;
+        let entries = self.entries();
+        let hint = self.render.selected;
+        if entries.get(hint).is_some_and(|entry| entry.key() == key) {
+            return Some(hint);
+        }
+        entries.iter().position(|entry| entry.key() == key)
+    }
+    pub(in crate::tui) fn select_entry(&mut self, index: usize) {
+        let key = self.entries().get(index).map(|entry| entry.key().clone());
+        self.render.selected = index;
+        self.view().selected = key;
     }
     pub(super) fn reveal_row(&mut self) {
-        let row = self.view().row;
-        if let Some(line) = self.render.rows.entry_start(row) {
-            self.view().scroll = Some(line);
+        let line = (self.selected_entry()).and_then(|row| self.render.rows.entry_start(row));
+        if line.is_some() {
+            self.scroll_to(line);
         }
     }
     pub(super) fn toggle(&mut self) {
-        let row = self.view().row;
-        if let Some(entry) = self.entries().get(row)
+        let row = self.selected_entry();
+        if let Some(entry) = row.and_then(|row| self.entries().get(row))
             && entry.expandable()
         {
             // Borrow only metadata; do not clone the trace/document to toggle.
-            let key = entry.key().clone();
-            let (job, open) = (entry.job_id(), entry.open());
+            let (key, open) = (entry.key().clone(), entry.open());
             // An override from a toggle not yet rebuilt into the entries wins.
             let closing = self.view().is_expanded(&key, open);
             self.view().set_expanded(key.clone(), !closing);
             self.selection = None;
             self.content_cache.invalidate_entry(key);
             self.content_dirty = true;
-            if !closing && let Some(job) = job {
-                self.fetch_output(job);
-            }
         }
     }
     pub(super) fn select(&mut self, agent: AgentId) {
@@ -447,29 +474,6 @@ impl App {
         self.selection = None;
         self.invalidate_content();
     }
-    pub(super) fn find(&mut self, backwards: bool) {
-        let query = self.view().query.to_lowercase();
-        if query.is_empty() {
-            return;
-        }
-        let start = self.view().row;
-        let count = self.entries().len();
-        for step in 1..=count {
-            let index = if backwards {
-                (start + count - step) % count
-            } else {
-                (start + step) % count
-            };
-            if self.entries()[index].selectable()
-                && self.entries()[index].text().to_lowercase().contains(&query)
-            {
-                self.view().row = index;
-                self.reveal_row();
-                return;
-            }
-        }
-        self.toast("No matches");
-    }
     /// Copy the composer's selection while it is focused, else the transcript's,
     /// else the selected or last agent message.
     pub(super) fn copy(&mut self) {
@@ -477,9 +481,10 @@ impl App {
             .then(|| self.editor.selected_text())
             .flatten();
         let text = composer.or_else(|| self.selected_text()).or_else(|| {
-            let row = self.view().row;
             let entries = self.entries();
-            let selected = entries.get(row).filter(|entry| entry.selectable());
+            let selected = (self.selected_entry())
+                .and_then(|row| entries.get(row))
+                .filter(|entry| entry.selectable());
             let last = || {
                 let mut entries = entries.iter().rev();
                 entries.find(|entry| entry.surface == model::Surface::Agent)
@@ -560,8 +565,8 @@ mod tests {
     use super::*;
 
     /// Each tab keeps its own reading state: a job opened in one tab stays closed
-    /// in the other, and closing it there leaves the first open; the row and
-    /// search query stay with their tab, while a switch returns to the latest
+    /// in the other, and closing it there leaves the first open; the row stays
+    /// with its tab, while a switch returns to the latest
     /// activity; and `/details` reopens what a hidden tab collapsed.
     #[tokio::test]
     async fn tabs_keep_reading_state_independently() {
@@ -576,29 +581,36 @@ mod tests {
             (Tab::Conversation, true),
         ] {
             app.set_tab(tab);
-            app.rebuild_content();
+            settled(&mut app).await;
             let row = job_row(&app).unwrap();
             assert_eq!(app.entries()[row].open(), open, "{tab:?}");
-            app.view().row = row;
+            app.select_entry(row);
             app.toggle();
         }
-        let row = app.view().row;
-        app.view().query = "exec".into();
-        app.view().scroll = Some(0);
+        let row = app.selected_entry().unwrap();
+        app.scroll_to(Some(0));
         app.set_tab(Tab::Jobs);
-        assert!(app.view().query.is_empty());
-        app.view().row = row + 1;
+        settled(&mut app).await;
+        let listed = job_row(&app).unwrap() - 1;
+        assert_ne!(listed, row);
+        app.select_entry(listed);
         app.command(Command::Details);
         app.set_tab(Tab::Conversation);
-        app.rebuild_content();
-        let view = app.view();
-        assert_eq!(
-            (view.row, view.query.as_str(), view.scroll),
-            (row, "exec", None)
-        );
+        settled(&mut app).await;
+        assert_eq!(app.selected_entry(), Some(row));
+        assert!(app.view().top.is_none());
         assert!(app.entries()[job_row(&app).unwrap()].open());
         app.set_tab(Tab::Jobs);
-        assert_eq!(app.view().row, row + 1);
+        settled(&mut app).await;
+        assert_eq!(app.selected_entry(), Some(listed));
+        // Let go of and shown again, a view on a nested job reads its root's page.
+        app.scroll_to(app.render.rows.entry_start(job_row(&app).unwrap()));
+        app.release();
+        settled(&mut app).await;
+        let top = app.view().top.as_ref().and_then(|top| top.key.clone());
+        assert_eq!(top, Some(key));
+        let root = model::Focus::Job(job_named(&app, "script"));
+        assert_eq!(app.focus_of_view(), Some(root));
     }
 
     /// A draft taller than its box scrolls under the wheel without moving its cursor,
@@ -695,7 +707,7 @@ mod tests {
         assert_eq!(app.editor.text(), "short\npaste");
         app.event(Event::Paste("long\n".repeat(13)));
         app.command(Command::Attachments);
-        assert_eq!(app.menu().unwrap().kind.items().len(), 1);
+        assert_eq!(app.menu.as_ref().unwrap().kind.items().len(), 1);
         key(&mut app, KeyCode::Delete, M::NONE);
         assert!(!app.editor.has_pastes());
         assert_eq!(app.editor.expanded_text(), "short\npaste");
@@ -761,7 +773,7 @@ mod tests {
         app.launch.model = config.into_runtime().unwrap().default_model();
         // A session offers the modes it was opened with.
         let (session, mut model) = played(&app.launch).await;
-        attach(&mut app, session);
+        attach(&mut app, session).await;
         let (children, _turns) = spawn_children(&mut app, &mut model, 1).await;
         let child = children[0].clone();
         for index in 0..12 {
@@ -774,7 +786,7 @@ mod tests {
         assert!(markers(&draw_buffer(&mut app)).is_empty());
         // Cycling only chooses the next message's mode: the session and the saved
         // preference stay as they were, drawn previews included.
-        let journaled = || app.session().unwrap().observe().snapshot.records.len();
+        let journaled = || app.session().unwrap().store().observe().snapshot.applied;
         let (records, remembered) = (journaled(), app.remembered_mode.clone());
         for (code, mode) in [
             (KeyCode::Tab, "look"),
@@ -788,15 +800,15 @@ mod tests {
             draw(&mut app);
         }
         assert!(draw(&mut app).contains("none · "));
-        let journaled = app.session().unwrap().observe().snapshot.records.len();
+        let journaled = app.session().unwrap().store().observe().snapshot.applied;
         assert_eq!((journaled, &app.remembered_mode), (records, &remembered));
-        assert_eq!(app.view().row, 0);
+        assert_eq!(app.selected_entry(), None);
 
         app.focus = Focus::Content;
         key(&mut app, KeyCode::Tab, M::NONE);
         key(&mut app, KeyCode::Tab, M::NONE);
         key(&mut app, KeyCode::BackTab, M::NONE);
-        assert_eq!((app.view().row, app.mode.as_str()), (1, "none"));
+        assert_eq!((app.selected_entry(), app.mode.as_str()), (Some(1), "none"));
         assert_eq!(
             markers(&draw_buffer(&mut app)),
             [ratatui::style::Color::Rgb(255, 255, 255)]
@@ -806,7 +818,7 @@ mod tests {
         draw(&mut app);
         // In the tree, a step views the next agent at its latest activity, wrapping.
         app.focus = Focus::Tree;
-        app.view().scroll = Some(0);
+        app.scroll_to(Some(0));
         for (code, viewed) in [
             (KeyCode::Tab, &child),
             (KeyCode::BackTab, &root),
@@ -816,7 +828,7 @@ mod tests {
         ] {
             key(&mut app, code, M::NONE);
             assert!(app.selected == *viewed && app.focus == Focus::Tree);
-            assert_eq!(app.view().scroll, None);
+            assert!(app.view().top.is_none());
         }
         assert!(draw(&mut app).contains('▌'));
         // The leader arrows do the same from anywhere, and step the inspector tabs.

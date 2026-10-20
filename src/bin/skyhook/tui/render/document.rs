@@ -31,14 +31,13 @@ pub(super) struct EntryGeometry {
     header_width: u16,
     framing: Framing,
     surface: Surface,
-    entry: usize,
     entry_key: std::sync::Arc<model::EntryKey>,
     selectable: bool,
     /// Cells before the text of every row, left to a spinner.
     gutter: u16,
 }
 impl EntryGeometry {
-    pub(super) fn new(entry: &model::Entry, width: u16, index: usize) -> Self {
+    pub(super) fn new(entry: &model::Entry, width: u16) -> Self {
         let framing = match entry.surface {
             Surface::User | Surface::Agent => Framing::Boxed,
             Surface::Tool if entry.open() => Framing::Hanging,
@@ -72,7 +71,6 @@ impl EntryGeometry {
             header_width: body_width.saturating_sub(counter).max(1),
             framing,
             surface: entry.surface,
-            entry: index,
             entry_key: std::sync::Arc::new(entry.key().clone()),
             selectable: entry.selectable(),
             gutter: 0,
@@ -104,7 +102,6 @@ impl EntryGeometry {
             inset,
             text_width: self.row_width.saturating_sub(inset + padding),
             surface: self.surface,
-            entry: self.entry,
             entry_key: self.entry_key.clone(),
             selectable: self.selectable,
             layout: layout.with_header(header),
@@ -188,12 +185,11 @@ impl EntryGeometry {
 pub(super) fn update_entry_rows(
     rows: &mut Vec<Row>,
     entry: &model::Entry,
-    index: usize,
     width: u16,
     highlights: &HighlightCache,
     request_columns: RequestColumns,
 ) -> Document {
-    let mut geometry = EntryGeometry::new(entry, width, index);
+    let mut geometry = EntryGeometry::new(entry, width);
     let boxed = geometry.framing == Framing::Boxed;
     rows.clear();
     if let Some(request) = entry.request() {
@@ -362,8 +358,7 @@ mod tests {
                 row: rows.len() - 1,
                 byte: rows.last().unwrap().text().len(),
             };
-            let mut blocks = RowBlocks::default();
-            blocks.replace_entry(0, rows, Vec::new());
+            let blocks = RowBlocks::entry(rows);
             assert_eq!(
                 selected_text(&blocks, (start, end)),
                 expected,
@@ -426,8 +421,7 @@ mod tests {
             (texts.iter()).position(|text| !text.is_empty() && from.starts_with(text.as_str()));
         let first = first.unwrap_or_else(|| panic!("{from:?} in {texts:?}"));
         let last = rows.len() - 1;
-        let mut blocks = RowBlocks::default();
-        blocks.replace_entry(0, rows, Vec::new());
+        let blocks = RowBlocks::entry(rows);
         let start = TextPosition {
             row: first,
             byte: 0,

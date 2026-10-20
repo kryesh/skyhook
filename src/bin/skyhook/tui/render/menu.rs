@@ -176,7 +176,7 @@ pub(super) fn draw_menu_item(
 }
 
 pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
-    let Some(Overlay::Menu(menu)) = &app.overlay else {
+    let Some(menu) = &app.menu else {
         return;
     };
     let area = app.content_rect;
@@ -236,11 +236,11 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         }
     }
     let height = rect.height.saturating_sub(3 + header_height) as usize;
-    let Some(Overlay::Menu(menu)) = &mut app.overlay else {
+    let Some(menu) = &mut app.menu else {
         return;
     };
     let top = menu.viewport(height);
-    let Some(Overlay::Menu(menu)) = &app.overlay else {
+    let Some(menu) = &app.menu else {
         return;
     };
     let items = menu.filtered();
@@ -354,7 +354,7 @@ mod tests {
             let cells = &terminal.backend().buffer().content;
             let found = cells.iter().any(|cell| cell.bg == THEME.selected);
             assert_eq!(found, highlighted, "{command}");
-            app.overlay = None;
+            app.menu = None;
         }
     }
 
@@ -369,14 +369,14 @@ mod tests {
         for turn in turns {
             turn.answer("done");
         }
-        observe_until(&mut app, |app| count(&app.snapshot, job_ended) == 2).await;
+        observe_until(&mut app, |app| count(&app.journal, job_ended) == 2).await;
         let children: Vec<_> = (agents.iter())
             .map(|child| format!("agent {}", crate::tui::format::agent_label(child)))
             .collect();
         // An open palette's rows follow agents and their live status, which is searchable.
-        app.menu_mut().unwrap().input.set("completed".into());
-        assert_eq!(app.menu().unwrap().filtered().len(), 2);
-        app.menu_mut().unwrap().input.set(String::new());
+        app.menu.as_mut().unwrap().input.set("completed".into());
+        assert_eq!(app.menu.as_ref().unwrap().filtered().len(), 2);
+        app.menu.as_mut().unwrap().input.set(String::new());
         for (width, stats, status) in [
             (40, false, false),
             (65, false, false),

@@ -213,7 +213,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.is_error);
-            let envelope = runtime.jobs.snapshot(result.job).unwrap();
+            let envelope = runtime.jobs.snapshot(result.job).await.unwrap();
             let diagnostic = envelope.diagnostic.as_ref().unwrap();
             assert_eq!(diagnostic.context.subject, Subject::argument([field]));
             assert_eq!(diagnostic.context.site, FailureSite::Host);

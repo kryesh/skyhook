@@ -96,7 +96,7 @@ pub(super) async fn queue_dispatcher(
                         let session = session.clone();
                         pending.push(async move {
                             let delivered = Delivered::from(receipt.await);
-                            let revision = session.revision();
+                            let revision = session.store().revision();
                             Work::QueueCommitted { id, generation, revision, delivered }
                         });
                     }
@@ -279,10 +279,9 @@ impl App {
     /// it. Every record since the last read is checked, so a failure a lagged
     /// update stream skipped still pauses before anything more is delivered.
     pub(super) fn hold_after_root_failure(&mut self) {
-        if root_failed(&self.snapshot, self.root_agent(), self.failures_read) {
+        if std::mem::take(&mut self.root_failed) {
             self.pause_queue(Paused::Stopped);
         }
-        self.failures_read = last_record(&self.snapshot);
     }
 
     pub(super) fn deliver_queue(&mut self) {
@@ -432,6 +431,7 @@ mod tests {
     use super::super::played::*;
     use super::super::tests::*;
     use super::*;
+    use std::sync::Arc;
 
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
 
@@ -455,8 +455,8 @@ mod tests {
         app.status.flush().await;
         let mut notices = Vec::new();
         if let Some(session) = app.session() {
-            let records = session.observe().snapshot.records;
-            notices.extend(records.values().filter_map(|record| match &record.event {
+            let records = journal(session).await;
+            notices.extend(records.iter().filter_map(|record| match &record.event {
                 SessionEvent::Status { message } => Some(message.clone()),
                 _ => None,
             }));
@@ -511,9 +511,9 @@ mod tests {
             .find_map(|(y, line)| Some((line[..line.find("ordinary")?].chars().count(), y)))
             .unwrap();
         click(&mut app, Rect::new(x as u16, y as u16, 1, 1));
-        assert!(app.view().scroll.is_some() && app.selection.is_some());
+        assert!(app.view().top.is_some() && app.selection.is_some());
         app.submit("next".into());
-        assert!(app.view().scroll.is_none() && app.selection.is_none());
+        assert!(app.view().top.is_none() && app.selection.is_none());
     }
 
     #[tokio::test]
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(shown(&app, refusal).await, 1);
         // The session holds the whole batch for /retry: the queue pauses without
         // taking any row back.
-        app.resubscribe();
+        resubscribed(&mut app).await;
         assert!(app.paused.is_some() && app.history.is_empty());
         assert_eq!(app.queue.len(), 3);
         assert!(
@@ -763,7 +763,7 @@ mod tests {
             receipt.await.unwrap();
         }
         app.command(Command::Queue);
-        app.menu_mut().unwrap().input.set("claimed".into());
+        app.menu.as_mut().unwrap().input.set("claimed".into());
         app.choose();
         assert_eq!(app.queue.len(), 2);
         assert_eq!(app.editor.text(), "draft");
@@ -786,16 +786,9 @@ mod tests {
     /// notice sent so far is journaled.
     async fn shown(app: &App, text: &str) -> usize {
         app.status.flush().await;
-        let snapshot = app.session().unwrap().observe().snapshot;
-        let projection = model::Projection::new(&snapshot);
-        let view = model::EntryView {
-            agent: app.root_agent(),
-            tab: model::Tab::Conversation,
-            view: &model::View::default(),
-            all_details: false,
-            today: app.clock.day(),
-        };
-        let entries = model::entries(&snapshot, &projection, view, &app.outputs, &[], false);
+        let session = app.session().unwrap();
+        let read = read(session, app.root_agent()).await;
+        let entries = read.entries(&app.outputs, false);
         entries
             .iter()
             .filter(|entry| entry.text().contains(text))
@@ -842,7 +835,7 @@ mod tests {
         assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
         app.work(work);
         observe_until(&mut app, |app| {
-            count(&app.snapshot, agent_failed) == 2 && stopped(&app.snapshot, &root)
+            count(&app.journal, agent_failed) == 2 && stopped(&app.snapshot, &root)
         })
         .await;
         assert_eq!(shown(&app, REJECTED).await, 2);
@@ -891,15 +884,19 @@ mod tests {
             {}
         })
         .await;
-        let busy = || session.observe().snapshot.activity[&root].state.is_busy();
+        let busy = || {
+            session.store().observe().snapshot.activity[&root]
+                .state
+                .is_busy()
+        };
         bounded(async {
             while busy() {
                 tokio::task::yield_now().await;
             }
         })
         .await;
-        app.resubscribe();
-        assert_eq!(count(&app.snapshot, agent_failed), 1);
+        resubscribed(&mut app).await;
+        assert_eq!(count(&app.journal, agent_failed), 1);
         assert!(!app.paused.is_some());
         session.shutdown().await.unwrap();
     }
@@ -910,7 +907,7 @@ mod tests {
     async fn a_root_failure_missed_by_a_lagged_observer_pauses_on_resubscribe() {
         let (_root, mut app, mut model, session) = played_fixture().await;
         let _rx = capture_work(&mut app);
-        let mut updates = session.observe().updates;
+        let mut updates = session.store().observe().updates;
         app.submit("first".into());
         app.close_observation();
         model.turn().await.fail(rejected());
@@ -920,7 +917,7 @@ mod tests {
             {}
         })
         .await;
-        app.resubscribe();
+        resubscribed(&mut app).await;
         assert!(app.paused.is_some());
         app.submit("second".into());
         let row = app.queue.iter().find(|row| row.submission.text == "second");
@@ -939,7 +936,7 @@ mod tests {
         observe_until(&mut app, |app| app.paused.is_some()).await;
         session.close().await.unwrap();
         let reopened = app.launch.create(Some(session.id())).await.unwrap();
-        let prepared = PreparedObservation::subscribe(reopened.clone());
+        let prepared = prepared(reopened.clone()).await;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = app.sibling(Some(prepared), app.launch.clone(), tx);
         app.submit("second".into());
@@ -951,7 +948,8 @@ mod tests {
                 }
             )
         };
-        observe_until(&mut app, |app| count(&app.snapshot, user) == 2).await;
+        // Only the second is committed after the reopening.
+        observe_until(&mut app, |app| count(&app.journal, user) == 1).await;
         assert!(!app.paused.is_some());
         assert!(
             !app.queue
@@ -987,7 +985,7 @@ mod tests {
         let (harness, mut model) = played_harness(&app.launch, policy.clone(), mode("Look.")).await;
         let session = harness.new_session().await.unwrap();
         let root = session.root_agent().clone();
-        attach(&mut app, session.clone());
+        attach(&mut app, session.clone()).await;
         let _rx = capture_work(&mut app);
         app.submit("delegate".into());
         let task = json!({"prompt": "work", "bg": true});
@@ -1003,7 +1001,7 @@ mod tests {
             false => (second, first),
         };
         answering.answer("delegated");
-        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        observe_until(&mut app, |app| count(&app.journal, answered) == 1).await;
         session.shutdown().await.unwrap();
         session.close().await.unwrap();
 
@@ -1013,7 +1011,7 @@ mod tests {
         let activated = reopened.record_status(root.clone(), "reopened".into());
         activated.await.unwrap();
         model.refuse(&root);
-        attach(&mut app, reopened.clone());
+        attach(&mut app, reopened.clone()).await;
         let mut rx = capture_work(&mut app);
         app.command(Command::Retry);
         model.turn().await.answer("worked");
@@ -1021,7 +1019,7 @@ mod tests {
         assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
         app.work(work);
         observe_until(&mut app, |app| {
-            let mut records = app.snapshot.records.values();
+            let mut records = app.journal.iter();
             let failed = records.any(|record| record.agent == root && agent_failed(&record.event));
             failed && stopped(&app.snapshot, &root)
         })
@@ -1041,7 +1039,7 @@ mod tests {
         app.model = "test/seeing".parse().unwrap();
         app.submit("warmup".into());
         model.turn().await.answer("ok");
-        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        observe_until(&mut app, |app| count(&app.journal, answered) == 1).await;
         bounded(async {
             while !app.queue.is_empty() {
                 let work = recv(&mut rx).await;
@@ -1049,7 +1047,7 @@ mod tests {
             }
         })
         .await;
-        app.rebuild_projection();
+        app.projection.reconcile(&app.snapshot);
         let active = app
             .projection
             .agents
@@ -1106,19 +1104,20 @@ mod tests {
         use skyhook::session::{Message, UserPart};
         let (_root, mut app, mut model, session) = played_fixture().await;
         let mut rx = capture_work(&mut app);
-        let committed = || {
-            let records = session.observe().snapshot.records;
-            let users = records
-                .into_values()
-                .filter_map(|record| match record.event {
-                    SessionEvent::MessageCommitted {
-                        message: Message::User(parts),
-                    } => parts.into_iter().find_map(|part| match part {
-                        UserPart::Text { text } => Some(text),
+        let committed = async || {
+            let records = journal(&session).await;
+            let users =
+                records
+                    .into_iter()
+                    .filter_map(|record| match Arc::unwrap_or_clone(record).event {
+                        SessionEvent::MessageCommitted {
+                            message: Message::User(parts),
+                        } => parts.into_iter().find_map(|part| match part {
+                            UserPart::Text { text } => Some(text),
+                            _ => None,
+                        }),
                         _ => None,
-                    }),
-                    _ => None,
-                });
+                    });
             users.collect::<Vec<_>>()
         };
         let id = |app: &App, text: &str| {
@@ -1181,7 +1180,7 @@ mod tests {
                 }
             })
             .await;
-            let committed = committed();
+            let committed = committed().await;
             assert_eq!(committed[committed.len() - expected.len()..], expected[..]);
         }
         session.shutdown().await.unwrap();
@@ -1198,14 +1197,14 @@ mod tests {
         let mut status = capture_work(&mut app);
         app.submit("first".into());
         model.turn().await.answer("ok");
-        observe_until(&mut app, |app| count(&app.snapshot, answered) == 1).await;
+        observe_until(&mut app, |app| count(&app.journal, answered) == 1).await;
         session.shutdown().await.unwrap();
         session.close().await.unwrap();
         let policy = std::sync::Arc::new(AllowAll);
         let (harness, model) = played_harness(&app.launch, policy, |builder| builder).await;
         model.refuse(&root);
         let reopened = harness.resume_session(session.id()).await.unwrap();
-        attach(&mut app, reopened.clone());
+        attach(&mut app, reopened.clone()).await;
         let mut rx = capture_work(&mut app);
         app.submit("second".into());
         bounded(async {

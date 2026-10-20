@@ -1,44 +1,23 @@
 //! Validate the journal's history rules and reconstruct exact provider requests from it.
 use crate::{
-    identity::AgentId,
     provider::{profile::ModelRef, protocol::ModelRequest},
     session::Message,
 };
+use std::{collections::HashMap, sync::Arc};
 
-use super::projection::project_from;
-use super::{EventRecord, ModelContext, ModelPurpose, SessionError, SessionEvent};
+use super::db::{self, Db, corrupt, rejected};
+use super::{EventRecord, ModelPurpose, SessionError, SessionEvent};
+use crate::identity::SessionId;
 use crate::session::{MessageSeq, RecordSeq, RequestSeq};
 
-/// The record journaled at `sequence`. Records must be in sequence order.
-#[must_use]
-pub fn record_at(records: &[EventRecord], sequence: RecordSeq) -> Option<&EventRecord> {
-    let index = records
-        .binary_search_by_key(&sequence, |record| record.sequence)
-        .ok()?;
-    Some(&records[index])
-}
-
-/// The context a `ModelRequested` record was issued under, with `lookup` finding
-/// the record journaled at a sequence.
-#[must_use]
-pub fn request_context<'a>(
-    record: &EventRecord,
-    lookup: impl FnOnce(RecordSeq) -> Option<&'a EventRecord>,
-) -> Option<&'a ModelContext> {
-    let SessionEvent::ModelRequested { context, .. } = &record.event else {
-        return None;
-    };
-    match &lookup(*context)?.event {
-        SessionEvent::ModelContext { context } => Some(context),
-        _ => None,
-    }
-}
-
-/// Validate a decoded journal's order-dependent rules, as append validates live
-/// records, so what a store hands out always projects.
-pub(super) fn admit_records(records: Vec<EventRecord>) -> Result<Vec<EventRecord>, SessionError> {
-    for (index, record) in records.iter().enumerate() {
-        validate(&records[..index], &[], record)?;
+/// Validate a decoded journal's order-dependent rules against `db`, which holds it,
+/// as append validates live records, so what a store hands out always projects.
+pub(super) fn admit_records(
+    db: &Db,
+    records: Vec<Arc<EventRecord>>,
+) -> Result<Vec<Arc<EventRecord>>, SessionError> {
+    for record in &records {
+        validate(db, record)?;
     }
     Ok(records)
 }
@@ -68,67 +47,93 @@ crate::named_enum::named_enum! {
     }
 }
 
-/// Whether `agent`'s todos changed after `frontier`, which makes the todos a
-/// summary up to it reconciled stale.
-pub(crate) fn stale_todos<'a>(
-    preceding: impl IntoIterator<Item = &'a EventRecord>,
-    agent: &AgentId,
-    frontier: RecordSeq,
-) -> bool {
-    preceding.into_iter().any(|source| {
-        &source.agent == agent
-            && source.sequence > frontier
-            && matches!(
-                source.event,
-                SessionEvent::TodosReplaced { .. } | SessionEvent::Compaction { .. }
-            )
-    })
+/// What an entry a record references is, as validating the reference needs it.
+pub(super) enum Referenced {
+    Context(ModelPurpose),
+    Request {
+        context: RecordSeq,
+    },
+    Checkpoint {
+        frontier: RecordSeq,
+        retained: Vec<MessageSeq>,
+    },
+    Commit,
+    Other,
 }
 
-/// Validate a request's or checkpoint's references against the records before it:
-/// `committed`, then `batch`.
-pub(super) fn validate(
-    committed: &[EventRecord],
-    batch: &[EventRecord],
-    record: &EventRecord,
-) -> Result<(), SessionError> {
-    let at = |sequence| record_at(batch, sequence).or_else(|| record_at(committed, sequence));
+/// The journal ahead of one agent's record, read by index: inside the record's own
+/// transaction, which holds every record ahead of it in its batch.
+#[derive(Clone, Copy)]
+struct Preceding<'a> {
+    db: &'a Db,
+    /// The agent's row.
+    row: i64,
+    /// The record: only what precedes it can be referenced.
+    before: RecordSeq,
+}
+
+impl<'a> Preceding<'a> {
+    fn of(db: &'a Db, record: &EventRecord) -> Result<Self, SessionError> {
+        let row = db::agent_row(db, &record.agent)?;
+        let row = row.ok_or_else(|| rejected(format!("agent {} has not started", record.agent)))?;
+        Ok(Self {
+            db,
+            row,
+            before: record.sequence,
+        })
+    }
+
+    /// What the agent's entry at `sequence` is; None unless the agent journaled it.
+    fn own(&self, sequence: RecordSeq) -> Result<Option<Referenced>, SessionError> {
+        if sequence >= self.before {
+            return Ok(None);
+        }
+        Ok(db::history::referenced(self.db, self.row, sequence)?)
+    }
+
+    fn committed(&self, sequence: RecordSeq) -> Result<bool, SessionError> {
+        Ok(matches!(self.own(sequence)?, Some(Referenced::Commit)))
+    }
+}
+
+/// Validate a request's or checkpoint's references against the journal `db` holds
+/// ahead of it.
+pub(super) fn validate(db: &Db, record: &EventRecord) -> Result<(), SessionError> {
     let checkpoint = match &record.event {
         SessionEvent::Compaction { checkpoint } => checkpoint,
-        SessionEvent::ModelRequested { .. } => {
-            return request_history(record, at).map(drop).map_err(|reason| {
-                SessionError::ModelRequestReplay {
-                    sequence: record.sequence.request(),
-                    reason,
-                }
-            });
+        event @ SessionEvent::ModelRequested { .. } => {
+            let preceding = Preceding::of(db, record)?;
+            return request_history(&preceding, record.sequence.request(), event).map(drop);
         }
         _ => return Ok(()),
     };
+    let preceding = Preceding::of(db, record)?;
     let invalid = |reason| SessionError::InvalidCompaction {
         sequence: record.sequence,
         reason,
     };
-    let preceding = || committed.iter().chain(batch);
-    if stale_todos(preceding(), &record.agent, checkpoint.frontier) {
+    // Todos changed after the frontier make those the summary reconciled stale.
+    let row = preceding.row;
+    if db::history::todos_changed(db, row, checkpoint.frontier, record.sequence)? {
         return Err(invalid(CheckpointError::StaleTodos));
     }
     if !matches!(checkpoint.message, Message::User(_)) {
         return Err(invalid(CheckpointError::MessageRole));
     }
-    if checkpoint.frontier >= record.sequence
-        || checkpoint.frontier
-            > batch
-                .last()
-                .or(committed.last())
-                .map_or(RecordSeq::default(), |r| r.sequence)
-    {
+    if checkpoint.frontier >= record.sequence {
         return Err(invalid(CheckpointError::Frontier));
     }
-    let summary = at(checkpoint.attempt.request.into())
-        .filter(|source| source.agent == record.agent && checkpoint.frontier < source.sequence)
-        .and_then(|source| request_context(source, at));
-    if summary.is_none_or(|context| context.purpose != ModelPurpose::Compaction) {
+    let summary = RecordSeq::from(checkpoint.attempt.request);
+    let summarized = match preceding.own(summary)? {
+        Some(Referenced::Request { context }) if checkpoint.frontier < summary => {
+            preceding.own(context)?
+        }
+        _ => None,
+    };
+    if !matches!(
+        summarized,
+        Some(Referenced::Context(ModelPurpose::Compaction))
+    ) {
         return Err(invalid(CheckpointError::SummaryRequest));
     }
     let mut last = MessageSeq::default();
@@ -136,63 +141,46 @@ pub(super) fn validate(
         if *sequence <= last || RecordSeq::from(*sequence) > checkpoint.frontier {
             return Err(invalid(CheckpointError::RetainedOrder));
         }
-        if !at((*sequence).into()).is_some_and(|source| {
-            source.agent == record.agent
-                && matches!(source.event, SessionEvent::MessageCommitted { .. })
-        }) {
+        if !preceding.committed((*sequence).into())? {
             return Err(invalid(CheckpointError::RetainedSource));
         }
         last = *sequence;
     }
     // References preserve whole messages and every existing result of a retained
     // exchange. Only the original trailing exchange may still be awaiting results.
-    let originals: Vec<_> = preceding()
-        .filter(|source| {
-            source.agent == record.agent
-                && source.sequence <= checkpoint.frontier
-                && matches!(source.event, SessionEvent::MessageCommitted { .. })
-        })
-        .collect();
-    let message = |index: usize| match &originals[index].event {
-        SessionEvent::MessageCommitted { message } => message,
-        _ => unreachable!(),
-    };
-    let retained = |index: usize| {
-        checkpoint
-            .retained
-            .binary_search(&originals[index].sequence.message())
-            .is_ok()
-    };
-    for index in 0..originals.len() {
-        if !retained(index) {
-            continue;
-        }
-        let assistant = match message(index) {
-            Message::Tool(_) => {
-                let Some(assistant) = (0..index)
-                    .rev()
-                    .find(|&index| !matches!(message(index), Message::Tool(_)))
-                else {
-                    return Err(invalid(CheckpointError::IncompleteExchange));
-                };
-                assistant
-            }
+    // Each exchange is read around its retained members, by index.
+    let messages = db::history::committed(db, &checkpoint.retained)?;
+    if messages.len() != checkpoint.retained.len() {
+        return Err(corrupt("a retained source is not a committed message").into());
+    }
+    let message = |sequence: RecordSeq| &messages[&sequence.message()];
+    let retained = |sequence: RecordSeq| messages.contains_key(&sequence.message());
+    let mut checked = None;
+    for sequence in checkpoint
+        .retained
+        .iter()
+        .map(|sequence| RecordSeq::from(*sequence))
+    {
+        let call = match message(sequence) {
+            Message::Tool(_) => db::history::opener(db, row, sequence)?
+                .ok_or_else(|| invalid(CheckpointError::IncompleteExchange))?,
             Message::Assistant(content) if content.iter().any(|item| item.call().is_some()) => {
-                index
+                sequence
             }
             _ => continue,
         };
-        let results: Vec<_> = (assistant + 1..originals.len())
-            .take_while(|&index| matches!(message(index), Message::Tool(_)))
-            .collect();
-        if !retained(assistant) || !results.iter().all(|&i| retained(i)) {
+        if checked.replace(call) == Some(call) {
+            continue;
+        }
+        let (results, end) = db::history::results(db, row, call, checkpoint.frontier)?;
+        let results = results.into_iter().map(RecordSeq::from);
+        if !retained(call) || !results.clone().all(retained) {
             return Err(invalid(CheckpointError::IncompleteExchange));
         }
-        let trailing = assistant + 1 + results.len() == originals.len();
-        let tools: Vec<_> = results.into_iter().map(message).collect();
-        match tool_exchange(message(assistant), &tools) {
+        let tools: Vec<_> = results.map(message).collect();
+        match tool_exchange(message(call), &tools) {
             None => return Err(invalid(CheckpointError::MismatchedExchange)),
-            Some(ToolExchange::Pending) if !trailing => {
+            Some(ToolExchange::Pending) if end.is_some() => {
                 return Err(invalid(CheckpointError::IncompleteExchange));
             }
             Some(_) => {}
@@ -223,8 +211,8 @@ fn tool_exchange(assistant: &Message, tools: &[&Message]) -> Option<ToolExchange
         })
         .map(|result| (result.call_id.as_str(), result.name.as_str()))
         .collect();
-    let call_map: std::collections::HashMap<_, _> = calls.iter().copied().collect();
-    let result_map: std::collections::HashMap<_, _> = results.iter().copied().collect();
+    let call_map: HashMap<_, _> = calls.iter().copied().collect();
+    let result_map: HashMap<_, _> = results.iter().copied().collect();
     if calls.is_empty()
         || calls.len() != call_map.len()
         || results.len() != result_map.len()
@@ -248,8 +236,10 @@ pub enum ReplayError {
     NotFound,
     #[error("event is not a model request")]
     NotRequest,
-    #[error("context must be a model context that precedes the call")]
+    #[error("context must be the agent's newest model context of its purpose ahead of the call")]
     Context,
+    #[error("an agent request must follow a result for every call its agent made")]
+    Unanswered,
     #[error("checkpoint must be a compaction of the same agent that precedes the call")]
     Checkpoint,
     #[error("history must end at a message of the same agent's history under the checkpoint")]
@@ -260,94 +250,102 @@ pub enum ReplayError {
     From,
 }
 
-/// The history a `ModelRequested` record names: its context, then its checkpoint's
-/// retained sources.
-struct RequestHistory<'a> {
-    context: &'a ModelContext,
-    retained: &'a [MessageSeq],
-}
-
-/// Resolve a request's references with `at`, which finds only records before it: its
-/// context and checkpoint belong to its agent, and `through` is a message the agent's
-/// history under that checkpoint holds.
-fn request_history<'a>(
-    record: &EventRecord,
-    at: impl Fn(RecordSeq) -> Option<&'a EventRecord>,
-) -> Result<RequestHistory<'a>, ReplayError> {
+/// Resolve the references of the request `event` journaled at `sequence`: its context
+/// and checkpoint belong to its agent, and `through` is a message the agent's history
+/// under that checkpoint holds. Returns the checkpoint's retained sources.
+fn request_history(
+    preceding: &Preceding,
+    sequence: RequestSeq,
+    event: &SessionEvent,
+) -> Result<Vec<MessageSeq>, SessionError> {
+    let invalid = |reason| SessionError::ModelRequestReplay { sequence, reason };
     let SessionEvent::ModelRequested {
         context,
         checkpoint,
         through,
         from,
         ..
-    } = &record.event
+    } = event
     else {
-        return Err(ReplayError::NotRequest);
+        return Err(invalid(ReplayError::NotRequest));
     };
-    let own = |source| at(source).filter(|found| found.agent == record.agent);
-    let Some(SessionEvent::ModelContext { context }) = own(*context).map(|found| &found.event)
-    else {
-        return Err(ReplayError::Context);
+    let Some(Referenced::Context(purpose)) = preceding.own(*context)? else {
+        return Err(invalid(ReplayError::Context));
     };
-    let (frontier, retained) = match checkpoint.map(own) {
-        None => (None, &[][..]),
-        Some(Some(EventRecord {
-            event: SessionEvent::Compaction { checkpoint },
-            ..
-        })) => (Some(checkpoint.frontier), &checkpoint.retained[..]),
-        Some(_) => return Err(ReplayError::Checkpoint),
+    let Preceding { db, row, before } = *preceding;
+    // Only each agent's newest context of a purpose stays resident to name.
+    if db::history::context_replaced(db, row, purpose, *context, before)? {
+        return Err(invalid(ReplayError::Context));
+    }
+    // An open session holds only the calls its agents made since their latest
+    // agent request, as each agent request follows a result for every earlier call.
+    if purpose == ModelPurpose::Agent && !db::history::unanswered(db, row, before)?.is_empty() {
+        return Err(invalid(ReplayError::Unanswered));
+    }
+    let (frontier, retained) = match checkpoint {
+        None => (None, Vec::new()),
+        Some(checkpoint) => match preceding.own(*checkpoint)? {
+            Some(Referenced::Checkpoint { frontier, retained }) => (Some(frontier), retained),
+            _ => return Err(invalid(ReplayError::Checkpoint)),
+        },
     };
     // The history's end is a message it projects.
     if let Some(through) = *through {
         let projected = retained.contains(&through)
             || frontier.is_none_or(|frontier| RecordSeq::from(through) > frontier);
-        let committed = matches!(
-            own(through.into()).map(|found| &found.event),
-            Some(SessionEvent::MessageCommitted { .. })
-        );
-        if !(projected && committed) {
-            return Err(ReplayError::Through);
+        if !(projected && preceding.committed(through.into())?) {
+            return Err(invalid(ReplayError::Through));
         }
     }
     // Only a summary drops older history, which invalidates no reasoning it replays;
     // reconstruction checks that it resumes at a cut `Projection::trim` could make.
-    if from.is_some() && context.purpose != ModelPurpose::Compaction {
-        return Err(ReplayError::From);
+    if from.is_some() && purpose != ModelPurpose::Compaction {
+        return Err(invalid(ReplayError::From));
     }
-    Ok(RequestHistory { context, retained })
+    Ok(retained)
 }
 
-/// Return the model the request was issued under and the exact request at a
-/// `ModelRequested` event.
-/// Records must be ordered by sequence, as returned by `SessionStore`.
-/// Attachment and image references keep their blob digests; use
-/// `SessionStore::load_blobs` to load their contents for provider encoding.
-pub fn reconstruct_model_request(
-    records: &[EventRecord],
+/// The model the request journaled at `sequence` was issued under, and the exact
+/// request, as `db` holds them.
+fn reconstruct(
+    db: &Db,
+    session: SessionId,
     sequence: RequestSeq,
 ) -> Result<(ModelRef, ModelRequest), SessionError> {
     let invalid = |reason| SessionError::ModelRequestReplay { sequence, reason };
-    let index = records
-        .binary_search_by_key(&sequence.into(), |record| record.sequence)
-        .map_err(|_| invalid(ReplayError::NotFound))?;
-    let call = &records[index];
-    let SessionEvent::ModelRequested {
-        checkpoint,
-        through,
-        from,
-        tail,
-        history_lifetime,
-        ..
-    } = &call.event
-    else {
+    let entry = RecordSeq::from(sequence);
+    let row = db::history::author(db, entry)?.ok_or(invalid(ReplayError::NotFound))?;
+    let Some(Referenced::Request { context }) = db::history::referenced(db, row, entry)? else {
         return Err(invalid(ReplayError::NotRequest));
     };
-    let earlier = &records[..index];
-    let RequestHistory { context, retained } =
-        request_history(call, |source| record_at(earlier, source)).map_err(invalid)?;
-    let checkpoint =
-        checkpoint.map(|checkpoint| earlier.partition_point(|record| record.sequence < checkpoint));
-    let mut history = project_from(earlier, &call.agent, checkpoint);
+    let records = db::decode_records(db, session, db::Entries::Only(&[context, entry]))?;
+    let missing = || SessionError::from(corrupt("a request's context is missing"));
+    let [context, request] = records.as_slice() else {
+        return Err(missing());
+    };
+    let (
+        SessionEvent::ModelContext { context },
+        event @ SessionEvent::ModelRequested {
+            checkpoint,
+            through,
+            from,
+            tail,
+            history_lifetime,
+            ..
+        },
+    ) = (&context.event, &request.event)
+    else {
+        return Err(missing());
+    };
+    let preceding = Preceding {
+        db,
+        row,
+        before: entry,
+    };
+    let retained = request_history(&preceding, sequence, event)?;
+    let opening = db::history::Opening::Named(*checkpoint);
+    let before = entry.preceding().unwrap_or_default();
+    let mut history = db::history::project(db, session, row, opening, before)?;
     // The history ends at `through`, after its checkpoint's opening.
     let opening = checkpoint.map_or(0, |_| 1 + retained.len());
     let through = through.map(RecordSeq::from);
@@ -371,14 +369,27 @@ pub fn reconstruct_model_request(
     Ok((context.profile.name.clone(), request))
 }
 
+impl super::SessionStore {
+    /// The model a `model_requested` record's request was issued under, and the exact
+    /// request, read from the journal. Attachment and image references keep their blob
+    /// digests; `load_blobs` loads their contents for provider encoding.
+    pub async fn reconstruct_model_request(
+        &self,
+        sequence: RequestSeq,
+    ) -> Result<(ModelRef, ModelRequest), SessionError> {
+        let session = self.id();
+        self.snapshot(move |db| reconstruct(db, session, sequence))
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::protocol::StateLifetime;
     use crate::session::CompactionTrigger;
-    use crate::session::{
-        project_history,
-        tests::{committed, context, requested_history, sequences, text_message},
+    use crate::session::tests::{
+        admitted, committed, context, projected, requested_history, sequences, text_message,
     };
     use crate::{
         agent::{TodoItem, TodoStatus},
@@ -480,20 +491,21 @@ mod tests {
             history_lifetime,
         );
         let call = append(&agent, request).await;
-        append(&agent, context_event_changed()).await;
+        let changed = append(&agent, context_event_changed()).await;
         append(&agent, committed(text_message("future message"))).await;
-        // A request names only its own agent's context and history.
+        // A request names only its own agent's newest context and its history.
         for (context, history, expected) in [
             (child_context.sequence, &[][..], ReplayError::Context),
+            (context.sequence, &[][..], ReplayError::Context),
             (
-                context.sequence,
+                changed.sequence,
                 &[child_message.sequence],
                 ReplayError::Through,
             ),
-            (context.sequence, &[context.sequence], ReplayError::Through),
+            (changed.sequence, &[changed.sequence], ReplayError::Through),
         ] {
             let request = requested_history(context, None, history, "state", history_lifetime);
-            let rejected = refused(&store, &agent, request);
+            let rejected = admitted(&store, &agent, request);
             assert!(
                 matches!(rejected, Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected),
                 "{expected}: {rejected:?}"
@@ -502,9 +514,9 @@ mod tests {
         let id = store.id();
         drop(store);
         let sessions = directory.path().join("sessions");
-        let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
-        let (model, mut restored) =
-            reconstruct_model_request(&records, call.sequence.request()).unwrap();
+        let store = SessionStore::open(&sessions, id).await.unwrap();
+        let restored = store.reconstruct_model_request(call.sequence.request());
+        let (model, mut restored) = restored.await.unwrap();
         assert_eq!(model.to_string(), "original-provider/test");
         let mut expected = template;
         let messages = [
@@ -536,22 +548,10 @@ mod tests {
             (child_context.sequence.request(), ReplayError::NotRequest),
         ] {
             assert!(matches!(
-                reconstruct_model_request(&records, sequence),
+                store.reconstruct_model_request(sequence).await,
                 Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
             ));
         }
-    }
-
-    /// Whether the journal takes `event` as `agent`'s next record.
-    fn refused(
-        store: &crate::session::SessionStore,
-        agent: &AgentId,
-        event: SessionEvent,
-    ) -> Result<(), SessionError> {
-        let committed = store.records();
-        let sequence = committed.len() as u64 + 1;
-        let record = crate::session::tests::record(agent, sequence, event);
-        validate(&committed, &[], &record)
     }
 
     fn context_event_changed() -> SessionEvent {
@@ -674,25 +674,12 @@ mod tests {
             ),
             (StaleTodos, checkpoint(research, vec![], summary)),
         ] {
-            let rejected = refused(store, agent, SessionEvent::Compaction { checkpoint });
+            let rejected = admitted(store, agent, SessionEvent::Compaction { checkpoint });
             assert!(
                 matches!(rejected, Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
                 "{expected}: {rejected:?}"
             );
         }
-        // A loaded journal is admitted by the same rules, so a checkpoint append
-        // would refuse never reaches projection.
-        let mut corrupt = store.records();
-        let mut record = corrupt.last().unwrap().clone();
-        record.sequence = record.sequence.next();
-        record.event = SessionEvent::Compaction {
-            checkpoint: invalid(messages(&[calls, calls])),
-        };
-        corrupt.push(record);
-        assert!(matches!(
-            admit_records(corrupt),
-            Err(SessionError::InvalidCompaction { .. })
-        ));
         // A checkpoint may name a summary request committed in its own batch.
         let owner = agent.clone();
         let summary = requested_history(summary_context, None, &sources, "sum", detached);
@@ -702,8 +689,7 @@ mod tests {
             vec![(owner.clone(), attempt(request)), (owner, compaction)]
         });
         let installed = batch.await.unwrap().last().unwrap().sequence;
-        let records = admit_records(store.records()).unwrap();
-        let projected = project_history(&records, agent);
+        let projected = projected(store, agent).await;
         assert_eq!(projected.checkpoint, Some(installed));
         assert_eq!(
             sequences(&projected),
@@ -711,9 +697,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checkpoints_admit_a_trailing_open_exchange_but_not_partial_retention() {
-        let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
+    #[tokio::test]
+    async fn checkpoints_admit_a_trailing_open_exchange_but_not_partial_retention() {
         let call = |id: &str, position| {
             AssistantItem::tool_call(id, position, ToolCall::new(id, "exec", json!({})).unwrap())
         };
@@ -728,22 +713,24 @@ mod tests {
         };
         use CheckpointError::{IncompleteExchange, MismatchedExchange};
         for (results, trailing, retained, expected) in [
-            (vec![], true, vec![1], None),
-            (vec!["b"], true, vec![1, 2], None),
-            (vec!["b", "a"], true, vec![1, 2, 3], None),
-            (vec![], false, vec![1], Some(IncompleteExchange)),
-            (vec!["b"], false, vec![1, 2], Some(IncompleteExchange)),
+            (vec![], true, vec![0], None),
+            (vec!["b"], true, vec![0, 1], None),
+            (vec!["b", "a"], true, vec![0, 1, 2], None),
+            (vec![], false, vec![0], Some(IncompleteExchange)),
+            (vec!["b"], false, vec![0, 1], Some(IncompleteExchange)),
+            (vec!["b"], true, vec![0], Some(IncompleteExchange)),
             (vec!["b"], true, vec![1], Some(IncompleteExchange)),
-            (vec!["b"], true, vec![2], Some(IncompleteExchange)),
-            (vec!["b", "a"], true, vec![1, 2], Some(IncompleteExchange)),
-            (vec!["unknown"], true, vec![1, 2], Some(MismatchedExchange)),
+            (vec!["b", "a"], true, vec![0, 1], Some(IncompleteExchange)),
+            (vec!["unknown"], true, vec![0, 1], Some(MismatchedExchange)),
             (
                 vec!["b", "b"],
                 true,
-                vec![1, 2, 3],
+                vec![0, 1, 2],
                 Some(MismatchedExchange),
             ),
         ] {
+            let session = crate::tests::TestRuntime::new().await;
+            let (store, agent) = (&session.store, &session.agent);
             let mut events = vec![committed(Message::Assistant(vec![
                 call("a", 0),
                 call("b", 1),
@@ -752,38 +739,48 @@ mod tests {
             if !trailing {
                 events.push(committed(text_message("later input")));
             }
-            let frontier = RecordSeq::from(events.len() as u64);
-            let context_sequence = frontier.next();
-            events.push(context(ModelPurpose::Compaction, "p", "m", "s"));
-            let summary = context_sequence.next();
-            events.push(requested_history(
-                context_sequence,
-                None,
-                &[],
-                "sum",
-                HistoryLifetime::Detached,
-            ));
-            events.push(SessionEvent::Compaction {
+            let mut messages = Vec::new();
+            for event in events {
+                let appended = store.append(agent.clone(), event).await;
+                let Ok(appended) = appended else {
+                    // The journal binds no result to a call it does not answer.
+                    assert_eq!(expected, Some(MismatchedExchange), "{results:?}");
+                    break;
+                };
+                messages.push(appended.sequence);
+            }
+            if messages.len() < 1 + results.len() + usize::from(!trailing) {
+                continue;
+            }
+            let frontier = *messages.last().unwrap();
+            let summarizes = context(ModelPurpose::Compaction, "p", "m", "s");
+            let summarizes = store
+                .append(agent.clone(), summarizes)
+                .await
+                .unwrap()
+                .sequence;
+            let detached = HistoryLifetime::Detached;
+            let summary = requested_history(summarizes, None, &[], "sum", detached);
+            let summary = store.append(agent.clone(), summary).await.unwrap().sequence;
+            let attempt = AttemptRef {
+                request: summary.request(),
+                attempt: 1,
+            };
+            let started = SessionEvent::ModelAttemptStarted(attempt);
+            store.append(agent.clone(), started).await.unwrap();
+            let compaction = SessionEvent::Compaction {
                 checkpoint: CompactionCheckpoint {
                     frontier,
                     message: text_message("summary"),
                     todos: Vec::new(),
-                    retained: retained.into_iter().map(MessageSeq::from).collect(),
-                    attempt: AttemptRef {
-                        request: summary.request(),
-                        attempt: 1,
-                    },
+                    retained: (retained.iter())
+                        .map(|index: &usize| messages[*index].message())
+                        .collect(),
+                    attempt,
                     trigger: CompactionTrigger::Occupancy(100),
                 },
-            });
-            let records = events
-                .into_iter()
-                .enumerate()
-                .map(|(index, event)| {
-                    crate::session::tests::record(&agent, index as u64 + 1, event)
-                })
-                .collect();
-            let admitted = admit_records(records).map(drop);
+            };
+            let admitted = admitted(store, agent, compaction);
             assert!(
                 match expected {
                     None => admitted.is_ok(),

@@ -305,7 +305,7 @@ pub(super) fn image_row(
 ) -> DbResult<()> {
     let blob = image.blob.sha256.to_bytes().to_vec();
     db.execute(
-        &format!(
+        format!(
             "INSERT INTO {table} ({owner}, position, blob, format, file) VALUES (?1, ?2, ?3, ?4, ?5)"
         ),
         params![id, position, blob, image.format, image.file.clone()],
@@ -323,7 +323,7 @@ pub(super) fn todos(
 ) -> DbResult<()> {
     for (position, item) in items.iter().enumerate() {
         db.execute(
-            &format!(
+            format!(
                 "INSERT INTO {table} ({owner}, position, text, status) VALUES (?1, ?2, ?3, ?4)"
             ),
             params![id, position, &item.text, item.status],
@@ -332,11 +332,14 @@ pub(super) fn todos(
     Ok(())
 }
 
-/// Every todo list an entry journaled.
-pub(super) fn entry_todos(db: &Db) -> DbResult<HashMap<i64, Vec<TodoItem>>> {
+/// Every todo list an entry in scope journaled.
+pub(super) fn entry_todos(events: &Events) -> DbResult<HashMap<i64, Vec<TodoItem>>> {
     grouped(
-        db,
-        "SELECT entry, text, status FROM todo_item ORDER BY entry, position",
+        events.db,
+        events.scoped(
+            "SELECT entry, text, status FROM todo_item {scope} ORDER BY entry, position",
+            "entry",
+        )?,
         todo,
     )
 }
@@ -469,17 +472,91 @@ fn filed<T, K: PartialEq>(rows: &HashMap<i64, T>, owners: &HashMap<i64, K>, kind
     (rows.keys()).all(|owner| owners.get(owner).is_some_and(|kind| kinds.contains(kind)))
 }
 
+/// The messages committed at `commits`, by commit.
+pub(in crate::session) fn committed(
+    db: &Db,
+    commits: &[MessageSeq],
+) -> DbResult<HashMap<MessageSeq, Message>> {
+    let commits: Vec<_> = commits.iter().map(|commit| commit.get()).collect();
+    let rows = db.query(
+        "SELECT entry, message FROM message_commit \
+         WHERE entry IN (SELECT value FROM json_each(?1))",
+        params![json(&commits)?],
+        |row| Ok((sequence(row.get(0)?).message(), row.get::<i64>(1)?)),
+    )?;
+    Ok(load_committed(db, rows)?.into_iter().collect())
+}
+
+/// The message of each `(commit, message row)` pair, in order.
+fn load_committed(db: &Db, rows: Vec<(MessageSeq, i64)>) -> DbResult<Vec<(MessageSeq, Message)>> {
+    let ids: Vec<_> = rows.iter().map(|(_, id)| *id).collect();
+    let messages = Messages::load(db, Scope::Only(&ids))?;
+    (rows.into_iter())
+        .map(|(commit, id)| Ok((commit, messages.message(id)?)))
+        .collect()
+}
+
+/// The rows a load reassembles: every one, or those of the listed keys.
+#[derive(Clone, Copy)]
+pub(in crate::session) enum Scope<'a, K = i64> {
+    All,
+    Only(&'a [K]),
+}
+
+/// What ties a table's rows to their key: a key column, or the assistant item or user
+/// part the row belongs to.
+#[derive(Clone, Copy)]
+pub(super) enum Owner {
+    Message(&'static str),
+    Item,
+    Part,
+}
+
+impl<K: serde::Serialize> Scope<'_, K> {
+    /// `sql` with `{scope}` replaced by a filter that keeps the rows `owner` ties
+    /// to a key in scope.
+    pub(super) fn query(self, sql: &str, owner: Owner) -> DbResult<Query> {
+        const SCOPED: &str = "IN (SELECT value FROM json_each(?1))";
+        Ok(match self {
+            Self::All => Query {
+                sql: sql.replace("{scope}", ""),
+                params: Vec::new(),
+            },
+            Self::Only(messages) => {
+                let filter = match owner {
+                    Owner::Message(column) => format!("{column} {SCOPED}"),
+                    Owner::Item => {
+                        format!("item IN (SELECT id FROM assistant_item WHERE message {SCOPED})")
+                    }
+                    Owner::Part => {
+                        format!("e.part IN (SELECT id FROM user_part WHERE message {SCOPED})")
+                    }
+                };
+                Query {
+                    sql: sql.replace("{scope}", &format!("WHERE {filter}")),
+                    params: params![json(&messages)?],
+                }
+            }
+        })
+    }
+}
+
 impl Messages {
-    pub(super) fn load(db: &Db) -> DbResult<Self> {
+    pub(super) fn load(db: &Db, scope: Scope) -> DbResult<Self> {
         let messages = Self {
-            roles: keyed(db, "SELECT id, role FROM message", |row| {
-                enum_column(row, 1)
-            })?,
+            roles: keyed(
+                db,
+                scope.query("SELECT id, role FROM message {scope}", Owner::Message("id"))?,
+                |row| enum_column(row, 1),
+            )?,
             parts: grouped(
                 db,
-                "SELECT p.message, p.id, p.kind, p.text, p.blob, length(b.bytes), \
-                 p.image_format, p.file FROM user_part p LEFT JOIN blob b ON b.sha256 = p.blob \
-                 ORDER BY p.message, p.position",
+                scope.query(
+                    "SELECT p.message, p.id, p.kind, p.text, p.blob, length(b.bytes), \
+                     p.image_format, p.file FROM user_part p LEFT JOIN blob b ON b.sha256 = p.blob \
+                     {scope} ORDER BY p.message, p.position",
+                    Owner::Message("p.message"),
+                )?,
                 |row| {
                     let blob = match row.get::<Option<Vec<u8>>>(4)? {
                         Some(digest) => Some((digest, row.get(5)?)),
@@ -497,38 +574,58 @@ impl Messages {
             )?,
             states: keyed(
                 db,
-                "SELECT s.message, s.date, t.name, s.location_workspace FROM message_state s \
-                 JOIN target t ON t.id = s.location_target",
+                scope.query(
+                    "SELECT s.message, s.date, t.name, s.location_workspace FROM message_state s \
+                     JOIN target t ON t.id = s.location_target {scope}",
+                    Owner::Message("s.message"),
+                )?,
                 |row| Ok((row.get(1)?, location(row.get(2)?, row.get(3)?)?)),
             )?,
             state_jobs: grouped(
                 db,
-                "SELECT j.message, j.position, j.parent_position, j.job, j.tool, j.name, j.state, \
-                 t.name, j.workspace, j.age_seconds, j.turns, j.tool_calls \
-                 FROM message_state_job j LEFT JOIN target t ON t.id = j.target \
-                 ORDER BY j.message, j.position",
+                scope.query(
+                    "SELECT j.message, j.position, j.parent_position, j.job, j.tool, j.name, \
+                     j.state, t.name, j.workspace, j.age_seconds, j.turns, j.tool_calls \
+                     FROM message_state_job j LEFT JOIN target t ON t.id = j.target \
+                     {scope} ORDER BY j.message, j.position",
+                    Owner::Message("j.message"),
+                )?,
                 state_job,
             )?,
             state_todos: grouped(
                 db,
-                "SELECT message, text, status FROM message_state_todo ORDER BY message, position",
+                scope.query(
+                    "SELECT message, text, status FROM message_state_todo \
+                     {scope} ORDER BY message, position",
+                    Owner::Message("message"),
+                )?,
                 todo,
             )?,
             job_events: grouped(
                 db,
-                "SELECT e.part, e.kind, e.job, e.name, e.source, e.text, e.view \
-                 FROM user_part_job_event e ORDER BY e.part, e.position",
+                scope.query(
+                    "SELECT e.part, e.kind, e.job, e.name, e.source, e.text, e.view \
+                     FROM user_part_job_event e {scope} ORDER BY e.part, e.position",
+                    Owner::Part,
+                )?,
                 job_event,
             )?,
             items: grouped(
                 db,
-                "SELECT message, id, position, provider_id, kind FROM assistant_item \
-                 ORDER BY message, position",
+                scope.query(
+                    "SELECT message, id, position, provider_id, kind FROM assistant_item \
+                     {scope} ORDER BY message, position",
+                    Owner::Message("message"),
+                )?,
                 |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, enum_column(row, 4)?)),
             )?,
             replays: keyed(
                 db,
-                "SELECT item, format, model, scope, payload, binding FROM reasoning_replay",
+                scope.query(
+                    "SELECT item, format, model, scope, payload, binding FROM reasoning_replay \
+                     {scope}",
+                    Owner::Item,
+                )?,
                 |row| {
                     Ok(Replay {
                         provenance: Provenance {
@@ -543,26 +640,38 @@ impl Messages {
             )?,
             blocks: grouped(
                 db,
-                "SELECT item, position, provider_id, text FROM assistant_block \
-                 ORDER BY item, position",
+                scope.query(
+                    "SELECT item, position, provider_id, text FROM assistant_block \
+                     {scope} ORDER BY item, position",
+                    Owner::Item,
+                )?,
                 |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)),
             )?,
             calls: keyed(
                 db,
-                "SELECT item, call_id, name, arguments FROM tool_call",
+                scope.query(
+                    "SELECT item, call_id, name, arguments FROM tool_call {scope}",
+                    Owner::Item,
+                )?,
                 |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)),
             )?,
             results: keyed(
                 db,
-                "SELECT r.message, c.call_id, c.name, r.result, r.is_error FROM tool_result r \
-                 JOIN tool_call c ON c.item = r.call",
+                scope.query(
+                    "SELECT r.message, c.call_id, c.name, r.result, r.is_error FROM tool_result r \
+                     JOIN tool_call c ON c.item = r.call {scope}",
+                    Owner::Message("r.message"),
+                )?,
                 |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )?,
             images: grouped(
                 db,
-                "SELECT i.result, i.blob, length(b.bytes), i.format, i.file \
-                 FROM tool_result_image i JOIN blob b ON b.sha256 = i.blob \
-                 ORDER BY i.result, i.position",
+                scope.query(
+                    "SELECT i.result, i.blob, length(b.bytes), i.format, i.file \
+                     FROM tool_result_image i JOIN blob b ON b.sha256 = i.blob \
+                     {scope} ORDER BY i.result, i.position",
+                    Owner::Message("i.result"),
+                )?,
                 |row| image(row, 1),
             )?,
         };
@@ -708,9 +817,10 @@ impl Messages {
         })
     }
 
-    /// Every committed message.
+    /// The commits in scope.
     pub(super) fn events(&self, events: &mut Events) -> DbResult<()> {
-        events.load("SELECT entry, message FROM message_commit", |row| {
+        let sql = "SELECT entry, message FROM message_commit {scope}";
+        events.load(sql, "entry", |row| {
             Ok(SessionEvent::MessageCommitted {
                 message: self.message(row.get(1)?)?,
             })

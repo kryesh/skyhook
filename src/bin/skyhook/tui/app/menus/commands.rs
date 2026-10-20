@@ -1,9 +1,13 @@
 //! Commands, from the palette, a shortcut or a typed `/command`.
 use super::{ConfirmAction, Item, MenuKind};
 use crate::state;
-use crate::tui::app::{App, Focus, HostRequest, Operation, Work, last_record, root_failed};
+use crate::tui::app::events::load_output;
+use crate::tui::app::output::MAX_LOADS;
+use crate::tui::app::{App, Focus, HostRequest, Operation, OutputStore, Work};
 use crate::tui::keys::{COMMANDS, Command};
 use crate::tui::model::{self, Tab, View};
+use futures_util::StreamExt;
+use skyhook::job::JobOutputQuery;
 
 impl App {
     pub fn command(&mut self, command: Command) {
@@ -25,7 +29,7 @@ impl App {
                     .collect();
                 let selected = items.iter().position(|item| item.value == self.model);
                 self.open("Model", MenuKind::Models(items));
-                self.menu_mut().unwrap().select(selected.unwrap_or(0));
+                self.menu.as_mut().unwrap().select(selected.unwrap_or(0));
             }
             Command::Mode => {
                 let items: Vec<_> = self
@@ -39,7 +43,7 @@ impl App {
                     .collect();
                 let selected = items.iter().position(|item| item.value == self.mode);
                 self.open("Mode", MenuKind::Modes(items));
-                self.menu_mut().unwrap().select(selected.unwrap_or(0));
+                self.menu.as_mut().unwrap().select(selected.unwrap_or(0));
             }
             Command::Agents => self.open("Agents", MenuKind::Agents(self.agent_items())),
             Command::Inspect => {
@@ -129,7 +133,7 @@ impl App {
                         "Enter: send / queue / expand\n",
                         "Alt+Enter / Ctrl+J: newline\n",
                         "PageUp / PageDown: scroll\n",
-                        "Content: / search; n/N next/previous; [ ] inspector tabs\n",
+                        "Content: [ ] inspector tabs\n",
                         "Ctrl+A/E: line start/end; Ctrl+W: delete word; Ctrl+U/K: delete to line boundary\n",
                         "Ctrl+- / Ctrl+.: undo/redo\n\n",
                         "Footer: session output · total input(uncached) · reported context (current/capacity)\n",
@@ -155,8 +159,7 @@ impl App {
         // continuing runs first, decides whether it resumes, as it does for
         // deliveries pending at close.
         let viewed = self.snapshot.phase == skyhook::session::SessionPhase::Viewing;
-        let mut activity = self.snapshot.activity.values();
-        let retryable = viewed || activity.any(|activity| activity.state.is_retryable());
+        let retryable = viewed || model::continuable(&self.snapshot);
         if self.creating.is_some() || self.stopping {
             self.toast("No failed or interrupted turns to retry");
             return;
@@ -207,7 +210,7 @@ impl App {
         }
         let requested = model.is_some() || mode.is_some();
         tokio::spawn(async move {
-            let read = last_record(&session.observe().snapshot);
+            let read = session.store().applied();
             let outcome = match session.selection(model.as_ref(), mode.as_ref()) {
                 Ok(selection) => session.continue_turn_with(selection).await,
                 Err(error) => Err(error),
@@ -232,45 +235,87 @@ impl App {
                     Ok(())
                 }
                 // The root turn it continued failed: the journal shows that.
-                Err(_) if root_failed(&session.observe().snapshot, session.root_agent(), read) => {
-                    Ok(())
-                }
-                Err(error) => Err(error.into()),
+                Err(error) => match session
+                    .store()
+                    .failed_after(session.root_agent(), read)
+                    .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) | Err(_) => Err(error.into()),
+                },
             };
             let _ = tx.send(Work::Continued { operation, result });
         });
     }
 
+    /// Export the selected agent's conversation with every detail: its whole
+    /// transcript read page by page, then the output of each job card the app does not
+    /// hold, written off the event loop from copies of what the app holds now. It is
+    /// work in hand until it reports.
     fn export(&mut self) {
-        let view = model::EntryView {
-            agent: &self.selected,
-            tab: Tab::Conversation,
-            view: &View::default(),
-            all_details: true,
-            today: self.clock.day(),
-        };
-        let entries = model::entries(
-            &self.snapshot,
-            &self.projection,
-            view,
-            &self.outputs,
-            &[],
-            true,
-        );
-        let text = entries.iter().map(|entry| entry.text()).collect::<Vec<_>>();
-        let text = text.join("\n\n");
-        let Some(session) = self.session() else {
+        let Some(session) = self.session().cloned() else {
             self.toast("No session to export yet");
             return;
         };
-        let label = crate::tui::format::agent_label(&self.selected).replace(':', "-");
-        let path = session.directory().join(format!("conversation-{label}.md"));
-        let tx = self.tx.clone();
+        let agent = self.selected.clone();
+        let mut chosen = self.outputs.chosen();
+        let (live, projection) = (self.snapshot.clone(), self.projection.clone());
+        let today = self.clock.day();
+        let label = crate::tui::format::agent_label(&agent).replace(':', "-");
+        let path = session
+            .store()
+            .directory()
+            .join(format!("conversation-{label}.md"));
+        let (tx, exporting) = (self.tx.clone(), self.exports.clone());
         tokio::spawn(async move {
-            let message = match tokio::fs::write(&path, text).await {
-                Ok(_) => format!("Exported {}", path.display()),
+            let window = match super::super::pages::whole(&session, &agent).await {
+                Ok(window) => window,
+                Err(error) => {
+                    let _ = tx.send(Work::Toast(error.to_string()));
+                    return;
+                }
+            };
+            let (mut held, mut queries) = (Vec::new(), Vec::new());
+            for job in window.jobs() {
+                match chosen.remove(&job) {
+                    Some(Ok(output)) => held.push((job, output)),
+                    Some(Err(query)) => queries.push(query),
+                    None => queries.push(JobOutputQuery::new(job)),
+                }
+            }
+            let loads = futures_util::stream::iter(queries).map(|query| {
+                let session = &session;
+                async move { (query.job, load_output(session, query).await) }
+            });
+            let loaded = loads.buffer_unordered(MAX_LOADS).collect::<Vec<_>>().await;
+            let outputs: OutputStore = held.into_iter().chain(loaded).collect();
+            let write = move || {
+                let view = model::EntryView {
+                    agent: &window.agent,
+                    tab: Tab::Conversation,
+                    view: &View::default(),
+                    all_details: true,
+                    today,
+                };
+                let inputs = model::Inputs {
+                    live: &live,
+                    window: &window,
+                    projection: &projection,
+                    presentation: view,
+                    outputs: &outputs,
+                    unsaved: &[],
+                };
+                let entries = model::entries(inputs, true);
+                let text = entries.iter().map(|entry| entry.text());
+                std::fs::write(&path, text.collect::<Vec<_>>().join("\n\n"))
+                    .map(|_| format!("Exported {}", path.display()))
+            };
+            let message = match tokio::task::spawn_blocking(write).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => error.to_string(),
                 Err(error) => error.to_string(),
             };
+            drop(exporting);
             let _ = tx.send(Work::Toast(message));
         });
     }
@@ -280,9 +325,8 @@ impl App {
 mod tests {
     use super::super::super::tests::*;
     use super::*;
-    use crate::tui::app::played::played_fixture;
+    use crate::tui::app::played::{observe_until, played_fixture};
     use crossterm::event::{KeyCode, KeyModifiers as M};
-    use skyhook::agent::ObservationSnapshot;
     use skyhook::identity::JobId;
     use skyhook::session::SessionEvent;
 
@@ -303,19 +347,16 @@ mod tests {
         model.turn().await.fail(rejected());
         let launched = bounded(launched).await.unwrap().unwrap();
         let child: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
-        let failures = |snapshot: &ObservationSnapshot| {
-            let records = snapshot.records.values();
-            let failed = records.filter(|record| {
-                matches!(record.event, SessionEvent::JobFinished {
-                    job, state: skyhook::job::JobEnd::Failed, ..
-                } if job == child)
-            });
-            failed.count()
+        let failed = |record: &skyhook::session::EventRecord| {
+            matches!(record.event, SessionEvent::JobFinished {
+                job, state: skyhook::job::JobEnd::Failed, ..
+            } if job == child)
         };
-        let observation = session.observe();
-        let (mut snapshot, mut updates) = (observation.snapshot, observation.updates);
-        assert_eq!(failures(&snapshot), 1);
-        app.snapshot = snapshot.clone();
+        observe_until(&mut app, |app| {
+            app.journal.iter().any(|record| failed(record))
+        })
+        .await;
+        let mut updates = session.store().observe().updates;
         let root = session.root_agent().clone();
         let waiting = skyhook::agent::ObservedActivity {
             state: skyhook::agent::AgentActivity::WaitingChildren,
@@ -330,8 +371,11 @@ mod tests {
         app.command(Command::Retry);
         model.turn().await.fail(rejected());
         crate::tests::bounded(async {
-            while failures(&snapshot) < 2 {
-                snapshot.apply(updates.recv().await.unwrap());
+            loop {
+                let update = updates.recv().await.unwrap();
+                if matches!(&update.event, skyhook::agent::RuntimeEvent::Record(record) if failed(record)) {
+                    break;
+                }
             }
         })
         .await;
@@ -357,9 +401,10 @@ mod tests {
             }
         ));
         app.work(continued);
-        assert!(!snapshot.records.values().any(|record| {
+        let requested = |record: &std::sync::Arc<skyhook::session::EventRecord>| {
             record.agent == root && matches!(record.event, SessionEvent::ModelRequested { .. })
-        }));
+        };
+        assert!(!journal(&session).await.iter().any(requested));
         // Child retry neither replaces nor finishes the pending root operation.
         assert!(app.operation);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
@@ -370,12 +415,11 @@ mod tests {
     /// knows whether anything resumes: here nothing does, and it says so.
     #[tokio::test]
     async fn retry_on_a_viewed_session_reaches_the_runtime() {
-        use crate::tui::app::observation::PreparedObservation;
         use skyhook::session::SessionPhase;
         let (_root, app, _model, session) = played_fixture().await;
         session.close().await.unwrap();
         let viewed = app.launch.create(Some(session.id())).await.unwrap();
-        let prepared = PreparedObservation::subscribe(viewed.clone());
+        let prepared = prepared(viewed.clone()).await;
         let (tx, mut work) = tokio::sync::mpsc::unbounded_channel();
         let mut app = app.sibling(Some(prepared), app.launch.clone(), tx);
         assert_eq!(app.snapshot.phase, SessionPhase::Viewing);
@@ -391,8 +435,8 @@ mod tests {
         .await;
         app.status.flush().await;
         let nothing = "Nothing to continue: no retained turn is failed or interrupted";
-        let records = viewed.observe().snapshot.records;
-        assert!(records.values().any(|record| matches!(
+        let records = journal(&viewed).await;
+        assert!(records.iter().any(|record| matches!(
             &record.event,
             SessionEvent::Status { message } if message == nothing
         )));
@@ -403,7 +447,7 @@ mod tests {
     async fn command_menu_shows_default_shortcuts_separately_and_searchably() {
         let (_root, mut app) = draft_fixture().await;
         app.command(Command::Commands);
-        let menu = app.menu_mut().unwrap();
+        let menu = app.menu.as_mut().unwrap();
         let MenuKind::Commands(items) = &menu.kind else {
             panic!("command menu")
         };
@@ -440,13 +484,36 @@ mod tests {
             assert_eq!(items[menu.filtered()[0].index].value, spec.command);
         }
         // Typing a command id runs that command.
-        app.overlay = None;
+        app.menu = None;
         app.paused = Some(crate::tui::app::Paused::Stopped);
         key(&mut app, KeyCode::Char('/'), M::NONE);
         let typed: Vec<_> = "resume".chars().map(KeyCode::Char).collect();
         press(&mut app, &typed);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(!app.paused.is_some());
-        assert!(app.menu().is_none());
+        assert!(app.menu.is_none());
+    }
+
+    /// An export holds the output of every job, including those never shown.
+    #[tokio::test]
+    async fn export_loads_the_output_of_jobs_never_shown() {
+        let (_root, mut app, session) = approving_fixture().await;
+        // The command never spells out what it prints, which only its output holds.
+        run_script(
+            &mut app,
+            "return await tool.exec({command: \"printf 'out%s' put-exported\"});",
+        )
+        .await;
+        let mut work = capture_work(&mut app);
+        app.command(Command::Export);
+        assert!(!app.settled(), "an export in flight keeps the session");
+        let Work::Toast(message) = recv(&mut work).await else {
+            panic!("the export reports where it wrote");
+        };
+        let path = message.strip_prefix("Exported ").expect(&message);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("output-exported"), "{text}");
+        assert!(app.settled());
+        session.shutdown().await.unwrap();
     }
 }

@@ -73,30 +73,83 @@ its own workspace-local session root.
 
 ## Host observation API
 
-`SessionHandle::observe()` returns a snapshot and receiver sharing an atomic revision
-boundary. Apply updates to the snapshot in revision order with `ObservationSnapshot::apply`.
-Once the session no longer runs (viewed, failed or closed), the snapshot reads every request,
-response, job and turn it left going as interrupted at its last activity; `apply` returns the jobs
-and requests an update read that way, which no update of their own reports.
-It contains:
+`SessionHandle::store()` is the session's journal. Its `observe()` returns an `Observation`: the
+session's live part, an `ObservationSnapshot`, and a receiver of the updates after it, sharing an
+atomic revision boundary. It copies only what the session holds live, so it costs the same however
+long the session is, and a host may call it whenever it needs a fresh start. Its `applied()` is
+the newest record the session has applied, without observing. The snapshot holds:
 
-- Durable records keyed by their original journal sequence.
-- The request ledger: each logical request's lifecycle phase, outcome, and usage, and which
-  failed turn a request's failure ended, folded from those records. Host statistics and
-  displays read request state from it.
-- Every job as the session state holds it: its owner, call arguments, state, failure, current
+- `applied`, the newest record it folds, after which every record arrives as an update, and
+  `last_activity`, when the newest record that is the session's activity was journaled.
+- `requests`, each agent's newest request, with its lifecycle phase, outcome and usage.
+- `jobs`, the jobs the session holds: their owner, call arguments, state, failure, current
   invocation, and when that invocation ran. A job's update arrives just before the record that
-  moved it.
-- Request-scoped live responses keyed by agent and logical request: their streamed blocks in
-  arrival order, then the authoritative blocks once the response has ended.
-- Current agent activity, with when its turn began (or, once it is no longer busy, when that
-  turn ended), and the context gauge: each agent's occupancy as its last committed response
-  reported it, folded from the journal and cleared by a checkpoint.
+  moved it. `RuntimeEvent::JobsUnheld` names the jobs the session let go of, which the snapshot
+  drops; a job's last update is its final view until a record moves it again.
+- `activity`, each agent's current activity, with when its turn began (or, once it is no longer
+  busy, when that turn ended); an agent that stops running, as a parked child does, gets an
+  update with none.
+- `views`, what the records fold into beside the committed state: `responses`, the live
+  responses keyed by agent and logical request (their streamed blocks in arrival order, then the
+  authoritative blocks once the response has ended; an agent's responses are its latest turn's,
+  and one that settled without committing, failed or interrupted, stays until the agent's next
+  agent request, as a reopened session also shows it); `context`, the context gauge, each agent's
+  occupancy as its last committed response reported it, cleared by a checkpoint; and `entries`,
+  how many entries each agent's transcript holds.
+- `usage`, the usage each agent's requests reported.
+
+Apply updates in revision order with `ObservationSnapshot::apply`. Once the session no longer runs
+(viewed, failed or closed), the snapshot reads every request, response, job and turn it left going
+as interrupted at its last activity. `apply` returns what an update changed beyond what it
+carries: `entry`, the ordinal its record took in its agent's transcript (none for a record the
+snapshot already folds); `stopped`, the jobs and requests read as interrupted that way, which no
+update of their own reports; `requests`, the requests its record changed; `superseded`, the
+request of its agent that a newer one replaced, as it left it; `fact`, what the fold decided of
+its record that presenting it reads (a `session::Fact`: the request an assistant message
+committed under, the message whose call a result answered, or that a failed turn ended on its
+request's failure); and `unheld`, the jobs the session let go of, as they left them.
+
+`RuntimeEvent::OutputChanged { job, invocation }` reports that a run captured output after its
+output was last read, by any reader; it carries no output. Read it with
+`inspect_output_with_captures`. No further one is posted for that run until its output is read
+again or the run finishes, whose job update reports the final output.
 
 Live response deltas are provisional, not additional committed messages. A new attempt of the
 same logical request resets its live response without removing durable attempt records. On
-receiver lag, obtain a fresh observation and replace **both** the snapshot and receiver; continuing
-with only one can leave a gap or apply stale live state.
+receiver lag, obtain a fresh observation and replace **both** the snapshot and receiver, then read
+again the pages on display; continuing with only one can leave a gap or apply stale live state.
+
+### Reading history in pages
+
+History is read in pages after observing, through the handle's `store()` (a `SessionStore`) and
+`jobs()` (a `JobManager`), each in one snapshot of the journal. A `Page` is the first or last of a
+list, or the entries after or before a key, which it never includes:
+
+- `transcript(agent, page, limit)` returns consecutive entries of one agent's transcript by
+  ordinal, with their `facts`: what presenting them reads beyond them, as the journal leaves it
+  (the requests they make or answer, each answer's request and when its turn began, the result
+  of each call they made and the calls that started a job, and the failed turns a request's
+  failure reports), so a host can show any page on its own. `PageFacts::observe` folds an
+  update's record and its `fact` into them.
+- `jobs().page(JobScope::Roots(owner) | JobScope::Children(parent), page, limit)` returns an
+  owner's jobs that do not nest under a parent (`JobEnvelope::nests`: a job its owner's script
+  issued), or a parent's children whoever created them, in id order; `jobs().views(ids)` returns
+  jobs by id.
+- `requests(agent, page, limit)` returns an agent's requests as the journal leaves them.
+- `agents()` returns every agent the session started as the records that say what a host shows
+  of it (its start, latest model and mode changes, latest todos and the latest record that ended
+  a turn), when the turn that record ended began and ended, when its open turn began, and its
+  owner job, read through `through`: a summary's records repeat any update through it.
+- `failed_after(agent, record)` says whether an agent journaled a failed turn after a record.
+
+A page sees at least what the observation applied. A host places an update's record at the
+ordinal `apply` reports, counted on from the snapshot's `views.entries`: a record at an ordinal a page
+holds is one the page already shows, and every later one is news. Requests and jobs read as the
+snapshot holds them where it holds them, and as their page read them otherwise; a page in flight
+when the session lets a job go may have read it before its final view, which `apply` hands over in
+`unheld`, as it hands over a request a newer one replaced in `superseded`.
+
+### Inspection and host records
 
 `inspect_output_with_captures` and `inspect_output_fields` are host inspection APIs. They do not
 claim jobs or consume agent notifications. `cancel_job` is the separate operation that requests
@@ -105,7 +158,7 @@ discovery outcomes without inserting diagnostics into model context or writing d
 terminal. `record_status` likewise records host-facing status, not a user message.
 
 `TodoItem` and `TodoStatus` are exported by `skyhook::agent`. Hosts projecting
-checklists from observed records apply `SessionEvent::TodosReplaced` and the reconciled todos in
+checklists from records apply `SessionEvent::TodosReplaced` and the reconciled todos in
 `SessionEvent::Compaction` checkpoints in sequence. Both replace the owning agent's entire list;
 child-agent lists remain independent.
 
@@ -148,7 +201,7 @@ input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 23. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 24. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
@@ -169,7 +222,8 @@ whose `new_session` caller gave up, is removed.
 A write the session journal cannot take stops the session as a crash would: the call that met it,
 calls it cut short and every later call return `SessionError::JournalFailed` with the first
 cause; `shutdown` and `close` report it too and still release the session. Its observation reads
-the phase as failed. `SessionHandle::phase` tells whether the session still runs and journals.
+the phase as failed and otherwise shows what reopening the session would; an observation attached
+before then no longer follows it once it folds that phase, and observes again. `SessionHandle::phase` tells whether the session still runs and journals.
 A session belongs to the Tokio runtime that created or resumed it: use it only from that runtime,
 and keep the runtime running until the session is closed.
 
@@ -188,16 +242,20 @@ behavior.
 
 ## Reading a session archive
 
-`SessionStore::read_records(root, id).await` returns sequence-ordered records from a read-only
-database snapshot without acquiring the session's writer lock. A live owner may continue writing;
-archive inspection neither takes ownership nor resumes unfinished work.
-`SessionStore::is_open(root, id).await` reports whether a store in any process holds the session.
-It takes the session lock shared for an instant; an open racing it retries once before failing
-with `AlreadyOpen`. `SessionStore::summary(root, id).await` reads a session list row without
-decoding the session, including its title as `SessionHandle::title` reads it, in `last_millis` the
-time of its newest record that `SessionEvent::is_activity` (closing a session is not), and, in
-`stopped`, the failed or interrupted turn that resuming the root agent would continue, if any. `stopped` reads only the root's journaled turns, so a session that closed idle with job
-deliveries pending has none, yet resumes interrupted.
+`SessionStore::read_records(root, id).await` returns every record, in sequence order, from a
+read-only database snapshot without acquiring the session's writer lock: an explicit export of the
+whole journal. A live owner may continue writing; archive inspection neither takes ownership nor
+resumes unfinished work. `SessionStore::is_open(root, id).await` reports whether a store in any
+process holds the session. It takes the session lock shared for an instant; an open racing it
+retries once before failing with `AlreadyOpen`. `SessionStore::summary(root, id).await` reads a
+session list row without decoding the session, including its title as `SessionStore::title`
+reads it, in `last_millis` the time of its newest record that `SessionEvent::is_activity` (closing
+a session is not), and, in `stopped`, the failed or interrupted turn that resuming the root agent
+would continue, if any. `stopped` reads only the root's journaled turns, so a session that closed
+idle with job deliveries pending has none, yet resumes interrupted.
+`SessionStore::stats(root, id).await` reads, the same way, the statistics `skyhook stats` reports:
+aggregates over the whole journal, its requests read a page at a time, so its memory does not grow
+with the session.
 
 The SQLite layout is versioned. Opening a database validates its identity and version; there is no
 migration or compatibility layer for earlier layouts.
@@ -234,15 +292,17 @@ or authentication headers:
   requests keep their recorded inputs; usage identifies the originating request, including summary
   requests and failed attempts.
 
-`session::reconstruct_model_request(&records, sequence)` returns the `provider/model` name the
+`SessionStore::reconstruct_model_request(sequence).await` returns the `provider/model` name the
 request was issued under and the reconstructed `ModelRequest` for a `model_requested` sequence,
-using sequence-ordered records from `SessionStore`. It checks the request's context, checkpoint
-and history bound as an append does, so other records fail with a `ReplayError`. Attachments and
-tool images reference content-addressed blobs by SHA-256; `load_blobs(&mut request, &mut cache)`
-on an owning `SessionStore` loads their contents for provider encoding, reusing and then keeping
-exactly this request's blobs in `cache`; unlike `read_records`, opening a store acquires the
-session's writer lock. Reconstruction reproduces Skyhook's provider-neutral input, not an
-API-specific wire encoding or a replay of the external call.
+read from the session's journal. It checks the request's context (its agent's newest for that
+purpose), checkpoint and history bound, and that an agent request follows a result for every call
+its agent made, as an append does, so other records fail with a `ReplayError`. Attachments and
+tool images reference content-addressed blobs by SHA-256;
+`load_blobs(&mut request, &mut cache)` on the same store loads their contents for provider
+encoding, reusing and then keeping exactly this request's blobs in `cache`. Both need an owning
+`SessionStore`; unlike `read_records`, opening a store acquires the session's writer lock.
+Reconstruction reproduces Skyhook's provider-neutral input, not an API-specific wire encoding or a
+replay of the external call.
 
 The `ModelRequest` contract preserves the typed context entries and `history_lifetime` cache hints.
 See [history, transient state, and caching](architecture.md#history-transient-state-and-caching)

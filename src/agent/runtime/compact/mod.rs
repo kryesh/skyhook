@@ -3,11 +3,11 @@
 use std::num::NonZeroU64;
 
 use super::{
-    HarnessError, SessionRuntime, TurnContext,
+    AgentContext, HarnessError, SessionRuntime, TurnContext,
     recovery::{FailureRecord, TurnError},
 };
 use crate::{
-    provider::{ProviderContext, ProviderErrorKind, protocol::ModelRequest},
+    provider::{ProviderErrorKind, protocol::ModelRequest},
     session::{AttemptRef, CompactionFailure, CompactionTrigger, ProfileSnapshot},
 };
 
@@ -77,11 +77,11 @@ impl SessionRuntime {
     pub(super) async fn compact_history(
         &self,
         turn: &TurnContext<'_>,
-        provider: &mut dyn ProviderContext,
-        profile: &ProfileSnapshot,
+        context: &mut AgentContext,
         input: &ModelRequest,
         trigger: CompactionTrigger,
     ) -> Result<(), TurnError> {
+        let profile = &context.model.profile.clone();
         let mut launches = self.jobs.active_launches(turn.agent);
         let mut model_attempt = 0;
         let mut fit = SummaryFit::default();
@@ -93,7 +93,7 @@ impl SessionRuntime {
             let result = self
                 .compact_inner(
                     turn,
-                    provider,
+                    context,
                     CompactionInput {
                         profile,
                         request: input,
@@ -175,13 +175,12 @@ mod tests {
         agent::{CompactionFault, TodoStatus},
         execution::ExecutionLocation,
         provider::{
-            Provider, ProviderErrorKind,
+            ProviderErrorKind,
             protocol::{
-                AssistantItem, ContextId, CutReason, ItemKind, ModelRequest, ResponseEvent,
-                ToolCall, Usage,
+                AssistantItem, CutReason, ItemKind, ModelRequest, ResponseEvent, ToolCall, Usage,
             },
         },
-        session::{CompactionTrigger, Message, SessionEvent, UserPart, project_history},
+        session::{CompactionTrigger, Message, SessionEvent, UserPart},
         tool::policy::CapabilitySet,
     };
 
@@ -308,8 +307,15 @@ mod tests {
             assert!(!self.workspace.path().join("must-not-exist").exists());
         }
 
-        pub(super) fn records(&self) -> Vec<crate::session::EventRecord> {
+        pub(super) fn records(&self) -> Vec<Arc<crate::session::EventRecord>> {
             self.session.runtime.store.records()
+        }
+
+        pub(super) async fn history(
+            &self,
+            agent: &crate::identity::AgentId,
+        ) -> crate::session::Projection {
+            crate::session::tests::projected(&self.session.runtime.store, agent).await
         }
 
         pub(super) async fn compact(&self) -> Result<(), HarnessError> {
@@ -332,16 +338,19 @@ mod tests {
                 _ => None,
             });
             let profile = profile.expect("the fixture prompt journaled a model context");
-            let mut input = self.template.clone();
-            let history = project_history(&records, agent);
+            let (system, tools) = (self.template.system.clone(), self.template.tools.clone());
             let capabilities = CapabilitySet::default();
+            let context =
+                runtime.open_agent_context(agent, profile, system, &capabilities, Some(tools));
+            let mut context = context.await.unwrap();
+            let mut input = self.template.clone();
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
             let (jobs, todos) = (&runtime.jobs, &runtime.store);
             let state = state::runtime_state_content(jobs, todos, agent, &capabilities, &location);
             // As the agent's context builds it: only a stateless mode sends no state.
             let state = crate::session::Message::State(state);
-            let sends = profile.profile.state_mode != StateMode::None;
-            input.context = history.context(sends.then_some(&state));
+            let sends = context.model.profile.profile.state_mode != StateMode::None;
+            input.context = context.projected.context(sends.then_some(&state));
             let cancellation = CancellationToken::new();
             let turn = TurnContext {
                 agent,
@@ -350,15 +359,13 @@ mod tests {
                 location: &location,
                 capabilities: capabilities.clone(),
             };
-            let mut provider = self.script.open_context(ContextId::from(agent))?;
             let (root, token) = (agent.clone(), cancellation.clone());
             runtime.store.enqueue(move |state| {
                 let facts = state.agents.get_mut(&root).expect("the root runs");
                 facts.turn_token = token;
                 facts.set_turn(Turn::Busy);
             });
-            let compacted =
-                runtime.compact_history(&turn, provider.as_mut(), &profile, &input, trigger);
+            let compacted = runtime.compact_history(&turn, &mut context, &input, trigger);
             let compacted = compacted.await;
             set_root_turn(&self.session, Turn::Idle);
             compacted
@@ -406,7 +413,7 @@ mod tests {
             let session = &fixture.session;
             let behind = match started {
                 true => None,
-                false => Some(interrupt_on(session, summarizing).await),
+                false => Some(interrupt_on(session, &session.root, summarizing).await),
             };
             let prompt = spawn_prompt(session, "Continue.");
             let interrupted = match behind {
@@ -429,8 +436,10 @@ mod tests {
                 if Some(attempt.request) == failure.request() => *attempt);
             assert_eq!(failure.attempt(), attempts.last().copied(), "{started}");
             // The failure settles the summary request on that attempt.
-            let ledger = fixture.session.observe().snapshot.ledger;
-            let request = failure.request().and_then(|request| ledger.get(request));
+            let ledger = crate::session::tests::ledger(&fixture.session.runtime.store);
+            let request = failure
+                .request()
+                .and_then(|request| ledger.requests.get(&request));
             let attempt = attempts.last().map(|attempt| attempt.attempt);
             assert!(
                 matches!(request.unwrap().phase,
@@ -453,7 +462,7 @@ mod tests {
         let fixture = Fixture::new([Step::new(summarized)]).await;
         fixture.add_history(20_000).await;
         let used: fn(&SessionEvent) -> bool = |event| matches!(event, SessionEvent::Usage { .. });
-        let interrupted = interrupt_on(&fixture.session, used).await;
+        let interrupted = interrupt_on(&fixture.session, &fixture.session.root, used).await;
         let (result, stopped) =
             bounded(async { tokio::join!(fixture.compact(), interrupted) }).await;
         assert_eq!(stopped, 1);
@@ -497,7 +506,7 @@ mod tests {
                 }
             )
         };
-        let interrupted = interrupt_on(session, joined).await;
+        let interrupted = interrupt_on(session, &session.root, joined).await;
         let from = fixture.records().len();
         fixture.script.release(1);
         assert_eq!(bounded(interrupted).await, 1);
@@ -567,11 +576,12 @@ mod tests {
                 "{:?}",
                 ended.event
             );
-            let live = fixture.session.observe().snapshot.ledger;
-            let reopened = crate::session::RequestLedger::of(&records);
-            for ledger in [live, reopened] {
-                assert!(ledger.failed_by(ended.sequence).is_some(), "{error}");
-            }
+            let ledger = crate::session::tests::ledger(&fixture.session.runtime.store);
+            let ended = ledger.facts.get(&ended.sequence);
+            assert!(
+                matches!(ended, Some(crate::session::Fact::EndedOn)),
+                "{error}"
+            );
             fixture.session.shutdown().await.unwrap();
         }
     }
@@ -621,7 +631,7 @@ mod tests {
                 .replace_todos(agent, old_todos.clone(), None)
                 .await
                 .unwrap();
-            let before = project_history(&fixture.records(), agent);
+            let before = fixture.history(agent).await;
             let compacted = fixture.compact_for(CompactionTrigger::Overflow);
             let fault = final_fault(retrying(&fixture.session, compacted).await, agent);
             assert!(expected(&fault), "{fault}");
@@ -630,7 +640,7 @@ mod tests {
                 events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
             assert_eq!(faults, vec![fault.clone(); attempts - 1]);
             let requests = fixture.requests().len() - 1;
-            let unchanged = project_history(&records, agent) == before;
+            let unchanged = fixture.history(agent).await == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
             let kept_todos = todos.inspect_todos(agent, None).unwrap() == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);

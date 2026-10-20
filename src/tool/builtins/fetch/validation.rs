@@ -137,6 +137,12 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
 
 pub(super) struct ClientSettings {
     pub(super) timeout: Duration,
+    pub(super) client: ClientIdentity,
+}
+
+/// The settings an HTTP client is built from, which the calls sharing it have in common.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ClientIdentity {
     pub(super) connect_timeout: Duration,
     pub(super) proxy: Option<String>,
     pub(super) insecure: bool,
@@ -204,9 +210,11 @@ impl TryFrom<FetchArgs> for FetchPlan {
             headers,
             client: ClientSettings {
                 timeout: args.timeout.duration(),
-                connect_timeout: args.connect_timeout.duration(),
-                proxy: args.proxy,
-                insecure: args.insecure,
+                client: ClientIdentity {
+                    connect_timeout: args.connect_timeout.duration(),
+                    proxy: args.proxy,
+                    insecure: args.insecure,
+                },
             },
             max_bytes: args.max_bytes.into(),
             max_redirects: args.max_redirects.into(),

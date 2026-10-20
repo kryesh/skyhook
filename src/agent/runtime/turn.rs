@@ -37,7 +37,7 @@ impl SessionRuntime {
             }
             let viewer = turn.diagnostic_viewer();
             self.deliver_events(agent, viewer, &[]).await?;
-            agent_context.refresh(&self.store, agent);
+            agent_context.refresh(&self.store, agent).await?;
             let profile = agent_context.model.profile.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
                 return Err(HarnessError::ImagesUnsupported(profile.model.clone()).into());
@@ -52,9 +52,7 @@ impl SessionRuntime {
             if let Some(trigger) = trigger {
                 overflowed = false;
                 let request = agent_context.request(tail.as_ref());
-                let provider = agent_context.provider.as_mut();
-                let snapshot = &agent_context.model.profile;
-                self.compact_history(&turn, provider, snapshot, &request, trigger)
+                self.compact_history(&turn, agent_context, &request, trigger)
                     .await?;
                 // Consume input received during compaction before starting the
                 // normal request, rather than delaying it by another request.
@@ -69,7 +67,7 @@ impl SessionRuntime {
                     let state = SessionEvent::MessageCommitted { message: state };
                     self.journal_turn(agent, Command::Journal, move |_| vec![state])
                         .await?;
-                    agent_context.refresh(&self.store, agent);
+                    agent_context.refresh(&self.store, agent).await?;
                     None
                 }
                 tail => tail,
@@ -210,7 +208,11 @@ impl SessionRuntime {
                     },
                 )?)
             };
-            let origin = match self.store.commit(Command::Journal, commit).await {
+            let origin = match self
+                .store
+                .commit_on(owner_job, Command::Journal, commit)
+                .await
+            {
                 Err(HarnessError::Interrupted) => {
                     let interrupted = recovery::AttemptEnd::Interrupted;
                     self.record_attempt(agent, attempt, usage, interrupted)
@@ -233,25 +235,18 @@ impl SessionRuntime {
             // Decided from the committed response's reported occupancy, which excludes
             // newly produced tool results and queued input. An answer ends the turn's
             // model work: what it would compact waits for the next request boundary.
-            agent_context.refresh(&self.store, agent);
+            agent_context.refresh(&self.store, agent).await?;
             if !ends && let Some(trigger) = agent_context.compaction_due() {
                 let current = agent_context.request(next_tail.as_ref());
-                let provider = agent_context.provider.as_mut();
-                let snapshot = &agent_context.model.profile;
-                self.compact_history(&turn, provider, snapshot, &current, trigger)
+                self.compact_history(&turn, agent_context, &current, trigger)
                     .await?;
-                agent_context.refresh(&self.store, agent);
+                agent_context.refresh(&self.store, agent).await?;
             }
             if !calls.is_empty() {
-                // Every call's job exists, in call order, before any runs: a `wait`
-                // in this response must see its sibling calls as outstanding work.
-                let mut created = Vec::with_capacity(calls.len());
-                for call in &calls {
-                    let capabilities = &turn.capabilities;
-                    let creating =
-                        self.create_call(agent, owner_job, call, origin, location, capabilities);
-                    created.push(creating.await);
-                }
+                let capabilities = &turn.capabilities;
+                let created =
+                    (self.create_calls(agent, owner_job, &calls, origin, location, capabilities))
+                        .await;
                 // A call that ended without a job ends it for a `wait` beside it.
                 if created
                     .iter()
@@ -624,7 +619,7 @@ mod tests {
 
     // End-to-end automatic compaction uses completed provider usage.
 
-    use crate::session::ModelPurpose;
+    use crate::session::{ModelPurpose, tests::request_purpose};
 
     fn with_usage(mut events: Vec<ResponseEvent>, snapshots: &[Usage]) -> Vec<ResponseEvent> {
         let end = events.pop().expect("response has a terminal event");
@@ -654,19 +649,11 @@ mod tests {
             .unwrap();
     }
 
-    fn purposes(records: &[EventRecord]) -> Vec<ModelPurpose> {
+    fn purposes(records: &[Arc<EventRecord>]) -> Vec<ModelPurpose> {
         records
             .iter()
-            .filter_map(|record| purpose(records, record))
+            .filter_map(|record| request_purpose(records, record))
             .collect()
-    }
-
-    /// The purpose of a request record, from its context.
-    fn purpose(records: &[EventRecord], record: &EventRecord) -> Option<ModelPurpose> {
-        let context = crate::session::request_context(record, |sequence| {
-            crate::session::record_at(records, sequence)
-        });
-        context.map(|context| context.purpose)
     }
 
     fn shell_response() -> Vec<ResponseEvent> {
@@ -740,12 +727,12 @@ mod tests {
         assert!(result.result.to_string().contains("retained-result"));
         let summary = records
             .iter()
-            .position(|record| purpose(&records, record) == Some(Compaction))
+            .position(|record| request_purpose(&records, record) == Some(Compaction))
             .unwrap();
         let checkpoint = position(&|event| matches!(event, SessionEvent::Compaction { .. }));
         let next = records
             .iter()
-            .rposition(|record| purpose(&records, record) == Some(Agent));
+            .rposition(|record| request_purpose(&records, record) == Some(Agent));
         assert!(summary < checkpoint && checkpoint < tool && tool < next.unwrap());
         {
             let captured = requests.lock().unwrap();
@@ -768,16 +755,16 @@ mod tests {
                 matches!(captured[2].messages().nth(index - 1), Some(Sent::Assistant(items))
                 if items.iter().filter_map(|item| item.call()).any(|call| call.id() == "append-once"))
             );
-            // The persisted summary boundary and the post-compaction call both replay exactly.
-            let requested = records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
-            for (record, sent) in requested.zip(captured.iter()) {
-                let (_, replayed) =
-                    crate::session::reconstruct_model_request(&records, record.sequence.request())
-                        .unwrap();
-                assert_eq!(&replayed, &sent.request);
-            }
+        }
+        // The persisted summary boundary and the post-compaction call both replay exactly.
+        let captured = requests.lock().unwrap().clone();
+        let requested = records
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
+        for (record, sent) in requested.zip(captured.iter()) {
+            let store = &session.runtime.store;
+            let replayed = store.reconstruct_model_request(record.sequence.request());
+            assert_eq!(&replayed.await.unwrap().1, &sent.request);
         }
         shutdown_session(session).await;
     }
@@ -904,7 +891,7 @@ mod tests {
         let resumed = harness.resume_session(id).await.unwrap();
         resumed.running().await.unwrap();
         let store = &resumed.runtime.store;
-        assert_eq!(store.read(|state| state.ledger.unanswered().count()), 0);
+        assert_eq!(store.read(|state| state.requests.unanswered().count()), 0);
         let results = count!(
             &store.records(),
             SessionEvent::MessageCommitted {
@@ -944,7 +931,7 @@ mod tests {
         let compacted: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::Compaction { .. });
         // Queued behind the checkpoint's commit.
-        let interrupted = interrupt_on(&session, compacted).await;
+        let interrupted = interrupt_on(&session, &session.root, compacted).await;
         let (result, stopped) =
             bounded(async { tokio::join!(session.prompt("Run the tool."), interrupted) }).await;
         assert_eq!(stopped, 1);
@@ -969,7 +956,7 @@ mod tests {
             tokio::join!(session.prompt("Run the tool."), async {
                 script.request(0).await;
                 // Queued behind the response's commit, ahead of its calls.
-                let interrupted = interrupt_on(&session, |_| true).await;
+                let interrupted = interrupt_on(&session, &session.root, |_| true).await;
                 script.release(0);
                 assert_eq!(interrupted.await, 1);
             })
@@ -1026,7 +1013,7 @@ mod tests {
                 }
             )
         };
-        let interrupted = interrupt_on(&session, answered).await;
+        let interrupted = interrupt_on(&session, &session.root, answered).await;
         let prompt = spawn_prompt(&session, "task");
         assert_eq!(bounded(interrupted).await, 0);
         assert_eq!(bounded(prompt).await.unwrap().unwrap(), "answer");
@@ -1063,7 +1050,7 @@ mod tests {
             };
             let behind = match started {
                 true => None,
-                false => Some(on_commit(&store, requested, interrupt.clone()).await),
+                false => Some(on_commit(&store, &agent, requested, interrupt.clone()).await),
             };
             let ended: futures_util::future::BoxFuture<bool> = if tree {
                 let (done, ended) = oneshot::channel();
@@ -1091,9 +1078,9 @@ mod tests {
             let once = usize::from(started);
             assert_eq!(attempts, (once, once, once), "{tree} {started}");
             let phase = store.read(|state| {
-                let request = state.ledger.latest(&agent);
+                let request = state.requests.latest(&agent);
                 request
-                    .and_then(|request| state.ledger.get(request))
+                    .and_then(|request| state.requests.get(request))
                     .map(|r| r.phase.clone())
             });
             assert!(
@@ -1222,7 +1209,7 @@ mod tests {
         root_waiting(&session).await;
         assert_eq!(session.interrupt().await, 2);
         // Cancelling the held child lets the root run on, the session still paused.
-        let job = session.runtime.jobs.list(&session.root)[0].id;
+        let job = session.runtime.jobs.list(&session.root).await.unwrap()[0].id;
         session.runtime.jobs.cancel(job).await.unwrap();
         provider.request(2).await;
         let arguments = json!({"source": "return 1", "bg": true});
@@ -1336,7 +1323,7 @@ mod tests {
                     history_lifetime,
                     ..
                 } => Some((
-                    purpose(&records, record).unwrap(),
+                    request_purpose(&records, record).unwrap(),
                     tail.as_slice(),
                     *history_lifetime,
                 )),
@@ -1382,7 +1369,7 @@ mod tests {
                 }
             )
         };
-        let interrupted = interrupt_on(&session, answered).await;
+        let interrupted = interrupt_on(&session, &session.root, answered).await;
         let prompt = spawn_prompt(&session, "Finish.");
         assert_eq!(bounded(interrupted).await, 0);
         assert_eq!(bounded(prompt).await.unwrap().unwrap(), "original final");
@@ -1396,7 +1383,7 @@ mod tests {
             matches!(event, SessionEvent::ModelContext { context }
                 if context.purpose == ModelPurpose::Compaction)
         };
-        let interrupted = interrupt_on(&session, compacting).await;
+        let interrupted = interrupt_on(&session, &session.root, compacting).await;
         let prompt = spawn_prompt(&session, "Next.");
         assert_eq!(bounded(interrupted).await, 1);
         let interrupted = bounded(prompt).await.unwrap();

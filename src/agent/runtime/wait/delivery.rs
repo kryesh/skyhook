@@ -235,7 +235,7 @@ mod tests {
         // A second after the progress, an undeferred wait would have resolved.
         time_out(&session, &only_child(&session), 1, 1).await;
         tracking.request(2).await;
-        let state = session.runtime.jobs.snapshot(wait).unwrap().state;
+        let state = session.runtime.jobs.snapshot(wait).await.unwrap().state;
         assert_eq!(
             state,
             JobState::Running,
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0]["text"], PROGRESS);
         assert!(events(&woken).is_empty(), "the child has not completed");
-        assert_eq!(jobs.snapshot(job).unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(job).await.unwrap().state, JobState::Running);
 
         // Releasing its work lets the child answer again and complete; that answer
         // is the completion's result.
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(messages[0]["text"], A);
         // A must not complete the still-working child
         assert!(events(&first).is_empty());
-        let state = runtime.jobs.snapshot(job).unwrap().state;
+        let state = runtime.jobs.snapshot(job).await.unwrap().state;
         assert_eq!(state, JobState::Running);
         // parent must not finish before addendum work
         assert!(!turn.is_finished());
@@ -464,7 +464,7 @@ mod tests {
                 matches!(&record.event, SessionEvent::MessageCommitted { message: Message::Assistant(content) } if *content == blank)
             });
         assert_eq!(committed.count(), 1);
-        let delivered = |records: &[crate::session::EventRecord]| {
+        let delivered = |records: &[Arc<crate::session::EventRecord>]| {
             records
                 .iter()
                 .filter(|record| matches!(&record.event, SessionEvent::JobMessageDelivered { .. }))
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(messages.matches("parent-reply-request-marker").count(), 1);
         // The child committed text WITH a tool call and reached another, gated invoke.
         tracking.request(4).await;
-        let state = runtime.jobs.snapshot(child_job).unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
         assert_eq!(state, JobState::Running);
         if !parent_already_waiting {
             // No new parent request may start while its current invoke is gated.
@@ -558,7 +558,7 @@ mod tests {
         }
         let next = tracking.request(5).await;
         assert_reason(&next, "waiting", "event");
-        let state = runtime.jobs.snapshot(child_job).unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
         // the reply must not depend on child completion
         assert_eq!(state, JobState::Running);
         assert!(events(&next).is_empty(), "a reply is not a job completion");
@@ -643,12 +643,12 @@ mod tests {
         }
         // Replies published while the parent's turn is busy stay pending for it.
         tracking.request(child_final).await;
-        let state = runtime.jobs.snapshot(child_job).unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
         assert_eq!(state, JobState::Running);
         assert!(!tracking.requested_from(parent_reply));
         tracking.release(1);
         let next = tracking.request(parent_reply).await;
-        let state = runtime.jobs.snapshot(child_job).unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
         // a no-tool parent response must not strand replies until child completion
         assert_eq!(state, JobState::Running);
         assert!(events(&next).is_empty());
@@ -890,16 +890,16 @@ mod tests {
                 if let RuntimeEvent::Record(record) = update.event
                     && let SessionEvent::MessageCommitted {
                         message: Message::User(saved),
-                    } = record.event
+                    } = &record.event
                 {
-                    break (record.agent, saved);
+                    break (record.agent.clone(), saved.clone());
                 }
             }
         })
         .await;
         assert_eq!(saved, (session.root_agent().clone(), vec![content]));
         let root = session.root_agent().clone();
-        found(&session, move |state| {
+        found(&session, [Key::Agent(root.clone())], move |state| {
             (!state.jobs.has_pending(&root)).then_some(())
         })
         .await;

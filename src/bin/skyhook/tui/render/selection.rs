@@ -79,13 +79,13 @@ impl SourcePoint {
     /// of the line latest in reading order among those shown before it, else
     /// the start of the earliest shown after it.
     fn at(rows: &RowBlocks, at: TextPosition) -> Option<Self> {
+        let (entry, offset) = rows.locate(at.row)?;
         let row = rows.get(at.row)?;
-        let offset = at.row - rows.entry_start(row.entry)?;
         let text = row.text();
         let byte = row.text_view().endpoint(at.byte)?;
         let point = |line, byte| Self {
             key: row.entry_key.clone(),
-            entry: row.entry,
+            entry,
             line,
             byte,
         };
@@ -93,10 +93,10 @@ impl SourcePoint {
         if let Some(span) = hit {
             return Some(point(span.line, span.to_source(&text, byte)));
         }
-        let order = rows.line_order(row.entry)?;
+        let order = rows.line_order(entry)?;
         let mut before: Option<(usize, markdown::LineId, usize)> = None;
         let mut after: Option<(usize, markdown::LineId, usize)> = None;
-        for (span_row, span) in entry_sources(rows.entry_rows(row.entry)) {
+        for (span_row, span) in entry_sources(rows.entry_rows(entry)) {
             let rank = order.rank(span.line)?;
             if (span_row, span.shown.end) < (offset, byte) {
                 if before.is_none_or(|(latest, ..)| rank >= latest) {
@@ -280,10 +280,16 @@ impl Selection {
         start != end && (start.row..=end.row).contains(&index)
     }
 
-    /// The shown bytes of `row`, whose text is `text`, the selection covers.
-    pub(super) fn highlights(&self, row: &Row, text: &str) -> Vec<std::ops::Range<usize>> {
+    /// The shown bytes of `row`, a row of `entry` whose text is `text`, the
+    /// selection covers.
+    pub(super) fn highlights(
+        &self,
+        entry: usize,
+        row: &Row,
+        text: &str,
+    ) -> Vec<std::ops::Range<usize>> {
         let spans = row.sources().filter_map(|span| {
-            let bytes = selected(&self.lines, row.entry, &span)?;
+            let bytes = selected(&self.lines, entry, &span)?;
             Some(span.to_shown(text, bytes.start)..span.to_shown(text, bytes.end))
         });
         spans.filter(|bytes| !bytes.is_empty()).collect()
@@ -312,19 +318,24 @@ mod tests {
             Surface::Tool,
         );
         let layout = markdown::RowLayout::default();
-        EntryGeometry::new(&entry, 30, 0).row(Line::from(text.to_owned()), false, layout)
+        EntryGeometry::new(&entry, 30).row(Line::from(text.to_owned()), false, layout)
     }
 
     /// Each entry laid out at its index, as the transcript lays them out.
     fn transcript(entries: &[model::Entry], width: u16) -> RowBlocks {
         let highlights = super::super::super::tool_view::HighlightCache::default();
         let mut blocks = RowBlocks::default();
-        for (index, entry) in entries.iter().enumerate() {
-            blocks.update_entry(index, Vec::new(), |rows| {
-                let columns = RequestColumns::default();
-                update_entry_rows(rows, entry, index, width, &highlights, columns)
-            });
-        }
+        blocks.reset(entries.len());
+        blocks.layout(&Vec::from_iter(0..entries.len()), |index| {
+            let columns = RequestColumns::default();
+            let mut rows = Vec::new();
+            let fences = update_entry_rows(&mut rows, &entries[index], width, &highlights, columns);
+            super::super::Laid {
+                rows,
+                sources: Vec::new(),
+                fences,
+            }
+        });
         blocks
     }
 
@@ -541,9 +552,9 @@ mod tests {
         rows: &RowBlocks,
         index: usize,
     ) -> Vec<std::ops::Range<usize>> {
-        let row = &rows[index];
+        let (row, (entry, _)) = (&rows[index], rows.locate(index).unwrap());
         if selection.covers(index) {
-            selection.highlights(row, &row.text())
+            selection.highlights(entry, row, &row.text())
         } else {
             Vec::new()
         }
@@ -713,8 +724,7 @@ mod tests {
     #[test]
     fn checked_row_text_rejects_interior_utf8_and_wrong_row_endpoints() {
         let row = source_row("é界👩‍💻é");
-        let mut rows = RowBlocks::default();
-        rows.replace_entry(0, vec![row.clone()], Vec::new());
+        let rows = RowBlocks::entry(vec![row.clone()]);
         let start = TextPosition { row: 0, byte: 0 };
         for byte in [1, 3, 6] {
             let end = TextPosition { row: 0, byte };
@@ -802,8 +812,15 @@ mod tests {
         assert_eq!(selection.text(), output[10..=12].join("\n"));
         // Narrow enough to wrap every line onto two rows.
         let highlights = super::super::super::tool_view::HighlightCache::default();
-        rows.update_entry(0, Vec::new(), |rows| {
-            update_entry_rows(rows, &entry, 0, 16, &highlights, RequestColumns::default())
+        rows.layout(&[0], |_| {
+            let columns = RequestColumns::default();
+            let mut rows = Vec::new();
+            let fences = update_entry_rows(&mut rows, &entry, 16, &highlights, columns);
+            super::super::Laid {
+                rows,
+                sources: Vec::new(),
+                fences,
+            }
         });
         assert!(rows.len() > unwrapped + output.len() / 2);
         let end = find(&rows, "4000", true);

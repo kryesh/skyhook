@@ -62,7 +62,7 @@ impl SessionRuntime {
         name: &ModeName,
     ) -> Result<Option<ModeChange>, HarnessError> {
         let mode = self.applied(name)?;
-        let depth = self.delegation(agent).map_or(0, |(_, depth)| depth);
+        let depth = self.held(agent, |_, depth, _| depth).unwrap_or(0);
         let granted = self.granted_by(&mode.definition).for_agent(depth);
         let unchanged = current == Some(&mode) && *capabilities == granted;
         Ok((!unchanged).then_some(ModeChange {
@@ -91,7 +91,10 @@ impl SessionRuntime {
     /// Whether the root runs a mode the configuration has since changed, which
     /// the next work that runs it adopts.
     pub(super) fn root_outdated(&self, root: &AgentId) -> bool {
-        let Some((current, capabilities)) = self.resumed_mode(root) else {
+        let held = self.held(root, |contract, _, granted| {
+            (contract.mode.clone(), granted)
+        });
+        let Some((current, capabilities)) = held else {
             return false;
         };
         let current = current.as_ref();

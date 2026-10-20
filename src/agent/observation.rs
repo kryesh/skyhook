@@ -1,11 +1,13 @@
-//! Host-only observation. A snapshot and its receiver share an atomic revision boundary.
+//! Host-only observation: the live part of a session and the updates after it, which
+//! share an atomic revision boundary.
 use super::{RuntimeEvent, TurnFailure};
 use crate::{
     identity::{AgentId, JobId},
     job::{JobEnvelope, JobState},
-    provider::protocol::{LiveBlock, LiveResponse, Step, Usage},
+    provider::protocol::{LiveBlock, LiveResponse, Step, UsageTotals},
     session::{
-        EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestSeq, SessionEvent, SessionPhase,
+        EventRecord, Fact, MessageSeq, ModelPurpose, RecordSeq, RequestRecord, RequestSeq,
+        ResidentLedger, SessionEvent, SessionPhase, ledger::Folded,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -64,25 +66,35 @@ impl ContextGauge {
         self.usage.get(agent)
     }
 
-    /// Fold `record`, which `ledger` has already observed.
-    fn fold(&mut self, ledger: &RequestLedger, record: &EventRecord) {
-        let agent = &record.agent;
-        let attempt = match &record.event {
-            SessionEvent::Compaction { .. } => {
-                self.usage.remove(agent);
-                return;
-            }
-            // Only an agent's own requests complete responses; a summary installs a checkpoint.
-            SessionEvent::ResponseCompleted { attempt, .. } => attempt,
-            _ => return,
-        };
-        if let Some(requested) = ledger.get(attempt.request)
-            && let Some(tokens) = (requested.phase.completed_usage()).and_then(Usage::occupancy)
-        {
-            let capacity = requested.profile.profile.max_context.get();
-            self.usage
-                .insert(agent.clone(), ContextUsage { tokens, capacity });
+    /// The gauge of each agent's `gauged` request.
+    pub(crate) fn opened(gauged: &[(RequestSeq, RequestRecord)]) -> Self {
+        let usage = gauged.iter().filter_map(|(_, request)| {
+            let tokens = request.phase.completed_usage()?.occupancy()?;
+            Some((request.agent.clone(), ContextUsage::of(request, tokens)))
+        });
+        Self {
+            usage: usage.collect(),
         }
+    }
+
+    /// Fold `record`, which `ledger` has already observed.
+    fn fold(&mut self, ledger: &ResidentLedger, record: &EventRecord) {
+        match crate::session::agent_state::gauged(ledger, record) {
+            Some(Some((_, request, tokens))) => {
+                let usage = ContextUsage::of(request, tokens);
+                self.usage.insert(record.agent.clone(), usage);
+            }
+            Some(None) => drop(self.usage.remove(&record.agent)),
+            None => {}
+        }
+    }
+}
+
+impl ContextUsage {
+    /// `tokens` of `request`'s model's context.
+    fn of(request: &RequestRecord, tokens: u64) -> Self {
+        let capacity = request.profile.profile.max_context.get();
+        Self { tokens, capacity }
     }
 }
 
@@ -149,6 +161,9 @@ impl ObservedResponse {
     }
 }
 
+/// The live part of a session: what its work can still change without being
+/// addressed, bounded by that work rather than by its history. History is read in
+/// pages: see [`SessionStore::transcript`](crate::session::SessionStore::transcript).
 #[derive(Clone, Debug, Default)]
 pub struct ObservationSnapshot {
     /// Where the session is in its life. Once its work stops, as a crash stops
@@ -156,17 +171,32 @@ pub struct ObservationSnapshot {
     /// interrupted at its last activity, as reopening settles them.
     pub phase: SessionPhase,
     pub revision: u64,
-    pub records: BTreeMap<RecordSeq, EventRecord>,
-    /// Every request's lifecycle, folded from `records`.
-    pub ledger: RequestLedger,
-    /// Every job, as the session's state holds it.
+    /// The newest record the slice folds. Every later record arrives as an update.
+    pub applied: RecordSeq,
+    /// When the newest record that is the session's activity was journaled.
+    pub last_activity: Option<i64>,
+    /// Each agent's newest request, whatever its phase.
+    pub requests: ResidentLedger,
+    /// The jobs the session holds, as the updates leave them.
     pub jobs: BTreeMap<JobId, JobEnvelope>,
-    pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
     pub activity: HashMap<AgentId, ObservedActivity>,
-    pub context: ContextGauge,
+    pub views: Views,
+    /// The usage each agent's requests reported.
+    pub usage: BTreeMap<AgentId, UsageTotals>,
 }
 
-pub(crate) type Responses = HashMap<(AgentId, RequestSeq), ObservedResponse>;
+/// What observers fold from each committed record beside the record itself and the
+/// requests it moved.
+#[derive(Clone, Debug, Default)]
+pub struct Views {
+    pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
+    pub context: ContextGauge,
+    /// How many entries each agent's transcript holds, for every agent the session
+    /// started: the ordinal its next entry takes.
+    pub entries: BTreeMap<AgentId, u64>,
+}
+
+type Responses = HashMap<(AgentId, RequestSeq), ObservedResponse>;
 
 /// The jobs and requests an update read as interrupted because the session's
 /// work stopped, which no update of their own reports.
@@ -176,51 +206,94 @@ pub struct StoppedReading {
     pub requests: Vec<RequestSeq>,
 }
 
+/// What folding an update changed beyond what the update carries.
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// The ordinal its record took in its agent's transcript: none for an update that
+    /// is not a record, or a record the slice already folds.
+    pub entry: Option<u64>,
+    pub stopped: StoppedReading,
+    /// The requests its record changed.
+    pub requests: Vec<RequestSeq>,
+    /// The request of its agent that a newer one replaced, as it left it: the slice
+    /// holds each agent's newest request only.
+    pub superseded: Option<(RequestSeq, RequestRecord)>,
+    /// What the fold decided of its record that presenting it reads.
+    pub fact: Option<Fact>,
+    /// The jobs the session let go of, as they left them.
+    pub unheld: Vec<JobEnvelope>,
+}
+
 impl ObservationSnapshot {
-    /// Idempotent journal projection; live deltas are applied once by revision.
-    pub fn apply(&mut self, update: ObservedEvent) -> StoppedReading {
+    /// Fold `update`, once and in revision order.
+    pub fn apply(&mut self, update: ObservedEvent) -> Applied {
         if update.revision <= self.revision {
-            return StoppedReading::default();
+            return Applied::default();
         }
         self.revision = update.revision;
-        match update.event {
-            RuntimeEvent::Record(record) => {
-                if self.records.contains_key(&record.sequence) {
-                    return StoppedReading::default();
-                }
-                let views = Views {
-                    ledger: &mut self.ledger,
-                    responses: &mut self.responses,
-                    context: &mut self.context,
-                };
-                views.record(&record);
-                self.records.insert(record.sequence, *record);
-            }
+        let mut applied = match update.event {
+            RuntimeEvent::Record(record) => self.record(&record),
             RuntimeEvent::Job(job) => {
                 self.jobs.insert(job.id, *job);
+                Applied::default()
             }
-            RuntimeEvent::Phase(phase) => self.phase = phase,
+            RuntimeEvent::JobsUnheld(jobs) => Applied {
+                unheld: (jobs.iter())
+                    .filter_map(|job| self.jobs.remove(job))
+                    .collect(),
+                ..Applied::default()
+            },
+            RuntimeEvent::Phase(phase) => {
+                self.phase = phase;
+                Applied::default()
+            }
             event => {
-                let records = &self.records;
-                let committed = |sequence: RecordSeq| records.contains_key(&sequence);
-                live(
-                    &mut self.responses,
-                    Some(&mut self.activity),
-                    committed,
-                    event,
-                );
+                let applied = self.applied;
+                let committed = |sequence: RecordSeq| sequence <= applied;
+                let responses = &mut self.views.responses;
+                live(responses, Some(&mut self.activity), committed, event);
+                Applied::default()
             }
+        };
+        applied.stopped = self.read_phase();
+        applied
+    }
+
+    /// Fold `record`: what it changed, nothing for one the slice already folds.
+    fn record(&mut self, record: &EventRecord) -> Applied {
+        // What the slice already folds, a read of the journal may deliver again.
+        if record.sequence <= self.applied {
+            return Applied::default();
         }
-        self.read_phase()
+        self.applied = record.sequence;
+        if record.event.is_activity() {
+            self.last_activity = Some(record.timestamp_millis);
+        }
+        if let SessionEvent::Usage { usage, .. } = &record.event {
+            (self.usage.entry(record.agent.clone()).or_default()).add(*usage);
+        }
+        let Folded {
+            changed,
+            superseded,
+            fact,
+        } = self.requests.fold(record);
+        self.views.record(&self.requests, record);
+        Applied {
+            entry: Some(self.views.count(record)),
+            requests: changed.into_iter().flatten().collect(),
+            superseded,
+            fact,
+            ..Applied::default()
+        }
     }
 
     /// Read what a session whose work stopped left going as interrupted at its
     /// last activity.
     pub(crate) fn read_phase(&mut self) -> StoppedReading {
-        let Some(at) = self.phase.stopped_at(self.records.values()) else {
+        let Some(at) = self.phase.stopped_at(self.last_activity) else {
             return StoppedReading::default();
         };
-        for response in self.responses.values_mut() {
+        for response in self.views.responses.values_mut() {
             if response.settlement().is_none() {
                 response.settle(Settlement::Failed(TurnFailure::Interrupted));
             }
@@ -236,24 +309,37 @@ impl ObservationSnapshot {
             });
         StoppedReading {
             jobs: jobs.collect(),
-            requests: self.ledger.stop(at),
+            requests: self.requests.stop(at),
         }
     }
 }
 
-/// What observers fold from each committed record beside the record itself.
-pub(crate) struct Views<'a> {
-    pub(crate) ledger: &'a mut RequestLedger,
-    pub(crate) responses: &'a mut Responses,
-    pub(crate) context: &'a mut ContextGauge,
-}
+impl Views {
+    /// Count committed `record` in its agent's transcript: the ordinal it takes.
+    pub(crate) fn count(&mut self, record: &EventRecord) -> u64 {
+        let length = self.entries.entry(record.agent.clone()).or_default();
+        *length += 1;
+        *length - 1
+    }
 
-impl Views<'_> {
-    pub(crate) fn record(self, record: &EventRecord) {
-        self.ledger.observe(record);
-        self.context.fold(self.ledger, record);
+    /// Fold `record`, which `ledger` has already observed.
+    pub(crate) fn record(&mut self, ledger: &ResidentLedger, record: &EventRecord) {
+        self.context.fold(ledger, record);
         let agent = &record.agent;
         match &record.event {
+            // An agent's responses are its latest turn's: its next agent request lets go
+            // of what earlier requests left settled, as an open seeds them only from its
+            // latest agent request.
+            SessionEvent::ModelRequested { .. }
+                if ledger
+                    .get(record.sequence.request())
+                    .is_some_and(|request| request.purpose == ModelPurpose::Agent) =>
+            {
+                let request = record.sequence.request();
+                self.responses.retain(|(owner, at), response| {
+                    owner != agent || *at >= request || response.settlement().is_none()
+                });
+            }
             SessionEvent::ModelAttemptStarted(attempt) => {
                 // One logical request survives retries; native item/block
                 // IDs may be reused. Clear only the displayed response,
@@ -295,7 +381,9 @@ pub(crate) fn live(
     match event {
         RuntimeEvent::Record(_)
         | RuntimeEvent::Job(_)
+        | RuntimeEvent::JobsUnheld(_)
         | RuntimeEvent::TurnCompleted { .. }
+        | RuntimeEvent::OutputChanged { .. }
         | RuntimeEvent::Phase(_) => {}
         RuntimeEvent::ResponseEvent {
             agent,
@@ -324,14 +412,19 @@ pub(crate) fn live(
             }
         }
         RuntimeEvent::Activity { agent, activity } => {
-            if let AgentActivity::Stopped(failure) = &activity.state {
+            if let Some(AgentActivity::Stopped(failure)) = activity.as_ref().map(|a| &a.state) {
                 for ((owner, _), response) in responses.iter_mut() {
                     if owner == &agent && response.settlement().is_none() {
                         response.settle(Settlement::Failed(failure.clone()));
                     }
                 }
             }
-            activities.map(|activities| activities.insert(agent, activity));
+            if let Some(activities) = activities {
+                match activity {
+                    Some(activity) => activities.insert(agent, activity),
+                    None => activities.remove(&agent),
+                };
+            }
         }
     }
 }
@@ -371,11 +464,13 @@ mod tests {
         update
     }
 
-    /// A fresh observer's fold of `records`.
-    fn replayed<'a>(records: impl IntoIterator<Item = &'a EventRecord>) -> ObservationSnapshot {
+    /// A fresh observer's fold of the records among `updates`.
+    fn replayed<'a>(updates: impl IntoIterator<Item = &'a ObservedEvent>) -> ObservationSnapshot {
         let hub = Hub::default();
-        for record in records {
-            send(&hub, RuntimeEvent::Record(Box::new(record.clone())));
+        for update in updates {
+            if let RuntimeEvent::Record(record) = &update.event {
+                send(&hub, RuntimeEvent::Record(record.clone()));
+            }
         }
         hub.into_inner()
     }
@@ -383,20 +478,23 @@ mod tests {
     /// Journals `event` at `sequence` seconds past the epoch.
     fn record(hub: &Hub, agent: &AgentId, sequence: u64, event: SessionEvent) -> ObservedEvent {
         let mut record = tests::record(agent, sequence, event);
-        record.timestamp_millis = sequence as i64 * 1000;
-        send(hub, RuntimeEvent::Record(Box::new(record)))
+        std::sync::Arc::make_mut(&mut record).timestamp_millis = sequence as i64 * 1000;
+        send(hub, RuntimeEvent::Record(record))
     }
 
     /// Journals request `request` for `purpose`, its context just before it.
-    fn request(hub: &Hub, agent: &AgentId, request: u64, purpose: ModelPurpose) {
+    fn request(
+        hub: &Hub,
+        agent: &AgentId,
+        request: u64,
+        purpose: ModelPurpose,
+    ) -> [ObservedEvent; 2] {
         let context = ModelContext::test(purpose, tests::profile());
-        record(
-            hub,
-            agent,
-            request - 1,
-            SessionEvent::ModelContext { context },
-        );
-        record(hub, agent, request, requested((request - 1).into()));
+        let context = SessionEvent::ModelContext { context };
+        [
+            record(hub, agent, request - 1, context),
+            record(hub, agent, request, requested((request - 1).into())),
+        ]
     }
 
     fn failed(request: u64, attempt: u64, error: &str) -> SessionEvent {
@@ -464,7 +562,7 @@ mod tests {
         let agent = AgentId::root(SessionId::from_bytes([7; 16]));
         let gauge = |hub: &Hub| {
             let snapshot = hub.borrow();
-            (snapshot.context.get(&agent)).map(|usage| (usage.tokens, usage.capacity))
+            (snapshot.views.context.get(&agent)).map(|usage| (usage.tokens, usage.capacity))
         };
         let usage = |request: u64, usage| SessionEvent::Usage {
             request: request.into(),
@@ -523,8 +621,9 @@ mod tests {
         let key = (agent.clone(), 7.into());
         delta(&hub, &agent, 7, "hello");
         let mut observer = hub.borrow().clone();
-        let text =
-            |snapshot: &ObservationSnapshot| snapshot.responses[&key].blocks()[0].text.clone();
+        let text = |snapshot: &ObservationSnapshot| {
+            snapshot.views.responses[&key].blocks()[0].text.clone()
+        };
         assert_eq!(text(&observer), "hello");
         let settled = RuntimeEvent::ResponseSettled {
             agent: agent.clone(),
@@ -543,8 +642,8 @@ mod tests {
                 assert_eq!(text(&observer), "hello!");
             }
         }
-        assert!(observer.responses.is_empty());
-        assert_eq!(observer.records.len(), 1);
+        assert!(observer.views.responses.is_empty());
+        assert_eq!(observer.applied, 3.into());
         assert_eq!(observer.revision, 4);
     }
 
@@ -553,30 +652,25 @@ mod tests {
         let hub = Hub::default();
         let agent = AgentId::root(SessionId::from_bytes([2; 16]));
         let key = (agent.clone(), 7.into());
-        let replayed = |snapshot: &ObservationSnapshot| replayed(snapshot.records.values());
-        request(&hub, &agent, 7, ModelPurpose::Agent);
+        let mut journal = Vec::from(request(&hub, &agent, 7, ModelPurpose::Agent));
         delta(&hub, &agent, 7, "partial answer");
-        record(&hub, &agent, 8, retried(7, 1));
+        let recovery = record(&hub, &agent, 8, retried(7, 1));
+        journal.push(recovery.clone());
         let snapshot = hub.borrow().clone();
-        let response = &snapshot.responses[&key];
+        let response = &snapshot.views.responses[&key];
         assert_eq!(response.settlement(), Some(&lost()));
         assert_eq!(response.blocks()[0].text, "partial answer");
-        record(&hub, &agent, 10, attempt(7.into(), 2));
+        journal.push(record(&hub, &agent, 10, attempt(7.into(), 2)));
         // Duplicate journal delivery cannot roll a newer response back.
-        let recovery = snapshot.records[&8.into()].clone();
-        send(&hub, RuntimeEvent::Record(Box::new(recovery)));
+        send(&hub, recovery.event);
         let started = hub.borrow().clone();
         for response in [
-            &started.responses[&key],
-            &replayed(&started).responses[&key],
+            &started.views.responses[&key],
+            &replayed(&journal).views.responses[&key],
         ] {
             assert!(response.settlement().is_none());
             assert!(response.blocks().is_empty());
         }
-        let json = |snapshot: &ObservationSnapshot| {
-            serde_json::to_value(&snapshot.records[&8.into()]).unwrap()
-        };
-        assert_eq!(json(&started), json(&snapshot));
     }
 
     /// The runtime's settlement is authoritative in either order against the
@@ -597,7 +691,7 @@ mod tests {
         };
         let response = |request: u64| {
             let key = (agent.clone(), request.into());
-            hub.borrow().clone().responses.get(&key).cloned()
+            hub.borrow().clone().views.responses.get(&key).cloned()
         };
         let settlement = |request| response(request).and_then(|r| r.settlement().cloned());
         // A record-driven failure yields to the runtime's later settlement.
@@ -614,7 +708,7 @@ mod tests {
             &hub,
             RuntimeEvent::Activity {
                 agent: agent_,
-                activity,
+                activity: Some(activity),
             },
         );
         let interrupted = Settlement::Failed(TurnFailure::Interrupted);

@@ -648,7 +648,7 @@ mod tests {
 
         async fn result(&self, job: JobId) -> crate::job::tests::Hydrated {
             bounded(self.runtime.jobs.wait_settled(job)).await.unwrap();
-            let envelope = self.runtime.jobs.metadata(job).unwrap();
+            let envelope = self.runtime.jobs.metadata(job).await.unwrap();
             self.runtime.jobs.hydrated(envelope).await.unwrap()
         }
 
@@ -962,6 +962,7 @@ mod tests {
                 .runtime
                 .jobs
                 .output(job)
+                .await
                 .test_bytes("/result/content")
                 .unwrap(),
             text.as_bytes()
@@ -974,7 +975,7 @@ mod tests {
             )
             .await;
         assert_eq!(worker.result(job).await.state, JobState::Completed);
-        let images = worker.runtime.jobs.snapshot(job).unwrap().images;
+        let images = worker.runtime.jobs.snapshot(job).await.unwrap().images;
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].file.as_deref(), image_path.to_str());
         let bytes = worker
@@ -989,6 +990,7 @@ mod tests {
                 .runtime
                 .jobs
                 .output(job)
+                .await
                 .test_bytes("/result/content")
                 .is_none()
         );
@@ -1092,7 +1094,7 @@ mod tests {
             "reusable"
         );
         assert_eq!(
-            worker.runtime.jobs.metadata(blocked).unwrap().state,
+            worker.runtime.jobs.metadata(blocked).await.unwrap().state,
             JobState::Cancelled
         );
         worker.finish().await;
@@ -1113,7 +1115,7 @@ mod tests {
                 serde_json::json!({"command":command}),
             )
             .await;
-        let saved = worker.runtime.jobs.output(job);
+        let saved = worker.runtime.jobs.output(job).await;
         bounded(async {
             while saved.test_bytes("/result/stdout").as_deref() != Some(b"before") {
                 tokio::time::sleep(POLL).await;
@@ -1125,6 +1127,7 @@ mod tests {
                 .runtime
                 .jobs
                 .metadata(job)
+                .await
                 .unwrap()
                 .state
                 .is_terminal()

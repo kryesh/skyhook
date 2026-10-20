@@ -61,7 +61,7 @@ impl App {
     }
     /// Remove the selected paste, attachment or queued follow-up.
     pub(super) fn delete_draft_item(&mut self) {
-        let menu = self.menu();
+        let menu = self.menu.as_ref();
         let index = menu.and_then(Menu::selected_index);
         match (menu.map(|menu| &menu.kind), index) {
             (Some(MenuKind::Attachments(items)), Some(index)) => match items[index].value {
@@ -109,7 +109,7 @@ mod tests {
         app.editor.set("draft".into());
         app.editor.attach(png_attachment("draft.png"));
         app.command(Command::Queue);
-        app.menu_mut().unwrap().input.set("second".into());
+        app.menu.as_mut().unwrap().input.set("second".into());
         app.choose();
         assert!(app.paused.is_some());
         assert_eq!(app.editor.text(), "second");
@@ -126,7 +126,7 @@ mod tests {
             [png_attachment("draft.png")]
         );
         app.command(Command::Queue);
-        app.menu_mut().unwrap().input.set("first".into());
+        app.menu.as_mut().unwrap().input.set("first".into());
         key(&mut app, KeyCode::Delete, M::NONE);
         assert_eq!(app.queue.len(), 2);
         assert!(app.paused.is_some());

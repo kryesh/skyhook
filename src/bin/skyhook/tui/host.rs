@@ -46,7 +46,7 @@ pub struct Opened {
     from: (SlotKey, u64),
     launch: Launch,
     prompts: mpsc::UnboundedReceiver<Prompt>,
-    result: Result<SessionHandle, LaunchError>,
+    result: Result<PreparedObservation, LaunchError>,
 }
 pub enum HostEvent {
     Slot(usize, SlotEvent),
@@ -68,6 +68,17 @@ pub struct Host {
     waiting: Vec<(SessionId, (SlotKey, u64))>,
     opened_tx: mpsc::UnboundedSender<Opened>,
     opened: mpsc::UnboundedReceiver<Opened>,
+}
+
+/// `session` observed, off the event loop; a session it cannot observe is shut down.
+pub async fn observed(session: SessionHandle) -> Result<PreparedObservation, LaunchError> {
+    match PreparedObservation::load(session.clone()).await {
+        Ok(observation) => Ok(observation),
+        Err(error) => {
+            let _ = session.shutdown().await;
+            Err(error.into())
+        }
+    }
 }
 
 /// A launch whose prompts arrive on their own channel: a prompt then belongs to
@@ -151,6 +162,9 @@ impl Host {
                 self.active -= usize::from(previous < index);
             } else if left.settled() {
                 left.shutdown();
+            } else {
+                // A session out of view keeps only its summary.
+                left.release();
             }
         }
         self.app().dirty = true;
@@ -195,9 +209,7 @@ impl Host {
                                 Err(_) => break,
                             }
                         }
-                        if records {
-                            app.rebuild_projection();
-                        }
+                        app.observed(records);
                     }
                     SlotEvent::Observation(Err(RecvError::Lagged(_))) => app.resubscribe(),
                     SlotEvent::Observation(Err(RecvError::Closed)) => app.close_observation(),
@@ -218,14 +230,17 @@ impl Host {
         } = opened;
         self.opening.retain(|opening| *opening != id);
         match result {
-            Ok(session) if self.quitting => {
-                let _ = session.shutdown().await;
+            Ok(observation) if self.quitting => {
+                let _ = observation.session().shutdown().await;
             }
-            Ok(session) => {
-                let observation = PreparedObservation::subscribe(session);
+            Ok(observation) => {
                 let (tx, work) = mpsc::unbounded_channel();
-                let app = self.app().sibling(Some(observation), launch, tx);
+                let mut app = self.app().sibling(Some(observation), launch, tx);
                 let idle = self.key() == key && self.app().editor.revision() == revision;
+                if !idle {
+                    // Opened out of view, it keeps only its summary.
+                    app.release();
+                }
                 let index = self.push(app, work, prompts);
                 if idle {
                     self.activate(index);
@@ -285,7 +300,7 @@ impl Host {
         }
         if std::mem::take(&mut self.peers_due) {
             let current = self.key();
-            let peers = self.slots.iter().filter(|slot| !slot.app.stopping);
+            let peers = self.slots.iter_mut().filter(|slot| !slot.app.stopping);
             let peers: Vec<_> = peers
                 .map(|slot| slot.app.peer(slot.key, slot.key == current))
                 .collect();
@@ -320,7 +335,10 @@ impl Host {
         let (launch, prompts) = with_prompts(self.app().launch.clone());
         let opened = self.opened_tx.clone();
         tokio::spawn(async move {
-            let result = launch.create(Some(id)).await;
+            let result = match launch.create(Some(id)).await {
+                Ok(session) => observed(session).await,
+                Err(error) => Err(error),
+            };
             let sent = opened.send(Opened {
                 id,
                 from,
@@ -329,11 +347,11 @@ impl Host {
                 result,
             });
             if let Err(mpsc::error::SendError(Opened {
-                result: Ok(session),
+                result: Ok(observation),
                 ..
             })) = sent
             {
-                let _ = session.shutdown().await;
+                let _ = observation.session().shutdown().await;
             }
         });
     }
@@ -343,8 +361,8 @@ impl Host {
             && let Some(opened) = self.opened.recv().await
         {
             self.opening.retain(|opening| *opening != opened.id);
-            if let Ok(session) = opened.result {
-                let _ = session.shutdown().await;
+            if let Ok(observation) = opened.result {
+                let _ = observation.session().shutdown().await;
             }
         }
         let mut result = Ok(());
@@ -424,7 +442,8 @@ mod tests {
             loop {
                 let work = slot.work.recv().await.expect("work channel open");
                 slot.app.work(work);
-                if let Some(MenuKind::Sessions(items)) = slot.app.menu().map(|menu| &menu.kind)
+                if let Some(MenuKind::Sessions(items)) =
+                    slot.app.menu.as_ref().map(|menu| &menu.kind)
                     && !items.is_empty()
                 {
                     break items.iter().position(|item| item.value == row);
@@ -433,7 +452,8 @@ mod tests {
         })
         .await;
         slot.app
-            .menu_mut()
+            .menu
+            .as_mut()
             .unwrap()
             .select(row.expect("a locked row"));
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);

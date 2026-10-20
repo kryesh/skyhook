@@ -1,190 +1,120 @@
-//! The jobs the journal records, as the core folds them, and what reopening settles.
+//! The jobs the journal records, as the core folds them and their status rows hold
+//! them, and what reopening settles.
 use super::*;
-use crate::session::EventRecord;
-
-/// Every job the journal records, with the live facts the core keeps beside them.
-#[derive(Default)]
-pub(crate) struct Jobs {
-    pub(super) entries: HashMap<JobId, JobFacts>,
-    /// The job each launched child agent answers through.
-    children: HashMap<AgentId, JobId>,
-    /// The highest id created so far.
-    last: u64,
-    pub(super) stamps: Stamps,
-    pub(super) progress: progress::Progress,
-    pub(super) calls: Calls,
-}
-
-/// Live only: model and script calls between their issue and their outcome, as
-/// a `wait` beside them needs to know them.
-#[derive(Default)]
-pub(super) struct Calls {
-    /// Per parent job, its issued calls whose jobs are not published yet.
-    issuing: HashMap<JobId, usize>,
-    /// Per agent, its latest response with a call that ended without a job: a
-    /// response's calls all end before the next one commits.
-    pub(super) jobless: HashMap<AgentId, MessageSeq>,
-}
-
-impl Calls {
-    pub(super) fn issue(&mut self, parent: JobId) {
-        *self.issuing.entry(parent).or_default() += 1;
-    }
-
-    pub(super) fn issued(&mut self, parent: JobId) {
-        if let Some(count) = self.issuing.get_mut(&parent) {
-            *count -= 1;
-            if *count == 0 {
-                self.issuing.remove(&parent);
-            }
-        }
-    }
-
-    pub(super) fn published(&self, parent: JobId) -> Option<()> {
-        (!self.issuing.contains_key(&parent)).then_some(())
-    }
-}
+use crate::session::{DbError, EventRecord, JobRow};
 
 impl Jobs {
-    /// The first record of `records` whose transition its job's phase, as the
-    /// records before it leave it, does not admit.
-    pub(crate) fn refused(&self, records: &[EventRecord]) -> Option<RecordSeq> {
-        let mut states = HashMap::new();
-        for record in records {
-            if let SessionEvent::JobCreated { job, .. } = &record.event {
-                states.insert(*job, JobState::Queued);
-            }
-            let Some((job, change)) = JobChange::of(&record.event) else {
-                continue;
-            };
-            let current = states.get(&job).copied();
-            let Some(state) = current.or_else(|| self.entries.get(&job).map(JobFacts::state))
-            else {
-                continue;
-            };
-            let step = change.step();
-            if !state.admits(step) {
-                return Some(record.sequence);
-            }
-            states.insert(job, JobState::after(step));
+    /// Fold one record: live commits, opening and reading back alike. Returns the
+    /// job whose lifecycle it moved. A transition the job's phase does not admit is
+    /// refused before it changes the job, as is a start naming a held job that
+    /// cannot install it: one of its parent's agent jobs with no child installed. A
+    /// job not held is unknown here.
+    pub(crate) fn apply(&mut self, record: &EventRecord) -> Result<Option<JobId>, SessionError> {
+        let refused = || SessionError::IllegalTransition {
+            sequence: record.sequence,
+        };
+        self.stamps.applying(record.sequence);
+        let launched = self.launched(&record.agent);
+        if let Some(job) = addressed(&record.agent, &record.event, |_| launched) {
+            debug_assert!(
+                self.contains(job) || !self.created(job),
+                "job {job} changes unheld"
+            );
         }
-        None
-    }
-
-    /// Fold one committed record: replay and live commits alike. Returns the job
-    /// whose lifecycle it moved.
-    pub(crate) fn apply(&mut self, record: &EventRecord) -> Option<JobId> {
-        self.progress.project(record);
-        match &record.event {
-            SessionEvent::JobCreated {
-                origin,
-                job,
-                parent,
-                tool,
-                role,
-                name,
-                arguments,
-                accepts_input,
-                background,
-                location,
-                output_schema,
-                ..
-            } => {
-                self.last = self.last.max(job.get());
-                let entry = JobFacts {
-                    origin: origin.clone(),
-                    output_schema: output_schema.clone(),
-                    agent: record.agent.clone(),
-                    parent: *parent,
-                    tool: tool.clone(),
-                    role: RoleState::new(*role),
-                    name: name.clone(),
-                    arguments: Arc::new(arguments.clone()),
-                    created_at_millis: record.timestamp_millis,
-                    created: record.sequence,
-                    phase: Phase::Queued,
-                    accepts_input: *accepts_input,
-                    delivery: DeliveryState::Pending {
-                        stamp: self.stamps.next(),
-                    },
-                    background: *background,
-                    location: location.clone(),
-                    resume: None,
-                    finishing: false,
-                    reads: Vec::new(),
-                    invocation: Invocation::default(),
-                    timing: RunTiming::Unstarted,
-                    cancel: CancelState::Open,
-                };
-                self.entries.insert(*job, entry);
-                return Some(*job);
+        if let Some((job, entry)) = JobFacts::created(record) {
+            if let Some(launch) = launched {
+                self.modify(launch, |entry, _| {
+                    if let Some(child) = entry.child_mut() {
+                        child.progress.tool_calls += 1;
+                    }
+                });
             }
+            self.create(job, entry);
+            return Ok(Some(job));
+        }
+        match &record.event {
             SessionEvent::AgentStarted {
                 owner_job: Some(job),
                 ..
             } => {
-                if let Some(entry) = self.entries.get_mut(job) {
-                    let owner = entry.agent.clone();
-                    if record.agent.parent().as_ref() == Some(&owner)
-                        && let Some(launched) = entry.child_mut()
-                        && launched
-                            .agent
-                            .as_ref()
-                            .is_none_or(|child| child == &record.agent)
-                    {
-                        launched.agent = Some(record.agent.clone());
-                        self.children.insert(record.agent.clone(), *job);
+                if let Some(entry) = self.get(*job) {
+                    let child = &record.agent;
+                    let installs = (entry.child()).is_some_and(|launched| launched.agent.is_none())
+                        && child.parent().as_ref() == Some(&entry.agent);
+                    if !installs {
+                        return Err(refused());
                     }
                 }
+                self.launch(*job, &record.agent);
             }
             SessionEvent::MessageCommitted { message } => {
-                if let Some(job) = self.children.get(&record.agent).copied()
+                if let Some(job) = launched
                     && let Some(reply) = messages::Reply::of(message)
                 {
-                    let publish = reply.publish(&self.entries, job);
-                    if let Some(entry) = self.entries.get_mut(&job) {
-                        let sequence = record.sequence.message();
-                        let stamps = &mut self.stamps;
-                        entry.publish_message(job, sequence, reply.text, publish, stamps);
-                    }
+                    let publish = reply.publish(self, job);
+                    let sequence = record.sequence.message();
+                    self.modify(job, |entry, stamps| {
+                        if let Some(child) = entry.child_mut() {
+                            child.progress.turns += 1;
+                        }
+                        entry.publish_message(job, sequence, reply.text, publish, stamps)
+                    });
                 }
             }
             SessionEvent::JobClaimed { job } | SessionEvent::JobInjected { job } => {
-                if let Some(entry) = self.entries.get_mut(job) {
-                    entry.acknowledge();
-                }
+                self.modify(*job, |entry, _| entry.acknowledge());
+            }
+            // No input restarts it any more.
+            SessionEvent::JobCancelRequested { job } => {
+                return Ok(self.modify(*job, |entry, _| {
+                    entry.cancel = CancelState::Recorded;
+                    *job
+                }));
             }
             SessionEvent::JobReleased { job } => {
-                if let Some(entry) = self.entries.get_mut(job) {
-                    entry.background = true;
-                }
+                self.modify(*job, |entry, _| entry.background = true);
             }
             SessionEvent::JobMessageReleased { job } => {
-                if let Some(child) = self.entries.get_mut(job).and_then(JobFacts::child_mut) {
-                    child.release(&mut self.stamps);
-                }
+                self.modify(*job, |entry, stamps| {
+                    entry.child_mut().map(|child| child.release(stamps))
+                });
             }
             SessionEvent::JobMessageDelivered { job, source, .. } => {
-                if let Some(entry) = self.entries.get_mut(job) {
-                    entry.deliver_message(*source);
-                }
+                self.modify(*job, |entry, _| entry.deliver_message(*source));
             }
             event => {
-                let (job, change) = JobChange::of(event)?;
-                let entry = self.entries.get_mut(&job)?;
-                entry.enter(change, &mut self.stamps);
-                entry.timing = entry.timing.after(entry.state(), record.timestamp_millis);
-                return Some(job);
+                let Some((job, change)) = JobChange::of(event) else {
+                    return Ok(None);
+                };
+                if (self.get(job)).is_some_and(|entry| entry.admits(change.step()).is_err()) {
+                    return Err(refused());
+                }
+                let at = record.timestamp_millis;
+                return Ok(self.modify(job, |entry, stamps| {
+                    entry.enter(change, stamps);
+                    entry.timing = entry.timing.after(entry.state(), at);
+                    job
+                }));
             }
         }
-        None
+        Ok(None)
+    }
+
+    /// The facts a fold of every record leaves each job with.
+    #[cfg(debug_assertions)]
+    fn folded(records: &[Arc<EventRecord>]) -> Result<HashMap<JobId, JobFacts>, SessionError> {
+        let mut jobs = Self::default();
+        for record in records {
+            jobs.apply(record)?;
+        }
+        Ok(jobs.entries())
     }
 
     /// The job whose running invocation `child` answers through, while that
     /// invocation has yet to begin and nothing is finishing it.
     pub(crate) fn unbegun(&self, child: &AgentId) -> Option<JobId> {
-        let job = *self.children.get(child)?;
-        let entry = self.entries.get(&job)?;
+        let job = self.launched(child)?;
+        let entry = self.get(job)?;
         let live = entry.end().is_none() && !entry.finishing;
         (live && entry.child()?.start != Start::Begun).then_some(job)
     }
@@ -192,16 +122,14 @@ impl Jobs {
     /// Begin the invocation `child` answers through, as it takes the input that
     /// begins it: whether an interrupt stopped that invocation first.
     pub(crate) fn begin(&mut self, child: &AgentId) -> bool {
-        let job = self.unbegun(child);
-        let launched = job.and_then(|job| self.entries.get_mut(&job)?.child_mut());
-        launched.is_some_and(|child| {
-            std::mem::replace(&mut child.start, Start::Begun) == Start::Preempted
-        })
-    }
-
-    /// The id the next created job takes.
-    pub(super) fn next_id(&self) -> Result<JobId, JobError> {
-        JobId::new(self.last.saturating_add(1)).map_err(|_| JobError::InvalidId)
+        let Some(job) = self.unbegun(child) else {
+            return false;
+        };
+        let begun = self.modify(job, |entry, _| {
+            let launched = entry.child_mut()?;
+            Some(std::mem::replace(&mut launched.start, Start::Begun) == Start::Preempted)
+        });
+        begun.flatten().unwrap_or(false)
     }
 
     /// What reopening settles for the foreground jobs nothing holds any more,
@@ -211,21 +139,315 @@ impl Jobs {
     /// is released to report to its owner.
     pub(crate) fn reopened(&self) -> Vec<(AgentId, SessionEvent)> {
         let settled = |job: JobId, entry: &JobFacts| match entry.end() {
-            None if entry.resume.is_none() && entry.origin.is_some() => {
+            None if entry.restart().is_none() && entry.origin.is_some() => {
                 Some(SessionEvent::JobClaimed { job })
             }
             None => Some(SessionEvent::JobReleased { job }),
             Some(_) if entry.unacknowledged() => Some(SessionEvent::JobReleased { job }),
             Some(_) => None,
         };
-        let mut jobs: Vec<_> = (self.entries.iter())
-            .filter(|(id, _)| !views::effectively_background(&self.entries, **id))
+        let mut jobs: Vec<_> = (self.iter())
+            .filter(|(id, _)| !views::effectively_background(self, *id))
             .collect();
-        jobs.sort_by_key(|(id, _)| **id);
-        let settled = jobs.into_iter().filter_map(|(id, entry)| {
-            settled(*id, entry).map(|event| (entry.agent.clone(), event))
-        });
+        jobs.sort_by_key(|(id, _)| *id);
+        let settled = (jobs.into_iter())
+            .filter_map(|(id, entry)| settled(id, entry).map(|event| (entry.agent.clone(), event)));
         settled.collect()
+    }
+}
+
+impl CoreState {
+    /// Job `id`'s facts, for a command that declared it, which holds it if it was
+    /// ever created.
+    pub(super) fn job(&self, id: JobId) -> Result<&JobFacts, JobError> {
+        let lookup = self.jobs.lookup(id);
+        debug_assert!(
+            !matches!(lookup, Lookup::Unheld(())),
+            "job {id} is read undeclared"
+        );
+        match lookup {
+            Lookup::Held(entry) => Ok(entry),
+            Lookup::Unheld(()) | Lookup::Unknown => Err(JobError::Unknown(id)),
+        }
+    }
+
+    /// Hold `settled` jobs, none of them held, with every ancestor not held among
+    /// them: in id order, so each parent before its children.
+    pub(crate) fn restore(&mut self, settled: Settled) {
+        (settled.0.into_iter()).for_each(|(id, entry)| self.jobs.restore(id, entry));
+    }
+}
+
+/// What the job fold leaves of a job beyond its creation: its status row and queued
+/// replies. The fold writes it in the transaction of the records that change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JobStatus {
+    pub(crate) state: JobState,
+    pub(crate) invocation: Invocation,
+    pub(crate) background: bool,
+    pub(crate) cancel_recorded: bool,
+    /// When its delivery became pending, until acknowledged.
+    pub(crate) pending: Option<u64>,
+    pub(crate) timing: RunTiming,
+    pub(crate) resident: bool,
+    /// An agent job's.
+    pub(crate) child: Option<ChildStatus>,
+}
+
+/// What an agent job's fold leaves of its child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChildStatus {
+    pub(crate) progress: AgentProgress,
+    pub(crate) answer: Option<(MessageSeq, AnswerKind)>,
+    /// Each queued reply, with when it was queued, oldest first.
+    pub(crate) replies: Vec<(MessageSeq, u64)>,
+}
+
+impl JobStatus {
+    pub(super) fn of(entry: &JobFacts) -> Self {
+        let child = |child: &Child| ChildStatus {
+            progress: child.progress,
+            answer: child.answer.as_ref().map(|answer| match answer {
+                Answer::Held(message) => (message.message, AnswerKind::Held),
+                Answer::Released(message) => (*message, AnswerKind::Released),
+            }),
+            replies: (child.messages.iter())
+                .map(|queued| (queued.reply.message, queued.stamp))
+                .collect(),
+        };
+        Self {
+            state: entry.state(),
+            invocation: entry.invocation,
+            background: entry.background,
+            cancel_recorded: entry.cancel == CancelState::Recorded,
+            pending: match entry.delivery {
+                DeliveryState::Pending { stamp } => Some(stamp),
+                DeliveryState::Acknowledged => None,
+            },
+            timing: entry.timing,
+            resident: entry.resident(),
+            child: entry.child().map(child),
+        }
+    }
+}
+
+impl JobFacts {
+    /// The job `record` creates, as its creation leaves it.
+    fn created(record: &EventRecord) -> Option<(JobId, Self)> {
+        let SessionEvent::JobCreated {
+            origin,
+            job,
+            parent,
+            tool,
+            role,
+            name,
+            arguments,
+            accepts_input,
+            background,
+            location,
+            output_schema,
+        } = &record.event
+        else {
+            return None;
+        };
+        let entry = Self {
+            origin: origin.clone(),
+            output_schema: output_schema.clone(),
+            agent: record.agent.clone(),
+            parent: *parent,
+            tool: tool.clone(),
+            role: RoleState::new(*role),
+            name: name.clone(),
+            arguments: Arc::new(arguments.clone()),
+            created_at_millis: record.timestamp_millis,
+            phase: Phase::Queued,
+            accepts_input: *accepts_input,
+            delivery: DeliveryState::Pending {
+                stamp: record.sequence.get(),
+            },
+            background: *background,
+            location: location.clone(),
+            handles: None,
+            finishing: false,
+            reads: Vec::new(),
+            invocation: Invocation::default(),
+            timing: RunTiming::Unstarted,
+            cancel: CancelState::Open,
+        };
+        Some((*job, entry))
+    }
+
+    /// The facts its creation and its status row leave a job with: as it was last
+    /// held, short of what only lives while held.
+    fn from_row(row: JobRow) -> Option<Self> {
+        let JobRow {
+            id,
+            created,
+            finish,
+            child,
+            status,
+            messages,
+        } = row;
+        let (_, mut entry) = Self::created(&created)?;
+        let reply = |message: MessageSeq| {
+            let SessionEvent::MessageCommitted { message: committed } =
+                &messages.get(&message)?.event
+            else {
+                return None;
+            };
+            let text = messages::Reply::of(committed)?.text;
+            let name = entry.name.clone();
+            Some(AgentMessage {
+                id,
+                name,
+                message,
+                text,
+            })
+        };
+        let finished = || match JobChange::of(&finish.as_ref()?.event)? {
+            (_, JobChange::Finish(finished)) => Some(Phase::Finished(finished)),
+            _ => None,
+        };
+        let phase = match status.state {
+            JobState::Queued => Phase::Queued,
+            JobState::AwaitingApproval => Phase::AwaitingApproval,
+            JobState::Running => Phase::Running,
+            JobState::WaitingInput => Phase::WaitingInput(QuestionOutput::default()),
+            _ => finished()?,
+        };
+        let restored = match &status.child {
+            Some(stored) => Some(Child {
+                agent: child,
+                messages: (stored.replies.iter())
+                    .map(|&(message, stamp)| {
+                        Some(Queued {
+                            stamp,
+                            reply: reply(message)?,
+                        })
+                    })
+                    .collect::<Option<_>>()?,
+                answer: match stored.answer {
+                    Some((message, AnswerKind::Held)) => Some(Answer::Held(reply(message)?)),
+                    Some((message, AnswerKind::Released)) => Some(Answer::Released(message)),
+                    None => None,
+                },
+                progress: stored.progress,
+                start: Start::Pending,
+            }),
+            None => None,
+        };
+        if let (Some(launched), Some(restored)) = (entry.child_mut(), restored) {
+            *launched = restored;
+        }
+        entry.phase = phase;
+        entry.invocation = status.invocation;
+        entry.background = status.background;
+        if status.cancel_recorded {
+            entry.cancel = CancelState::Recorded;
+        }
+        entry.delivery = (status.pending).map_or(DeliveryState::Acknowledged, |stamp| {
+            DeliveryState::Pending { stamp }
+        });
+        entry.timing = status.timing;
+        Some(entry)
+    }
+
+    /// What the journal records of it, as job `id`.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn journaled(&self, id: JobId) -> String {
+        let child = self.child().map(|child| {
+            let answer = child.answer.as_ref().map(|answer| match answer {
+                Answer::Held(message) => message.message,
+                Answer::Released(message) => *message,
+            });
+            let messages = (child.messages.iter())
+                .map(|queued| (queued.stamp, &queued.reply))
+                .collect::<Vec<_>>();
+            let progress = child.progress;
+            format!("{:?} {messages:?} {answer:?} {progress:?}", child.agent)
+        });
+        let finished = (self.finished())
+            .map(|finished| (finished.images.clone(), finished.diagnostic.clone()));
+        format!(
+            "{id} {:?} {:?} {} {} {:?} {} {:?} {:?} {:?} {:?} {} {finished:?} {child:?}",
+            self.state(),
+            self.delivery,
+            self.background,
+            self.cancel == CancelState::Recorded,
+            self.parent,
+            self.created_at_millis,
+            self.invocation,
+            self.timing,
+            self.origin,
+            self.name,
+            self.arguments,
+        )
+    }
+}
+
+/// Panic unless the status rows hold what a fold of every record leaves: each row as
+/// that fold would write it, read back as that fold leaves its job.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_folded(rows: Vec<JobRow>, records: &[Arc<EventRecord>]) {
+    use std::collections::BTreeMap;
+    let folded = Jobs::folded(records).expect("the journal folds");
+    let written: BTreeMap<_, _> = (rows.iter())
+        .map(|row| (row.id, row.status.clone()))
+        .collect();
+    let statuses = (folded.iter()).map(|(id, entry)| (*id, JobStatus::of(entry)));
+    assert_eq!(written, statuses.collect(), "job rows differ from the fold");
+    let read = Settled::of(rows).expect("job rows read back").0;
+    let shown = |(id, entry): (&JobId, &JobFacts)| (*id, entry.journaled(*id));
+    assert_eq!(
+        read.iter().map(shown).collect::<BTreeMap<_, _>>(),
+        folded.iter().map(shown).collect(),
+        "job rows read back unlike the fold"
+    );
+}
+
+/// Jobs read back from their status rows: the only way facts of a job not held
+/// are read. Ids follow creation, so their order puts each parent first.
+#[derive(Default)]
+pub(crate) struct Settled(std::collections::BTreeMap<JobId, JobFacts>);
+
+impl Settled {
+    pub(crate) fn read(
+        journal: &crate::session::Journal,
+        jobs: &[JobId],
+    ) -> Result<Self, SessionError> {
+        Self::of(journal.jobs(jobs)?)
+    }
+
+    /// The jobs `rows` hold.
+    pub(crate) fn of(rows: Vec<JobRow>) -> Result<Self, SessionError> {
+        let job = |row: JobRow| {
+            let id = row.id;
+            let entry = JobFacts::from_row(row);
+            let corrupt = || DbError::Corrupt(format!("job {id}'s status row is incomplete"));
+            Ok((id, entry.ok_or_else(corrupt)?))
+        };
+        rows.into_iter()
+            .map(job)
+            .collect::<Result<_, DbError>>()
+            .map(Self)
+            .map_err(Into::into)
+    }
+
+    /// Add `read`'s jobs; returns their parents these do not hold.
+    pub(crate) fn merge(&mut self, read: Self) -> Vec<JobId> {
+        let mut parents: Vec<_> = read.0.values().filter_map(|entry| entry.parent).collect();
+        self.0.extend(read.0);
+        parents.retain(|parent| !self.0.contains_key(parent));
+        parents
+    }
+
+    /// Job `id`'s facts, as read back.
+    pub(super) fn take(&mut self, id: JobId) -> Result<JobFacts, JobError> {
+        self.0.remove(&id).ok_or(JobError::Unknown(id))
+    }
+
+    pub(super) fn into_iter(self) -> impl Iterator<Item = (JobId, JobFacts)> {
+        self.0.into_iter()
     }
 }
 
@@ -235,10 +457,9 @@ impl JobManager {
     pub(crate) async fn interrupt_running(
         &self,
     ) -> Result<(Vec<(AgentId, SessionEvent)>, Vec<Prepared>), JobError> {
-        let running = |(job, entry): (&JobId, &JobFacts)| {
-            (entry.end().is_none()).then(|| (Run(*job, entry.invocation), entry.agent.clone()))
-        };
-        let running: Vec<_> = self.facts(|jobs| jobs.entries.iter().filter_map(running).collect());
+        let running =
+            |(job, entry): (JobId, &JobFacts)| (Run(job, entry.invocation), entry.agent.clone());
+        let running: Vec<_> = self.facts(|jobs| jobs.running().map(running).collect());
         let (mut interrupted, mut outputs) = (Vec::new(), Vec::new());
         for (run @ Run(job, _), agent) in running {
             let (change, output) = self.finished(run, ToolError::interrupted().into()).await?;
@@ -261,7 +482,7 @@ mod tests {
         tool::{ToolOutput, policy::CapabilitySet},
     };
 
-    /// An on-disk runtime, so `reopen` can replay its journal.
+    /// An on-disk runtime, so `reopen` can open its journal again.
     async fn runtime() -> (tempfile::TempDir, JobManager, crate::identity::AgentId) {
         let crate::tests::TestRuntime {
             root, jobs, agent, ..
@@ -364,7 +585,10 @@ mod tests {
         assert!(matches!(failure.cause(),
             SessionError::IllegalTransition { sequence: refused } if *refused == sequence));
         assert_eq!(jobs.store().records().len(), before);
-        assert_eq!(jobs.metadata(lease.id()).unwrap().state, JobState::Running);
+        assert_eq!(
+            jobs.metadata(lease.id()).await.unwrap().state,
+            JobState::Running
+        );
     }
 
     /// A job is timed from its first run to its end, through waits for input, and
@@ -378,9 +602,9 @@ mod tests {
         let mut step = |jobs: &mut Jobs, job: u64, event: SessionEvent| {
             at += 1;
             let mut record = crate::session::tests::record(&agent, at, event);
-            record.timestamp_millis = at as i64;
+            Arc::make_mut(&mut record).timestamp_millis = at as i64;
             let job = JobId::new(job).unwrap();
-            assert_eq!(jobs.apply(&record), Some(job));
+            assert_eq!(jobs.apply(&record).unwrap(), Some(job));
             let view = jobs.view(job).unwrap();
             (view.invocation, view.timing)
         };
@@ -421,7 +645,7 @@ mod tests {
         jobs.store().append(agent.clone(), created).await.unwrap();
         // A creation no manager ever ran, as a crash leaves it.
         let jobs = reopen(jobs, root.path()).await;
-        let interrupted = jobs.metadata(job).unwrap();
+        let interrupted = jobs.metadata(job).await.unwrap();
         assert_eq!(interrupted.state, JobState::Interrupted);
         assert!(
             interrupted
@@ -443,7 +667,7 @@ mod tests {
             .test_approving(JobSpec::test(agent, "exec"))
             .await
             .into_test_id();
-        let pending = jobs.snapshot(job).unwrap();
+        let pending = jobs.snapshot(job).await.unwrap();
         assert_eq!(
             pending.metadata_view(&capabilities).into_value()["state"],
             "queued"
@@ -465,6 +689,7 @@ mod tests {
         let restored = reopen(jobs, root.path()).await;
         let replayed = restored
             .snapshot(job)
+            .await
             .unwrap()
             .metadata_view(&capabilities)
             .into_value();
@@ -499,6 +724,7 @@ mod tests {
             let lease = manager.test_running(spec).await;
             manager
                 .output(lease.id())
+                .await
                 .test_capture(field, kind, bytes.as_bytes());
             leases.push(lease);
         }
@@ -517,7 +743,7 @@ mod tests {
             assert_eq!(view.get("result"), None);
             let capture = serde_json::json!({"field":field,"complete":false});
             assert_eq!(view["presentation"]["captures"][0], capture);
-            let snapshot = restored.snapshot(id).unwrap();
+            let snapshot = restored.snapshot(id).await.unwrap();
             assert_eq!(
                 (snapshot.state, snapshot.location),
                 (JobState::Interrupted, location)
@@ -537,7 +763,7 @@ mod tests {
 
     const OUTCOME_IMAGE: &[u8] = b"historical image";
 
-    fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
+    async fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
         jobs.entry(id, |entry| {
             let finished = entry.finished();
             let diagnostic = finished.and_then(|finished| finished.diagnostic.as_ref());
@@ -547,9 +773,10 @@ mod tests {
                 "error": diagnostic.map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
                 "denied": diagnostic.is_some_and(|diagnostic| diagnostic.is_denial()),
                 "pending": entry.unacknowledged(),
-                "resumable": entry.resume.is_some(),
+                "resumable": entry.restart().is_some(),
             })
         })
+        .await
         .unwrap()
     }
 
@@ -588,21 +815,51 @@ mod tests {
                 .await;
                 settled.unwrap();
             }
-            let projection = stored_projection(&jobs, id);
+            let projection = stored_projection(&jobs, id).await;
             assert_eq!(projection["resumable"], !matches!(case, 4 | 6));
             // The saved payload is never replaced by the in-memory question.
             if matches!(case, 0 | 2 | 4) {
-                let document = jobs.output(id).test_document().unwrap();
+                let document = jobs.output(id).await.test_document().unwrap();
                 assert_eq!(document["result"], serde_json::json!({"result":"saved"}));
             }
-            let mut projection = projection;
             let replay = reopen(jobs, root.path()).await;
-            let mut replayed = stored_projection(&replay, id);
-            // Resume handlers are live-only and never replayed.
-            projection["resumable"] = false.into();
-            replayed["resumable"] = false.into();
-            assert_eq!(projection, replayed);
+            assert_eq!(projection, stored_projection(&replay, id).await);
         }
+    }
+
+    /// A job is let go once nothing keeps it, and reads back as it was held: a
+    /// settled script stays held while a job it launched runs, and goes with it.
+    #[tokio::test]
+    async fn a_job_let_go_reads_back_as_it_was_held() {
+        let (_root, jobs, agent) = runtime().await;
+        let script = jobs
+            .test_running(JobSpec::test(agent.clone(), "script"))
+            .await;
+        let spec = JobSpec {
+            parent: Some(script.id()),
+            ..JobSpec::test(agent, "exec")
+        };
+        let launched = jobs.test_running(spec).await;
+        jobs.test_finish(script.id(), serde_json::json!("done"))
+            .await;
+        jobs.test_claim(script.id()).await.unwrap();
+        let script = script.id();
+        let held = |jobs: &JobManager| {
+            jobs.facts(|jobs| jobs.get(script).map(|entry| entry.journaled(script)))
+        };
+        let before = (
+            held(&jobs).expect("held for the job it launched"),
+            jobs.snapshot(script).await.unwrap(),
+        );
+        jobs.test_finish(launched.id(), Value::Null).await;
+        jobs.test_claim(launched.id()).await.unwrap();
+        assert_eq!(held(&jobs), None);
+        let mut settled = Settled::read(&jobs.store().test_journal(), &[script]).unwrap();
+        let read = settled.take(script).unwrap();
+        assert_eq!(
+            (read.journaled(script), jobs.snapshot(script).await.unwrap()),
+            before
+        );
     }
 
     /// A release lets go of a held child. A reply it made before is only recorded;
@@ -618,9 +875,7 @@ mod tests {
             ..JobSpec::test(owner.clone(), "agent")
         };
         let job = jobs.test_running(spec).await.into_test_id();
-        let child =
-            crate::session::tests::start_child(jobs.store(), &owner, 1, Some(job), root.path())
-                .await;
+        let child = jobs.test_install(job).await;
         // A resumed child runs until its next input.
         let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, mut input| {
             Box::pin(async move {
@@ -628,7 +883,7 @@ mod tests {
                 Ok(ToolOutput::new(serde_json::json!("done")))
             })
         });
-        jobs.set_resume_handler(job, handler).await.unwrap();
+        jobs.test_resume_with(job, handler);
         jobs.finish(job, ToolError::interrupted().into())
             .await
             .unwrap();

@@ -300,7 +300,7 @@ async fn evaluate_inner(
                         }
                         HostRequest::Receive => {
                             drop(issuing);
-                            let result = match host_executor.jobs().is_background(host_context.job()) {
+                            let result = match host_executor.jobs().is_background(host_context.job()).await {
                                 Ok(true) => host_context.receive().await.map_err(|error| error.to_string()),
                                 Ok(false) => Err("receive() requires the script tool to be invoked with bg: true".to_owned()),
                                 Err(error) => Err(error.to_string()),
@@ -473,7 +473,7 @@ mod tests {
         executor: ToolExecutor,
         context: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
-        let saved = executor.jobs().output(context.job());
+        let saved = executor.jobs().output(context.job()).await;
         let captured = evaluate_captured(source.into(), executor, context).await;
         let mut output = captured?;
         let console = saved
@@ -1184,14 +1184,14 @@ return __testCalls;
     async fn a_script_acknowledges_what_its_calls_report_with_its_finish() {
         use crate::session::SessionEvent::{JobClaimed, JobCreated};
         let (runtime, executor, _slot) = image_runtime().await;
-        let created = |records: &[crate::session::EventRecord], name| -> Vec<_> {
+        let created = |records: &[Arc<crate::session::EventRecord>], name| -> Vec<_> {
             let jobs = records.iter().filter_map(|record| match &record.event {
                 JobCreated { job, tool, .. } if tool == name => Some(*job),
                 _ => None,
             });
             jobs.collect()
         };
-        let claimed = |records: &[crate::session::EventRecord], read| {
+        let claimed = |records: &[Arc<crate::session::EventRecord>], read| {
             (records.iter()).any(|record| matches!(record.event, JobClaimed { job } if job == read))
         };
         let source = "return (await tool.read({path: 'image.png'})).state;";
@@ -1214,10 +1214,11 @@ return __testCalls;
             let (executor, agent) = (executor.clone(), runtime.agent.clone());
             async move { executor.run_host(&agent, "script", arguments).await }
         });
-        let started = move |state: &mut crate::session::CoreState| {
-            let reads = created(&state.records, "read");
-            (reads.len() == 2).then(|| (created(&state.records, "script")[0], reads[0]))
+        let started = move |records: &[Arc<crate::session::EventRecord>]| {
+            let reads = created(records, "read");
+            (reads.len() == 2).then(|| (created(records, "script")[0], reads[0]))
         };
+        let started = crate::session::tests::on_records(&runtime.store, &runtime.agent, started);
         let (script_job, read) = bounded(runtime.store.until(started)).await.unwrap();
         runtime.jobs.cancel(script_job).await.unwrap();
         assert!(bounded(script).await.unwrap().is_err());
@@ -1244,14 +1245,22 @@ return __testCalls;
             "console survives the deliberate image-discard policy\n"
         );
         assert!(failed.output.images.is_empty());
-        assert!(runtime.jobs.snapshot(failed.job).unwrap().images.is_empty());
-        let jobs = runtime.jobs.list(&runtime.agent);
+        assert!(
+            runtime
+                .jobs
+                .snapshot(failed.job)
+                .await
+                .unwrap()
+                .images
+                .is_empty()
+        );
+        let jobs = runtime.jobs.list(&runtime.agent).await.unwrap();
         let source = jobs.into_iter().find(|job| job.tool == "read");
         let source = source.expect("owning read result survives script failure");
         assert_eq!(source.state, JobState::Completed);
         assert_loaded(
             &runtime.store,
-            runtime.jobs.snapshot(source.id).unwrap().images,
+            runtime.jobs.snapshot(source.id).await.unwrap().images,
         )
         .await;
     }

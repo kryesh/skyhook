@@ -1,5 +1,6 @@
 //! Host interaction contracts and streamed runtime events.
 
+use std::sync::Arc;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 use schemars::JsonSchema;
@@ -7,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::session::RequestSeq;
-use crate::{identity::AgentId, session::EventRecord};
+use crate::{
+    identity::{AgentId, JobId},
+    session::EventRecord,
+};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub struct QuestionOption {
@@ -72,9 +76,12 @@ pub enum QuestionError {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeEvent {
-    Record(Box<EventRecord>),
+    Record(Arc<EventRecord>),
     /// A job as the record that follows leaves it.
     Job(Box<crate::job::JobEnvelope>),
+    /// Jobs the session no longer holds: what last moved them is their last view,
+    /// until a record moves one again, which reports it anew.
+    JobsUnheld(Vec<JobId>),
     /// Provider-native item/block lifecycle, validated by the observation reducer.
     ResponseEvent {
         agent: AgentId,
@@ -86,13 +93,21 @@ pub enum RuntimeEvent {
         request: RequestSeq,
         settlement: super::Settlement,
     },
-    /// An agent's activity moved, as the session's state reads it.
+    /// An agent's activity moved, as the session's state reads it; none once the
+    /// agent no longer runs, as a parked child does not.
     Activity {
         agent: AgentId,
-        activity: super::ObservedActivity,
+        activity: Option<super::ObservedActivity>,
     },
     TurnCompleted {
         agent: AgentId,
+    },
+    /// Run `invocation` of `job` captured output after its output was last read.
+    /// No further one is posted for that run until its output is read again or
+    /// the run finishes.
+    OutputChanged {
+        job: JobId,
+        invocation: crate::job::Invocation,
     },
     /// The phase the session moved to.
     Phase(crate::session::SessionPhase),

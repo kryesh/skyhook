@@ -229,7 +229,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         );
         if line.index == app.prompt_input().choice
             && !cursor_drawn
-            && app.overlay.is_none()
+            && app.menu.is_none()
             && !(app.multiple_questions() && app.question_editing())
         {
             focus_cursor(frame, row.x - 1, row.y, THEME.input);
@@ -280,7 +280,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         }
         if visible > 0
             && (!app.multiple_questions() || app.question_editing())
-            && app.overlay.is_none()
+            && app.menu.is_none()
         {
             frame.set_cursor_position((
                 2 + (cursor_column as u16).min(rect.width.saturating_sub(4)),

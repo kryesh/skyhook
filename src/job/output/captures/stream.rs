@@ -75,6 +75,10 @@ impl StoredCapture {
             extent: CaptureExtent::default(),
         })
     }
+
+    fn changed(&self) {
+        self.output.changes.changed(self.output.run());
+    }
 }
 
 impl CaptureTarget for StoredCapture {
@@ -86,6 +90,7 @@ impl CaptureTarget for StoredCapture {
             .db
             .append_capture(self.completed.capture, self.extent, bytes)
             .map_err(database)?;
+        self.changed();
         Ok(())
     }
 
@@ -101,6 +106,7 @@ impl CaptureTarget for StoredCapture {
             .db
             .truncate_capture(self.completed.capture, length)
             .map_err(database)?;
+        self.changed();
         Ok(())
     }
 
@@ -112,7 +118,9 @@ impl CaptureTarget for StoredCapture {
         self.output
             .db
             .delete_capture(self.completed.capture)
-            .map_err(database)
+            .map_err(database)?;
+        self.changed();
+        Ok(())
     }
 }
 
@@ -124,8 +132,8 @@ impl JobManager {
         field: FieldPointer,
         kind: CaptureKind,
     ) -> Result<PendingCapture, ToolError> {
-        let output = self.output(job);
-        crate::job::output::blocking(move || {
+        let output = self.output(job).await;
+        crate::blocking(move || {
             Ok(PendingCapture::new(
                 StoredCapture::reserve(&output, &field, kind)?,
                 Abandon::Discard,
@@ -144,6 +152,7 @@ pub(crate) struct HostOutput {
 pub(crate) struct CaptureCollector {
     output: Output,
     store: SessionStore,
+    supervisor: crate::job::Supervisor,
     runtime: tokio::runtime::Handle,
     captures: Mutex<HashMap<CaptureId, CollectedCapture>>,
 }
@@ -166,8 +175,8 @@ fn writing(
 }
 
 impl HostOutput {
-    pub(crate) fn new(store: SessionStore, job: JobId) -> Self {
-        let collector = Arc::new(CaptureCollector::new(store, job));
+    pub(crate) async fn new(jobs: &JobManager, job: JobId) -> Self {
+        let collector = Arc::new(CaptureCollector::new(jobs, job).await);
         Self {
             context: OutputContext::new(collector.clone()),
             collector,
@@ -199,10 +208,11 @@ impl HostOutput {
 }
 
 impl CaptureCollector {
-    pub(crate) fn new(store: SessionStore, job: JobId) -> Self {
+    pub(crate) async fn new(jobs: &JobManager, job: JobId) -> Self {
         Self {
-            output: Output::current(&store, job),
-            store,
+            output: jobs.output(job).await,
+            store: jobs.store().clone(),
+            supervisor: jobs.supervisor().clone(),
             runtime: tokio::runtime::Handle::current(),
             captures: Mutex::new(HashMap::new()),
         }
@@ -223,10 +233,13 @@ impl CaptureCollector {
 }
 
 impl OutputSink for CaptureCollector {
-    fn abandon(&self, event: OutputEvent) -> Abandonment {
-        // Preserve local capture durability even when execution is forcibly dropped.
-        let _ = self.send(event);
-        Abandonment::Handled
+    /// Write what a producer abandoned even when execution is forcibly dropped, on
+    /// the blocking pool, as a producer can be dropped on an async worker; the
+    /// session waits for it before it closes.
+    fn abandon(self: Arc<Self>, event: OutputEvent) -> Abandonment {
+        let (supervisor, runtime) = (self.supervisor.clone(), self.runtime.clone());
+        let write = move || drop(self.send(event));
+        Abandonment::Writing(supervisor.spawn_blocking(write, &runtime))
     }
 
     fn send(&self, event: OutputEvent) -> io::Result<()> {
@@ -325,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn host_output_preserves_abandonment_and_validates_origin() {
         let (_root, manager, job) = fixture(None).await;
-        let host = HostOutput::new(manager.store().clone(), job);
+        let host = HostOutput::new(&manager, job).await;
         let context = host.context();
         let mut retained = context
             .pending_stream_capture(
@@ -347,13 +360,17 @@ mod tests {
         drop(host);
         drop(retained);
         drop(discarded);
-        let output = manager.output(job);
-        assert_eq!(
-            output.test_bytes("/result/partial").unwrap(),
-            b"buffered tail"
-        );
-        assert!(output.test_bytes("/result/content").is_none());
-        let host = HostOutput::new(manager.store().clone(), job);
+        // Abandoned writes land on the blocking pool, which only the session's drain awaits.
+        let output = manager.output(job).await;
+        crate::tests::bounded(async {
+            while output.test_bytes("/result/partial").as_deref() != Some(b"buffered tail")
+                || output.test_bytes("/result/content").is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let host = HostOutput::new(&manager, job).await;
         let context = host.context();
         assert!(
             context
@@ -393,7 +410,7 @@ mod tests {
                 .unwrap(),
             image.bytes()
         );
-        let foreign = HostOutput::new(manager.store().clone(), job);
+        let foreign = HostOutput::new(&manager, job).await;
         assert!(
             foreign
                 .finish(
@@ -411,15 +428,52 @@ mod tests {
             .unwrap();
         assert!(output.captures[0].matches(job, "/result/matches"));
         assert_eq!(
-            manager.output(job).test_bytes("/result/matches").unwrap(),
+            manager
+                .output(job)
+                .await
+                .test_bytes("/result/matches")
+                .unwrap(),
             b"[1]"
         );
+    }
+
+    /// Observers hear of a run's captured output once until it is read again.
+    #[tokio::test]
+    async fn captured_output_notifies_observers_once_until_it_is_read() {
+        let (_root, manager, job) = fixture(None).await;
+        let mut updates = manager.store().observe().updates;
+        let output = manager.output(job).await;
+        let mut notices = || {
+            std::iter::from_fn(|| updates.try_recv().ok())
+                .filter(|update| match update.event {
+                    crate::agent::RuntimeEvent::OutputChanged {
+                        job: changed,
+                        invocation,
+                    } => {
+                        assert_eq!((changed, invocation), (job, output.invocation));
+                        true
+                    }
+                    _ => false,
+                })
+                .count()
+        };
+        let mut capture = text(&output, TextCaptureField::Stdout).open();
+        for line in ["one\n", "two\n"] {
+            capture.write_text(line).unwrap();
+        }
+        assert_eq!(notices(), 1);
+        capture.write_text("three\n").unwrap();
+        assert_eq!(notices(), 0);
+        Saved::load(&output).unwrap();
+        capture.write_text("four\n").unwrap();
+        capture.write_text("five\n").unwrap();
+        assert_eq!(notices(), 1);
     }
 
     #[tokio::test]
     async fn ownership_prevents_truncation() {
         let (_root, manager, job) = fixture(None).await;
-        let output = manager.output(job);
+        let output = manager.output(job).await;
         let matches = "/result/matches".parse().unwrap();
         let create = |kind| PendingCapture::create(&output, &matches, kind);
         let mut writer = create(CaptureKind::Json).unwrap().open();
@@ -465,7 +519,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let (_root, manager, job) = fixture(None).await;
-            let output = manager.output(job);
+            let output = manager.output(job).await;
             let console = TextCaptureField::Console.pointer();
             let mut capture = text(&output, TextCaptureField::Console).open();
             capture.write_text("before failure\n").unwrap();

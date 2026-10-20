@@ -4,7 +4,7 @@ use super::*;
 /// Strings longer than this are offloaded from a saved document into captures.
 const OFFLOAD_BYTES: usize = 4 * 1024;
 
-pub(super) fn database(error: crate::session::DbError) -> ToolError {
+fn database(error: crate::session::DbError) -> ToolError {
     ToolError::io(std::io::Error::other(error))
 }
 
@@ -13,28 +13,23 @@ pub(super) fn database(error: crate::session::DbError) -> ToolError {
 #[derive(Clone)]
 pub(crate) struct Output {
     pub(super) db: SharedDb,
+    pub(super) reads: crate::session::Reads,
+    pub(super) changes: crate::session::OutputChanges,
     pub(super) job: JobId,
     pub(super) invocation: crate::job::Invocation,
 }
 
 impl Output {
-    /// The rows of job `job`'s current run.
-    pub(crate) fn current(store: &crate::session::SessionStore, job: JobId) -> Self {
-        let entry = |state: &crate::session::CoreState| {
-            state.jobs.entries.get(&job).map(|entry| entry.invocation)
-        };
-        Self::of(store, job, store.read(entry).unwrap_or_default())
-    }
-
     /// The rows of run `invocation` of job `job`.
     pub(crate) fn of(
         store: &crate::session::SessionStore,
         job: JobId,
         invocation: crate::job::Invocation,
     ) -> Self {
-        let db = store.outputs();
         Self {
-            db,
+            db: store.outputs(),
+            reads: store.reads(),
+            changes: store.output_changes(),
             job,
             invocation,
         }
@@ -77,9 +72,12 @@ pub(crate) struct Saved {
 impl Saved {
     pub(crate) fn load(output: &Output) -> Result<Self, ToolError> {
         let run = output.run();
-        let saved = output.db.output(run).map_err(database)?;
-        let captures = output.db.captures(run).map_err(database)?;
-        let presented = output.db.presented_fields(run).map_err(database)?;
+        output.changes.read(run);
+        let crate::session::SavedRows {
+            output: saved,
+            captures,
+            presented,
+        } = output.reads.saved(run).map_err(database)?;
         let (product, fields) = match saved {
             Some(saved) => {
                 let result = saved.result.as_deref().map(serde_json::from_str);
@@ -107,7 +105,7 @@ impl Saved {
     pub(super) fn capture(&self, field: &FieldPointer) -> Option<Source> {
         self.captures.get(field).map(|capture| {
             Source::Capture(reader::CaptureReader::new(
-                self.output.db.clone(),
+                self.output.reads.clone(),
                 capture.id,
             ))
         })
@@ -121,7 +119,7 @@ impl Saved {
             .contains(field)
             .then(|| self.captures.get(field))
             .flatten()?;
-        let source = reader::CaptureReader::new(self.output.db.clone(), capture.id);
+        let source = reader::CaptureReader::new(self.output.reads.clone(), capture.id);
         Some(if capture.detection == Some(json::Detection::Sequence) {
             let source = BufReader::with_capacity(IO_BUFFER_BYTES, source);
             Box::new(json::SequenceArray::new(source))
@@ -129,14 +127,6 @@ impl Saved {
             Box::new(source)
         })
     }
-}
-
-/// Run blocking output work off the async workers.
-pub(in crate::job) async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
-) -> Result<T, ToolError> {
-    let joined = tokio::task::spawn_blocking(work).await;
-    joined.map_err(ToolError::failed)?
 }
 
 /// Fields a saved document treats specially.
@@ -154,8 +144,8 @@ pub(super) struct Stored<'a> {
 /// hold the `referenced` fields, JSON or long candidate text, other strings over
 /// `OFFLOAD_BYTES`, and the outermost larger containers that enclose none of these,
 /// no complete field and no long string reached through object members alone.
-/// A pointer an unreferenced raw capture owns stays inline. Offloaded captures,
-/// like every other row, are saved with the finish.
+/// A pointer an unreferenced raw capture owns stays inline. Offloaded captures are
+/// written here, staged for the finish that saves the rest.
 pub(super) fn prepare_document(
     output: &Output,
     registered: &BTreeMap<FieldPointer, CaptureRow>,
@@ -169,12 +159,10 @@ pub(super) fn prepare_document(
         registered,
         stored: &stored,
         fields: Vec::new(),
-        offloaded: Vec::new(),
+        staged: Vec::new(),
     };
     offload.visit(&FieldPointer::root(), &mut document)?;
-    let Offload {
-        fields, offloaded, ..
-    } = offload;
+    let Offload { fields, staged, .. } = offload;
     let result = has_result
         .then(|| serde_json::to_string(&document["result"]))
         .transpose()?;
@@ -183,7 +171,7 @@ pub(super) fn prepare_document(
         result,
         captures_complete,
         fields,
-        offloaded,
+        staged,
         presented: stored.presented,
     })
 }
@@ -194,7 +182,7 @@ struct Offload<'a> {
     stored: &'a Stored<'a>,
     /// Registered captures the saved document references.
     fields: Vec<(i64, Option<json::Detection>)>,
-    offloaded: Vec<OffloadedCapture>,
+    staged: Vec<StagedCapture>,
 }
 
 impl Offload<'_> {
@@ -204,7 +192,7 @@ impl Offload<'_> {
         {
             let detection = match value {
                 Value::String(_) if self.stored.candidates.contains(field) => {
-                    let source = reader::CaptureReader::new(self.output.db.clone(), capture.id);
+                    let source = reader::CaptureReader::new(self.output.reads.clone(), capture.id);
                     Some(classify(json::detect(source)?, value))
                 }
                 Value::String(_) | Value::Object(_) | Value::Array(_) => {
@@ -230,15 +218,15 @@ impl Offload<'_> {
                 }
                 let text = std::mem::take(text).into_bytes();
                 let detection = classify(detection, value);
-                self.store(field, CaptureKind::Text, Some(detection), text);
+                self.store(field, (CaptureKind::Text, Some(detection)), &text)?;
             }
             Value::String(text) if text.len() > OFFLOAD_BYTES => {
                 let text = std::mem::take(text).into_bytes();
-                self.store(field, CaptureKind::Text, None, text);
+                self.store(field, (CaptureKind::Text, None), &text)?;
             }
             Value::Object(_) | Value::Array(_) if self.offloadable(field, value) => {
                 let bytes = serde_json::to_vec(value)?;
-                self.store(field, CaptureKind::Json, None, bytes);
+                self.store(field, (CaptureKind::Json, None), &bytes)?;
                 clear(value);
             }
             _ => return self.children(field, value),
@@ -287,16 +275,13 @@ impl Offload<'_> {
     fn store(
         &mut self,
         field: &FieldPointer,
-        kind: CaptureKind,
-        detection: Option<json::Detection>,
-        data: Vec<u8>,
-    ) {
-        self.offloaded.push(OffloadedCapture {
-            pointer: field.clone(),
-            kind,
-            detection,
-            data,
-        });
+        kind: (CaptureKind, Option<json::Detection>),
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let run = self.output.run();
+        let staged = (self.output.db).stage_capture(run, field, kind, data);
+        self.staged.push(staged.map_err(std::io::Error::other)?);
+        Ok(())
     }
 }
 
@@ -369,11 +354,22 @@ pub(crate) fn presented_size(output: &Output) -> usize {
 
 #[cfg(test)]
 impl Output {
+    /// What the run saved, read on the writer's connection, as a test reads it
+    /// outside the pool's readers.
+    pub(crate) fn test_saved(&self) -> Saved {
+        let reads = crate::session::Reads::writer(self.db.clone());
+        let output = Self {
+            reads,
+            ..self.clone()
+        };
+        Saved::load(&output).unwrap()
+    }
+
     /// Register `field` holding `bytes`, as an unfinished producer leaves it,
     /// replacing any capture already there.
     pub(crate) fn test_capture(&self, field: &str, kind: CaptureKind, bytes: &[u8]) {
         let field: FieldPointer = field.parse().unwrap();
-        if let Some(existing) = Saved::load(self).unwrap().captures.get(&field) {
+        if let Some(existing) = self.test_saved().captures.get(&field) {
             self.db.delete_capture(existing.id).unwrap();
         }
         let mut writer = PendingCapture::create(self, &field, kind).unwrap().open();
@@ -384,9 +380,7 @@ impl Output {
     }
 
     pub(crate) fn test_bytes(&self, field: &str) -> Option<Vec<u8>> {
-        let mut source = Saved::load(self)
-            .unwrap()
-            .capture(&field.parse().unwrap())?;
+        let mut source = self.test_saved().capture(&field.parse().unwrap())?;
         let mut bytes = Vec::new();
         source.read_to_end(&mut bytes).unwrap();
         Some(bytes)
@@ -394,19 +388,15 @@ impl Output {
 
     /// The compact saved product as `{"result": ...}`, if the job has finished.
     pub(crate) fn test_document(&self) -> Option<Value> {
-        Saved::load(self)
-            .unwrap()
-            .product
-            .map(|product| product.document())
+        (self.test_saved().product).map(|product| product.document())
     }
 
     pub(crate) fn test_captures_complete(&self) -> Option<bool> {
-        let saved = Saved::load(self).unwrap();
-        saved.product.map(|product| product.captures_complete)
+        (self.test_saved().product).map(|product| product.captures_complete)
     }
 
     pub(crate) fn test_fields(&self) -> Vec<FieldPointer> {
-        Saved::load(self).unwrap().fields.into_iter().collect()
+        self.test_saved().fields.into_iter().collect()
     }
 
     pub(crate) fn test_delete_capture(&self, capture: &CompletedCapture) {
@@ -422,7 +412,7 @@ mod tests {
 
     /// The result `output`'s saved document holds.
     fn value(output: &Output) -> Value {
-        let saved = Saved::load(output).unwrap();
+        let saved = output.test_saved();
         hydrate(&saved, saved.product.as_ref().unwrap().document()).unwrap()["result"].take()
     }
 
@@ -461,7 +451,7 @@ mod tests {
             let mut spec = JobSpec::test(agent.clone(), "classified");
             spec.output_schema = Some(schema.clone());
             let id = manager.test_running(spec).await.into_test_id();
-            let output = manager.output(id);
+            let output = manager.output(id).await;
             // Candidate text is classified whether it streamed or returned inline;
             // other strings are never parsed.
             let mut result = json!({"note":"{\"x\":1}"});
@@ -529,7 +519,7 @@ mod tests {
             output.streams = crate::tool::StreamEnd::Cut;
         }
         manager.test_complete(id, output).await;
-        let saved = Saved::load(&manager.output(id)).unwrap();
+        let saved = Saved::load(&manager.output(id).await).unwrap();
         (root, manager, saved)
     }
 
@@ -590,7 +580,7 @@ mod tests {
             .map(|value| serde_json::to_vec(value).unwrap().len())
             .sum();
             assert!(presentation["shape"].is_object());
-            assert_eq!(presented_size(&manager.output(id)), emitted);
+            assert_eq!(presented_size(&manager.output(id).await), emitted);
         }
     }
 
@@ -601,7 +591,7 @@ mod tests {
             .test_running(JobSpec::test(agent, "offloaded"))
             .await
             .into_test_id();
-        let output = manager.output(id);
+        let output = manager.output(id).await;
         let items: Vec<_> = (0..400).map(|id| json!({"id":id,"name":"pod"})).collect();
         let result = json!({
             "items": items,

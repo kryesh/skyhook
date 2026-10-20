@@ -1,11 +1,11 @@
 //! Job notifications as the model received them, headed by the job's current state.
 
 use super::super::tool_view::{Document, Hints, Role, Run};
+use super::entries::Inputs;
 use super::jobs::{HEADER_DETAIL, state_name, state_role};
 use super::{Entry, EntryKey, View, clean};
 use crate::text::brief;
 use serde_json::Value;
-use skyhook::agent::ObservationSnapshot;
 use skyhook::job::JobRole;
 use skyhook::session::{JobEvent, RecordSeq};
 
@@ -17,7 +17,7 @@ pub(super) fn job_event_entries(
     record: RecordSeq,
     block: usize,
     events: &[JobEvent],
-    snapshot: &ObservationSnapshot,
+    inputs: Inputs<'_>,
     view: &View,
     all: bool,
 ) -> Vec<Entry> {
@@ -40,7 +40,7 @@ pub(super) fn job_event_entries(
             let mut body = open.then(Document::default);
             match event {
                 JobEvent::Message(message) => {
-                    let job = snapshot.jobs.get(&message.id);
+                    let job = inputs.job(&message.id);
                     let tool = job.map_or(JobRole::Agent.as_str(), |job| job.tool.as_str());
                     header.push(Run::new(tool, Role::ToolName));
                     header.push(Run::new(format!(" #{}", message.id), Role::Muted));
@@ -63,7 +63,7 @@ pub(super) fn job_event_entries(
                 }
                 JobEvent::Job(job_view) => {
                     let id = job_view.id;
-                    let job = id.and_then(|id| snapshot.jobs.get(&id));
+                    let job = id.and_then(|id| inputs.job(&id));
                     let tool = job_view
                         .tool()
                         .or_else(|| job.map(|job| job.tool.as_str()))
@@ -100,13 +100,36 @@ mod tests {
     use skyhook::job::JobTransition;
     use skyhook::session::RecordSeq;
 
+    use super::super::{EntryView, Projection, Tab, Window, tests::root};
+    use crate::tui::app::OutputStore;
+    use skyhook::agent::ObservationSnapshot;
+
+    /// The cards of `events` for jobs as `live` shows them.
     fn events(
         events: &[JobEvent],
-        snapshot: &ObservationSnapshot,
+        live: &ObservationSnapshot,
         view: &View,
         all: bool,
     ) -> Vec<Entry> {
-        job_event_entries(RecordSeq::default(), 0, events, snapshot, view, all)
+        let agent = root(1);
+        let window = Window::empty(agent.clone(), Tab::Conversation, 0);
+        let (projection, outputs) = (Projection::default(), OutputStore::default());
+        let presentation = EntryView {
+            agent: &agent,
+            tab: Tab::Conversation,
+            view,
+            all_details: all,
+            today: Default::default(),
+        };
+        let inputs = Inputs {
+            live,
+            window: &window,
+            projection: &projection,
+            presentation,
+            outputs: &outputs,
+            unsaved: &[],
+        };
+        job_event_entries(RecordSeq::default(), 0, events, inputs, view, all)
     }
 
     #[tokio::test]
@@ -114,7 +137,7 @@ mod tests {
         let (_root, mut app, mut model, session) = played_fixture().await;
         let task = json!({"prompt": "ask", "name": "current-name"});
         asking_child(&session, &mut model, task).await;
-        let job = observe_find(&mut app, |app| job_of_call(&app.snapshot, "agent-0")).await;
+        let job = observe_find(&mut app, |app| job_of_call(&app.journal, "agent-0")).await;
         reached(&mut app, job, JobTransition::WaitingInput).await;
         let message = "Both reviewer gaps are fixed.\nChecking \"native\" replay — next.";
         let reply = [JobEvent::Message(skyhook::job::AgentMessage {

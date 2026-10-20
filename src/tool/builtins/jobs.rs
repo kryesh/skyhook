@@ -106,22 +106,26 @@ fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
 }
 
 async fn list(jobs: JobManager, context: ToolContext, all: bool) -> Result<ToolOutput, ToolError> {
-    let current = jobs.metadata(context.job()).map_err(|error| {
+    let current = jobs.metadata(context.job()).await.map_err(|error| {
         job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
     })?;
     let containing_script = if let Some(parent) = current.parent {
-        let parent = jobs.metadata(parent).map_err(|error| {
+        let parent = jobs.metadata(parent).await.map_err(|error| {
             job_failure(error, Operation::Inspect, parent).effects(Effects::Unchanged)
         })?;
         (parent.role == crate::job::JobRole::Script).then_some(parent.id)
     } else {
         None
     };
-    let listing = jobs
-        .list(context.agent())
-        .into_iter()
+    let listed = if all {
+        jobs.list(context.agent()).await.map_err(|error| {
+            job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
+        })?
+    } else {
+        jobs.active(context.agent())
+    };
+    let listing = (listed.into_iter())
         .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
-        .filter(|job| all || !job.state.is_terminal())
         .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
         .collect();
     Ok(ToolOutput::new(Value::Array(listing)))

@@ -16,8 +16,7 @@ pub(crate) struct JobProcess {
 
 impl ProcessOwner {
     pub(crate) fn attach(&self, pid: u32) -> JobProcess {
-        self.jobs
-            .handles(self.job, |handles| handles.process = Some(pid));
+        self.jobs.processes().insert(pid, self.job);
         JobProcess {
             owner: self.clone(),
             pid,
@@ -35,24 +34,23 @@ impl JobManager {
 
     /// The job whose attached process comes first in `pids`.
     pub(crate) fn process_job(&self, pids: &[u32]) -> Option<JobId> {
-        let handles = (self.inner.handles)
+        let processes = self.processes();
+        pids.iter().find_map(|pid| processes.get(pid).copied())
+    }
+
+    fn processes(&self) -> std::sync::MutexGuard<'_, HashMap<u32, JobId>> {
+        (self.inner.processes)
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        pids.iter().find_map(|&pid| {
-            (handles.iter())
-                .find_map(|(&job, handles)| (handles.process == Some(pid)).then_some(job))
-        })
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Drop for JobProcess {
     fn drop(&mut self) {
-        let pid = self.pid;
-        self.owner.jobs.handles(self.owner.job, |handles| {
-            if handles.process == Some(pid) {
-                handles.process = None;
-            }
-        });
+        let mut processes = self.owner.jobs.processes();
+        if processes.get(&self.pid) == Some(&self.owner.job) {
+            processes.remove(&self.pid);
+        }
     }
 }
 
