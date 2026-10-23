@@ -4,11 +4,12 @@ use super::{Entry, Timing, clean, number};
 use crate::tui::format::{Precision, local_time};
 use chrono::{Local, NaiveDate};
 use skyhook::provider::protocol::Usage;
-use skyhook::session::{ModelPurpose, RequestPhase, RequestRecord, RequestSeq};
+use skyhook::session::{ModelPurpose, RequestNumber, RequestPhase, RequestRecord, RequestSeq};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RequestRow {
     pub sequence: RequestSeq,
+    pub number: RequestNumber,
     pub purpose: ModelPurpose,
     pub model: String,
     pub phase: RequestPhase,
@@ -21,7 +22,7 @@ pub struct RequestRow {
 impl RequestRow {
     pub fn metadata(&self) -> [String; 5] {
         [
-            format!("Request #{}", self.sequence),
+            format!("Request #{}", self.number),
             self.sent.clone(),
             match self.purpose {
                 ModelPurpose::Agent => "Agent",
@@ -58,6 +59,7 @@ pub(super) fn request_entry(
 ) -> Entry {
     Entry::request_entry(RequestRow {
         sequence,
+        number: record.number,
         purpose: record.purpose,
         model: clean(record.profile.profile.model.as_str()).replace('\n', " "),
         phase: record.phase.clone(),

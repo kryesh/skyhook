@@ -16,7 +16,7 @@ use crate::tool::{
 };
 use crate::{
     fs::FileKind,
-    media::{Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES},
+    media::{Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, MediaError},
     session::SessionStore,
 };
 
@@ -416,7 +416,15 @@ async fn inspect_asset(
             }
             .context(at(Operation::Read, &source))
         })?;
-    match crate::media::classify(bytes) {
+    let classified = crate::media::classify(bytes)
+        .await
+        .map_err(|error| match error {
+            MediaError::Task(error) => error.into(),
+            error => {
+                ToolError::failed(error).operation(Operation::Deserialize, Subject::path(&source))
+            }
+        })?;
+    match classified {
         Classified::Image(image) => {
             let image = store
                 .store_image(Some(asset.clone()), &image)

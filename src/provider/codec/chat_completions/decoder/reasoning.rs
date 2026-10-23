@@ -670,7 +670,7 @@ mod tests {
         let turn = crate::provider::protocol::Message::Assistant(reduced.items().to_vec());
         (request.context).extend(crate::provider::protocol::entries([turn]));
         let router = native_dialect(ReasoningReplay::Details, "reasoning_details", replayed());
-        let body = encode(&request, &router).unwrap();
+        let body = encode(&request, Default::default(), &router).unwrap();
         assert_eq!(body["messages"][1]["reasoning_details"], json!(details));
         // So does another id on a detail of the same type; an encrypted entry is
         // whole, so one without an id never continues another.

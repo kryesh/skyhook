@@ -1,9 +1,9 @@
 //! Shared model-facing input conversion, native field access, finish settlement
 //! and opaque reasoning provenance.
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use crate::{
-    media::{AttachmentRef, ImageRef, MediaError, TextRef},
+    media::{AttachmentRef, BlobDigest, Image, ImageRef, MediaError, Prepared, TextRef},
     named_enum::{NamedEnum, named_enum},
     provider::{
         ProviderError, ProviderErrorKind,
@@ -93,9 +93,52 @@ pub(crate) fn blob_error(error: MediaError) -> ProviderError {
     ProviderErrorKind::InvalidRequest.error(format!("attachment: {error}"))
 }
 
-pub(crate) fn image_url(request: &ModelRequest, image: &ImageRef) -> Result<String, ProviderError> {
-    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
-    Ok(format!("data:{};base64,{data}", image.format.as_str()))
+pub(crate) fn image_url(image: &Image) -> String {
+    format!("data:{};base64,{}", image.format().as_str(), image.base64())
+}
+
+/// The images a request references, by stored original, as its provider context
+/// prepared them for the model.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedImages<'a>(&'a BTreeMap<BlobDigest, Prepared>);
+
+impl Default for PreparedImages<'_> {
+    fn default() -> Self {
+        static NONE: BTreeMap<BlobDigest, Prepared> = BTreeMap::new();
+        Self(&NONE)
+    }
+}
+
+impl<'a> PreparedImages<'a> {
+    pub(crate) const fn new(prepared: &'a BTreeMap<BlobDigest, Prepared>) -> Self {
+        Self(prepared)
+    }
+
+    pub(crate) fn get(self, image: &ImageRef) -> Result<&'a Prepared, ProviderError> {
+        self.0
+            .get(&image.blob.sha256)
+            .ok_or_else(|| blob_error(MediaError::NotLoaded))
+    }
+
+    /// `image` as `fitted` encodes the copy sent, or as a `text_type` part saying
+    /// why none is.
+    pub(crate) fn part(
+        self,
+        image: &ImageRef,
+        text_type: &str,
+        fitted: impl Fn(&Image) -> Value,
+    ) -> Result<Value, ProviderError> {
+        Ok(match self.get(image)? {
+            Prepared::Fitted(copy) => fitted(copy),
+            Prepared::Omitted(reason) => {
+                let text = match &image.file {
+                    Some(file) => format!("[Image {file} not sent: {reason}]"),
+                    None => format!("[Image not sent: {reason}]"),
+                };
+                json!({"type": text_type, "text": text})
+            }
+        })
+    }
 }
 
 /// Attached text as the model sees it: its source file, if any, then the content.
@@ -110,19 +153,20 @@ pub(crate) fn attachment_text(
     })
 }
 
-/// User content parts, with `image` encoding the protocol's image part.
+/// User content parts, with `image` encoding the protocol's part for a fitted image.
 pub(crate) fn user_parts(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     parts: &[UserContent],
     text_type: &str,
-    image: impl Fn(&ImageRef) -> Result<Value, ProviderError>,
+    image: impl Fn(&Image) -> Value,
 ) -> Result<Vec<Value>, ProviderError> {
     let part = |text: &str| json!({"type":text_type, "text":text});
     parts
         .iter()
         .map(|content| match content.text() {
             Ok(text) => Ok(part(&text)),
-            Err(AttachmentRef::Image(reference)) => image(reference),
+            Err(AttachmentRef::Image(reference)) => images.part(reference, text_type, &image),
             Err(AttachmentRef::Text(file)) => Ok(part(&attachment_text(request, file)?)),
         })
         .collect()
@@ -423,7 +467,8 @@ pub(crate) fn replay(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::media::{BlobRef, ImageFormat};
+    use crate::media::{BlobRef, ImageFormat, ImageLimits};
+    use crate::provider::http::images::FittedImages;
     use crate::provider::protocol::{
         AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step, Usage,
     };
@@ -618,8 +663,30 @@ pub(crate) mod tests {
         ImageRef {
             file: Some("image.png".into()),
             format: ImageFormat::Png,
-            blob: BlobRef::of(b"\x01\x02\x03"),
+            blob: BlobRef::of(&crate::tests::png_bytes(b"")),
         }
+    }
+
+    /// The data URL [`image`] is sent as.
+    pub(crate) fn image_data() -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let data = STANDARD.encode(crate::tests::png_bytes(b""));
+        format!("data:image/png;base64,{data}")
+    }
+
+    /// Limits [`image`] is within.
+    pub(crate) const LIMITS: ImageLimits = ImageLimits::new(64, 1 << 20);
+
+    /// Load [`image`] and [`notes`] into `request`, then fit its images as a
+    /// context does.
+    pub(crate) async fn loaded(request: &mut ModelRequest) -> FittedImages {
+        request
+            .blobs
+            .insert(image().blob, crate::tests::png_bytes(b""));
+        request.blobs.insert(notes().blob, b"notes".to_vec());
+        let mut images = FittedImages::default();
+        images.refresh(request, LIMITS).await.unwrap();
+        images
     }
 
     pub(crate) fn notes() -> TextRef {
@@ -666,19 +733,26 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn direct_provider_wire_parity_requires_a_loaded_blob() {
+    #[tokio::test]
+    async fn direct_provider_wire_parity_requires_a_loaded_blob() {
         let (image, text) = (image(), notes());
         let mut request = request("model");
-        let missing = image_url(&request, &image).unwrap_err();
+        request.context = crate::provider::protocol::entries(vec![tool_result(
+            "call",
+            "read",
+            json!({}),
+            vec![image.clone()],
+            false,
+        )]);
+        let mut unloaded = FittedImages::default();
+        let missing = unloaded.refresh(&request, LIMITS).await.unwrap_err();
         assert_eq!(missing.kind(), ProviderErrorKind::InvalidRequest);
         assert!(attachment_text(&request, &text).is_err());
-        request.blobs.insert(image.blob, b"\x01\x02\x03".to_vec());
-        request.blobs.insert(text.blob, b"notes".to_vec());
-        assert_eq!(
-            image_url(&request, &image).unwrap(),
-            "data:image/png;base64,AQID"
-        );
+        let images = loaded(&mut request).await;
+        let Ok(Prepared::Fitted(fitted)) = images.prepared().get(&image) else {
+            panic!("a fitted copy");
+        };
+        assert_eq!(image_url(fitted), image_data());
         assert_eq!(
             attachment_text(&request, &text).unwrap(),
             "File: notes.txt\nnotes"

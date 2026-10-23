@@ -36,7 +36,8 @@ inheritable request settings. Request defaults and model settings are typed part
 complete, independently validated codec and transport profile. The shared `Request` also carries
 `service_tier`, a body field on every codec, `explicit_caching` for Chat and Responses, and the
 Responses-only selections (`reasoning_summary`, `access_programs`); admission refuses an effective
-one on any other codec, and each dialect's Responses preset declares its summary default.
+one on any other codec, and each dialect's Responses preset declares its summary default. Its
+`image_limits` replace the per-image limits each dialect declares in its profile.
 
 ## Provider boundary and lifetime
 
@@ -59,13 +60,29 @@ Each model runs as its own `HttpProvider` at its codec's endpoint under the shar
 models of one provider build share its HTTP client, credential sources, command generations, and
 OAuth state.
 
+Images are admitted only when they decode whole (`media::Image`) through `image`'s own decoders,
+with an allocation limit that also covers an animation's canvas, and turned upright by their EXIF
+orientation. The journal keeps a still PNG, JPEG or WebP as attached; an animated PNG or WebP, and
+any GIF, is kept as its decoded default image or first frame, fitted to the stored size. An `HttpProvider` context fits each image a request references to its profile's limits
+once, and keeps the outcome (`media::Prepared`) while the context still references the image: a
+fitted copy, or the reason none could be made. Codecs read these through a read-only view and
+encode a copy with its own format, or an omitted image as a text part giving the reason, so an
+image that cannot be fitted never fails the request. Only a fault in Skyhook's own fitting work,
+such as a panic, fails it, as `ProviderErrorKind::Internal`.
+
 The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A child whose invocation has resolved, with nothing left for it to take, parks: its
-loop and context are released, and the input that resumes it opens a fresh context under the
-same identity from its history. A model change prepares its replacement before committing the
-selection and preserves journal history. Reselecting the current model keeps the current
-context. A mode change also replaces the prompt and tool surface and invalidates earlier bound
-reasoning. Resume opens a fresh provider context under the same context identity.
+loop and context are released, and the input that resumes it opens a fresh context under the same
+identity from its history. A model change prepares its replacement before committing the selection
+and preserves journal history. Reselecting the current model keeps the current context. A mode
+change also replaces the prompt and tool surface and invalidates earlier bound reasoning. Resume
+opens a fresh provider context under the same context identity, or none for a root whose model the
+configuration no longer has: the session still activates for writes, and only running the root
+fails with `UnknownModel` until a selection, or `activate_on`, which journals the switch in the
+activation commit, moves it to a configured model. A child whose own model is gone restarts on the
+root's committed model, journaled as it starts. `continue` restarts retryable children in one
+commit, then claims and admits the root's held batch in one step, so nothing withdraws from it
+meanwhile and a refused batch is held again unchanged while the children run on.
 
 The session owns the durable conversation (`session::Message`): user text and attachments, job
 events (child replies and presented job views), parent input and compaction summaries, assistant
@@ -167,8 +184,10 @@ activates it (`agent/runtime/reopen.rs`), and shutdown stops a session as a cras
 Interrupt, continue and new input read three facts the core keeps, and nothing else: the
 session's flow (open or paused), each agent's turn (`Turn` in `agent/runtime/agents.rs`), and
 whether each child invocation has begun. `stop_turns`, `redirect` and `interrupt_tree` in
-`agent/runtime/lifecycle.rs` decide each agent from them. The host's observation is a display,
-never an input to that decision.
+`agent/runtime/lifecycle.rs` decide each agent from them. A busy turn an interrupt stops stays
+stopping until its loop has unwound the work it took: nothing claims it, or what it would hold,
+and `continue` and new input wait for that (`settle_interrupts`), so one agent never runs two
+commands at once. The host's observation is a display, never an input to that decision.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,
@@ -268,6 +287,14 @@ stays small whatever the result's size, and opening a session removes those a fi
 committed. JavaScript receives complete results, while the journal retains the exact previews
 delivered to the model. [Saved job output](../reference/job-output.md) documents the user-facing
 limits.
+
+Each script runs in a fresh QuickJS runtime (`tool/javascript`). Its runtime is embedded ES
+modules (`tool/javascript/js`), compiled to bytecode once per process and instantiated per
+script; the submitted body is compiled separately, as its own module, so failure reports
+can keep only its frames. One conversion turns tool arguments and returned values into JSON at
+the host boundary (`bridge.rs`), and the host fills a response's declared absent fields with
+`null` there, from the same schemas that declare its presentations
+(`job/output/projection.rs`).
 
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
@@ -413,24 +440,34 @@ Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/src/agent/ru
 The terminal shows the viewed agent's tab from a window of its history, so drawing reads only
 memory and what the terminal holds is bounded by the view, not by the history. Each tab is one
 run of a list loaded a page at a time from either end: the conversation's entries by ordinal,
-each page with the facts presenting it reads, which later updates extend, so an entry shows the
-same whatever else is loaded; requests, an owner's jobs, and a card's children. Loads run off
-the event loop, at most one in flight above the view and one below, and land as work; what is
-not loaded past either end of the run shows as a loading row. The scrollbar spans the whole
-transcript, counting the entries not loaded at the loaded rows' average per entry, and a
-position beyond the run (the scrollbar, `Home`, `End`) reads there instead, at once, in a window
-of its own: what the one it replaces had in flight lands unused, and until the position is laid
-out, scrolling moves it rather than the rows shown. A reading position is an anchor (an entry key
-and rows into it, and the tab's own entry it belongs to: a transcript entry, a request or a root
-job), never a row, so it is found again whatever a new page, width or recovered observation lays
-out; the children still to read where it belongs load whatever their distance, and it is given up
-only once a page read where it lies shows it is not there. Entries far from the view are let go with what presenting them read, and
-with the outputs of the cards they show. A job the session lets go of, and a request a newer one
-replaces, keep the view they were left with while the window shows them, whatever order that and
-the pages reading them arrive in. A frame lays out only what the window holds, and the sidebar
-asks the session what the viewed agent holds only once an agent's start or mode change, or the
-chosen agent or mode, changes it, so a frame never waits on a commit. A session out of view keeps
-only its live part, its agents' summaries and the job output selections chosen.
+keeping only the kinds it can show, so a run of records that never show costs reads but nothing
+held, each page with the facts presenting it reads, which later updates extend, so an entry
+shows the same whatever else is loaded; requests, an owner's jobs, and a card's children. Loads
+run off the event loop, at most one in flight above the view and one below, and land as work;
+what is not loaded past either end of the run shows as a loading row. The conversation's
+scrollbar spans the transcript's records, each entry's rows its own record and records that show
+nothing none, so what loads or is let go moves it only when a load finds an end of the
+transcript, which the entry nearest that end then reaches; a list's spans the rows it loaded.
+What streams after the last record spans one record more, as its reply will once committed, so
+the thumb moves through a long reply as it streams. Rows that show no record lie where the next
+one starts, and a position there finds the first of them, so the start of the track shows what
+precedes the first entry. The track maps a position to the record there, whatever the view
+shows. A position beyond the run (the scrollbar, `Home`, `End`) reads there instead, at once,
+in a window of its own: what the one it replaces had in flight lands unused, and until the position is laid out, scrolling
+moves it rather than the rows shown. A reading position is an anchor (an entry key and rows into
+it, and the tab's own entry it belongs to: a transcript entry, a request or a root job, or the
+start or end where it belongs to none), never a row, so it is found again whatever a new page,
+width or recovered observation lays out; the children still to read where it belongs load
+whatever their distance, and it is given up only once a page read where it lies shows it is not
+there. Entries beyond a fixed budget on either side of those the view needs (what it shows and
+those up to the next entry each way that shows, so scrolling reaches the next row) are let go
+with what presenting them read, and with the outputs of the cards they show. A job the session
+lets go of, and a request a newer one replaces, keep the view they were left with while the
+window shows them, whatever order that and the pages reading them arrive in. A frame lays out
+only what the window holds, and the sidebar asks the session what the viewed agent holds only
+once an agent's start or mode change, or the chosen agent or mode, changes it, so a frame never
+waits on a commit. A session out of view keeps only its live part, its agents' summaries and the
+job output selections chosen.
 
 ## Terminal transcript selection
 
@@ -445,9 +482,10 @@ trimmed separators, a replaced wide grapheme, or an empty cell.
 A selection is anchored to source, not to rows: each end is an entry key, a logical line identity
 within that entry, and a byte in that line's text. Line identities come from the source and do
 not depend on width, but they are identities only. A Markdown line is identified by its source
-position. A tool document or plain line after an entry's header is identified by all the text
-before it, so inserting a line gives every line below it a new identity; the header's own text
-is the entry's state, so it takes no part. Document order is the order in which the
+position; within a tool document, also by all the text before its Markdown block. A tool document
+or plain line after an entry's header is identified by all the text before it, so inserting a
+line gives every line below it a new identity; the header's own text is the entry's state, so it
+takes no part. Document order is the order in which the
 layout first shows each line, which reads a table's cells row by row even when their fragments
 interleave on screen. Endpoints, copying and highlighting all read the same spans. Copying joins
 each selected line's parts in that order, one line per table cell. Each layout of an entry orders

@@ -1,6 +1,9 @@
 use crate::text::duration;
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone};
-use skyhook::provider::protocol::UsageTotals;
+use skyhook::provider::{
+    profile::ModelRef,
+    protocol::{UsageTotals, WireModel},
+};
 pub use skyhook::session::stats::agent_label;
 pub fn number(n: u64) -> String {
     if n >= 1_000_000 {
@@ -49,6 +52,16 @@ pub fn footer_stats(usage: UsageTotals, context: Option<(u64, u64)>) -> [String;
         ),
         context,
     ]
+}
+
+/// A harness error as a notice: one about a model points at /model.
+pub fn harness_error(error: &skyhook::agent::HarnessError) -> String {
+    match error {
+        skyhook::agent::HarnessError::UnknownModel(model) => {
+            format!("model `{model}` is not configured; choose another with /model")
+        }
+        error => error.to_string(),
+    }
 }
 
 /// Remove terminal controls while preserving line boundaries and expanding tabs.
@@ -213,6 +226,15 @@ pub fn pretty(value: &impl serde::Serialize) -> String {
     serde_json::to_string_pretty(value).unwrap_or_default()
 }
 
+/// A model by its configured `provider/model` name, with the API model ID when it
+/// differs from the model key.
+pub fn model_label(name: &ModelRef, wire: Option<&WireModel>) -> String {
+    match wire {
+        Some(wire) if wire.as_str() != name.model.as_str() => format!("{name} ({wire})"),
+        _ => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +248,19 @@ mod tests {
         ] {
             assert_eq!(clean(text), expected);
             assert_eq!(*Clean::from(text), *expected);
+        }
+    }
+
+    #[test]
+    fn model_labels_add_the_api_model_only_when_it_differs() {
+        let name: ModelRef = "openai/fast".parse().unwrap();
+        for (wire, expected) in [
+            (Some("gpt-5-mini"), "openai/fast (gpt-5-mini)"),
+            (Some("fast"), "openai/fast"),
+            (None, "openai/fast"),
+        ] {
+            let wire = wire.map(|wire| wire.parse::<WireModel>().unwrap());
+            assert_eq!(model_label(&name, wire.as_ref()), expected);
         }
     }
 

@@ -38,7 +38,9 @@ pub(super) use job::{creations, job_rows, write_status};
 pub(super) use message::Scope;
 pub(super) use output::remove_staged;
 pub(crate) use output::{CaptureExtent, CaptureRow, OutputRows, SavedRows, StagedCapture};
-pub(super) use pages::{agent_summaries, child_jobs, failed_after, root_jobs, transcript};
+pub(super) use pages::{
+    agent_summaries, child_jobs, failed_after, newest_jobs, root_jobs, transcript,
+};
 #[cfg(test)]
 pub(super) use reads::CONNECTIONS;
 pub(crate) use reads::{Own, ReadPool, Reads};
@@ -54,7 +56,7 @@ pub(super) use wal::{CHECKPOINT_FRAMES, Frames};
 pub(super) use wal::{Checkpointer, Log};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 24;
+pub(super) const USER_VERSION: i64 = 26;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -269,10 +271,13 @@ macro_rules! params {
 }
 pub(super) use params;
 
+#[derive(Clone, Copy)]
 pub(super) enum OpenMode {
     Create,
     Open,
     ReadOnly,
+    /// Read-only, to a database its store opened: the store's writer checked it.
+    Reader,
     Memory,
     /// A connection that only checkpoints the write-ahead log.
     Checkpoint,
@@ -353,7 +358,9 @@ impl Db {
     pub(super) fn open(path: &Path, mode: OpenMode) -> DbResult<Self> {
         let builder = match mode {
             OpenMode::Memory => Builder::new_local(":memory:"),
-            OpenMode::ReadOnly => Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_ONLY),
+            OpenMode::ReadOnly | OpenMode::Reader => {
+                Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            }
             OpenMode::Create => Builder::new_local(path)
                 .flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE),
             OpenMode::Open | OpenMode::Checkpoint => {
@@ -374,10 +381,12 @@ impl Db {
                 db.check_version()?;
                 Dictionaries(&db, Seeding::Check).seed()?;
             }
-            OpenMode::Checkpoint => db.check_version()?,
+            OpenMode::Checkpoint | OpenMode::Reader => db.check_version()?,
         }
         db.batch(&match mode {
-            OpenMode::ReadOnly => "PRAGMA foreign_keys = ON; PRAGMA query_only = 1;".to_owned(),
+            OpenMode::ReadOnly | OpenMode::Reader => {
+                "PRAGMA foreign_keys = ON; PRAGMA query_only = 1;".to_owned()
+            }
             OpenMode::Checkpoint => return Ok(db),
             // The writer neither syncs at its commits nor checkpoints: the core syncs
             // once per group of commands, and a thread of its own checkpoints.
@@ -1208,13 +1217,7 @@ mod tests {
                 "{rows:?}"
             );
             let after = summary();
-            let shown = |summary: &SessionSummary| {
-                (
-                    summary.title.clone(),
-                    summary.model.clone(),
-                    summary.mode.clone(),
-                )
-            };
+            let shown = |summary: &SessionSummary| (summary.title.clone(), summary.mode.clone());
             assert_eq!(shown(&after), shown(&before), "{rows:?}");
             if kind != EntryKind::AgentFailed {
                 assert_eq!(after.stopped, before.stopped, "{rows:?}");

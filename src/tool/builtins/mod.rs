@@ -63,55 +63,7 @@ fn default_dot() -> String {
     crate::tool::registry::DEFAULT_PATH.to_owned()
 }
 
-mod bounded {
-    /// An integer argument from `MIN` through `MAX`, a range its schema carries.
-    #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
-    #[serde(try_from = "u64", into = "u64")]
-    pub(super) struct Bounded<const MIN: u64, const MAX: u64>(u64);
-
-    impl<const MIN: u64, const MAX: u64> Bounded<MIN, MAX> {
-        /// A constant within the range, checked at compile time.
-        pub(super) const fn new<const VALUE: u64>() -> Self {
-            const { assert!(MIN <= VALUE && VALUE <= MAX) };
-            Self(VALUE)
-        }
-    }
-
-    impl<const MIN: u64, const MAX: u64> TryFrom<u64> for Bounded<MIN, MAX> {
-        type Error = String;
-
-        fn try_from(value: u64) -> Result<Self, String> {
-            (MIN..=MAX)
-                .contains(&value)
-                .then_some(Self(value))
-                .ok_or_else(|| format!("must be {MIN} through {MAX}"))
-        }
-    }
-
-    impl<const MIN: u64, const MAX: u64> From<Bounded<MIN, MAX>> for u64 {
-        fn from(value: Bounded<MIN, MAX>) -> Self {
-            value.0
-        }
-    }
-
-    impl<const MIN: u64, const MAX: u64> schemars::JsonSchema for Bounded<MIN, MAX> {
-        fn inline_schema() -> bool {
-            true
-        }
-        fn schema_name() -> std::borrow::Cow<'static, str> {
-            "Bounded".into()
-        }
-        fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-            schemars::json_schema!({
-                "type": "integer",
-                "format": "uint64",
-                "minimum": MIN,
-                "maximum": MAX,
-            })
-        }
-    }
-}
-use bounded::Bounded;
+use crate::newtype::Bounded;
 
 /// Seconds a call may run.
 type TimeoutSecs = Bounded<1, 3600>;

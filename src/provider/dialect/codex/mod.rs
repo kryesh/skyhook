@@ -128,7 +128,8 @@ impl DialectConfig for Config {
                 codec,
             });
         }
-        let mut profile = Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex);
+        let codec = Codec::Responses(responses());
+        let mut profile = Profile::new(codec, transport(), Dialect::Codex, super::openai::IMAGES);
         profile.service = Some("codex");
         profile.fixed(ORIGINATOR, SKYHOOK);
         Ok(profile)

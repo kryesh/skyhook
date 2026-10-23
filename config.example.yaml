@@ -78,6 +78,11 @@ providers:
     #   command: "op read 'op://Private/Anthropic/api-key'"
     # Cache breakpoints default to five minutes; the hour costs more to write:
     # cache_ttl: "1h"
+    # Larger images are downscaled or re-encoded for each request; the stored original
+    # is kept. Each dialect has defaults (here 8000 px and 7.5 MiB); a limit left out keeps it:
+    # image_limits:
+    #   max_edge: 4096     # longest edge, in pixels
+    #   max_bytes: 5242880 # encoded size, in bytes; at most 8 MiB
     models:
       # https://platform.claude.com/docs/en/about-claude/models/overview
       opus:

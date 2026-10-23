@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn match_pages_count_their_framing() {
         let items: Vec<_> = (0..3000).collect();
-        let page = run(&json!(items), "$[*]", 0, crate::job::output::MAX_LIMIT).unwrap();
+        let page = run(&json!(items), "$[*]", 0, super::super::args::MAX_LIMIT).unwrap();
         assert!(json_bytes(&page.matches) <= Accounting::Page.budget());
         assert_eq!(page.next_index, Some(page.matches.len()));
     }

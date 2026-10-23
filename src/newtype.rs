@@ -1,4 +1,4 @@
-//! `String` newtypes that only ever hold values their check accepted.
+//! Newtypes that only ever hold values their check accepted.
 
 /// A value that must carry text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -76,6 +76,53 @@ pub(crate) use string_newtype;
 string_newtype! {
     /// Text written for a reader, such as instructions or a hint: never blank.
     pub struct Prose(Blank) = |text| nonblank("text", text);
+}
+
+/// An integer argument from `MIN` through `MAX`, a range its schema carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct Bounded<const MIN: u64, const MAX: u64>(u64);
+
+impl<const MIN: u64, const MAX: u64> Bounded<MIN, MAX> {
+    /// A constant within the range, checked at compile time.
+    pub(crate) const fn new<const VALUE: u64>() -> Self {
+        const { assert!(MIN <= VALUE && VALUE <= MAX) };
+        Self(VALUE)
+    }
+}
+
+impl<const MIN: u64, const MAX: u64> TryFrom<u64> for Bounded<MIN, MAX> {
+    type Error = String;
+
+    fn try_from(value: u64) -> Result<Self, String> {
+        (MIN..=MAX)
+            .contains(&value)
+            .then_some(Self(value))
+            .ok_or_else(|| format!("must be {MIN} through {MAX}"))
+    }
+}
+
+impl<const MIN: u64, const MAX: u64> From<Bounded<MIN, MAX>> for u64 {
+    fn from(value: Bounded<MIN, MAX>) -> Self {
+        value.0
+    }
+}
+
+impl<const MIN: u64, const MAX: u64> schemars::JsonSchema for Bounded<MIN, MAX> {
+    fn inline_schema() -> bool {
+        true
+    }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Bounded".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "format": "uint64",
+            "minimum": MIN,
+            "maximum": MAX,
+        })
+    }
 }
 
 #[cfg(test)]

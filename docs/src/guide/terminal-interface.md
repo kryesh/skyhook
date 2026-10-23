@@ -50,7 +50,10 @@ which agent is selected. Parents with pending waits stay in those waits. On a re
 that has not run anything yet, `/retry` always starts it and continues whatever it left
 unfinished, or reports that there was nothing.
 Automatic model retries display the attempt number, a countdown to the next attempt, and the
-latest diagnostic in one error block. Partial output from the failed attempt clears when the next
+latest diagnostic in one error block. Error blocks expand to the error, its first lines when it
+is long, which copying or exporting the block gives whole: a final failure starts expanded and a
+pending retry collapsed, while `/details` and exports expand them all.
+Partial output from the failed attempt clears when the next
 attempt starts, and partial output a failed or interrupted turn left clears when the agent's next
 turn begins, as reopening the session shows it; successful replies have no retry labels. Retries
 continue until success or cancellation for
@@ -62,8 +65,9 @@ long a conversation grows, its whole history scrolls and the scrollbar spans all
 far from view is read as the view nears it, with **Loading…** at its edge until it arrives, and
 it arrives without moving what you are reading. Drag the scrollbar to move through the history
 quickly. Requests
-include compaction requests, when each was sent, token summaries, and how long each took; transient
-retries appear under the same request, which reads **Retrying** while the next attempt is pending.
+include compaction requests, numbered from 1 for each agent, with when each was sent, token
+summaries, and how long each took; transient retries appear under the same request and number,
+which reads **Retrying** while the next attempt is pending.
 Full request bodies are available in the session log, not rendered in the UI. Status messages,
 such as interruptions and errors, appear in the conversation and are saved with the session, but
 are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
@@ -74,10 +78,13 @@ shows briefly on the notice line instead. An export finishes even if you switch 
 session meanwhile.
 
 Job output is paged and searchable without acknowledging the agent's pending notifications.
-Select a job and press `o` for output fields, regex search, and the next page; `c` requests
-cancellation (useful for background jobs, since interrupting already cancels the foreground tool).
+Select a job and press `o` for output fields, regex search, and the next page; `c` asks to
+confirm, then requests cancellation (useful for background jobs, since interrupting already
+cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
-cards. Earlier progress messages remain readable after the job completes or resumes. Remote
+cards. Earlier progress messages remain readable after the job completes or resumes. Child-agent
+messages and answers, and question prompts and option descriptions, render as Markdown, both in
+cards and in the question prompt. Remote
 output becomes available as it is transferred to the host. An expanded job card loads its output
 while it is on screen and follows what a running job writes.
 
@@ -121,8 +128,13 @@ paused: nothing is sent until you resume the queue, submit another message, or `
 session closed before then drops the batch.
 Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
-Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
-Restore a missing recorded model before resuming rather than substituting another model.
+Resumed sessions retain their last applied model, unless `--model` names another: the session
+switches to it at startup, before any message or startup script, rather than for the next message
+as `/model` does. `/models` remains an alias for `/model`.
+A session whose recorded model is no longer configured still opens, with a startup warning, and
+is never moved to another model on its own. A message sent to it stays queued and the model
+picker opens: the model chosen there becomes the session's, then the message is sent. Children
+whose own model is gone restart on it too.
 
 The interface stores the last submitted model and mode and the sidebar setting in the workspace's
 `.skyhook/state.json`, beside its sessions, without changing the model configuration.
@@ -142,11 +154,13 @@ Terminals narrower than 100 columns hide it without changing the saved setting.
 The bottom bar uses this format:
 
 ```text
-default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
+default · openai/fast (gpt-5-mini) · 3f9c2a7d…       8.4k · 200k(31.2k) · 42% (54k/128k)
 ```
 
-Values are session output tokens, session total input tokens (uncached input), and the selected
-agent's context occupancy as the last response that reported its prompt counted it
+The left side is the mode, the configured `provider/model` name with its API model ID in
+parentheses when the two differ, and the session ID. The statistics are session output tokens,
+session total input tokens (uncached input), and the selected agent's context occupancy as the
+last response that reported its prompt counted it
 (tokens/model capacity). Session totals include children and compaction; a count a provider did
 not report adds nothing. Context includes instructions, tools, history, runtime state and that
 response; it is not cumulative usage. It appears as `—` until a response reports its prompt,
@@ -171,7 +185,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
 | `Ctrl+X ←`, `Ctrl+X →` | Previous/next of Conversation, Requests, Jobs (wrapping) |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | View the agent above/below in the tree (wrapping) and focus the tree |
-| `↑`, `↓` in the tree | View the agent above/below at its latest activity |
+| `↑`, `↓`, `PageUp`, `PageDown` in the tree | View the agent above/below, or a page above/below, at its latest activity |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
 | `Tab`, `Shift+Tab` | Next/previous [mode](permissions.md#modes) in the composer; next/previous row in the tree or conversation |
 | `Ctrl+X P`, `/mode` | Choose the mode from a list |
@@ -196,8 +210,11 @@ Type `/` in an empty composer to open the command palette. Search by command nam
 (with or without `/`), label, or configured shortcut; exact command names take priority over label matches.
 The command palette omits navigation-only actions; the `Ctrl+X` arrows step through
 agents and inspector tabs. Click the conversation, or pick an agent with `Ctrl+X A`, to focus it.
-Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
-the selected item. The Agents palette labels its Status column and its Output, Input (uncached),
+Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`, and `PageUp`/`PageDown` move the
+selection a page of the rows shown, keeping its place on screen; Enter or Tab activates
+the selected item. Quitting or closing a session while work is running, and cancelling a job,
+first ask a Yes/No question that starts on No, so only choosing Yes goes ahead.
+The Agents palette labels its Status column and its Output, Input (uncached),
 Context, and Time statistics. The composer
 wraps at word boundaries and grows with its draft up to half the space between the top and
 bottom bars, then scrolls to follow the cursor; the mouse wheel over a taller draft scrolls it
@@ -218,7 +235,7 @@ spinners of blocks and tool cards are not selected. In a table, selection follow
 reading order rather than the drawn grid: each table cell copies as one line, whole however it
 wraps, without borders or padding, and an empty cell copies as an empty line. Each copy reports
 how many characters it sent to the terminal; the terminal does not confirm that it accepted them.
-The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
+The workspace path is centered in the top bar. The bottom bar shows the model, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file
 (press `Esc` to keep a typed `@`): image files attach as images and other files as text.

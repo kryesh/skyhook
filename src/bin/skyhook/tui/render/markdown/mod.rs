@@ -175,8 +175,9 @@ pub(super) enum Segment {
     /// text before it: a line inserted above gives every line below it a new
     /// identity rather than another line's.
     Lines,
-    /// A Markdown body, numbered by source position.
-    Markdown,
+    /// A Markdown body, numbered by source position, after the hash of the
+    /// text before it as a `Lines` identity is.
+    Markdown(u64),
     Footer,
 }
 
@@ -231,8 +232,8 @@ impl LineIds {
     }
 }
 
-/// Identifies the lines after a header, in order, by a hash of all the text
-/// before each.
+/// Identifies the lines and Markdown blocks after a header, in order, by a
+/// hash of all the text before each.
 #[derive(Default)]
 pub(super) struct TextIds(std::hash::DefaultHasher);
 
@@ -249,6 +250,14 @@ impl TextIds {
         }
         self.0.write_u8(b'\n');
         id
+    }
+
+    pub fn markdown(&mut self, source: &str) -> Segment {
+        use std::hash::Hasher;
+        let segment = Segment::Markdown(self.0.finish());
+        self.0.write(source.as_bytes());
+        self.0.write_u8(b'\n');
+        segment
     }
 }
 

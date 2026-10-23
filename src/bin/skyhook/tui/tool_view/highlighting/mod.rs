@@ -80,7 +80,7 @@ impl Document {
     pub fn highlight_sources(&self) -> impl Iterator<Item = u64> + '_ {
         self.admitted_codes().map(|(source, _)| source.digest)
     }
-    fn keys(&self) -> impl Iterator<Item = CodeKey> + '_ {
+    pub fn keys(&self) -> impl Iterator<Item = CodeKey> + '_ {
         self.admitted_codes()
             .map(|(source, language)| CodeKey::admit(source, language).unwrap())
     }
@@ -88,7 +88,7 @@ impl Document {
 /// Cloning shares an already-checked immutable source; it does not grant a cache
 /// slot. Every insertion still passes the independent source-byte budget.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CodeKey {
+pub struct CodeKey {
     source: CodeSource,
     language: String,
 }

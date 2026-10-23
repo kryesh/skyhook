@@ -943,7 +943,7 @@ mod tests {
         let path = root.path().join("text");
         std::fs::write(&path, &text).unwrap();
         let image_path = root.path().join("image.png");
-        let image = crate::tests::png(b"remote source bytes");
+        let image = crate::tests::png(b"remote source bytes").await;
         std::fs::write(&image_path, image.bytes()).unwrap();
         let policy = RecordingPolicy::allowing();
         let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy).await;

@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
     Method, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{ACCEPT, HeaderMap, HeaderName, HeaderValue},
 };
 
 use super::{Auth, FetchArgs, HeaderValues, LocalError, ResponseFormat};
@@ -73,11 +73,6 @@ fn check_url(url: &Url) -> Result<(), AdmissionError> {
     Ok(())
 }
 fn validate_options(args: &FetchArgs) -> Result<(), AdmissionError> {
-    if args.text && (args.save_to.is_some() || args.response_format == ResponseFormat::Base64) {
-        return Err(AdmissionError::invalid_arguments(
-            "text conflicts with save_to and response_format base64",
-        ));
-    }
     if args.overwrite && args.save_to.is_none() {
         return Err(AdmissionError::invalid_arguments(
             "overwrite requires save_to",
@@ -148,17 +143,10 @@ pub(super) struct ClientIdentity {
     pub(super) insecure: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InlineMode {
-    Auto,
-    Text,
-    Base64,
-    ExtractText,
-}
-/// A download cannot be paired with inline decoding or extraction options.
+/// A download keeps the bytes as sent, so it has no response format.
 #[derive(Debug)]
 pub(super) enum OutputPlan {
-    Inline(InlineMode),
+    Inline(ResponseFormat),
     Download {
         destination: String,
         overwrite: bool,
@@ -187,23 +175,22 @@ impl TryFrom<FetchArgs> for FetchPlan {
         let method = Method::from_bytes(args.method.as_bytes())
             .map_err(AdmissionError::invalid_arguments)?;
         validate_options(&args)?;
-        let headers = request_headers(&args)?;
+        let mut headers = request_headers(&args)?;
         url.append_query(&args.query);
         let output = match args.save_to {
             Some(destination) => OutputPlan::Download {
                 destination,
                 overwrite: args.overwrite,
             },
-            None => OutputPlan::Inline(if args.text {
-                InlineMode::ExtractText
-            } else {
-                match args.response_format {
-                    ResponseFormat::Auto => InlineMode::Auto,
-                    ResponseFormat::Text => InlineMode::Text,
-                    ResponseFormat::Base64 => InlineMode::Base64,
-                }
-            }),
+            None => OutputPlan::Inline(args.response_format),
         };
+        if let OutputPlan::Inline(format) = &output
+            && let Some(accept) = format.accept()
+        {
+            headers
+                .entry(ACCEPT)
+                .or_insert(HeaderValue::from_static(accept));
+        }
         Ok(Self {
             url,
             method,
@@ -246,12 +233,29 @@ mod tests {
         assert!(!a.insecure && !a.include_headers);
         assert_eq!(a.redirects, RedirectPolicy::Safe);
         FetchPlan::try_from(a).unwrap();
+        // Formats that extract HTML send an Accept, unless the caller chose one.
+        for (value, accept) in [
+            (json!({}), ResponseFormat::Auto.accept()),
+            (json!({"response_format":"text"}), None),
+            (json!({"save_to":"out"}), None),
+            (
+                json!({"headers":{"Accept":"application/json"}}),
+                Some("application/json"),
+            ),
+        ] {
+            let mut value = value;
+            value["url"] = json!("https://example.org");
+            let plan = plan(value).unwrap();
+            let sent = plan
+                .headers
+                .get(ACCEPT)
+                .map(|value| value.to_str().unwrap());
+            assert_eq!(sent, accept);
+        }
         for value in [
             json!({"url":"file:///etc/passwd"}),
             json!({"url":"https://user:secret@example.org"}),
             json!({"url":"http://example.org","method":"bad method"}),
-            json!({"url":"http://example.org","text":true,"save_to":"out"}),
-            json!({"url":"http://example.org","text":true,"response_format":"base64"}),
             json!({"url":"http://example.org","overwrite":true}),
             json!({"url":"http://example.org","headers":{"a":"bad\r\nheader"}}),
             json!({"url":"http://example.org","headers":{"content-length":"2"}}),
@@ -265,18 +269,13 @@ mod tests {
         // header sensitivity proofs.
         let plan = plan(json!({
             "url":"https://example.org/p?x=first#discard", "query":[["x","second"]],
-            "headers":{"X-Multi":["one","two"]}, "auth":{"kind":"bearer","token":"credential"},
-            "text":true
+            "headers":{"X-Multi":["one","two"]}, "auth":{"kind":"bearer","token":"credential"}
         }))
         .unwrap();
         assert_eq!(plan.url.as_str(), "https://example.org/p?x=first&x=second");
         assert!(plan.url.join("ftp://example.org/file").is_err());
         assert_eq!(plan.headers.get_all("x-multi").iter().count(), 2);
         assert!(plan.headers.get("authorization").unwrap().is_sensitive());
-        assert!(matches!(
-            plan.output,
-            OutputPlan::Inline(InlineMode::ExtractText)
-        ));
     }
 
     #[test]

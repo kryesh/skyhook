@@ -1,6 +1,7 @@
 //! Agent identity and command menu rendering.
 
 use super::*;
+use ratatui::layout::{Constraint, Layout, Margin};
 use skyhook::job::JobState;
 
 fn agent_status_color(state: model::AgentDisplayState) -> Color {
@@ -190,22 +191,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
     let width = area.width.saturating_sub(margin * 2);
     // Likewise a short transcript keeps every row for the palette.
     let gap = 1.min(area.height.saturating_sub(6) / 2);
-    let rect = r(area.x + margin, area.y + gap, width, area.height - gap * 2);
-    fill(frame, rect, THEME.input);
-    text(
-        frame,
-        r(rect.x + 1, rect.y, width.saturating_sub(2), 1),
-        menu.title.clone(),
-        THEME.primary,
-        THEME.input,
-    );
-    text(
-        frame,
-        r(rect.x + 1, rect.y + 1, width.saturating_sub(2), 1),
-        format!("> {}▏", model::clean(menu.input.text())),
-        THEME.fg,
-        THEME.input,
-    );
+    let full = area.height - gap * 2;
     let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
     let agents = &app.projection.agents;
     let agent_stats: Vec<_> = if agent_menu {
@@ -224,18 +210,60 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
     let stats_width = columns.stats_width;
     // Headed columns: the status, then the statistics when they fit.
     let header_height = u16::from(agent_menu && columns.status_width > 0);
-    if header_height > 0 && rect.height > 2 {
-        let y = rect.y + 2;
-        let status_x = rect.x + 1 + columns.identity_width + 2;
-        let status = r(status_x, y, columns.status_width, 1);
-        text(frame, status, "Status", THEME.muted, THEME.input);
-        if stats_width > 0 {
-            let stats = r(rect.right() - 1 - stats_width, y, stats_width, 1);
-            let headers = columns.stats.format(&AGENT_STATS_HEADERS.map(String::from));
-            text(frame, stats, headers, THEME.muted, THEME.input);
-        }
+    let filter = match menu.layout() {
+        MenuLayout::Filtered(input) => Some(input.text()),
+        MenuLayout::Compact => None,
+    };
+    let filter_height = u16::from(filter.is_some());
+    let title = wrap_plain(&menu.title, row_width.into());
+    let title_lines = title.len() as u16;
+    // The title's first line takes the space first, then the rows, the controls
+    // and the rest of the title, so a short menu still says what it asks.
+    let mut left = full;
+    let mut take = |wanted: u16| {
+        let taken = wanted.min(left);
+        left -= taken;
+        taken
+    };
+    let lead = take(title_lines.min(1));
+    take(match menu.layout() {
+        MenuLayout::Filtered(_) => 1,
+        MenuLayout::Compact => menu.filtered().len() as u16,
+    });
+    let [filter_height, header_height, help_height] =
+        [filter_height, header_height, 1].map(&mut take);
+    let title_height = lead + take(title_lines - lead);
+    let height = match menu.layout() {
+        MenuLayout::Filtered(_) => full,
+        MenuLayout::Compact => full - left,
+    };
+    let rect = r(area.x + margin, area.y + gap, width, height);
+    fill(frame, rect, THEME.input);
+    let [title_area, filter_area, header_area, rows_area, help_area] = Layout::vertical([
+        Constraint::Length(title_height),
+        Constraint::Length(filter_height),
+        Constraint::Length(header_height),
+        Constraint::Fill(1),
+        Constraint::Length(help_height),
+    ])
+    .areas(rect.inner(Margin::new(1, 0)));
+    for (line_rect, line) in title_area.rows().zip(title) {
+        text(frame, line_rect, line, THEME.primary, THEME.input);
     }
-    let height = rect.height.saturating_sub(3 + header_height) as usize;
+    if let Some(filter) = filter {
+        let filter = format!("> {}▏", model::clean(filter));
+        text(frame, filter_area, filter, THEME.fg, THEME.input);
+    }
+    let (y, header) = (header_area.y, header_area.height);
+    let status_x = header_area.x + columns.identity_width + 2;
+    let status = r(status_x, y, columns.status_width, header);
+    text(frame, status, "Status", THEME.muted, THEME.input);
+    if stats_width > 0 {
+        let stats = r(header_area.right() - stats_width, y, stats_width, header);
+        let headers = columns.stats.format(&AGENT_STATS_HEADERS.map(String::from));
+        text(frame, stats, headers, THEME.muted, THEME.input);
+    }
+    let height = rows_area.height as usize;
     let Some(menu) = &mut app.menu else {
         return;
     };
@@ -244,16 +272,16 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         return;
     };
     let items = menu.filtered();
-    let page = menu.page();
+    let page = menu.is_text_page();
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
-        let y = rect.y + 2 + header_height + (i - top) as u16;
+        let y = rows_area.y + (i - top) as u16;
         let selected = i == menu.selected() && !page;
         let bg = if selected {
             THEME.selected
         } else {
             THEME.input
         };
-        let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
+        let row = r(rows_area.x, y, rows_area.width, 1);
         if let MenuKind::Agents(choices) = &menu.kind {
             let id = &choices[item.index].value;
             if let Some(agent) = agents.get(item.index).filter(|a| &a.id == id) {
@@ -308,28 +336,13 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         app.hits.push((row, Hit::Menu(i)));
     }
     if items.is_empty() && !matches!(menu.kind, MenuKind::OutputSearch(_)) {
-        text(
-            frame,
-            r(
-                rect.x + 1,
-                rect.y + 2 + header_height,
-                width.saturating_sub(2),
-                1,
-            ),
-            "No matching entries",
-            THEME.muted,
-            THEME.input,
-        );
+        let empty = "No matching entries";
+        text(frame, rows_area, empty, THEME.muted, THEME.input);
     }
     text(
         frame,
-        r(
-            rect.x + 1,
-            rect.bottom().saturating_sub(1),
-            width.saturating_sub(2),
-            1,
-        ),
-        "↑↓ select · Enter open · Esc return",
+        help_area,
+        menu.layout().help(),
         THEME.muted,
         THEME.input,
     );
@@ -359,6 +372,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_title_leaves_rows_and_controls_inside_the_menu() {
+        let (_root, mut app) = crate::tui::app::tests::fixture().await;
+        app.command(crate::tui::keys::Command::Help);
+        app.menu.as_mut().unwrap().title = format!("/{}", "segment/".repeat(20));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        app.content_rect = r(0, 0, 40, 8);
+        terminal.draw(|frame| draw_menu(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let line = |y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        let rows: Vec<String> = (0..12).map(line).collect();
+        // Nothing is painted below the menu's area.
+        assert!(
+            rows[8..].iter().all(|row| row.trim().is_empty()),
+            "{rows:#?}"
+        );
+        // The filter and at least one item row stay visible.
+        assert!(
+            rows.iter().any(|row| row.trim_start().starts_with('>')),
+            "{rows:#?}"
+        );
+        assert!(
+            app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Menu(_))),
+            "{rows:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn agents_palette_hides_columns_without_stacking_rows() {
         use crate::tui::app::played::{
             count, job_ended, observe_until, played_fixture, spawn_children,
@@ -374,9 +414,15 @@ mod tests {
             .map(|child| format!("agent {}", crate::tui::format::agent_label(child)))
             .collect();
         // An open palette's rows follow agents and their live status, which is searchable.
-        app.menu.as_mut().unwrap().input.set("completed".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("completed".into()));
         assert_eq!(app.menu.as_ref().unwrap().filtered().len(), 2);
-        app.menu.as_mut().unwrap().input.set(String::new());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set(String::new()));
         for (width, stats, status) in [
             (40, false, false),
             (65, false, false),

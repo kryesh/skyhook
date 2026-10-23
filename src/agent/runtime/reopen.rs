@@ -27,6 +27,12 @@ impl SessionHandle {
     /// session viewed, with nothing journaled, for the next call to try again. A
     /// session that no longer runs refuses the call.
     pub(super) async fn running(&self) -> Result<(), HarnessError> {
+        self.running_on(None).await
+    }
+
+    /// Run the session as [`running`](Self::running) does, an activation this
+    /// call starts resuming the root on `on` where named.
+    pub(super) async fn running_on(&self, on: Option<ModelRef>) -> Result<(), HarnessError> {
         enum Activating {
             Decided(Result<(), SessionError>),
             Started,
@@ -34,7 +40,7 @@ impl SessionHandle {
         }
         loop {
             let (activated, outcome) = oneshot::channel();
-            let runtime = self.runtime.clone();
+            let (runtime, on) = (self.runtime.clone(), on.clone());
             let decide =
                 move |state: &mut CoreState| match (state.phase(), state.agents.activation()) {
                     (crate::session::SessionPhase::Viewing, Activation::Preparing) => {
@@ -45,7 +51,7 @@ impl SessionHandle {
                         let supervisor = runtime.jobs.supervisor().clone();
                         let ends = EndsActivation(runtime.store.clone());
                         let activate = async move {
-                            let activation = runtime.activate_root().await;
+                            let activation = runtime.activate_root(on).await;
                             drop(ends);
                             activated.send(activation)
                         };
@@ -90,6 +96,7 @@ mod tests {
     use crate::agent::TodoStatus;
     use crate::agent::runtime::tests::*;
     use crate::job::JobRole::{self, Tool};
+    use crate::provider::ProviderErrorKind;
     use crate::session::tests::{attempt, requested};
 
     /// What a process killed while `job` ran as `role` at `location` leaves
@@ -579,30 +586,38 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
+    /// A provider that cannot open a conversation.
+    struct Unopenable;
+
+    impl crate::provider::Provider for Unopenable {
+        fn open_context(
+            &self,
+            _: crate::provider::protocol::ContextId,
+        ) -> Result<Box<dyn crate::provider::ProviderContext>, crate::provider::ProviderError>
+        {
+            Err(ProviderErrorKind::Transport.error("unreachable"))
+        }
+    }
+
     /// A reopened session journals nothing until a call changes it. One whose root
-    /// cannot be prepared, its model no longer configured, stays viewed: every
-    /// such call reports why, and what the crashed process left open is neither
-    /// settled nor shown running, before its shutdown or after it, when every
-    /// such call is refused.
+    /// cannot be prepared, its provider unable to open its context, stays viewed:
+    /// every such call reports why, and what the crashed process left open is
+    /// neither settled nor shown running, before its shutdown or after it, when
+    /// every such call is refused.
     #[tokio::test]
     async fn a_resume_whose_root_cannot_start_commits_nothing() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let requests = Requests::default();
         let provider = scripted_provider(&requests, [answer("first")]);
-        let gone = crate::tests::profile("gone-model", false);
-        let harness = serving(root.path(), provider.clone(), [("gone", gone)])
-            .default_model(model_ref("gone"))
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(root.path(), &sessions, provider).await;
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.prompt("hello").await.unwrap(), "first");
         let (id, agent) = (session.id(), session.root.clone());
         shutdown_session(session).await;
         let job = crashed_running(&sessions, id, &agent).await;
         let crashed = SessionStore::read_records(&sessions, id).await.unwrap();
-        let harness = test_harness(root.path(), &sessions, provider).await;
+        let harness = test_harness(root.path(), &sessions, Arc::new(Unopenable)).await;
         let resumed = harness.resume_session(id).await.unwrap();
         // Concurrent first calls join an activation, or try again once it failed.
         let (first, second) = tokio::join!(
@@ -610,9 +625,8 @@ mod tests {
             resumed.record_status(agent.clone(), "acted".into()),
         );
         for refused in [first, second] {
-            let gone = model_ref("gone");
             assert!(
-                matches!(&refused, Err(HarnessError::UnknownModel(model)) if *model == gone),
+                matches!(&refused, Err(HarnessError::Provider(_))),
                 "{refused:?}"
             );
             let viewed = resumed.store().observe().snapshot;
@@ -648,6 +662,216 @@ mod tests {
         job
     }
 
+    /// Under a harness that has model `test/gone`, the default, a session whose
+    /// root failed, having delegated a child that failed first where it
+    /// `delegates`: the session and its root.
+    async fn failed_on_gone(root: &Path, requests: &Requests, delegates: bool) -> SessionId {
+        let failed = || Step::fail(ProviderErrorKind::Protocol.error("not retried"));
+        let delegated = Step::new(response(vec![delegation("child", 0)]));
+        let steps = match delegates {
+            true => vec![delegated, failed(), failed()],
+            false => vec![failed()],
+        };
+        let provider = Script::new(steps, requests);
+        let gone = crate::tests::profile("gone-model", false);
+        let harness = serving(root, provider, [("gone", gone)])
+            .default_model(model_ref("gone"))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        session.prompt("hello").await.unwrap_err();
+        let id = session.id();
+        shutdown_session(session).await;
+        id
+    }
+
+    /// The harness that no longer has `test/gone`, answering "recovered": it
+    /// has `test/test`, and `broken/unreachable`, whose provider cannot open.
+    async fn without_gone(root: &Path, requests: &Requests) -> Harness {
+        let answers = std::array::from_fn::<_, 4, _>(|_| answer("recovered"));
+        let provider = scripted_provider(requests, answers);
+        let unreachable = crate::tests::profile("unreachable", false);
+        serving(root, provider, [])
+            .provider(
+                provider_name("broken"),
+                Arc::new(Unopenable),
+                models([("unreachable", unreachable)]),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// Once `continue` has restarted child `agent`, journaled since `since`, and
+    /// its loop parks again.
+    async fn restarted(session: &SessionHandle, agent: &AgentId, since: RecordSeq) {
+        let started = agent.clone();
+        found(session, [Key::Agent(agent.clone())], move |state| {
+            let profiled = state.agent_states.get(&started)?.profiled;
+            (profiled > since).then_some(())
+        })
+        .await;
+        until_parked(session, agent).await;
+    }
+
+    /// The models `agent` changed to, as `session` journaled them.
+    fn model_changes(session: &SessionHandle, agent: &AgentId) -> Vec<String> {
+        let records = session.runtime.store.records();
+        let changes = records.iter().filter(|record| &record.agent == agent);
+        events!(changes, SessionEvent::ModelChanged { profile } => profile.name.to_string())
+    }
+
+    /// A session whose root's model the configuration no longer has activates for
+    /// what only writes, such as a title, warning of the model. Only running the
+    /// root is refused, journaling nothing: a message, direct or queued, keeping
+    /// that model, a continuation of its turn and a host script, until one
+    /// selects another.
+    #[tokio::test]
+    async fn a_session_whose_root_model_is_gone_runs_its_root_only_on_another() {
+        let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
+        let id = failed_on_gone(root.path(), &requests, false).await;
+        let harness = without_gone(root.path(), &requests).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        let warnings = resumed.startup_warnings().join("\n");
+        assert!(
+            warnings.contains("no longer has model `test/gone`"),
+            "{warnings}"
+        );
+        resumed.rename(Some("renamed".into())).await.unwrap();
+        let (before, asked) = (
+            resumed.runtime.store.records(),
+            requests.lock().unwrap().len(),
+        );
+        let gone = model_ref("gone");
+        let unknown = |result: Result<(), HarnessError>| matches!(result, Err(HarnessError::UnknownModel(model)) if model == gone);
+        assert!(unknown(resumed.prompt("refused").await.map(drop)));
+        assert!(unknown(resumed.continue_turn().await.map(drop)));
+        assert!(unknown(resumed.run_script("return 1;").await.map(drop)));
+        let queued = vec![QueuedPrompt::default(), QueuedPrompt::default()];
+        let receipts = resumed.enqueue_prompts(queued).await.into_iter();
+        let receipts = futures_util::future::join_all(receipts.map(IntoFuture::into_future));
+        let receipts = bounded(receipts).await;
+        let refused = &receipts[0];
+        assert!(matches!(refused, Err(HarnessError::UnknownModel(model)) if *model == gone));
+        assert!(matches!(receipts[1], Err(HarnessError::Interrupted)));
+        assert_eq!(resumed.runtime.store.records(), before);
+        assert_eq!(requests.lock().unwrap().len(), asked);
+        let test = resumed.selection(Some(&model_ref("test")), None).unwrap();
+        let continued = resumed.continue_turn_with(test).await.unwrap();
+        assert_eq!(continued.answer.as_deref(), Some("recovered"));
+        shutdown_session(resumed).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert!(resumed.startup_warnings().is_empty());
+        shutdown_session(resumed).await;
+    }
+
+    /// The gone session of [`failed_on_gone`] that delegated, activated on
+    /// `test/test`: refused first on a model whose provider cannot open, which
+    /// leaves it viewed, then journaling the root's switch as it activates.
+    async fn activated_on_test(root: &Path, requests: &Requests) -> SessionHandle {
+        let id = failed_on_gone(root, requests, true).await;
+        let harness = without_gone(root, requests).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        let before = resumed.runtime.store.records();
+        let refused = resumed
+            .activate_on(&"broken/unreachable".parse().unwrap())
+            .await;
+        assert!(
+            matches!(refused, Err(HarnessError::Provider(_))),
+            "{refused:?}"
+        );
+        assert_eq!(resumed.phase(), crate::session::SessionPhase::Viewing);
+        assert_eq!(resumed.runtime.store.records(), before);
+        resumed.activate_on(&model_ref("test")).await.unwrap();
+        assert_eq!(model_changes(&resumed, &resumed.root), ["test/test"]);
+        resumed
+    }
+
+    /// Once activated on a model, a session whose children ran on the gone one
+    /// restarts them on the root's model, as each one's start journals.
+    #[tokio::test]
+    async fn a_child_whose_model_is_gone_restarts_on_the_roots() {
+        let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
+        let resumed = activated_on_test(root.path(), &requests).await;
+        let since = resumed.store().applied();
+        let continued = resumed.continue_turn_with(Selection::default()).await;
+        let continued = continued.unwrap();
+        assert_eq!(continued.answer.as_deref(), Some("recovered"));
+        assert_eq!(continued.children_resumed, 1);
+        let child = resumed.root.child(1);
+        restarted(&resumed, &child, since).await;
+        assert_eq!(model_changes(&resumed, &child), ["test/test"]);
+        assert_eq!(model_changes(&resumed, &resumed.root), ["test/test"]);
+        shutdown_session(resumed).await;
+    }
+
+    /// A child restarted while its root's model is gone too fails to start, and
+    /// restarts on the model a later selection activates.
+    #[tokio::test]
+    async fn a_child_restarted_before_a_selection_restarts_on_it() {
+        let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
+        let id = failed_on_gone(root.path(), &requests, true).await;
+        let harness = without_gone(root.path(), &requests).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        let refused = resumed.continue_turn().await;
+        assert!(
+            matches!(&refused, Err(HarnessError::UnknownModel(_))),
+            "{refused:?}"
+        );
+        // The restart the continue committed fails, leaving the call to continue.
+        let job = job_found(&resumed, &resumed.root, |_| true).await;
+        until(&resumed, job, |job| {
+            job.state == crate::job::JobState::Failed
+        })
+        .await;
+        resumed.activate_on(&model_ref("test")).await.unwrap();
+        let since = resumed.store().applied();
+        let continued = resumed.continue_turn_with(Selection::default()).await;
+        assert_eq!(continued.unwrap().children_resumed, 1);
+        let child = resumed.root.child(1);
+        restarted(&resumed, &child, since).await;
+        assert_eq!(model_changes(&resumed, &child), ["test/test"]);
+        shutdown_session(resumed).await;
+    }
+
+    /// A `continue` whose root's held batch is refused still restarts the
+    /// children: the error is reported, and the batch held for the root alone.
+    #[tokio::test]
+    async fn a_refused_root_batch_still_restarts_the_children() {
+        let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
+        let resumed = activated_on_test(root.path(), &requests).await;
+        let image = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(b"").await,
+        };
+        let many = QueuedPrompt {
+            text: "many".into(),
+            attachments: vec![image; crate::media::MAX_IMAGES_PER_SUBMISSION + 1],
+            ..QueuedPrompt::default()
+        };
+        let held = many.cancellation.clone();
+        let _receipts = resumed.enqueue_prompts(vec![many]).await;
+        bounded(async {
+            while !held.is_retained() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let since = resumed.store().applied();
+        let refused = resumed.continue_turn().await;
+        assert!(
+            matches!(refused, Err(HarnessError::ImageLimit)),
+            "{refused:?}"
+        );
+        let child = resumed.root.child(1);
+        restarted(&resumed, &child, since).await;
+        assert_eq!(model_changes(&resumed, &child), ["test/test"]);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        assert!(held.is_retained() && held.cancel());
+        shutdown_session(resumed).await;
+    }
+
     /// A first call starts the activation and need not see it through: its root
     /// is prepared, and the session activated, without it.
     #[tokio::test]
@@ -677,7 +901,8 @@ mod tests {
 
     /// A turn that failed or was interrupted before the session closed reopens
     /// stopped for that reason and is continued; a finished one leaves nothing to
-    /// continue.
+    /// continue. One that failed on images its model cannot take reopens too, and
+    /// continues on a model that can.
     #[tokio::test]
     async fn reopened_failed_or_interrupted_turn_continues() {
         use crate::agent::{AgentActivity, Failure, TurnFailure};
@@ -689,17 +914,23 @@ mod tests {
             }
         };
         let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
         let requests = Requests::default();
         let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
+        let read = json!({"path": "tool.png"});
         let steps = [
             Step::fail(failure),
             Step::new(answer("recovered")),
             Step::new(answer("never released")).midstream(),
             Step::new(answer("continued")),
+            Step::new(response(vec![tool_call(0, "read-call", "read", read)])),
+            Step::new(answer("seen")),
         ];
         let script = Script::new(steps, &requests);
-        let harness = test_harness(root.path(), &sessions, script.clone()).await;
+        let vision = crate::tests::profile("vision-model", true);
+        let harness = serving(root.path(), script.clone(), [("vision", vision)])
+            .build()
+            .await
+            .unwrap();
         let session = harness.new_session().await.unwrap();
         let id = session.id();
         session.prompt("fails").await.unwrap_err();
@@ -730,6 +961,20 @@ mod tests {
         assert_eq!(stopped(&resumed).await, None);
         assert_eq!(resumed.continue_turn().await.unwrap(), "");
         assert_eq!(requests.lock().unwrap().len(), 4);
+        std::fs::write(root.path().join("tool.png"), crate::tests::png_bytes(b"")).unwrap();
+        let refused = resumed.prompt("look").await;
+        assert!(
+            matches!(refused, Err(HarnessError::ImagesUnsupported(_))),
+            "{refused:?}"
+        );
+        shutdown_session(resumed).await;
+
+        let resumed = harness.resume_session(id).await.unwrap();
+        let agent = resumed.root.clone();
+        resumed.record_status(agent, "acted".into()).await.unwrap();
+        let vision = resumed.selection(Some(&model_ref("vision")), None).unwrap();
+        let continued = resumed.continue_turn_with(vision).await.unwrap();
+        assert_eq!(continued.answer.as_deref(), Some("seen"));
         shutdown_session(resumed).await;
     }
 

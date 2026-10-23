@@ -5,7 +5,9 @@ use super::*;
 /// Measure the same wrapped content used for painting, so long questions,
 /// choices and typed answers can grow the prompt instead of being clipped.
 pub(super) struct PromptLayout {
-    body: Vec<String>,
+    body: Vec<markdown::LayoutLine>,
+    /// The code fences the Markdown highlights.
+    pub(super) fences: Document,
     title_start: Option<usize>,
     options: Vec<PromptOptionLine>,
     selected_start: usize,
@@ -24,16 +26,27 @@ struct PromptAreas {
 impl PromptLayout {
     pub(super) fn new(app: &App, width: u16) -> Self {
         let width = width.saturating_sub(4);
-        let body_text = model::clean(&app.prompt_text());
-        let body = wrap_plain(&body_text, width as usize);
         let question = match app.prompts.front().map(|prompt| &prompt.kind) {
             Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
                 questions.get(app.question_index())
             }
             _ => None,
         };
-        let header = question.and_then(|_| body_text.split_once('\n'));
-        let title_start = header.map(|(header, _)| wrap_plain(header, width as usize).len());
+        let body_text = model::clean(&app.prompt_text());
+        let mut body: Vec<_> = (wrap_plain(&body_text, width as usize).into_iter())
+            .map(plain_line)
+            .collect();
+        let title_start = question.map(|_| body.len());
+        let mut fences = Document::default();
+        let mut lay_out = |source: &str, width: usize| {
+            let highlights = Some(&app.render.highlights);
+            let laid = markdown::layout_highlighted(source, false, width, highlights);
+            fences.sections.extend(laid.fences.sections);
+            laid.lines
+        };
+        if let Some(question) = question {
+            body.extend(lay_out(&model::clean(&question.prompt), width.into()));
+        }
         let choices = match question {
             Some(question) => question
                 .options
@@ -54,7 +67,7 @@ impl PromptLayout {
                 .collect(),
         };
         let (options, selected_start) =
-            prompt_option_lines(&choices, app.prompt_input().choice, width);
+            prompt_option_lines(&choices, app.prompt_input().choice, width, &mut lay_out);
         let prompt = app.prompts.front();
         let input = if !prompt.is_some_and(|prompt| prompt.takes_text()) {
             None
@@ -85,6 +98,7 @@ impl PromptLayout {
         };
         Self {
             body,
+            fences,
             title_start,
             options,
             selected_start,
@@ -167,19 +181,16 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     app.prompt_body_rect = areas.body;
     app.prompt_options_rect = areas.options;
     app.prompt_body_rows = lines.len();
-    app.prompt_input_mut().body_scroll = app
-        .prompt_input()
-        .body_scroll
-        .min(lines.len().saturating_sub(body_height as usize));
+    let body_top = (app.prompt_input_mut().body).fit(body_height.into(), lines.len(), None);
     for (offset, line) in lines
         .iter()
-        .skip(app.prompt_input().body_scroll)
+        .skip(body_top)
         .take(body_height as usize)
         .enumerate()
     {
         let title = layout
             .title_start
-            .is_some_and(|start| app.prompt_input().body_scroll + offset >= start);
+            .is_some_and(|start| body_top + offset >= start);
         let style = if title {
             Style::default()
                 .fg(THEME.primary)
@@ -187,8 +198,9 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         } else {
             Style::default().fg(THEME.warning)
         };
-        render_line(
-            &Line::from(line.as_str()),
+        render_row_line(
+            &line.line,
+            &line.layout,
             r(
                 2,
                 areas.body.y + offset as u16,
@@ -201,17 +213,13 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     }
     app.prompt_option_rows = option_lines.len();
     let input = app.prompt_input_mut();
-    if !input.options_scrolled {
-        input.option_scroll = scroll_to(input.option_scroll, selected_start, option_height.into());
-        input.options_scrolled = true;
-    }
-    input.option_scroll = input
-        .option_scroll
-        .min(option_lines.len().saturating_sub(option_height as usize));
+    let reveal = (!input.options_scrolled).then_some(selected_start);
+    input.options_scrolled = true;
+    let options_top = (input.options).fit(option_height.into(), option_lines.len(), reveal);
     let mut cursor_drawn = false;
     for (offset, line) in option_lines
         .iter()
-        .skip(app.prompt_input().option_scroll)
+        .skip(options_top)
         .take(option_height as usize)
         .enumerate()
     {
@@ -221,12 +229,11 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
             rect.width.saturating_sub(4),
             1,
         );
-        render_line(
-            &Line::from(line.text.as_str()),
-            row,
-            frame.buffer_mut(),
-            line.style(app.prompt_input().choice),
-        );
+        let style = line.style(app.prompt_input().choice);
+        render_line(&Line::from(line.marker), row, frame.buffer_mut(), style);
+        let text = r(row.x + 2, row.y, row.width.saturating_sub(2), 1);
+        let (text_line, layout) = (&line.text.line, &line.text.layout);
+        render_row_line(text_line, layout, text, frame.buffer_mut(), style);
         if line.index == app.prompt_input().choice
             && !cursor_drawn
             && app.menu.is_none()
@@ -317,11 +324,6 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     text(frame, areas.help, hint, color, THEME.input);
 }
 
-/// Move a `height`-row window's first row as little as possible to show `cursor`.
-pub(in crate::tui) fn scroll_to(top: usize, cursor: usize, height: usize) -> usize {
-    top.min(cursor).max((cursor + 1).saturating_sub(height))
-}
-
 /// Visible agent hierarchy with shared statistics and navigation hit targets.
 pub(super) fn draw_tree(
     frame: &mut Frame,
@@ -334,12 +336,10 @@ pub(super) fn draw_tree(
     let tree_y = app.tree_rect.y;
     fill(frame, app.tree_rect, THEME.panel);
     app.tree_cursor = app.tree_cursor.min(tree_agents.len().saturating_sub(1));
-    if app.focus == Focus::Tree {
-        app.tree_scroll = scroll_to(app.tree_scroll, app.tree_cursor, tree_rows.into());
-    }
-    app.tree_scroll = app
-        .tree_scroll
-        .min(tree_agents.len().saturating_sub(tree_rows as usize));
+    let cursor = (app.focus == Focus::Tree).then_some(app.tree_cursor);
+    let tree_top = app
+        .tree_view
+        .fit(tree_rows.into(), tree_agents.len(), cursor);
     let agents = tree_agents
         .iter()
         .map(|&index| &app.projection.agents[index]);
@@ -351,17 +351,12 @@ pub(super) fn draw_tree(
     let row_width = width.saturating_sub(4);
     let columns = AgentColumns::new(agents, row_width, stats);
     let track = r(width - 1, tree_y + 1, 1, tree_rows);
-    scroll_thumb(
-        frame,
-        track,
-        app.tree_scroll,
-        tree_agents.len(),
-        THEME.panel,
-    );
+    let shown = tree_top as f64..(tree_top + tree_rows as usize) as f64;
+    scroll_thumb(frame, track, shown, tree_agents.len() as f64, THEME.panel);
     let rows = tree_agents.iter().enumerate();
-    for (index, &agent_index) in rows.skip(app.tree_scroll).take(tree_rows as usize) {
+    for (index, &agent_index) in rows.skip(tree_top).take(tree_rows as usize) {
         let agent = &app.projection.agents[agent_index];
-        let y = tree_y + 1 + (index - app.tree_scroll) as u16;
+        let y = tree_y + 1 + (index - tree_top) as u16;
         let selected = agent.id == app.selected;
         let focused = navigation_active && app.focus == Focus::Tree && app.tree_cursor == index;
         let rect = r(2, y, row_width, 1);
@@ -390,7 +385,9 @@ pub(super) fn draw_tree(
 /// Every label and description row retains the choice's selection and hit target.
 struct PromptOptionLine {
     index: usize,
-    text: String,
+    /// Painted in the two cells before the text.
+    marker: &'static str,
+    text: markdown::LayoutLine,
     description: bool,
 }
 
@@ -409,42 +406,47 @@ impl PromptOptionLine {
     }
 }
 
-/// Wrap labels and descriptions independently so descriptions always start on
-/// a new line, and measure exactly the rows that draw_prompt will paint.
+fn plain_line(text: String) -> markdown::LayoutLine {
+    markdown::LayoutLine {
+        line: Line::from(text),
+        ..markdown::LayoutLine::default()
+    }
+}
+
+/// Wrap labels and `lay_out` Markdown descriptions independently so
+/// descriptions always start on a new line, and measure exactly the rows that
+/// draw_prompt will paint.
 fn prompt_option_lines(
     options: &[(String, String)],
     selected: usize,
     width: u16,
+    mut lay_out: impl FnMut(&str, usize) -> Vec<markdown::LayoutLine>,
 ) -> (Vec<PromptOptionLine>, usize) {
+    let width = width.saturating_sub(2) as usize;
     let mut option_lines = Vec::new();
     let mut selected_start = 0;
     for (index, (label, description)) in options.iter().enumerate() {
         if index == selected {
             selected_start = option_lines.len();
         }
-        for (description, source) in [(false, label), (true, description)] {
-            let source = model::clean(source);
-            if description && source.is_empty() {
-                continue;
-            }
-            for (offset, line) in wrap_plain(&source, width.saturating_sub(2) as usize)
-                .into_iter()
-                .enumerate()
-            {
-                option_lines.push(PromptOptionLine {
-                    index,
-                    text: format!(
-                        "{} {line}",
-                        if !description && offset == 0 && index == selected {
-                            ">"
-                        } else {
-                            " "
-                        }
-                    ),
-                    description,
-                });
-            }
-        }
+        let label = wrap_plain(&model::clean(label), width).into_iter();
+        option_lines.extend(label.enumerate().map(|(offset, line)| PromptOptionLine {
+            index,
+            marker: if offset == 0 && index == selected {
+                "> "
+            } else {
+                "  "
+            },
+            text: plain_line(line),
+            description: false,
+        }));
+        let description = lay_out(&model::clean(description), width);
+        option_lines.extend(description.into_iter().map(|text| PromptOptionLine {
+            index,
+            marker: "  ",
+            text,
+            description: true,
+        }));
     }
     (option_lines, selected_start)
 }
@@ -583,16 +585,18 @@ mod tests {
             ("Write an answer…".into(), String::new()),
         ];
         for width in [6, 12, 30] {
-            let (rows, selected_start) = prompt_option_lines(&options, 1, width);
+            let lay_out = |source: &str, width| {
+                markdown::layout_highlighted(source, false, width, None).lines
+            };
+            let (rows, selected_start) = prompt_option_lines(&options, 1, width, lay_out);
             assert_eq!(rows[selected_start].index, 1);
-            assert!(rows[selected_start].text.starts_with("> "));
-            assert_eq!(
-                rows.iter().filter(|row| row.text.starts_with("> ")).count(),
-                1
-            );
+            assert_eq!(rows[selected_start].marker, "> ");
+            assert_eq!(rows.iter().filter(|row| row.marker == "> ").count(), 1);
             // Separators stay on the row they end, past its visible edge.
             assert!(rows.iter().all(|row| {
-                row.text.trim_end().width() <= width as usize && !row.text.contains('—')
+                let text = row.text.line.to_string();
+                row.marker.width() + text.trim_end().width() <= width as usize
+                    && !text.contains('—')
             }));
             for (index, (label, description)) in options.iter().enumerate() {
                 let choice: Vec<_> = rows.iter().filter(|row| row.index == index).collect();
@@ -601,7 +605,8 @@ mod tests {
                     let parts = choice
                         .iter()
                         .filter(|row| row.description == is_description);
-                    let reconstructed: String = parts.map(|row| &row.text[2..]).collect();
+                    let reconstructed: String =
+                        parts.map(|row| row.text.line.to_string()).collect();
                     assert_eq!(reconstructed, model::clean(source));
                 }
                 // Descriptions follow the label rows contiguously.

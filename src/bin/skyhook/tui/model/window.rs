@@ -12,6 +12,7 @@ use skyhook::session::{
     EventRecord, Fact, Page, RequestRecord, RequestSeq, SessionEvent, TranscriptPage,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 /// Records a transcript page reads.
@@ -20,8 +21,8 @@ pub const PAGE: usize = 64;
 pub const LIST_PAGE: usize = 128;
 /// Children a card reads at a time.
 pub const CHILD_PAGE: usize = 16;
-/// Records, requests or jobs kept loaded; beyond them, those farthest from the view
-/// are let go.
+/// Records, requests or jobs kept loaded besides those in view, half on each side;
+/// beyond them, those farthest from the view are let go.
 pub const KEPT: usize = 8 * PAGE;
 
 /// Which side of the view a load fills. Each side has at most one load in flight.
@@ -73,20 +74,28 @@ pub struct Near {
     pub above: bool,
 }
 
-/// Consecutive keys loaded a page at a time, and whether more lie past either end.
+/// Consecutive keys read a page at a time, those kept, and whether more lie past
+/// either end.
 pub struct List<K> {
-    pub keys: Vec<K>,
+    run: Option<Run<K>>,
     pub earlier: bool,
     pub later: bool,
     /// The newest key the updates made, loaded or not.
     newest: Option<K>,
 }
 
+/// The keys read, from `first` to `last`, kept or passed, and those kept.
+struct Run<K> {
+    first: K,
+    last: K,
+    kept: Vec<K>,
+}
+
 impl<K> Default for List<K> {
     /// Nothing read yet: whatever exists lies past the end.
     fn default() -> Self {
         Self {
-            keys: Vec::new(),
+            run: None,
             earlier: false,
             later: true,
             newest: None,
@@ -103,86 +112,135 @@ impl<K: Ord + Copy> List<K> {
         }
     }
 
-    /// Add what `page` read, `full` when it read as many as it asked for, unless it was
-    /// read for an end that has moved since; a page from an end reads the list afresh.
+    /// Add what `page` read in order, each key kept or passed, `full` when it read as
+    /// many as it asked for, unless it was read for an end that has moved since; a page
+    /// from an end reads the list afresh.
     pub(super) fn insert(
         &mut self,
         page: Page<K>,
-        keys: impl IntoIterator<Item = K>,
+        read: impl IntoIterator<Item = (K, bool)>,
         full: bool,
     ) -> bool {
-        let empty = self.keys.is_empty();
+        let ends = self.run.as_ref().map(|run| (run.first, run.last));
+        let empty = ends.is_none();
         match page {
-            Page::First => (self.keys, self.earlier, self.later) = (Vec::new(), false, full),
-            Page::Last => (self.keys, self.earlier, self.later) = (Vec::new(), full, false),
-            Page::Before(key) if self.keys.first().is_none_or(|first| *first == key) => {
+            Page::First => (self.run, self.earlier, self.later) = (None, false, full),
+            Page::Last => (self.run, self.earlier, self.later) = (None, full, false),
+            Page::Before(key) if ends.is_none_or(|(first, _)| first == key) => {
                 (self.earlier, self.later) = (full, self.later || empty);
             }
-            Page::After(key) if self.keys.last().is_none_or(|last| *last == key) => {
+            Page::After(key) if ends.is_none_or(|(_, last)| last == key) => {
                 (self.earlier, self.later) = (self.earlier || empty, full);
             }
             _ => return false,
         }
-        self.keys.extend(keys);
-        self.keys.sort_unstable();
-        self.keys.dedup();
+        let read: Vec<_> = read.into_iter().collect();
+        if let (Some(&(start, _)), Some(&(end, _))) = (read.first(), read.last()) {
+            let kept = read.iter().filter_map(|&(key, kept)| kept.then_some(key));
+            match &mut self.run {
+                None => {
+                    self.run = Some(Run {
+                        first: start,
+                        last: end,
+                        kept: kept.collect(),
+                    });
+                }
+                Some(run) => {
+                    (run.first, run.last) = (run.first.min(start), run.last.max(end));
+                    match page {
+                        Page::Before(_) => drop(run.kept.splice(0..0, kept)),
+                        _ => run.kept.extend(kept),
+                    }
+                }
+            }
+        }
         // A key made after the read lies past what it read, however little it read.
-        self.later |= self.newest > self.keys.last().copied();
+        self.later |= self.newest > self.run.as_ref().map(|run| run.last);
         true
     }
 
-    /// Add a key the updates made, at the end, while the end is loaded.
-    pub(super) fn push(&mut self, key: K) -> bool {
+    /// Add a key the updates made, at the end, while the end is loaded: kept, or passed.
+    /// Returns whether it was kept.
+    pub(super) fn push(&mut self, key: K, kept: bool) -> bool {
         self.newest = self.newest.max(Some(key));
-        let added = !self.later && self.keys.last().is_none_or(|last| *last < key);
+        let added = !self.later && self.run.as_ref().is_none_or(|run| run.last < key);
         if added {
-            self.keys.push(key);
+            let run = self.run.get_or_insert_with(|| Run {
+                first: key,
+                last: key,
+                kept: Vec::new(),
+            });
+            run.last = key;
+            if kept {
+                run.kept.push(key);
+            }
         }
-        added
+        added && kept
     }
 
-    /// Where `key` falls among the keys loaded; past them all when there is none.
-    fn at(&self, key: Option<K>) -> usize {
-        key.map_or(self.keys.len(), |key| {
-            self.keys.partition_point(|k| *k < key)
-        })
+    /// The keys kept, in order.
+    pub fn kept(&self) -> &[K] {
+        self.run.as_ref().map_or(&[], |run| &run.kept)
     }
 
-    /// Whether `key` lies within what is loaded, or past an end nothing lies beyond.
+    /// The first through the last key read, kept or passed.
+    pub fn extent(&self) -> Option<RangeInclusive<K>> {
+        self.run.as_ref().map(|run| run.first..=run.last)
+    }
+
+    /// Whether `key` lies among the keys read, kept or passed.
+    pub(super) fn holds(&self, key: K) -> bool {
+        self.extent().is_some_and(|extent| extent.contains(&key))
+    }
+
+    /// Where `key` falls among the keys loaded.
+    fn at(&self, key: K) -> usize {
+        self.kept().partition_point(|k| *k < key)
+    }
+
+    /// Whether `key` lies within what is read, or past an end nothing lies beyond.
     fn reaches(&self, key: K) -> bool {
-        let (Some(first), Some(last)) = (self.keys.first(), self.keys.last()) else {
+        let Some(run) = &self.run else {
             return !self.earlier && !self.later;
         };
-        (!self.earlier || *first <= key) && (!self.later || key <= *last)
+        (!self.earlier || run.first <= key) && (!self.later || key <= run.last)
     }
 
-    /// Let go of the keys farthest from the view's place `at` beyond what is kept.
-    pub(super) fn trim(&mut self, at: usize) -> bool {
-        let Some(excess) = self
-            .keys
-            .len()
-            .checked_sub(KEPT)
-            .filter(|excess| *excess > 0)
-        else {
+    /// Let go of the keys beyond what is kept around the view's `shown` ones.
+    pub(super) fn trim(&mut self, shown: Range<usize>) -> bool {
+        let Some(run) = &mut self.run else {
             return false;
         };
-        let before = excess.min(at.saturating_sub(KEPT / 2));
-        let after = excess - before;
-        self.keys.drain(..before);
-        self.keys.truncate(self.keys.len() - after);
+        let before = shown.start.saturating_sub(KEPT / 2);
+        let after = (run.kept.len() - shown.end).saturating_sub(KEPT / 2);
+        if before + after == 0 {
+            return false;
+        }
+        run.kept.drain(..before);
+        run.kept.truncate(run.kept.len() - after);
+        // What lies past the keys kept is read again.
+        if let (Some(&start), Some(&end)) = (run.kept.first(), run.kept.last()) {
+            if before > 0 {
+                run.first = start;
+            }
+            if after > 0 {
+                run.last = end;
+            }
+        }
         self.earlier |= before > 0;
         self.later |= after > 0;
         true
     }
 
     /// The page of up to `page` keys beyond the end `gap` stands for, while more lie
-    /// there and trimming around the view's place `at` would keep what it reads.
-    fn want(&self, gap: Gap, at: usize, page: usize) -> Option<Page<K>> {
-        let kept = |beyond: usize| self.keys.len() + page <= KEPT || beyond + page <= KEPT / 2;
+    /// there and trimming around the view's `shown` ones would keep what it reads.
+    fn want(&self, gap: Gap, shown: Range<usize>, page: usize) -> Option<Page<K>> {
+        let kept = |beyond: usize| beyond + page <= KEPT / 2;
+        let run = self.run.as_ref()?;
         match gap {
-            Gap::Earlier if self.earlier && kept(at) => Some(Page::Before(*self.keys.first()?)),
-            Gap::Later if self.later && kept(self.keys.len() - at) => {
-                Some(Page::After(*self.keys.last()?))
+            Gap::Earlier if self.earlier && kept(shown.start) => Some(Page::Before(run.first)),
+            Gap::Later if self.later && kept(run.kept.len() - shown.end) => {
+                Some(Page::After(run.last))
             }
             _ => None,
         }
@@ -204,6 +262,15 @@ impl Content {
         }
     }
 
+    /// How many keys are loaded.
+    fn len(&self) -> usize {
+        match self {
+            Self::Conversation(transcript) => transcript.run.kept().len(),
+            Self::Requests(list) => list.kept().len(),
+            Self::Jobs(list) => list.kept().len(),
+        }
+    }
+
     /// Whether more lies before and after what is loaded.
     pub fn ends(&self) -> (bool, bool) {
         match self {
@@ -214,13 +281,31 @@ impl Content {
     }
 }
 
-/// One of a tab's own entries, by which its window pages: where the view's top sits,
-/// around which loads stay; none while it follows the newest entries.
+/// One of a tab's own entries, by which its window pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Ordinal(u64),
     Request(RequestSeq),
     Job(JobId),
+}
+
+/// Where along a tab's own entries something lies: before them all, at one, or past
+/// them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge<T = Focus> {
+    Start,
+    At(T),
+    End,
+}
+
+impl<T> Edge<T> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Edge<U> {
+        match self {
+            Self::Start => Edge::Start,
+            Self::At(at) => Edge::At(f(at)),
+            Self::End => Edge::End,
+        }
+    }
 }
 
 /// An update of the viewed agent that arrived before the first load landed: its
@@ -253,8 +338,9 @@ pub struct Window {
     phase: Phase,
     /// Whether each side has a load in flight.
     loading: [bool; 2],
-    /// Where the view's top last sat, around which what is loaded stays.
-    focus: Option<Focus>,
+    /// The entries the view last showed, from its top to its bottom, around which
+    /// what is loaded stays.
+    shown: RangeInclusive<Edge>,
     /// Changes whenever the places it holds change.
     pub shape: u64,
     changes: HashSet<Dep>,
@@ -264,7 +350,7 @@ pub struct Window {
 
 impl Window {
     /// `agent`'s `tab`, its first load read around `focus`.
-    pub fn new(agent: AgentId, tab: Tab, id: u64, focus: Option<Focus>) -> Self {
+    pub fn new(agent: AgentId, tab: Tab, id: u64, focus: Edge) -> Self {
         Self {
             agent,
             tab,
@@ -275,7 +361,7 @@ impl Window {
             children: HashMap::new(),
             phase: Phase::Opening(Vec::new()),
             loading: [false; 2],
-            focus,
+            shown: focus..=focus,
             shape: 0,
             changes: HashSet::new(),
             unpruned: false,
@@ -284,7 +370,7 @@ impl Window {
 
     /// A window with nothing to read: a draft's.
     pub fn empty(agent: AgentId, tab: Tab, id: u64) -> Self {
-        let mut window = Self::new(agent, tab, id, None);
+        let mut window = Self::new(agent, tab, id, Edge::End);
         window.phase = Phase::Open;
         match &mut window.content {
             Content::Conversation(transcript) => transcript.run = List::complete(),
@@ -359,7 +445,7 @@ impl Window {
                 transcript.retain_facts();
                 transcript.shown_requests()
             }
-            Content::Requests(list) => list.keys.iter().copied().collect(),
+            Content::Requests(list) => list.kept().iter().copied().collect(),
             Content::Jobs(_) => HashSet::new(),
         };
         self.requests
@@ -368,25 +454,29 @@ impl Window {
     }
 
     /// The loads what is not loaded `near` the view needs: for each side with none in
-    /// flight, the nearest the view, within what is kept around `focus`. The first load
-    /// comes before any other, and reads from the focus the window was made for.
-    pub fn plan(&mut self, near: &[Near], focus: Option<Focus>) -> Vec<(Direction, Want)> {
+    /// flight, the nearest the view, within what is kept around the entries `shown`.
+    /// The first load comes before any other, and reads from the focus the window was
+    /// made for.
+    pub fn plan(&mut self, near: &[Near], shown: RangeInclusive<Edge>) -> Vec<(Direction, Want)> {
         match self.phase {
             Phase::Failed => return Vec::new(),
             Phase::Opening(_) => {
                 if self.loading() {
                     return Vec::new();
                 }
-                let want = match (self.tab, self.focus) {
-                    (Tab::Conversation, Some(Focus::Ordinal(ordinal))) => {
+                let want = match (self.tab, *self.shown.start()) {
+                    (Tab::Conversation, Edge::At(Focus::Ordinal(ordinal))) => {
                         Want::Transcript(following(ordinal.checked_sub(1)))
                     }
-                    (Tab::Requests, Some(Focus::Request(request))) => {
+                    (Tab::Requests, Edge::At(Focus::Request(request))) => {
                         Want::Requests(following(request.preceding()))
                     }
-                    (Tab::Jobs, Some(Focus::Job(job))) => {
+                    (Tab::Jobs, Edge::At(Focus::Job(job))) => {
                         Want::Roots(following(JobId::new(job.get() - 1).ok()))
                     }
+                    (Tab::Conversation, Edge::Start) => Want::Transcript(Page::First),
+                    (Tab::Requests, Edge::Start) => Want::Requests(Page::First),
+                    (Tab::Jobs, Edge::Start) => Want::Roots(Page::First),
                     (Tab::Conversation, _) => Want::Transcript(Page::Last),
                     (Tab::Requests, _) => Want::Requests(Page::Last),
                     (Tab::Jobs, _) => Want::Roots(Page::Last),
@@ -394,7 +484,7 @@ impl Window {
                 self.loading[Direction::Down as usize] = true;
                 return vec![(Direction::Down, want)];
             }
-            Phase::Open => self.focus = focus,
+            Phase::Open => self.shown = shown,
         }
         let mut wants = Vec::new();
         for direction in [Direction::Up, Direction::Down] {
@@ -427,7 +517,7 @@ impl Window {
     }
 
     fn want(&self, gap: Gap) -> Option<Want> {
-        let at = self.at();
+        let at = self.in_view();
         Some(match (gap, &self.content) {
             (Gap::More(parent), _) => Want::Children(vec![(parent, self.children_after(parent)?)]),
             (gap, Content::Conversation(transcript)) => {
@@ -438,34 +528,56 @@ impl Window {
         })
     }
 
-    /// Where the view's top falls on what is loaded.
-    fn at(&self) -> usize {
-        match (&self.content, self.focus) {
-            (Content::Conversation(transcript), Some(Focus::Ordinal(ordinal))) => {
-                transcript.run.at(Some(ordinal))
+    /// Where what the view shows falls on what is loaded.
+    fn in_view(&self) -> Range<usize> {
+        let start = self.at(*self.shown.start());
+        let end = match *self.shown.end() {
+            Edge::At(bottom) => self.at(Edge::At(bottom)) + 1,
+            edge => self.at(edge),
+        };
+        start..end.clamp(start, self.content.len())
+    }
+
+    /// Where `edge` falls on what is loaded.
+    fn at(&self, edge: Edge) -> usize {
+        match (&self.content, edge) {
+            (Content::Conversation(transcript), Edge::At(Focus::Ordinal(ordinal))) => {
+                transcript.run.at(ordinal)
             }
-            (Content::Conversation(transcript), _) => transcript.run.at(None),
-            (Content::Requests(list), Some(Focus::Request(request))) => list.at(Some(request)),
-            (Content::Jobs(list), Some(Focus::Job(job))) => list.at(Some(job)),
-            (Content::Requests(list), _) => list.at(None),
-            (Content::Jobs(list), _) => list.at(None),
+            (Content::Requests(list), Edge::At(Focus::Request(request))) => list.at(request),
+            (Content::Jobs(list), Edge::At(Focus::Job(job))) => list.at(job),
+            (_, Edge::Start) => 0,
+            (content, _) => content.len(),
+        }
+    }
+
+    /// Whether the window read `focus`, whether it shows anything or not.
+    pub fn holds(&self, focus: Focus) -> bool {
+        match (&self.content, focus) {
+            (Content::Conversation(transcript), Focus::Ordinal(ordinal)) => {
+                transcript.run.holds(ordinal)
+            }
+            (Content::Requests(list), Focus::Request(request)) => list.holds(request),
+            (Content::Jobs(list), Focus::Job(job)) => list.holds(job),
+            _ => false,
         }
     }
 
     /// Whether `focus` lies beyond what an open window loaded, whatever it has in
     /// flight: a window made there reads it instead. An opening window's extent is not
     /// known yet.
-    pub fn beyond(&self, focus: Option<Focus>) -> bool {
+    pub fn beyond(&self, focus: Edge) -> bool {
         if !matches!(self.phase, Phase::Open) {
             return false;
         }
         match (&self.content, focus) {
-            (content, None) => content.ends().1,
-            (Content::Conversation(transcript), Some(Focus::Ordinal(ordinal))) => {
+            (content, Edge::Start) => content.ends().0,
+            (content, Edge::End) => content.ends().1,
+            (Content::Conversation(transcript), Edge::At(Focus::Ordinal(ordinal))) => {
                 !transcript.run.reaches(ordinal)
             }
-            (Content::Requests(list), Some(Focus::Request(request))) => !list.reaches(request),
-            (Content::Jobs(list), Some(Focus::Job(job))) => !list.reaches(job),
+            (Content::Requests(list), Edge::At(Focus::Request(request))) => !list.reaches(request),
+            (Content::Jobs(list), Edge::At(Focus::Job(job))) => !list.reaches(job),
             _ => false,
         }
     }
@@ -474,7 +586,7 @@ impl Window {
     fn children_after(&self, parent: JobId) -> Option<Option<JobId>> {
         match self.children.get(&parent) {
             Some(children) if !children.later => None,
-            children => Some(children.and_then(|children| children.keys.last().copied())),
+            children => Some(children.and_then(|children| children.kept().last().copied())),
         }
     }
 
@@ -493,12 +605,12 @@ impl Window {
         self.add(loaded);
         if let Phase::Opening(early) = &mut self.phase {
             let empty = match &self.content {
-                Content::Conversation(transcript) => transcript.run.keys.is_empty(),
-                Content::Requests(list) => list.keys.is_empty(),
-                Content::Jobs(list) => list.keys.is_empty(),
+                Content::Conversation(transcript) => transcript.run.extent().is_none(),
+                Content::Requests(list) => list.extent().is_none(),
+                Content::Jobs(list) => list.extent().is_none(),
             };
-            if self.focus.is_some() && empty {
-                self.focus = None;
+            if *self.shown.start() != Edge::End && empty {
+                self.shown = Edge::End..=Edge::End;
                 return;
             }
             let early = std::mem::take(early);
@@ -532,14 +644,14 @@ impl Window {
             }
             (Content::Requests(list), Read::Requests(page, read)) => {
                 let full = read.len() == LIST_PAGE;
-                list.insert(page, read.iter().map(|(request, _)| *request), full);
+                list.insert(page, read.iter().map(|(request, _)| (*request, true)), full);
                 for (request, record) in read {
                     self.requests.entry(request).or_insert(record);
                 }
             }
             (Content::Jobs(list), Read::Roots(page)) => {
                 let full = jobs.len() == LIST_PAGE;
-                list.insert(page, jobs.iter().map(|job| job.id), full);
+                list.insert(page, jobs.iter().map(|job| (job.id, true)), full);
             }
             _ => {}
         }
@@ -554,7 +666,7 @@ impl Window {
             let list = self.children.entry(parent).or_default();
             list.insert(
                 after.map_or(Page::First, Page::After),
-                jobs.iter().map(|job| job.id),
+                jobs.iter().map(|job| (job.id, true)),
                 more,
             );
             read_jobs(jobs, &mut self.jobs);
@@ -563,7 +675,7 @@ impl Window {
 
     /// Let go of what lies farthest from the view beyond what is kept.
     fn trim(&mut self) {
-        let at = self.at();
+        let at = self.in_view();
         let trimmed = match &mut self.content {
             Content::Conversation(transcript) => transcript.trim(at),
             Content::Requests(list) => list.trim(at),
@@ -576,12 +688,17 @@ impl Window {
     fn shown(&self) -> HashSet<JobId> {
         let mut shown = match &self.content {
             Content::Conversation(transcript) => transcript.shown_jobs(),
-            Content::Jobs(list) => list.keys.iter().copied().collect(),
+            Content::Jobs(list) => list.kept().iter().copied().collect(),
             Content::Requests(_) => HashSet::new(),
         };
         let mut parents: Vec<_> = shown.iter().copied().collect();
         while let Some(parent) = parents.pop() {
-            for child in self.children.get(&parent).into_iter().flat_map(|c| &c.keys) {
+            for child in self
+                .children
+                .get(&parent)
+                .into_iter()
+                .flat_map(|c| c.kept())
+            {
                 if shown.insert(*child) {
                     parents.push(*child);
                 }
@@ -612,7 +729,7 @@ impl Window {
                 placed
             }
             (Content::Requests(list), SessionEvent::ModelRequested { .. }) => {
-                list.push(record.sequence.request())
+                list.push(record.sequence.request(), true)
             }
             (
                 Content::Jobs(list),
@@ -622,7 +739,7 @@ impl Window {
                     origin,
                     ..
                 },
-            ) if !skyhook::job::nests(*parent, origin) => list.push(*job),
+            ) if !skyhook::job::nests(*parent, origin) => list.push(*job, true),
             _ => false,
         };
         let mut nested = false;
@@ -643,7 +760,7 @@ impl Window {
                     true => Some(self.children.entry(*parent).or_default()),
                     false => self.children.get_mut(parent),
                 };
-                nested = children.is_some_and(|children| children.push(*job));
+                nested = children.is_some_and(|children| children.push(*job, true));
             }
             // A new script whose card is loaded has no children it has not issued since.
             let card = match &self.content {
@@ -694,14 +811,14 @@ mod tests {
     }
 
     /// The transcript page `window`, viewed at `focus`, asks for first or past `gap`.
-    fn want(window: &mut Window, gap: Option<Gap>, focus: Option<Focus>) -> (Direction, Page<u64>) {
+    fn want(window: &mut Window, gap: Option<Gap>, focus: Edge) -> (Direction, Page<u64>) {
         let near: Vec<_> = (gap.into_iter())
             .map(|gap| Near {
                 gap,
                 above: gap == Gap::Earlier,
             })
             .collect();
-        match window.plan(&near, focus).pop() {
+        match window.plan(&near, focus..=focus).pop() {
             Some((direction, Want::Transcript(page))) => (direction, page),
             want => panic!("{want:?}"),
         }
@@ -709,7 +826,7 @@ mod tests {
 
     /// The ordinals loaded, and whether they follow one another.
     fn run(window: &Window) -> (&[u64], bool) {
-        let keys = &window.transcript().unwrap().run.keys;
+        let keys = window.transcript().unwrap().run.kept();
         (keys, keys.windows(2).all(|pair| pair[1] == pair[0] + 1))
     }
 
@@ -718,7 +835,7 @@ mod tests {
     #[test]
     fn a_page_read_while_a_child_is_made_leaves_it_to_read() {
         let mut children = List::default();
-        children.push(JobId::new(2).unwrap());
+        children.push(JobId::new(2).unwrap(), true);
         children.insert(Page::First, [], false);
         assert!(children.later);
     }
@@ -744,7 +861,7 @@ mod tests {
         bounded(futures_util::future::try_join_all(statuses))
             .await
             .unwrap();
-        let mut focus = Some(Focus::Ordinal(PAGE as u64));
+        let mut focus = Edge::At(Focus::Ordinal(PAGE as u64));
         let mut window = Window::new(agent.clone(), Tab::Conversation, 1, focus);
         let (direction, first) = want(&mut window, None, focus);
         window.loaded(direction, read(&session, first).await);
@@ -752,16 +869,17 @@ mod tests {
         let stale = read(&session, earlier).await;
         // The view moves down until the run's start is let go, then back up to it.
         while run(&window).0[0] == PAGE as u64 {
-            focus = Some(Focus::Ordinal(run(&window).0.last().unwrap() - 10));
+            focus = Edge::At(Focus::Ordinal(run(&window).0.last().unwrap() - 10));
             let (down, later) = want(&mut window, Some(Gap::Later), focus);
             window.loaded(down, read(&session, later).await);
         }
-        window.plan(&[], Some(Focus::Ordinal(run(&window).0[0] + 6)));
+        let top = Edge::At(Focus::Ordinal(run(&window).0[0] + 6));
+        window.plan(&[], top..=top);
         window.loaded(up, stale);
         assert!(run(&window).1, "{:?}", run(&window).0);
         // At the end, a record commits after the last page's read, before it lands.
         let (down, last) = loop {
-            focus = Some(Focus::Ordinal(run(&window).0.last().unwrap() - 10));
+            focus = Edge::At(Focus::Ordinal(run(&window).0.last().unwrap() - 10));
             let (down, later) = want(&mut window, Some(Gap::Later), focus);
             let page = read(&session, later).await;
             match &page.read {

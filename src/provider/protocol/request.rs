@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Entry, Message};
+use super::{Entry, Message, ToolResult, UserContent};
 use crate::{
     identity::AgentId,
-    media::LoadedBlobs,
+    media::{AttachmentRef, ImageRef, LoadedBlobs},
     named_enum::named_enum,
     newtype::{Blank, nonblank, string_newtype},
 };
@@ -64,6 +64,28 @@ impl ModelRequest {
     /// The context's messages in send order, without its states.
     pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> + Clone {
         self.context.iter().filter_map(Entry::message)
+    }
+
+    /// The images the context's user content and tool results reference.
+    pub fn images(&self) -> impl Iterator<Item = &ImageRef> {
+        self.messages().flat_map(|message| {
+            let (parts, results): (&[UserContent], &[ToolResult]) = match message {
+                Message::User(parts) => (parts, &[]),
+                Message::Tool(results) => (&[], results),
+                Message::Assistant(_) => (&[], &[]),
+            };
+            let attached = parts.iter().filter_map(|part| match part {
+                UserContent::Attachment {
+                    attachment: AttachmentRef::Image(image),
+                } => Some(image),
+                UserContent::Attachment {
+                    attachment: AttachmentRef::Text(_),
+                }
+                | UserContent::Text { .. }
+                | UserContent::Runtime { .. } => None,
+            });
+            attached.chain(results.iter().flat_map(|result| &result.images))
+        })
     }
 
     pub fn messages_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Message> {

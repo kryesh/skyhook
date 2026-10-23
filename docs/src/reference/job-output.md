@@ -15,14 +15,14 @@ ordinary response.
 Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
 Nulls in tool payloads are preserved; fields a tool has no value for are absent.
 Process results contain `exit_code`, or `signal` when a signal killed the process, and the
-`stdout` and `stderr` streams that produced output; scripts read an absent stream as `""`.
+`stdout` and `stderr` streams that produced output; scripts read an absent stream as `null`.
 A `stdout` holding JSON is read as that JSON; see [JSON output](#json-output).
 Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{id,prompt,options?}]}`.
 
 Directory reads return grouped entries with file sizes, for example:
 `{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}`.
 Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names; empty `symlinks` and
-`other` groups are absent, and scripts read them as `[]`.
+`other` groups are absent, and scripts read them as `null`.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
 An empty search result has `matches: {}`.
 `targets` returns each target's routing and authentication metadata; fields a target does not set are absent.
@@ -127,7 +127,7 @@ its deepest levels to `"{…}"` and `[count, "…"]`.
 `kept` lists the index ranges shown, as `[[first, last], ...]`, when a complete field inside an
 array or object keeps an element beyond the leading ones; such records are always listed. Reading
 a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
-include an `Output incomplete.` notice. These rules also apply after session resume and to
+include an `Output incomplete; captured fields remain readable with jobs({job, field}).` notice. These rules also apply after session resume and to
 completed remote jobs.
 
 ## Script result presentation
@@ -226,7 +226,7 @@ matches.
 ## Persistence and live output
 
 Reads are repeatable and survive session resume. Finished jobs with retained partial output have
-an `Output incomplete.` notice, including when viewing the final captured page.
+an `Output incomplete; captured fields remain readable with jobs({job, field}).` notice, including when viewing the final captured page.
 
 The view's `presentation.captures` lists captures that are not a finished part of the result: live,
 unfinished, or abandoned output, even without a structured result:

@@ -358,7 +358,7 @@ impl RequestColumns {
 mod tests {
     use super::*;
     use ratatui::widgets::{Paragraph, Widget};
-    use skyhook::session::RequestSeq;
+    use skyhook::session::{RequestNumber, RequestSeq};
 
     /// Every row formats to the columns' width, right-aligned, however many of its
     /// values are empty; short of room, every row drops the same leftmost columns
@@ -419,6 +419,7 @@ mod tests {
         };
         model::RequestRow {
             sequence: RequestSeq::default(),
+            number: RequestNumber::FIRST,
             purpose: skyhook::session::ModelPurpose::Agent,
             model: "model".into(),
             phase,
@@ -487,7 +488,7 @@ mod tests {
         for row in [&running, &completed] {
             let line = columns.line(row, 100, 100);
             let text = line.to_string();
-            let sent = format!("  Request #{}{SEP}{}", row.sequence, row.sent);
+            let sent = format!("  Request #{}{SEP}{}", row.number, row.sent);
             assert!(text.starts_with(&sent), "{text}");
             assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
             assert_eq!(header.width(), text.width());
@@ -519,6 +520,7 @@ mod tests {
 
         let row = model::RequestRow {
             sequence: RequestSeq::default(),
+            number: RequestNumber::FIRST,
             purpose: skyhook::session::ModelPurpose::Compaction,
             model: "long model 界界 😀".into(),
             phase: RequestPhase::Requested,

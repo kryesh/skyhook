@@ -1,11 +1,13 @@
 //! Palettes over the conversation, one module per kind that needs more than a row.
-use super::{App, HostRequest, QueuedInputId, Work};
+use super::{App, HostRequest, QueuedInputId, Viewport, Work};
+use crate::text::brief;
 use crate::tui::editor::{Editor, TextField};
 use crate::tui::keys::Command;
 use crate::tui::model;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::provider::profile::ModelRef;
+use skyhook::session::SessionTitle;
 use skyhook::tool::policy::ModeName;
 use std::path::PathBuf;
 
@@ -18,9 +20,6 @@ mod sessions;
 pub use draft::DraftItem;
 pub use output::OutputAction;
 pub use sessions::{SavedState, SessionRef};
-
-/// Rows PageUp and PageDown move a menu's selection by.
-const MENU_PAGE: usize = 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MenuId(u64);
@@ -40,10 +39,53 @@ pub enum ConfirmAction {
     CloseSession,
     CancelJob(JobId),
 }
+impl ConfirmAction {
+    /// The action comes first, so it survives a clipped title.
+    fn question(&self, session: Option<&SessionTitle>) -> String {
+        match (self, session) {
+            (Self::Exit, _) => "Quit Skyhook?".into(),
+            (Self::CloseSession, Some(title)) => {
+                format!("Close session {}?", brief(&title.text, super::TITLE_CHARS))
+            }
+            (Self::CloseSession, None) => "Close this session?".into(),
+            (Self::CancelJob(id), _) => format!("Cancel job {id}?"),
+        }
+    }
+    /// What saying yes does that the question does not ask.
+    fn consequence(&self) -> &'static str {
+        match self {
+            Self::Exit => "stops running work in all sessions",
+            Self::CloseSession => "stops running work in this session",
+            Self::CancelJob(_) => "",
+        }
+    }
+}
 #[derive(Clone)]
 pub enum ConfirmChoice {
-    KeepWorking,
-    Proceed(ConfirmAction),
+    Yes(ConfirmAction),
+    No,
+}
+/// How a menu sits over the conversation.
+pub enum MenuLayout<'a> {
+    /// The conversation's height, under a line that filters its rows.
+    Filtered(&'a Editor),
+    /// Only as tall as its few rows, which are not filtered.
+    Compact,
+}
+
+impl MenuLayout<'_> {
+    pub fn help(&self) -> &'static str {
+        match self {
+            Self::Filtered(_) => "↑↓ select · Enter open · Esc return",
+            Self::Compact => "↑↓ select · Enter choose · Esc cancel",
+        }
+    }
+    pub fn query(&self) -> &str {
+        match self {
+            Self::Filtered(input) => input.text(),
+            Self::Compact => "",
+        }
+    }
 }
 /// How strongly a menu row is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -165,17 +207,17 @@ impl MenuKind {
     }
 }
 pub struct Menu {
-    pub(super) id: MenuId,
+    pub id: MenuId,
     pub title: String,
     pub kind: MenuKind,
-    pub input: Editor,
+    /// What filters the rows, while the kind is filtered.
+    filter: Editor,
     /// The highlighted row among the filtered ones.
     selected: usize,
-    /// The first filtered row in view. Each draw moves it only as far as it
-    /// must to show the selection, so a pointer, which only selects rows in
-    /// view, never moves it, while the keyboard, filtering and a shorter
-    /// viewport do.
-    top: usize,
+    /// The filtered rows in view. Each draw moves them only as far as it must
+    /// to show the selection, so a pointer, which only selects rows in view,
+    /// never moves them, while the keyboard, filtering and a shorter viewport do.
+    view: Viewport,
 }
 impl Menu {
     fn new(id: MenuId, title: String, kind: MenuKind) -> Self {
@@ -183,9 +225,9 @@ impl Menu {
             id,
             title,
             kind,
-            input: Editor::default(),
+            filter: Editor::default(),
             selected: 0,
-            top: 0,
+            view: Viewport::default(),
         }
     }
 
@@ -211,7 +253,8 @@ impl Menu {
     /// Select the filtered row under the pointer, leaving the rows in view where
     /// they are. Returns whether the selection changed.
     pub fn point(&mut self, index: usize) -> bool {
-        let changed = !self.page() && index < self.filtered().len() && self.selected != index;
+        let changed =
+            !self.is_text_page() && index < self.filtered().len() && self.selected != index;
         if changed {
             self.selected = index;
         }
@@ -219,27 +262,33 @@ impl Menu {
     }
 
     /// A text page has nothing to pick: its selection is the first visible line.
-    pub fn page(&self) -> bool {
+    pub fn is_text_page(&self) -> bool {
         matches!(self.kind, MenuKind::Info(_))
     }
 
     /// The first filtered row in view when `rows` fit, showing the selection.
     pub fn viewport(&mut self, rows: usize) -> usize {
-        let count = self.filtered().len();
-        self.top = if self.page() {
-            self.selected
-        } else {
-            crate::tui::render::scroll_to(self.top, self.selected, rows.max(1))
-        };
-        self.top = self.top.min(count.saturating_sub(rows));
-        if self.page() {
-            self.selected = self.top;
+        let len = self.filtered().len();
+        let page = self.is_text_page();
+        if page {
+            self.view.top = self.selected;
         }
-        self.top
+        let top = self.view.fit(rows, len, (!page).then_some(self.selected));
+        if page {
+            self.selected = top;
+        }
+        top
+    }
+
+    pub fn layout(&self) -> MenuLayout<'_> {
+        match self.kind {
+            MenuKind::Confirm(_) => MenuLayout::Compact,
+            _ => MenuLayout::Filtered(&self.filter),
+        }
     }
 
     pub fn filtered(&self) -> Vec<ItemRef<'_>> {
-        let query = self.input.text().to_lowercase();
+        let query = self.layout().query().to_lowercase();
         let commands = if let MenuKind::Commands(items) = &self.kind {
             Some(items)
         } else {
@@ -267,6 +316,13 @@ impl Menu {
             items.sort_by_key(|item| commands[item.index].value.id() != query);
         }
         items
+    }
+    /// Edit the filter, which selects its first match. Compact menus have none.
+    pub(in crate::tui) fn filter<R>(&mut self, edit: impl FnOnce(&mut Editor) -> R) {
+        if matches!(self.layout(), MenuLayout::Filtered(_)) {
+            edit(&mut self.filter);
+            self.select(0);
+        }
     }
     pub(super) fn selected_index(&self) -> Option<usize> {
         self.filtered().get(self.selected).map(|item| item.index)
@@ -332,11 +388,15 @@ impl App {
         );
     }
     pub(super) fn confirm(&mut self, action: ConfirmAction) {
+        let question = action.question(self.title.as_ref());
+        let consequence = action.consequence();
         let items = vec![
-            Item::new(ConfirmChoice::KeepWorking, "Keep working", ""),
-            Item::new(ConfirmChoice::Proceed(action), "Stop work and continue", ""),
+            Item::new(ConfirmChoice::Yes(action), "Yes", consequence),
+            Item::new(ConfirmChoice::No, "No", ""),
         ];
-        self.open("Confirm action", MenuKind::Confirm(items));
+        self.open(&question, MenuKind::Confirm(items));
+        // A stray Enter keeps working.
+        self.menu.as_mut().expect("opened").select(1);
     }
     pub(super) fn menu_key(&mut self, mut key: KeyEvent) {
         if key.modifiers.contains(M::CONTROL) {
@@ -350,16 +410,17 @@ impl App {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        let last = menu.filtered().len().saturating_sub(1);
-        let step = match key.code {
-            KeyCode::PageUp | KeyCode::PageDown => MENU_PAGE,
-            _ => 1,
-        };
+        let len = menu.filtered().len();
+        let last = len.saturating_sub(1);
         let selected = match key.code {
             KeyCode::Home => Some(0),
             KeyCode::End => Some(last),
-            KeyCode::Up | KeyCode::PageUp => Some(menu.selected.saturating_sub(step)),
-            KeyCode::Down | KeyCode::PageDown => Some((menu.selected + step).min(last)),
+            KeyCode::Up => Some(menu.selected.saturating_sub(1)),
+            KeyCode::Down => Some((menu.selected + 1).min(last)),
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let step = menu.view.page(key.code == KeyCode::PageDown, len);
+                Some(menu.selected.saturating_add_signed(step).min(last))
+            }
             _ => None,
         };
         if let Some(selected) = selected {
@@ -370,10 +431,7 @@ impl App {
             KeyCode::Esc => self.menu = None,
             KeyCode::Enter | KeyCode::Tab => self.choose(),
             KeyCode::Delete => self.delete_draft_item(),
-            _ => {
-                menu.input.handle(key);
-                menu.select(0);
-            }
+            _ => menu.filter(|input| input.handle(key)),
         }
     }
     pub(super) fn choose(&mut self) {
@@ -382,11 +440,11 @@ impl App {
         };
         let index = menu.selected_index();
         match (menu.kind, index) {
-            (MenuKind::OutputSearch(job), _) => self.search_output(job, menu.input.text()),
+            (MenuKind::OutputSearch(job), _) => self.search_output(job, menu.filter.text()),
             (kind @ MenuKind::Info(_), _) => self.menu = Some(Menu { kind, ..menu }),
             (_, None) => {}
             (MenuKind::Commands(items), Some(index)) => self.command(items[index].value),
-            (MenuKind::Models(items), Some(index)) => self.model.clone_from(&items[index].value),
+            (MenuKind::Models(items), Some(index)) => self.choose_model(items[index].value.clone()),
             (MenuKind::Modes(items), Some(index)) => self.mode.clone_from(&items[index].value),
             (MenuKind::Agents(items), Some(index)) => self.select(items[index].value.clone()),
             (MenuKind::Sessions(items), Some(index)) => match items[index].value {
@@ -401,10 +459,10 @@ impl App {
             }
             (MenuKind::Queue(items), Some(index)) => self.edit_queued(items[index].value),
             (MenuKind::Confirm(items), Some(index)) => match items[index].value.clone() {
-                ConfirmChoice::KeepWorking => {}
-                ConfirmChoice::Proceed(ConfirmAction::Exit) => self.host = Some(HostRequest::Quit),
-                ConfirmChoice::Proceed(ConfirmAction::CloseSession) => self.shutdown(),
-                ConfirmChoice::Proceed(ConfirmAction::CancelJob(id)) => {
+                ConfirmChoice::No => {}
+                ConfirmChoice::Yes(ConfirmAction::Exit) => self.host = Some(HostRequest::Quit),
+                ConfirmChoice::Yes(ConfirmAction::CloseSession) => self.shutdown(),
+                ConfirmChoice::Yes(ConfirmAction::CancelJob(id)) => {
                     let Some(session) = self.session().cloned() else {
                         return;
                     };
@@ -476,7 +534,10 @@ mod tests {
             assert!(!app.dirty);
 
             app.open("Newer request", kind);
-            app.menu.as_mut().unwrap().input.insert("query");
+            app.menu
+                .as_mut()
+                .unwrap()
+                .filter(|input| input.insert("query"));
             app.work(closed_failure);
             app.work(stale_success);
             assert!(app.menu.as_ref().unwrap().kind.items().is_empty());
@@ -493,7 +554,7 @@ mod tests {
             app.work(current);
             let menu = app.menu.as_ref().unwrap();
             assert_eq!(menu.kind.items()[0].label, "current");
-            assert_eq!(menu.input.text(), "query");
+            assert_eq!(menu.layout().query(), "query");
 
             app.info("Replacement overlay", "Keep me".into());
             app.work(replaced);
@@ -570,7 +631,10 @@ mod tests {
             ("test/second", "Visible second"),
         ];
         app.open("Models", models(filtered));
-        app.menu.as_mut().unwrap().input.set("Visible".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("Visible".into()));
         let visible_second = row(&mut app, 1);
         mouse(&mut app, visible_second, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
@@ -631,6 +695,14 @@ mod tests {
         assert_eq!(top(&mut app), first - 1);
         key(&mut app, KeyCode::Home, M::NONE);
         assert_eq!(top(&mut app), 0);
+        // A page moves the view and the selection by the rows shown, so the
+        // selection keeps its place on screen.
+        let page = rows(&mut app).len();
+        let selected = |app: &App| app.menu.as_ref().unwrap().selected();
+        press(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::PageDown]);
+        assert_eq!((top(&mut app), selected(&app)), (page, page + 2));
+        key(&mut app, KeyCode::PageUp, M::NONE);
+        assert_eq!((top(&mut app), selected(&app)), (0, 2));
         key(&mut app, KeyCode::End, M::NONE);
         assert_eq!(top(&mut app), first);
         // Clicking a row still chooses it.
@@ -641,21 +713,68 @@ mod tests {
 
         let lines: Vec<_> = (0..60).map(|line| format!("line {line}")).collect();
         app.info("Page", lines.join("\n"));
+        let page = rows(&mut app).len();
         key(&mut app, KeyCode::PageDown, M::NONE);
         let shown = rows(&mut app);
-        assert_eq!(shown[0].0, MENU_PAGE);
+        assert_eq!(shown[0].0, page);
         drag(&mut app, &shown);
-        assert_eq!(top(&mut app), MENU_PAGE);
-        assert!(app.menu.as_ref().is_some_and(Menu::page));
+        assert_eq!(top(&mut app), page);
+        assert!(app.menu.as_ref().is_some_and(Menu::is_text_page));
         assert!(app.selection.is_none() && app.clipboard.is_none());
         key(&mut app, KeyCode::Down, M::NONE);
-        assert_eq!(top(&mut app), MENU_PAGE + 1);
+        assert_eq!(top(&mut app), page + 1);
         // At the end of the page, Up scrolls back at once.
         key(&mut app, KeyCode::End, M::NONE);
         let last = top(&mut app);
         assert_eq!(last + shown.len(), lines.len());
         key(&mut app, KeyCode::Up, M::NONE);
         assert_eq!(top(&mut app), last - 1);
+    }
+
+    /// A confirmation asks its whole question right above Yes and No, without
+    /// a filter, and starts on No: neither a stray Enter nor a typed or pasted
+    /// key confirms.
+    #[tokio::test]
+    async fn a_confirmation_asks_its_question_and_starts_on_no() {
+        let (_root, mut app) = fixture().await;
+        app.confirm(ConfirmAction::Exit);
+        let screen = draw(&mut app);
+        let lines: Vec<_> = screen.lines().collect();
+        let mut hits = app.hits.iter();
+        let yes = hits.find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(rect.y));
+        let yes = usize::from(yes.unwrap());
+        assert!(lines[yes - 1].contains("Quit Skyhook?"));
+        assert!(lines[yes].contains("Yes   stops running work in all sessions"));
+        assert!(lines[yes + 2].contains("Enter choose"));
+        // Below four rows the help line gives way first: the title's first line
+        // still names the action above the choices, the selected one at least.
+        app.menu = None;
+        app.title = Some(SessionTitle {
+            text: "a long automatic title from the first prompt".into(),
+            source: skyhook::session::TitleSource::Prompt,
+        });
+        app.confirm(ConfirmAction::CloseSession);
+        for (height, first) in [(10, 0), (9, 1)] {
+            let screen = draw_sized(&mut app, 40, height);
+            let lines: Vec<_> = screen.lines().collect();
+            let rows: Vec<_> = (app.hits.iter())
+                .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(rect.y))
+                .collect();
+            assert_eq!(rows.len(), 2 - first, "{screen}");
+            let top = usize::from(rows[0]);
+            assert!(lines[top - 1].contains("Close session a long"), "{screen}");
+            assert!(lines[top].contains(["Yes", "No"][first]), "{screen}");
+        }
+        app.menu = None;
+        press(&mut app, &[KeyCode::Char('y'), KeyCode::Enter]);
+        assert!(app.menu.is_none() && app.host.is_none());
+        app.confirm(ConfirmAction::Exit);
+        app.event(crossterm::event::Event::Paste(" ".into()));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.menu.is_none() && app.host.is_none());
+        app.confirm(ConfirmAction::Exit);
+        press(&mut app, &[KeyCode::Up, KeyCode::Enter]);
+        assert!(matches!(app.host, Some(HostRequest::Quit)));
     }
 
     /// A shorter viewport scrolls to keep the selection in view, so Enter never

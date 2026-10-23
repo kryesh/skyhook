@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::format::model_label;
 use skyhook::agent::{HarnessError, QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommitted};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -313,9 +314,12 @@ impl App {
             Ok(selections) => selections,
             Err(error) => {
                 self.pause(Paused::Stopped);
-                return self.notice(format!(
-                    "Queued message was not submitted: {error}. Resume to retry."
-                ));
+                self.not_submitted(&error);
+                // The session's root model is gone: choosing one sends the queue.
+                if matches!(error, HarnessError::UnknownModel(_)) {
+                    self.command(crate::tui::keys::Command::Model);
+                }
+                return;
             }
         };
         let mut deliveries = Vec::new();
@@ -377,12 +381,34 @@ impl App {
             Delivered::Refused(error) => {
                 self.queue[index].state = RowState::Waiting;
                 self.pause_queue(Paused::Stopped);
-                self.notice(format!(
-                    "Queued message was not submitted: {error}. Resume to retry."
-                ));
+                self.not_submitted(&error);
             }
         }
         self.refresh_menu();
+    }
+    fn not_submitted(&self, error: &HarnessError) {
+        let error = crate::tui::format::harness_error(error);
+        self.notice(format!(
+            "Queued message was not submitted: {error}. Send it again with /retry."
+        ));
+    }
+    /// Send what follows on `model`. A session whose root's model the
+    /// configuration no longer has activates on it first, then sends the queue
+    /// that model stopped.
+    pub(super) fn choose_model(&mut self, model: ModelRef) {
+        let config = self.launch.model.config();
+        let root = (self.projection.agents.iter()).find(|agent| &agent.id == self.root_agent());
+        let gone = root.is_some_and(|root| config.model(&root.model).is_none());
+        self.model.clone_from(&model);
+        let Some(session) = self.session().filter(|_| gone).cloned() else {
+            return;
+        };
+        let (tx, activating) = (self.tx.clone(), self.tasks.clone());
+        tokio::spawn(async move {
+            let activated = session.activate_on(&model).await;
+            drop(activating);
+            let _ = tx.send(Work::Activated(activated));
+        });
     }
     pub(super) fn queued_input(&mut self, submission: Submission) -> QueuedInput {
         self.next_queued_id.0 += 1;
@@ -404,10 +430,7 @@ impl App {
                 Item::new(
                     queued.id,
                     brief(&queued.submission.text, TITLE_CHARS),
-                    match profile {
-                        Some(profile) => profile.model.to_string(),
-                        None => queued.model.to_string(),
-                    },
+                    model_label(&queued.model, profile.map(|profile| &profile.model)),
                 )
             })
             .collect()
@@ -469,11 +492,11 @@ mod tests {
         notices
     }
 
-    fn image_row() -> Submission {
+    async fn image_row() -> Submission {
         // The fixture's model does not support images: a claimed row that fails.
         Submission {
             text: "image".into(),
-            attachments: vec![png_attachment("image.png")],
+            attachments: vec![png_attachment("image.png").await],
         }
     }
 
@@ -521,7 +544,7 @@ mod tests {
         let (_root, mut app, mut deliveries) = queue_fixture().await;
         app.submit(Submission {
             text: "first".into(),
-            attachments: vec![png_attachment("first.png")],
+            attachments: vec![png_attachment("first.png").await],
         });
         app.submit("second".into());
         let first = deliveries.try_recv().unwrap();
@@ -530,7 +553,10 @@ mod tests {
             (texts(&first), texts(&second)),
             (vec!["first"], vec!["second"])
         );
-        assert_eq!(first[0].prompt.attachments, [png_attachment("first.png")]);
+        assert_eq!(
+            first[0].prompt.attachments,
+            [png_attachment("first.png").await]
+        );
         let model = first[0]
             .prompt
             .options
@@ -591,7 +617,7 @@ mod tests {
         let (_root, mut app) = fixture().await;
         let _rx = capture_work(&mut app);
         app.paused = Some(Paused::Stopped);
-        app.submit(image_row());
+        app.submit(image_row().await);
         app.submit("second".into());
         app.submit("third".into());
         app.command(Command::Resume);
@@ -763,7 +789,10 @@ mod tests {
             receipt.await.unwrap();
         }
         app.command(Command::Queue);
-        app.menu.as_mut().unwrap().input.set("claimed".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("claimed".into()));
         app.choose();
         assert_eq!(app.queue.len(), 2);
         assert_eq!(app.editor.text(), "draft");
@@ -822,7 +851,7 @@ mod tests {
         app.model = "test/seeing".parse().unwrap();
         app.submit(Submission {
             text: "first".into(),
-            attachments: vec![png_attachment("first.png")],
+            attachments: vec![png_attachment("first.png").await],
         });
         model.turn().await.fail(rejected());
         observe_until(&mut app, |app| stopped(&app.snapshot, &root)).await;
@@ -1056,7 +1085,7 @@ mod tests {
             .unwrap();
         assert_eq!(active.model.to_string(), "test/seeing");
         app.model = "test/first".parse().unwrap();
-        app.submit(image_row());
+        app.submit(image_row().await);
         observe_until(&mut app, |app| {
             stopped(&app.snapshot, &root) && app.paused.is_some()
         })
@@ -1132,7 +1161,7 @@ mod tests {
                 &["second", "third"]
             };
             app.model = "test/first".parse().unwrap();
-            app.submit(image_row());
+            app.submit(image_row().await);
             for text in behind {
                 app.submit((*text).into());
             }
@@ -1226,6 +1255,101 @@ mod tests {
                 .any(|notice| notice.contains("no longer opens")),
             "{notices:?}"
         );
+        reopened.shutdown().await.unwrap();
+    }
+
+    /// An app showing a session reopened on a configuration that renamed its
+    /// model, `test/first`, to `test/second`, and the work it sends from then.
+    async fn gone_fixture() -> (
+        tempfile::TempDir,
+        App,
+        SessionHandle,
+        mpsc::UnboundedReceiver<Work>,
+    ) {
+        use skyhook::provider::dialect::ProviderSettings;
+        let (root, mut app) = draft_fixture().await;
+        let session = app.launch.create(None).await.unwrap();
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+        let mut config = app.launch.model.config().config().clone();
+        let ProviderSettings::Compatible(provider) = &mut config.providers["test"].settings else {
+            panic!("compatible fixture");
+        };
+        let profile = provider.models.shift_remove("first").unwrap();
+        provider.models.insert("second".parse().unwrap(), profile);
+        app.launch.model = config.into_runtime().unwrap().default_model();
+        let reopened = app.launch.create(Some(session.id())).await.unwrap();
+        let work = capture_work(&mut app);
+        attach(&mut app, reopened.clone()).await;
+        (root, app, reopened, work)
+    }
+
+    fn model_changes(records: &[Arc<skyhook::session::EventRecord>]) -> Vec<String> {
+        let changed = records.iter().filter_map(|record| match &record.event {
+            SessionEvent::ModelChanged { profile } => Some(profile.name.to_string()),
+            _ => None,
+        });
+        changed.collect()
+    }
+
+    /// A session reopened after its model left the configuration keeps a message
+    /// queued and opens the model picker: the model chosen there runs the session,
+    /// which then takes the message.
+    #[tokio::test]
+    async fn a_session_whose_model_is_gone_holds_the_queue_until_a_model_is_picked() {
+        let (_root, mut app, reopened, mut status) = gone_fixture().await;
+        app.submit("held".into());
+        let notices = notices(&app, &mut status).await;
+        assert!(app.paused.is_some() && matches!(app.queue[0].state, RowState::Waiting));
+        let pointed = "model `test/first` is not configured; choose another with /model";
+        assert!(
+            notices.iter().any(|notice| notice.contains(pointed)),
+            "{notices:?}"
+        );
+        let picker = app.menu.as_ref().map(|menu| &menu.kind);
+        let Some(MenuKind::Models(models)) = picker else {
+            panic!("the model picker opens");
+        };
+        let second = models
+            .iter()
+            .position(|item| item.value.to_string() == "test/second");
+        app.menu.as_mut().unwrap().select(second.unwrap());
+        let mut rx = capture_work(&mut app);
+        app.choose();
+        bounded(async {
+            loop {
+                let work = recv(&mut rx).await;
+                let done = matches!(work, Work::QueueCommitted { .. });
+                app.work(work);
+                if done {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(app.queue.is_empty() && app.paused.is_none());
+        assert_eq!(model_changes(&journal(&reopened).await), ["test/second"]);
+        reopened.shutdown().await.unwrap();
+    }
+
+    /// Switching away from an idle session as its picked model activates does
+    /// not close it first.
+    #[tokio::test]
+    async fn a_picked_model_activating_keeps_the_session_open() {
+        let (_root, mut app, reopened, mut rx) = gone_fixture().await;
+        assert!(app.settled());
+        app.choose_model("test/second".parse().unwrap());
+        assert!(!app.settled(), "an activation in flight keeps the session");
+        let activated = bounded(async {
+            loop {
+                if let Work::Activated(activated) = recv(&mut rx).await {
+                    break activated;
+                }
+            }
+        });
+        assert!(activated.await.is_ok());
+        assert!(app.settled());
+        assert_eq!(model_changes(&journal(&reopened).await), ["test/second"]);
         reopened.shutdown().await.unwrap();
     }
 }

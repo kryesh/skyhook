@@ -6,8 +6,8 @@ happen there. Relative paths use that target's workspace; no files are implicitl
 machines. Like `exec`, it supports `name`, `bg`, cancellation, and saved job output.
 
 ```js
-// Read an article without sending HTML boilerplate to the model.
-const page = (await tool.fetch({url: "https://example.com/article", text: true})).unwrap();
+// Read a web page as markdown, without its HTML boilerplate.
+const page = (await tool.fetch({url: "https://example.com/article"})).unwrap();
 
 // Send JSON to an API. HTTP 4xx/5xx are responses, not tool failures.
 const response = (await tool.fetch({
@@ -67,32 +67,51 @@ Multipart form-data encoding is not supported. File bodies can set their media t
 ## Responses and extraction
 
 Responses include the status, the received byte count (`size`), the elapsed milliseconds
-(`duration`), and a tagged `body`: `text`, `json`, `base64`, `file`, or `empty`. Followed redirects add
-their history (`redirects`), whose last `location` is the final URL. Response `headers` is absent
-by default; set `include_headers: true` to return a map of repeated header values.
-This option does not affect the `headers` request-header map.
-A textual body that is JSON is read as that value, following the
-[JSON output](job-output.md#json-output) rules: the body is then `{kind: "json", value}`. Other
-bodies, and any body fetched with `response_format: "text"` or `text: true`, remain decoded text in
-`body.text`.
-`response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
-character decoding and `base64` preserves response entity bytes. HTTP decompression is automatic;
-these are not raw wire bytes. `save_to` saves the response to a file on success instead of
-embedding the payload. Errors or cancellation do not replace an existing destination.
+(`duration`), and a tagged `body`: `page`, `unreadable`, `json`, `text`, `base64`, `file`, or
+`empty`. Followed redirects add their history (`redirects`), whose last `location` is the final URL.
+Response `headers` is absent by default; set `include_headers: true` to return a map of repeated
+header values. This option does not affect the `headers` request-header map.
+
+`response_format` chooses how an inline body is returned:
+
+- `auto` (the default): HTML is read as markdown (below). A textual body that is JSON is read as
+  that value, following the [JSON output](job-output.md#json-output) rules: the body is then
+  `{kind: "json", value}`. A body served as HTML that does not begin like HTML is textual, so JSON
+  labelled as HTML is still read as JSON. Other textual bodies are decoded into `body.text`, and
+  binary bodies, including any that open with control bytes text never holds whatever their media
+  type, are base64 in `body.data`.
+- `readable`: like `auto`, but reads any textual body served as HTML as a page, and also reads a
+  body as HTML when it looks like HTML but was served as another media type, such as `text/plain`.
+- `text`: any body decoded as text exactly as sent, including HTML and JSON.
+- `base64`: the response entity bytes.
+
+HTTP decompression is automatic; these are not raw wire bytes. Character decoding honors BOMs, HTTP
+charsets, and HTML meta charsets where applicable. Without an `Accept` header, `auto` sends
+`text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8`, as a browser asks, so sites
+that answer other requests with an empty page or a non-HTML variant return their HTML, while APIs
+that serve no HTML still return JSON; `readable` sends
+`text/html,application/xhtml+xml;q=0.9,*/*;q=0.8`.
+`save_to` saves the response to a file on success instead of embedding the payload, and ignores
+`response_format`. Errors or cancellation do not replace an existing destination.
+
+HTML is returned as `{kind: "page", title, byline?, site_name?, language?, scope, markdown}`.
+`scope` is `article` when the page has a readable main article, and `markdown` holds only that
+article. Otherwise it is `page`, and `markdown` holds the whole page body without scripts,
+navigation, form controls, footers, and hidden elements. Markdown keeps headings, absolute links, lists, code
+blocks, and tables with a header row, but not images embedded as data; other tables read as their
+text. A table cell spanning several columns or rows is repeated in each, so every value stays under
+its header.
+Extraction does not execute JavaScript or fetch linked assets. HTML that cannot be read is returned
+as `{kind: "unreadable", reason, text}` with its decoded source in `text`. `reason` is `too_large`
+(over 10 MiB of HTML, 50,000 elements and parse errors, 256 levels of nesting, or 20 MiB built
+while converting it), `no_text` (for example a page rendered by JavaScript), or `parser_failed`.
+Extraction never fails the call: the status, headers, and redirects are always returned.
+
 Automatic job presentation may shorten a result over its preview budget: the body, and also long
 header values and redirect lists, recording what it cut; retrieve the complete saved payload
-using `jobs({job})` fields such as `/result/body/text`, `/result/body/value`, `/result/body/data`
-or `/result/headers`. JavaScript calls still receive the complete payload for processing.
-
-`text:true` is separate from `response_format:"text"`: it extracts readable article content from
-HTML, returning plain text and metadata with the title, plus byline, site name, and language when
-available.
-It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
-pass through decoded; binary content is not converted. Extraction failures are explicit, never
-silently replaced with raw HTML. Fetch with `text:false` to inspect the original response. Empty
-responses remain empty. `text:true` cannot be combined with `save_to` or `response_format:"base64"`.
-Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements. Character decoding
-honors BOMs, HTTP charsets, and HTML meta charsets where applicable.
+using `jobs({job})` fields such as `/result/body/markdown`, `/result/body/text`,
+`/result/body/value`, `/result/body/data` or `/result/headers`. JavaScript calls still receive the
+complete payload for processing.
 
 ## Limits and failure diagnostics
 

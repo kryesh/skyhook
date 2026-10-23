@@ -19,7 +19,7 @@ binary's command help. `skyhook` itself requires an interactive terminal; `batch
 | `-c, --config PATH` | Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging. |
 | `-w, --workspace PATH` | Set the workspace base directory (default `.`). |
 | `--resume SESSION_ID` | Reopen a saved session. |
-| `-m, --model PROVIDER/MODEL` | Choose a configured model for a new session, named by its provider and model keys. Resumed sessions retain their recorded model. |
+| `-m, --model PROVIDER/MODEL` | Choose a configured model for a new session, named by its provider and model keys. With `--resume`, the session switches to it before anything runs, including a `--prompt` or `--script`. Otherwise a resumed session keeps its recorded model. |
 | `-p, --prompt TEXT` | Submit an initial user message. |
 | `-s, --script PATH` | Run a JavaScript workflow. Mutually exclusive with `--prompt`. |
 | `--image PATH` | Attach an image to the initial prompt; repeat for multiple images. Requires `--prompt`, conflicts with `--script`. |
@@ -38,7 +38,8 @@ just its own options, after its name.
 ## Batch
 
 `skyhook batch` runs exactly one prompt or script without a terminal, then exits. It takes the
-session options above except that `--prompt` or `--script` is required, plus:
+session options above except that `--prompt` or `--script` is required. A resumed session whose
+recorded model is no longer configured needs `--model` to run either. Batch also takes:
 
 | Option | Meaning |
 | --- | --- |

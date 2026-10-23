@@ -18,17 +18,22 @@ static JOB_VIEW_TYPE: LazyLock<String> = LazyLock::new(|| {
     schema_type(schema, schema)
 });
 
-/// Append a result type to `description`, unless it is plain JSON.
-fn describe(description: &str, label: &str, result: Option<&ResultSchema>) -> String {
-    let rendered = result.map(|result| match result {
-        ResultSchema::Json(schema) => result_type(schema),
-        ResultSchema::JobViews(JobViewResult::One) => "JobView".to_owned(),
-        ResultSchema::JobViews(JobViewResult::Many) => "JobView[]".to_owned(),
-    });
-    match rendered {
-        Some(result) if result != "JSON" => format!("{description} {label} `{result}`."),
-        _ => description.to_owned(),
+/// Append the response type to `description` after `lead`, a JobView of the
+/// result type, unless the result is plain JSON.
+fn describe(description: &str, lead: &str, result: Option<&ResultSchema>) -> String {
+    let (rendered, definitions) = match result {
+        None => return description.to_owned(),
+        Some(ResultSchema::Json(schema)) => result_type(schema),
+        Some(ResultSchema::JobViews(JobViewResult::One)) => ("JobView".to_owned(), String::new()),
+        Some(ResultSchema::JobViews(JobViewResult::Listing)) => (
+            "{jobs: JobView[], older?: number}".to_owned(),
+            String::new(),
+        ),
+    };
+    if rendered == "JSON" {
+        return description.to_owned();
     }
+    format!("{description}{lead} `JobView<{rendered}>{definitions}`.")
 }
 
 impl ToolSurface {
@@ -38,7 +43,8 @@ impl ToolSurface {
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
             .map(|tool| {
                 let description =
-                    describe(&tool.description, "Result:", tool.result_schema.as_ref());
+                    // Its own paragraph: the type is the tool's, not its last sentence's.
+                    describe(&tool.description, "\n\nResult:", tool.result_schema.as_ref());
                 let description = if tool.job_role == crate::job::JobRole::Script {
                     self.script_description(&description)
                 } else {
@@ -79,6 +85,7 @@ pub(crate) fn job_view_type() -> &'static str {
 pub(crate) struct ScriptManifest {
     name: String,
     properties: Vec<String>,
+    #[serde(skip)]
     required: Vec<String>,
     #[serde(flatten)]
     binding: ScriptBinding,
@@ -150,7 +157,7 @@ impl ScriptManifest {
                 ))
             })
             .collect::<String>();
-        let description = describe(&tool.description, "Returns", tool.result_schema.as_ref());
+        let description = describe(&tool.description, " Returns", tool.result_schema.as_ref());
         format!("- `{call}` — {description}{field_docs}")
     }
 }
@@ -167,8 +174,9 @@ fn schema_type<'a>(field: &'a Value, root: &'a Value) -> String {
 }
 
 /// Render a result type, defining each definition referenced more than once
-/// a single time after the type instead of expanding it at every use.
-fn result_type(schema: &Value) -> String {
+/// a single time after the type instead of expanding it at every use: the type
+/// and those definitions' suffix.
+fn result_type(schema: &Value) -> (String, String) {
     let mut counts = BTreeMap::<&str, usize>::new();
     count_references(schema, &mut counts);
     let shared = counts
@@ -196,9 +204,9 @@ fn result_type(schema: &Value) -> String {
         })
         .collect::<Vec<_>>();
     if definitions.is_empty() {
-        rendered
+        (rendered, String::new())
     } else {
-        format!("{rendered}` where `{}", definitions.join("; "))
+        (rendered, format!("` where `{}", definitions.join("; ")))
     }
 }
 
@@ -393,9 +401,10 @@ mod tests {
             ],
             "$defs":{"Body":body, "Once":{"type":"integer"}}
         });
+        let result = ResultSchema::Json(schema);
         assert_eq!(
-            result_type(&schema),
-            "{body:Body} | {body?:Body, once?:integer}` where `Body = {text:string}"
+            describe("Send.", " Returns", Some(&result)),
+            "Send. Returns `JobView<{body:Body} | {body?:Body, once?:integer}>` where `Body = {text:string}`."
         );
     }
 }

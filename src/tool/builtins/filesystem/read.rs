@@ -12,7 +12,7 @@ use super::super::{ImageSummary, workspace::relative_path};
 use crate::tool::path::source_file;
 use crate::{
     fs::FileKind,
-    media::MAX_IMAGE_BYTES,
+    media::{Image, MAX_IMAGE_BYTES, MediaError},
     tool::output::{FinishedOutput, TextCaptureField},
     tool::{
         PathArgument, PathKind, RegistryError,
@@ -72,9 +72,15 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
     let bytes = crate::fs::read_regular(&path, MAX_IMAGE_BYTES)
         .await
         .map_err(source_file(&path))?;
-    let image = crate::media::Image::new(bytes).map_err(|_| {
-        LocalError::failed("file is neither UTF-8 text nor a supported image")
-            .operation(Operation::Deserialize, Subject::path(&path))
+    let image = Image::decode(bytes).await.map_err(|error| {
+        let failed = match error {
+            MediaError::Task(error) => return error.into(),
+            MediaError::UnsupportedImage => {
+                LocalError::failed("file is neither UTF-8 text nor a supported image")
+            }
+            error => LocalError::failed(error),
+        };
+        failed.operation(Operation::Deserialize, Subject::path(&path))
     })?;
     let name = relative_path(&context.execution_location().workspace, &path);
     let reference = context
@@ -368,8 +374,11 @@ mod tests {
         assert_eq!(result.output.value["content"], "one\ntwo\nthree\n");
         fs::write(&path, "changed").await.unwrap();
         let mut args = crate::job::output::OutputArgs::new(result.job);
-        (args.field, args.start, args.limit) =
-            (Some("/result/content".parse().unwrap()), Some(2), Some(1));
+        (args.field, args.start, args.limit) = (
+            Some("/result/content".parse().unwrap()),
+            Some(2),
+            Some(crate::job::output::PageLimit::new::<1>()),
+        );
         let page = runtime
             .jobs
             .present_output(args, &Default::default())

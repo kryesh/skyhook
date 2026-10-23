@@ -277,14 +277,16 @@ impl SessionRuntime {
     /// it did.
     async fn rest(&self, id: &AgentId, turn: Turn) -> bool {
         let id = id.clone();
-        let rest = move |state: &mut CoreState| {
-            let busy = state
-                .agents
-                .get_mut(&id)
-                .filter(|facts| facts.turn == Turn::Busy);
-            busy.map(|facts| facts.set_turn(turn)).is_some()
-        };
+        let rest = move |state: &mut CoreState| state.agents.rest(&id, turn);
         self.store.live(rest).await
+    }
+
+    /// End `id`'s work that ran no turn, as [`Agents::unwind`](agents::Agents::unwind).
+    async fn unwind(&self, id: &AgentId, turn: Turn) {
+        let id = id.clone();
+        self.store
+            .live(move |state| state.agents.unwind(&id, turn))
+            .await;
     }
 
     /// End `id`'s turn as `failure` says. A turn an interrupt or closing already
@@ -314,6 +316,7 @@ impl SessionRuntime {
                     facts.turn,
                     Turn::Held
                         | Turn::Cancelled(Was::Held)
+                        | Turn::Stopping
                         | Turn::Parked(TurnFailure::Interrupted)
                 )
             });
@@ -484,9 +487,10 @@ impl SessionRuntime {
                 // The phase, not the command, decides: whatever the agent holds is
                 // refused with it, and a pending reply stays journaled.
                 Taken::Refused(refused, held) => {
-                    for command in held {
-                        command.refuse(|| refused.refusal().into());
-                    }
+                    let refused = held
+                        .into_iter()
+                        .filter_map(|command| command.refuse(|| refused.refusal().into()));
+                    refused.for_each(queue::Admitted::hand_back);
                     let _ = (self.store)
                         .append(id.clone(), SessionEvent::AgentInterrupted)
                         .await;
@@ -505,18 +509,27 @@ impl SessionRuntime {
             };
             let work = match work {
                 Work::Command(AgentCommand::QueuedInputs(inputs)) => {
-                    let batch = queue::Batch::default();
                     let consumed =
-                        self.consume_queued(&mut turn, &mut context, &mut settings, batch, inputs);
+                        self.consume_queued(&mut turn, &mut context, &mut settings, inputs);
                     consumed.await.map(|consumed| Begins::Taken(consumed, None))
                 }
-                // A retried batch commits with its selection before the turn goes on;
-                // an interrupt that stops it first still ends the turn it began.
-                Work::Command(AgentCommand::Retry { batch, done }) => {
-                    let taken = Vec::new();
-                    let consumed =
-                        self.consume_queued(&mut turn, &mut context, &mut settings, batch, taken);
-                    Some(Begins::Taken(consumed.await.unwrap_or(Ok(())), Some(done)))
+                // A `continue` runs as a turn from the moment it claims the root,
+                // so an interrupt stops it and a second `continue` leaves it alone;
+                // one refused rests as it was.
+                Work::Command(AgentCommand::Continue {
+                    selection,
+                    batch,
+                    resting,
+                    done,
+                }) => {
+                    let (context, settings) = (&mut context, &mut settings);
+                    let continued = self
+                        .continue_root(&mut turn, context, settings, selection, batch, *resting);
+                    if let Err(error) = continued.await {
+                        done.settle(Err(error));
+                        continue;
+                    }
+                    Some(Begins::Taken(Ok(()), Some(done)))
                 }
                 Work::Command(AgentCommand::Input {
                     content,
@@ -566,7 +579,7 @@ impl SessionRuntime {
                         Err(error) => {
                             // The phase is untouched: a parked child stays parked until
                             // an input with an admissible selection resumes its task.
-                            self.rest(&id, resting).await;
+                            self.unwind(&id, resting).await;
                             if let Some(done) = done {
                                 done.settle(Err(error));
                             }
@@ -1129,9 +1142,9 @@ mod tests {
         assert_eq!(failed.state, JobState::Failed);
         let child = session.root.child(1);
         assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
-        let retry = format!("return tool.job({job}).send({{value:'try again'}});");
+        let retry = format!("return (await tool.job({job}).send({{value:'try again'}})).unwrap();");
         let resumed = session.run_script(retry).await.unwrap();
-        assert_eq!(resumed.value["value"], json!({}));
+        assert_eq!(resumed.value["value"], serde_json::Value::Null);
         let recovered = wait().await;
         assert_eq!(recovered.state, JobState::Completed);
         assert_eq!(recovered.output, Some(json!("child recovered")));
@@ -1631,7 +1644,7 @@ mod tests {
             // that turn's request.
             let image = crate::media::Attachment::Image {
                 file: None,
-                image: crate::tests::png(b""),
+                image: crate::tests::png(b"").await,
             };
             let attachment = store.store_attachment(&image).await.unwrap();
             let image = Message::User(vec![UserPart::Attachment { attachment }]);

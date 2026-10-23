@@ -5,6 +5,7 @@ use serde_json::{Map, Value, json};
 
 use super::{ModelError, Placements, Profile};
 use crate::{
+    media::{ImageBytes, ImageEdge, ImageLimits},
     newtype::{Blank, nonblank, string_newtype},
     provider::{
         codec::{Cache, Codec, CodecName, CyberAccessProgram, ReasoningSummary, path},
@@ -37,6 +38,9 @@ crate::provider::settings::settings! {
         /// leaving placement to the backend.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub explicit_caching: Option<bool> => default,
+        /// What the model accepts of each image, in place of the dialect's limits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub image_limits: Option<ImageLimitSettings> => object(ImageLimitSettings),
     }
 }
 
@@ -45,6 +49,19 @@ crate::provider::settings::settings! {
     pub struct AccessPrograms => AccessProgramsPatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cyber: Option<CyberAccessProgram> => default,
+    }
+}
+
+crate::provider::settings::settings! {
+    /// Per-image limits; a limit left out keeps the dialect's.
+    #[derive(Default)]
+    pub struct ImageLimitSettings => ImageLimitSettingsPatch {
+        /// The longest edge in pixels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_edge: Option<ImageEdge> => optional(ImageEdge),
+        /// The encoded size in bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_bytes: Option<ImageBytes> => optional(ImageBytes),
     }
 }
 
@@ -64,6 +81,17 @@ impl Request {
         wire.codec = self.placements.apply(wire.codec)?;
         if self.explicit_caching == Some(true) {
             *wire.codec.cache_mut().ok_or(ModelError::ExplicitCaching)? = Cache::Explicit;
+        }
+        if let Some(limits) = &self.image_limits {
+            let images = ImageLimits {
+                max_edge: limits.max_edge.unwrap_or(wire.images.max_edge),
+                max_bytes: limits.max_bytes.unwrap_or(wire.images.max_bytes),
+            };
+            // Sealed replay is bound to the images sent with it, which other limits refit.
+            if images != wire.images {
+                wire.discriminate("image_limits", &images);
+                wire.images = images;
+            }
         }
         if let Some(tier) = &self.service_tier {
             let field = (const { path("service_tier") }, json!(tier));

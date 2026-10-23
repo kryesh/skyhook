@@ -8,10 +8,12 @@ use super::super::{
     span,
 };
 use super::{Built, Dep, Inputs, Place, Source, ToolGroup, status_entry};
+use skyhook::agent::{CompactionFault, Failure};
 use skyhook::identity::JobId;
 use skyhook::provider::protocol::{AssistantItem, BlockRef};
 use skyhook::session::{
-    CompactionTrigger, EventRecord, JobEvent, Message, PageFacts, SessionEvent, UserPart,
+    CompactionCheckpoint, CompactionTrigger, EventRecord, JobEvent, Message, PageFacts,
+    SessionEvent, UserPart,
 };
 use std::fmt::Write as _;
 
@@ -76,6 +78,52 @@ pub(super) fn source(place: &Place, inputs: Inputs<'_>) -> Built {
     built
 }
 
+/// What the conversation builds entries from.
+enum Presented<'a> {
+    Request,
+    User(&'a [UserPart]),
+    Assistant(&'a [AssistantItem]),
+    Job(JobId),
+    Compaction(&'a CompactionCheckpoint),
+    Status(&'a str),
+    AgentFailed(&'a Failure),
+    CompactionFailed(&'a CompactionFault),
+}
+
+impl<'a> Presented<'a> {
+    /// What `event` presents, if anything. Persisted runtime state is model context,
+    /// not conversation; a result shows with the call it answers, and a job its script
+    /// issued under its parent's card.
+    fn of(event: &'a SessionEvent) -> Option<Self> {
+        Some(match event {
+            SessionEvent::ModelRequested { .. } => Self::Request,
+            SessionEvent::MessageCommitted { message } => match message {
+                Message::User(parts) => Self::User(parts),
+                Message::Assistant(items) => Self::Assistant(items),
+                Message::State(_) | Message::Tool(_) => return None,
+            },
+            SessionEvent::JobCreated {
+                job,
+                parent,
+                origin,
+                ..
+            } if !skyhook::job::nests(*parent, origin) => Self::Job(*job),
+            SessionEvent::Compaction { checkpoint } => Self::Compaction(checkpoint),
+            SessionEvent::Status { message } => Self::Status(message),
+            SessionEvent::AgentFailed { failure } => Self::AgentFailed(failure),
+            SessionEvent::CompactionFailed { error, .. } => Self::CompactionFailed(error),
+            _ => return None,
+        })
+    }
+}
+
+/// Whether `conversation` can build entries from `event`. A window passes over the
+/// records it never builds from as it reads them, so a run of them costs a read, not
+/// what it holds; they show only through the facts of those it builds from.
+pub(in crate::tui::model) fn presents(event: &SessionEvent) -> bool {
+    Presented::of(event).is_some()
+}
+
 fn conversation(
     record: &EventRecord,
     place: &Place,
@@ -97,8 +145,11 @@ fn conversation(
     } = presentation;
     let agent_name = projection.agent_name(agent);
     let key = EntryKey::Record(record.sequence);
-    match &record.event {
-        SessionEvent::ModelRequested { .. } => {
+    let Some(presented) = Presented::of(&record.event) else {
+        return;
+    };
+    match presented {
+        Presented::Request => {
             let request = record.sequence.request();
             built.deps.push(Dep::Request(request));
             if let Some(entry) = super::super::retry::retry_entry(inputs, agent, request) {
@@ -117,71 +168,56 @@ fn conversation(
                 }
             }
         }
-        SessionEvent::MessageCommitted { message } => match message {
-            Message::User(blocks) => {
-                for (i, block) in blocks.iter().enumerate() {
-                    let (title, text, surface) = match block {
-                        UserPart::Text { text } => (
-                            if agent.path().is_empty() {
-                                "You"
-                            } else {
-                                "Parent"
-                            },
-                            text.clone(),
-                            Surface::User,
-                        ),
-                        UserPart::ParentInput { text } => ("Parent", text.clone(), Surface::User),
-                        UserPart::Attachment { attachment } => {
-                            ("Attachment", pretty(attachment), Surface::User)
+        Presented::User(blocks) => {
+            for (i, block) in blocks.iter().enumerate() {
+                let (title, text, surface) = match block {
+                    UserPart::Text { text } => (
+                        if agent.path().is_empty() {
+                            "You"
+                        } else {
+                            "Parent"
+                        },
+                        text.clone(),
+                        Surface::User,
+                    ),
+                    UserPart::ParentInput { text } => ("Parent", text.clone(), Surface::User),
+                    UserPart::Attachment { attachment } => {
+                        ("Attachment", pretty(attachment), Surface::User)
+                    }
+                    UserPart::JobEvents { events } => {
+                        let jobs = events.iter().filter_map(JobEvent::job);
+                        built.deps.extend(jobs.map(Dep::Job));
+                        let group = ToolGroup::Notification(record.sequence, i);
+                        let entries = job_event_entries(
+                            record.sequence,
+                            i,
+                            events,
+                            inputs,
+                            view,
+                            all_details,
+                        );
+                        for entry in entries {
+                            built.push(entry, Some(group));
                         }
-                        UserPart::JobEvents { events } => {
-                            let jobs = events.iter().filter_map(JobEvent::job);
-                            built.deps.extend(jobs.map(Dep::Job));
-                            let group = ToolGroup::Notification(record.sequence, i);
-                            let entries = job_event_entries(
-                                record.sequence,
-                                i,
-                                events,
-                                inputs,
-                                view,
-                                all_details,
-                            );
-                            for entry in entries {
-                                built.push(entry, Some(group));
-                            }
-                            continue;
-                        }
-                        UserPart::Compaction { text } => {
-                            ("Compaction", text.clone(), Surface::Muted)
-                        }
-                    };
-                    let key = EntryKey::UserBlock {
-                        record: record.sequence,
-                        index: i,
-                    };
-                    let entry = Entry::titled(key, Title::plain(title), text, surface);
-                    built.push(entry, None);
-                }
+                        continue;
+                    }
+                    UserPart::Compaction { text } => ("Compaction", text.clone(), Surface::Muted),
+                };
+                let key = EntryKey::UserBlock {
+                    record: record.sequence,
+                    index: i,
+                };
+                let entry = Entry::titled(key, Title::plain(title), text, surface);
+                built.push(entry, None);
             }
-            Message::Assistant(items) => {
-                assistant(record, items, facts, inputs, built);
-            }
-            // Persisted runtime state is model context, not conversation; a result
-            // shows with the call it answers.
-            Message::State(_) | Message::Tool(_) => {}
-        },
-        // A job its script issued shows under its parent's card instead.
-        SessionEvent::JobCreated {
-            job,
-            parent,
-            origin,
-            ..
-        } if !skyhook::job::nests(*parent, origin) => {
-            if let Some((entry, group)) = job_card(*job, place, inputs, built) {
+        }
+        Presented::Assistant(items) => assistant(record, items, facts, inputs, built),
+        Presented::Job(job) => {
+            if let Some((entry, group)) = job_card(job, place, inputs, built) {
                 built.push(entry, group);
             }
         }
-        SessionEvent::Compaction { checkpoint } => {
+        Presented::Compaction(checkpoint) => {
             let open = view.is_expanded(&key, false);
             let title = match checkpoint.trigger {
                 CompactionTrigger::Occupancy(tokens) => {
@@ -189,24 +225,25 @@ fn conversation(
                 }
                 CompactionTrigger::Overflow => "Context compacted after it overflowed".to_owned(),
             };
-            let body = if open {
-                format!("Summary and retained sources\n{}", pretty(checkpoint))
-            } else {
-                String::new()
-            };
-            let title = Title::disclosed(title, open);
-            built.push(Entry::titled(key, title, body, Surface::Muted), None);
+            let body = || format!("Summary and retained sources\n{}", pretty(checkpoint));
+            built.push(
+                Entry::disclosed(key, title, open, Surface::Muted, body),
+                None,
+            );
         }
-        SessionEvent::Status { message } => built.push(status_entry(key, message), None),
+        Presented::Status(message) => built.push(status_entry(key, &message), None),
         // A failure its request's card reports is not repeated.
-        SessionEvent::AgentFailed { failure } if !facts.reported.contains(&record.sequence) => {
-            built.push(super::super::retry::failure_entry(key, failure), None);
+        Presented::AgentFailed(failure) => {
+            if !facts.reported.contains(&record.sequence) {
+                built.push(super::super::retry::failure_entry(key, failure, view), None);
+            }
         }
-        SessionEvent::CompactionFailed { error, .. } => {
-            let text = format!("Compaction failed; previous context retained\n{error}");
-            built.push(Entry::new(key, text, Surface::Error), None);
+        Presented::CompactionFailed(error) => {
+            let open = view.is_expanded(&key, true);
+            let title = "Compaction failed; previous context retained";
+            let entry = Entry::disclosed(key, title, open, Surface::Error, || error.to_string());
+            built.push(entry, None);
         }
-        _ => {}
     }
 }
 

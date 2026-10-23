@@ -5,8 +5,8 @@ use serde_json::Value;
 use crate::{
     identity::JobId,
     job::{
-        FieldPointer, JobError, JobManager, ViewKind,
-        output::{DEFAULT_LIMIT, MAX_CONTEXT, MAX_LIMIT, OutputArgs, OutputOptions},
+        FieldPointer, JobError, JobListing, JobManager, ViewKind,
+        output::{DEFAULT_LIMIT, MAX_CONTEXT, OutputArgs, OutputOptions, PageLimit, Selectors},
     },
     tool::{
         AdmissionError, JobViewResult, RegistryError, ToolContext, ToolError, ToolOptions,
@@ -23,14 +23,14 @@ pub(crate) fn register(
     let admitted = jobs.clone();
     builder.register_checked(
         "jobs",
-        "Without `job`, list this agent's active jobs, excluding this call and its containing script; `all` adds finished jobs. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: text by line (start/offset/pattern), JSON by element or member (index), or query matches.",
-        ToolOptions::default().job_views(JobViewResult::Many),
+        "Without `job`, list this agent's active jobs as {jobs, older}, excluding this call and its containing script; `all` adds finished jobs, and `limit` keeps the newest jobs, counting those left out in `older` when any are. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: text by line (start/offset/pattern), JSON by element or member (index), or query matches.",
+        ToolOptions::default().job_views(JobViewResult::Listing),
         |args: JobsArgs| JobsRequest::try_from(args),
         move |request| {
             let jobs = admitted.clone();
             match request {
-                JobsRequest::List { all } => {
-                    Invocation::new(move |context| list(jobs, context, all))
+                JobsRequest::List { all, limit } => {
+                    Invocation::new(move |context| list(jobs, context, all, limit))
                 }
                 JobsRequest::Output(args) => Invocation::job_view(move |context| async move {
                     let job = args.job;
@@ -105,30 +105,49 @@ fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
     }
 }
 
-async fn list(jobs: JobManager, context: ToolContext, all: bool) -> Result<ToolOutput, ToolError> {
-    let current = jobs.metadata(context.job()).await.map_err(|error| {
-        job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
-    })?;
+async fn list(
+    jobs: JobManager,
+    context: ToolContext,
+    all: bool,
+    limit: PageLimit,
+) -> Result<ToolOutput, ToolError> {
+    let current = jobs
+        .metadata(context.job())
+        .await
+        .map_err(|error| job_failure(error, Operation::Inspect, context.job()))?;
     let containing_script = if let Some(parent) = current.parent {
-        let parent = jobs.metadata(parent).await.map_err(|error| {
-            job_failure(error, Operation::Inspect, parent).effects(Effects::Unchanged)
-        })?;
+        let parent = jobs
+            .metadata(parent)
+            .await
+            .map_err(|error| job_failure(error, Operation::Inspect, parent))?;
         (parent.role == crate::job::JobRole::Script).then_some(parent.id)
     } else {
         None
     };
-    let listed = if all {
-        jobs.list(context.agent()).await.map_err(|error| {
-            job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
-        })?
+    let except = [Some(context.job()), containing_script];
+    let (listed, older) = if all {
+        let newest = jobs.newest(
+            context.agent(),
+            except.into_iter().flatten().collect(),
+            limit.get(),
+        );
+        newest
+            .await
+            .map_err(|error| job_failure(error, Operation::Inspect, context.job()))?
     } else {
-        jobs.active(context.agent())
+        let mut active = jobs.active(context.agent());
+        active.retain(|job| !except.contains(&Some(job.id)));
+        let older = active.len().saturating_sub(limit.get());
+        (active.split_off(older), older)
     };
-    let listing = (listed.into_iter())
-        .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
-        .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
-        .collect();
-    Ok(ToolOutput::new(Value::Array(listing)))
+    let listing = JobListing {
+        jobs: (listed.into_iter())
+            .map(|job| job.metadata_view(context.diagnostic_viewer()))
+            .collect(),
+        older: std::num::NonZeroUsize::new(older),
+    };
+    let listing = serde_json::to_value(listing).expect("a job listing serializes");
+    Ok(ToolOutput::new(listing))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -144,9 +163,9 @@ struct JobsArgs {
     /// Text fields: one-based first source line; use returned next_start to continue.
     #[schemars(range(min = 1), extend("default" = 1))]
     start: Option<usize>,
-    /// Maximum returned lines (including match context), values or query matches.
-    #[schemars(range(min = 1, max = MAX_LIMIT), extend("default" = DEFAULT_LIMIT))]
-    limit: Option<usize>,
+    /// Maximum returned lines (including match context), values or query matches; without job, the newest jobs listed.
+    #[schemars(extend("default" = DEFAULT_LIMIT))]
+    limit: Option<PageLimit>,
     /// Text fields: case-sensitive line regex; use (?i) for case-insensitive matching.
     pattern: Option<String>,
     /// Surrounding lines per match.
@@ -163,7 +182,7 @@ struct JobsArgs {
 }
 
 enum JobsRequest {
-    List { all: bool },
+    List { all: bool, limit: PageLimit },
     Output(OutputArgs),
 }
 
@@ -199,19 +218,24 @@ impl TryFrom<JobsArgs> for JobsRequest {
                 query,
             })),
             None if field.is_some()
-                || start.is_some()
-                || limit.is_some()
                 || pattern.is_some()
-                || context.is_some()
-                || offset.is_some()
-                || index.is_some()
-                || query.is_some() =>
+                || query.is_some()
+                || (Selectors {
+                    start,
+                    offset,
+                    index,
+                    context,
+                })
+                .is_set() =>
             {
                 Err(AdmissionError::invalid_arguments(
-                    "output selection requires job",
+                    "field, start, offset, pattern, context, index and query read a job's output; pass job",
                 ))
             }
-            None => Ok(Self::List { all }),
+            None => Ok(Self::List {
+                all,
+                limit: limit.unwrap_or(DEFAULT_LIMIT),
+            }),
         }
     }
 }
@@ -243,12 +267,8 @@ mod tests {
     };
 
     fn ids(listing: &Value) -> Vec<Value> {
-        listing
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|job| job["id"].clone())
-            .collect()
+        let jobs = listing["jobs"].as_array().unwrap();
+        jobs.iter().map(|job| job["id"].clone()).collect()
     }
 
     #[test]
@@ -260,11 +280,16 @@ mod tests {
         };
         assert!(matches!(
             request(json!({})),
-            Ok(JobsRequest::List { all: false })
+            Ok(JobsRequest::List {
+                all: false,
+                limit: DEFAULT_LIMIT
+            })
         ));
+        // Selectors restating their defaults are a listing's, as schema-filling models send them.
+        let listing = json!({"all":true, "limit":5, "start":1, "offset":0, "index":0, "context":0});
         assert!(matches!(
-            request(json!({"all":true})),
-            Ok(JobsRequest::List { all: true })
+            request(listing),
+            Ok(JobsRequest::List { all: true, limit }) if limit.get() == 5
         ));
         assert!(matches!(
             request(json!({"job":3, "pattern":"x"})),
@@ -273,7 +298,8 @@ mod tests {
         for value in [
             json!({"job":3, "all":true}),
             json!({"field":"/result"}),
-            json!({"limit":5}),
+            json!({"start":2}),
+            json!({"limit":0}),
         ] {
             assert!(
                 matches!(request(value.clone()), Err(error)
@@ -351,13 +377,14 @@ mod tests {
             .await;
         let output = output.unwrap().output.value;
         for (value, state) in [
-            (&current, &current[0]["state"]),
+            (&current, &current["jobs"][0]["state"]),
             (&output, &output["state"]),
         ] {
             assert!(!value.to_string().contains("awaiting_approval"));
             assert_eq!(state, "queued");
         }
         assert_eq!(ids(&current), [json!(pending)]);
+        assert_eq!(current.get("older"), None);
 
         let spec = JobSpec {
             accepts_input: true,
@@ -380,6 +407,21 @@ mod tests {
         let listed = ids(&all.output.value);
         assert!(listed.contains(&json!(pending)) && listed.contains(&json!(completed)));
         assert!(!listed.contains(&json!(all.job)));
+        // The newest jobs, and how many older ones the limit leaves out.
+        let newest = executor
+            .run_host(agent, "jobs", json!({"all": true, "limit": 2}))
+            .await
+            .unwrap();
+        let older = listed.len() + 1 - 2;
+        assert_eq!(newest.output.value["older"], older);
+        let expected = [listed.last().unwrap().clone(), json!(all.job)];
+        assert_eq!(ids(&newest.output.value), expected);
+        let active = executor.run_host(agent, "jobs", json!({"limit": 1})).await;
+        let active = active.unwrap().output.value;
+        assert_eq!(
+            (ids(&active), &active["older"]),
+            (vec![json!(script)], &json!(1))
+        );
     }
 
     /// An output read acknowledges the outcome it presents with its own finish:

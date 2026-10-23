@@ -1,7 +1,10 @@
 //! Model requests, their attempts and outcomes, turn failures, compaction, and the
 //! state rows the request fold writes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroU64,
+};
 
 use super::{
     contract::profiles,
@@ -17,8 +20,8 @@ use crate::{
     provider::protocol::Usage,
     session::{
         AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
-        CompletedOutcome, EntryKind, Page, ProfileSnapshot, RequestPhase, RequestRecord,
-        RequestSeq, SessionEvent,
+        CompletedOutcome, EntryKind, Page, ProfileSnapshot, RequestNumber, RequestPhase,
+        RequestRecord, RequestSeq, SessionEvent,
     },
 };
 
@@ -53,13 +56,14 @@ pub(super) fn write_requests(
         };
         let (usage, counts) = (record.usage, reported.unwrap_or_default());
         db.execute(
-            "INSERT OR REPLACE INTO request_state (request, phase, phased, attempts, attempt, \
-               message, input_tokens, cached_input_tokens, cache_write_input_tokens, \
+            "INSERT OR REPLACE INTO request_state (request, number, phase, phased, attempts, \
+               attempt, message, input_tokens, cached_input_tokens, cache_write_input_tokens, \
                output_tokens, reported, reported_input_tokens, reported_cached_input_tokens, \
                reported_cache_write_input_tokens, reported_output_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 *request,
+                record.number.0.get(),
                 kind,
                 record.phased,
                 record.attempts,
@@ -108,7 +112,7 @@ macro_rules! request_rows {
                s.input_tokens, s.cached_input_tokens, s.cache_write_input_tokens, \
                s.output_tokens, s.reported, s.reported_input_tokens, \
                s.reported_cached_input_tokens, s.reported_cache_write_input_tokens, \
-               s.reported_output_tokens, e.agent \
+               s.reported_output_tokens, e.agent, s.number \
              FROM entry e JOIN request_state s ON s.request = e.seq \
              JOIN model_request r ON r.entry = e.seq JOIN model_context c ON c.entry = r.context \
              JOIN entry p ON p.seq = s.phased LEFT JOIN failure f ON f.entry = s.phased \
@@ -232,8 +236,10 @@ fn request_record(
         },
     };
     let profile = profiles.get(&row.get(4)?);
+    let number = NonZeroU64::new(row.get(28)?).ok_or_else(|| corrupt("a request is numbered 0"))?;
     let record = RequestRecord {
         agent: agent.clone(),
+        number: RequestNumber(number),
         context: sequence(row.get(2)?),
         purpose: enum_column(row, 3)?,
         profile: profile

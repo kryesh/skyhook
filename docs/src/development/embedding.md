@@ -174,21 +174,27 @@ when a request boundary takes them, all of them as one batch. A batch the sessio
 the turn, whose `AgentFailed` record says why, and waits with it: its receipts stay pending, each
 prompt can still be withdrawn (`QueuedPromptCancellation::is_retained` tells such a prompt) until
 `continue_turn_with` takes the batch to try again under its selection, together with anything
-queued since. An interrupt leaves it waiting; a `prompt` hands it back (`Interrupted`), and so does
-an interrupt that overtakes the refusal itself or lands while `continue_turn_with` is committing it,
-after which the root rests unless a turn is still open. Closing the session drops it. Explicit job
-cancellation is non-resumable.
+queued since. It checks the batch as a request boundary would before it changes anything, and from
+then on the root runs it as a turn: a batch those checks or the selection refuse waits again
+unchanged, together with anything queued meanwhile, and the call returns why. One that an interrupt
+stops first also waits again unchanged, but the interrupt hands back what was queued meanwhile
+(`Interrupted`), as it does any input no turn has taken. An interrupt leaves a waiting batch
+waiting; a `prompt` hands it back (`Interrupted`), and so does an interrupt that overtakes the
+refusal itself, after which the root rests unless a turn is still open. Closing the session drops
+it. Explicit job cancellation is non-resumable.
 `continue_turn_with` continues failed or interrupted work without duplicating its input and can
-select a model or mode for the continued root turn. Its `ContinueOutcome` distinguishes a root
-answer from resumed children and reports whether the selection applied: restarting children does
-not imply that a waiting or live root also ran. `continue_turn` uses default options and returns
-the root answer, or an empty string when there is none.
+select a model or mode for the continued root turn. It always restarts the interrupted or failed
+children first; a root turn or batch refused afterwards returns why without undoing that. Its
+`ContinueOutcome` distinguishes a root answer from resumed children and reports whether the
+selection applied: only a continued root turn applies it, and restarting children does not imply
+that a waiting or live root also ran. `continue_turn` uses default options and returns the root
+answer, or an empty string when there is none.
 
 Use `Harness::resume_session` to reopen durable state. The session opens to view: it journals
 nothing, and its observation reads it stopped at its last activity, until the first call that
 changes it, such as a prompt, `continue_turn_with`, a script, a status, a title or a job
-cancellation. That call first prepares the root agent; if the root cannot run, for example because
-its model is no longer configured, the call fails and the session stays viewed. Otherwise the
+cancellation. That call first prepares the root agent; if that fails, for example because its
+provider cannot open a conversation, the call fails and the session stays viewed. Otherwise the
 runtime reconciles interrupted work in one transaction before starting agents. Shutting down a
 viewed session stops nothing and journals nothing: it closes the session, releasing it for another
 open, and later calls that would change it are refused. Work the previous process left open is
@@ -200,8 +206,17 @@ that closed idle with job deliveries pending resumes interrupted too, so `contin
 input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
+A session whose root's recorded model is no longer configured still opens and activates, and
+`startup_warnings` says so: calls that only write, such as a title, a status or a job
+cancellation, work as usual. Only running the root fails, with `HarnessError::UnknownModel` and
+before anything is journaled: a script, or a direct prompt, a continuation or an
+`enqueue_prompts` call of which no prompt names a configured model. A selection naming one
+replaces the model, as does `SessionHandle::activate_on`, which a viewed session journals in the
+commit that activates it. Job deliveries that would wake the root before then begin a turn that
+fails as any failed turn does, journaled, and stay pending for the input that names a model. A child whose own model is gone restarts
+on the root's, journaled as a model change; with the root's gone too, its restart fails alone.
 
-Session databases use format 24. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 26. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 

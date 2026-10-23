@@ -1,11 +1,12 @@
 //! The viewed agent's history read a page at a time, off the event loop, as `Work`:
 //! drawing asks for what the view nears, and the window folds what lands.
 use super::*;
-use model::{CHILD_PAGE, ChildPage, Direction, Focus, LIST_PAGE, Loaded, Near, PAGE, Read, Want};
+use model::{CHILD_PAGE, ChildPage, Direction, Edge, LIST_PAGE, Loaded, Near, PAGE, Read, Want};
 use skyhook::agent::HarnessError;
 use skyhook::job::{JobEnvelope, JobRole, JobScope};
 use skyhook::session::Page;
 use std::collections::VecDeque;
+use std::ops::RangeInclusive;
 
 /// Child pages a page load reads under the scripts it shows, nearest first.
 const FAMILY_PAGES: usize = 32;
@@ -148,9 +149,9 @@ impl App {
     }
 
     /// Where the viewed tab's top sits, for a window made for it.
-    pub(crate) fn focus_of_view(&self) -> Option<Focus> {
+    pub(crate) fn focus_of_view(&self) -> Edge {
         let top = self.viewed().and_then(|view| view.top.as_ref());
-        top.and_then(model::Anchor::focus)
+        top.map_or(Edge::End, model::Anchor::focus)
     }
 
     /// How many entries the viewed agent's transcript holds.
@@ -160,12 +161,12 @@ impl App {
     }
 
     /// Ask for the loads what is not loaded `near` the view needs, keeping what is
-    /// loaded around `focus`.
-    pub(crate) fn load_near(&mut self, near: &[Near], focus: Option<Focus>) {
+    /// loaded around the entries `shown`, from the view's top to its bottom.
+    pub(crate) fn load_near(&mut self, near: &[Near], shown: RangeInclusive<Edge>) {
         let (Some(session), Some(window)) = (self.session().cloned(), self.window.as_mut()) else {
             return;
         };
-        for (direction, want) in window.plan(near, focus) {
+        for (direction, want) in window.plan(near, shown) {
             #[cfg(test)]
             {
                 self.loads += 1;
@@ -254,7 +255,7 @@ mod tests {
             .filter(|entry| entry.text().starts_with("Status"));
         let loaded = statuses.count();
         assert!(
-            (model::KEPT..=model::KEPT + PAGE).contains(&loaded),
+            (model::KEPT / 2..=model::KEPT / 2 + PAGE).contains(&loaded),
             "{loaded}"
         );
         let last = app.journal.last().unwrap();
@@ -273,14 +274,17 @@ mod tests {
     /// A list shows its latest page, and `Home` reads the page before each time until
     /// its start shows, keeping no more than is kept however long the list is; shown
     /// again, it reads there.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn home_reads_a_long_list_back_to_its_start() {
+        use futures_util::StreamExt;
         let (_root, app) = fixture().await;
         let session = app.session().unwrap().clone();
         let total = model::KEPT + LIST_PAGE + 2;
-        for _ in 0..total {
-            bounded(session.run_script("return 1;")).await.unwrap();
-        }
+        // Run together: nothing below depends on the order the scripts ran in.
+        let scripts = futures_util::stream::repeat_with(|| session.run_script("return 1;"));
+        let scripts = scripts.take(total).buffer_unordered(64);
+        let ran = bounded(scripts.collect::<Vec<_>>()).await;
+        assert!(ran.into_iter().all(|ran| ran.is_ok()));
         let (_viewer, mut app) = viewing(&session, Tab::Jobs).await;
         let jobs = |app: &App| {
             app.entries()
@@ -304,7 +308,7 @@ mod tests {
         // Let go of and shown again, the list reads where its view was.
         app.release();
         settled(&mut app).await;
-        assert_eq!(app.focus_of_view(), Some(Focus::Job(first)));
+        assert_eq!(app.focus_of_view(), Edge::At(model::Focus::Job(first)));
     }
 
     /// A job made and let go while a window's first load is in flight, after the load
@@ -384,31 +388,31 @@ mod tests {
             });
             unspaced.collect::<Vec<_>>()
         };
+        let mut reads = Vec::new();
+        for ordinal in 0..whole.live.views.entries[&root] {
+            let page = ordinal.checked_sub(1).map_or(Page::First, Page::After);
+            let read = bounded(session.store().transcript(&root, page, 1))
+                .await
+                .unwrap();
+            let loaded = shown(&session, page, read, FAMILY_PAGES);
+            let loaded = bounded(loaded).await.unwrap();
+            let focus = Edge::At(model::Focus::Ordinal(ordinal));
+            let id = window_id();
+            let mut window = model::Window::new(root.clone(), Tab::Conversation, id, focus);
+            window.plan(&[], focus..=focus);
+            window.loaded(Direction::Down, loaded);
+            reads.push(Whole {
+                live: whole.live.clone(),
+                window,
+                projection: whole.projection.clone(),
+            });
+        }
         for details in [false, true] {
-            let mut alone = Vec::new();
-            for ordinal in 0..whole.live.views.entries[&root] {
-                let page = ordinal.checked_sub(1).map_or(Page::First, Page::After);
-                let read = bounded(session.store().transcript(&root, page, 1))
-                    .await
-                    .unwrap();
-                let loaded = shown(&session, page, read, FAMILY_PAGES);
-                let loaded = bounded(loaded).await.unwrap();
-                let focus = Some(Focus::Ordinal(ordinal));
-                let id = window_id();
-                let mut window = model::Window::new(root.clone(), Tab::Conversation, id, focus);
-                window.plan(&[], focus);
-                window.loaded(Direction::Down, loaded);
-                let read = Whole {
-                    live: whole.live.clone(),
-                    window,
-                    projection: *bounded(PreparedObservation::load(session.clone()))
-                        .await
-                        .unwrap()
-                        .projection,
-                };
-                alone.extend(history(&read, details));
-            }
-            assert!(alone == history(&whole, details), "details {details}");
+            let alone = reads.iter().flat_map(|read| history(read, details));
+            assert!(
+                alone.collect::<Vec<_>>() == history(&whole, details),
+                "details {details}"
+            );
         }
     }
 }

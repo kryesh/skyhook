@@ -39,7 +39,7 @@ impl PreparedObservation {
     /// loop: every agent's summary, and its root's conversation.
     pub async fn load(session: SessionHandle) -> Result<Self, HarnessError> {
         let root = session.root_agent().clone();
-        let view = (root, Tab::Conversation, None);
+        let view = (root, Tab::Conversation, model::Edge::End);
         Self::view(session, Some(view), None).await
     }
 
@@ -47,7 +47,7 @@ impl PreparedObservation {
     /// and whether the root failed a turn after `read`.
     async fn view(
         session: SessionHandle,
-        view: Option<(AgentId, Tab, Option<model::Focus>)>,
+        view: Option<(AgentId, Tab, model::Edge)>,
         read: Option<skyhook::session::RecordSeq>,
     ) -> Result<Self, HarnessError> {
         let Observation { snapshot, updates } = session.store().observe();
@@ -58,7 +58,7 @@ impl PreparedObservation {
         let mut window = None;
         if let Some((agent, tab, focus)) = view {
             let mut shown = model::Window::new(agent, tab, super::pages::window_id(), focus);
-            for (direction, want) in shown.plan(&[], focus) {
+            for (direction, want) in shown.plan(&[], focus..=focus) {
                 let loaded = super::pages::load(&session, &shown.agent, want).await?;
                 shown.loaded(direction, loaded);
             }

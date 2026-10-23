@@ -22,16 +22,29 @@ impl App {
         self.view().top = None;
     }
 
-    /// View the agent above or below the viewed one in the tree, wrapping, at its
-    /// latest activity, and keep the tree focused for the next step.
+    /// View the agent above or below the viewed one in the tree, wrapping.
     pub(super) fn step_agent(&mut self, backwards: bool) {
+        let step = |current, len| (current + if backwards { len - 1 } else { 1 }) % len;
+        self.move_in_tree(step);
+    }
+
+    /// View the agent a page above or below the viewed one, scrolling the tree
+    /// with it.
+    fn page_tree(&mut self, down: bool) {
+        let len = self.projection.visible(&self.selected).count();
+        let step = self.tree_view.page(down, len);
+        self.move_in_tree(|current, len| current.saturating_add_signed(step).min(len - 1));
+    }
+
+    /// View the tree row `to` picks from the viewed agent's row and the row
+    /// count, at its latest activity, and keep the tree focused for the next step.
+    fn move_in_tree(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let (agents, selected) = (&self.projection.agents, &self.selected);
         let shown: Vec<_> = self.projection.visible(selected).collect();
         let Some(current) = shown.iter().position(|&i| &agents[i].id == selected) else {
             return;
         };
-        let step = if backwards { shown.len() - 1 } else { 1 };
-        self.select(agents[shown[(current + step) % shown.len()]].id.clone());
+        self.select(agents[shown[to(current, shown.len())]].id.clone());
         let (agents, selected) = (&self.projection.agents, &self.selected);
         let cursor = self
             .projection
@@ -124,16 +137,8 @@ impl App {
                     }
                 }
                 KeyCode::PageUp | KeyCode::PageDown => {
-                    let options = key.modifiers.contains(M::CONTROL);
-                    let height = if options {
-                        self.prompt_options_rect.height
-                    } else {
-                        self.prompt_body_rect.height
-                    };
-                    self.scroll_prompt(
-                        options,
-                        height.max(1) as isize * if key.code == KeyCode::PageUp { -1 } else { 1 },
-                    );
+                    let (view, len) = self.prompt_view(key.modifiers.contains(M::CONTROL));
+                    view.page(key.code == KeyCode::PageDown, len);
                 }
                 KeyCode::Left | KeyCode::Right if multiple && !self.question_editing() => {
                     self.switch_question(if key.code == KeyCode::Left { -1 } else { 1 });
@@ -208,10 +213,13 @@ impl App {
             }
             KeyCode::PageUp | KeyCode::PageDown => {
                 let down = key.code == KeyCode::PageDown;
-                // A draft taller than its box pages itself; otherwise the conversation.
+                // A draft taller than its box pages itself, as does the focused
+                // tree; otherwise the conversation.
                 if self.focus == Focus::Composer && self.composer_overflows() {
                     self.editor.page(self.composer_rows(), down);
                     self.composer_scroll = None;
+                } else if self.focus == Focus::Tree {
+                    self.page_tree(down);
                 } else {
                     let page = self.content_rect.height as isize;
                     self.scroll(if down { page } else { -page });
@@ -327,7 +335,7 @@ impl App {
                 _ => {}
             },
             Focus::Content => match key.code {
-                KeyCode::Home => self.scroll_to_span(Some(0)),
+                KeyCode::Home => self.scroll_to_span(Some(0.0)),
                 KeyCode::End => self.scroll_to(None),
                 KeyCode::Up | KeyCode::Down => {
                     let current = self.selected_entry().unwrap_or(0);
@@ -396,15 +404,19 @@ impl App {
         };
         self.view().top = top;
     }
-    /// Pin the view's top at `row` of the whole history's span, read there when it is
+    /// Pin the view's top at `at` along the whole history's span, read there when it is
     /// not loaded, or follow the newest entries.
-    pub(in crate::tui) fn scroll_to_span(&mut self, row: Option<usize>) {
-        match row.map(|row| crate::tui::render::Track::of(self).locate(row)) {
+    pub(in crate::tui) fn scroll_to_span(&mut self, at: Option<f64>) {
+        match at.map(|at| crate::tui::render::Track::of(self).locate(self, at)) {
             Some(crate::tui::render::Spot::Ordinal(ordinal)) => {
                 self.view().top = Some(model::Anchor::ordinal(ordinal));
                 self.render.top = crate::tui::render::Top::Pending;
             }
             Some(crate::tui::render::Spot::Row(row)) => self.scroll_to(Some(row)),
+            Some(crate::tui::render::Spot::Start) => {
+                self.view().top = Some(model::Anchor::start());
+                self.render.top = crate::tui::render::Top::Pending;
+            }
             None => self.scroll_to(None),
         }
     }
@@ -417,7 +429,7 @@ impl App {
             || self.window.as_ref().is_some_and(model::Window::opening)
         {
             if let Some(top) = self.view().top.as_mut()
-                && let Some((model::Focus::Ordinal(ordinal), _)) = top.place
+                && let model::Edge::At((model::Focus::Ordinal(ordinal), _)) = top.place
             {
                 *top = model::Anchor::ordinal(ordinal.saturating_add_signed(delta as i64));
             }
@@ -610,7 +622,7 @@ mod tests {
         let top = app.view().top.as_ref().and_then(|top| top.key.clone());
         assert_eq!(top, Some(key));
         let root = model::Focus::Job(job_named(&app, "script"));
-        assert_eq!(app.focus_of_view(), Some(root));
+        assert_eq!(app.focus_of_view(), model::Edge::At(root));
     }
 
     /// A draft taller than its box scrolls under the wheel without moving its cursor,

@@ -319,7 +319,12 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        provider::{codec::CodecName, dialect::Sourced, settings::Setting},
+        media::ImageLimits,
+        provider::{
+            codec::CodecName,
+            dialect::{Sourced, compatible},
+            settings::Setting,
+        },
     };
 
     const LOCAL: &str = r#"
@@ -632,12 +637,14 @@ providers:
     base_url: http://127.0.0.1:11434/v1
     api_key: virtual-key
     tags: [shared]
+    image_limits: {max_bytes: 1000000}
     models:
       openai:
         model: openai-alias
         codec: responses
         upstream: openai
         tags: []
+        image_limits: {max_edge: 2000}
         max_context: 4096
         max_output: 512
       anthropic:
@@ -676,6 +683,27 @@ providers:
             admitted.models()["anthropic"].wire.codec.name(),
             CodecName::Messages
         );
+        // Image limits merge per limit over the dialect's.
+        let images = |model: &str| admitted.models()[model].wire.images;
+        assert_eq!(images("openai"), ImageLimits::new(2000, 1_000_000));
+        let edge = compatible::IMAGES.max_edge.get();
+        assert_eq!(images("anthropic"), ImageLimits::new(edge, 1_000_000));
+        // Limits other than the dialect's partition sealed replay; its own do not.
+        let scope = |text: &str| {
+            let admitted = Config::from_yaml(text).unwrap().providers["local"].admit();
+            admitted.unwrap().models()["anthropic"].wire.scope.clone()
+        };
+        let unset = PROXY.replace("    image_limits: {max_bytes: 1000000}\n", "");
+        let max_bytes = compatible::IMAGES.max_bytes.to_string();
+        assert_ne!(scope(PROXY), scope(&unset));
+        assert_eq!(scope(&unset), scope(&PROXY.replace("1000000", &max_bytes)));
+        // Limits read as the ones in effect, so only an effective change partitions.
+        let over = |max_bytes: &str| PROXY.replace("1000000", max_bytes);
+        assert_eq!(scope(&over("9000000")), scope(&over("90000000")));
+        let over = Config::from_yaml(&over("9000000").replace("2000", "70000")).unwrap();
+        let admitted = over.providers["local"].admit().unwrap();
+        let effective = ImageLimits::new(65_535, crate::media::MAX_IMAGE_BYTES);
+        assert_eq!(admitted.models()["openai"].wire.images, effective);
         for (field, value) in [("codec", "responses"), ("upstream", "openai")] {
             let missing = PROXY.replace(&format!("        {field}: {value}\n"), "");
             let refused = error(&missing);

@@ -1,6 +1,7 @@
 //! One agent's context window and independently owned provider conversation.
 
 use crate::{
+    agent::HarnessError,
     identity::AgentId,
     provider::{
         ProviderContext,
@@ -19,7 +20,9 @@ pub(super) struct AgentContext {
     /// different selection reopens it for, and the prompt and tools it offers.
     pub model: ModelContext,
     pub projected: Projection,
-    pub provider: Box<dyn ProviderContext>,
+    /// What serves its requests: none while the configuration no longer has its
+    /// model, as only a reopened root's can be, until a selection replaces it.
+    provider: Option<Box<dyn ProviderContext>>,
     /// The last request's blobs, which the next request reuses.
     pub blobs: crate::media::LoadedBlobs,
     /// What the agent's last completed response reported, which the next request
@@ -38,7 +41,7 @@ impl AgentContext {
     pub async fn open(
         agent: &AgentId,
         model: ModelContext,
-        provider: Box<dyn ProviderContext>,
+        provider: Option<Box<dyn ProviderContext>>,
         store: &SessionStore,
     ) -> Result<Self, SessionError> {
         let OpenedHistory {
@@ -56,6 +59,15 @@ impl AgentContext {
             through,
             feed,
         })
+    }
+
+    /// The provider context serving the agent's model, unless the configuration
+    /// no longer has that model.
+    pub fn provider(&mut self) -> Result<&mut dyn ProviderContext, HarnessError> {
+        match &mut self.provider {
+            Some(provider) => Ok(provider.as_mut()),
+            None => Err(HarnessError::UnknownModel(self.model.profile.name.clone())),
+        }
     }
 
     /// The last journal sequence the history reflects.
@@ -115,7 +127,16 @@ impl AgentContext {
             .then_some(CompactionTrigger::Occupancy(tokens))
     }
 
-    pub fn contains_images(&self) -> bool {
+    /// Refused unless its model supports the images its history holds.
+    pub fn admits_images(&self) -> Result<(), HarnessError> {
+        let profile = &self.model.profile.profile;
+        match profile.supports_images || !self.contains_images() {
+            true => Ok(()),
+            false => Err(HarnessError::ImagesUnsupported(profile.model.clone())),
+        }
+    }
+
+    fn contains_images(&self) -> bool {
         self.projected
             .messages
             .iter()

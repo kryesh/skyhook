@@ -198,6 +198,19 @@ impl super::Journal {
             .reads
             .read(|db| db::child_jobs(db, parent, page, limit))?)
     }
+
+    /// The newest `limit` jobs `owner` created but those `except` names, in id
+    /// order, and how many older ones there are.
+    pub(crate) fn newest_jobs(
+        &self,
+        owner: &AgentId,
+        except: &[JobId],
+        limit: usize,
+    ) -> Result<(Vec<JobId>, usize), SessionError> {
+        Ok(self
+            .reads
+            .read(|db| db::newest_jobs(db, owner, except, limit))?)
+    }
 }
 
 #[cfg(test)]

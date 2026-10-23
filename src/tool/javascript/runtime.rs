@@ -2,51 +2,32 @@
 
 use std::sync::Arc;
 
-use rquickjs::{
-    AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise, context::intrinsic,
-    function::Async,
-};
-use serde::Deserialize;
+use rquickjs::{CatchResultExt, Function, Promise, function::Async};
 use serde_json::Value;
-use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::bridge::Outcome;
+use super::{
+    bridge::{Config, Failure, Finished, HostRequest, HostResponse, Presented, Returned},
+    engine,
+    errors::{JsError, bridge_error, javascript_error},
+    source::{MAX_SOURCE_BYTES, SubmittedSource},
+};
+
+use serde::{Deserialize, de::IgnoredAny};
 
 use crate::{
+    identity::JobId,
+    job::{
+        FieldPointer, JOB_VIEW_SCHEMAS, JobManager,
+        output::{fill_absent, presented_fields},
+    },
     media::ImageRef,
     tool::diagnostic::{Effects, FailureSite, Operation, Subject},
     tool::executor::{InvocationKind, ToolExecutor, failure_response},
-    tool::{ToolContext, ToolError, ToolOutput},
+    tool::output::FieldPresentation,
+    tool::registry::ResultSchema,
+    tool::{ToolContext, ToolError, ToolOutput, ToolResultPolicy},
 };
-
-const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum HostRequest {
-    Call { name: String, arguments: Value },
-    Receive,
-}
-
-#[derive(Debug, Error)]
-enum JsError {
-    #[error("JavaScript source exceeds the {MAX_SOURCE_BYTES}-byte limit")]
-    SourceTooLarge,
-    #[error("QuickJS initialization failed: {0}")]
-    Initialization(String),
-    #[error("QuickJS execution failed: {0}")]
-    Execution(String),
-    #[error("QuickJS execution was cancelled")]
-    Cancelled,
-    #[error("{message}")]
-    Failure {
-        message: String,
-        details: Option<Value>,
-    },
-    #[error("JavaScript returned invalid JSON: {0}")]
-    InvalidOutput(String),
-}
 
 /// Execute into the owning job's capture; native callers hydrate only when collecting the job.
 pub(crate) async fn evaluate_captured(
@@ -115,44 +96,6 @@ fn console_failure(error: ToolError, operation: Operation, effects: Effects) -> 
         .effects(effects)
 }
 
-fn javascript_error(error: JsError) -> ToolError {
-    let (operation, subject, effects) = match &error {
-        JsError::SourceTooLarge => (
-            Operation::Validate,
-            "JavaScript source",
-            Effects::NotStarted,
-        ),
-        JsError::Initialization(_) => (
-            Operation::Prepare,
-            "JavaScript runtime",
-            Effects::NotStarted,
-        ),
-        JsError::Execution(_) | JsError::Cancelled => {
-            (Operation::Execute, "JavaScript source", Effects::Unknown)
-        }
-        JsError::Failure { .. } => (Operation::Execute, "JavaScript source", Effects::Started),
-        JsError::InvalidOutput(_) => (
-            Operation::Deserialize,
-            "JavaScript result",
-            Effects::OutputIncomplete,
-        ),
-    };
-    let error = match error {
-        JsError::Cancelled => ToolError::cancelled(),
-        JsError::Failure { message, details } => ToolError::with_output(
-            message,
-            super::result::script_output(Value::Null, details, None),
-        ),
-        error => ToolError::with_output(
-            error.to_string(),
-            super::result::script_output(Value::Null, None, None),
-        ),
-    };
-    error
-        .operation(operation, Subject::Label(subject.into()))
-        .effects(effects)
-}
-
 async fn evaluate_inner(
     source: String,
     executor: ToolExecutor,
@@ -162,74 +105,46 @@ async fn evaluate_inner(
     if source.len() > MAX_SOURCE_BYTES {
         return Err(javascript_error(JsError::SourceTooLarge));
     }
-    let runtime = AsyncRuntime::new()
-        .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
-    let cancellation = context.clone();
-    runtime
-        .set_interrupt_handler(Some(Box::new(move || cancellation.is_cancelled())))
-        .await;
-    let js_context = AsyncContext::builder()
-        .with::<intrinsic::Eval>()
-        .with::<intrinsic::Date>()
-        .with::<intrinsic::RegExpCompiler>()
-        .with::<intrinsic::RegExp>()
-        .with::<intrinsic::TypedArrays>()
-        .with::<intrinsic::Performance>()
-        .with::<intrinsic::Proxy>()
-        .with::<intrinsic::Promise>()
-        .with::<intrinsic::Json>()
-        .with::<intrinsic::MapSet>()
-        .build_async(&runtime)
+    let (_runtime, js_context) = engine::create(&context)
         .await
+        .map_err(|error| javascript_error(JsError::Initialization(error)))?;
+    let surface = executor.surface_for_agent(context.agent());
+    let source = SubmittedSource::new(&source);
+    let config = Config {
+        builders: surface.script_manifests(),
+        source: source.layout(),
+    };
+    let config = serde_json::to_string(&config)
         .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
-    let surface = Arc::new(executor.surface_for_agent(context.agent()));
-    let builders = surface.script_manifests();
-    let builders = serde_json::to_string(&builders)
-        .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
-    let script = wrapper_script(&source, &builders);
-    let marker_end = script
-        .find(USER_SOURCE_MARKER)
-        .expect("script wrapper contains its source marker")
-        + USER_SOURCE_MARKER.len();
-    let user_start_line = script[..marker_end]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1;
-    let user_line_count = source.lines().count().max(1);
     let images = Arc::new(Mutex::new(Vec::<ImageRef>::new()));
     let returned_images = images.clone();
     let cancelled = context.clone();
+    let calls = tokio_util::task::TaskTracker::new();
+    let host_calls = calls.clone();
+    let submitted = &source;
     let execution = js_context.async_with(async move |js| {
         let sleep_context = context.clone();
+        // The runtime's `sleep` admits only delays a JavaScript timer accepts.
         let sleep = Function::new(js.clone(), Async(move |milliseconds: f64| {
             let context = sleep_context.clone();
             async move {
-                if !milliseconds.is_finite() || milliseconds < 0.0 {
-                    return Err(bridge_error(&"sleep(ms) requires finite nonnegative milliseconds"));
-                }
                 let duration = std::time::Duration::try_from_secs_f64(milliseconds / 1000.0)
-                    .map_err(|_| bridge_error(&"sleep(ms) requires finite nonnegative milliseconds within the supported timer range"))?;
-                let deadline = tokio::time::Instant::now().checked_add(duration)
-                    .ok_or_else(|| bridge_error(&"sleep(ms) exceeds the supported timer range"))?;
-                tokio::select! {
+                    .map_err(|error| bridge_error(&error))?;
+                // Whether the delay elapsed, rather than cancellation ending it.
+                Ok::<_, rquickjs::Error>(tokio::select! {
                     biased;
-                    () = context.cancelled() => Err(bridge_error(&"sleep was cancelled")),
-                    () = tokio::time::sleep_until(deadline) => Ok(()),
-                }
+                    () = context.cancelled() => false,
+                    () = tokio::time::sleep(duration) => true,
+                })
             }
         }))
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-        js.globals().set("sleep", sleep).map_err(|error| JsError::Initialization(error.to_string()))?;
         let log = Function::new(js.clone(), move |text: String| {
             console.lock().expect("console lock poisoned").write_text(&format!("{text}\n")).map_err(|error| {
                 bridge_error(&console_failure(error.into(), Operation::WriteCapture, Effects::OutputIncomplete))
             })
         })
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-        js.globals()
-            .set("__skyhookConsoleLog", log)
-            .map_err(|error| JsError::Initialization(error.to_string()))?;
         let host_context = context.clone();
         let host_executor = executor.clone();
         let host_images = images.clone();
@@ -243,7 +158,7 @@ async fn evaluate_inner(
                 let host_executor = host_executor.clone();
                 let host_images = host_images.clone();
                 let surface = surface.clone();
-                async move {
+                host_calls.track_future(async move {
                     let request: HostRequest =
                         serde_json::from_str(&request).map_err(|error| bridge_error(&error))?;
                     let response = match request {
@@ -254,11 +169,11 @@ async fn evaluate_inner(
                             let failed =
                                 |error| failure_response(error, host_context.diagnostic_viewer());
                             // Native schemas describe only envelope.result.
-                            let mut policy = crate::tool::ToolResultPolicy::Value;
+                            let mut policy = ToolResultPolicy::Value;
                             let created = host_executor
                                 .create(InvocationKind::Script, host_context.agent().clone(),
                                     &name,
-                                    arguments,
+                                    Value::Object(arguments),
                                     parent,
                                 )
                                 .await;
@@ -275,28 +190,18 @@ async fn evaluate_inner(
                                 }
                                 Err(error) => failed(error),
                             };
-                            let presented_fields = crate::job::output::presented_fields;
-                            let mut presented = std::collections::BTreeMap::new();
-                            match policy {
-                                // The response keeps its error and questions whole,
-                                // and its result what the tool's schema declares.
-                                crate::tool::ToolResultPolicy::Value => {
-                                    let root = crate::job::FieldPointer::root();
-                                    let response = &crate::job::views::JOB_VIEW_SCHEMAS.response;
-                                    presented.extend(presented_fields(&output.value, &root, response));
-                                    let result = surface.get(&name).and_then(|tool| tool.result_schema.as_ref());
-                                    if let (Some(result), Some(value)) = (result, output.value.get("result")) {
-                                        let field = crate::job::FieldPointer::result();
-                                        presented.extend(presented_fields(value, &field, result.schema()));
-                                    }
-                                }
-                                // Job views and bare envelopes are presentations already.
-                                crate::tool::ToolResultPolicy::JobView | crate::tool::ToolResultPolicy::Nothing => {
-                                    presented.insert(crate::job::FieldPointer::root(), crate::tool::output::FieldPresentation::Complete);
-                                }
-                            }
                             host_images.lock().await.extend(output.images);
-                            Outcome::Ok { value: output.value, presented }
+                            let inspected = match policy {
+                                ToolResultPolicy::JobView => inspected_schema(host_executor.jobs(), &output.value).await,
+                                ToolResultPolicy::Value | ToolResultPolicy::Nothing => None,
+                            };
+                            let declared = surface.get(&name).and_then(|tool| tool.result_schema.as_ref());
+                            let result = match policy {
+                                ToolResultPolicy::Value => declared.map(ResultSchema::schema),
+                                ToolResultPolicy::JobView => inspected.as_deref(),
+                                ToolResultPolicy::Nothing => None,
+                            };
+                            script_view(output.value, policy, result)
                         }
                         HostRequest::Receive => {
                             drop(issuing);
@@ -306,54 +211,70 @@ async fn evaluate_inner(
                                 Err(error) => Err(error.to_string()),
                             };
                             match result {
-                                Ok(value) => Outcome::Ok { value, presented: std::collections::BTreeMap::new() },
-                                Err(error) => Outcome::Failed { error },
+                                Ok(value) => HostResponse::Ok { value, presented: Presented::new() },
+                                Err(error) => HostResponse::Failed { error },
                             }
                         }
                     };
                     serde_json::to_string(&response).map_err(|error| bridge_error(&error))
-                }
+                })
             }),
         )
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-        js.globals()
-            .set("__skyhookHostCall", host_call)
+        let entry = engine::load(&js).map_err(JsError::Initialization)?;
+        let export = |name| entry.get::<_, Function>(name)
+            .catch(&js)
+            .map_err(|error| JsError::Initialization(error.to_string()));
+        let (install, run, fail) = (export("install")?, export("run")?, export("fail")?);
+        let config = js.json_parse(config)
+            .catch(&js)
             .map_err(|error| JsError::Initialization(error.to_string()))?;
-        let promise = js
-            .eval::<Promise<'_>, _>(script)
+        install.call::<_, ()>((config, host_call, sleep, log))
             .catch(&js)
-            .map_err(|error| JsError::Execution(error.to_string()))?;
-        promise
-            .into_future::<String>()
-            .await
-            .catch(&js)
-            .map_err(|error| JsError::Execution(error.to_string()))
+            .map_err(|error| JsError::Initialization(error.to_string()))?;
+        let failed = |error: rquickjs::CaughtError<'_>| JsError::Execution(error.to_string());
+        let thrown = |error| match error {
+            rquickjs::Error::Exception => {
+                let encoded: String = fail.call((js.catch(),)).catch(&js).map_err(failed)?;
+                serde_json::from_str::<Failure>(&encoded).map_err(|error| JsError::InvalidOutput(error.to_string()))
+            }
+            error => Err(JsError::Execution(error.to_string())),
+        };
+        let module = match submitted.declare(&js) {
+            Ok(module) => module,
+            Err(error) => return Err(JsError::Syntax(thrown(error)?.message)),
+        };
+        let body = match SubmittedSource::instantiate(module).await {
+            Ok(body) => body,
+            // Only input that closes the wrapper early runs anything before the body.
+            Err(error) => {
+                let failure = Some(thrown(error)?);
+                return Ok(Finished { returned: Returned::default(), failure });
+            }
+        };
+        let promise: Promise = run.call((body,)).catch(&js).map_err(failed)?;
+        let encoded: String = promise.into_future().await.catch(&js).map_err(failed)?;
+        serde_json::from_str(&encoded).map_err(|error| JsError::InvalidOutput(error.to_string()))
     });
-    let result = execution.await;
+    let result = tokio::select! {
+        biased;
+        result = execution => result,
+        () = cancelled.cancelled() => Err(JsError::Cancelled),
+    };
     if cancelled.is_cancelled() {
+        // Cancellation interrupts JavaScript and ends the calls in flight. The
+        // script may settle first, or await what can no longer settle; either way
+        // its calls are driven to their end, so none outlives it.
+        calls.close();
+        js_context.async_with(async |_| calls.wait().await).await;
         return Err(javascript_error(JsError::Cancelled));
     }
-    let encoded = result.map_err(|error| {
-        javascript_error(match error {
-            JsError::Execution(message) => {
-                JsError::Execution(map_script_lines(&message, user_start_line, user_line_count))
-            }
-            error => error,
-        })
-    })?;
-    let envelope: Outcome<Value> = serde_json::from_str(&encoded)
-        .map_err(|error| javascript_error(JsError::InvalidOutput(error.to_string())))?;
-    let (value, presented) = match envelope {
-        Outcome::Ok { value, presented } => (value, presented),
-        Outcome::Failed { error: mut details } => {
-            map_failure_stack_lines(&mut details, user_start_line, user_line_count);
-            let (message, details) = failure_parts(details);
-            return Err(javascript_error(JsError::Failure {
-                message: map_script_lines(&message, user_start_line, user_line_count),
-                details,
-            }));
-        }
-    };
+    let Finished { returned, failure } = result.map_err(javascript_error)?;
+    if let Some(failure) = failure {
+        let returned = Box::new(returned);
+        return Err(javascript_error(JsError::Failure { failure, returned }));
+    }
+    let Returned { value, presented } = returned;
     let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
@@ -362,90 +283,65 @@ async fn evaluate_inner(
         .with_presented(presented.into_iter().collect()))
 }
 
-/// The error text, once: a thrown error's message and then its stack, or the
-/// thrown value's JSON. Only a thrown error's other properties remain as details.
-fn failure_parts(details: Value) -> (String, Option<Value>) {
-    match details {
-        Value::Object(mut error) if error.get("message").is_some_and(Value::is_string) => {
-            let Some(Value::String(mut message)) = error.shift_remove("message") else {
-                unreachable!("checked above")
-            };
-            if let Some(Value::String(stack)) = error.shift_remove("stack")
-                && !stack.is_empty()
-            {
-                message.push('\n');
-                message.push_str(&stack);
+/// A response as scripts see it: with the presentations its schemas declare, and
+/// each member they declare but it lacks as `null`. `result` is the schema its
+/// result follows, when known.
+fn script_view(mut value: Value, policy: ToolResultPolicy, result: Option<&Value>) -> HostResponse {
+    let schemas = &JOB_VIEW_SCHEMAS;
+    let mut presented = Presented::new();
+    let view = match policy {
+        // The response keeps its error and questions whole, and its result what
+        // the tool's schema declares.
+        ToolResultPolicy::Value => {
+            presented.extend(presented_fields(
+                &value,
+                &FieldPointer::root(),
+                &schemas.response,
+            ));
+            if let (Some(schema), Some(result)) = (result, value.get("result")) {
+                presented.extend(presented_fields(result, &FieldPointer::result(), schema));
             }
-            (message, (!error.is_empty()).then_some(Value::Object(error)))
+            &schemas.response
         }
-        details => (details.to_string(), None),
+        // Job views and bare envelopes are presentations already.
+        ToolResultPolicy::Nothing => {
+            presented.insert(FieldPointer::root(), FieldPresentation::Complete);
+            &schemas.response
+        }
+        ToolResultPolicy::JobView => {
+            presented.insert(FieldPointer::root(), FieldPresentation::Complete);
+            &schemas.one
+        }
+    };
+    if let (Some(schema), Some(result)) = (result, value.get_mut("result")) {
+        fill_absent(result, schema);
     }
+    fill_absent(&mut value, view);
+    HostResponse::Ok { value, presented }
 }
 
-fn bridge_error(error: &impl ToString) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message("host request", "JavaScript promise", error.to_string())
-}
-
-const USER_SOURCE_MARKER: &str = "// __skyhook_user_source__\n";
-
-// Only exception stacks belong to this wrapper. Nested JobViews and partial
-// outputs remain untouched, even if they contain similar location text.
-fn map_failure_stack_lines(details: &mut Value, user_start: usize, user_lines: usize) {
-    match details {
-        Value::Object(error) => {
-            if let Some(Value::String(stack)) = error.get_mut("stack") {
-                *stack = map_script_lines(stack, user_start, user_lines);
-            }
-            if let Some(cause) = error.get_mut("cause") {
-                map_failure_stack_lines(cause, user_start, user_lines);
-            }
-        }
-        Value::Array(errors) => {
-            for error in errors {
-                map_failure_stack_lines(error, user_start, user_lines);
-            }
-        }
-        _ => {}
+/// The schema an inspected job's result follows, when the view shows it whole: a
+/// preview or page may stub members, so their absence there is unknown.
+async fn inspected_schema(jobs: &JobManager, view: &Value) -> Option<Arc<Value>> {
+    #[derive(Deserialize)]
+    struct Inspected {
+        id: JobId,
+        presentation: Option<Shown>,
     }
-}
-
-fn map_script_lines(error: &str, user_start: usize, user_lines: usize) -> String {
-    let user_end = user_start.saturating_add(user_lines.saturating_sub(1));
-    let mut output = String::with_capacity(error.len());
-    let mut remaining = error;
-    while let Some((prefix, after)) = remaining.split_once("eval_script:") {
-        output.push_str(prefix);
-        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-        let line = after[..digits].parse::<usize>().ok();
-        if let Some(line) = line.filter(|line| (*line >= user_start) && (*line <= user_end)) {
-            output.push_str("skyhook-script:");
-            output.push_str(&(line - user_start + 1).to_string());
-        } else {
-            output.push_str("eval_script:");
-            output.push_str(&after[..digits]);
-        }
-        remaining = &after[digits..];
+    #[derive(Deserialize)]
+    struct Shown {
+        preview: Option<IgnoredAny>,
+        truncated: Option<IgnoredAny>,
     }
-    output.push_str(remaining);
-    output
-}
-
-pub(super) fn wrapper_script(source: &str, builders: &str) -> String {
-    let runtime = include_str!("runtime.js");
-    format!(
-        "const __builders = {builders};\n{runtime}\n\
-         (async () => {{\n\
-         \"use strict\";\n\
-         try {{\n\
-         const value = await (async () => {{\n\
-         {USER_SOURCE_MARKER}{source}\n\
-         }})();\n\
-         const presented = {{}};\n\
-         const resolved = await __resolve(value, \"$\", new Set(), \"/result/value\", presented);\n\
-         return __stringify({{outcome:\"ok\", value:resolved, presented}});\n\
-         }} catch (error) {{ return __stringify({{outcome:\"failed\", error:__describeError(error)}}); }}\n\
-         }})()\n"
-    )
+    let view = Inspected::deserialize(view).ok()?;
+    let whole = view
+        .presentation
+        .is_none_or(|shown| shown.preview.is_none() && shown.truncated.is_none());
+    jobs.output_schema(view.id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|_| whole)
 }
 
 #[cfg(test)]
@@ -527,9 +423,9 @@ mod tests {
         let output = plain(
             r#"
             const errors = [];
-            for (const milliseconds of [-1, NaN, Infinity, Number.MAX_VALUE]) {
+            for (const milliseconds of [-1, NaN, Infinity, 2 ** 31, "10"]) {
                 try { await sleep(milliseconds); throw new Error("invalid sleep admitted"); }
-                catch (error) { errors.push(String(error).includes("sleep(ms)")); }
+                catch (error) { errors.push(error instanceof TypeError && error.message.startsWith("sleep(ms)")); }
             }
             await sleep(0);
             return errors;
@@ -537,34 +433,50 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(output.value["value"], json!([true, true, true, true]));
+        assert_eq!(output.value["value"], json!([true, true, true, true, true]));
     }
 
     #[tokio::test]
-    async fn sleep_stops_on_cancellation_and_unawaited_sleep_does_not_keep_a_script_alive() {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let mut builder = ToolRegistryBuilder::default();
-        let notify = entered.clone();
-        builder
-            .register_product::<crate::tool::registry::Arguments, Value, _, _>(
-                "entered",
-                "",
-                ToolOptions::default(),
-                move |_, _| {
-                    notify.notify_one();
-                    async { Ok(ToolOutput::default()) }
-                },
-            )
-            .unwrap();
-        let (_scope, executor, context) = test_runtime(builder).await;
-        let cancellation = context.cancellation_token();
-        let source = "await tool.entered({}); await sleep(60000); return 'finished';";
-        let (result, ()) = tokio::join!(evaluate(source, executor, context), async {
-            bounded(entered.notified()).await;
-            cancellation.cancel();
-        });
-        assert_eq!(result.unwrap_err().diagnostic().cause, Cause::Cancelled);
-        // Far below the script's sleep, yet generous under load.
+    async fn cancellation_stops_sleep_and_pending_promises_without_keeping_unawaited_work_alive() {
+        // Cancellation ends the script only once a call in flight has ended, both
+        // when the script settles first and when it awaits what never settles.
+        for source in [
+            "await Promise.all([sleep(60000), tool.entered({})]); return 'finished';",
+            "await new Promise(() => { tool.entered({}).then(() => {}); });",
+        ] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut builder = ToolRegistryBuilder::default();
+            let (notify, end) = (entered.clone(), ended.clone());
+            builder
+                .register_product::<crate::tool::registry::Arguments, Value, _, _>(
+                    "entered",
+                    "",
+                    ToolOptions::default(),
+                    move |context, _| {
+                        notify.notify_one();
+                        let end = end.clone();
+                        async move {
+                            context.cancelled().await;
+                            tokio::task::yield_now().await;
+                            end.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(ToolOutput::default())
+                        }
+                    },
+                )
+                .unwrap();
+            let (_scope, executor, context) = test_runtime(builder).await;
+            let cancellation = context.cancellation_token();
+            let (result, ()) = bounded(async {
+                tokio::join!(evaluate(source, executor, context), async {
+                    bounded(entered.notified()).await;
+                    cancellation.cancel();
+                })
+            })
+            .await;
+            assert_eq!(result.unwrap_err().diagnostic().cause, Cause::Cancelled);
+            assert!(ended.load(std::sync::atomic::Ordering::SeqCst), "{source}");
+        }
         let unawaited = bounded(plain("sleep(60000); return 'finished';"));
         assert_eq!(unawaited.await.unwrap().value["value"], "finished");
     }
@@ -596,7 +508,7 @@ mod tests {
         let responses = output.value["value"].as_array().unwrap();
         assert_eq!(responses.len(), 3);
         for response in responses {
-            assert_eq!(response, &json!({"result":"a"}));
+            assert_eq!(response["result"], "a");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -666,35 +578,43 @@ return {full, extracted};";
             )
             .unwrap();
         let (_scope, executor, context) = test_runtime(builder).await;
+        let unavailable = executor
+            .create(
+                InvocationKind::Script,
+                context.agent().clone(),
+                "script",
+                json!({"source": "return null;"}),
+                Some(context.job()),
+            )
+            .await
+            .err()
+            .expect("script is unavailable even to direct bridge calls");
+        let unavailable = failure_response(unavailable, context.diagnostic_viewer()).value;
+        assert_eq!(unavailable["state"], "failed");
+        assert!(unavailable.get("id").is_none());
+        assert!(unavailable.get("meta").is_none());
+        assert!(
+            unavailable["error"]
+                .as_str()
+                .unwrap()
+                .contains("not available in scripts")
+        );
         let source = r#"
-const direct = JSON.parse(await __skyhookHostCall(JSON.stringify({
-  type: "call",
-  name: "script",
-  arguments: {source: "return null;", name: "nested"},
-})));
 const deniedResponse = await tool.deny({value:"x"});
 let denied;
 try { deniedResponse.unwrap(); } catch (error) {
   denied = {code:error.code, job:error.job, message:error.message,
             output:error.output ?? null, sameResponse:error.response === deniedResponse};
 }
-return {visible: typeof tool.script, direct, deniedResponse, denied};
+const imported = await import("skyhook:tools").then(() => true, () => false);
+return {visible: typeof tool.script, imported, deniedResponse, denied};
 "#;
         let output = evaluate(source, executor.clone(), context.clone())
             .await
             .unwrap();
         let value = &output.value["value"];
         assert_eq!(value["visible"], "undefined");
-        assert_eq!(value["direct"]["outcome"], "ok");
-        assert_eq!(value["direct"]["value"]["state"], "failed");
-        assert_eq!(value["direct"]["value"].get("id"), None);
-        assert_eq!(value["direct"]["value"].get("meta"), None);
-        assert!(
-            value["direct"]["value"]["error"]
-                .as_str()
-                .unwrap()
-                .contains("not available in scripts")
-        );
+        assert_eq!(value["imported"], false);
         assert_eq!(value["deniedResponse"]["state"], "failed");
         // A returned response keeps its error whole in the script's presentation.
         let error: crate::job::FieldPointer = "/result/value/deniedResponse/error".parse().unwrap();
@@ -744,7 +664,9 @@ const tasks = values.map(value => async () => {
   return value * 3;
 });
 for await (const result of new WorkPool(2).run(tasks)) settled.push(result);
-return {values, pooled, settled};
+let rejected = false;
+try { new WorkPool(1).map(values, null); } catch (error) { rejected = error instanceof TypeError; }
+return {values, pooled, settled, rejected};
 "#,
         )
         .await
@@ -754,7 +676,8 @@ return {values, pooled, settled};
             json!({
                 "values": [2, 3],
                 "pooled": [{ "index":0, "value":4 }, { "index":1, "value":6 }],
-                "settled": [{"index":0,"value":6}]
+                "settled": [{"index":0,"value":6}],
+                "rejected": true,
             })
         );
         let output = plain(
@@ -791,57 +714,101 @@ return {first, second, started};
     }
 
     #[tokio::test]
-    async fn script_failure_stack_and_summary_use_submitted_source_lines() {
-        for (source, line) in [
-            ("\n\nawait Promise.resolve();\nthrow new Error('boom');", 4),
+    async fn script_failures_report_submitted_source_positions_only() {
+        for (source, expected) in [
+            (
+                "throw new TypeError('boom');",
+                "TypeError: boom at <anonymous> (skyhook-script:1:11)",
+            ),
             (
                 "\n\nfunction fail() {\n  throw new Error('boom');\n}\nfail();",
-                4,
+                "boom at fail (skyhook-script:4:13) at <anonymous> (skyhook-script:6:1)",
             ),
             (
-                "\n\nthrow new Error('outer', {cause:new Error('inner')});",
-                3,
+                "return {nested: {stdout: undefined}};",
+                "the returned value has undefined at $.nested.stdout",
+            ),
+            // A failing getter does not replace the error that was thrown.
+            (
+                "const error = new Error('primary'); Object.defineProperty(error, 'hostile', \
+                 {enumerable:true, get() {throw new Error('secondary');}}); throw error;",
+                "primary at <anonymous> (skyhook-script:1:19)",
             ),
         ] {
-            let (diagnostic, Some(output)) = plain(source).await.unwrap_err().into_parts() else {
-                panic!("expected JavaScript failure output");
-            };
-            let Cause::Message(message) = diagnostic.cause else {
-                panic!("expected JavaScript failure");
-            };
-            // The message and stack appear once, in the error; only other
-            // properties of the thrown error remain as failure details.
-            assert!(
-                message.contains(&format!("skyhook-script:{line}:")),
-                "{message}"
+            let (diagnostic, _) = plain(source).await.unwrap_err().into_parts();
+            assert_eq!(diagnostic.context.effects, Effects::Unknown, "{source}");
+            assert_eq!(
+                diagnostic.cause,
+                Cause::Message(expected.into()),
+                "{source}"
             );
-            let failure = output.value.get("failure");
-            assert_eq!(failure.is_some(), source.contains("cause"));
-            if let Some(failure) = failure {
-                let cause = failure["cause"]["stack"].as_str().unwrap();
-                assert!(cause.contains(&format!("skyhook-script:{line}:")));
-                assert_eq!(failure.as_object().unwrap().len(), 1);
-            }
         }
-        let (diagnostic, Some(_)) = plain("\n\nconst value = ;").await.unwrap_err().into_parts()
+        // Only the thrown error's other properties remain as failure details, and
+        // only an exception's own stack is filtered.
+        let source = "const error = new Error('outer', {cause:new Error('inner')}); \
+                      error.output = {stack:'data'}; throw error;";
+        let (_, Some(output)) = plain(source).await.unwrap_err().into_parts() else {
+            panic!("expected JavaScript failure output");
+        };
+        assert_eq!(
+            output.value["failure"],
+            json!({"output": {"stack":"data"}, "cause": {"name":"Error", "message":"inner",
+                   "stack":"    at <anonymous> (skyhook-script:1:45)"}})
+        );
+        // A returned value that does not convert keeps what did.
+        let (_, Some(output)) = plain("return {kept: 1, nested: {stdout: undefined}};")
+            .await
+            .unwrap_err()
+            .into_parts()
         else {
-            panic!("expected JavaScript syntax failure output");
+            panic!("expected JavaScript failure output");
         };
-        let Cause::Message(message) = diagnostic.cause else {
-            panic!("expected JavaScript syntax failure");
-        };
-        assert!(message.contains("skyhook-script:3:"), "{message}");
+        assert_eq!(
+            output.value["value"],
+            json!({"kept":1, "nested":{"stdout":null}})
+        );
+        // Input that closes the wrapper runs before the body, not at compilation.
+        let diagnostic = plain("}); throw new Error('escaped'); (0, async () => {")
+            .await
+            .unwrap_err()
+            .diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Execute);
+        assert_eq!(diagnostic.context.effects, Effects::Unknown);
+        for (source, location) in [
+            ("\n\nconst value = ;", "skyhook-script:3:15"),
+            ("if (true) {", "end of source"),
+        ] {
+            let diagnostic = plain(source).await.unwrap_err().diagnostic();
+            assert_eq!(diagnostic.context.operation, Operation::Validate);
+            assert_eq!(diagnostic.context.effects, Effects::NotStarted);
+            assert!(
+                matches!(&diagnostic.cause, Cause::Message(message)
+                    if message.starts_with("SyntaxError: ") && message.ends_with(&format!("at {location}"))),
+                "{diagnostic:?}"
+            );
+        }
         // A host script's failure is its execution's, at the host.
         let runtime = TestRuntime::new().await;
         let (executor, _slot) =
             crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
-        let source = json!({"source": "return {nested:undefined};"});
+        let source = json!({"source": "return {nested:NaN};"});
         let failed = executor.run_host(&runtime.agent, "script", source).await;
         let diagnostic = failed.unwrap_err().diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::Execute);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
         assert!(
-            matches!(&diagnostic.cause, Cause::Message(message) if message.contains("undefined at $.nested"))
+            matches!(&diagnostic.cause, Cause::Message(message) if message.contains("a non-finite number at $.nested"))
+        );
+    }
+
+    #[tokio::test]
+    async fn console_replaces_unpaired_surrogates() {
+        let output = plain(r"console.log('\uD800', new Error('\uDC00')); return 1;")
+            .await
+            .unwrap();
+        assert_eq!(
+            output.value["console"],
+            "\u{fffd} \u{fffd}\n    at <anonymous> (skyhook-script:1:27)\n"
         );
     }
 
@@ -870,8 +837,11 @@ return {first, second, started};
         // One primary with failure details and one without any output.
         for error in [
             javascript_error(JsError::Failure {
-                message: "primary failure".into(),
-                details: Some(json!({"job": 3})),
+                failure: Failure {
+                    message: "primary failure".into(),
+                    details: Some(serde_json::Map::from_iter([("job".into(), json!(3))])),
+                },
+                returned: Box::default(),
             }),
             javascript_error(JsError::Cancelled),
         ] {
@@ -912,36 +882,11 @@ return {first, second, started};
         assert_eq!(output.unwrap().value, json!({"value":{"computed":42}}));
     }
 
-    #[test]
-    fn script_line_mapping_preserves_nested_tool_responses_and_partial_output() {
-        let response = json!({
-            "state": "failed",
-            "error": "eval_script:102: child failure",
-            "result": {"stack": "eval_script:102:"},
-            "meta": {"target": "remote", "code": "permission_denied"},
-        });
-        let mut details = json!({
-            "message": "failed",
-            "stack": "at eval_script:102:4\nat eval_script:9:1",
-            "cause": {"stack": "at eval_script:103:5"},
-            "response": response,
-            "output": response["result"],
-        });
-        map_failure_stack_lines(&mut details, 100, 5);
-        assert_eq!(
-            details["stack"],
-            "at skyhook-script:3:4\nat eval_script:9:1"
-        );
-        assert_eq!(details["cause"]["stack"], "at skyhook-script:4:5");
-        assert_eq!(details["response"], response);
-        assert_eq!(details["output"], response["result"]);
-    }
-
     // Standalone wrapper regressions: no executor, jobs, or external processes are needed.
     const BUILDERS: &str = r#"[
-    {"binding":"top_level","name":"echo","properties":["value"],"required":["value"]},
-    {"binding":"job_method","name":"job_send","method":"send","job_argument":"job","properties":["job","value"],"required":["value"]},
-    {"binding":"job_method","name":"job_cancel","method":"cancel","job_argument":"job","properties":["job"],"required":[]}
+    {"binding":"top_level","name":"echo","properties":["value"]},
+    {"binding":"job_method","name":"job_send","method":"send","job_argument":"job","properties":["value"]},
+    {"binding":"job_method","name":"job_cancel","method":"cancel","job_argument":"job","properties":[]}
 ]"#;
 
     const MOCK_HOST: &str = r#"
@@ -974,22 +919,47 @@ function __skyhookConsoleLog(message) {
             ctx.eval::<(), _>(MOCK_HOST)
                 .catch(&ctx)
                 .expect("install mock host");
-            let promise: Promise = ctx
-                .eval(wrapper_script(source, BUILDERS))
+            let entry = engine::load(&ctx).expect("load runtime modules");
+            let install: Function = entry.get("install").unwrap();
+            let run: Function = entry.get("run").unwrap();
+            let source = SubmittedSource::new(source);
+            let layout = serde_json::to_string(source.layout()).unwrap();
+            let config = ctx
+                .json_parse(format!(r#"{{"builders":{BUILDERS},"source":{layout}}}"#))
+                .unwrap();
+            let host: Function = ctx.eval("request => __skyhookHostCall(request)").unwrap();
+            let sleep: Function = ctx.eval("() => Promise.resolve(true)").unwrap();
+            let log: Function = ctx.eval("text => __skyhookConsoleLog(text)").unwrap();
+            install
+                .call::<_, ()>((config, host, sleep, log))
                 .catch(&ctx)
-                .expect("evaluate wrapper before watchdog deadline");
+                .unwrap();
+            let (module, evaluated) = source
+                .declare(&ctx)
+                .and_then(|module| module.eval())
+                .catch(&ctx)
+                .unwrap();
+            evaluated.finish::<()>().catch(&ctx).unwrap();
+            let body: Function = module.get("default").unwrap();
+            let promise: Promise = run
+                .call((body,))
+                .catch(&ctx)
+                .expect("evaluate body before watchdog deadline");
             let encoded: String = promise
                 .finish()
                 .catch(&ctx)
                 .expect("finish wrapper before watchdog deadline without pending host work");
-            let result: Value = serde_json::from_str(&encoded).expect("wrapper JSON result");
-            assert_eq!(result["outcome"], "ok", "wrapper failed: {result:#}");
-            result
+            serde_json::from_str(&encoded).expect("wrapper JSON result")
         })
     }
 
     fn evaluate_wrapper(source: &str) -> Value {
-        evaluate_wrapper_envelope(source)["value"].clone()
+        let result = evaluate_wrapper_envelope(source);
+        assert!(
+            result.get("failure").is_none(),
+            "wrapper failed: {result:#}"
+        );
+        result["value"].clone()
     }
 
     #[test]
@@ -1102,15 +1072,135 @@ return results;
         );
     }
 
-    /// Scripts see the JSON the model sees: a direct and an inspected result
-    /// have the same fields, and an absent one is an ordinary missing property.
+    #[test]
+    fn returns_await_thenables_convert_errors_and_report_each_unconvertible_member() {
+        let value = evaluate_wrapper(
+            r#"
+const error = new TypeError("bad", {cause: "why"});
+error.code = 7;
+return {
+  awaited: [Promise.resolve(1), (async () => ({inner: tool.echo({value: "nested"})}))(),
+            Object.assign(() => 0, {then: resolve => resolve(2)})],
+  error, text: "\uD800", "a.b": [null],
+};
+"#,
+        );
+        assert_eq!(
+            value,
+            json!({
+                "awaited": [1, {"inner": {"id":1, "state":"completed", "result":{"value":"nested"}}}, 2],
+                "error": {"code":7, "name":"TypeError", "message":"bad", "cause":"why"},
+                "text": "\u{fffd}",
+                "a.b": [null],
+            })
+        );
+        // Each member that does not convert is reported and kept as null.
+        let failed = evaluate_wrapper_envelope(
+            r#"
+const keys = new Error("keys");
+keys["\uD800"] = 1;
+let deep = [];
+for (let i = 0; i < 100; i++) deep = [deep];
+return {kept: 1, list: [1, , 2], a: {b: undefined}, "b.c": new Date(0), keys, deep,
+        get thrower() { throw new TypeError("boom"); },
+        odd: Object.create({constructor: {name: "\uD800"}}),
+        rejected: Promise.reject(new Error("no"))};
+"#,
+        );
+        let message = failed["failure"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(
+                r#"the returned value has undefined at $.list[1]; undefined at $.a.b; a Date at $["b.c"]; an unpaired surrogate in a key at $.keys; nesting deeper than 100 at $.deep[0][0][0][0][0][0][0][0][0][0][0][0][0][0]…; a throwing property"#
+            ),
+            "{message}"
+        );
+        for problem in [
+            "; a throwing property at $.thrower: TypeError: boom;",
+            "; a \u{fffd} at $.odd;",
+            "; a rejected promise at $.rejected: no",
+        ] {
+            assert!(message.contains(problem), "{problem}: {message}");
+        }
+        let value = &failed["value"];
+        for member in ["thrower", "odd", "rejected"] {
+            assert_eq!(value.get(member), Some(&Value::Null), "{member}");
+        }
+        assert_eq!(value["list"], json!([1, null, 2]));
+        assert_eq!(value["a"], json!({"b": null}));
+        assert_eq!(value["keys"], json!({"name":"Error", "message":"keys"}));
+        assert_eq!(value["kept"], 1);
+    }
+
+    #[test]
+    fn arguments_convert_when_a_builder_is_made() {
+        let result = evaluate_wrapper(
+            r#"
+const rejected = [];
+for (const make of [
+  () => tool.echo({value: [undefined]}),
+  () => tool.echo({value: tool.echo({value: 1})}),
+  () => tool.echo({value: "\uD800"}),
+  () => tool.echo([]),
+  () => tool.job(7).send({job: 8, value: 1}),
+  () => tool.job(7).send(Promise.resolve({value: 1})),
+  () => tool.job(7).cancel(new Date()),
+]) {
+  try { make(); rejected.push(null); } catch (error) { rejected.push(error.message); }
+}
+await tool.echo({value: {kept: 1, omitted: undefined}});
+return {rejected, calls: __testCalls};
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({
+                "rejected": [
+                    "tool.echo argument has undefined at $.value[0]",
+                    "tool.echo argument has an unawaited promise or tool call at $.value",
+                    "tool.echo argument has an unpaired surrogate at $.value",
+                    "tool.echo argument must be a plain object",
+                    "tool.job(id).send cannot override its bound job ID",
+                    "tool.job(id).send argument has an unawaited promise or tool call at $",
+                    "tool.job(id).cancel argument has a Date at $",
+                ],
+                "calls": [{"type":"call", "name":"echo", "arguments":{"value":{"kept":1}}}],
+            })
+        );
+    }
+
+    /// Each returned thenable continues as soon as it settles, so a branch may wait
+    /// on a call nested in another's resolved value; members keep their order.
+    #[test]
+    fn returned_branches_continue_independently_in_source_order() {
+        let envelope = evaluate_wrapper_envelope(
+            r#"
+const reply = __skyhookHostCall;
+let release;
+const gate = new Promise(resolve => { release = resolve; });
+__skyhookHostCall = async encoded => {
+  const {value} = JSON.parse(encoded).arguments;
+  if (value === "waits") await gate;
+  if (value === "releases") release();
+  return reply(encoded);
+};
+return {waits: tool.echo({value: "waits"}), nested: (async () => ({releases: tool.echo({value: "releases"})}))()};
+"#,
+        );
+        let value = &envelope["value"];
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["waits", "nested"]
+        );
+        assert_eq!(value["waits"]["result"]["value"], "waits");
+        assert_eq!(value["nested"]["releases"]["result"]["value"], "releases");
+    }
+
+    /// Scripts read a field a response's schemas declare but it lacks as `null`,
+    /// alike in a direct and an inspected result, while the model's view stays sparse.
     #[tokio::test]
-    async fn direct_and_inspected_results_share_one_sparse_shape() {
+    async fn scripts_read_declared_absent_fields_as_null() {
         let runtime = TestRuntime::new().await;
         tokio::fs::create_dir(runtime.root.path().join("listed"))
-            .await
-            .unwrap();
-        tokio::fs::write(runtime.root.path().join("listed/file"), "x")
             .await
             .unwrap();
         let (executor, _slot) =
@@ -1119,16 +1209,13 @@ return results;
             .run_model(&runtime.agent, "read", json!({"path":"listed"}))
             .await
             .unwrap();
+        let entries = &listed.output.value["result"]["entries"];
+        assert_eq!(entries.get("symlinks"), None, "{entries}");
         let source = format!(
             r#"
 const direct = await tool.read({{path:"listed"}});
-const inspected = (await tool.jobs({{job:{}}})).unwrap();
-const entries = direct.unwrap().entries;
-const absent = [direct.state, direct.id, entries.symlinks, inspected.entries.other]
-  .every(value => value === undefined);
-entries.symlinks ??= [];
-entries.symlinks.push("added");
-return {{direct:direct.result, inspected, absent, symlinks:entries.symlinks}};
+const inspected = await tool.jobs({{job:{}}});
+return {{direct, inspected, missing:direct.result.entries.symlinks === null}};
 "#,
             listed.job
         );
@@ -1136,15 +1223,50 @@ return {{direct:direct.result, inspected, absent, symlinks:entries.symlinks}};
             .await
             .output;
         let value = &output.value["result"]["value"];
-        assert_eq!(value["absent"], true, "{value}");
-        assert_eq!(value["symlinks"], json!(["added"]));
-        let mut direct = value["direct"].clone();
-        direct["entries"]
-            .as_object_mut()
-            .unwrap()
-            .remove("symlinks");
-        assert_eq!(direct, value["inspected"]);
-        assert_eq!(value["inspected"]["entries"]["files"][0]["name"], "file");
+        assert_eq!(value["missing"], true);
+        let groups = json!({"files":[], "directories":[], "symlinks":null, "other":null});
+        assert_eq!(value["direct"]["result"]["entries"], groups);
+        assert_eq!(value["direct"].get("id"), Some(&Value::Null));
+        assert_eq!(value["inspected"]["result"]["entries"], groups);
+        assert_eq!(value["inspected"].get("error"), Some(&Value::Null));
+    }
+
+    /// An inspected result fills from its own invocation's schema, here a JobView
+    /// rather than the listing the `jobs` tool declares, and only when shown whole.
+    #[tokio::test]
+    async fn inspected_results_fill_from_their_invocations_schema() {
+        let runtime = TestRuntime::new().await;
+        tokio::fs::create_dir(runtime.root.path().join("listed"))
+            .await
+            .unwrap();
+        let (executor, _slot) =
+            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let listed = executor
+            .run_model(&runtime.agent, "read", json!({"path":"listed"}))
+            .await
+            .unwrap();
+        let inspection = executor
+            .run_model(&runtime.agent, "jobs", json!({"job":listed.job}))
+            .await
+            .unwrap();
+        let source = format!(
+            "return (await tool.jobs({{job:{}}})).result;",
+            inspection.job
+        );
+        let output = script(&executor, &runtime.agent, source, false)
+            .await
+            .output;
+        let view = &output.value["result"]["value"];
+        assert_eq!(view.get("error"), Some(&Value::Null), "{view}");
+        assert_eq!(view.get("jobs"), None, "{view}");
+        let shown = |presentation: Value| json!({"id":listed.job, "presentation":presentation});
+        assert!(
+            inspected_schema(&runtime.jobs, &shown(json!({})))
+                .await
+                .is_some()
+        );
+        let truncated = shown(json!({"truncated":[{"field":"/result/entries"}]}));
+        assert!(inspected_schema(&runtime.jobs, &truncated).await.is_none());
     }
 
     #[test]

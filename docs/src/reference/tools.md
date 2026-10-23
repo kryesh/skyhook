@@ -9,21 +9,24 @@
 shell parsing: `exec({command: "cargo test 2>&1 | tail"})` or `exec({command: ["cargo", "test"]})`.
 
 `jobs()` lists the current agent's active jobs, excluding the listing call and its containing script.
-`jobs({all:true})` includes completed history, and the listing payload is in the envelope's `.result`.
+`jobs({all:true})` includes completed history. A listing returns `{jobs, older}`: the newest
+`limit` jobs (100 by default), oldest first, and how many older ones it left out, omitted when
+none were. The listing payload is in the envelope's `.result`.
 `jobs({job})` reads that job's saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
 [output selections](job-output.md#paging-searching-and-querying) `field` and `limit`, with
 `start`, `offset`, `pattern`, and `context` for text, or `index` and `query` for JSON.
-`all` cannot be combined with `job`, and selections require `job`. Scripts also control jobs with
-`tool.job(id).send({value})` and `.cancel()`.
+`all` cannot be combined with `job`, and the other selections require `job` unless they restate
+their defaults. Scripts also control jobs with `tool.job(id).send({value})` and `.cancel()`.
 
 Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view's `.result` is
-`{reason:"event"}` or `{reason:"timeout"}`. Omitted or null `timeout` waits indefinitely;
-a supplied timeout must be a positive integer number of seconds. An event does not guarantee a
-particular job has completed; inspect its current status. See
-[waiting for background work](../scripting/jobs-and-agents.md#waiting-for-background-work) for
-when a wait resolves.
+`{reason, waited_s}`: `reason` is `"event"`, `"timeout"` or `"cancelled"`, and `waited_s` counts the
+whole seconds waited. A cancelled wait is a failed view that still carries this result. Omitted or
+null `timeout` waits indefinitely; a supplied timeout must be a positive integer number of seconds.
+An event does not guarantee a particular job has completed; inspect its current status. See
+[waiting for background work](../scripting/jobs-and-agents.md#waiting-for-background-work) for when
+a wait resolves.
 
 See the [JavaScript response contract](javascript.md#responseunwrap-and-native-results) for
 `response.unwrap()`, serialization, and operational-failure behavior. In this reference,
@@ -33,7 +36,8 @@ See the [JavaScript response contract](javascript.md#responseunwrap-and-native-r
 ## Reading and replacing text
 
 `read({path})` reads only regular files. A file is text when it is valid UTF-8 without NUL bytes;
-any other file is attached if it is a supported image and rejected otherwise.
+any other file is attached if it decodes as a supported image (PNG, JPEG, GIF or WebP) and
+rejected otherwise.
 `replace({path, old, new, count?})` edits files of at most 4 MiB, both before and after the
 replacement.
 

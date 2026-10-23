@@ -21,6 +21,8 @@ crate::named_enum::named_enum! {
         RateLimited = "RateLimited",
         /// A retryable server-side failure: 5xx, overloaded, or an in-stream error.
         Unavailable = "Unavailable",
+        /// Skyhook's own work on the request failed, such as a panic: never retried.
+        Internal = "Internal",
     }
 }
 

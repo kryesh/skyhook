@@ -8,10 +8,10 @@ use skyhook::{
     config::{Config, ConfigError, ConfiguredModel, RuntimeConfig},
     fs::RegularFileError,
     identity::SessionId,
-    media::{Attachment, Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, classify},
+    media::{Attachment, Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, MediaError, classify},
     provider::profile::ModelRef,
     remote::{ArtifactError, EmbeddedShimCatalog},
-    session::{SessionError, SessionStore},
+    session::SessionError,
     tool::policy::{AllowAll, Capability, CapabilitySet, ModeName, Policy},
 };
 use std::{
@@ -34,6 +34,8 @@ pub(crate) enum AttachmentError {
     Unsupported(PathBuf),
     #[error("{0} is not a supported image")]
     NotImage(PathBuf),
+    #[error("{0}: {1}")]
+    InvalidImage(PathBuf, #[source] MediaError),
 }
 
 /// Read a workspace file as a prompt attachment: an image when its bytes are a
@@ -54,7 +56,10 @@ pub(crate) async fn read_attachment(
             RegularFileError::TooLarge { .. } => AttachmentError::TooLarge,
             error => AttachmentError::Read(path.clone(), error),
         })?;
-    match classify(bytes) {
+    let classified = classify(bytes)
+        .await
+        .map_err(|error| AttachmentError::InvalidImage(path.clone(), error))?;
+    match classified {
         Classified::Image(image) => Ok(Attachment::Image {
             file: Some(path),
             image,
@@ -139,8 +144,6 @@ pub enum LaunchError {
     Shims(#[from] ArtifactError),
     #[error(transparent)]
     Session(#[from] SessionError),
-    #[error("Model {0} is missing. Restore it in the configuration before resuming.")]
-    MissingModel(ModelRef),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -168,19 +171,9 @@ pub struct Launch {
 }
 impl Launch {
     pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, LaunchError> {
-        let mut model = self.model.clone();
-        if let Some(id) = resume {
-            let summary = SessionStore::summary(&self.sessions, id).await?;
-            if let Some(name) = summary.model {
-                model = self
-                    .model
-                    .config()
-                    .select_model(&name)
-                    .map_err(|_| LaunchError::MissingModel(name))?;
-            }
-        }
-        let capabilities = self.ceiling(model.config().config(), resume.is_some());
-        let builder = model.harness_builder(&self.workspace)?;
+        let config = self.model.config().config();
+        let capabilities = self.ceiling(config, resume.is_some());
+        let builder = self.model.harness_builder(&self.workspace)?;
         let builder = match &self.permissions {
             // A resumed session continues in its own mode, which may not be configured.
             Permissions::Mode(_) if resume.is_some() => builder,
@@ -193,8 +186,7 @@ impl Launch {
             .session_root(self.sessions.clone())
             .shim_catalog(self.catalog.clone())
             .capabilities(capabilities.clone());
-        let policy: Arc<dyn Policy> = match (&self.interaction, model.config().config().approve_all)
-        {
+        let policy: Arc<dyn Policy> = match (&self.interaction, config.approve_all) {
             (_, true) => Arc::new(AllowAll),
             (None, false) => Arc::new(HostApprovalPolicy::Unattended),
             (Some(ui), false) => Arc::new(HostApprovalPolicy::Attended {
@@ -363,43 +355,6 @@ mod tests {
             unknown.to_string(),
             "invalid model `test/removed`: model is not configured"
         );
-    }
-
-    #[tokio::test]
-    async fn resume_rebinds_recorded_name_and_reports_a_missing_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let config = history_config(None);
-        let session = launch(root.path(), &config)
-            .await
-            .create(None)
-            .await
-            .unwrap();
-        let id = session.id();
-        session.shutdown().await.unwrap();
-        drop(session);
-
-        let mut reloaded = config.config().clone();
-        let ProviderSettings::Compatible(provider) = &mut reloaded.providers["test"].settings
-        else {
-            panic!("compatible fixture");
-        };
-        let models = &mut provider.models;
-        let profile = models.shift_remove("test").unwrap();
-        models.insert("replacement".parse().unwrap(), profile);
-        let launch = launch(root.path(), &reloaded.into_runtime().unwrap()).await;
-        let Err(missing) = launch.create(Some(id)).await else {
-            panic!("a missing recorded model is reported");
-        };
-        assert!(
-            matches!(&missing, LaunchError::MissingModel(name) if name.to_string() == "test/test")
-        );
-        assert_eq!(
-            missing.to_string(),
-            "Model test/test is missing. Restore it in the configuration before resuming."
-        );
-        // A valid new selection remains usable; stale history is not silently
-        // rebound to that unrelated model.
-        launch.create(None).await.unwrap().shutdown().await.unwrap();
     }
 
     /// Sessions live under the selected workspace whatever the storage setting, and

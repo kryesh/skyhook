@@ -176,8 +176,9 @@ impl SessionHandle {
     /// Continue a failed or interrupted turn without duplicating its input,
     /// optionally on another model (a refusal is deterministic for a given
     /// request). Retained interrupted children restart first, and those stopped
-    /// before they began begin; a root still waiting on them is left alone and
-    /// woken by their ordinary completion.
+    /// before they began begin, whether or not the root's turn is then refused;
+    /// a root still waiting on them is left alone and woken by their ordinary
+    /// completion.
     pub async fn continue_turn_with(
         &self,
         options: Selection,
@@ -190,64 +191,36 @@ impl SessionHandle {
         self.running().await?;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
-        let (runtime, root) = (self.runtime.clone(), self.root.clone());
-        let selection_applied = options.model.is_some() || options.mode.is_some();
-        let (done, answer) = oneshot::channel();
+        let requested = options.model.is_some() || options.mode.is_some();
+        let runtime = self.runtime.clone();
         let restart = move |state: &CoreState| {
             let (running, restart) = runtime.jobs.continue_resumable(state);
             Ok::<_, HarnessError>(Plan::new(running, move |state, _| {
                 state.agents.set_flow(Flow::Open);
                 let resumed = restart(state);
                 // A held wait resumes with its children: busy as they restart.
-                let waiting = state.agents.turned(&Turn::Held);
-                for agent in &waiting {
-                    state
-                        .agents
-                        .get_mut(agent)
-                        .expect("listed agents run")
-                        .set_turn(Turn::Busy);
+                for agent in state.agents.turned(&Turn::Held) {
+                    let facts = state.agents.get_mut(&agent).expect("listed agents run");
+                    facts.set_turn(Turn::Busy);
                 }
-                // A root that stopped short of its answer goes on from where it did.
-                // A batch it holds is claimed here, so a later withdrawal finds it
-                // being submitted, and commits under this selection.
-                let held = (state.agents.get_mut(&root)).and_then(|facts| facts.held.take());
-                let retried = held.and_then(|held| held.retried(options.clone()));
-                let done = RequestCompletion::Root(done);
-                let sent = match retried {
-                    Some(batch) => state
-                        .agents
-                        .send(&root, AgentCommand::Retry { batch, done }),
-                    None => {
-                        let input = AgentCommand::Input {
-                            options,
-                            content: Vec::new(),
-                            done: Some(done),
-                        };
-                        super::agents::settle_held(state, &root) && state.agents.send(&root, input)
-                    }
-                };
-                let continued = sent.then_some(answer);
-                (resumed, continued)
+                resumed
             }))
         };
-        let continued = self.runtime.store.commit(Command::Continue, restart);
-        let (children_resumed, continued) = continued.await?;
-        // Child-only recovery deliberately leaves a live/waiting root request
-        // untouched. Its normal delivery path observes the replacement result.
-        // A model or mode change cannot apply here: only a continued root turn adopts
-        // one, so report it as unapplied rather than dropping it silently.
-        let Some(answer) = continued else {
-            return Ok(ContinueOutcome {
-                answer: None,
-                children_resumed,
-                selection_applied: false,
-            });
+        let children_resumed = self.runtime.store.commit(Command::Continue, restart);
+        let children_resumed = children_resumed.await?;
+        let (done, answer) = oneshot::channel();
+        let runtime = self.runtime.clone();
+        let claim = move |state: &mut CoreState| runtime.claim_root(state, options, done);
+        // Children alone resumed: a root still running or waiting on them is left
+        // alone, and the selection is not applied.
+        let answer = match self.runtime.store.live(claim).await? {
+            true => Some(answer.await.map_err(|_| HarnessError::AgentStopped)??),
+            false => None,
         };
-        let answer = answer.await.map_err(|_| HarnessError::AgentStopped)??;
         Ok(ContinueOutcome {
-            answer: Some(answer),
+            selection_applied: requested && answer.is_some(),
+            answer,
             children_resumed,
-            selection_applied,
         })
     }
 
@@ -257,11 +230,13 @@ impl SessionHandle {
         if !self.runtime.root_outdated(&self.root) {
             return Ok(());
         }
+        self.adopt(Selection::default()).await
+    }
+
+    /// Have the root adopt `options` between turns.
+    async fn adopt(&self, options: Selection) -> Result<(), HarnessError> {
         let (done, adopted) = oneshot::channel();
-        let command = AgentCommand::Select {
-            options: Selection::default(),
-            done,
-        };
+        let command = AgentCommand::Select { options, done };
         let root = self.root.clone();
         let send = move |state: &mut CoreState| state.agents.send(&root, command);
         if !self.runtime.store.live(send).await {
@@ -298,6 +273,19 @@ impl SessionHandle {
             Ok(result.await?.output)
         };
         self.outcome(run.await)
+    }
+
+    /// Run the session with its root on `model`, as one whose root's model the
+    /// configuration no longer has must before the root runs again: a viewed
+    /// session activates with the switch journaled in that commit, and a running
+    /// one's root adopts it between turns.
+    pub async fn activate_on(&self, model: &ModelRef) -> Result<(), HarnessError> {
+        let selection = self.selection(Some(model), None)?;
+        self.running_on(Some(model.clone())).await?;
+        match self.runtime.root_model() == *model {
+            true => Ok(()),
+            false => self.adopt(selection).await,
+        }
     }
 
     /// Submit a user message and wait for the resulting turn to finish.
@@ -435,6 +423,104 @@ impl SessionHandle {
 }
 
 impl SessionRuntime {
+    /// Claim the root for `continue` under `options`, where its turn goes on:
+    /// the batch it holds is claimed and admitted in one step, so nothing
+    /// withdraws from it what that admits, and a batch it refuses is held again
+    /// as it was. One admitted makes the root busy in that step: no other
+    /// `continue` or interrupt finds it resting without its batch. Whether its
+    /// turn goes on, for `done` to hear its answer; one with nothing left to
+    /// continue rests.
+    // Such a root has no live foreground child, as an interrupt holds one that
+    // does and a redirect or reopen releases it, so an interrupt parks the turn
+    // its claim makes busy and hands back what it has yet to take.
+    fn claim_root(
+        &self,
+        state: &mut CoreState,
+        options: Selection,
+        done: oneshot::Sender<Result<String, HarnessError>>,
+    ) -> Result<bool, HarnessError> {
+        let root = AgentId::root(self.store.id());
+        let Some(facts) = state.agents.get_mut(&root) else {
+            return Ok(false);
+        };
+        let claimed = facts.held.take().and_then(queue::Batch::claimed);
+        let (batch, selection) = match claimed {
+            Some(claimed) => match claimed.admit(self, options) {
+                Ok((batch, selection)) => (Some(batch), selection),
+                Err(refusal) => {
+                    facts.held = refusal.batch.and_then(|batch| (*batch).held());
+                    return Err(refusal.error);
+                }
+            },
+            None => (None, options),
+        };
+        if batch.is_none() && !super::agents::settle_held(state, &root) {
+            return Ok(false);
+        }
+        let facts = state
+            .agents
+            .get_mut(&root)
+            .expect("a root that continues runs");
+        let command = AgentCommand::Continue {
+            selection,
+            batch,
+            resting: Box::new(facts.set_turn(Turn::Busy)),
+            done: RequestCompletion::Root(done),
+        };
+        state.agents.send(&root, command);
+        Ok(true)
+    }
+
+    /// Continue the root's turn as `continue` asked: prepare `selection` for it,
+    /// then commit it with the messages of `batch`, if any. A continuation
+    /// refused, or interrupted first, changes nothing: the root rests as it was,
+    /// unless interrupted, and holds its batch again.
+    pub(super) async fn continue_root(
+        &self,
+        turn: &mut TurnContext<'_>,
+        context: &mut AgentContext,
+        settings: &mut AgentSettings,
+        selection: Selection,
+        batch: Option<queue::Admitted>,
+        resting: Turn,
+    ) -> Result<(), HarnessError> {
+        let images = batch.as_ref().is_some_and(queue::Admitted::images);
+        let continued = async {
+            let selected = self.select(turn, context, settings, selection, images);
+            let selected = selected.await?;
+            let messages = match &batch {
+                Some(batch) => batch.messages(self).await?,
+                None => Vec::new(),
+            };
+            let adopting = queue::Adopting::Joins(messages);
+            self.adopt(turn, context, settings, selected, adopting)
+                .await
+        };
+        match continued.await {
+            Ok(()) => {
+                if let Some(batch) = batch {
+                    batch.committed(context, settings);
+                }
+                Ok(())
+            }
+            // The root rests and holds its batch again in one step, so no other
+            // `continue` finds it resting without the batch.
+            Err(error) => {
+                let root = turn.agent.clone();
+                let rests = move |state: &mut CoreState| {
+                    state.agents.unwind(&root, resting);
+                    if let Some(batch) = batch {
+                        state.agents.hold_again(&root, batch);
+                    }
+                };
+                self.store.live(rests).await;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl SessionRuntime {
     /// A selection another runtime instance issued, even for this session before a
     /// resume, proves nothing about this instance's catalog.
     pub(super) fn admit_selection(&self, options: &Selection) -> Result<(), HarnessError> {
@@ -462,13 +548,9 @@ impl SessionRuntime {
         let (mut images, mut total) = (0, 0_u64);
         for attachment in attachments {
             if let crate::media::Attachment::Image { image, .. } = attachment {
-                let bytes = image.bytes().len() as u64;
                 images += 1;
-                total = total.saturating_add(bytes);
-                if bytes > MAX_IMAGE_BYTES
-                    || images > MAX_IMAGES_PER_SUBMISSION
-                    || total > MAX_IMAGE_BYTES_PER_SUBMISSION
-                {
+                total = total.saturating_add(image.bytes().len() as u64);
+                if images > MAX_IMAGES_PER_SUBMISSION || total > MAX_IMAGE_BYTES_PER_SUBMISSION {
                     return Err(HarnessError::ImageLimit);
                 }
             }
@@ -972,7 +1054,6 @@ mod tests {
         let summary = SessionStore::summary(&sessions, session.id())
             .await
             .unwrap();
-        assert_eq!(summary.model, Some(model_ref("test")));
         let records = session.runtime.store.records();
         assert_eq!(summary.entries, records.len() as u64);
         assert_eq!(
@@ -987,7 +1068,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let image = crate::media::Attachment::Image {
             file: Some(root.path().join("sample.png")),
-            image: crate::tests::png(b"image fixture"),
+            image: crate::tests::png(b"image fixture").await,
         };
         let requests = Requests::default();
         let responses = [answer("Image received"), answer("Image still present")];
@@ -1004,11 +1085,7 @@ mod tests {
                 .unwrap()
         };
         let before = session.runtime.store.records().len();
-        let oversized = crate::media::Attachment::Image {
-            file: None,
-            image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
-        };
-        let oversized = [oversized];
+        let oversized = crate::tests::over_limit_images().await;
         let rejected =
             session.prompt_with_options("Oversized image", &oversized, model("test/vision"));
         assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
@@ -1141,7 +1218,7 @@ mod tests {
         // The child's resumed turn is in a model request, so it is interrupted; the
         // root holding it shows interrupted again.
         assert_eq!(session.interrupt().await, 2);
-        assert_eq!(turn(&session, &child), INTERRUPTED);
+        assert!(turn(&session, &child).interrupted());
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         session.shutdown().await.unwrap();
@@ -1196,7 +1273,7 @@ mod tests {
         let id = waiting.get();
         // The cancel result is the target's view, with no denial code.
         let cancel = format!(
-            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === undefined;"
+            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === null;"
         );
         assert_eq!(
             session.run_script(cancel).await.unwrap().value["value"],

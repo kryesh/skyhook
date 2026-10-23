@@ -101,19 +101,25 @@ mod tests {
     async fn filtered_queue_selection_pauses_and_preserves_the_current_draft() {
         let (_root, mut app) = draft_fixture().await;
         for text in ["first", "second"] {
-            let attachments = vec![png_attachment(text)];
+            let attachments = vec![png_attachment(text).await];
             let text = text.into();
             let queued = app.queued_input(Submission { text, attachments });
             app.queue.push_back(queued);
         }
         app.editor.set("draft".into());
-        app.editor.attach(png_attachment("draft.png"));
+        app.editor.attach(png_attachment("draft.png").await);
         app.command(Command::Queue);
-        app.menu.as_mut().unwrap().input.set("second".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("second".into()));
         app.choose();
         assert!(app.paused.is_some());
         assert_eq!(app.editor.text(), "second");
-        assert_eq!(app.editor.attachments(), [png_attachment("second").into()]);
+        assert_eq!(
+            app.editor.attachments(),
+            [png_attachment("second").await.into()]
+        );
         let texts: Vec<_> = app
             .queue
             .iter()
@@ -123,10 +129,13 @@ mod tests {
         assert_eq!(texts, ["draft", "first", "second"]);
         assert_eq!(
             app.queue[0].submission.attachments,
-            [png_attachment("draft.png")]
+            [png_attachment("draft.png").await]
         );
         app.command(Command::Queue);
-        app.menu.as_mut().unwrap().input.set("first".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("first".into()));
         key(&mut app, KeyCode::Delete, M::NONE);
         assert_eq!(app.queue.len(), 2);
         assert!(app.paused.is_some());

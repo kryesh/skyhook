@@ -87,7 +87,8 @@ pub(crate) fn classify(
 
 /// The server's own explanation, from the common error envelope shapes:
 /// `{"error":{"message"}}`, `{"error":"text"}`, `{"message"}`, or `{"detail"}`,
-/// or a bare string for bodies that were not JSON.
+/// or a bare string for bodies that were not JSON. An error object without one
+/// is itself the explanation, as compact JSON, unless it is empty.
 fn server_message(native: &serde_json::Value) -> Option<String> {
     let error = native.get("error");
     [
@@ -100,7 +101,17 @@ fn server_message(native: &serde_json::Value) -> Option<String> {
     .into_iter()
     .flatten()
     .find_map(serde_json::Value::as_str)
-    .and_then(excerpt)
+    .map_or_else(|| members(error_object(native)), excerpt)
+}
+
+/// An error object or list as compact JSON, unless it holds nothing.
+fn members(value: &serde_json::Value) -> Option<String> {
+    let held = match value {
+        serde_json::Value::Object(members) => !members.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => false,
+    };
+    held.then(|| value.to_string())
 }
 
 /// The server's message as one line.
@@ -176,6 +187,13 @@ mod tests {
                 json!({"error":"bad field"}),
                 "provider HTTP 400 error: bad field",
             ),
+            // An error object with no string message is shown whole.
+            (
+                Some(422),
+                json!({"detail":[{"loc":["body","tools"],"msg":"field required"}]}),
+                r#"provider HTTP 422 error: {"detail":[{"loc":["body","tools"],"msg":"field required"}]}"#,
+            ),
+            (Some(400), json!({"error":{}}), "provider HTTP 400 error"),
             // A proxy nesting an upstream error keeps the upstream reason.
             (
                 Some(400),

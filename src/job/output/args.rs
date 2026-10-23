@@ -1,24 +1,80 @@
 //! Output queries: what a page selects, and the bounds every query is admitted within.
 use super::*;
-use crate::tool::diagnostic::{Operation, Subject};
+use crate::{
+    newtype::Bounded,
+    tool::diagnostic::{Operation, Subject},
+};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use std::sync::Arc;
 
-/// Lines a page returns unless the query sets `limit`.
-pub(crate) const DEFAULT_LIMIT: usize = 100;
-/// The most lines one page returns.
+/// What a page returns unless the query sets `limit`.
+pub(crate) const DEFAULT_LIMIT: PageLimit = PageLimit::new::<100>();
+/// The most lines, values or matches one page returns.
 pub(crate) const MAX_LIMIT: usize = 1000;
 /// The most context lines a match carries.
 pub(crate) const MAX_CONTEXT: usize = 20;
 /// Bounds what compiling an untrusted pattern may allocate.
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
+/// How many lines, values, matches or listed jobs one page returns.
+pub type PageLimit = Bounded<1, { MAX_LIMIT as u64 }>;
+
+impl PageLimit {
+    pub fn get(self) -> usize {
+        // Lossless: the bound is a `usize`.
+        u64::from(self) as usize
+    }
+}
+
+/// Paging selectors as a query sets them.
+#[derive(Clone, Copy)]
+pub(crate) struct Selectors {
+    pub(crate) start: Option<usize>,
+    pub(crate) offset: Option<usize>,
+    pub(crate) index: Option<usize>,
+    pub(crate) context: Option<usize>,
+}
+
+impl Selectors {
+    pub(crate) fn is_set(self) -> bool {
+        let Paging {
+            start,
+            offset,
+            index,
+            context,
+        } = self.into();
+        start.or(offset).or(index).or(context).is_some()
+    }
+}
+
+/// The selectors that differ from their defaults. One restating its default
+/// selects nothing, so a model that fills in schema defaults can page either
+/// kind of field, or list jobs.
+struct Paging {
+    start: Option<usize>,
+    offset: Option<usize>,
+    index: Option<usize>,
+    context: Option<usize>,
+}
+
+impl From<Selectors> for Paging {
+    fn from(selectors: Selectors) -> Self {
+        let chosen = |value: Option<usize>, default| value.filter(|&value| value != default);
+        Self {
+            start: chosen(selectors.start, 1),
+            offset: chosen(selectors.offset, 0),
+            index: chosen(selectors.index, 0),
+            context: chosen(selectors.context, 0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputArgs {
     pub job: JobId,
     pub field: Option<FieldPointer>,
     pub start: Option<usize>,
-    pub limit: Option<usize>,
+    pub limit: Option<PageLimit>,
     pub pattern: Option<String>,
     pub context: Option<usize>,
     pub offset: Option<usize>,
@@ -65,29 +121,28 @@ impl OutputArgs {
 
     /// The page this query selects, validated even when no output exists yet.
     pub(super) fn admit(&self) -> Result<Query, ToolError> {
-        let limit = self.limit.unwrap_or(DEFAULT_LIMIT);
-        let context = self.context.unwrap_or(0);
-        if !(1..=MAX_LIMIT).contains(&limit) || self.start == Some(0) || context > MAX_CONTEXT {
+        let paging = Paging::from(Selectors {
+            start: self.start,
+            offset: self.offset,
+            index: self.index,
+            context: self.context,
+        });
+        if paging.start == Some(0) || paging.context.is_some_and(|context| context > MAX_CONTEXT) {
             return Err(ToolError::invalid_arguments(format!(
-                "limit must be 1-{MAX_LIMIT}, start positive, and context 0-{MAX_CONTEXT}"
+                "start must be positive and context 0-{MAX_CONTEXT}"
             )));
         }
-        if context > 0 && self.pattern.is_none() {
+        if paging.context.is_some() && self.pattern.is_none() {
             return Err(ToolError::invalid_arguments("context requires pattern"));
         }
         let lines = Lines {
             matcher: self.pattern.as_deref().map(pattern_matcher).transpose()?,
-            context,
-            start: self.start.unwrap_or(1),
-            offset: self.offset.unwrap_or(0),
+            context: paging.context.unwrap_or(0),
+            start: paging.start.unwrap_or(1),
+            offset: paging.offset.unwrap_or(0),
         };
-        // Selectors restating their defaults select nothing, so a model that fills
-        // in schema defaults can still page either kind of field.
-        let text = lines.matcher.is_some() || lines.start != 1 || lines.offset != 0;
-        let index = self
-            .index
-            .filter(|&index| index > 0 || self.query.is_some());
-        let position = match (&self.query, index) {
+        let text = lines.matcher.is_some() || paging.start.is_some() || paging.offset.is_some();
+        let position = match (&self.query, paging.index) {
             (Some(_), _) | (None, Some(_)) if text => {
                 return Err(ToolError::invalid_arguments(
                     "index and query select JSON; start, offset, pattern and context page text",
@@ -109,7 +164,7 @@ impl OutputArgs {
         };
         Ok(Query {
             field: self.field.clone().unwrap_or_else(FieldPointer::result),
-            limit,
+            limit: self.limit.unwrap_or(DEFAULT_LIMIT).get(),
             position,
         })
     }

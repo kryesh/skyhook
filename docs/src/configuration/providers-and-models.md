@@ -40,14 +40,15 @@ directly beside `model`.
 | Where | Fields |
 | --- | --- |
 | Provider only | `dialect`, `base_url`, `api_key`, `headers`, `startup_timeout_secs`, `read_idle_timeout_secs`; Codex's `auth_url`. |
-| Provider defaults or direct model settings | `codec`; `service_tier`; all placement selections listed below; the Responses settings `reasoning_summary`, `access_programs`; `explicit_caching`; the dialect's request fields: OpenAI's `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
+| Provider defaults or direct model settings | `codec`; `service_tier`; all placement selections listed below; the Responses settings `reasoning_summary`, `access_programs`; `explicit_caching`; `image_limits`; the dialect's request fields: OpenAI's `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
 | Model only | `model`, `reasoning`, `max_context`, `max_output`, `supports_images`, `state_mode`, `hint`. |
 
 Missing model settings inherit from the provider. Explicit values win even when they are `false`,
 `[]`, or a setting's usual default. Lists replace inherited lists rather than append. Under
 OpenRouter's `routing`, only declared members change: a model's `order` replaces the inherited
 order while an undeclared `allow_fallbacks` still inherits. The same leaf-by-leaf inheritance
-applies to `access_programs`: `{}` inherits its leaves, rather than clearing the object.
+applies to `access_programs` and `image_limits`: `{}` inherits its leaves, rather than clearing
+the object.
 
 Every request setting in the table above reads the same way, apart from lists. Left out, it
 inherits, and with nothing to inherit takes its default. An explicit `null` sends nothing: `organization: null` removes the
@@ -144,6 +145,42 @@ astra:
   access_programs:
     cyber: "daybreak_blue"
   explicit_caching: true
+```
+
+### Image limits
+
+Images of up to 8 MiB are stored as attached, except that an animation, and any GIF, is stored as
+a PNG of its first frame (an APNG's default image, which may lie outside its animation),
+re-encoded as a smaller JPEG if that PNG would exceed 8 MiB. An image with very large dimensions
+can be refused when attached, whatever the model's limits.
+Before a request, an image whose longest edge or encoded size exceeds the model's limits is
+fitted: it is downscaled to the edge limit, keeping its aspect ratio, and re-encoded as PNG
+(unless it is a JPEG) if that is within the size limit; otherwise it is re-encoded as JPEG and
+made smaller until it fits. An image within the limits is sent unchanged, the stored original is
+kept, and the model is not told that an image was fitted. An image that cannot be fitted, such as
+one whose stored data no longer decodes, is sent as a short note saying so, and the request
+proceeds. Each dialect sets defaults:
+
+| Dialect | `max_edge` | `max_bytes` |
+| --- | --- | --- |
+| `anthropic` | 8000 px | 7.5 MiB (10 MiB as base64) |
+| `openai`, `codex` | 6000 px | 8 MiB |
+| `compatible`, `litellm`, `openrouter` | 4096 px | 3.5 MiB |
+
+`image_limits` replaces either limit, as a provider default or beside `model`; a limit left out
+keeps the default, and `image_limits: null` restores both. `max_bytes` is at most 8 MiB, since no
+image is stored larger, and `max_edge` at most 65535 px, the largest JPEG; a larger value reads
+as that maximum. The limits are per image: a service
+rule that depends on how many images a request holds, or on their total pixel area, is not
+applied. Changing a model's limits from its dialect's defaults changes the images earlier
+reasoning saw, so signed reasoning from before the change is not replayed afterward.
+
+```yaml
+local:
+  model: "vision-model"
+  image_limits:
+    max_edge: 2048     # longest edge, in pixels
+    max_bytes: 2097152 # encoded size, in bytes
 ```
 
 ### Placement selections

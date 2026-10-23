@@ -263,6 +263,12 @@ impl CoreState {
         self.waits.register(wait, reply);
     }
 
+    /// How many registered waits read `key`.
+    #[cfg(test)]
+    pub(crate) fn waits_reading(&self, key: &super::waits::Key) -> usize {
+        self.waits.reading(key)
+    }
+
     /// What every change since the last settle touched.
     fn take_dirty(&mut self) -> Dirty {
         let mut dirty = std::mem::take(&mut self.dirty);

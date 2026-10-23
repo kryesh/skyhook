@@ -1,13 +1,14 @@
 //! Encode canonical history and provider-bound reasoning replay into Chat requests.
 use super::dialect::{Dialect, EmptyContent, ReasoningReplay, SystemRole, UsageRequest};
+use crate::media::Image;
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::InvalidRequest,
     codec::{
         Cache, CacheControl, CodecName, ToolNames,
         common::{
-            StateWire, check_tool, image_url, is_sealed, own_replay, push_state, signed_context,
-            system_text, tool_text, user_parts,
+            PreparedImages, StateWire, check_tool, image_url, is_sealed, own_replay, push_state,
+            signed_context, system_text, tool_text, user_parts,
         },
         placement::{breakpoint, explicit_breakpoint, push_history},
         set_each,
@@ -34,6 +35,7 @@ pub(crate) const ASSISTANT_FIELDS: &[&str] = &["role", "content", "tool_calls"];
 
 pub(crate) fn encode(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
     let mut messages = Vec::new();
@@ -69,7 +71,9 @@ pub(crate) fn encode(
         message: |role, content| json!({"role": role, "content": content}),
     };
     let send = |messages: &mut Vec<Value>, entry: &Entry| match entry {
-        Entry::Message(message) => push_message(request, dialect, signed_only, messages, message),
+        Entry::Message(message) => {
+            push_message(request, images, dialect, signed_only, messages, message)
+        }
         Entry::State(state) => {
             push_state(dialect.state_role, &state_wire, messages, state);
             Ok(())
@@ -158,16 +162,17 @@ fn system_role(dialect: &Dialect) -> &'static str {
 
 fn push_message(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     dialect: &Dialect,
     signed_only: bool,
     messages: &mut Vec<Value>,
     message: &Message,
 ) -> Result<(), ProviderError> {
+    let image_part =
+        |image: &Image| json!({"type": "image_url", "image_url": {"url": image_url(image)}});
     match message {
         Message::User(parts) => {
-            let content = user_parts(request, parts, "text", |image| {
-                Ok(json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}}))
-            })?;
+            let content = user_parts(request, images, parts, "text", image_part)?;
             messages.push(json!({"role": "user", "content": content}));
         }
         Message::Assistant(parts) => {
@@ -241,21 +246,21 @@ fn push_message(
         }
         Message::Tool(results) => {
             // All tool replies must precede the synthetic user image message.
-            let mut images = Vec::new();
+            let mut parts = Vec::new();
             for result in results {
                 if result.call_id.is_empty() {
                     return Err(InvalidRequest.error("Chat tool results require a call ID"));
                 }
                 messages.push(json!({"role": "tool", "tool_call_id": result.call_id, "content": tool_text(result)}));
                 if !result.images.is_empty() {
-                    images.push(json!({"type": "text", "text": format!("Images returned by tool call {}:", result.call_id)}));
+                    parts.push(json!({"type": "text", "text": format!("Images returned by tool call {}:", result.call_id)}));
                     for image in &result.images {
-                        images.push(json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}}));
+                        parts.push(images.part(image, "text", image_part)?);
                     }
                 }
             }
-            if !images.is_empty() {
-                messages.push(json!({"role": "user", "content": images}));
+            if !parts.is_empty() {
+                messages.push(json!({"role": "user", "content": parts}));
             }
         }
     }
@@ -343,7 +348,7 @@ pub(super) mod tests {
     use super::super::decoder::tests::{delta, end, reduced_as};
     use super::*;
     use crate::provider::codec::common::tests::{
-        envelope, image, notes, request, tool_result, user,
+        envelope, image, image_data, loaded, notes, request, tool_result, user,
     };
     use crate::provider::codec::{Locations, NonEmpty, SchemaConstraint, UnsignedReasoning};
     use crate::provider::protocol::{entries, state};
@@ -422,7 +427,7 @@ pub(super) mod tests {
         };
         let context = "session".parse().unwrap();
         let encoded = Codec::ChatCompletions(developer)
-            .encode(&request, &context)
+            .encode(&request, Default::default(), &context)
             .unwrap();
         let body = &encoded.body;
         assert_eq!(body["messages"][0]["role"], "developer");
@@ -441,7 +446,7 @@ pub(super) mod tests {
             empty_content: EmptyContent::Null,
             ..Dialect::compatible()
         };
-        let body = encode(&request, &strict).unwrap();
+        let body = encode(&request, Default::default(), &strict).unwrap();
         let format = &body["response_format"]["json_schema"];
         assert_eq!(
             (&format["schema"], &format["strict"]),
@@ -456,11 +461,11 @@ pub(super) mod tests {
             inspect("call", json!({})),
         )]);
         assert_eq!(
-            encode(&turn, &Dialect::compatible()).unwrap()["messages"][0]["content"],
+            encode(&turn, Default::default(), &Dialect::compatible()).unwrap()["messages"][0]["content"],
             ""
         );
         assert_eq!(
-            encode(&turn, &strict).unwrap()["messages"][0]["content"],
+            encode(&turn, Default::default(), &strict).unwrap()["messages"][0]["content"],
             Value::Null
         );
     }
@@ -513,7 +518,7 @@ pub(super) mod tests {
         ]));
         let current = crate::provider::protocol::StateLifetime::Current;
         (request.context).push(state("<state>", current));
-        let body = encode(&request, &thinking_blocks).unwrap();
+        let body = encode(&request, Default::default(), &thinking_blocks).unwrap();
         let messages = body["messages"].as_array().unwrap();
         // Marked system segments keep their parts; the text-only replay is foreign here.
         assert_eq!(
@@ -544,12 +549,12 @@ pub(super) mod tests {
         assert_eq!(messages[4], json!({"role":"user","content":"<state>"}));
         assert_eq!(messages.len(), 5);
         request.history_lifetime = HistoryLifetime::Detached;
-        let detached = encode(&request, &thinking_blocks).unwrap();
+        let detached = encode(&request, Default::default(), &thinking_blocks).unwrap();
         assert!(detached["messages"][3]["content"].is_string());
         assert!(detached["messages"][0]["content"].is_array());
         // Without a cache convention, the same request flattens to strings, and a
         // text-replay dialect leaves signed blocks out.
-        let plain = encode(&request, &Dialect::compatible()).unwrap();
+        let plain = encode(&request, Default::default(), &Dialect::compatible()).unwrap();
         assert_eq!(plain["messages"][0]["content"], "stable\n\nvolatile");
         assert!(plain["messages"][2].get("thinking_blocks").is_none());
         assert_eq!(plain["messages"][2]["reasoning_content"], "t");
@@ -560,7 +565,7 @@ pub(super) mod tests {
             cache: Cache::Explicit,
             ..Dialect::compatible()
         };
-        let body = encode(&request, &explicit).unwrap();
+        let body = encode(&request, Default::default(), &explicit).unwrap();
         let mark = json!({"mode":"explicit"});
         assert_eq!(body["prompt_cache_options"], mark);
         assert_eq!(
@@ -609,7 +614,7 @@ pub(super) mod tests {
             for turn in turns {
                 request.context.extend(entries([turn, user("next")]));
             }
-            let body = encode(&request, dialect).unwrap();
+            let body = encode(&request, Default::default(), dialect).unwrap();
             let assistant: Vec<_> = body["messages"]
                 .as_array()
                 .unwrap()
@@ -721,7 +726,7 @@ pub(super) mod tests {
                     })
                     .collect(),
             )));
-        let body = encode(&request, &router).unwrap();
+        let body = encode(&request, Default::default(), &router).unwrap();
         assert_eq!(body["reasoning"], json!({"effort":"high"}));
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("stream_options").is_none());
@@ -753,8 +758,8 @@ pub(super) mod tests {
         ToolCall::new(id, "inspect", arguments).unwrap()
     }
 
-    #[test]
-    fn request_preserves_text_tools_images_and_reasoning_settings() {
+    #[tokio::test]
+    async fn request_preserves_text_tools_images_and_reasoning_settings() {
         let notes = notes();
         let mut request = request("gpt-5");
         request.system = vec![SystemSegment {
@@ -789,13 +794,11 @@ pub(super) mod tests {
                 true,
             ),
         ]);
-        assert!(encode(&request, &unsupported()).is_err());
-        // Load the fixture blobs as the session store would.
-        request.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
-        request.blobs.insert(notes.blob, b"notes".to_vec());
-        let body = encode(&request, &unsupported()).unwrap();
+        assert!(encode(&request, Default::default(), &unsupported()).is_err());
+        let images = loaded(&mut request).await;
+        let body = encode(&request, images.prepared(), &unsupported()).unwrap();
         let messages = &body["messages"];
-        let image_url = "data:image/png;base64,AQID";
+        let image_url = image_data();
         assert_eq!(messages[0]["content"], "system");
         assert_eq!(messages[1]["content"][0]["text"], "look");
         assert_eq!(messages[1]["content"][1]["image_url"]["url"], image_url);
@@ -832,7 +835,7 @@ pub(super) mod tests {
             description: String::new(),
             input_schema: json!({"type":"object"}),
         }];
-        let body = encode(&minimal, &unsupported()).unwrap();
+        let body = encode(&minimal, Default::default(), &unsupported()).unwrap();
         assert_eq!(
             body["messages"][0],
             json!({"role":"system","content":"one\n\ntwo"})
@@ -845,7 +848,7 @@ pub(super) mod tests {
         for (effort, valid) in [("max", true), ("adaptive", false)] {
             let mut request = history(vec![]);
             request.reasoning = Some(effort.into());
-            let body = encode(&request, &unsupported());
+            let body = encode(&request, Default::default(), &unsupported());
             assert_eq!(
                 body.ok().map(|body| body["reasoning_effort"].clone()),
                 valid.then(|| json!(effort))
@@ -865,7 +868,7 @@ pub(super) mod tests {
             let call = ToolCall::new("call", name, json!({"x-vendor": [null, 1]})).unwrap();
             let request = history(vec![AssistantItem::tool_call("item", 0, call)]);
             for (dialect, sent) in [(&unsupported(), name), (&strict, expected.as_str())] {
-                let body = encode(&request, dialect).unwrap();
+                let body = encode(&request, Default::default(), dialect).unwrap();
                 let call = &body["messages"][0]["tool_calls"][0];
                 assert_eq!(
                     (&call["id"], &call["function"]["name"]),
@@ -901,7 +904,7 @@ pub(super) mod tests {
             (Dialect::compatible(), "reasoning_content", "reasoning"),
             (reasoning_field(), "reasoning", "reasoning_content"),
         ] {
-            let body = encode(&original, &dialect).unwrap();
+            let body = encode(&original, Default::default(), &dialect).unwrap();
             assert_eq!(body["messages"].as_array().unwrap().len(), 1);
             let message = &body["messages"][0];
             assert_eq!(message["content"], "ok");
@@ -909,7 +912,7 @@ pub(super) mod tests {
             assert!(message.get(absent).is_none());
             assert!(body.get("n").is_none());
         }
-        let unsupported = encode(&original, &unsupported()).unwrap();
+        let unsupported = encode(&original, Default::default(), &unsupported()).unwrap();
         assert_eq!(
             unsupported["messages"],
             json!([{"role":"assistant","content":"ok"}])
@@ -927,7 +930,7 @@ pub(super) mod tests {
                 Some(payload) => replay.as_mut().unwrap().payload = payload,
                 None => *replay = None,
             }
-            let body = encode(&request, &Dialect::compatible()).unwrap();
+            let body = encode(&request, Default::default(), &Dialect::compatible()).unwrap();
             assert_eq!(
                 body["messages"],
                 json!([{"role":"assistant","content":"ok"}])
@@ -955,7 +958,7 @@ pub(super) mod tests {
             AssistantItem::text("t", 1, "answer"),
             AssistantItem::tool_call("c", 2, inspect("call", json!({}))),
         ]);
-        let body = encode(&req, &reasoning_field()).unwrap();
+        let body = encode(&req, Default::default(), &reasoning_field()).unwrap();
         assert_eq!(body["messages"][0]["reasoning"], "original private thought");
         assert_eq!(body["messages"][0]["content"], "answer");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call");
@@ -973,7 +976,7 @@ pub(super) mod tests {
         let mut req = history(vec![call]);
         req.context.insert(0, state("earlier", Superseded));
         req.context.extend([result.into(), state("now", Current)]);
-        let body = encode(&req, &unsupported()).unwrap();
+        let body = encode(&req, Default::default(), &unsupported()).unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "tool");
@@ -984,14 +987,14 @@ pub(super) mod tests {
             state_role: crate::provider::codec::StateRole::System,
             ..unsupported()
         };
-        let body = encode(&req, &system).unwrap();
+        let body = encode(&req, Default::default(), &system).unwrap();
         assert_eq!(
             body["messages"][2],
             json!({"role":"system","content":"now"})
         );
         let mut req = request("test-model");
         req.context.push(state("now", Current));
-        let body = encode(&req, &unsupported()).unwrap();
+        let body = encode(&req, Default::default(), &unsupported()).unwrap();
         assert_eq!(
             body["messages"],
             json!([{"role":"user","content":"hello\n\nnow"}])

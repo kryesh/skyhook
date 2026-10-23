@@ -15,6 +15,8 @@ use crate::tool::{
     policy::{Capability, PathAccess, PermissionUse, ResourceId},
 };
 
+mod budget;
+mod markdown;
 mod progress;
 mod redirects;
 mod request;
@@ -66,9 +68,6 @@ struct FetchArgs {
     include_headers: bool,
     body: Option<RequestBody>,
     auth: Option<Auth>,
-    /// Extract readable HTML text.
-    #[serde(default)]
-    text: bool,
     #[serde(default)]
     response_format: ResponseFormat,
     save_to: Option<String>,
@@ -126,10 +125,28 @@ pub(super) enum Auth {
 #[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResponseFormat {
+    /// HTML as markdown, JSON as a value, other text as text, binary as base64.
     #[default]
     Auto,
+    /// As auto, preferring HTML from the server and reading HTML served as any type.
+    Readable,
+    /// The decoded body as sent.
     Text,
+    /// The raw bytes as base64.
     Base64,
+}
+
+impl ResponseFormat {
+    /// The `Accept` sent when the caller sets none. HTML comes first, as a browser
+    /// asks, since some sites answer anything else with an empty shell or a
+    /// non-HTML variant; `auto` still ranks JSON above other types for APIs.
+    fn accept(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => Some("text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"),
+            Self::Readable => Some("text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"),
+            Self::Text | Self::Base64 => None,
+        }
+    }
 }
 
 #[serde_with::skip_serializing_none]
@@ -140,7 +157,7 @@ pub(super) struct FetchOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redirects: Vec<Redirect>,
     body: ResponseBody,
-    /// Decoded entity bytes received (before text extraction).
+    /// Decoded entity bytes received (before extraction).
     size: u64,
     /// Milliseconds.
     duration: u64,
@@ -151,13 +168,18 @@ struct Redirect {
     location: String,
     method: String,
 }
-#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ResponseBody {
     Text {
         text: String,
-        metadata: Option<text::ExtractionMetadata>,
+    },
+    /// HTML read as markdown.
+    Page(text::Page),
+    /// HTML that could not be read as markdown, with its decoded source.
+    Unreadable {
+        reason: text::Unreadable,
+        text: String,
     },
     /// A textual body that holds JSON, read as it.
     Json {
@@ -176,7 +198,7 @@ enum ResponseBody {
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_checked(
         "fetch",
-        "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
+        "HTTP(S) from the selected target. HTTP error statuses are normal results. response_format auto and readable return HTML as readable markdown, or its source and a reason when unreadable; the status is never hidden. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
         ToolOptions::new(vec![Capability::Network])
             .result::<FetchOutput>()
             .argument_permissions(|location, plan: &FetchPlan| {
@@ -253,25 +275,38 @@ mod tests {
     async fn json_bodies_are_read_as_values_unless_text_is_requested() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
-        let json = "Content-Type: application/json\r\n";
-        for (format, body, expected) in [
+        let (json, html) = (
+            "Content-Type: application/json\r\n",
+            "Content-Type: text/html\r\n",
+        );
+        for (format, headers, body, expected) in [
             (
                 "auto",
+                json,
                 "{\"a\": [1, 2]}\n",
                 json!({"kind":"json","value":{"a":[1,2]}}),
             ),
+            // JSON labelled as HTML is still JSON.
             (
                 "auto",
+                html,
+                "{\"a\":1}\n{\"a\":2}\n",
+                json!({"kind":"json","value":[{"a":1},{"a":2}]}),
+            ),
+            (
+                "readable",
+                json,
                 "{\"a\":1}\n{\"a\":2}\n",
                 json!({"kind":"json","value":[{"a":1},{"a":2}]}),
             ),
             (
                 "text",
+                json,
                 "{\"a\": [1, 2]}\n",
                 json!({"kind":"text","text":"{\"a\": [1, 2]}\n"}),
             ),
         ] {
-            let (url, task) = server(vec![reply("200 OK", json, body)]).await;
+            let (url, task) = server(vec![reply("200 OK", headers, body)]).await;
             let arguments = json!({"url": url, "response_format": format});
             let output = fetch(&runtime, &executor, arguments).await.unwrap();
             task.finish().await;

@@ -73,8 +73,8 @@ mod tests {
         let workspace = app.launch.workspace.clone();
         let relative = PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff.txt".to_vec()));
         std::fs::write(workspace.join(&relative), "file contents").unwrap();
-        let bytes = b"\x89PNG\r\n\x1a\nfixture";
-        std::fs::write(workspace.join("shot.png"), bytes).unwrap();
+        let bytes = png();
+        std::fs::write(workspace.join("shot.png"), &bytes).unwrap();
         let items = workspace_files(&workspace);
         let mut rx = capture_work(&mut app);
         let canonical = |path: &PathBuf| Some(workspace.join(path).canonicalize().unwrap());
@@ -85,7 +85,7 @@ mod tests {
         let image = PathBuf::from("shot.png");
         let png = Attachment::Image {
             file: canonical(&image),
-            image: skyhook::media::Image::new(bytes.to_vec()).unwrap(),
+            image: skyhook::media::Image::decode(bytes).await.unwrap(),
         };
         for (path, expected) in [(relative, text), (image, png)] {
             app.open("Files", MenuKind::Files(items.clone(), None));
@@ -135,7 +135,10 @@ mod tests {
         assert!(app.menu.is_none());
         assert_eq!(app.editor.text(), "mail user@");
         key(&mut app, KeyCode::Char('@'), M::SHIFT);
-        app.menu.as_mut().unwrap().input.set("notes".into());
+        app.menu
+            .as_mut()
+            .unwrap()
+            .filter(|input| input.set("notes".into()));
         while app.menu.as_ref().unwrap().filtered().is_empty() {
             let work = recv(&mut rx).await;
             app.work(work);

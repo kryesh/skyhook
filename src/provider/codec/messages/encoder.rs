@@ -1,15 +1,15 @@
 //! Messages request encoding.
 use super::{Dialect, SystemState, native::BlockType};
 use crate::{
-    media::ImageRef,
+    media::Image,
     provider::{
         ProviderError,
         ProviderErrorKind::InvalidRequest,
         codec::{
             CodecName, StateRole,
             common::{
-                blob_error, check_tool, is_sealed, own_replay, signed_context, tagged, tool_text,
-                user_parts,
+                PreparedImages, check_tool, is_sealed, own_replay, signed_context, tagged,
+                tool_text, user_parts,
             },
             placement::{breakpoint, path, push_history},
             set_each,
@@ -34,6 +34,7 @@ pub(crate) const BODY_FIELDS: &[&str] = &[
 
 pub(crate) fn encode(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
     let max_tokens = request
@@ -64,7 +65,7 @@ pub(crate) fn encode(
         dialect.unsigned.replayed().is_some() && !signed_context(request, ReplayFormat::Messages);
     let mut messages: Vec<Value> = Vec::new();
     let send = |messages: &mut Vec<Value>, entry: &Entry| match entry {
-        Entry::Message(message) => push_message(request, unsigned, messages, message),
+        Entry::Message(message) => push_message(request, images, unsigned, messages, message),
         Entry::State(state) => push_state(dialect, messages, state),
     };
     let budget = Some(dialect.breakpoints);
@@ -122,15 +123,16 @@ pub(crate) fn encode(
 
 fn push_message(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     unsigned: bool,
     messages: &mut Vec<Value>,
     message: &Message,
 ) -> Result<(), ProviderError> {
     let (role, content) = match message {
-        Message::User(items) => {
-            let image = |image: &_| image_block(request, image);
-            ("user", user_parts(request, items, "text", image)?)
-        }
+        Message::User(items) => (
+            "user",
+            user_parts(request, images, items, "text", image_block)?,
+        ),
         Message::Assistant(items) => {
             let mut blocks = Vec::new();
             for item in items {
@@ -173,7 +175,7 @@ fn push_message(
                 }
                 let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
                 for image in &result.images {
-                    content.push(image_block(request, image)?);
+                    content.push(images.part(image, "text", image_block)?);
                 }
                 blocks.push(json!({"type":"tool_result", "tool_use_id":result.call_id,
                     "content":content, "is_error":result.is_error}));
@@ -237,10 +239,9 @@ fn push_state(
     }
 }
 
-fn image_block(request: &ModelRequest, image: &ImageRef) -> Result<Value, ProviderError> {
-    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
-    Ok(json!({"type":"image", "source":{"type":"base64",
-        "media_type":image.format.as_str(), "data":data}}))
+fn image_block(image: &Image) -> Value {
+    json!({"type":"image", "source":{"type":"base64",
+        "media_type":image.format().as_str(), "data":image.base64()}})
 }
 
 /// A replayed thinking block must be one the service issued: signed thinking,
@@ -285,11 +286,12 @@ fn last_cacheable(messages: &[Value]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::codec::common::tests::{envelope, image, notes, tool_result};
+    use crate::provider::codec::common::tests::{envelope, notes, tool_result};
     use crate::provider::codec::{NonEmpty, StateRole};
     use crate::provider::protocol::{Entry, StateLifetime, entries, state};
     use crate::{
-        media::AttachmentRef,
+        media::{AttachmentRef, ImageRef, Prepared},
+        provider::http::images::FittedImages,
         provider::protocol::{
             AssistantItem, Binding, HistoryLifetime, Replay, ResponseSchema, SystemSegment,
             ToolCall, ToolDefinition, UserContent,
@@ -320,9 +322,16 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn request_maps_native_schema_tools_system_cache_and_adaptive_effort() {
-        let (image, notes) = (image(), notes());
+    #[tokio::test]
+    async fn request_maps_native_schema_tools_system_cache_and_adaptive_effort() {
+        // A PNG only a JPEG fits within the limits.
+        let source = crate::tests::noise(::image::ImageFormat::Png, 64, 64);
+        let image = ImageRef {
+            file: None,
+            format: crate::media::ImageFormat::Png,
+            blob: crate::media::BlobRef::of(&source),
+        };
+        let notes = notes();
         let mut request = request();
         request.system = vec![SystemSegment {
             text: "cached".into(),
@@ -354,11 +363,14 @@ mod tests {
             ),
         ]);
         request.context.push(state("state", StateLifetime::Current));
-        assert!(encode(&request, &Dialect::standard()).is_err());
-        // Load the fixture blobs as the session store would.
-        request.blobs.insert(image.blob, b"\x01\x02\x03".to_vec());
+        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
+        // Load the fixture blobs as the session store would, and fit as a context does.
+        request.blobs.insert(image.blob, source);
         request.blobs.insert(notes.blob, b"notes".to_vec());
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let mut images = FittedImages::default();
+        let limits = crate::media::ImageLimits::new(64, 4000);
+        images.refresh(&request, limits).await.unwrap();
+        let body = encode(&request, images.prepared(), &Dialect::standard()).unwrap();
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(
             body["system"][0]["cache_control"],
@@ -376,7 +388,14 @@ mod tests {
         );
         let user = &body["messages"][0]["content"];
         assert_eq!(user[0]["text"], "look");
-        assert_eq!(user[1]["source"]["data"], "AQID");
+        let Ok(Prepared::Fitted(fitted)) = images.prepared().get(&image) else {
+            panic!("a fitted copy");
+        };
+        assert_eq!(
+            user[1]["source"],
+            json!({"type":"base64", "media_type":"image/jpeg",
+                "data":fitted.base64()})
+        );
         // The earlier request's prefix ended before the response, and is marked.
         assert_eq!(
             user[2],
@@ -411,7 +430,7 @@ mod tests {
         let superseded = StateLifetime::Superseded;
         (replayed.context).insert(1, state("earlier", superseded));
         assert_eq!(
-            encode(&replayed, &Dialect::standard()).unwrap()["messages"],
+            encode(&replayed, images.prepared(), &Dialect::standard()).unwrap()["messages"],
             body["messages"]
         );
         // A limit placed inside output_config sits beside the format and effort.
@@ -419,7 +438,7 @@ mod tests {
             output_limit: NonEmpty::one(const { path("output_config.max_tokens") }),
             ..Dialect::standard()
         };
-        let body = encode(&request, &nested).unwrap();
+        let body = encode(&request, images.prepared(), &nested).unwrap();
         let format = json!({"type":"json_schema", "schema":schema});
         assert_eq!(
             body["output_config"],
@@ -431,7 +450,7 @@ mod tests {
             ..Dialect::standard()
         };
         assert_eq!(
-            encode(&request, &dropping).unwrap()["thinking"]["block_binding"],
+            encode(&request, images.prepared(), &dropping).unwrap()["thinking"]["block_binding"],
             json!({"prefix_mismatch_behavior":"drop_block"})
         );
         for (reasoning, thinking) in [
@@ -442,7 +461,7 @@ mod tests {
             ("off", json!({"type":"disabled"})),
         ] {
             request.reasoning = Some(reasoning.into());
-            let body = encode(&request, &Dialect::standard()).unwrap();
+            let body = encode(&request, images.prepared(), &Dialect::standard()).unwrap();
             assert_eq!(body["thinking"], thinking);
         }
     }
@@ -479,12 +498,12 @@ mod tests {
             system_state: SystemState::Plain,
             ..system.clone()
         };
-        let body = encode(&request, &plain).unwrap();
+        let body = encode(&request, Default::default(), &plain).unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[3], system_message("second", false));
-        let body = encode(&request, &system).unwrap();
+        let body = encode(&request, Default::default(), &system).unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[1], system_message("first", true));
@@ -502,7 +521,8 @@ mod tests {
             2
         );
         let unmarked = |request: &ModelRequest| -> Vec<Value> {
-            let messages = encode(request, &system).unwrap()["messages"].to_string();
+            let messages =
+                encode(request, Default::default(), &system).unwrap()["messages"].to_string();
             let messages = messages.replace(r#","cache_control":{"type":"ephemeral"}"#, "");
             serde_json::from_str(&messages).unwrap()
         };
@@ -514,7 +534,7 @@ mod tests {
         assert_eq!(current[..previous.len()], previous);
         // A detached request differs only in its cache: its states go the same way.
         request.history_lifetime = HistoryLifetime::Detached;
-        let detached = encode(&request, &system).unwrap();
+        let detached = encode(&request, Default::default(), &system).unwrap();
         assert_eq!(detached["messages"], json!(current));
         // Persisted state stays in view; a state after an assistant turn is not sent.
         request.history_lifetime = HistoryLifetime::Extends;
@@ -524,7 +544,7 @@ mod tests {
             Message::Assistant(vec![AssistantItem::text("said", 0, "done")]).into(),
             state("after", Current),
         ];
-        let body = encode(&request, &system).unwrap();
+        let body = encode(&request, Default::default(), &system).unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1], system_message("kept", false));
@@ -557,7 +577,7 @@ mod tests {
             said("one"),
         ])));
         // The last history text also takes the cache breakpoint.
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let body = encode(&request, Default::default(), &Dialect::standard()).unwrap();
         assert_eq!(
             body["messages"][1]["content"],
             json!([unsigned, {"type":"text","text":"one","cache_control":{"type":"ephemeral"}}])
@@ -567,7 +587,7 @@ mod tests {
             Message::User(vec![text("more")]),
             Message::Assistant(vec![item("b", &signed), said("two")]),
         ]));
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let body = encode(&request, Default::default(), &Dialect::standard()).unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(
             messages[1]["content"],
@@ -590,7 +610,7 @@ mod tests {
             item("c", &broken),
             said("x"),
         ])]);
-        assert!(encode(&request, &Dialect::standard()).is_err());
+        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
     }
 
     #[test]
@@ -604,7 +624,7 @@ mod tests {
             .push(Entry::from(Message::Assistant(vec![reasoning])));
         let current = StateLifetime::Current;
         request.context.push(state("state", current));
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let body = encode(&request, Default::default(), &Dialect::standard()).unwrap();
         let messages = &body["messages"];
         assert_eq!(
             messages[0]["content"][0]["cache_control"],
@@ -616,7 +636,7 @@ mod tests {
             ..Dialect::standard()
         };
         assert_eq!(
-            encode(&request, &timed).unwrap()["messages"][0]["content"][0]["cache_control"],
+            encode(&request, Default::default(), &timed).unwrap()["messages"][0]["content"][0]["cache_control"],
             json!({"type":"ephemeral", "ttl":"1h"})
         );
         assert_eq!(
@@ -624,7 +644,8 @@ mod tests {
             json!([{"type":"text", "text":"state"}])
         );
         let unmarked = |request: &ModelRequest| {
-            let body = json!(encode(request, &Dialect::standard()).unwrap()).to_string();
+            let body = json!(encode(request, Default::default(), &Dialect::standard()).unwrap())
+                .to_string();
             !body.contains("cache_control")
         };
         // Detached history shares no cached prefix with any other request.
@@ -639,9 +660,9 @@ mod tests {
             cache: true,
         };
         request.system = vec![cached.clone(); 4];
-        assert!(encode(&request, &Dialect::standard()).is_ok());
+        assert!(encode(&request, Default::default(), &Dialect::standard()).is_ok());
         request.context = entries(vec![Message::User(vec![text("hello")])]);
-        assert!(encode(&request, &Dialect::standard()).is_err());
+        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
         // A long history marks its newest prefix ends beside the system prompt.
         request.system = vec![cached];
         for turn in ["two", "three", "four", "five"] {
@@ -651,7 +672,7 @@ mod tests {
                 Message::User(vec![text(turn)]),
             ]));
         }
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let body = encode(&request, Default::default(), &Dialect::standard()).unwrap();
         assert_eq!(json!(body).to_string().matches("cache_control").count(), 4);
         let messages = body["messages"].as_array().unwrap();
         let marked: Vec<_> = (messages.iter())
@@ -672,13 +693,13 @@ mod tests {
             AssistantItem::text("blank", 0, "   "),
             AssistantItem::tool_call("t", 1, call),
         ]));
-        let body = encode(&request, &Dialect::standard()).unwrap();
+        let body = encode(&request, Default::default(), &Dialect::standard()).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool_use");
         // The runtime never journals a turn without content; one that reaches
         // the codec is an error, not something to paper over.
         request.context = entries(continue_after(vec![AssistantItem::text("blank", 0, "   ")]));
-        assert!(encode(&request, &Dialect::standard()).is_err());
+        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
     }
 }

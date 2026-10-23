@@ -47,7 +47,7 @@ impl SessionRuntime {
         context.refresh(&self.store, agent).await?;
         let frontier = context.through();
         let projected = context.projected.clone();
-        let provider = context.provider.as_mut();
+        let provider = context.provider()?;
         for launch in self.jobs.active_launches(agent) {
             if !launches.contains(&launch) {
                 launches.push(launch);
@@ -409,8 +409,8 @@ mod tests {
         let fixture = Fixture::new([Step::new(summary(summary_json()))]).await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
-        let user_png = crate::tests::png(b"user-image");
-        let tool_png = crate::tests::png(b"tool-image");
+        let user_png = crate::tests::png(b"user-image").await;
+        let tool_png = crate::tests::png(b"tool-image").await;
         let store = &runtime.store;
         let user_image = store
             .store_image(Some("user.png".into()), &user_png)

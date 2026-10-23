@@ -1,12 +1,13 @@
 //! Encode Responses input history, replay, runtime state, and explicit cache checkpoints.
 use super::{Dialect, ProviderError, native::ItemType, reasoning_parts};
+use crate::media::Image;
 use crate::provider::{
     ProviderErrorKind::InvalidRequest,
     codec::{
         Cache,
         common::{
-            StateWire, image_url, is_sealed, own_replay, push_state, signed_context, tagged,
-            tool_text, user_parts,
+            PreparedImages, StateWire, image_url, is_sealed, own_replay, push_state,
+            signed_context, tagged, tool_text, user_parts,
         },
         placement::{explicit_breakpoint, push_history},
     },
@@ -16,6 +17,7 @@ use serde_json::{Value, json};
 
 pub(super) fn encode(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     dialect: &Dialect,
 ) -> Result<Vec<Value>, ProviderError> {
     let mut input = Input::default();
@@ -31,7 +33,7 @@ pub(super) fn encode(
         request,
         budget,
         0,
-        |input, entry| input.push_entry(request, dialect, unsigned, entry),
+        |input, entry| input.push_entry(request, images, dialect, unsigned, entry),
         |input| input.text,
         Input::mark,
     )?;
@@ -72,10 +74,13 @@ impl Input {
     fn push_entry(
         &mut self,
         request: &ModelRequest,
+        images: PreparedImages<'_>,
         dialect: &Dialect,
         unsigned: bool,
         entry: &Entry,
     ) -> Result<(), ProviderError> {
+        let image_part =
+            |image: &Image| json!({"type":"input_image", "image_url":image_url(image)});
         let message = match entry {
             Entry::Message(message) => message,
             Entry::State(state) => {
@@ -90,9 +95,7 @@ impl Input {
         };
         match message {
             Message::User(parts) => {
-                let content = user_parts(request, parts, "input_text", |image| {
-                    Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
-                })?;
+                let content = user_parts(request, images, parts, "input_text", image_part)?;
                 let text = content.iter().rposition(|part| {
                     part.get("text")
                         .and_then(Value::as_str)
@@ -170,9 +173,7 @@ impl Input {
                         let mut content = vec![json!({"type":"input_text", "text":format!(
                                 "Images from tool {} (call_id: {}):", result.name, result.call_id)})];
                         for image in &result.images {
-                            content.push(
-                                json!({"type":"input_image", "image_url":image_url(request, image)?}),
-                            );
+                            content.push(images.part(image, "input_text", image_part)?);
                         }
                         self.push(
                             json!({"type":"message", "role":"user", "content":content}),
@@ -195,7 +196,9 @@ mod tests {
     use crate::media::AttachmentRef;
     use crate::provider::codec::StateRole;
     use crate::provider::{
-        codec::common::tests::{envelope, image, notes, request, tool_result, user},
+        codec::common::tests::{
+            envelope, image, image_data, loaded, notes, request, tool_result, user,
+        },
         protocol::{Binding, HistoryLifetime, Outcome, UserContent, entries},
     };
 
@@ -204,8 +207,8 @@ mod tests {
         reduced.completion.items().to_vec()
     }
 
-    #[test]
-    fn user_attachments_and_tool_images_require_loaded_blobs() {
+    #[tokio::test]
+    async fn user_attachments_and_tool_images_require_loaded_blobs() {
         let mut req = request("gpt-5");
         let attach = |attachment| UserContent::Attachment { attachment };
         let Message::User(mut content) = user("look") else {
@@ -225,12 +228,10 @@ mod tests {
                 true,
             ),
         ]);
-        assert!(encode(&req, &Dialect::stateless()).is_err());
-        // Load the fixture blobs as the session store would.
-        req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
-        req.blobs.insert(notes().blob, b"notes".to_vec());
-        let input = encode(&req, &Dialect::stateless()).unwrap();
-        let image_url = "data:image/png;base64,AQID";
+        assert!(encode(&req, Default::default(), &Dialect::stateless()).is_err());
+        let images = loaded(&mut req).await;
+        let input = encode(&req, images.prepared(), &Dialect::stateless()).unwrap();
+        let image_url = image_data();
         let content = &input[0]["content"];
         assert_eq!(content[0]["text"], "look");
         assert_eq!(content[1]["image_url"], image_url);
@@ -258,7 +259,7 @@ mod tests {
             let reasoning = AssistantItem::reasoning("r", 0, "private", Some(replay));
             req.context = entries(vec![Message::Assistant(vec![reasoning])]);
             assert_eq!(
-                encode(&req, &Dialect::stateless()).unwrap(),
+                encode(&req, Default::default(), &Dialect::stateless()).unwrap(),
                 Vec::<Value>::new()
             );
         }
@@ -292,7 +293,7 @@ mod tests {
         ] {
             let mut req = request("test-model");
             req.context = entries(turns.into_iter().map(turn));
-            let input = encode(&req, &dialect).unwrap();
+            let input = encode(&req, Default::default(), &dialect).unwrap();
             assert_eq!(input.iter().collect::<Vec<_>>(), expected);
         }
     }
@@ -316,7 +317,7 @@ mod tests {
             Message::Assistant(items),
             tool_result("call_1", "search", json!({"found":true}), vec![], false),
         ]);
-        let input = encode(&req, &Dialect::stateless()).unwrap();
+        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert_eq!(input[0], native);
         assert_eq!(
             (&input[1]["type"], &input[2]["type"]),
@@ -325,7 +326,7 @@ mod tests {
         assert_eq!(input[1]["call_id"], input[2]["call_id"]);
         // Another model's reasoning stays behind; the call and its output do not.
         req.model = "gpt-6".parse().unwrap();
-        let wire = encode(&req, &Dialect::stateless()).unwrap();
+        let wire = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert_eq!(wire, vec![input[1].clone(), input[2].clone()]);
     }
 
@@ -344,7 +345,7 @@ mod tests {
             Message::Assistant(items),
             tool_result("call_1", "search", json!({"value":42}), vec![], false),
         ]);
-        let input = encode(&req, &Dialect::stateless()).unwrap();
+        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
         assert_eq!(reasoning.count(), 1);
         assert_eq!(input[1], native_reasoning);
@@ -371,7 +372,7 @@ mod tests {
                 "answer", "42",
             )]))));
         req.context.push(Entry::from(user("thanks")));
-        let replayed = encode(&req, &Dialect::stateless()).unwrap();
+        let replayed = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");
         assert_eq!(replayed[6]["content"][0]["text"], "thanks");
@@ -391,7 +392,7 @@ mod tests {
             state("now", Current),
         ];
         let as_user = Dialect::stateless();
-        let input = encode(&req, &as_user).unwrap();
+        let input = encode(&req, Default::default(), &as_user).unwrap();
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(
@@ -402,10 +403,10 @@ mod tests {
             state_role: StateRole::System,
             ..Dialect::stateless()
         };
-        let input = encode(&req, &system).unwrap();
+        let input = encode(&req, Default::default(), &system).unwrap();
         assert_eq!(input[1]["role"], "developer");
         req.context = vec![user("hi").into(), state("now", Current)];
-        let input = encode(&req, &as_user).unwrap();
+        let input = encode(&req, Default::default(), &as_user).unwrap();
         assert_eq!(
             json!(input),
             json!([{"type":"message","role":"user","content":[text("hi"), text("now")]}])
@@ -457,7 +458,7 @@ mod tests {
             .into(),
             state("now", Current),
         ];
-        let input = encode(&req, &Dialect::stateless()).unwrap();
+        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert!(!has_checkpoint(&json!(input)));
         assert_eq!(
             input[0]["content"],
@@ -480,7 +481,7 @@ mod tests {
             let dialect = explicit(role);
             let mut req = request("gpt-5");
             req.context = vec![user("first").into(), state("snapshot 1", Current)];
-            let first = encode(&req, &dialect).unwrap();
+            let first = encode(&req, Default::default(), &dialect).unwrap();
             let stable = first[0]["content"][0].clone();
             assert!(marked(&stable));
             if role == StateRole::User {
@@ -500,7 +501,7 @@ mod tests {
                 user("second").into(),
                 state("snapshot 2", Current),
             ];
-            let second = encode(&req, &dialect).unwrap();
+            let second = encode(&req, Default::default(), &dialect).unwrap();
             assert_eq!(second[0]["content"][0], stable);
             assert!(!has_checkpoint(&second[1]));
             assert!(marked(&second[2]["content"][0]));
@@ -516,7 +517,7 @@ mod tests {
                 user("third").into(),
                 state("snapshot 3", Current),
             ];
-            let third = encode(&req, &dialect).unwrap();
+            let third = encode(&req, Default::default(), &dialect).unwrap();
             assert_eq!(third[0], second[0]);
             assert_eq!(third[2]["content"][0], second[2]["content"][0]);
             assert!(marked(&third[4]["content"][0]));
@@ -541,14 +542,14 @@ mod tests {
                 if persisted {
                     req.context.push(state("stable state", Persisted));
                 }
-                let first = encode(&req, &dialect).unwrap();
+                let first = encode(&req, Default::default(), &dialect).unwrap();
                 if persisted {
                     let content = first.last().unwrap()["content"].as_array().unwrap();
                     assert!(marked(content.last().unwrap()));
                 }
                 let prefix = first.as_slice();
                 req.context.extend([answer("one"), user("next").into()]);
-                let second = encode(&req, &dialect).unwrap();
+                let second = encode(&req, Default::default(), &dialect).unwrap();
                 assert_eq!(&second[..prefix.len()], prefix);
                 assert!(marked(&second.last().unwrap()["content"][0]));
                 // Only the newest seams that fit the budget are marked, the
@@ -556,7 +557,7 @@ mod tests {
                 for prompt in ["three", "four", "five", "six"] {
                     req.context.extend([answer("reply"), user(prompt).into()]);
                 }
-                let input = encode(&req, &dialect).unwrap();
+                let input = encode(&req, Default::default(), &dialect).unwrap();
                 let mut seams = Vec::new();
                 for [turn, next] in input.array_windows() {
                     if next["role"] == "assistant" {
@@ -571,12 +572,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_tool_outputs_keep_arrays_ids_errors_and_image_sidecars_across_turns() {
+    #[tokio::test]
+    async fn explicit_tool_outputs_keep_arrays_ids_errors_and_image_sidecars_across_turns() {
         use crate::provider::protocol::{StateLifetime::*, state};
         let dialect = explicit(StateRole::User);
         let mut req = request("gpt-5");
-        req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
         let Message::Tool(mut results) =
             tool_result("call_1", "search", json!({"failed":true}), vec![], true)
         else {
@@ -601,7 +601,8 @@ mod tests {
             answer("rest assistant"),
             tool_result("call_1", "search", json!("rest output"), vec![], false).into(),
         ];
-        let input = encode(&req, &dialect).unwrap();
+        let images = loaded(&mut req).await;
+        let input = encode(&req, images.prepared(), &dialect).unwrap();
         assert_eq!(input[1]["call_id"], input[2]["call_id"]);
         assert_eq!(input[3]["call_id"], "call_2");
         for output in [&input[2], &input[3], &input[6]] {
@@ -619,7 +620,7 @@ mod tests {
         assert!(marked(&input[4]["content"][0]));
         assert_eq!(
             input[4]["content"][1],
-            json!({"type":"input_image", "image_url":"data:image/png;base64,AQID"})
+            json!({"type":"input_image", "image_url":image_data()})
         );
         assert_eq!(input[4]["content"][2]["text"], "now");
         assert!(!marked(&input[4]["content"][2]));
@@ -627,7 +628,7 @@ mod tests {
         req.context[3] = state("now", Superseded);
         req.context.push(answer("done"));
         req.context.push(state("next", Current));
-        let second = encode(&req, &dialect).unwrap();
+        let second = encode(&req, images.prepared(), &dialect).unwrap();
         assert_eq!(&second[..4], &input[..4]);
         assert_eq!(
             &second[4]["content"].as_array().unwrap()[..2],
@@ -641,11 +642,10 @@ mod tests {
         assert_eq!(second[6]["call_id"], input[6]["call_id"]);
     }
 
-    #[test]
-    fn unsupported_trailing_items_fall_back_without_mutating_native_replay() {
+    #[tokio::test]
+    async fn unsupported_trailing_items_fall_back_without_mutating_native_replay() {
         let native = reasoning_item();
         let mut req = request("gpt-5");
-        req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
         req.context = entries(vec![
             user("stable"),
             Message::Assistant(assemble(vec![
@@ -662,18 +662,18 @@ mod tests {
                 },
             ]),
         ]);
-        let automatic = encode(&req, &Dialect::stateless()).unwrap();
-        let explicit = encode(&req, &explicit(StateRole::User)).unwrap();
+        let images = loaded(&mut req).await;
+        let automatic = encode(&req, images.prepared(), &Dialect::stateless()).unwrap();
+        let explicit = encode(&req, images.prepared(), &explicit(StateRole::User)).unwrap();
         assert!(marked(&explicit[0]["content"][0]));
         assert_eq!(explicit[1], native);
         assert_eq!(&explicit[1..], &automatic[1..]);
     }
 
-    #[test]
-    fn empty_nonmarkable_and_detached_inputs_have_no_checkpoints() {
+    #[tokio::test]
+    async fn empty_nonmarkable_and_detached_inputs_have_no_checkpoints() {
         let dialect = explicit(StateRole::User);
         let mut req = request("gpt-5");
-        req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
         let contexts = [
             vec![],
             entries(vec![
@@ -686,7 +686,8 @@ mod tests {
         ];
         for context in contexts {
             req.context = context;
-            let input = encode(&req, &dialect).unwrap();
+            let images = loaded(&mut req).await;
+            let input = encode(&req, images.prepared(), &dialect).unwrap();
             assert!(!has_checkpoint(&json!(input)));
         }
         req.history_lifetime = HistoryLifetime::Detached;
@@ -697,7 +698,7 @@ mod tests {
             answer("done"),
             user("tail").into(),
         ];
-        let input = encode(&req, &dialect).unwrap();
+        let input = encode(&req, Default::default(), &dialect).unwrap();
         assert!(!has_checkpoint(&json!(input)));
         assert!(input[2]["output"].is_array());
     }
@@ -715,7 +716,7 @@ mod tests {
             tool_result("call_1", "search", json!("rest tool"), vec![], false).into(),
             state("tail current", Current),
         ];
-        let input = encode(&req, &explicit(StateRole::User)).unwrap();
+        let input = encode(&req, Default::default(), &explicit(StateRole::User)).unwrap();
         assert!(marked(&input[0]["content"][0]));
         assert!(!input.iter().skip(1).any(has_checkpoint));
         assert_eq!(input[1]["content"][0]["text"], "rest user");

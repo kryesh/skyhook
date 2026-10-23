@@ -12,11 +12,14 @@ use tokio::io::AsyncWriteExt;
 
 use super::super::workspace::atomic_write_context;
 use super::progress::{FetchProgress, transport_error};
-use super::validation::{HttpRequestUrl, InlineMode, OutputPlan};
-use super::{LocalContext, LocalError, ResponseBody, text};
+use super::validation::{HttpRequestUrl, OutputPlan};
+use super::{LocalContext, LocalError, ResponseBody, ResponseFormat, text};
 
 enum BodySink {
-    Memory { bytes: Vec<u8>, mode: InlineMode },
+    Memory {
+        bytes: Vec<u8>,
+        format: ResponseFormat,
+    },
     Download(PendingDownload),
 }
 
@@ -98,9 +101,9 @@ impl PendingDownload {
 impl BodySink {
     async fn new(output: OutputPlan, progress: &mut FetchProgress) -> Result<Self, LocalError> {
         match output {
-            OutputPlan::Inline(mode) => Ok(Self::Memory {
+            OutputPlan::Inline(format) => Ok(Self::Memory {
                 bytes: Vec::new(),
-                mode,
+                format,
             }),
             OutputPlan::Download {
                 destination,
@@ -139,18 +142,12 @@ impl BodySink {
         received: u64,
     ) -> Result<ResponseBody, LocalError> {
         match self {
-            Self::Memory { bytes, mode } => {
-                match mode {
-                    InlineMode::ExtractText => progress.step(
-                        Operation::Capture,
-                        Subject::Label("HTML text extraction".into()),
-                    ),
-                    _ => progress.step(
-                        Operation::Deserialize,
-                        Subject::Label("HTTP response body".into()),
-                    ),
-                }
-                response_body(bytes, content_type, url, mode).await
+            Self::Memory { bytes, format } => {
+                progress.step(
+                    Operation::Deserialize,
+                    Subject::Label("HTTP response body".into()),
+                );
+                Ok(response_body(bytes, content_type, url, format, progress).await)
             }
             Self::Download(download) => download.finish(context, progress, received).await,
         }
@@ -224,50 +221,36 @@ async fn response_body(
     bytes: Vec<u8>,
     content_type: Option<&str>,
     url: &HttpRequestUrl,
-    mode: InlineMode,
-) -> Result<ResponseBody, LocalError> {
-    use text::{ContentClass, ExtractableHtml, ResponseEntity};
+    format: ResponseFormat,
+    progress: &mut FetchProgress,
+) -> ResponseBody {
+    use text::{ContentClass, ResponseEntity};
 
     if bytes.is_empty() {
-        return Ok(ResponseBody::Empty);
+        return ResponseBody::Empty;
     }
-    if matches!(mode, InlineMode::Base64) {
-        return Ok(ResponseBody::Base64 {
+    if format == ResponseFormat::Base64 {
+        return ResponseBody::Base64 {
             data: STANDARD.encode(bytes),
-        });
+        };
     }
-    let entity = ResponseEntity::new(bytes, content_type);
-    if matches!(mode, InlineMode::ExtractText) {
-        match entity.class() {
-            ContentClass::Html => {
-                let input = ExtractableHtml::admit(entity, url).map_err(LocalError::failed)?;
-                let extracted = text::extract(input).await.map_err(LocalError::failed)?;
-                return Ok(ResponseBody::Text {
-                    text: extracted.text,
-                    metadata: Some(extracted.metadata),
-                });
-            }
-            ContentClass::Binary => {
-                return Err(LocalError::failed(
-                    "text extraction is unsupported for this binary content type",
-                ));
-            }
-            ContentClass::Text => {}
+    let entity = ResponseEntity::new(bytes, content_type, format);
+    match (format, entity.class()) {
+        (ResponseFormat::Text, _) => ResponseBody::Text {
+            text: entity.decode(),
+        },
+        (_, ContentClass::Html) => {
+            progress.step(Operation::Capture, Subject::Label("HTML extraction".into()));
+            text::extract(entity, url).await
         }
-    }
-    if matches!(mode, InlineMode::Auto) && entity.class() == ContentClass::Binary {
-        return Ok(ResponseBody::Base64 {
+        (_, ContentClass::Binary) => ResponseBody::Base64 {
             data: STANDARD.encode(entity.bytes()),
-        });
+        },
+        (_, ContentClass::Text) => json_or_text(entity.decode()).await,
     }
-    let text = entity.decode();
-    // Only automatic handling reads JSON; `text` keeps the decoded text as sent.
-    if !matches!(mode, InlineMode::Auto) {
-        return Ok(ResponseBody::Text {
-            text,
-            metadata: None,
-        });
-    }
+}
+
+async fn json_or_text(text: String) -> ResponseBody {
     // A body can be large, so it is parsed off the async workers.
     let parsed = tokio::task::spawn_blocking(move || {
         let json = crate::job::output::parse_json_text(&text);
@@ -275,13 +258,10 @@ async fn response_body(
     })
     .await;
     let (text, json) = parsed.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
-    Ok(match json {
+    match json {
         Some(value) => ResponseBody::Json { value },
-        None => ResponseBody::Text {
-            text,
-            metadata: None,
-        },
-    })
+        None => ResponseBody::Text { text },
+    }
 }
 
 #[cfg(test)]
@@ -293,26 +273,24 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn extraction_failure_names_its_reason() {
+    async fn unreadable_html_keeps_the_response_and_its_source() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
-        let html = "<html><body></body></html>";
+        let html = "<html><body><div id='app'></div></body></html>";
         let (url, task) = server(vec![reply(
             "201 Created",
             "Content-Type: text/html\r\n",
             html,
         )])
         .await;
-        let error = fetch(&runtime, &executor, json!({"url":url, "text":true}))
-            .await
-            .unwrap_err();
+        let arguments = json!({"url":url, "include_headers":true});
+        let output = fetch(&runtime, &executor, arguments).await.unwrap();
         task.finish().await;
-        let (diagnostic, output) = error.into_parts();
-        assert!(output.is_none());
-        assert_eq!(diagnostic.context.operation, Operation::Capture);
+        assert_eq!(output["status"], 201);
+        assert_eq!(output["headers"]["content-type"], json!(["text/html"]));
         assert_eq!(
-            diagnostic.cause,
-            Cause::Message(text::ExtractionFailure::Parser.to_string())
+            output["body"],
+            json!({"kind":"unreadable", "reason":"no_text", "text":html})
         );
     }
 
@@ -421,43 +399,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_formats_decode_extract_or_reject_by_mode() {
+    async fn response_formats_decode_or_extract_by_format() {
+        use ResponseFormat::{Auto, Readable, Text};
         let url = HttpRequestUrl::parse("https://example.org/article").unwrap();
         let html = format!(
             "<!doctype html><html><title>Sniffed article</title><article><p>{}</p></article></html>",
             "Meaningful article details, independent of media type spelling. ".repeat(30)
         );
-        let body =
-            |bytes: Vec<u8>, content_type, mode| response_body(bytes, content_type, &url, mode);
-        assert!(matches!(
-            body(vec![0, 255, 3], Some("application/octet-stream"), InlineMode::Auto).await,
-            Ok(ResponseBody::Base64 { data }) if data == "AP8D"
-        ));
-        assert!(matches!(
-            body(vec![0xe9], Some("text/plain; charset=windows-1252"), InlineMode::Auto).await,
-            Ok(ResponseBody::Text { text, metadata: None }) if text == "\u{e9}"
-        ));
-        assert!(matches!(
-            body(Vec::new(), Some("text/html"), InlineMode::Text).await,
-            Ok(ResponseBody::Empty)
-        ));
-        // Sniffed HTML extracts even without a declared media type.
-        let Ok(ResponseBody::Text {
-            text,
-            metadata: Some(metadata),
-        }) = body(html.into_bytes(), None, InlineMode::ExtractText).await
-        else {
-            panic!("expected extracted text")
+        let url = &url;
+        let read = |bytes: &[u8], content_type, format| {
+            let bytes = bytes.to_vec();
+            async move {
+                let mut progress = FetchProgress::new();
+                let body = response_body(bytes, content_type, url, format, &mut progress).await;
+                let step = progress.failure(LocalError::failed("probe")).diagnostic();
+                (body, step.context.operation)
+            }
         };
-        assert!(text.contains("Meaningful article details"));
-        assert_eq!(metadata.title, "Sniffed article");
-        let error = body(
-            vec![0, 255],
-            Some("application/pdf"),
-            InlineMode::ExtractText,
-        )
-        .await;
-        assert!(error.is_err());
+        let body = async |bytes, content_type, format| read(bytes, content_type, format).await.0;
+        assert!(matches!(
+            body(&[0, 255, 3], Some("application/octet-stream"), Readable).await,
+            ResponseBody::Base64 { data } if data == "AP8D"
+        ));
+        assert!(matches!(
+            body(&[0xe9], Some("text/plain; charset=windows-1252"), Auto).await,
+            ResponseBody::Text { text } if text == "\u{e9}"
+        ));
+        assert!(matches!(
+            body(&[], Some("text/html"), Text).await,
+            ResponseBody::Empty
+        ));
+        let html = html.as_bytes();
+        assert!(matches!(
+            body(html, Some("text/html"), Text).await,
+            ResponseBody::Text { text } if text.as_bytes() == html
+        ));
+        // Sniffed HTML extracts without a declared media type, and `readable`
+        // also reads HTML served as another one.
+        for (content_type, format) in [(None, Auto), (Some("text/plain"), Readable)] {
+            let (ResponseBody::Page(page), Operation::Capture) =
+                read(html, content_type, format).await
+            else {
+                panic!("expected a page extracted as a capture step for {content_type:?}")
+            };
+            assert!(page.markdown.contains("Meaningful article details"));
+            assert_eq!(page.title, "Sniffed article");
+        }
+        assert!(matches!(
+            body(html, Some("text/plain"), Auto).await,
+            ResponseBody::Text { .. }
+        ));
     }
 
     #[tokio::test]

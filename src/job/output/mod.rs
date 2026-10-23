@@ -12,9 +12,9 @@ mod reader;
 mod render;
 mod saved;
 mod shape;
-pub use args::OutputArgs;
 use args::Selection;
-pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, MAX_LIMIT, line_matcher};
+pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, Selectors, line_matcher};
+pub use args::{OutputArgs, PageLimit};
 pub(crate) use captures::{
     CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
 };
@@ -25,7 +25,7 @@ pub use products::{
     Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NumberedLine, OutputFields,
     OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
-pub(crate) use projection::{Presented, presented_fields};
+pub(crate) use projection::{Presented, fill_absent, presented_fields};
 use reader::Source;
 pub(crate) use saved::{Output, Saved, presented_size};
 use saved::{Stored, hydrate, prepare_document};
@@ -52,7 +52,7 @@ const IO_BUFFER_BYTES: usize = 64 * 1024;
 /// Capture pages host inspection reads at once while hydrating a presentation.
 const HYDRATED_PAGES: usize = 4;
 /// The most lines host inspection shows of a running job's capture: its latest.
-const LIVE_LINES: usize = 20;
+const LIVE_LINES: PageLimit = PageLimit::new::<20>();
 
 /// Omit null-valued object fields from human-only UI display copies.
 /// Never use for model, history, saved output, or JavaScript response data.
@@ -202,8 +202,9 @@ impl JobManager {
                     let page = async {
                         if live {
                             let held = reads.clone();
-                            let start =
-                                move || reader::last_page_start(&reads, target.capture, LIVE_LINES);
+                            let start = move || {
+                                reader::last_page_start(&reads, target.capture, LIVE_LINES.get())
+                            };
                             query.start = Some(held.hold(start).await?);
                             query.limit = Some(LIVE_LINES);
                         }
@@ -600,7 +601,7 @@ mod tests {
             match field {
                 "field" => args.field = text,
                 "start" => (args.field, args.start) = (text, Some(1)),
-                "limit" => args.limit = Some(100),
+                "limit" => args.limit = Some(DEFAULT_LIMIT),
                 "pattern" => (args.field, args.pattern) = (text, Some(String::new())),
                 "context" => args.context = Some(0),
                 "offset" => (args.field, args.offset) = (text, Some(0)),
@@ -704,8 +705,14 @@ mod tests {
                     "{outcome}"
                 );
                 if outcome == "unreferenced" && terminal {
-                    assert_eq!(view["presentation"]["notice"], "Output incomplete.");
-                    assert_eq!(page["presentation"]["notice"], "Output incomplete.");
+                    assert_eq!(
+                        view["presentation"]["notice"],
+                        crate::job::Notice::OutputIncomplete.as_str()
+                    );
+                    assert_eq!(
+                        page["presentation"]["notice"],
+                        crate::job::Notice::OutputIncomplete.as_str()
+                    );
                 } else {
                     assert!(view["result"].is_null(), "{outcome}");
                 }
@@ -775,7 +782,10 @@ mod tests {
             view["presentation"]["captures"],
             incomplete("/result/console")
         );
-        assert_eq!(view["presentation"]["notice"], "Output incomplete.");
+        assert_eq!(
+            view["presentation"]["notice"],
+            crate::job::Notice::OutputIncomplete.as_str()
+        );
         assert_eq!(lines(&model(&manager, query).await), 50);
     }
 
@@ -796,7 +806,10 @@ mod tests {
                 if complete {
                     assert!(view["presentation"]["notice"].is_null());
                 } else {
-                    assert_eq!(view["presentation"]["notice"], "Output incomplete.");
+                    assert_eq!(
+                        view["presentation"]["notice"],
+                        crate::job::Notice::OutputIncomplete.as_str()
+                    );
                 }
             }
         }
@@ -935,7 +948,11 @@ mod tests {
         loop {
             let mut args = field_args(id, "/result/stdout");
             (args.start, args.offset) = (start, offset);
-            (args.pattern, args.context, args.limit) = (Some("(?i)error".into()), Some(2), Some(2));
+            (args.pattern, args.context, args.limit) = (
+                Some("(?i)error".into()),
+                Some(2),
+                Some(PageLimit::new::<2>()),
+            );
             let view = model(&manager, args).await;
             let preview = &view["presentation"]["preview"];
             // The page is of the requested field, so it does not repeat it.
@@ -1150,7 +1167,7 @@ mod tests {
         use crate::{
             identity::AgentId,
             session::SessionStore,
-            tests::{IMAGE, TestRuntime, assert_loaded, image_runtime, script, tool_executor},
+            tests::{TestRuntime, assert_loaded, image_runtime, script, tool_executor},
             tool::{
                 ToolError, ToolOutput,
                 policy::{Capability, CapabilitySet},
@@ -1178,11 +1195,7 @@ mod tests {
             let source = format!("return await tool.jobs({query});");
             let output = script(&executor, agent, source, false).await;
             assert!(output.output.images.is_empty());
-            for query in [
-                json!({"job":read.job,"limit":0}),
-                json!({"job":read.job,"pattern":"["}),
-                json!({"job":999999}),
-            ] {
+            for query in [json!({"job":read.job,"pattern":"["}), json!({"job":999999})] {
                 let response = executor.run_model(agent, "jobs", query).await.unwrap();
                 assert_eq!(response.output.value["state"], "failed");
             }
@@ -1218,7 +1231,9 @@ mod tests {
         #[tokio::test]
         async fn retrieved_images_survive_resume_including_failed_tool_output() {
             let runtime = TestRuntime::on_disk().await;
-            let image = crate::media::Image::new(IMAGE.to_vec()).unwrap();
+            let image = crate::media::Image::decode(crate::tests::image_png())
+                .await
+                .unwrap();
             let image = runtime.store.store_image(Some("image.png".into()), &image);
             let image = image.await.unwrap();
             let spec = JobSpec::test(runtime.agent.clone(), "partial-image");

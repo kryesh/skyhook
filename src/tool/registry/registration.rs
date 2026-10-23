@@ -290,9 +290,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
     }
 
     pub fn build(self) -> Catalog<C, P> {
-        Catalog {
-            tools: Arc::new(self.tools),
-        }
+        Catalog::new(self.tools)
     }
 }
 

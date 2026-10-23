@@ -144,9 +144,66 @@ mod tests {
         }
     }
 
-    /// A valid PNG image: the PNG signature followed by `tail`.
-    pub(crate) fn png(tail: &[u8]) -> crate::media::Image {
-        crate::media::Image::new([&b"\x89PNG\r\n\x1a\n"[..], tail].concat()).unwrap()
+    /// A 1x1 PNG followed by `tail`, which decoding ignores: distinct tails make
+    /// distinct blobs.
+    pub(crate) fn png_bytes(tail: &[u8]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        [bytes.into_inner(), tail.to_vec()].concat()
+    }
+
+    /// Deterministic bytes that do not compress.
+    pub(crate) fn noise_bytes() -> impl Iterator<Item = u8> {
+        let mut seed = 0x2545_f491_u32;
+        std::iter::repeat_with(move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed.to_le_bytes()
+        })
+        .flatten()
+    }
+
+    /// Deterministic noise encoded as `format`, so encoded sizes grow with the image.
+    pub(crate) fn noise(format: image::ImageFormat, width: u32, height: u32) -> Vec<u8> {
+        let pixels = noise_bytes().take(width as usize * height as usize * 4);
+        let pixels = image::RgbaImage::from_vec(width, height, pixels.collect()).unwrap();
+        let pixels = match format {
+            image::ImageFormat::Jpeg => image::DynamicImage::from(pixels).into_rgb8().into(),
+            _ => image::DynamicImage::from(pixels),
+        };
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
+    /// [`png_bytes`] as an image.
+    pub(crate) async fn png(tail: &[u8]) -> crate::media::Image {
+        crate::media::Image::decode(png_bytes(tail)).await.unwrap()
+    }
+
+    /// A GIF of a red frame, then a blue one.
+    pub(crate) fn animated_gif() -> Vec<u8> {
+        let mut animation = Vec::new();
+        let frame = |color| image::Frame::new(image::RgbaImage::from_pixel(4, 2, color));
+        image::codecs::gif::GifEncoder::new(&mut animation)
+            .encode_frames([
+                frame(image::Rgba([255, 0, 0, 255])),
+                frame(image::Rgba([0, 0, 255, 255])),
+            ])
+            .unwrap();
+        animation
+    }
+
+    /// More image attachments than one submission may carry.
+    pub(crate) async fn over_limit_images() -> Vec<crate::media::Attachment> {
+        let image = crate::media::Attachment::Image {
+            file: None,
+            image: png(b"").await,
+        };
+        vec![image; crate::media::MAX_IMAGES_PER_SUBMISSION + 1]
     }
 
     /// Records every authorization request and decides synchronously from it.
@@ -280,8 +337,10 @@ mod tests {
         }
     }
 
-    /// A PNG, at `image.png` in an image runtime's workspace.
-    pub(crate) const IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nattachment test";
+    /// The PNG at `image.png` in an image runtime's workspace.
+    pub(crate) fn image_png() -> Vec<u8> {
+        png_bytes(b"attachment test")
+    }
 
     /// An executor offering the filesystem, job-control and script tools, and
     /// the slot through which its script tool reaches it.
@@ -301,14 +360,14 @@ mod tests {
         (executor, slot)
     }
 
-    /// A runtime whose workspace holds [`IMAGE`], with its [`tool_executor`].
+    /// A runtime whose workspace holds [`image_png`], with its [`tool_executor`].
     pub(crate) async fn image_runtime() -> (
         TestRuntime,
         ToolExecutor,
         Arc<std::sync::OnceLock<ToolExecutor>>,
     ) {
         let runtime = TestRuntime::new().await;
-        tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
+        tokio::fs::write(runtime.root.path().join("image.png"), image_png())
             .await
             .unwrap();
         let (executor, slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
@@ -329,7 +388,7 @@ mod tests {
             .unwrap()
     }
 
-    /// `images` is one PNG whose bytes a model request loads as [`IMAGE`].
+    /// `images` is one PNG whose bytes a model request loads as [`image_png`].
     pub(crate) async fn assert_loaded(store: &SessionStore, images: Vec<crate::media::ImageRef>) {
         use crate::provider::{codec::common::tests::tool_result, protocol::ModelRequest};
         assert_eq!(images.len(), 1);
@@ -345,6 +404,6 @@ mod tests {
             .load_blobs(&mut request, &mut Default::default())
             .await
             .unwrap();
-        assert_eq!(request.blobs.get(&blob).unwrap(), IMAGE);
+        assert_eq!(request.blobs.get(&blob).unwrap(), image_png());
     }
 }

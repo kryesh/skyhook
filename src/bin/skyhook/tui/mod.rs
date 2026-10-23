@@ -10,6 +10,7 @@ mod render;
 mod status;
 mod theme;
 mod tool_view;
+mod viewport;
 
 use super::cli::{InitialInput, InteractiveRequest};
 use app::App;
@@ -97,12 +98,16 @@ pub async fn run(
     let launch = Launch::from_request(&request, model, permissions, None).await?;
     let (launch, prompts) = host::with_prompts(launch);
     let observation = match request.resume {
-        Some(id) => Some(host::observed(launch.create(Some(id)).await?).await?),
+        Some(id) => {
+            let session = launch.create(Some(id)).await?;
+            Some(host::resumed(session, request.model.as_ref()).await?)
+        }
         None => None,
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(observation, launch, &mode, saved, tx);
-    // An explicit mode outranks the one a resumed session was last in, if it has it.
+    // An explicit mode outranks the one a resumed session was last in, if the
+    // session has it.
     if let Some(mode) = explicit
         && !app.select_mode(&mode)
     {
@@ -134,6 +139,9 @@ pub async fn run(
     }
     let mut host = host::Host::new(app, rx, prompts);
     let result: io::Result<()> = async {
+        // A menu an event opened is drawn before the next event: its rows are what
+        // it pages by.
+        let mut opened = false;
         while host.settle() {
             let app = host.app();
             let now = Instant::now();
@@ -141,6 +149,7 @@ pub async fn run(
                 draw_terminal(&mut terminal, app)?;
                 pacer.drawn(now, now.elapsed());
                 app.dirty = false;
+                opened = false;
             }
             if let Some(text) = app.clipboard.take() {
                 copy_terminal(terminal.backend_mut(), &text)?;
@@ -150,10 +159,10 @@ pub async fn run(
             let busy = writer.busy();
             let budget = pacer.due().filter(|_| app.dirty && !busy);
             tokio::select! {
-                event = input.next() => match event {
+                event = input.next(), if !opened => match event {
                     Some(Ok(event)) => {
-                        apply(&mut host, &mut pacer, event);
-                        drain(&mut input, &mut host, &mut pacer).await?;
+                        opened = apply(&mut host, &mut pacer, event)
+                            || drain(&mut input, &mut host, &mut pacer).await?;
                     }
                     Some(Err(error)) => return Err(error),
                     None => break,
@@ -180,8 +189,9 @@ pub async fn run(
 }
 
 /// Input continuing a gesture (pointer motion, drags, wheel steps) repaints within
-/// the frame budget; anything else paints as soon as the writer is free.
-fn apply(host: &mut host::Host, pacer: &mut frames::Pacer, event: Event) {
+/// the frame budget; anything else paints as soon as the writer is free. Whether
+/// the event opened a menu.
+fn apply(host: &mut host::Host, pacer: &mut frames::Pacer, event: Event) -> bool {
     use crossterm::event::MouseEventKind as Kind;
     let gesture = matches!(&event, Event::Mouse(mouse) if matches!(
         mouse.kind,
@@ -195,27 +205,35 @@ fn apply(host: &mut host::Host, pacer: &mut frames::Pacer, event: Event) {
     if !gesture {
         pacer.input();
     }
+    let menu = |host: &mut host::Host| host.app().menu.as_ref().map(|menu| menu.id);
+    let shown = menu(host);
     host.app().event(event);
+    menu(host).is_some_and(|opened| shown != Some(opened))
 }
 
 /// Apply every input event already queued, so one frame answers a burst: a window
-/// drag relays out once, for its latest size. A host request is settled first.
+/// drag relays out once, for its latest size. A host request is settled first, and
+/// a menu an event opened is drawn first: whether one was.
 async fn drain(
     input: &mut EventStream,
     host: &mut host::Host,
     pacer: &mut frames::Pacer,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     while host.app().host.is_none() && !host.app().exit {
         // Poll with this task's waker: crossterm keeps the first waker it is given
         // until input arrives, so a no-op waker would strand later input.
         let next = std::future::poll_fn(|cx| Poll::Ready(input.poll_next_unpin(cx))).await;
         match next {
-            Poll::Ready(Some(Ok(event))) => apply(host, pacer, event),
+            Poll::Ready(Some(Ok(event))) => {
+                if apply(host, pacer, event) {
+                    return Ok(true);
+                }
+            }
             Poll::Ready(Some(Err(error))) => return Err(error),
             Poll::Ready(None) | Poll::Pending => break,
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Buffer each frame and present it atomically on terminals supporting synchronized output.

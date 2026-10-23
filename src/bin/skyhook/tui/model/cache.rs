@@ -445,6 +445,8 @@ mod tests {
         let (_root, app, mut model, session) = played_fixture().await;
         drop(app);
         let mut fold = Fold::new(&session, Tab::Conversation).await;
+        // Details disclose the pending retry's whole card.
+        fold.app.details = true;
         let asked = ask(&session, "question");
         let delay = std::time::Duration::from_millis(10);
         let request = observe_find(&mut fold.app, |app| latest_request(&app.journal)).await;
@@ -495,8 +497,8 @@ mod tests {
             let due = Timing::Until(at(&fold.app.journal, scheduled, attempt - 1) + 10);
             assert_eq!(replies[0].timing, due);
             let text = replies[0].text();
-            let attempt_part = format!(" · attempt {}\n", attempt + 1);
-            assert!(text.starts_with("Retrying · "), "{text}");
+            let attempt_part = format!(" · attempt {} · Unavailable\n", attempt + 1);
+            assert!(text.starts_with("▾ Retrying · "), "{text}");
             for part in [attempt_part.as_str(), "HTTP 503"] {
                 assert!(text.contains(part), "{text}");
             }
@@ -529,7 +531,7 @@ mod tests {
             .collect();
         assert!(failures.is_empty(), "{failures:?}");
         // What the store reads of the journal shows the same.
-        let read = whole_entries(&mut fold.app, false).await;
+        let read = whole_entries(&mut fold.app, true).await;
         fold.refresh();
         assert!(fold.app.entries() == read);
     }

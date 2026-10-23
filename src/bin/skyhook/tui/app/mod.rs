@@ -3,7 +3,8 @@ pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
 use lifecycle::PendingStart;
 pub use menus::{
-    ConfirmAction, Emphasis, Item, ItemRef, Menu, MenuId, MenuKind, SavedState, SessionRef,
+    ConfirmAction, Emphasis, Item, ItemRef, Menu, MenuId, MenuKind, MenuLayout, SavedState,
+    SessionRef,
 };
 use prompts::UiPrompt;
 pub use queue::{Delivered, Paused, QueuedInput, QueuedInputId};
@@ -34,6 +35,7 @@ use super::{
     editor::{Editor, TextField},
     keys::{Command, KeyMap},
     model::{self, Entry, Projection, Tab, View, Views},
+    viewport::Viewport,
 };
 use crate::interaction::{ApprovalReply, Prompt, PromptKind};
 use crate::{state, text::brief};
@@ -135,7 +137,7 @@ pub struct App {
     pub views: Views,
     pub focus: Focus,
     pub tree_cursor: usize,
-    pub tree_scroll: usize,
+    pub tree_view: Viewport,
     pub editor: Composer,
     pub history: Vec<String>,
     history_browse: Option<HistoryBrowse>,
@@ -179,8 +181,9 @@ pub struct App {
     pub animating: bool,
     pub details: bool,
     pub outputs: OutputStore,
-    /// Held by each export in flight.
-    exports: std::sync::Arc<()>,
+    /// Held by each task the session stays open for: an export, or the
+    /// activation of a picked model.
+    tasks: std::sync::Arc<()>,
     pub tx: mpsc::UnboundedSender<Work>,
     pub keys: KeyMap,
     pub leader: Option<KeyEvent>,
@@ -279,7 +282,7 @@ impl App {
             views: Views::default(),
             focus: Focus::Composer,
             tree_cursor: 0,
-            tree_scroll: 0,
+            tree_view: Viewport::default(),
             editor: Composer::default(),
             history: vec![],
             history_browse: None,
@@ -310,7 +313,7 @@ impl App {
             animating: false,
             details: false,
             outputs: OutputStore::default(),
-            exports: Default::default(),
+            tasks: Default::default(),
             tx: tx.clone(),
             keys: KeyMap::default(),
             leader: None,
@@ -433,8 +436,16 @@ pub(super) mod tests {
             let agents = session.store().agents().await.unwrap();
             let mut records = Vec::new();
             for agent in agents.agents {
-                let window = pages::whole(session, &agent.agent).await.unwrap();
-                records.extend(window.transcript().unwrap().loaded_records());
+                let mut page = Some(skyhook::session::Page::First);
+                while let Some(read) = page {
+                    let store = session.store();
+                    let read = store.transcript(&agent.agent, read, model::PAGE).await;
+                    let read = read.unwrap();
+                    page = (read.records.len() == model::PAGE).then(|| {
+                        skyhook::session::Page::After(read.first + model::PAGE as u64 - 1)
+                    });
+                    records.extend(read.records);
+                }
             }
             records.sort_unstable_by_key(|record| record.sequence);
             records
@@ -524,11 +535,19 @@ pub(super) mod tests {
         let observation = prepared(session).await;
         *app = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
     }
-    /// An image attachment whose bytes are a minimal PNG signature.
-    pub(super) fn png_attachment(name: &str) -> Attachment {
+    /// A 1x1 PNG.
+    pub(super) fn png() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+    /// An image attachment of [`png`].
+    pub(super) async fn png_attachment(name: &str) -> Attachment {
         Attachment::Image {
             file: Some(name.into()),
-            image: skyhook::media::Image::new(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap(),
+            image: skyhook::media::Image::decode(png()).await.unwrap(),
         }
     }
     /// The entries a fresh build of `app`'s view shows from what the app holds.
@@ -658,17 +677,26 @@ pub(super) mod tests {
     pub(super) fn draw_buffer(app: &mut App) -> ratatui::buffer::Buffer {
         draw_sized_buffer(app, 60, 24)
     }
+    /// A test terminal kept across frames, which repaints only the cells a frame changes.
+    pub(in crate::tui) struct Screen(ratatui::Terminal<ratatui::backend::TestBackend>);
+    impl Screen {
+        pub(in crate::tui) fn new(width: u16, height: u16) -> Self {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            Self(ratatui::Terminal::new(backend).unwrap())
+        }
+        pub(in crate::tui) fn draw(&mut self, app: &mut App) -> &ratatui::buffer::Buffer {
+            self.0
+                .draw(|frame| crate::tui::render::draw(frame, app))
+                .unwrap();
+            self.0.backend().buffer()
+        }
+    }
     pub(in crate::tui) fn draw_sized_buffer(
         app: &mut App,
         width: u16,
         height: u16,
     ) -> ratatui::buffer::Buffer {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| crate::tui::render::draw(frame, app))
-            .unwrap();
-        terminal.backend().buffer().clone()
+        Screen::new(width, height).draw(app).clone()
     }
     pub(in super::super) fn draw(app: &mut App) -> String {
         draw_sized(app, 60, 24)

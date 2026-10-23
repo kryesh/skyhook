@@ -13,6 +13,8 @@ pub(super) enum Syntax {
     Detect,
     /// A JSON document: formatted when it parses, highlighted as JSON either way.
     Json,
+    /// Model-written prose, laid out as Markdown.
+    Markdown,
     Named(&'static str),
     /// The file type of the call's `path` argument.
     Path,
@@ -33,6 +35,8 @@ enum Hint {
     Source(&'static str, Syntax, Role),
     /// A result text field shown as its own labelled block.
     Text(&'static str, &'static str, Syntax),
+    /// The syntax of a text result.
+    Result(Syntax),
     /// The call starts a child agent on its `target` argument's target.
     ChildTarget,
 }
@@ -40,6 +44,7 @@ enum Hint {
 /// Rows for a specific tool precede the rows for every tool, so they win.
 const HINTS: &[(Option<&str>, Hint)] = &[
     (Some(AGENT), ChildTarget),
+    (Some(AGENT), Result(Markdown)),
     (Some(SCRIPT), Label("JavaScript workflow")),
     (Some(SCRIPT), Source("source", Named("js"), Role::Plain)),
     (Some(EXEC), Source("command", Named("sh"), Role::Plain)),
@@ -122,13 +127,23 @@ impl<'a> Hints<'a> {
         })
     }
 
-    /// A saved output field's syntax; the whole document and its result are JSON.
+    /// A text result's syntax, where the tool declares one.
+    pub(super) fn result(self) -> Option<Syntax> {
+        rows(self.tool).find_map(|hint| match hint {
+            Hint::Result(syntax) => Some(*syntax),
+            _ => None,
+        })
+    }
+
+    /// A saved output field's syntax; the whole document is JSON, and so is
+    /// a result of undeclared syntax.
     pub(super) fn field_syntax(self, field: &FieldPointer) -> Syntax {
         let result = FieldPointer::result();
         let mut texts = self.texts();
         match texts.find(|(name, ..)| result.property(name) == *field) {
             Some((.., syntax)) => syntax,
-            None if field.is_root() || *field == result => Json,
+            None if *field == result => self.result().unwrap_or(Json),
+            None if field.is_root() => Json,
             None => Detect,
         }
     }
@@ -136,7 +151,7 @@ impl<'a> Hints<'a> {
     /// The highlighting language, empty for plain text.
     pub(super) fn language(self, syntax: Syntax) -> String {
         match syntax {
-            Verbatim | Detect => String::new(),
+            Verbatim | Detect | Markdown => String::new(),
             Json => "json".into(),
             Named(language) => language.into(),
             Path => {

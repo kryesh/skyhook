@@ -396,7 +396,7 @@ mod tests {
         writer.truncate(2).unwrap();
         writer.write_all(b"]").unwrap();
         let selected = writer.finish().unwrap();
-        let image = crate::media::Image::new(b"\x89PNG\r\n\x1a\nsource".to_vec()).unwrap();
+        let image = crate::tests::png(b"source").await;
         let reference = context
             .store_image(Some("image.png".into()), &image)
             .await

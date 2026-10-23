@@ -347,7 +347,7 @@ mod tests {
         let fixture = Fixture::new([Step::fail(error.clone()), answer("recovered")]).await;
         let image = crate::media::Attachment::Image {
             file: Some(fixture.workspace.path().join("evidence.png")),
-            image: crate::tests::png(b"request image fixture"),
+            image: crate::tests::png(b"request image fixture").await,
         };
         let (images, options) = ([image], Selection::default());
         let started = tokio::time::Instant::now();

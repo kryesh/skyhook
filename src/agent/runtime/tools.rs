@@ -86,7 +86,7 @@ pub(super) fn register(
     );
     builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
         "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout|cancelled, waited_s} with whole seconds waited. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
         ToolOptions::default().job_role(crate::job::JobRole::Wait),
         move |context, args| {
             let runtime = wait.get().and_then(Weak::upgrade);
@@ -109,7 +109,7 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "todo",
-        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
+        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit. Reads return {items}; replacing returns no result.",
         ToolOptions::default().result::<TodoList>(),
         |TodoArgs { items, job }| match (items, job) {
             (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments("items and job cannot be combined")
@@ -486,8 +486,8 @@ async fn run_child_request(
         tokio::select! {
             result = &mut done_rx => {
                 let text = result
-                    .map_err(|_| failure(Operation::Receive, Effects::Started)(ToolError::failed("child agent stopped before returning a result")))?
-                    .map_err(|error| failure(Operation::Wait, Effects::Started)(match error {
+                    .map_err(|_| failure(Operation::Receive, Effects::Unknown)(ToolError::failed("child agent stopped before returning a result")))?
+                    .map_err(|error| failure(Operation::Wait, Effects::Unknown)(match error {
                         TurnFailure::Interrupted => ToolError::interrupted(),
                         other => ToolError::failed(other),
                     }))?;
@@ -505,7 +505,7 @@ async fn run_child_request(
                     Err(error) => {
                         runtime.questions.cancel_child_question(context.job()).await;
                         runtime.interrupt_tree(child).await;
-                        return Err(failure(Operation::Receive, Effects::Started)(error));
+                        return Err(failure(Operation::Receive, Effects::Unknown)(error));
                     }
                 };
                 if !runtime.questions.answer_child_question(context.job(), value.clone()).await

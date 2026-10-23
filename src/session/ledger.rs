@@ -2,7 +2,10 @@
 //! and which committed message answered it. The fold keeps only each agent's newest
 //! request and what its turn leaves open; the core writes each request's row as its
 //! records change it, and what it decides of a record as a [`Fact`].
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroU64,
+};
 
 use crate::{
     agent::{CompactionFault, Failure},
@@ -110,9 +113,30 @@ impl RequestPhase {
     }
 }
 
+/// A request's place among its agent's requests, compaction included, from 1. Every
+/// attempt of a request keeps its number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestNumber(pub(in crate::session) NonZeroU64);
+
+impl RequestNumber {
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+impl std::fmt::Display for RequestNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestRecord {
     pub agent: AgentId,
+    pub number: RequestNumber,
     /// The model context it was sent under.
     pub context: RecordSeq,
     pub purpose: ModelPurpose,
@@ -229,11 +253,15 @@ impl ResidentLedger {
                 let profile = profile.clone();
                 // A newer request supersedes whatever the previous one left pending.
                 interrupted = self.interrupt(agent, record);
+                let number = (self.latest.get(agent))
+                    .and_then(|previous| self.requests.get(previous))
+                    .map_or(RequestNumber::FIRST, |previous| previous.number.next());
                 let request = record.sequence.request();
                 self.requests.insert(
                     request,
                     RequestRecord {
                         agent: agent.clone(),
+                        number,
                         context: *context,
                         purpose,
                         profile,
@@ -699,6 +727,41 @@ mod tests {
         assert_eq!((record.attempts, record.usage), (2, usage(16, 3, 4)));
         assert_eq!(journal.open(), None);
         assert_eq!(journal.ledger.latest(&journal.agent), Some(request));
+    }
+
+    /// Each agent numbers its own requests, compaction included; a retry is the same
+    /// request, so it keeps its number.
+    #[test]
+    fn requests_number_per_agent_through_retries() {
+        let mut journal = Journal::new();
+        let (root, child) = (journal.agent.clone(), journal.agent.child(1));
+        let mut numbered = Vec::new();
+        for (agent, purpose) in [
+            (&root, ModelPurpose::Agent),
+            (&child, ModelPurpose::Agent),
+            (&child, ModelPurpose::Compaction),
+            (&root, ModelPurpose::Compaction),
+            (&root, ModelPurpose::Agent),
+            (&child, ModelPurpose::Agent),
+        ] {
+            journal.agent = agent.clone();
+            let request = journal.attempted(purpose);
+            journal.retried(request, 1, 5);
+            journal.attempt(request, 2);
+            numbered.push((agent, request));
+        }
+        let numbers: Vec<_> = (numbered.iter())
+            .map(|&(agent, request)| (agent, journal.record_of(request).number.0.get()))
+            .collect();
+        let expected = [
+            (&root, 1),
+            (&child, 1),
+            (&child, 2),
+            (&root, 2),
+            (&root, 3),
+            (&child, 3),
+        ];
+        assert_eq!(numbers, expected);
     }
 
     #[test]

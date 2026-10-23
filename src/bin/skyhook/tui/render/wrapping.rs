@@ -1,25 +1,37 @@
 //! Lossless grapheme and word wrapping for terminal lines.
 
 use super::*;
+use unicode_segmentation::GraphemeCursor;
 
 /// Printable ASCII: every byte is its own grapheme, one cell wide.
 fn narrow_ascii(text: &str) -> bool {
     text.bytes().all(|byte| matches!(byte, b' '..=b'~'))
 }
 
-/// A string's graphemes as `(byte offset, grapheme, cell width)`. Printable ASCII
-/// skips grapheme segmentation, which dominates layout of ordinary text.
+/// A string's graphemes as `(byte offset, grapheme, cell width)`. A printable ASCII
+/// byte followed by ASCII is a one-cell grapheme of its own, as only a non-ASCII
+/// character extends one; that skips segmentation, which dominates layout of
+/// ordinary text.
 pub(super) fn cells(text: &str) -> impl Iterator<Item = (usize, &str, usize)> {
-    let ascii = narrow_ascii(text);
-    let narrow = ascii.then(|| (0..text.len()).map(move |byte| (byte, &text[byte..=byte], 1)));
-    let segmented = (!ascii).then(|| {
-        text.grapheme_indices(true)
-            .map(|(byte, grapheme)| (byte, grapheme, grapheme.width()))
-    });
-    narrow
-        .into_iter()
-        .flatten()
-        .chain(segmented.into_iter().flatten())
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let start = at;
+        let narrow = matches!(bytes.get(start)?, b' '..=b'~')
+            && bytes.get(start + 1).is_none_or(u8::is_ascii);
+        if narrow {
+            at += 1;
+            return Some((start, &text[start..at], 1));
+        }
+        let mut cursor = GraphemeCursor::new(start, text.len(), true);
+        at = cursor
+            .next_boundary(text, 0)
+            .ok()
+            .flatten()
+            .unwrap_or(text.len());
+        let grapheme = &text[start..at];
+        Some((start, grapheme, grapheme.width()))
+    })
 }
 
 /// The cells a string paints, grapheme by grapheme (which can differ from its
@@ -204,13 +216,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cells_match_grapheme_segmentation_with_and_without_the_ascii_fast_path() {
+    fn cells_match_grapheme_segmentation_around_the_ascii_fast_path() {
         for text in [
             "",
             "plain ascii ~!@#$%^&*()_+{}|:<>?",
             "tab\tnewline\ncarriage\r\nnul\0",
             "pré e\u{301}lan",
             "👩‍💻 世界 ﻻ",
+            "a·b 1\u{fe0f}\u{20e3} \u{600}1 🇦🇺🇳🇿a",
         ] {
             let expected: Vec<_> = text
                 .grapheme_indices(true)

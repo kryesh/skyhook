@@ -4,6 +4,7 @@
 use super::*;
 use crate::json_schema::{Node, Resolver, accepts, declared_types};
 use crate::tool::output::{FieldPresentation, PREVIEW};
+use jsonschema::{JsonType, JsonTypeSet};
 
 /// Fields of a result whose presentation is declared, each presented one way.
 #[derive(Clone, Debug, Default)]
@@ -141,6 +142,31 @@ pub(crate) fn json_text_fields(
     .collect()
 }
 
+/// Insert `null` for each member the schema declares but `value` lacks, where the
+/// schema provably applies: a union branch counts only as the one that matches.
+pub(crate) fn fill_absent(value: &mut Value, schema: &Value) {
+    fn visit<'a>(value: &mut Value, schemas: &[Node<'a>], root: &'a Value) {
+        let applicable = ApplicableSchemas::new(schemas, root, value, Branches::Unique);
+        match value {
+            Value::Object(map) => {
+                for key in applicable.declared() {
+                    map.entry(key.clone()).or_insert(Value::Null);
+                }
+                for (key, child) in map {
+                    visit(child, &applicable.property(key), root);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter_mut().enumerate() {
+                    visit(child, &applicable.item(index), root);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(value, &[Node::root(schema)], schema);
+}
+
 fn schema_fields<T>(
     value: &Value,
     field: &FieldPointer,
@@ -155,7 +181,7 @@ fn schema_fields<T>(
         selects: impl Fn(&ApplicableSchemas<'_>, &Value) -> Option<T> + Copy,
         fields: &mut BTreeMap<FieldPointer, T>,
     ) {
-        let applicable = ApplicableSchemas::new(schemas, root, value);
+        let applicable = ApplicableSchemas::new(schemas, root, value, Branches::Matching);
         if let Some(selected) = selects(&applicable, value) {
             fields.insert(field.clone(), selected);
         }
@@ -187,17 +213,39 @@ fn schema_fields<T>(
     fields
 }
 
+/// Which `anyOf`/`oneOf` branches apply to a value.
+#[derive(Clone, Copy)]
+enum Branches {
+    /// Every branch the value may match: annotations hold wherever any may apply.
+    Matching,
+    /// The branch only when it is the one the value matches.
+    Unique,
+}
+
 // Share schema navigation across annotation queries over in-memory values.
 struct ApplicableSchemas<'a>(Vec<Node<'a>>);
 
 impl<'a> ApplicableSchemas<'a> {
-    fn new(schemas: &[Node<'a>], root: &'a Value, value: &Value) -> Self {
+    fn new(schemas: &[Node<'a>], root: &'a Value, value: &Value, branches: Branches) -> Self {
         let resolver = Resolver::new(root);
         let mut applicable = Vec::new();
         for schema in schemas {
-            expand(&resolver, *schema, value, &mut applicable, &mut Vec::new());
+            expand(
+                &resolver,
+                *schema,
+                value,
+                branches,
+                &mut applicable,
+                &mut Vec::new(),
+            );
         }
         Self(applicable)
+    }
+
+    fn declared(&self) -> impl Iterator<Item = &'a String> {
+        (self.0.iter())
+            .filter_map(|node| node.schema.get("properties")?.as_object())
+            .flat_map(serde_json::Map::keys)
     }
 
     /// The presentation these schemas declare: complete when any does.
@@ -243,6 +291,7 @@ fn expand<'a>(
     resolver: &Resolver<'a>,
     node: Node<'a>,
     value: &Value,
+    branches: Branches,
     out: &mut Vec<Node<'a>>,
     refs: &mut Vec<Node<'a>>,
 ) {
@@ -253,17 +302,48 @@ fn expand<'a>(
         && !refs.iter().any(|active| active.is(target))
     {
         refs.push(target);
-        expand(resolver, target, value, out, refs);
+        expand(resolver, target, value, branches, out, refs);
         refs.pop();
     }
     for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = node.schema.get(key).and_then(Value::as_array) {
-            for branch in branches.iter().map(|branch| node.child(branch)) {
-                if key == "allOf" || matches(resolver, branch, value, &mut Vec::new()) {
-                    expand(resolver, branch, value, out, refs);
-                }
+        let Some(alternatives) = node.schema.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let applies: Vec<_> = (alternatives.iter().map(|branch| node.child(branch)))
+            .filter(|branch| key == "allOf" || matches(resolver, *branch, value, &mut Vec::new()))
+            .collect();
+        if key == "allOf" || matches!(branches, Branches::Matching) || applies.len() == 1 {
+            for branch in applies {
+                expand(resolver, branch, value, branches, out, refs);
             }
         }
+    }
+}
+
+// A sound match never rejects a value its schema accepts, so it follows JSON
+// Schema rather than how typed tools read values: an integral number is an
+// integer, numbers are equal by value, and `required` applies only to objects.
+fn instance_of(types: JsonTypeSet, value: &Value) -> bool {
+    accepts(types, value)
+        || (types.contains(JsonType::Integer) && value.as_f64().is_some_and(|n| n.fract() == 0.0))
+}
+
+fn equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| equal(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && (left.iter())
+                    .all(|(key, left)| right.get(key).is_some_and(|right| equal(left, right)))
+        }
+        _ => left == right,
     }
 }
 
@@ -288,19 +368,20 @@ fn matches<'a>(
         }
     }
     if let Some(constant) = schema.get("const")
-        && constant != value
+        && !equal(constant, value)
     {
         return false;
     }
     if let Some(variants) = schema.get("enum").and_then(Value::as_array)
-        && !variants.contains(value)
+        && !variants.iter().any(|variant| equal(variant, value))
     {
         return false;
     }
-    if declared_types(schema).is_some_and(|types| !accepts(types, value)) {
+    if declared_types(schema).is_some_and(|types| !instance_of(types, value)) {
         return false;
     }
     if let Some(required) = schema.get("required").and_then(Value::as_array)
+        && value.is_object()
         && required
             .iter()
             .filter_map(Value::as_str)
@@ -313,6 +394,22 @@ fn matches<'a>(
             if let Some(child) = value.get(key)
                 && !matches(resolver, node.child(property), child, refs)
             {
+                return false;
+            }
+        }
+    }
+    // Any branch of a union suffices, which keeps the match lax but sound.
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            let mut matching = branches
+                .iter()
+                .map(|branch| matches(resolver, node.child(branch), value, refs));
+            let applies = if key == "allOf" {
+                matching.all(|applies| applies)
+            } else {
+                matching.any(|applies| applies)
+            };
+            if !applies {
                 return false;
             }
         }
@@ -548,5 +645,45 @@ mod tests {
             }
             assert_eq!(format!("{prefix}{remaining}"), text);
         }
+    }
+
+    #[test]
+    fn absent_members_fill_only_where_one_branch_provably_applies() {
+        let tagged = serde_json::json!({"oneOf": [
+            {"type":"object", "required":["kind"], "properties":{
+                "kind":{"const":"a"}, "x":{}, "nested":{"type":"object", "properties":{"y":{}}},
+            }},
+            {"type":"object", "required":["kind"], "properties":{"kind":{"const":"b"}, "z":{}}},
+        ]});
+        let mut value = serde_json::json!({"kind":"a", "nested":{}});
+        fill_absent(&mut value, &tagged);
+        assert_eq!(
+            value,
+            serde_json::json!({"kind":"a", "nested":{"y":null}, "x":null})
+        );
+        // Either branch accepts the value, so neither is known to apply.
+        let untagged = serde_json::json!({"anyOf": [
+            {"type":"object", "properties":{"lines":{}}},
+            {"type":"object", "properties":{"next":{}}},
+        ]});
+        let mut value = serde_json::json!({"lines":1});
+        fill_absent(&mut value, &untagged);
+        assert_eq!(value, serde_json::json!({"lines":1}));
+        // JSON Schema accepts 3.0 as the constant 3, so neither branch is unique.
+        let numeric = serde_json::json!({"anyOf": [
+            {"properties":{"n":{"const":3}, "a":{}}},
+            {"properties":{"b":{}}},
+        ]});
+        let mut value = serde_json::json!({"n":3.0});
+        fill_absent(&mut value, &numeric);
+        assert_eq!(value, serde_json::json!({"n":3.0}));
+        // A branch discriminated through its own composition is told apart too.
+        let composed = serde_json::json!({"anyOf": [
+            {"allOf": [{"properties":{"kind":{"const":"a"}}, "required":["kind"]}], "properties":{"x":{}}},
+            {"allOf": [{"properties":{"kind":{"const":"b"}}, "required":["kind"]}], "properties":{"y":{}}},
+        ]});
+        let mut value = serde_json::json!({"kind":"a"});
+        fill_absent(&mut value, &composed);
+        assert_eq!(value, serde_json::json!({"kind":"a", "x":null}));
     }
 }

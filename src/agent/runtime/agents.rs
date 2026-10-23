@@ -229,6 +229,16 @@ impl AgentFacts {
         std::mem::replace(&mut self.turn, turn)
     }
 
+    /// Stop the work it took, as an interrupt does: `Stopping` until its loop
+    /// unwinds that work, or interrupted at once while that work is a
+    /// `continue` claim its loop has yet to take, as only a claim queues one.
+    pub(super) fn stop(&mut self) {
+        let claimed =
+            (self.inbox.iter()).any(|command| matches!(command, AgentCommand::Continue { .. }));
+        self.set_turn(if claimed { INTERRUPTED } else { Turn::Stopping });
+        self.turn_token.cancel();
+    }
+
     /// Park failed, holding the batch whose refusal failed the turn.
     pub(super) fn park_holding(&mut self, failure: crate::agent::Failure, held: queue::Batch) {
         self.set_turn(Turn::Parked(TurnFailure::Failed(failure)));
@@ -256,6 +266,10 @@ pub(super) enum Turn {
     /// holds. `continue` makes it busy again, as does cancelling a job it holds;
     /// a wait that ends otherwise parks it interrupted.
     Held,
+    /// A turn an interrupt stopped whose loop has yet to unwind the work it
+    /// took. It reads interrupted, but nothing claims it, or what it would
+    /// hold, until its loop parks it so.
+    Stopping,
     /// The last turn ended without an answer: only input or `continue` resumes
     /// it, and deliveries wait for that request. A turn whose tree its owner
     /// cancelled is parked `Cancelled` until it ends as it unwinds.
@@ -276,6 +290,14 @@ pub(super) enum Was {
 impl Turn {
     fn busy(&self) -> bool {
         matches!(self, Self::Busy | Self::Held | Self::Cancelled(Was::Held))
+    }
+
+    /// Whether an interrupt stopped it, unwound or not.
+    pub(super) fn interrupted(&self) -> bool {
+        matches!(
+            self,
+            Self::Stopping | Self::Parked(TurnFailure::Interrupted)
+        )
     }
 }
 
@@ -322,29 +344,39 @@ fn interrupted() -> AgentActivity {
     AgentActivity::Stopped(TurnFailure::Interrupted)
 }
 
-/// Rest `agent`'s parked turn once nothing is left for `continue` to try again:
-/// the journal reads it answered, no delivery waits, and any batch it held was
-/// withdrawn. One its owner cancelled stays parked. Whether it stays parked.
-pub(super) fn settle_held(state: &mut CoreState, agent: &AgentId) -> bool {
-    let open = (state.stopped_turn(agent))
-        .or_else(|| held_deliveries(state, agent))
-        .is_some();
-    let Some(facts) = state.agents.get_mut(agent) else {
+/// Whether `agent`'s parked turn leaves `continue` something to try again: the
+/// journal reads it short of an answer, a delivery waits, or a batch it held is
+/// still held. One its owner cancelled always does.
+pub(super) fn continues(state: &CoreState, agent: &AgentId) -> bool {
+    let Some(facts) = state.agents.get(agent) else {
         return false;
     };
-    let holds = facts.held.as_mut().is_some_and(queue::Batch::holds);
-    if !holds {
-        facts.held = None;
-    }
     match facts.turn {
         Turn::Parked(TurnFailure::Cancelled) => true,
-        Turn::Parked(_) if holds || open => true,
         Turn::Parked(_) => {
-            facts.set_turn(Turn::Idle);
-            false
+            facts.held.as_ref().is_some_and(queue::Batch::retains)
+                || (state.stopped_turn(agent))
+                    .or_else(|| held_deliveries(state, agent))
+                    .is_some()
         }
         _ => false,
     }
+}
+
+/// Rest `agent`'s parked turn once nothing is left for `continue` to try again,
+/// dropping what of a batch it held was withdrawn. Whether it stays parked.
+pub(super) fn settle_held(state: &mut CoreState, agent: &AgentId) -> bool {
+    let continues = continues(state, agent);
+    let Some(facts) = state.agents.get_mut(agent) else {
+        return false;
+    };
+    if !facts.held.as_mut().is_some_and(queue::Batch::holds) {
+        facts.held = None;
+    }
+    if !continues && matches!(facts.turn, Turn::Parked(_)) {
+        facts.set_turn(Turn::Idle);
+    }
+    continues
 }
 
 /// Why `agent`, with no turn to continue, rests parked on the deliveries
@@ -365,6 +397,7 @@ pub(crate) fn held_deliveries(state: &CoreState, agent: &AgentId) -> Option<Turn
 fn running(state: &CoreState, agent: &AgentId, facts: &AgentFacts) -> AgentActivity {
     match &facts.turn {
         Turn::Parked(failure) => AgentActivity::Stopped(failure.clone()),
+        Turn::Stopping => interrupted(),
         Turn::Held | Turn::Cancelled(Was::Held) => AgentActivity::WaitingChildren,
         Turn::Idle | Turn::Cancelled(Was::Idle)
             if agent.parent().is_some() && state.jobs.has_live(agent) =>
@@ -634,7 +667,7 @@ impl Agents {
             AgentCommand::QueuedInputs(inputs) => inputs,
             AgentCommand::Input { .. }
             | AgentCommand::Select { .. }
-            | AgentCommand::Retry { .. } => {
+            | AgentCommand::Continue { .. } => {
                 unreachable!("partitioned out")
             }
         });
@@ -676,7 +709,7 @@ impl Agents {
 
     /// Whether an interrupt stopped `agent`'s turn.
     pub(crate) fn stopped(&self, agent: &AgentId) -> bool {
-        (self.running.get(agent)).is_some_and(|facts| facts.turn == INTERRUPTED)
+        (self.running.get(agent)).is_some_and(|facts| facts.turn.interrupted())
     }
 
     /// Hand back the input `agent` has yet to take, as interrupted, apart from
@@ -690,10 +723,42 @@ impl Agents {
             && matches!(facts.inbox.front(), Some(AgentCommand::Input { .. }));
         let handed: Vec<_> = facts.inbox.drain(usize::from(begins)..).collect();
         let untaken = !handed.is_empty();
-        handed
-            .into_iter()
-            .for_each(|command| command.refuse(|| HarnessError::Interrupted));
+        for command in handed {
+            if let Some(batch) = command.refuse(|| HarnessError::Interrupted) {
+                self.hold_again(agent, batch);
+            }
+        }
         untaken
+    }
+
+    /// Settle `agent`'s busy turn at `turn`, unless an interrupt stopped it
+    /// first; whether it did.
+    pub(super) fn rest(&mut self, agent: &AgentId, turn: Turn) -> bool {
+        let busy = self.get_mut(agent).filter(|facts| facts.turn == Turn::Busy);
+        busy.map(|facts| facts.set_turn(turn)).is_some()
+    }
+
+    /// End `agent`'s work that ran no turn: busy, it rests at `turn`; stopped,
+    /// its loop has unwound, and it parks interrupted.
+    pub(super) fn unwind(&mut self, agent: &AgentId, turn: Turn) {
+        let Some(facts) = self.get_mut(agent) else {
+            return;
+        };
+        match facts.turn {
+            Turn::Busy => drop(facts.set_turn(turn)),
+            Turn::Stopping => drop(facts.set_turn(INTERRUPTED)),
+            _ => {}
+        }
+    }
+
+    /// Hold `batch`, as it was claimed, again for `agent`'s failed turn, with
+    /// the input queued since; a turn that no longer waits hands it back.
+    pub(super) fn hold_again(&mut self, agent: &AgentId, batch: queue::Admitted) {
+        let held = batch.release(self.take_queued(agent));
+        match self.get_mut(agent) {
+            Some(facts) if matches!(facts.turn, Turn::Parked(_)) => facts.held = held,
+            _ => held.into_iter().for_each(queue::Batch::hand_back),
+        }
     }
 
     /// A job `agent` held was cancelled on request: its held turn runs on.
@@ -716,10 +781,11 @@ impl Agents {
         self.journaled.retain(|agent, _| agent.parent().is_none());
         for (agent, facts) in std::mem::take(&mut self.running) {
             self.dirty.agent(&agent);
-            facts
+            let claimed = facts
                 .inbox
                 .into_iter()
-                .for_each(|command| command.refuse(&error));
+                .filter_map(|command| command.refuse(&error));
+            claimed.for_each(queue::Admitted::hand_back);
         }
     }
 
@@ -735,7 +801,7 @@ impl Agents {
                 Turn::Busy => Some(Turn::Parked(TurnFailure::Cancelled)),
                 Turn::Idle => Some(Turn::Cancelled(Was::Idle)),
                 Turn::Held => Some(Turn::Cancelled(Was::Held)),
-                Turn::Parked(_) | Turn::Cancelled(_) => None,
+                Turn::Stopping | Turn::Parked(_) | Turn::Cancelled(_) => None,
             };
             if let Some(turn) = cancelled {
                 facts.set_turn(turn);

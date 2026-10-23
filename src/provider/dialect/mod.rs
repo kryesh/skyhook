@@ -9,6 +9,7 @@ use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
 use serde::Serialize;
 
 use crate::{
+    media::ImageLimits,
     named_enum::named_enum,
     provider::{
         ProviderError,
@@ -47,8 +48,8 @@ pub use login::{
     AuthStatus, Login, LoginCommand, LoginError, LoginReason, LoginRequired, Usage, UsageWindow,
 };
 pub use models::{
-    AccessPrograms, AccessProgramsPatch, ModelSpec, Request, RequestPatch, RequestSettings,
-    ResponseSetting, ServiceTier,
+    AccessPrograms, AccessProgramsPatch, ImageLimitSettings, ImageLimitSettingsPatch, ModelSpec,
+    Request, RequestPatch, RequestSettings, ResponseSetting, ServiceTier,
 };
 pub use placements::{PlacementError, PlacementKey, Placements, PlacementsPatch};
 
@@ -90,10 +91,17 @@ pub(crate) struct Profile {
     /// The service beneath an API root that serves several, which the codec's
     /// path joins (Codex's `codex`).
     pub service: Option<&'static str>,
+    /// What the service accepts of each image; larger ones are sent fitted.
+    pub images: ImageLimits,
 }
 
 impl Profile {
-    pub(crate) fn new(codec: Codec, transport: Transport, dialect: Dialect) -> Self {
+    pub(crate) fn new(
+        codec: Codec,
+        transport: Transport,
+        dialect: Dialect,
+        images: ImageLimits,
+    ) -> Self {
         Self {
             headers: codec.headers(),
             codec,
@@ -101,6 +109,7 @@ impl Profile {
             scope: dialect.as_str().to_owned(),
             key: Scheme::Bearer,
             service: None,
+            images,
         }
     }
 
@@ -220,6 +229,7 @@ pub(crate) fn build(
         transport: profile.transport,
         headers,
         timeouts: connection.timeouts,
+        images: profile.images,
     })
 }
 
@@ -435,7 +445,12 @@ pub(crate) mod tests {
         ];
         for (settings, codec, names) in rows {
             let conventions = settings.admit(codec).unwrap().codec;
-            let accepts = |request| conventions.encode(request, &"c".parse().unwrap()).is_ok();
+            let accepts = |request| {
+                let images = Default::default();
+                conventions
+                    .encode(request, images, &"c".parse().unwrap())
+                    .is_ok()
+            };
             assert_eq!(
                 (accepts(&dotted), accepts(&long)),
                 (names == Any, names != OpenAi),

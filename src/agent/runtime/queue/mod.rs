@@ -176,32 +176,26 @@ pub(super) struct QueuedInput {
 }
 
 impl QueuedInput {
+    fn images(&self) -> bool {
+        self.content.iter().any(UserPart::is_image)
+            || (self.attachments.iter())
+                .any(|attachment| matches!(attachment, crate::media::Attachment::Image { .. }))
+    }
+
     pub(super) fn reject(self, error: HarnessError) {
         let _ = self.cancellation.cancel();
         let _ = self.committed.send(Err(error));
     }
 }
 
-/// Queued inputs taken as one submission, with the selection that overrides
-/// theirs: claimed while a boundary or `continue` commits them, held while a
-/// failed turn keeps them for `continue`.
+/// Queued inputs taken as one submission: claimed while a boundary or
+/// `continue` commits them, held while a failed turn keeps them for `continue`.
 #[derive(Default)]
 pub(super) struct Batch {
     inputs: Vec<QueuedInput>,
-    selection: Selection,
 }
 
 impl Batch {
-    /// Claim `inputs` too, in order; one withdrawn meanwhile is handed back.
-    fn claim(&mut self, inputs: impl IntoIterator<Item = QueuedInput>) {
-        for input in inputs {
-            match input.cancellation.try_claim() {
-                true => self.inputs.push(input),
-                false => input.reject(HarnessError::Interrupted),
-            }
-        }
-    }
-
     /// Hold `inputs` too, in order; one withdrawn meanwhile is handed back.
     pub(super) fn join(&mut self, inputs: impl IntoIterator<Item = QueuedInput>) {
         for input in inputs {
@@ -212,28 +206,21 @@ impl Batch {
         }
     }
 
+    /// Whether anything it holds was not withdrawn.
+    pub(super) fn retains(&self) -> bool {
+        (self.inputs.iter()).any(|input| !input.cancellation.is_withdrawn())
+    }
+
     /// The batch held for `continue`, unless nothing in it is left.
     pub(super) fn held(self) -> Option<Self> {
-        let mut held = Self {
-            inputs: Vec::new(),
-            selection: self.selection,
-        };
+        let mut held = Self::default();
         held.join(self.inputs);
         (!held.inputs.is_empty()).then_some(held)
     }
 
-    /// The held batch claimed for `continue` to commit under `selection`, where it
-    /// names a model or mode, unless everything in it was withdrawn.
-    pub(super) fn retried(self, selection: Selection) -> Option<Self> {
-        let mut retried = Self {
-            inputs: Vec::new(),
-            selection: Selection {
-                model: selection.model.or(self.selection.model),
-                mode: selection.mode.or(self.selection.mode),
-            },
-        };
-        retried.claim(self.inputs);
-        (!retried.inputs.is_empty()).then_some(retried)
+    /// The batch claimed, unless everything in it was withdrawn.
+    pub(super) fn claimed(self) -> Option<Claimed> {
+        Claimed::claim(self.inputs)
     }
 
     /// Whether anything held is left, once what was withdrawn since is dropped.
@@ -251,6 +238,102 @@ impl Batch {
     /// Give every input back to its submitter.
     pub(super) fn hand_back(self) {
         (self.inputs.into_iter()).for_each(|input| input.reject(HarnessError::Interrupted));
+    }
+}
+
+/// Queued inputs the runtime claimed as one submission: none can be withdrawn.
+pub(super) struct Claimed(Vec<QueuedInput>);
+
+impl Claimed {
+    /// `inputs` claimed in order, handing back each withdrawn meanwhile, unless
+    /// none is left.
+    fn claim(inputs: impl IntoIterator<Item = QueuedInput>) -> Option<Self> {
+        let mut claimed = Vec::new();
+        for input in inputs {
+            match input.cancellation.try_claim() {
+                true => claimed.push(input),
+                false => input.reject(HarnessError::Interrupted),
+            }
+        }
+        (!claimed.is_empty()).then_some(Self(claimed))
+    }
+
+    /// Check every input as the session takes a message, then resolve what the
+    /// batch commits under: what `over` names, else the last model and mode
+    /// any input names. A refused batch is the refusal's, as it was claimed.
+    pub(super) fn admit(
+        self,
+        runtime: &SessionRuntime,
+        over: Selection,
+    ) -> Result<(Admitted, Selection), Refusal> {
+        let Self(inputs) = self;
+        let admits =
+            |input: &QueuedInput| runtime.admit_message(&input.attachments, &input.options);
+        if let Some(error) = inputs.iter().find_map(|input| admits(input).err()) {
+            let batch = Some(Box::new(Batch { inputs }));
+            return Err(Refusal { error, batch });
+        }
+        let named = || inputs.iter().rev().map(|input| &input.options);
+        let selection = Selection {
+            model: (over.model).or_else(|| named().find_map(|options| options.model.clone())),
+            mode: (over.mode).or_else(|| named().find_map(|options| options.mode.clone())),
+        };
+        Ok((Admitted(inputs), selection))
+    }
+}
+
+/// A claimed batch the session admitted, for the turn that takes it to prepare
+/// and commit, or to hold again as it was.
+pub(super) struct Admitted(Vec<QueuedInput>);
+
+impl Admitted {
+    /// Whether any of its inputs carries an image.
+    pub(super) fn images(&self) -> bool {
+        self.0.iter().any(QueuedInput::images)
+    }
+
+    /// Its messages, once their attachments are stored.
+    pub(super) async fn messages(
+        &self,
+        runtime: &SessionRuntime,
+    ) -> Result<Vec<Message>, HarnessError> {
+        let mut messages = Vec::with_capacity(self.0.len());
+        for input in &self.0 {
+            let content = input.content.clone();
+            let content = runtime.with_attachments(content, &input.attachments);
+            messages.push(Message::User(content.await?));
+        }
+        Ok(messages)
+    }
+
+    /// Tell every submitter its message committed under the agent's selection.
+    pub(super) fn committed(self, context: &AgentContext, settings: &AgentSettings) {
+        let committed = QueuedPromptCommitted {
+            model: context.model.profile.name.clone(),
+            mode: (settings.mode.as_ref()).map(|mode| mode.name.clone()),
+        };
+        for input in self.0 {
+            let _ = input.committed.send(Ok(committed.clone()));
+        }
+    }
+
+    /// The batch held again, with `behind` queued since, unless nothing in it
+    /// is left.
+    pub(super) fn release(self, behind: Vec<QueuedInput>) -> Option<Batch> {
+        let mut batch = Batch { inputs: self.0 };
+        batch.join(behind);
+        batch.held()
+    }
+
+    /// The batch `error` refused, for whoever holds it.
+    pub(super) fn refused(self, error: HarnessError) -> Refusal {
+        let batch = Some(Box::new(Batch { inputs: self.0 }));
+        Refusal { error, batch }
+    }
+
+    /// Give every input back to its submitter.
+    pub(super) fn hand_back(self) {
+        Batch { inputs: self.0 }.hand_back();
     }
 }
 
@@ -326,8 +409,18 @@ impl SessionHandle {
         if batch.is_empty() {
             return receipts;
         }
-        // A session that cannot run takes nothing: the first prompt says why.
-        if let Err(error) = self.running().await {
+        // A session that cannot run takes nothing, nor one whose root's model is
+        // gone unless a prompt names another: the first prompt says why.
+        let admitted = async {
+            self.running().await?;
+            let root = self.runtime.root_model();
+            let named = batch.iter().any(|input| input.options.model.is_some());
+            match named || self.runtime.harness.models.contains_key(&root) {
+                true => Ok(()),
+                false => Err(HarnessError::UnknownModel(root)),
+            }
+        };
+        if let Err(error) = admitted.await {
             let mut batch = batch.into_iter();
             if let Some(first) = batch.next() {
                 first.reject(error);
@@ -344,77 +437,49 @@ impl SessionHandle {
 }
 
 impl SessionRuntime {
-    /// Consume, as one submission before a provider request, `batch`, then
-    /// `taken`, then every input queued for the agent now: claim every member
-    /// its submitter has not withdrawn, check each, adopt the last model and
-    /// mode any of them names, or the batch's own, then store their attachments
-    /// and commit their messages with that selection in one transaction. None
-    /// when it claims nothing, or an interrupt stopped the turn first, which
-    /// hands the batch back. A batch the session refuses is the refusal's, for
-    /// the failure of the turn to hold.
+    /// Consume, as one submission before a provider request, `taken`, then
+    /// every input queued for the agent now: claim every member its submitter
+    /// has not withdrawn, admit them, select what they name, then store their
+    /// attachments and commit their messages with that selection in one
+    /// transaction. None when it claims nothing, or an interrupt stopped the
+    /// turn first, which hands the batch back. A batch the session refuses is
+    /// the refusal's, for the failure of the turn to hold.
     pub(super) async fn consume_queued(
         &self,
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
-        mut batch: Batch,
         taken: Vec<QueuedInput>,
     ) -> Option<Result<(), Refusal>> {
         let agent = turn.agent.clone();
         let queued = (self.store)
             .live(move |state| state.agents.take_queued(&agent))
             .await;
-        batch.claim(taken.into_iter().chain(queued));
-        if batch.inputs.is_empty() {
-            return None;
-        }
-        let (mut options, mut images, mut admitted) = (Selection::default(), false, Ok(()));
-        for input in &batch.inputs {
-            admitted =
-                admitted.and_then(|()| self.admit_message(&input.attachments, &input.options));
-            options.model = input.options.model.clone().or(options.model);
-            options.mode = input.options.mode.clone().or(options.mode);
-            images |= input.content.iter().any(UserPart::is_image)
-                || (input.attachments.iter())
-                    .any(|attachment| matches!(attachment, crate::media::Attachment::Image { .. }));
-        }
-        options.model = batch.selection.model.clone().or(options.model);
-        options.mode = batch.selection.mode.clone().or(options.mode);
+        let claimed = Claimed::claim(taken.into_iter().chain(queued))?;
+        let (admitted, options) = match claimed.admit(self, Selection::default()) {
+            Ok(admitted) => admitted,
+            Err(refusal) => return Some(Err(refusal)),
+        };
+        let images = admitted.images();
         let adopted = async {
-            admitted?;
             let selected = self.select(turn, context, settings, options, images);
             let selected = selected.await?;
-            let mut joins = Vec::with_capacity(batch.inputs.len());
-            for input in &batch.inputs {
-                let content = input.content.clone();
-                let content = self.with_attachments(content, &input.attachments).await?;
-                joins.push(Message::User(content));
-            }
-            let adopting = Adopting::Joins(joins);
+            let adopting = Adopting::Joins(admitted.messages(self).await?);
             self.adopt(turn, context, settings, selected, adopting)
                 .await
         };
         match adopted.await {
             Ok(()) => {
-                let committed = QueuedPromptCommitted {
-                    model: context.model.profile.name.clone(),
-                    mode: (settings.mode.as_ref()).map(|mode| mode.name.clone()),
-                };
-                for input in batch.inputs {
-                    let _ = input.committed.send(Ok(committed.clone()));
-                }
+                admitted.committed(context, settings);
                 Some(Ok(()))
             }
             // The interrupt already handed back what was queued: what waits since
             // is new input.
             Err(HarnessError::Interrupted) => {
-                batch.hand_back();
+                admitted.hand_back();
                 None
             }
-            Err(error) => {
-                let batch = Some(Box::new(batch));
-                Some(Err(Refusal { error, batch }))
-            }
+            Err(error) => Some(Err(admitted.refused(error))),
         }
     }
 
@@ -426,7 +491,7 @@ impl SessionRuntime {
         context: &mut AgentContext,
         settings: &mut AgentSettings,
     ) -> Result<bool, Refusal> {
-        let consumed = self.consume_queued(turn, context, settings, Batch::default(), Vec::new());
+        let consumed = self.consume_queued(turn, context, settings, Vec::new());
         consumed
             .await
             .transpose()
@@ -608,7 +673,7 @@ mod tests {
     async fn idle_batch_prepares_images_before_any_request() {
         let (root, tracking, session) = start(false).await;
         let file = root.path().join("batch.png");
-        let png = crate::tests::png(b"batch image fixture");
+        let png = crate::tests::png(b"batch image fixture").await;
         let image = crate::media::Attachment::Image {
             file: Some(file.clone()),
             image: png.clone(),
@@ -662,7 +727,7 @@ mod tests {
                 ..queued(
                     &session,
                     "test:withdrawn",
-                    vec![oversized()],
+                    crate::tests::over_limit_images().await,
                     Some("queue-test/third"),
                 )
             },
@@ -725,7 +790,7 @@ mod tests {
         let blind = vec![queued(
             &session,
             "test:b",
-            vec![unsupported()],
+            vec![unsupported().await],
             Some("queue-test/blind"),
         )];
         let second = enqueue_batch(&session, blind);
@@ -756,7 +821,12 @@ mod tests {
         let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let blind = Some("queue-test/blind");
-        let refused = vec![queued(&session, "test:refused", vec![unsupported()], blind)];
+        let refused = vec![queued(
+            &session,
+            "test:refused",
+            vec![unsupported().await],
+            blind,
+        )];
         let refused = enqueue_batch(&session, refused);
         buffered(&session, 1).await;
         tracking.release(0);
@@ -772,86 +842,506 @@ mod tests {
         stop(&session).await;
     }
 
-    /// A batch an idle root's session refuses fails the turn it began and is
-    /// held with it: input reaching the root meanwhile waits with the batch. A
-    /// `continue` that is refused again fails and holds it again, journaling no
-    /// selection; one on a model that takes it claims it at once, so it can no
-    /// longer be withdrawn, and commits it all on that model. Once a held batch
-    /// is withdrawn, the root rests at once and new input runs on its own.
-    #[tokio::test]
-    async fn a_refused_idle_batch_fails_its_turn_and_waits_for_continue() {
+    /// Until the root's turn is parked, or not.
+    async fn rests(session: &SessionHandle, parked: bool) {
+        bounded(async {
+            while matches!(turn(session, &session.root), Turn::Parked(_)) != parked {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    /// The [`start`] session, answered once on the text-only "blind", then
+    /// failed by the image a batch it holds brings, which a text input joined.
+    struct HeldOnBlind {
+        _root: tempfile::TempDir,
+        tracking: Arc<Script>,
+        session: Arc<SessionHandle>,
+        held: [QueuedPromptCancellation; 2],
+        receipts: [tokio::task::JoinHandle<Vec<Result<QueuedPromptCommitted, HarnessError>>>; 2],
+    }
+
+    async fn held_on_blind() -> HeldOnBlind {
         let (_root, tracking, session) = start(false).await;
-        let root = session.root.clone();
-        let rests = async |parked: bool| {
-            bounded(async {
-                while matches!(turn(&session, &root), Turn::Parked(_)) != parked {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-        };
-        let until = async |done: &dyn Fn() -> bool| {
-            bounded(async {
-                while !done() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-        };
-        let blind = Some("queue-test/blind");
-        let refused = queued(&session, "test:refused", vec![unsupported()], blind);
+        let blind = session.selection(Some(&"queue-test/blind".parse().unwrap()), None);
+        let (blind, prompting) = (blind.unwrap(), session.clone());
+        let prompted =
+            tokio::spawn(
+                async move { prompting.prompt_with_options("on blind", &[], blind).await },
+            );
+        tracking.request(0).await;
+        tracking.release(0);
+        assert_eq!(bounded(prompted).await.unwrap().unwrap(), "answer-0");
+        let refused = queued(&session, "test:refused", vec![unsupported().await], None);
         let first = refused.cancellation.clone();
         let refused = enqueue_batch(&session, vec![refused]);
-        rests(true).await;
+        until_held(&session, std::slice::from_ref(&first)).await;
         let joined = queued(&session, "test:joined", vec![], None);
-        let held = joined.cancellation.clone();
+        let held = [first, joined.cancellation.clone()];
         let joined = enqueue_batch(&session, vec![joined]);
-        until(&|| held.is_retained()).await;
+        until_held(&session, &held).await;
+        HeldOnBlind {
+            _root,
+            tracking,
+            session,
+            held,
+            receipts: [refused, joined],
+        }
+    }
+
+    /// A batch an idle root refuses fails its turn, which holds it, with input
+    /// queued since joining it. A `continue` the batch refuses, bare or
+    /// selecting a model, is refused, journaling nothing and leaving it held.
+    #[tokio::test]
+    async fn a_refused_idle_batch_fails_its_turn_and_is_held_through_refused_continues() {
+        let HeldOnBlind {
+            tracking,
+            session,
+            held,
+            ..
+        } = held_on_blind().await;
+        let changes = model_changes(&session);
+        let bare = bounded(session.continue_turn()).await;
+        assert!(matches!(bare, Err(HarnessError::ImagesUnsupported(_))));
         let again = bounded(retry(&session, "queue-test/blind")).await.unwrap();
         assert!(matches!(again, Err(HarnessError::ImagesUnsupported(_))));
-        until(&|| first.is_retained() && held.is_retained()).await;
-        assert!(model_changes(&session).is_empty());
-        assert_eq!(count(&tracking), 0);
-        let continued = retry(&session, "queue-test/second");
-        // Withdrawing what `continue` took finds it already being submitted.
-        until(&|| turn(&session, &root) == Turn::Busy).await;
-        assert!(!first.cancel() && !held.cancel());
-        let next = tracking.request(0).await;
-        assert_eq!(next.model.as_str(), "second-model");
-        assert_eq!(texts(next.messages()), ["test:refused", "test:joined"]);
-        for results in [refused, joined] {
-            assert!(bounded(results).await.unwrap().iter().all(Result::is_ok));
-        }
-        tracking.release(0);
-        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-0");
-        rests(false).await;
-        let empty = crate::media::Attachment::Image {
-            file: None,
-            image: crate::tests::png(b""),
-        };
-        let many = vec![empty; MAX_IMAGES_PER_SUBMISSION + 1];
-        let many = queued(&session, "test:many-images", many, None);
-        let cancellation = many.cancellation.clone();
-        let many = enqueue_batch(&session, vec![many]);
-        rests(true).await;
-        assert!(cancellation.cancel());
-        rests(false).await;
-        assert!(bounded(many).await.unwrap().iter().all(Result::is_err));
-        let next = enqueue_batch(&session, vec![queued(&session, "test:next", vec![], None)]);
-        let request = tracking.request(1).await;
-        let texts = texts(request.messages());
-        assert_eq!(texts, ["test:refused", "test:joined", "test:next"]);
-        assert!(bounded(next).await.unwrap().iter().all(Result::is_ok));
-        tracking.release(1);
+        until_held(&session, &held).await;
+        assert_eq!(model_changes(&session), changes);
+        assert_eq!(count(&tracking), 1);
         stop(&session).await;
         let failures = failures(&session);
         assert!(
-            failures[0].contains("does not support image inputs"),
+            matches!(&failures[..], [failure] if failure.contains("does not support image inputs")),
             "{failures:?}"
         );
-        assert_eq!(failures[1], failures[0]);
-        assert_eq!(failures[2..], [HarnessError::ImageLimit.to_string()]);
-        assert_eq!(count(&tracking), 2);
+    }
+
+    /// A `continue` on a model that takes the held batch claims it at once, so
+    /// it can no longer be withdrawn, and commits it all on that model.
+    #[tokio::test]
+    async fn a_continue_on_a_model_that_takes_the_held_batch_claims_and_commits_it() {
+        let HeldOnBlind {
+            tracking,
+            session,
+            held,
+            receipts,
+            ..
+        } = held_on_blind().await;
+        let continued = retry(&session, "queue-test/second");
+        // Withdrawing what `continue` took finds it already being submitted.
+        bounded(async {
+            while turn(&session, &session.root) != Turn::Busy {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(held.iter().all(|held| !held.cancel()));
+        let next = tracking.request(1).await;
+        assert_eq!(next.model.as_str(), "second-model");
+        assert_eq!(texts(next.messages()), ["test:refused", "test:joined"]);
+        for results in receipts {
+            assert!(bounded(results).await.unwrap().iter().all(Result::is_ok));
+        }
+        tracking.release(1);
+        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-1");
+        rests(&session, false).await;
+        stop(&session).await;
+    }
+
+    /// A `continue` with nothing to resume changes nothing, though it selects a
+    /// model.
+    #[tokio::test]
+    async fn a_continue_with_nothing_to_resume_changes_nothing() {
+        let (_root, tracking, session) = start(false).await;
+        let prompted = spawn_prompt(&session, "test:answered");
+        tracking.request(0).await;
+        tracking.release(0);
+        assert_eq!(bounded(prompted).await.unwrap().unwrap(), "answer-0");
+        let records = session.runtime.store.records().len();
+        let third = session.selection(Some(&"queue-test/third".parse().unwrap()), None);
+        let idle = bounded(session.continue_turn_with(third.unwrap())).await;
+        assert!(idle.unwrap().is_empty());
+        assert!(model_changes(&session).is_empty());
+        assert_eq!(session.runtime.store.records().len(), records);
+        stop(&session).await;
+    }
+
+    /// Once a held batch is withdrawn, the root rests at once, and new input
+    /// runs on its own.
+    #[tokio::test]
+    async fn a_withdrawn_held_batch_rests_its_root_for_new_input_alone() {
+        let (_root, tracking, session) = start(false).await;
+        let empty = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(b"").await,
+        };
+        let many = vec![empty; MAX_IMAGES_PER_SUBMISSION + 1];
+        let many = queued(&session, "test:many-images", many, Some("queue-test/third"));
+        let cancellation = many.cancellation.clone();
+        let many = enqueue_batch(&session, vec![many]);
+        until_held(&session, std::slice::from_ref(&cancellation)).await;
+        let records = session.runtime.store.records().len();
+        let bare = bounded(session.continue_turn()).await;
+        assert!(matches!(bare, Err(HarnessError::ImageLimit)), "{bare:?}");
+        assert!(model_changes(&session).is_empty());
+        assert_eq!(session.runtime.store.records().len(), records);
+        assert!(cancellation.cancel());
+        rests(&session, false).await;
+        assert!(bounded(many).await.unwrap().iter().all(Result::is_err));
+        let next = enqueue_batch(&session, vec![queued(&session, "test:next", vec![], None)]);
+        let request = tracking.request(0).await;
+        assert_eq!(texts(request.messages()), ["test:next"]);
+        tracking.release(0);
+        assert!(bounded(next).await.unwrap().iter().all(Result::is_ok));
+        stop(&session).await;
+        assert_eq!(failures(&session), [HarnessError::ImageLimit.to_string()]);
+        assert_eq!(count(&tracking), 1);
+    }
+
+    /// A `continue` claims the batch it retries before it journals anything, so
+    /// once its selection is journaled nothing in the batch can be withdrawn.
+    #[tokio::test]
+    async fn a_continue_claims_its_batch_before_journaling_a_selection() {
+        let (_root, tracking, session) = start(false).await;
+        let blind = Some("queue-test/blind");
+        let image = queued(&session, "test:image", vec![unsupported().await], blind);
+        let text = queued(&session, "test:text", vec![], None);
+        let held = [image.cancellation.clone(), text.cancellation.clone()];
+        let batch = enqueue_batch(&session, vec![image, text]);
+        bounded(async {
+            while !held.iter().all(QueuedPromptCancellation::is_retained) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let continued = retry(&session, "queue-test/second");
+        bounded(async {
+            while model_changes(&session).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(held.iter().all(|held| !held.cancel()));
+        let request = tracking.request(0).await;
+        assert_eq!(request.model.as_str(), "second-model");
+        assert_eq!(texts(request.messages()), ["test:image", "test:text"]);
+        tracking.release(0);
+        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-0");
+        assert!(bounded(batch).await.unwrap().iter().all(Result::is_ok));
+        stop(&session).await;
+    }
+
+    /// A refused batch is held as it was queued: neither a `continue` that
+    /// refuses it nor an input withdrawn from it leaves the batch a selection.
+    #[tokio::test]
+    async fn a_held_batch_keeps_no_selection_it_was_refused_under() {
+        let (_root, tracking, session) = start(false).await;
+        let blind = Some("queue-test/blind");
+        let image = queued(&session, "test:image", vec![unsupported().await], blind);
+        let text = queued(&session, "test:text", vec![], None);
+        let held = [image.cancellation.clone(), text.cancellation.clone()];
+        let batch = enqueue_batch(&session, vec![image, text]);
+        until_held(&session, &held).await;
+        let refused = bounded(retry(&session, "queue-test/blind")).await.unwrap();
+        assert!(matches!(refused, Err(HarnessError::ImagesUnsupported(_))));
+        until_held(&session, &held).await;
+        assert!(held[0].cancel());
+        let continued = spawn_continue(&session);
+        let request = tracking.request(0).await;
+        assert_eq!(request.model.as_str(), "first-model");
+        assert_eq!(texts(request.messages()), ["test:text"]);
+        tracking.release(0);
+        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-0");
+        assert!(model_changes(&session).is_empty());
+        let receipts = bounded(batch).await.unwrap();
+        assert!(matches!(
+            receipts[..],
+            [Err(HarnessError::Interrupted), Ok(_)]
+        ));
+        stop(&session).await;
+    }
+
+    /// A `continue` is a turn from the moment the root takes it: a second
+    /// `continue` while it prepares leaves the root alone, and once that
+    /// preparation fails the batch is held again with nothing journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_continue_while_another_prepares_leaves_its_batch_held() {
+        let (_root, tracking, session, gate) = gated(false).await;
+        let image = queued(
+            &session,
+            "test:image",
+            vec![unsupported().await],
+            Some("queue-test/blind"),
+        );
+        let held = [image.cancellation.clone()];
+        let batch = enqueue_batch(&session, vec![image]);
+        until_held(&session, &held).await;
+        let records = session.runtime.store.records().len();
+        let preparing = retry(&session, "gate/gated");
+        gate.opening().await;
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        assert_eq!(turn(&session, &session.root), Turn::Busy);
+        gate.open(false);
+        let refused = bounded(preparing).await.unwrap();
+        assert!(
+            matches!(refused, Err(HarnessError::Provider(_))),
+            "{refused:?}"
+        );
+        until_held(&session, &held).await;
+        assert_eq!(session.runtime.store.records().len(), records);
+        let continued = retry(&session, "queue-test/second");
+        assert_eq!(tracking.request(0).await.model.as_str(), "second-model");
+        tracking.release(0);
+        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-0");
+        assert!(bounded(batch).await.unwrap().iter().all(Result::is_ok));
+        stop(&session).await;
+    }
+
+    /// An interrupt while a `continue` prepares, or before the root takes it,
+    /// stops it: nothing is journaled or requested, and the batch waits for the
+    /// next `continue`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupt_while_a_continue_prepares_stops_it() {
+        let (_root, tracking, session, gate) = gated(false).await;
+        let image = queued(
+            &session,
+            "test:image",
+            vec![unsupported().await],
+            Some("queue-test/blind"),
+        );
+        let held = [image.cancellation.clone()];
+        let batch = enqueue_batch(&session, vec![image]);
+        until_held(&session, &held).await;
+        let records = session.runtime.store.records().len();
+        let preparing = retry(&session, "gate/gated");
+        gate.opening().await;
+        assert_eq!(bounded(session.interrupt()).await, 1);
+        gate.open(true);
+        let interrupted = bounded(preparing).await.unwrap();
+        assert!(
+            matches!(interrupted, Err(HarnessError::Interrupted)),
+            "{interrupted:?}"
+        );
+        until_held(&session, &held).await;
+        assert_eq!(session.runtime.store.records().len(), records);
+        // So does one that reaches the `continue` before the root takes it.
+        let (runtime, root) = (session.runtime.clone(), session.root.clone());
+        let (done, refused) = oneshot::channel();
+        let interrupt = move |state: &mut CoreState| {
+            let facts = state.agents.get_mut(&root).unwrap();
+            let claimed = facts.held.take().and_then(super::Batch::claimed).unwrap();
+            let Ok((batch, selection)) = claimed.admit(&runtime, Selection::default()) else {
+                panic!("the batch is admitted");
+            };
+            let continuing = AgentCommand::Continue {
+                selection,
+                batch: Some(batch),
+                resting: Box::new(facts.set_turn(Turn::Busy)),
+                done: RequestCompletion::Root(done),
+            };
+            state.agents.send(&root, continuing);
+            runtime.stop_turns(state, &root)
+        };
+        assert_eq!(bounded(session.runtime.store.live(interrupt)).await, 1);
+        let refused = bounded(refused).await.unwrap();
+        assert!(matches!(refused, Err(HarnessError::Interrupted)));
+        until_held(&session, &held).await;
+        assert_eq!(session.runtime.store.records().len(), records);
+        let continued = retry(&session, "queue-test/second");
+        let request = tracking.request(0).await;
+        assert_eq!(request.model.as_str(), "second-model");
+        assert_eq!(texts(request.messages()), ["test:image"]);
+        tracking.release(0);
+        assert_eq!(bounded(continued).await.unwrap().unwrap(), "answer-0");
+        assert!(bounded(batch).await.unwrap().iter().all(Result::is_ok));
+        stop(&session).await;
+    }
+
+    /// A `continue` behind one an interrupt stopped while it prepared waits for
+    /// that one to unwind, however its preparation ends: the stopped one
+    /// commits nothing and holds its batch again, which the next commits under
+    /// its own selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_continue_waits_for_a_stopped_continue_to_unwind() {
+        for opens in [true, false] {
+            continue_behind_a_stopped_continue(opens).await;
+        }
+    }
+
+    async fn continue_behind_a_stopped_continue(opens: bool) {
+        let (_root, tracking, session, gate) = gated(true).await;
+        let initial = spawn_prompt(&session, "test:initial");
+        tracking.request(0).await;
+        let blind = Some("queue-test/blind");
+        let image = queued(&session, "test:image", vec![unsupported().await], blind);
+        let held = [image.cancellation.clone()];
+        let batch = enqueue_batch(&session, vec![image]);
+        buffered(&session, 1).await;
+        tracking.release(0);
+        let failed = bounded(initial).await.unwrap();
+        assert!(
+            matches!(failed, Err(HarnessError::ImagesUnsupported(_))),
+            "{failed:?}"
+        );
+        until_held(&session, &held).await;
+        let records = session.runtime.store.records().len();
+
+        let stopped = retry(&session, "gate/gated");
+        gate.opening().await;
+        assert_eq!(bounded(session.interrupt()).await, 1);
+        let root = Key::Agent(session.root.clone());
+        let reading = |root| {
+            session
+                .runtime
+                .store
+                .read(|state| state.waits_reading(root))
+        };
+        let waits = reading(&root);
+        let next = retry(&session, "queue-test/second");
+        // Until the stopped one unwinds, the next neither claims the root nor
+        // journals anything.
+        bounded(async {
+            while reading(&root) == waits && turn(&session, &session.root) == Turn::Stopping {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(turn(&session, &session.root), Turn::Stopping);
+        assert_eq!(session.runtime.store.records().len(), records);
+        gate.open(opens);
+
+        let stopped = bounded(stopped).await.unwrap();
+        assert!(stopped.is_err(), "{stopped:?}");
+        let request = tracking.request(1).await;
+        assert_eq!(request.model.as_str(), "second-model");
+        assert_eq!(texts(request.messages()), ["test:initial", "test:image"]);
+        tracking.release(1);
+        assert_eq!(bounded(next).await.unwrap().unwrap(), "answer-1");
+        let receipts = bounded(batch).await.unwrap();
+        let second = |receipt: &Result<QueuedPromptCommitted, _>| matches!(receipt, Ok(committed) if committed.model.to_string() == "queue-test/second");
+        assert!(receipts.iter().all(second), "{receipts:?}");
+        assert_eq!(model_changes(&session), ["queue-test/second"]);
+        stop(&session).await;
+    }
+
+    /// Once the root's failed turn holds `held`, every input still retained.
+    async fn until_held(session: &SessionHandle, held: &[QueuedPromptCancellation]) {
+        bounded(async {
+            while !held.iter().all(QueuedPromptCancellation::is_retained)
+                || !matches!(turn(session, &session.root), Turn::Parked(_))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// A bare `continue` from a task.
+    fn spawn_continue(
+        session: &Arc<SessionHandle>,
+    ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
+        let session = session.clone();
+        tokio::spawn(async move { session.continue_turn().await })
+    }
+
+    /// Opens a provider context only once the test lets it, holding a
+    /// `continue` that selects its model while it prepares.
+    pub(super) struct Gate {
+        script: Arc<Script>,
+        opening: tokio::sync::Semaphore,
+        opens: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<bool>>,
+        open: tokio::sync::mpsc::UnboundedSender<bool>,
+    }
+
+    impl Gate {
+        /// Once a context has begun to open.
+        async fn opening(&self) {
+            bounded(self.opening.acquire()).await.unwrap().forget();
+        }
+
+        /// Let the opening context through, or fail it.
+        fn open(&self, opens: bool) {
+            self.open.send(opens).unwrap();
+        }
+    }
+
+    impl crate::provider::Provider for Gate {
+        fn open_context(
+            &self,
+            context: crate::provider::protocol::ContextId,
+        ) -> Result<Box<dyn crate::provider::ProviderContext>, crate::provider::ProviderError>
+        {
+            self.opening.add_permits(1);
+            // Opening a context is synchronous: the worker hands its other tasks
+            // on while it waits for the test.
+            let opens = async { self.opens.lock().await.recv().await };
+            let opens = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(bounded(opens))
+            });
+            match opens {
+                Some(true) => self.script.open_context(context),
+                _ => Err(crate::provider::ProviderErrorKind::Protocol.error("not opened")),
+            }
+        }
+    }
+
+    /// The [`start`] session, whose provider "gate" serves model "gated" through
+    /// a [`Gate`], with only the first two responses, both gated.
+    async fn gated(
+        first_calls_tool: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Script>,
+        Arc<SessionHandle>,
+        Arc<Gate>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let answers = (0..2).map(|index| {
+            let item = if index == 0 && first_calls_tool {
+                let todo = ToolCall::new("queue-todo", "todo", json!({"items": []})).unwrap();
+                AssistantItem::tool_call("queue-todo", 0, todo)
+            } else {
+                AssistantItem::text("text/0", 0, format!("answer-{index}"))
+            };
+            Step::new(response(vec![item])).gated()
+        });
+        let tracking = Script::new(answers, &Default::default());
+        let (open, opens) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(Gate {
+            script: tracking.clone(),
+            opening: tokio::sync::Semaphore::new(0),
+            opens: tokio::sync::Mutex::new(opens),
+            open,
+        });
+        let profile = |model: &str| crate::tests::profile(model, true);
+        let blind = ModelProfile {
+            supports_images: false,
+            ..profile("blind-model")
+        };
+        let harness = HarnessBuilder::new(root.path())
+            .session_root(root.path().join("sessions"))
+            .coalescing(wait::Coalescing::NONE)
+            .provider(
+                provider_name("queue-test"),
+                tracking.clone(),
+                models([
+                    ("first", profile("first-model")),
+                    ("second", profile("second-model")),
+                    ("blind", blind),
+                ]),
+            )
+            .provider(
+                provider_name("gate"),
+                gate.clone(),
+                models([("gated", profile("gated-model"))]),
+            )
+            .default_model("queue-test/first".parse().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let session = Arc::new(ephemeral_session(&harness).await);
+        (root, tracking, session, gate)
     }
 
     /// A direct prompt breaks the hold of a refused batch: the batch is handed
@@ -860,7 +1350,7 @@ mod tests {
     async fn a_prompt_breaks_the_hold_of_a_refused_batch() {
         let (_root, tracking, session) = start(false).await;
         let blind = Some("queue-test/blind");
-        let refused = queued(&session, "test:refused", vec![unsupported()], blind);
+        let refused = queued(&session, "test:refused", vec![unsupported().await], blind);
         let held = refused.cancellation.clone();
         let refused = enqueue_batch(&session, vec![refused]);
         bounded(async {
@@ -888,7 +1378,7 @@ mod tests {
         let turn_task = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let blind = Some("queue-test/blind");
-        let refused = queued(&session, "test:refused", vec![unsupported()], blind);
+        let refused = queued(&session, "test:refused", vec![unsupported().await], blind);
         let held = refused.cancellation.clone();
         let refused = enqueue_batch(&session, vec![refused]);
         buffered(&session, 1).await;
@@ -907,17 +1397,10 @@ mod tests {
         assert_eq!(count(&tracking), 2);
     }
 
-    fn unsupported() -> crate::media::Attachment {
+    async fn unsupported() -> crate::media::Attachment {
         crate::media::Attachment::Image {
             file: None,
-            image: crate::tests::png(b"unsupported"),
-        }
-    }
-
-    fn oversized() -> crate::media::Attachment {
-        crate::media::Attachment::Image {
-            file: None,
-            image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
+            image: crate::tests::png(b"unsupported").await,
         }
     }
 

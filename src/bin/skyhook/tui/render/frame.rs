@@ -1,7 +1,7 @@
 //! Main frame composition and viewport orchestration.
 
 use super::*;
-use crate::tui::{composer::ComposerLayout, keys::Command};
+use crate::tui::{composer::ComposerLayout, format::model_label, keys::Command};
 use skyhook::job::JobState;
 
 /// One input row between the composer's padding rows.
@@ -176,10 +176,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_sidebar(frame, app, sidebar, rect);
     }
     draw_header(frame, app, width);
-    prepare_rows(app, content_width);
+    let prompt_fences = prompt_layout.as_ref().map(|layout| &layout.fences);
+    prepare_rows(app, content_width, prompt_fences);
     app.load_shown_output(visible_entries(app));
     let near = near_view(app);
-    app.load_near(&near, app.focus_of_view());
+    app.load_near(&near, shown_edges(app));
     let navigation_active = matches!(target, InputTarget::Composer | InputTarget::None);
     draw_content(frame, app, navigation_active);
     // The popup and any notice share the row above the tree and composer.
@@ -326,7 +327,8 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         fill(frame, rect, bg);
         let text_rect = r(row.paragraph_x(), y, row.text_width, 1);
         render_row_line(
-            row,
+            &row.line,
+            &row.layout,
             text_rect,
             frame.buffer_mut(),
             Style::default().fg(foreground(row.surface)).bg(bg),
@@ -398,16 +400,12 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
 fn draw_scrollbar(frame: &mut Frame, app: &mut App) -> u16 {
     let content = app.content_rect;
     let whole = Track::of(app);
-    let total = whole.len();
-    if total <= content.height as usize || content.height == 0 {
+    let track = r(content.width - 1, content.y, 1, content.height);
+    if !scroll_thumb(frame, track, whole.shown, whole.total, THEME.base) {
         return 0;
     }
-    let scroll = app.render.scroll();
-    let track = r(content.width - 1, content.y, 1, content.height);
-    let top = scroll.map_or(total, |scroll| whole.before + scroll);
-    scroll_thumb(frame, track, top, total, THEME.base);
     app.hits.push((track, Hit::Scrollbar));
-    if scroll.is_none() {
+    if app.render.scroll().is_none() {
         return 0;
     }
     let width = 17.min(content.width.saturating_sub(2));
@@ -447,7 +445,8 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
         text(frame, r(2, y, text_width, 1), line, THEME.fg, THEME.input);
     }
     let track = r(rect.width - 1, rect.y + 1, 1, visible as u16);
-    scroll_thumb(frame, track, top, layout.rows.len(), THEME.input);
+    let shown = top as f64..(top + visible) as f64;
+    scroll_thumb(frame, track, shown, layout.rows.len() as f64, THEME.input);
     let attachments = app.editor.attachments();
     if !attachments.is_empty() {
         let names = attachments.iter().map(|attachment| {
@@ -532,10 +531,8 @@ fn footer_model(app: &App) -> String {
         let agent = app.projection.agents.iter().find(|a| a.id == app.selected);
         agent.map_or(&app.model, |a| &a.model)
     };
-    let config = app.launch.model.config();
-    let model = config
-        .model(model)
-        .map_or_else(|| model.to_string(), |profile| profile.model.to_string());
+    let profile = app.launch.model.config().model(model);
+    let model = model_label(model, profile.map(|profile| &profile.model));
     if root {
         format!("{} · {model}", app.mode)
     } else {
@@ -564,6 +561,7 @@ fn footer_metadata(model: &str, session: &str, width: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interaction::{Prompt, PromptKind};
     use crate::tui::{
         app::{
             Work,
@@ -580,9 +578,10 @@ mod tests {
         keys::Command,
         theme::THEME,
     };
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use serde_json::json;
     use skyhook::agent::AgentActivity;
+    use skyhook::agent::Question;
     use skyhook::provider::protocol::AssistantItem;
     use skyhook::session::SessionEvent;
     use std::time::Duration;
@@ -909,6 +908,43 @@ mod tests {
                 "completed highlights did not reach the frame: width={width}, reset={reset}"
             );
             assert_eq!(serde_json::to_vec(&app.journal).unwrap(), records);
+        }
+    }
+
+    /// A prompt paints a completed highlight on the frame its completion wakes,
+    /// and highlights the same code anew under another fence language.
+    #[tokio::test]
+    async fn prompt_code_highlights_on_completion_and_per_language() {
+        let (_root, mut app) = fixture().await;
+        let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
+        app.render = RenderState::new(app.selected.clone(), notify);
+        let source = "let answer = 42;";
+        let question = |id: &str, language: &str| Question {
+            id: id.into(),
+            prompt: format!("```{language}\n{source}\n```"),
+            options: vec![],
+        };
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        let kind = PromptKind::Questions {
+            agent: app.root_agent().clone(),
+            questions: vec![question("first", "rust"), question("second", "c")],
+            background: false,
+            reply,
+        };
+        app.prompt(Prompt { id: 1, kind });
+        for question in 0..2 {
+            if question > 0 {
+                app.event(Event::Key(KeyCode::Right.into()));
+            }
+            assert_eq!(app.question_index(), question);
+            let buffer = draw_sized_buffer(&mut app, 60, 30);
+            assert!(!number_is_painted(&buffer, source, THEME.accent));
+            app.work(crate::tests::bounded(ready.recv()).await.unwrap());
+            let buffer = draw_sized_buffer(&mut app, 60, 30);
+            assert!(
+                number_is_painted(&buffer, source, THEME.accent),
+                "{question}"
+            );
         }
     }
 

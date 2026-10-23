@@ -6,8 +6,7 @@ mod hints;
 pub use hints::{Hints, starts_child};
 
 use super::{format::Clean, theme::THEME};
-use highlighting::CodeKey;
-pub use highlighting::{CodeSource, HighlightCache};
+pub use highlighting::{CodeKey, CodeSource, HighlightCache};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -106,6 +105,8 @@ pub enum Section {
         gutters: Option<Clean>,
         role: Role,
     },
+    /// Model-written prose, laid out as Markdown `indent` cells in.
+    Markdown { source: Clean, indent: usize },
 }
 /// Layout intent travels with each logical line; it is never inferred from text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +123,13 @@ pub struct DocumentLine {
     pub lead: Line<'static>,
     pub text: Line<'static>,
     pub wrap: Wrap,
+}
+
+/// What a document lays out: a logical line, or Markdown that layout wraps
+/// at the width it is given.
+pub enum DocumentBlock<'a> {
+    Line(DocumentLine),
+    Markdown { source: &'a str, indent: usize },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -142,6 +150,8 @@ enum Piece<'a> {
         language: &'a str,
         role: Role,
     },
+    /// A whole Markdown section, whose lines layout decides.
+    Markdown(&'a str),
 }
 
 /// A logical line: its lead, as `indent` cells and any marker, then its text.
@@ -164,6 +174,11 @@ impl Document {
                         indent: *indent,
                         marker: None,
                         piece: Piece::Runs { runs, wrap: *wrap },
+                    })),
+                    Section::Markdown { source, indent } => Box::new(std::iter::once(Logical {
+                        indent: *indent,
+                        marker: None,
+                        piece: Piece::Markdown(source),
                     })),
                     Section::Code {
                         source,
@@ -195,8 +210,8 @@ impl Document {
             })
     }
 
-    /// The document as displayed, leads included: a whole entry's plain text.
-    /// Selection copies the same lines without their leads.
+    /// The document's text, leads included and Markdown as its source: a whole
+    /// entry's plain text. Selection copies the displayed lines without their leads.
     pub fn plain_text(&self) -> String {
         let mut text = String::new();
         for (index, line) in self.logical_lines().enumerate() {
@@ -208,28 +223,41 @@ impl Document {
             match line.piece {
                 Piece::Runs { runs, .. } => text.extend(runs.iter().map(Run::text)),
                 Piece::Code { text: code, .. } => text.push_str(code),
+                Piece::Markdown(source) => {
+                    let lead = format!("\n{}", " ".repeat(line.indent));
+                    text.push_str(&source.replace('\n', &lead));
+                }
             }
         }
         text
     }
-    /// Each logical line as painted, its lead included.
+    /// Each logical line as painted, its lead included; Markdown as its source.
     pub fn lines(&self, cache: Option<&HighlightCache>) -> Vec<Line<'static>> {
-        self.layout_lines(cache)
-            .into_iter()
-            .map(|DocumentLine { mut lead, text, .. }| {
-                lead.spans.extend(text.spans);
-                lead
+        let blocks = self.layout_lines(cache).into_iter();
+        blocks
+            .flat_map(|block| match block {
+                DocumentBlock::Line(DocumentLine { mut lead, text, .. }) => {
+                    lead.spans.extend(text.spans);
+                    vec![lead]
+                }
+                DocumentBlock::Markdown { source, indent } => (source.split('\n'))
+                    .map(|line| Line::from(format!("{}{line}", " ".repeat(indent))))
+                    .collect(),
             })
             .collect()
     }
-    pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<DocumentLine> {
+    pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<DocumentBlock<'_>> {
         // A code section's highlighting, looked up once for all its lines.
         let mut highlighted: Option<(&CodeSource, Option<&[Line<'static>]>)> = None;
         let lines = self.logical_lines().map(|line| match line.piece {
-            Piece::Runs { runs, wrap } => DocumentLine {
+            Piece::Runs { runs, wrap } => DocumentBlock::Line(DocumentLine {
                 lead: lead(line.indent, None),
                 text: header_line(runs),
                 wrap,
+            }),
+            Piece::Markdown(source) => DocumentBlock::Markdown {
+                source,
+                indent: line.indent,
             },
             Piece::Code {
                 text,
@@ -258,11 +286,11 @@ impl Document {
                     Some(styled) => Line::from(styled.spans.clone()),
                     None => Line::from(Span::styled(text.to_owned(), role.style())),
                 };
-                DocumentLine {
+                DocumentBlock::Line(DocumentLine {
                     lead: lead(line.indent, marker),
                     text,
                     wrap: Wrap::Hard,
-                }
+                })
             }
         });
         lines.collect()

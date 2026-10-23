@@ -189,7 +189,7 @@ impl ToolExecutor {
 
     /// Generate model and JavaScript tools for the receiving agent.
     #[must_use]
-    pub fn surface_for_agent(&self, agent: &AgentId) -> crate::tool::ToolSurface {
+    pub fn surface_for_agent(&self, agent: &AgentId) -> Arc<crate::tool::ToolSurface> {
         self.shared
             .registry
             .surface_for_agent(&self.capabilities, agent)

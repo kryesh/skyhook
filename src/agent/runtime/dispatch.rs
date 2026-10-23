@@ -23,6 +23,14 @@ enum Start {
     Resume(Resumed, Box<agents::Journaled>, u64),
 }
 
+impl Start {
+    /// Whether it resumes on `profile` in place of its journaled model, which its
+    /// start journals and the images its history holds must suit.
+    fn moves_to(&self, profile: &crate::session::ProfileSnapshot) -> bool {
+        matches!(self, Self::Resume(_, read, _) if read.contract.profile.name != profile.name)
+    }
+}
+
 /// The agent call a new child answers: its job, and the prompt that begins the
 /// child's first invocation.
 pub(super) struct Call {
@@ -66,11 +74,21 @@ impl PreparedAgentLaunch {
                 (contract, grants, Start::New(todos))
             }
             // Resumed as its journal leaves its last turn.
-            AgentLaunch::Resume => {
+            AgentLaunch::Resume { on } => {
                 let ended = runtime.store.read(|state| state.agents.ended(&id));
                 let (journaled, grants, stopped) = runtime.journaled(&id).await?;
                 let resumed = stopped.map_or(Resumed::Idle, Resumed::Parked);
-                let contract = journaled.contract.clone();
+                let mut contract = journaled.contract.clone();
+                // One whose own model is gone moves to the root's, which a root on a
+                // gone model keeps until a selection replaces it.
+                let on = on.or_else(|| {
+                    let gone = !runtime.harness.models.contains_key(&contract.profile.name);
+                    gone.then(|| runtime.root_model())
+                });
+                if let Some(name) = on.filter(|name| *name != contract.profile.name) {
+                    let profile = runtime.model_entry(&name)?.profile;
+                    contract.profile = crate::session::ProfileSnapshot { name, profile };
+                }
                 let start = Start::Resume(resumed, journaled.into(), ended);
                 (contract, grants, start)
             }
@@ -102,6 +120,10 @@ impl PreparedAgentLaunch {
         };
         let context =
             (runtime.open_agent_context(&id, profile, system, &capabilities, tools)).await?;
+        // A journaled profile ran the history it resumes; another must suit it.
+        if start.moves_to(&context.model.profile) {
+            context.admits_images()?;
+        }
         Ok(Self {
             runtime,
             agent_loop: AgentLoop {
@@ -148,12 +170,20 @@ impl PreparedAgentLaunch {
     }
 
     /// What journals a new agent's start, with its seeded todos and the prompt
-    /// of its `call`; nothing for one that resumes.
+    /// of its `call`; for one that resumes, the model it moves to, if any.
     fn started(&self, call: Option<&Call>) -> Vec<(AgentId, SessionEvent)> {
-        let Start::New(todos) = &self.start else {
-            return Vec::new();
-        };
         let (runtime, agent_loop) = (&self.runtime, &self.agent_loop);
+        let Start::New(todos) = &self.start else {
+            let profile = &agent_loop.context.model.profile;
+            let moved = (self.start.moves_to(profile)).then(|| {
+                let profile = profile.clone();
+                (
+                    agent_loop.id.clone(),
+                    SessionEvent::ModelChanged { profile },
+                )
+            });
+            return moved.into_iter().collect();
+        };
         let started = SessionEvent::AgentStarted {
             owner_job: agent_loop.owner_job,
             profile: agent_loop.context.model.profile.clone(),
@@ -191,13 +221,18 @@ impl PreparedAgentLaunch {
         // A resumed agent's last invocation resolved: only input opens the next.
         let (turn, invocation, read) = match start {
             Start::New(_) => (Turn::Idle, Invocation::Open, None),
-            Start::Resume(Resumed::Idle, read, _) => {
-                (Turn::Idle, Invocation::Resolved, Some(*read))
+            Start::Resume(Resumed::Idle, read, ..) => {
+                (Turn::Idle, Invocation::Resolved, Some(read))
             }
-            Start::Resume(Resumed::Parked(failure), read, _) => {
-                (Turn::Parked(failure), Invocation::Resolved, Some(*read))
+            Start::Resume(Resumed::Parked(failure), read, ..) => {
+                (Turn::Parked(failure), Invocation::Resolved, Some(read))
             }
         };
+        // As of its start, which journals the model it moves to.
+        let read = read.map(|mut read| {
+            read.contract.profile = agent_loop.context.model.profile.clone();
+            *read
+        });
         let id = agent_loop.id.clone();
         let facts = agents::AgentFacts {
             turn,
@@ -251,16 +286,20 @@ impl SessionRuntime {
     /// last ran the session left open and starts the root, parked as it read
     /// stopped, or on the deliveries the settlement leaves it, as the live turn
     /// would rest.
-    pub(super) async fn activate_root(self: Arc<Self>) -> Result<(), HarnessError> {
+    pub(super) async fn activate_root(
+        self: Arc<Self>,
+        on: Option<ModelRef>,
+    ) -> Result<(), HarnessError> {
         // Settlement closes only what preparing already read as stopped.
         let root = AgentId::root(self.store.id());
-        let resume = AgentLaunch::Resume;
+        let resume = AgentLaunch::Resume { on };
         let prepared = PreparedAgentLaunch::prepare(self.clone(), root, None, resume).await?;
+        let started = prepared.started(None);
         let resume = move |state: &mut CoreState| {
             let held = agents::held_deliveries(state, &prepared.agent_loop.id);
             prepared.resting_on(held).run(state, None);
         };
-        self.activate(resume).await
+        self.activate(started, resume).await
     }
 
     /// Start child `id` for `call`, accepting the call as its child is installed.
@@ -414,6 +453,17 @@ impl SessionRuntime {
             .ok_or_else(|| HarnessError::UnknownModel(model.clone()))
     }
 
+    /// The model the root has committed to.
+    pub(super) fn root_model(&self) -> ModelRef {
+        let root = AgentId::root(self.store.id());
+        let committed = |state: &CoreState| {
+            let held = state.agents.journaled(&root);
+            held.map(|held| held.contract.profile.name.clone())
+        };
+        let committed = self.store.read(committed);
+        committed.expect("the root's journal is held from its start")
+    }
+
     /// The edition of `name` the configuration defines now.
     pub(super) fn applied(&self, name: &ModeName) -> Result<AppliedMode, HarnessError> {
         let definition = self.modes.get(name);
@@ -451,6 +501,9 @@ impl SessionRuntime {
     /// live tool surface, or `pinned` tools journaled earlier. A pinned tool runs
     /// against its live definition, which validates the arguments; one the live
     /// surface no longer offers stays visible to the model but fails when called.
+    /// While the configuration no longer has the model, only the root opens, with
+    /// no provider, until a selection replaces it: a child refused here starts
+    /// again on the root's model once it has one.
     pub(super) async fn open_agent_context(
         &self,
         agent: &AgentId,
@@ -459,7 +512,12 @@ impl SessionRuntime {
         capabilities: &CapabilitySet,
         pinned: Option<Vec<crate::provider::protocol::ToolDefinition>>,
     ) -> Result<AgentContext, HarnessError> {
-        let provider = self.model_entry(&profile.name)?.provider;
+        let id = crate::provider::protocol::ContextId::from(agent);
+        let provider = match self.harness.models.get(&profile.name) {
+            Some(entry) => Some(entry.provider.open_context(id)?),
+            None if agent.parent().is_none() => None,
+            None => return Err(HarnessError::UnknownModel(profile.name)),
+        };
         let tools = pinned.unwrap_or_else(|| {
             let executor = self
                 .executor
@@ -474,7 +532,6 @@ impl SessionRuntime {
             tools,
             response_schema: None,
         };
-        let provider = provider.open_context(crate::provider::protocol::ContextId::from(agent))?;
         Ok(AgentContext::open(agent, model, provider, &self.store).await?)
     }
 }
@@ -574,19 +631,23 @@ impl SessionRuntime {
                     if !starts.is_empty() {
                         state.phase().admits(Command::LaunchAgent)?;
                     }
+                    let moved = starts
+                        .iter()
+                        .flat_map(|start| start.started(None))
+                        .collect();
                     let start = move |state: &mut CoreState| {
                         starts
                             .into_iter()
                             .for_each(|start| drop(start.run(state, None)));
                     };
-                    Ok(plan(state)?.after(start, Looped::Ran))
+                    Ok(plan(state)?.after(moved, start, Looped::Ran))
                 };
                 match self.store.commit(Command::Journal, looped).await? {
                     Looped::Ran(value) => return Ok(value),
                     Looped::Parked(parked, launches, unplanned) => {
                         (prepared, plan) = (launches, unplanned);
                         let prepare = parked.into_iter().map(|(child, job)| {
-                            let resume = AgentLaunch::Resume;
+                            let resume = AgentLaunch::Resume { on: None };
                             PreparedAgentLaunch::prepare(self.clone(), child, Some(job), resume)
                         });
                         for launch in futures_util::future::join_all(prepare).await {

@@ -37,6 +37,10 @@ impl Document {
             role,
         });
     }
+    pub fn markdown(&mut self, text: &str, indent: usize) {
+        let source = Clean::from(text);
+        self.sections.push(Section::Markdown { source, indent });
+    }
     pub fn arguments(&mut self, hints: Hints<'_>) {
         self.line("Arguments", Role::Heading);
         if hints.args.as_object().is_some_and(|v| v.is_empty()) {
@@ -217,13 +221,13 @@ impl Document {
     fn questions(&mut self, questions: &[Question]) {
         for question in questions {
             self.line("Question", Role::Label);
-            self.indented(2, &question.prompt, Role::Plain, Wrap::Words);
+            self.markdown(&question.prompt, 2);
             // As in the prompt panel, a description starts on its own line.
             for option in &question.options {
                 let label = format!("• {}", option.label);
                 self.indented(2, label, Role::Label, Wrap::Words);
                 if !option.description.is_empty() {
-                    self.indented(4, &option.description, Role::Muted, Wrap::Words);
+                    self.markdown(&option.description, 4);
                 }
             }
         }
@@ -231,7 +235,8 @@ impl Document {
     /// Literal text fields are split out of the display copy of the result.
     fn result(&mut self, hints: Hints<'_>, result: &Value) {
         if let Some(text) = result.as_str() {
-            return self.text(text, hints, Syntax::Detect, Role::Plain);
+            let syntax = hints.result().unwrap_or(Syntax::Detect);
+            return self.text(text, hints, syntax, Role::Plain);
         }
         let mut rest = result.clone();
         omit_null_fields(&mut rest);
@@ -270,6 +275,8 @@ impl Document {
                 let formatted = syntax
                     .detects_json()
                     .then(|| pretty_json_preview(&source, more, root));
+                // A page is a slice of source lines whose Markdown context
+                // precedes it, so it shows as the source it is.
                 match formatted.flatten() {
                     Some(formatted) => self.code(&formatted, "json", 2, None, Role::Plain),
                     None => self.code(&source, &hints.language(syntax), 2, None, Role::Plain),
@@ -324,6 +331,8 @@ impl Document {
             && let Some(value) = json_container(text)
         {
             self.code(&pretty(&value), "json", 2, None, role);
+        } else if let Syntax::Markdown = syntax {
+            self.markdown(text, 2);
         } else {
             self.code(text, &hints.language(syntax), 2, None, role);
         }
@@ -439,8 +448,10 @@ fn scalar(value: &Value) -> Option<(String, Role)> {
 }
 #[cfg(test)]
 mod tests {
-    use super::super::{THEME, Wrap, tests::view};
+    use super::super::{DocumentBlock, THEME, Wrap, tests::view};
     use super::*;
+
+    const INCOMPLETE: &str = skyhook::job::Notice::OutputIncomplete.as_str();
     use serde_json::json;
 
     fn with_error(output: Value, error: Option<&str>) -> Document {
@@ -478,9 +489,10 @@ mod tests {
     fn argument_wrapping_is_semantic_and_retains_nested_context() {
         let wrap_of = |document: &Document, needle: &str| {
             let lines = document.layout_lines(None);
-            let found = lines
-                .iter()
-                .find(|line| line.text.to_string().contains(needle));
+            let found = lines.into_iter().find_map(|block| match block {
+                DocumentBlock::Line(line) if line.text.to_string().contains(needle) => Some(line),
+                _ => None,
+            });
             found.unwrap().wrap
         };
         let document = arguments(
@@ -724,6 +736,21 @@ mod tests {
             "    Second step",
         ];
         assert_eq!(rows(&rendered("agent", &Value::Null, output)), expected);
+        // An agent's answer is Markdown; a page of it is the source it slices.
+        for (output, markdown) in [
+            (json!({"result": "**done**"}), true),
+            (
+                json!({"presentation": {"preview": {"field": "/result", "lines": ["**done**"]}}}),
+                false,
+            ),
+        ] {
+            let document = rendered("agent", &Value::Null, output);
+            assert!(document.sections.iter().any(|section| match section {
+                Section::Markdown { source, indent: 2 } => markdown && &**source == "**done**",
+                Section::Code { source, .. } => !markdown && &**source == "**done**",
+                _ => false,
+            }));
+        }
     }
 
     #[test]
@@ -740,9 +767,9 @@ mod tests {
             ),
         ] {
             let output = json!({"result": {"stdout": "payload"},
-                "presentation": {"notice": "Output incomplete.", "preview": preview}});
+                "presentation": {"notice": INCOMPLETE, "preview": preview}});
             let text = rendered("exec", &Value::Null, output).plain_text();
-            assert_eq!(text.matches("Output incomplete.").count(), 1);
+            assert_eq!(text.matches(INCOMPLETE).count(), 1);
             assert_eq!(text.matches("payload").count(), 1);
             assert!(footer.is_none_or(|footer| text.contains(footer)));
         }
@@ -750,7 +777,7 @@ mod tests {
 
     #[test]
     fn live_captures_keep_unique_read_errors_without_envelopes_or_empty_panes() {
-        let incomplete = |preview: Value, captures: Value| json!({"notice": "Output incomplete.", "preview": preview, "captures": captures});
+        let incomplete = |preview: Value, captures: Value| json!({"notice": INCOMPLETE, "preview": preview, "captures": captures});
         let capture = |field: &str, error: &str, presentation: Value| {
             json!({"field": field, "complete": false, "output": {"state": "completed",
                 "error": error, "presentation": presentation}})
@@ -776,7 +803,7 @@ mod tests {
             let document = with_error(output, Some("parent failure"));
             let text = document.plain_text();
             for marker in [
-                "Output incomplete.",
+                INCOMPLETE,
                 "parent failure",
                 "field read failed",
                 "Latest of 40 lines",

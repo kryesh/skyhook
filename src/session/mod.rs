@@ -40,7 +40,9 @@ pub use event::{
     ModelPurpose, ProfileSnapshot, RecordSeq, Refused, RequestSeq, RetryDelay, SessionEvent,
     TitleSource, Truncation,
 };
-pub use ledger::{Fact, RequestFailure, RequestPhase, RequestRecord, ResidentLedger};
+pub use ledger::{
+    Fact, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
+};
 pub use pages::{AgentSummary, AgentsPage, Answer, Page, PageFacts, TranscriptPage};
 pub(crate) use projection::{CompletedRequest, OpenedHistory, Requested};
 pub use projection::{Projected, Projection, render_history};
@@ -280,7 +282,7 @@ impl SessionStore {
             if !path.is_file() {
                 return Err(SessionError::NotFound(id));
             }
-            Ok(Reads::Own(Arc::new(db::Own::new(path))).read(read)?)
+            Ok(Reads::Own(Arc::new(db::Own::new(path, db::OpenMode::ReadOnly))).read(read)?)
         })
         .await
     }
@@ -341,8 +343,11 @@ impl SessionStore {
         // other reads.
         let (reads, core_reads) = match durable {
             true => (
-                Reads::Pool(Arc::new(db::ReadPool::new(path.clone()))),
-                Reads::Own(Arc::new(db::Own::new(path))),
+                Reads::Pool(Arc::new(db::ReadPool::new(
+                    path.clone(),
+                    db::OpenMode::Reader,
+                ))),
+                Reads::Own(Arc::new(db::Own::new(path, db::OpenMode::Reader))),
             ),
             false => {
                 let reads = Reads::writer(db.clone());
@@ -468,7 +473,8 @@ impl SessionStore {
     pub(crate) fn test_reads(&self) -> Reads {
         match self.reads() {
             Reads::Pool(_) => {
-                Reads::Own(Arc::new(db::Own::new(self.directory().join(DATABASE_FILE))))
+                let path = self.directory().join(DATABASE_FILE);
+                Reads::Own(Arc::new(db::Own::new(path, db::OpenMode::Reader)))
             }
             reads => reads,
         }
@@ -2002,7 +2008,7 @@ pub(crate) mod tests {
         drop(store);
         let path = sessions.join(id.to_string()).join(DATABASE_FILE);
         for pragma in [
-            "user_version = 23",
+            "user_version = 25",
             "user_version = 3",
             "application_id = 1",
         ] {

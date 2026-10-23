@@ -1,20 +1,25 @@
 //! The one HTTP provider: a codec, a transport dialect, the composed request
 //! headers with their credentials, and the timeouts. Dialect modules construct it.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures_util::{TryStreamExt, stream};
 use reqwest::Url;
 
-use crate::provider::{
-    Provider, ProviderContext, ProviderError, ResponseStream,
-    codec::{self, BodyPath, Codec, CodecName},
-    protocol::{AssistantItem, ContextId, Message, ModelRequest, ResponseEvent, Scope},
+use crate::{
+    media::ImageLimits,
+    provider::{
+        Provider, ProviderContext, ProviderError, ResponseStream,
+        codec::{self, BodyPath, Codec, CodecName},
+        protocol::{AssistantItem, ContextId, Message, ModelRequest, ResponseEvent, Scope},
+    },
 };
+use images::FittedImages;
 
 pub(crate) mod auth;
 pub(crate) mod errors;
 pub(crate) mod headers;
+pub(crate) mod images;
 pub(crate) mod session;
 pub(crate) mod transport;
 
@@ -129,6 +134,7 @@ pub(crate) struct HttpProvider {
     pub(crate) scope: Scope,
     /// Admission validated these.
     pub(crate) timeouts: Timeouts,
+    pub(crate) images: ImageLimits,
 }
 
 /// Provider-bound provenance prevents replaying sealed reasoning to a different
@@ -169,6 +175,7 @@ impl Provider for HttpProvider {
             provider: self.clone(),
             context,
             session: session::SessionState::default(),
+            images: Arc::default(),
         }))
     }
 }
@@ -177,6 +184,7 @@ struct Context {
     provider: HttpProvider,
     context: ContextId,
     session: session::SessionState,
+    images: Arc<tokio::sync::Mutex<FittedImages>>,
 }
 
 impl ProviderContext for Context {
@@ -184,9 +192,15 @@ impl ProviderContext for Context {
         let provider = self.provider.clone();
         let context = self.context.clone();
         let session = self.session.clone();
+        let images = Arc::clone(&self.images);
         let started = async move {
             filter_reasoning_scope(&mut request, &provider.scope);
-            let mut encoded = provider.codec.encode(&request, &context)?;
+            let mut images = images.lock().await;
+            images.refresh(&request, provider.images).await?;
+            let mut encoded = provider
+                .codec
+                .encode(&request, images.prepared(), &context)?;
+            drop(images);
             provider
                 .transport
                 .fields
@@ -549,6 +563,54 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// A stored image that no longer decodes is sent as a note in its place, on
+    /// every request that references it, rather than failing them.
+    #[tokio::test]
+    async fn an_undecodable_image_is_sent_as_a_note() {
+        use crate::{
+            media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
+            provider::{
+                Provider,
+                dialect::{self, Sourced, compatible},
+                protocol::UserContent,
+            },
+        };
+        crate::tests::bounded(async {
+            let answer = vec![
+                json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            ];
+            let (url, server) = serve(vec![answer.clone(), answer]).await;
+            let common = dialect::tests::common(&url, Some(Sourced::Literal("k".into())));
+            let chat = codec::CodecName::ChatCompletions;
+            let settings = compatible::Config::default();
+            let provider = dialect::tests::provider("local", &settings, chat, &common);
+            let mut context = provider.open_context("images".parse().unwrap()).unwrap();
+            let broken = b"\x89PNG\r\n\x1a\nbroken".to_vec();
+            let image = ImageRef {
+                file: Some("shot.png".into()),
+                format: ImageFormat::Png,
+                blob: BlobRef::of(&broken),
+            };
+            let attached = Message::User(vec![UserContent::Attachment {
+                attachment: AttachmentRef::Image(image.clone()),
+            }]);
+            let mut request = chat_request("served-model", vec![attached]);
+            request.blobs.insert(image.blob, broken);
+            for _ in 0..2 {
+                let reduced = complete(&mut *context, request.clone()).await;
+                assert_eq!(reduced.completion.outcome(), Outcome::Answer);
+            }
+            for request in server.finish().await {
+                let body: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                // A turn left with only text is sent as text.
+                let note = body["messages"][0]["content"].as_str().unwrap();
+                assert!(note.starts_with("[Image shot.png not sent: image data is invalid"));
+            }
+        })
+        .await;
+    }
+
     /// The transport's `Accept` displaces an entry's before any value is
     /// produced: the entry's command never runs, so it holds no lease that
     /// would turn a later 401 on the fixed key into an expiry.
@@ -614,6 +676,7 @@ pub(crate) mod tests {
             },
             headers: composed,
             timeouts: Timeouts::default(),
+            images: common::tests::LIMITS,
         }
     }
 

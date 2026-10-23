@@ -267,7 +267,7 @@ mod tests {
                 fixture.one(root.clone(), $event)
             };
         }
-        let image = fixture.blob(crate::tests::png(b"image").bytes());
+        let image = fixture.blob(&crate::tests::png_bytes(b"image"));
         let notes = fixture.blob(b"notes");
         let png = ImageRef {
             file: Some("image.png".into()),

@@ -11,19 +11,20 @@ mod row;
 mod rows;
 mod selection;
 mod sidebar;
+mod track;
 mod wrapping;
 
 pub use cache::RenderState;
 #[cfg(test)]
 pub(crate) use cache::visible_entries as visible;
-pub(crate) use cache::{Spot, Top, Track, anchor};
+pub(crate) use cache::{Top, anchor};
 pub use frame::draw;
 pub(super) use markdown::{Section, sections};
-pub(super) use panels::scroll_to;
 pub use row::Row;
 use rows::Laid;
 pub use rows::RowBlocks;
 pub use selection::{Selection, TextPosition};
+pub(crate) use track::{Spot, Track};
 
 use cache::*;
 use columns::*;
@@ -35,10 +36,14 @@ use sidebar::*;
 use wrapping::*;
 
 use super::{
-    app::{App, Emphasis, Focus, Hit, InputTarget, ItemRef, MenuKind, SavedState, SessionRef},
+    app::{
+        App, Emphasis, Focus, Hit, InputTarget, ItemRef, MenuKind, MenuLayout, SavedState,
+        SessionRef,
+    },
     editor::TextField,
     model::{self, Surface, Tab},
     theme::THEME,
+    tool_view::Document,
 };
 use ratatui::{
     Frame,

@@ -85,9 +85,9 @@ Directory results use the same tree format, rooted at the selected path. Trees m
 descending through them. Long trees and asset text are saved in full and can be paged using `jobs`.
 
 Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
-Supported raster images are attached with metadata. Other binary files return metadata rather
-than raw binary or base64 content. Paths inside a skill must be relative and cannot escape its
-root. Use `path: "."` to browse the root.
+Supported raster images are attached with metadata, and one that does not decode is an error.
+Other binary files return metadata rather than raw binary or base64 content. Paths inside a skill
+must be relative and cannot escape its root. Use `path: "."` to browse the root.
 
 Skills live on the session host. `location` is `{path, target: "root"}`, the skill directory's
 absolute path there, so ordinary tools can reach its files. `target` is included only for agents

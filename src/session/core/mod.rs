@@ -57,10 +57,11 @@ impl<T> Plan<T> {
         }
     }
 
-    /// The same plan, changing the state with `first` ahead of its own change,
-    /// whose result `map` takes.
+    /// The same plan, journaling `entries` and changing the state with `first`
+    /// ahead of its own, whose result `map` takes.
     pub(crate) fn after<U: 'static>(
         self,
+        mut entries: Vec<(AgentId, SessionEvent)>,
         first: impl FnOnce(&mut CoreState) + Send + 'static,
         map: fn(T) -> U,
     ) -> Plan<U>
@@ -72,7 +73,8 @@ impl<T> Plan<T> {
             first(state);
             map(live(state, records))
         };
-        Plan::new(self.entries, live).saving(self.outputs)
+        entries.extend(self.entries);
+        Plan::new(entries, live).saving(self.outputs)
     }
 
     /// Also save `outputs`, the products of the finishes the plan journals.

@@ -193,7 +193,12 @@ impl DialectConfig for Config {
         };
         let mut profile = Profile {
             scope: self.upstream.scope(),
-            ..Profile::new(conventions, transport(), Dialect::Litellm)
+            ..Profile::new(
+                conventions,
+                transport(),
+                Dialect::Litellm,
+                super::compatible::IMAGES,
+            )
         };
         if anthropic_messages {
             // These conventions send state as turn-scoped system messages, which the

@@ -13,7 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::named_enum::named_enum;
+mod images;
+pub use images::{FitError, Image, ImageBytes, ImageEdge, ImageFormat, ImageLimits, Prepared};
 
 pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_IMAGES_PER_SUBMISSION: usize = 8;
@@ -82,6 +83,10 @@ pub enum MediaError {
     InvalidDigest,
     #[error("data is not a supported image (PNG, JPEG, GIF or WebP)")]
     UnsupportedImage,
+    #[error("image data is invalid: {0}")]
+    InvalidImage(#[source] image::ImageError),
+    #[error("image work stopped: {0}")]
+    Task(#[from] tokio::task::JoinError),
     #[error("blob was not loaded for this request")]
     NotLoaded,
     #[error("text attachment is not valid UTF-8")]
@@ -90,71 +95,10 @@ pub enum MediaError {
     InvalidBase64,
     #[error("blob exceeds its byte limit")]
     TooLarge,
+    #[error(transparent)]
+    Fit(#[from] FitError),
     #[error("blob allocation failed: {0}")]
     Allocation(#[source] std::collections::TryReserveError),
-}
-
-named_enum! {
-    /// A supported image encoding, identified from the image bytes themselves and
-    /// spelled as its media type.
-    #[derive(
-        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema,
-    )]
-    pub enum ImageFormat {
-        Png = "image/png",
-        Jpeg = "image/jpeg",
-        Gif = "image/gif",
-        WebP = "image/webp",
-    }
-}
-
-impl ImageFormat {
-    pub fn sniff(bytes: &[u8]) -> Option<Self> {
-        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            Some(Self::Png)
-        } else if bytes.starts_with(b"\xff\xd8\xff") {
-            Some(Self::Jpeg)
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            Some(Self::Gif)
-        } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-            Some(Self::WebP)
-        } else {
-            None
-        }
-    }
-
-    /// The conventional file extension for names shown to the model.
-    pub const fn extension(self) -> &'static str {
-        match self {
-            Self::Png => "png",
-            Self::Jpeg => "jpg",
-            Self::Gif => "gif",
-            Self::WebP => "webp",
-        }
-    }
-}
-
-/// An image kept in its source encoding. Construction proves the bytes are a
-/// supported format, so producers never pair bytes with a separate media type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Image {
-    format: ImageFormat,
-    bytes: Vec<u8>,
-}
-
-impl Image {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, MediaError> {
-        let format = ImageFormat::sniff(&bytes).ok_or(MediaError::UnsupportedImage)?;
-        Ok(Self { format, bytes })
-    }
-
-    pub const fn format(&self) -> ImageFormat {
-        self.format
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 /// Whole file contents by presentation. NUL bytes mean binary, even in valid UTF-8.
@@ -165,17 +109,18 @@ pub enum Classified {
     Binary(Vec<u8>),
 }
 
-pub fn classify(bytes: Vec<u8>) -> Classified {
-    if let Some(format) = ImageFormat::sniff(&bytes) {
-        return Classified::Image(Image { format, bytes });
+/// Bytes signed as a supported image must decode as one.
+pub async fn classify(bytes: Vec<u8>) -> Result<Classified, MediaError> {
+    if ImageFormat::sniff(&bytes).is_some() {
+        return Image::decode(bytes).await.map(Classified::Image);
     }
     if bytes.contains(&0) {
-        return Classified::Binary(bytes);
+        return Ok(Classified::Binary(bytes));
     }
-    match String::from_utf8(bytes) {
+    Ok(match String::from_utf8(bytes) {
         Ok(text) => Classified::Text(text),
         Err(error) => Classified::Binary(error.into_bytes()),
-    }
+    })
 }
 
 /// Content attached to a prompt before it is stored. `file` records where the
@@ -263,8 +208,14 @@ impl LoadedBlobs {
         std::str::from_utf8(self.get(&text.blob)?).map_err(|_| MediaError::InvalidText)
     }
 
-    pub fn base64(&self, blob: &BlobRef) -> Result<String, MediaError> {
-        Ok(STANDARD.encode(self.get(blob)?))
+    /// The stored image `image` names. The store admits only decoded images and
+    /// checks their format when it loads them.
+    pub fn image(&self, image: &ImageRef) -> Result<Image, MediaError> {
+        let bytes = self
+            .0
+            .get(&image.blob.sha256)
+            .ok_or(MediaError::NotLoaded)?;
+        Ok(Image::stored(image.format, Arc::clone(bytes)))
     }
 
     pub(crate) fn contains(&self, blob: &BlobRef) -> bool {
@@ -323,16 +274,20 @@ mod tests {
         session::{BlobError, SessionError, SessionStore},
     };
 
-    #[test]
-    fn classification_prefers_images_and_treats_nul_as_binary() {
+    #[tokio::test]
+    async fn classification_decodes_images_and_treats_nul_as_binary() {
+        let png = crate::tests::png(b"\0").await;
+        let classified = classify(png.bytes().to_vec()).await.unwrap();
+        assert_eq!(classified, Classified::Image(png));
         assert!(matches!(
-            classify(crate::tests::png(b"\0").bytes().to_vec()),
-            Classified::Image(_)
+            classify(b"\x89PNG\r\n\x1a\ntext".to_vec()).await,
+            Err(MediaError::InvalidImage(_))
         ));
-        assert_eq!(classify(b"text".to_vec()), Classified::Text("text".into()));
+        let text = classify(b"text".to_vec()).await.unwrap();
+        assert_eq!(text, Classified::Text("text".into()));
         for binary in [&b"text\0"[..], b"\xff"] {
             assert_eq!(
-                classify(binary.to_vec()),
+                classify(binary.to_vec()).await.unwrap(),
                 Classified::Binary(binary.to_vec())
             );
         }
@@ -395,7 +350,7 @@ mod tests {
             } else {
                 SessionStore::create_ephemeral(root.path()).await.unwrap()
             };
-            let png = Image::new(b"\x89PNG\r\n\x1a\npixels".to_vec()).unwrap();
+            let png = crate::tests::png(b"pixels").await;
             let image = Attachment::Image {
                 file: Some("shot.png".into()),
                 image: png.clone(),
@@ -464,19 +419,5 @@ mod tests {
                 assert!(matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded)));
             }
         }
-    }
-
-    #[test]
-    fn images_keep_their_source_format_and_reject_other_bytes() {
-        for (bytes, format) in [
-            (&b"\x89PNG\r\n\x1a\nrest"[..], ImageFormat::Png),
-            (b"\xff\xd8\xffrest", ImageFormat::Jpeg),
-            (b"GIF89arest", ImageFormat::Gif),
-            (b"RIFF\0\0\0\0WEBPrest", ImageFormat::WebP),
-        ] {
-            let image = Image::new(bytes.to_vec()).unwrap();
-            assert_eq!((image.format(), image.bytes()), (format, bytes));
-        }
-        assert!(Image::new(b"not an image".to_vec()).is_err());
     }
 }

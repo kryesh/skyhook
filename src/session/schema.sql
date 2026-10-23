@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 24). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 25). Tables are STRICT;
 -- subtype rows reference entry(seq), whose kind the decoder requires them to match.
 -- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
 -- saturate to i64::MAX.
@@ -501,6 +501,8 @@ CREATE TABLE request_phase (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- carries. Counts are NULL when no report gave them.
 CREATE TABLE request_state (
   request INTEGER PRIMARY KEY REFERENCES model_request(entry),
+  -- Its place among its agent's requests; every attempt keeps it.
+  number INTEGER NOT NULL CHECK (number > 0),
   phase TEXT NOT NULL REFERENCES request_phase(name),
   phased INTEGER NOT NULL REFERENCES entry(seq),
   attempts INTEGER NOT NULL CHECK (attempts >= 0),

@@ -17,8 +17,9 @@ impl SessionRuntime {
     /// agent's capabilities, the tools they allow and its instructions; children it
     /// already started keep their own. The root also adopts the configuration's
     /// current definition of the mode it runs, or the default mode once its own is
-    /// gone, when the input names none. `images` rejects an unsupported profile
-    /// before any provider context opens.
+    /// gone, when the input names none. An agent whose model the configuration no
+    /// longer has is refused unless the input names another, and `images` rejects
+    /// an unsupported profile, before any provider context opens.
     // Boxed as a `dyn` future: proving the agent loop `Send` through this body
     // otherwise exceeds the compiler's recursion limit. Exclusive borrows keep it
     // `Send` without requiring the context to be `Sync`.
@@ -32,10 +33,15 @@ impl SessionRuntime {
     ) -> futures_util::future::BoxFuture<'a, Result<Selected, HarnessError>> {
         Box::pin(async move {
             let agent = turn.agent;
-            let model = options
-                .model
-                .map(|model| model.name)
-                .filter(|name| name != &context.model.profile.name);
+            // An agent whose model is gone runs only on another that its input names.
+            let model = match options.model {
+                Some(model) => Some(model.name),
+                None => {
+                    context.provider()?;
+                    None
+                }
+            };
+            let model = model.filter(|name| name != &context.model.profile.name);
             let snapshot = match &model {
                 Some(name) => crate::session::ProfileSnapshot {
                     name: name.clone(),
@@ -85,12 +91,8 @@ impl SessionRuntime {
             } else {
                 None
             };
-            if !profile.supports_images
-                && replacement
-                    .as_ref()
-                    .is_some_and(AgentContext::contains_images)
-            {
-                return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+            if let Some(replacement) = &replacement {
+                replacement.admits_images()?;
             }
             let mut events = Vec::new();
             if model.is_some() {
@@ -230,9 +232,9 @@ mod tests {
         // Exercise the public script send as well as the underlying job mailbox.
         let first = json!({"instruction": "test:parent-one", "nested": [1, true]});
         let second = json!("test:parent-two");
-        let send = format!("return await tool.job({job}).send({{value:{first}}});");
+        let send = format!("return (await tool.job({job}).send({{value:{first}}})).unwrap();");
         let accepted = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(accepted.value["value"], json!({}));
+        assert_eq!(accepted.value["value"], serde_json::Value::Null);
         forwarded(1).await;
         let send = runtime.jobs.send(job, second.clone());
         bounded(send).await.unwrap();
@@ -375,8 +377,8 @@ mod tests {
     #[tokio::test]
     async fn queued_fifo_images_and_the_last_model_commit_before_next_request() {
         let (root, tracking, session) = start(true).await;
-        let png = |name| crate::tests::png(name);
-        let (first_png, second_png) = (png(b"first image fixture"), png(b"second image fixture"));
+        let first_png = crate::tests::png(b"first image fixture").await;
+        let second_png = crate::tests::png(b"second image fixture").await;
         let image = |name: &str, image: &crate::media::Image| crate::media::Attachment::Image {
             file: Some(root.path().join(name)),
             image: image.clone(),

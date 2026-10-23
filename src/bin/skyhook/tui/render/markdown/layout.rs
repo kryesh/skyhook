@@ -208,7 +208,7 @@ mod tests {
             .map(|row| {
                 let area = Rect::new(0, 0, width, 1);
                 let mut buffer = Buffer::empty(area);
-                render_row_line(row, area, &mut buffer, Style::default());
+                render_row_line(&row.line, &row.layout, area, &mut buffer, Style::default());
                 let painted: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
                 painted.trim_end().to_owned()
             })

@@ -10,15 +10,15 @@ use std::ops::Deref;
 pub struct PromptInput {
     pub editor: Editor,
     pub choice: usize,
-    pub body_scroll: usize,
-    pub option_scroll: usize,
+    pub body: Viewport,
+    pub options: Viewport,
     /// Set by manual option scrolling; otherwise rendering reveals the choice.
     pub options_scrolled: bool,
 }
 impl PromptInput {
     fn reset_view(&mut self) {
-        self.body_scroll = 0;
-        self.option_scroll = 0;
+        self.body.top = 0;
+        self.options.top = 0;
         self.options_scrolled = false;
     }
 }
@@ -375,24 +375,22 @@ impl App {
         self.leader = None;
         self.menu = None;
     }
-    pub(super) fn scroll_prompt(&mut self, options: bool, delta: isize) {
-        if self.prompts.is_empty() {
-            return;
-        }
-        if options {
-            let max = self
-                .prompt_option_rows
-                .saturating_sub(self.prompt_options_rect.height as usize);
-            let input = self.prompt_input_mut();
-            input.option_scroll = input.option_scroll.saturating_add_signed(delta).min(max);
-            input.options_scrolled = true;
+    /// The view of the prompt's choices or else its text, to scroll by hand,
+    /// and how many rows that part lays out.
+    pub(super) fn prompt_view(&mut self, options: bool) -> (&mut Viewport, usize) {
+        let len = if options {
+            self.prompt_option_rows
         } else {
-            let max = self
-                .prompt_body_rows
-                .saturating_sub(self.prompt_body_rect.height as usize);
-            let input = self.prompt_input_mut();
-            input.body_scroll = input.body_scroll.saturating_add_signed(delta).min(max);
-        }
+            self.prompt_body_rows
+        };
+        let input = self.prompt_input_mut();
+        input.options_scrolled |= options;
+        let view = if options {
+            &mut input.options
+        } else {
+            &mut input.body
+        };
+        (view, len)
     }
     pub fn prompt_options(&self) -> Vec<&str> {
         let Some(prompt) = self.prompts.front() else {
@@ -412,6 +410,8 @@ impl App {
             PromptKind::Authentication { .. } | PromptKind::Rename { .. } => vec![],
         }
     }
+    /// The prompt's plain text; a question's own prompt is Markdown the panel
+    /// lays out after it.
     pub fn prompt_text(&self) -> String {
         let Some(prompt) = self.prompts.front() else {
             return String::new();
@@ -441,13 +441,12 @@ impl App {
                         .join("\n");
                     format!("Review answers\n{answers}")
                 },
-                |q| {
+                |_| {
                     format!(
-                        "Agent {} · question {}/{}\n{}",
+                        "Agent {} · question {}/{}",
                         crate::tui::format::agent_label(agent),
                         self.question_index() + 1,
                         questions.len(),
-                        q.prompt
                     )
                 },
             ),
@@ -746,11 +745,11 @@ mod tests {
         );
         assert!(!label.modifier.contains(bold));
         key(&mut app, Tab, M::NONE);
-        app.prompt_input_mut().body_scroll = 5;
-        app.prompt_input_mut().option_scroll = 5;
+        app.prompt_input_mut().body.top = 5;
+        app.prompt_input_mut().options.top = 5;
         key(&mut app, Right, M::NONE);
         let input = app.prompt_input_mut();
-        assert_eq!((input.body_scroll, input.option_scroll), (0, 0));
+        assert_eq!((input.body.top, input.options.top), (0, 0));
         paste(&mut app, "draft");
         press(&mut app, &[Tab, Right, Right]);
         assert_eq!(app.question_index(), 2);
@@ -999,11 +998,7 @@ mod tests {
             key(&mut app, Enter, M::NONE);
             paste(&mut app, "unfinished answer");
             let input = app.prompt_input_mut();
-            (
-                input.body_scroll,
-                input.option_scroll,
-                input.options_scrolled,
-            ) = (3, 2, true);
+            (input.body.top, input.options.top, input.options_scrolled) = (3, 2, true);
             app.info("Details", "An open menu".into());
             let response = authentication(&mut app, 100, SensitivePromptKind::Password);
             assert!(matches!(app.input_target(), InputTarget::Prompt));
@@ -1036,11 +1031,7 @@ mod tests {
             let input = app.prompt_input_mut();
             assert_eq!(input.editor.text(), "unfinished answer");
             assert_eq!(
-                (
-                    input.body_scroll,
-                    input.option_scroll,
-                    input.options_scrolled
-                ),
+                (input.body.top, input.options.top, input.options_scrolled),
                 (3, 2, true)
             );
             assert_eq!(

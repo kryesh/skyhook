@@ -27,13 +27,14 @@ impl App {
             return;
         }
         let (model, mode) = action.selection();
-        let Ok(model) = self.launch.model.config().select_model(model) else {
-            self.notice("The selected model is no longer configured");
+        let Ok(configured) = self.launch.model.config().select_model(model) else {
+            let unavailable = skyhook::agent::HarnessError::UnknownModel(model.clone());
+            self.notice(crate::tui::format::harness_error(&unavailable));
             self.pause(Paused::Stopped);
             return self.park_action(action);
         };
         let launch = Launch {
-            model,
+            model: configured,
             permissions: crate::launch::Permissions::Mode(mode.clone()),
             ..self.launch.clone()
         };
@@ -263,7 +264,7 @@ mod tests {
         app.submit("first input".into());
         assert!(app.creating.is_some() && app.session().is_none());
         app.model = "test/second".parse().unwrap();
-        let attachments = vec![png_attachment("queued.png")];
+        let attachments = vec![png_attachment("queued.png").await];
         app.submit(Submission {
             text: "second input".into(),
             attachments,
@@ -275,7 +276,7 @@ mod tests {
         app.session_started(prepared);
         // The session cannot take the second row's model, so the batch stays queued whole.
         assert!(app.creating.is_none() && app.paused.is_some());
-        let image = [png_attachment("queued.png")];
+        let image = [png_attachment("queued.png").await];
         assert_eq!(
             queued(&app),
             [
@@ -322,7 +323,7 @@ mod tests {
         let (_root, mut app) = draft_fixture().await;
         let mut rx = capture_work(&mut app);
         block_sessions(&app);
-        let attachments = vec![png_attachment("first.png")];
+        let attachments = vec![png_attachment("first.png").await];
         app.submit(Submission {
             text: "first".into(),
             attachments,
@@ -332,7 +333,7 @@ mod tests {
         app.editor.set("new draft".into());
         fail_creation(&mut app, &mut rx).await;
         assert!(!app.busy() && app.paused.is_some() && app.session().is_none());
-        let image = [png_attachment("first.png")];
+        let image = [png_attachment("first.png").await];
         assert_eq!(
             queued(&app),
             [
@@ -372,7 +373,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(notices, ["The selected model is no longer configured"]);
+        assert_eq!(
+            notices,
+            ["model `test/removed` is not configured; choose another with /model"]
+        );
         assert!(app.paused.is_some() && app.creating.is_none());
         assert_eq!(app.queue.len(), 1);
     }

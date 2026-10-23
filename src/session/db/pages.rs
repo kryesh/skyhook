@@ -284,6 +284,36 @@ pub(in crate::session) fn child_jobs(
     )
 }
 
+/// The newest `limit` jobs `owner` created but those `except` names, in id order,
+/// and how many older ones there are.
+pub(in crate::session) fn newest_jobs(
+    db: &Db,
+    owner: &AgentId,
+    except: &[JobId],
+    limit: usize,
+) -> DbResult<(Vec<JobId>, usize)> {
+    let Some(row) = agent_row(db, owner)? else {
+        return Ok((Vec::new(), 0));
+    };
+    let except: Vec<_> = except.iter().map(|job| job.get()).collect();
+    let rows = db.query(
+        "SELECT j.id, count(*) OVER () FROM entry e JOIN job j ON j.created = e.seq \
+         WHERE e.agent = ?1 AND e.kind = ?2 AND j.id NOT IN (SELECT value FROM json_each(?3)) \
+         ORDER BY j.id DESC LIMIT ?4",
+        params![row, EntryKind::JobCreated, json(&except)?, limit],
+        |row| {
+            Ok((
+                job(row.get(0)?)?,
+                usize::try_from(row.get::<i64>(1)?).unwrap_or_default(),
+            ))
+        },
+    )?;
+    let listed = rows.first().map_or(0, |(_, listed)| *listed);
+    let jobs: Vec<_> = rows.into_iter().rev().map(|(job, _)| job).collect();
+    let older = listed - jobs.len();
+    Ok((jobs, older))
+}
+
 /// Every agent the session started, as [`AgentSummary`] describes it.
 pub(in crate::session) fn agent_summaries(db: &Db, session: SessionId) -> DbResult<AgentsPage> {
     let through = counters(db)?.newest;

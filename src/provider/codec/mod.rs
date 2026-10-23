@@ -18,6 +18,7 @@ use crate::provider::{
     protocol::{ContextId, ModelRequest, ResponseEvent, ResponseSchema, Scope},
 };
 use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_valid_tool_name};
+use common::PreparedImages;
 
 pub mod chat_completions;
 pub(crate) mod common;
@@ -141,15 +142,17 @@ impl Codec {
         }
     }
 
+    /// Encode `request`, sending each image as `images` prepared it.
     pub(crate) fn encode(
         &self,
         request: &ModelRequest,
+        images: PreparedImages<'_>,
         context: &ContextId,
     ) -> Result<Encoded, ProviderError> {
         let mut body = match self {
-            Self::ChatCompletions(dialect) => chat_completions::encode(request, dialect)?,
-            Self::Responses(dialect) => responses::encode(request, dialect)?,
-            Self::Messages(dialect) => messages::encode(request, dialect)?,
+            Self::ChatCompletions(dialect) => chat_completions::encode(request, images, dialect)?,
+            Self::Responses(dialect) => responses::encode(request, images, dialect)?,
+            Self::Messages(dialect) => messages::encode(request, images, dialect)?,
         };
         let mut headers = HeaderMap::new();
         Encoded::place_identity(&mut body, &mut headers, self.identity(), context)?;
@@ -405,7 +408,9 @@ mod tests {
             },
             ..messages::Dialect::standard()
         });
-        let encoded = keyed.encode(&request, &context).unwrap();
+        let encoded = keyed
+            .encode(&request, Default::default(), &context)
+            .unwrap();
         assert_eq!(encoded.headers.len(), 1);
         assert_eq!(encoded.headers["x-session-id"], "session");
         assert_eq!(
@@ -413,7 +418,13 @@ mod tests {
             serde_json::json!({"session": "session", "user": "session"})
         );
         let plain = Codec::Messages(messages::Dialect::standard());
-        assert!(plain.encode(&request, &context).unwrap().headers.is_empty());
+        assert!(
+            plain
+                .encode(&request, Default::default(), &context)
+                .unwrap()
+                .headers
+                .is_empty()
+        );
     }
 
     /// Admission keeps placements clear of the listed fields, so every path an
@@ -506,7 +517,12 @@ mod tests {
                 &["output_config.max_tokens", "output_config.effort"],
             ),
         ] {
-            let body = Value::Object(codec.encode(&request, &"c".parse().unwrap()).unwrap().body);
+            let body = Value::Object(
+                codec
+                    .encode(&request, Default::default(), &"c".parse().unwrap())
+                    .unwrap()
+                    .body,
+            );
             let listed: Vec<_> = fields.iter().chain(placed).copied().collect();
             let name = codec.name();
             let found = unlisted("", body.as_object().unwrap(), &listed);

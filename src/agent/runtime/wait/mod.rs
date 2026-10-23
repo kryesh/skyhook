@@ -8,7 +8,7 @@ use crate::{
     job::{CancellationToken, WaitFloor, Waiting},
     session::{CoreState, Key, SessionStore, Wait},
     tool::{
-        ToolContext, ToolError,
+        ToolContext, ToolError, ToolOutput,
         diagnostic::{Effects, Operation, Subject},
     },
 };
@@ -161,6 +161,15 @@ pub(super) enum WakeReason {
 #[derive(Serialize, JsonSchema, Debug, PartialEq)]
 pub(super) struct WaitOutput {
     pub(super) reason: WakeReason,
+    /// Whole seconds waited.
+    pub(super) waited_s: u64,
+}
+
+/// The result a cancelled wait's error carries, read as its output would be.
+#[derive(Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+enum Unwoken {
+    Cancelled { waited_s: u64 },
 }
 
 impl SessionRuntime {
@@ -208,10 +217,11 @@ impl SessionRuntime {
         context: &ToolContext,
         args: WaitArgs,
     ) -> Result<WaitOutput, ToolError> {
+        let entered = tokio::time::Instant::now();
         let deadline = args
             .timeout
             .map(|seconds| {
-                tokio::time::Instant::now()
+                entered
                     .checked_add(std::time::Duration::from_secs(seconds.get()))
                     .ok_or_else(|| {
                         ToolError::invalid_arguments("timeout is too large")
@@ -222,12 +232,10 @@ impl SessionRuntime {
             .transpose()?;
         let (agent, caller) = (context.agent().clone(), context.job());
         if self.agents(|agents| agents.get(&agent).is_none()) {
-            return Err(ToolError::failed("calling agent is not active")
-                .operation(
-                    Operation::Lookup,
-                    Subject::Label(format!("calling agent {agent}")),
-                )
-                .effects(Effects::Unchanged));
+            return Err(ToolError::failed("calling agent is not active").operation(
+                Operation::Lookup,
+                Subject::Label(format!("calling agent {agent}")),
+            ));
         }
         // The agent cannot act while its foreground work is outstanding, so that
         // takes precedence; the next request carries every event together. Waiting
@@ -264,18 +272,25 @@ impl SessionRuntime {
         // reported; one lost to it stays unseen.
         let park = move |state: &mut CoreState| state.jobs.park(caller);
         let decided = move |()| Wait::on(keys, decided);
-        tokio::select! {
+        let reason = tokio::select! {
             biased;
             decided = self.store.until_after(park, decided) => match decided {
                 Ok(Some(floor)) => {
                     self.store.live(move |state| state.jobs.shown(caller, floor)).await;
-                    Ok(WaitOutput { reason: WakeReason::Event })
+                    Some(WakeReason::Event)
                 }
-                Ok(None) | Err(_) => Err(ToolError::cancelled()
-                    .operation(Operation::Wait, Subject::Job(caller))
-                    .effects(Effects::Unchanged)),
+                Ok(None) | Err(_) => None,
             },
-            () = timeout => Ok(WaitOutput { reason: WakeReason::Timeout }),
+            () = timeout => Some(WakeReason::Timeout),
+        };
+        let waited_s = entered.elapsed().as_secs();
+        match reason {
+            Some(reason) => Ok(WaitOutput { reason, waited_s }),
+            None => Err(ToolError::cancelled()
+                .operation(Operation::Wait, Subject::Job(caller))
+                .with_result(ToolOutput::new(serde_json::json!(Unwoken::Cancelled {
+                    waited_s
+                })))),
         }
     }
 }
@@ -448,7 +463,8 @@ pub(super) mod tests {
         assert_eq!(event["result"], answer, "{event}");
     }
 
-    pub(super) fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
+    /// The native result of wait call `id` in `request`, and whether the call failed.
+    fn wait_result(request: &ModelRequest, id: &str) -> (bool, Value) {
         let results = request.messages().flat_map(|message| match message {
             Sent::Tool(results) => results.as_slice(),
             _ => &[],
@@ -457,8 +473,13 @@ pub(super) mod tests {
             .filter(|result| result.call_id == id)
             .collect::<Vec<_>>();
         assert_eq!(results.len(), 1, "wait must have exactly one result");
-        assert!(!results[0].is_error, "wait failed: {:?}", results[0]);
-        assert_eq!(results[0].result["result"], json!({"reason":reason}));
+        (results[0].is_error, results[0].result["result"].clone())
+    }
+
+    pub(super) fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
+        let (failed, result) = wait_result(request, id);
+        assert!(!failed, "wait failed: {result}");
+        assert_eq!(result["reason"], reason, "{result}");
     }
 
     /// Completions share one request and each carries its saved output.
@@ -652,10 +673,10 @@ pub(super) mod tests {
     /// wait, not sleep until the script ends.
     #[tokio::test]
     async fn a_deferring_wait_wakes_when_its_holder_parks() {
-        let first = json!({"source":"return (await tool.wait({timeout:30})).result;"});
+        let first = json!({"source":"return (await tool.wait({timeout:30})).result.reason;"});
         // Holds the agent until a second elapses, then parks in a wait of its own.
         let second = json!({"source":"await sleep(1000); \
-            await tool.wait({timeout:30}); return (await tool.wait({timeout:1})).result;"});
+            await tool.wait({timeout:30}); return (await tool.wait({timeout:1})).result.reason;"});
         let tracking = tracking_all(vec![
             (
                 "root",
@@ -722,7 +743,7 @@ pub(super) mod tests {
             .unwrap()
             .output;
         let value = output.as_ref().map(|output| &output["value"]);
-        assert_eq!(value, Some(&json!({"reason":"event"})), "{output:?}");
+        assert_eq!(value, Some(&json!("event")), "{output:?}");
         time_out(&session, &session.root, 3, 1).await;
         tracking.request(1).await;
         bounded(queued).await.unwrap().unwrap();
@@ -831,8 +852,8 @@ pub(super) mod tests {
     /// script's waits only once.
     #[tokio::test]
     async fn queued_input_does_not_respin_a_script_wait() {
-        let source = "const first = (await tool.wait({timeout:60})).result; \
-            const second = (await tool.wait({timeout:1})).result; return [first, second];";
+        let source = "const first = (await tool.wait({timeout:60})).result.reason; \
+            const second = (await tool.wait({timeout:1})).result.reason; return [first, second];";
         let tracking = tracking(vec![
             ("root", call("run", "script", json!({"source": source}))),
             ("root", answer()),
@@ -857,7 +878,7 @@ pub(super) mod tests {
             .await
             .unwrap()
             .output;
-        let expected = json!([{"reason":"event"}, {"reason":"timeout"}]);
+        let expected = json!(["event", "timeout"]);
         assert_eq!(
             output.as_ref().map(|output| &output["value"]),
             Some(&expected),
@@ -878,8 +899,8 @@ pub(super) mod tests {
     /// wait or by the next: one that times out leaves it unseen.
     #[tokio::test]
     async fn an_event_ready_with_the_timeout_reaches_the_script() {
-        let source = "const first = (await tool.wait({timeout:1})).result; \
-            const second = (await tool.wait({timeout:1})).result; return [first, second];";
+        let source = "const first = (await tool.wait({timeout:1})).result.reason; \
+            const second = (await tool.wait({timeout:1})).result.reason; return [first, second];";
         let tracking = tracking(vec![
             ("root", call("run", "script", json!({"source": source}))),
             ("root", answer()),
@@ -947,7 +968,7 @@ pub(super) mod tests {
             elapsed = true;
         }
         let output = jobs.wait(script, false).await.unwrap().output.unwrap();
-        let event = json!({"reason":"event"});
+        let event = json!("event");
         let reasons = output["value"].as_array().unwrap();
         assert_eq!(
             reasons.iter().filter(|reason| **reason == event).count(),
@@ -1002,7 +1023,7 @@ pub(super) mod tests {
             let result = executor.execute(session.root.clone(), "wait", invalid.clone(), None);
             assert!(bounded(result).await.is_err(), "accepted {invalid}");
         }
-        let source = "const direct = (await tool.wait({timeout:1})).result; const builder = (await tool.wait().timeout(1)).result; return [direct, builder];";
+        let source = "const direct = (await tool.wait({timeout:1})).result.reason; const builder = (await tool.wait().timeout(1)).result.reason; return [direct, builder];";
         let jobs = session
             .runtime
             .jobs
@@ -1017,7 +1038,7 @@ pub(super) mod tests {
         };
         let (output, ()) = tokio::join!(bounded(session.run_script(source)), timeouts);
         let output = output.unwrap();
-        let timeouts = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
+        let timeouts = json!(["timeout", "timeout"]);
         assert_eq!(output.value, json!({"value":timeouts}));
         session.shutdown().await.unwrap();
     }
@@ -1077,6 +1098,33 @@ pub(super) mod tests {
         let history = tracking.request(1).await;
         let history = rendered(&history);
         assert!(history.contains("cancel"), "{history}");
+        tracking.release(1);
+        assert_eq!(bounded(resumed).await.unwrap().unwrap(), "done");
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_wait_reports_how_long_it_waited() {
+        let tracking = tracking(vec![
+            ("root", call("waiting", "wait", json!({}))),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        // Nothing can end this wait: the seconds let pass are only waited.
+        time_out(&session, &session.root, 1, 2).await;
+        running_tools(&session, &session.root).await;
+        assert_eq!(bounded(session.interrupt()).await, 1);
+        assert!(bounded(turn).await.unwrap().is_err());
+        let resumed = tokio::spawn({
+            let session = session.clone();
+            async move { session.continue_turn().await }
+        });
+        let (failed, result) = wait_result(&tracking.request(1).await, "waiting");
+        assert!(failed);
+        assert_eq!(result["reason"], "cancelled", "{result}");
+        assert!(result["waited_s"].as_u64() >= Some(2), "{result}");
         tracking.release(1);
         assert_eq!(bounded(resumed).await.unwrap().unwrap(), "done");
         session.shutdown().await.unwrap();

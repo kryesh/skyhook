@@ -6,6 +6,7 @@
 //! entries, rebuilt only when something it was built from changes, so a new record
 //! costs its own entries, not the history's.
 mod build;
+pub(super) use build::presents;
 
 use crate::tui::app::OutputStore;
 
@@ -172,14 +173,14 @@ impl<'a> Inputs<'a> {
                         self.children(&place, *job, &mut places);
                     }
                 }
-                // A status shows where its anchor is loaded.
+                // A status shows where its anchor is read.
                 let agent = self.presentation.agent;
                 let unsaved = self.unsaved.iter().enumerate();
                 let unsaved = unsaved.filter(|(_, status)| {
                     &status.agent == agent
                         && status
                             .after
-                            .map_or(!earlier, |after| transcript.record(after).is_some())
+                            .map_or(!earlier, |after| transcript.run.holds(after))
                 });
                 places.extend(unsaved.map(|(index, status)| {
                     let anchor =
@@ -188,12 +189,12 @@ impl<'a> Inputs<'a> {
                 }));
             }
             Content::Requests(list) => {
-                let requests = list.keys.iter();
+                let requests = list.kept().iter();
                 places
                     .extend(requests.map(|request| Place::under(None, Source::Request(*request))));
             }
             Content::Jobs(list) => {
-                for job in &list.keys {
+                for job in list.kept() {
                     let place = Place::under(None, Source::Job(*job));
                     places.push(place.clone());
                     self.children(&place, *job, &mut places);
@@ -215,7 +216,7 @@ impl<'a> Inputs<'a> {
             places.extend(script.then(|| Place::under(Some(parent), Source::More(job))));
             return;
         };
-        for child in &children.keys {
+        for child in children.kept() {
             let place = Place::under(Some(parent), Source::Job(*child));
             places.push(place.clone());
             if place.depth() < 2 * MAX_NESTING {
@@ -499,19 +500,34 @@ impl History {
     /// The entries the loaded tab's own entry `focus` shows, with those placed under
     /// it.
     pub fn place(&self, focus: Focus) -> Option<Range<usize>> {
+        let (at, own) = self.segment(focus);
+        let under = self.segments[at..].iter();
+        let last = under
+            .take_while(|segment| segment.place.0[0] == own)
+            .last()?;
+        Some(self.segments[at].start..last.start + last.len)
+    }
+
+    /// The entry where `focus` shows, or would.
+    pub fn at(&self, focus: Focus) -> usize {
+        let (at, _) = self.segment(focus);
+        self.segments
+            .get(at)
+            .map_or(self.len(), |segment| segment.start)
+    }
+
+    /// The first segment placed at or after `focus`, and its source.
+    fn segment(&self, focus: Focus) -> (usize, Source) {
         let own = match focus {
             Focus::Ordinal(ordinal) => Source::Transcript(ordinal),
             Focus::Request(request) => Source::Request(request),
             Focus::Job(job) => Source::Job(job),
         };
-        let position = *self.index.get(&own)?;
-        let first = (self.segments.get(position)).filter(|first| first.place.depth() == 0)?;
-        let under = self.segments[position + 1..].iter();
-        let under = under.take_while(|segment| segment.place.0[0] == own);
-        let end = under
-            .last()
-            .map_or(first.start + first.len, |s| s.start + s.len);
-        Some(first.start..end)
+        (
+            self.segments
+                .partition_point(|segment| segment.place.0[0] < own),
+            own,
+        )
     }
 
     /// The tab's own entry the entry at `index` belongs to.
@@ -693,7 +709,10 @@ mod tests {
             .expect("a refusal is presented in the conversation");
         assert_eq!(card.surface, Surface::Error);
         let mut lines = card.text().lines();
-        assert_eq!(lines.next(), Some("Model declined to respond · attempt 1"));
+        assert_eq!(
+            lines.next(),
+            Some("▾ Model declined to respond · attempt 1")
+        );
         assert_eq!(lines.next(), Some(detail.as_str()));
         assert_eq!(lines.next(), Some(super::super::retry::REFUSAL_HINT));
         assert_eq!(lines.next(), None);
@@ -713,7 +732,7 @@ mod tests {
         assert_eq!(card.surface, Surface::Status);
         assert_eq!(
             card.text(),
-            "Request failed · attempt 1\nProtocol: rejected"
+            "▾ Request failed · attempt 1 · Protocol\nrejected"
         );
     }
 
@@ -794,12 +813,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
+    async fn retry_card_discloses_the_whole_stored_error() {
         let (_root, mut app, mut model, session) = played_fixture().await;
         let _asked = ask(&session, "question");
         let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
+        // A pending retry must outlast both reads; the interrupt below ends it.
+        let hour = Some(std::time::Duration::from_secs(3600));
         let overloaded = ProviderErrorKind::Unavailable.error(error.clone());
-        model.turn().await.fail(overloaded);
+        model.turn().await.fail(overloaded.with_retry_after(hour));
         let scheduled = |event: &SessionEvent| {
             matches!(
                 event,
@@ -811,15 +832,17 @@ mod tests {
         };
         observe_until(&mut app, |app| recorded(&app.journal, scheduled)).await;
         let request = latest_request(&app.journal).unwrap();
-        let cards = whole_entries(&mut app, false).await;
-        let mut retries = cards
-            .iter()
-            .filter(|card| card.key() == &EntryKey::Retry(request));
-        let text = retries.next().unwrap().text();
-        assert!(retries.next().is_none());
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.contains("attempt 2") && text.contains("HTTP 503 overloaded"));
-        assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
+        let title = "Retrying · attempt 2 · Unavailable";
+        // A pending retry starts collapsed; details disclose the whole error, safe to paint.
+        let whole = format!("▾ {title}\nHTTP 503 overloaded\n[31m{}", "x".repeat(1000));
+        for (details, expected) in [(false, format!("▸ {title}")), (true, whole)] {
+            let cards = whole_entries(&mut app, details).await;
+            let mut retries = cards
+                .iter()
+                .filter(|card| card.key() == &EntryKey::Retry(request));
+            assert_eq!(retries.next().unwrap().text(), expected);
+            assert!(retries.next().is_none());
+        }
         let stored = |event: &SessionEvent| {
             matches!(event, SessionEvent::ModelFailed {
                 failure: AttemptFailure::Retrying { message, .. }, ..

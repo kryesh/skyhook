@@ -520,7 +520,7 @@ pub(crate) async fn preflight_path_arguments(
         };
         let resolution =
             resolve_for_authorization(workspace, authorization_root, &input, argument.kind);
-        let resolved = match resolution.await.map_err(&annotate)? {
+        let resolved = match resolution.await.map_err(annotate)? {
             Resolution::Resolved(resolved) => resolved,
             // Later paths resolve as they would had this one existed.
             Resolution::Unresolved(resolved, error) => {

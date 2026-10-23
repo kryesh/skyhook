@@ -184,7 +184,8 @@ pub enum ToolResultPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobViewResult {
     One,
-    Many,
+    /// A [`JobListing`](crate::job::JobListing).
+    Listing,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

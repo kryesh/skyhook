@@ -4,6 +4,7 @@
 use serde::Deserialize;
 
 use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, Scheme};
+use crate::media::ImageLimits;
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -16,6 +17,10 @@ use crate::provider::{
         headers::HeaderText,
     },
 };
+
+/// What the service accepts of an image: 8000 px, and 7.5 MiB, which is 10 MiB
+/// as base64.
+const IMAGES: ImageLimits = ImageLimits::new(8000, 15 * 512 * 1024);
 
 /// Anthropic's Messages conventions, wherever the service is reached, with its
 /// tool-name alphabet. Signed thinking is bound to the exact conversation before it;
@@ -121,7 +126,7 @@ impl DialectConfig for Config {
         }
         let mut profile = Profile {
             key: Scheme::XApiKey,
-            ..Profile::new(codec, transport(), Dialect::Anthropic)
+            ..Profile::new(codec, transport(), Dialect::Anthropic, IMAGES)
         };
         state(&mut profile, self.state_role);
         if let Some(workspace) = &self.workspace_id {
@@ -173,7 +178,10 @@ mod tests {
         request.context.extend(entries([Message::Assistant(turn)]));
         let sent = |settings: &dyn DialectConfig| {
             let codec = settings.admit(CodecName::Messages).unwrap().codec;
-            let body = codec.encode(&request, &"c".parse().unwrap()).unwrap().body;
+            let body = codec
+                .encode(&request, Default::default(), &"c".parse().unwrap())
+                .unwrap()
+                .body;
             body["messages"][1]["content"][0].clone()
         };
         assert_eq!(sent(&Config::default())["type"], "text");

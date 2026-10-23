@@ -654,7 +654,7 @@ mod tests {
             false,
         )));
         let original = request;
-        let body = encode(&original, &Dialect::standard()).unwrap();
+        let body = encode(&original, Default::default(), &Dialect::standard()).unwrap();
         assert_eq!(
             body["messages"][1]["content"],
             json!([native, redacted, tool])
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
         assert!(body.get("thinking").is_none()); // replay does not require enabling new thinking
         let assistant = |request: &ModelRequest| {
-            encode(request, &Dialect::standard()).unwrap()["messages"][1]["content"].clone()
+            encode(request, Default::default(), &Dialect::standard()).unwrap()["messages"][1]["content"].clone()
         };
         let mut foreign = original.clone();
         foreign.model = "different-model".parse().unwrap();

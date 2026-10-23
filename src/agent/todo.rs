@@ -14,7 +14,7 @@ use crate::{
     },
     tool::{
         ToolError,
-        diagnostic::{Effects, Operation, Subject},
+        diagnostic::{Operation, Subject},
     },
 };
 
@@ -143,14 +143,12 @@ impl SessionStore {
                             "job does not identify an initialized child agent",
                         )
                         .operation(Operation::Lookup, Subject::Job(job))
-                        .effects(Effects::Unchanged)
                     })?;
                 if agent == caller || !agent.is_within(caller) {
                     return Err(ToolError::invalid_arguments(
                         "todo inspection is limited to descendants",
                     )
-                    .operation(Operation::Inspect, Subject::Job(job))
-                    .effects(Effects::Unchanged));
+                    .operation(Operation::Inspect, Subject::Job(job)));
                 }
                 agent
             } else {

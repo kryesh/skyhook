@@ -339,7 +339,7 @@ pub struct Presentation {
 crate::named_enum::named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Notice {
-        OutputIncomplete = "Output incomplete.",
+        OutputIncomplete = "Output incomplete; captured fields remain readable with jobs({job, field}).",
     }
 }
 
@@ -522,11 +522,19 @@ impl JobEnvelope {
     }
 }
 
-/// The schemas of one job view and of a list of them, as results declare them.
+/// Jobs as a listing shows them: the newest, and how many older ones it leaves out.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct JobListing {
+    pub(crate) jobs: Vec<JobView>,
+    pub(crate) older: Option<std::num::NonZeroUsize>,
+}
+
+/// The schemas of one job view and of a listing of them, as results declare them.
 /// A job view is itself a presentation; presenting it again never shortens it.
 pub(crate) struct JobViewSchemas {
     pub(crate) one: Value,
-    pub(crate) many: Value,
+    pub(crate) listing: Value,
     /// A tool response's own view, which keeps its error and questions whole.
     pub(crate) response: Value,
 }
@@ -536,7 +544,7 @@ pub(crate) static JOB_VIEW_SCHEMAS: std::sync::LazyLock<JobViewSchemas> =
         use crate::tool::registry::{complete_result_schema, result_schema};
         JobViewSchemas {
             one: complete_result_schema::<JobView>(),
-            many: complete_result_schema::<Vec<JobView>>(),
+            listing: complete_result_schema::<JobListing>(),
             response: result_schema::<JobView>(),
         }
     });
@@ -583,6 +591,11 @@ impl JobManager {
         self.entry(id, |entry| entry.envelope(id)).await
     }
 
+    /// The schema job `id`'s result follows, when its invocation declares one.
+    pub(crate) async fn output_schema(&self, id: JobId) -> Result<Option<Arc<Value>>, JobError> {
+        self.entry(id, |entry| entry.output_schema.clone()).await
+    }
+
     /// The token job `id` runs under, while it can still run.
     pub(crate) async fn cancellation_token(
         &self,
@@ -599,6 +612,19 @@ impl JobManager {
     pub async fn list(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
         let owner = owner.clone();
         self.listed(move |journal| journal.created_by(&owner)).await
+    }
+
+    /// The newest `limit` of `owner`'s jobs but those `except` names, in id order,
+    /// and how many older ones there are.
+    pub(crate) async fn newest(
+        &self,
+        owner: &AgentId,
+        except: Vec<JobId>,
+        limit: usize,
+    ) -> Result<(Vec<JobEnvelope>, usize), JobError> {
+        let owner = owner.clone();
+        self.listed_with(move |journal| journal.newest_jobs(&owner, &except, limit))
+            .await
     }
 
     /// `owner`'s unfinished jobs, in id order.
@@ -785,7 +811,7 @@ mod tests {
         };
         assert_eq!(
             noticed.clone().into_value()["presentation"],
-            serde_json::json!({"notice":"Output incomplete."})
+            serde_json::json!({"notice":Notice::OutputIncomplete.as_str()})
         );
         assert_eq!(null.clone().into_value().get("result"), Some(&Value::Null));
         assert_eq!(missing.clone().into_value().get("result"), None);
@@ -959,9 +985,9 @@ mod tests {
 
     #[test]
     fn a_waiting_job_presents_its_question_batch_in_place_of_a_result() {
-        for (schema, many) in [
+        for (schema, listed) in [
             (&JOB_VIEW_SCHEMAS.one, false),
-            (&JOB_VIEW_SCHEMAS.many, true),
+            (&JOB_VIEW_SCHEMAS.listing, true),
         ] {
             assert!(
                 schema["$defs"]["QuestionOutput"]["properties"]
@@ -977,7 +1003,11 @@ mod tests {
                 "choice"
             );
             assert_eq!(job.get("result"), None);
-            let value = if many { serde_json::json!([job]) } else { job };
+            let value = if listed {
+                serde_json::json!({ "jobs": [job], "older": 1 })
+            } else {
+                job
+            };
             assert!(jsonschema::is_valid(schema, &value));
         }
     }

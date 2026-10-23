@@ -46,7 +46,7 @@ impl Reads {
     pub(in crate::session) fn read<T>(&self, read: impl FnOnce(&Db) -> DbResult<T>) -> DbResult<T> {
         match self {
             Self::Pool(pool) => pool.read(read),
-            Self::Own(own) => snapshot(&mut own.db(), &own.path, read),
+            Self::Own(own) => snapshot(&mut own.db(), &own.path, own.mode, read),
             Self::Writer(db, _) => read(&db.lock()),
         }
     }
@@ -81,14 +81,16 @@ impl Reads {
 /// One read-only connection, opened when first read.
 pub(crate) struct Own {
     path: PathBuf,
+    mode: OpenMode,
     db: Mutex<Option<Db>>,
     turn: Turn,
 }
 
 impl Own {
-    pub(in crate::session) fn new(path: PathBuf) -> Self {
+    pub(in crate::session) fn new(path: PathBuf, mode: OpenMode) -> Self {
         Self {
             path,
+            mode,
             db: Mutex::default(),
             turn: Turn::default(),
         }
@@ -119,6 +121,7 @@ pub(crate) struct ReadPool {
 
 struct Shared {
     path: PathBuf,
+    mode: OpenMode,
     queue: Mutex<Queue>,
     queued: Condvar,
 }
@@ -147,10 +150,11 @@ thread_local! {
 }
 
 impl ReadPool {
-    pub(in crate::session) fn new(path: PathBuf) -> Self {
+    pub(in crate::session) fn new(path: PathBuf, mode: OpenMode) -> Self {
         Self {
             shared: Arc::new(Shared {
                 path,
+                mode,
                 queue: Mutex::default(),
                 queued: Condvar::new(),
             }),
@@ -166,7 +170,7 @@ impl ReadPool {
         HELD.with_borrow_mut(|held| {
             let held = held.as_mut().filter(|held| held.pool == pool);
             let held = held.expect("a read pool reads only inside a hold");
-            snapshot(&mut held.db, path, read)
+            snapshot(&mut held.db, path, self.shared.mode, read)
         })
     }
 
@@ -259,6 +263,7 @@ impl Drop for ReadPool {
 fn snapshot<T>(
     slot: &mut Option<Db>,
     path: &Path,
+    mode: OpenMode,
     read: impl FnOnce(&Db) -> DbResult<T>,
 ) -> DbResult<T> {
     struct Unfinished<'a>(&'a mut Option<Db>);
@@ -270,7 +275,7 @@ fn snapshot<T>(
         }
     }
     if slot.is_none() {
-        *slot = Some(Db::open(path, OpenMode::ReadOnly)?);
+        *slot = Some(Db::open(path, mode)?);
     }
     let unfinished = Unfinished(slot);
     let db = unfinished.0.as_ref().expect("opened above");
@@ -289,7 +294,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("session.db");
         drop(Db::open(&path, OpenMode::Create).unwrap());
-        let reads = Reads::Pool(Arc::new(ReadPool::new(path)));
+        let reads = Reads::Pool(Arc::new(ReadPool::new(path, OpenMode::ReadOnly)));
         for _ in 0..=CONNECTIONS {
             let held = reads.clone();
             let read = move || {
@@ -306,7 +311,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_in_held_work_is_an_error() {
-        let reads = Reads::Pool(Arc::new(ReadPool::new("never-read.db".into())));
+        let reads = Reads::Pool(Arc::new(ReadPool::new(
+            "never-read.db".into(),
+            OpenMode::ReadOnly,
+        )));
         let held = reads.hold(|| -> Result<(), tokio::task::JoinError> { panic!("held work") });
         assert!(held.await.unwrap_err().is_panic());
     }

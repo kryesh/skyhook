@@ -307,10 +307,12 @@ impl Ingestion {
                 id: PayloadId::Image(id),
             } => {
                 let image = match self.images.remove(&id) {
-                    Some(ImagePayload::Receiving { file, bytes }) => match Image::new(bytes) {
-                        Ok(image) => context.store().store_image(file, &image).await.ok(),
-                        Err(_) => None,
-                    },
+                    Some(ImagePayload::Receiving { file, bytes }) => {
+                        match Image::decode(bytes).await {
+                            Ok(image) => context.store().store_image(file, &image).await.ok(),
+                            Err(_) => None,
+                        }
+                    }
                     Some(ImagePayload::Invalid) => None,
                     _ => return Err(protocol("finish for inactive image")),
                 };
@@ -592,7 +594,7 @@ mod tests {
             ] {
                 ingest.receive(&context, event).await.unwrap();
             }
-            let png = crate::tests::png(b"remote source bytes");
+            let png = crate::tests::png(b"remote source bytes").await;
             let valid = ImageRef {
                 file: Some("source.png".into()),
                 format: png.format(),

@@ -210,7 +210,7 @@ impl App {
     pub(super) fn active_work(&self) -> bool {
         self.busy()
             || model::open_jobs(&self.snapshot)
-            || std::sync::Arc::strong_count(&self.exports) > 1
+            || std::sync::Arc::strong_count(&self.tasks) > 1
     }
     pub fn agent_status(&self, agent: &model::AgentInfo) -> model::AgentDisplayState {
         let pending = self.prompts.iter().find(|prompt| match &prompt.kind {

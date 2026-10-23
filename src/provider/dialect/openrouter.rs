@@ -296,7 +296,12 @@ impl DialectConfig for Config {
             *ttl = self.cache_ttl;
         }
         codec.identity_mut().cache_key = Locations::one(header("x-session-id"));
-        let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
+        let mut profile = Profile::new(
+            codec,
+            transport,
+            Dialect::Openrouter,
+            super::compatible::IMAGES,
+        );
         profile.state_role(self.state_role, StateRole::User);
         if let Some(routing) = &self.routing {
             profile.transport.fields.every = routing.fields();
@@ -387,10 +392,10 @@ mod tests {
     /// Chat marks the system prompt and each earlier request's prefix end within the
     /// strictest upstream cap, so an upstream that reads only at marked boundaries
     /// reuses the previous request's cache; the oldest seams give way first.
-    #[test]
-    fn chat_keeps_earlier_prefix_ends_within_the_breakpoint_budget() {
+    #[tokio::test]
+    async fn chat_keeps_earlier_prefix_ends_within_the_breakpoint_budget() {
         use crate::provider::{
-            codec::{Cache, common::tests::user},
+            codec::{Cache, common, common::tests::user},
             protocol::{AssistantItem, Message, SystemSegment, entries},
         };
         let mut codec = Config::default()
@@ -405,7 +410,10 @@ mod tests {
         }];
         let marked = |request: &crate::provider::protocol::ModelRequest| -> Vec<bool> {
             let context = "session".parse().unwrap();
-            let body = codec.encode(request, &context).unwrap().body;
+            let body = codec
+                .encode(request, Default::default(), &context)
+                .unwrap()
+                .body;
             let messages = body["messages"].as_array().unwrap();
             messages
                 .iter()
@@ -428,16 +436,18 @@ mod tests {
         );
         // A history without text adds no breakpoint of its own, so a system prompt
         // filling the budget still fits.
-        let image = crate::provider::codec::common::tests::image();
-        request.blobs.insert(image.blob, b"\x01".to_vec());
         request.system = vec![request.system[0].clone(); 4];
         request.context = entries([Message::User(vec![
             crate::provider::protocol::UserContent::Attachment {
-                attachment: crate::media::AttachmentRef::Image(image),
+                attachment: crate::media::AttachmentRef::Image(common::tests::image()),
             },
         ])]);
+        let images = common::tests::loaded(&mut request).await;
         let context = "session".parse().unwrap();
-        let body = codec.encode(&request, &context).unwrap().body;
+        let body = codec
+            .encode(&request, images.prepared(), &context)
+            .unwrap()
+            .body;
         let markers = serde_json::Value::Object(body).to_string();
         assert_eq!(markers.matches("cache_control").count(), 4);
     }

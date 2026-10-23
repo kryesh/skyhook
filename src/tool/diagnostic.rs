@@ -63,13 +63,24 @@ named_enum! {
     }
 }
 
+impl Operation {
+    /// The effects of a failure whose site names none: an operation that only
+    /// observes has no destination to report on.
+    const fn unset_effects(self) -> Effects {
+        match self {
+            Self::Inspect | Self::Lookup | Self::Wait => Effects::ReadOnly,
+            _ => Effects::Unknown,
+        }
+    }
+}
+
 named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum Effects {
         Unknown = "unknown",
         NotStarted = "not_started",
-        Started = "started",
         Unchanged = "unchanged",
+        ReadOnly = "read_only",
         DestinationReplaced = "destination_replaced",
         PartialChange = "partial_change",
         OutputIncomplete = "output_incomplete",
@@ -290,7 +301,7 @@ impl PartialContext {
         }
     }
     /// Unset facts resolve to the neutral spellings: a plain execution failure
-    /// at the invocation whose effects are unknown.
+    /// at the invocation whose effects are its operation's.
     pub fn resolve(self) -> DiagnosticContext {
         let (operation, subject) = self
             .operation
@@ -299,7 +310,7 @@ impl PartialContext {
             operation,
             subject,
             site: self.site.unwrap_or(FailureSite::Invocation),
-            effects: self.effects.unwrap_or(Effects::Unknown),
+            effects: self.effects.unwrap_or(operation.unset_effects()),
             request: self.request.unwrap_or(RequestEffects::Unknown),
             paths: self.paths,
         }
@@ -626,9 +637,8 @@ impl Diagnostic {
             RequestEffects::MayHaveExecuted => "; request may have executed",
         });
         text.push_str(match self.context.effects {
-            Effects::Unknown => "",
+            Effects::Unknown | Effects::ReadOnly => "",
             Effects::NotStarted => "; operation did not start",
-            Effects::Started => "; operation started",
             Effects::Unchanged => "; destination unchanged",
             Effects::DestinationReplaced => "; destination replaced; durability is uncertain",
             Effects::PartialChange => "; partial changes may remain",

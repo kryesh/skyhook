@@ -190,32 +190,38 @@ async fn import_image(
         PartialContext::new(operation, subject.clone()).effects(Effects::OutputIncomplete)
     };
     let import_context = context(Operation::Deserialize);
+    let exceeded = || ToolError::failed("MCP images exceed attachment limits");
+    if image_count >= MAX_IMAGES_PER_SUBMISSION {
+        return Err(exceeded().context(import_context));
+    }
     let limit = usize::try_from(MAX_IMAGE_BYTES).expect("image limit fits usize");
     let bytes = decode_base64_bounded(source, limit).map_err(|error| {
         match error {
-            MediaError::TooLarge => ToolError::failed("MCP images exceed attachment limits"),
+            MediaError::TooLarge => exceeded(),
             other => ToolError::failed(format!("invalid MCP image encoding: {other}")),
         }
         .context(import_context.clone())
     })?;
-    let total_bytes = total_bytes + bytes.len() as u64;
-    if image_count >= MAX_IMAGES_PER_SUBMISSION || total_bytes > MAX_IMAGE_BYTES_PER_SUBMISSION {
-        return Err(
-            ToolError::failed("MCP images exceed attachment limits").context(import_context)
-        );
-    }
-    // The declared type governs admission; bytes of another format are invalid
-    // rather than silently re-typed.
+    // The declared type governs admission; source bytes of another format are
+    // invalid rather than silently re-typed.
     let declared = mime_type.parse::<ImageFormat>().map_err(|_| {
         ToolError::failed("unsupported MCP image type").context(import_context.clone())
     })?;
-    let image = Image::new(bytes)
-        .ok()
-        .filter(|image| image.format() == declared)
-        .ok_or_else(|| {
-            ToolError::failed("invalid MCP image: data does not match its declared image type")
-                .context(import_context)
-        })?;
+    if ImageFormat::sniff(&bytes) != Some(declared) {
+        return Err(ToolError::failed(
+            "invalid MCP image: data does not match its declared image type",
+        )
+        .context(import_context));
+    }
+    let image = Image::decode(bytes).await.map_err(|error| match error {
+        MediaError::Task(error) => error.into(),
+        error => {
+            ToolError::failed(format!("invalid MCP image: {error}")).context(import_context.clone())
+        }
+    })?;
+    if total_bytes + image.bytes().len() as u64 > MAX_IMAGE_BYTES_PER_SUBMISSION {
+        return Err(exceeded().context(import_context));
+    }
     store
         .store_image(None, &image)
         .await
@@ -228,8 +234,10 @@ mod tests {
     use crate::{tests::TestRuntime, tool::ToolOutput};
     use serde_json::json;
 
-    /// A 1x1 PNG.
-    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/1cAAAAASUVORK5CYII=";
+    /// A 1x1 PNG, base64-encoded.
+    fn png() -> String {
+        base64::engine::general_purpose::STANDARD.encode(crate::tests::png_bytes(b""))
+    }
 
     async fn map(value: &Value, runtime: &TestRuntime) -> Result<ToolOutput, ToolError> {
         map_result(
@@ -270,13 +278,14 @@ mod tests {
 
     #[tokio::test]
     async fn partial_image_failures_use_persistent_blobs_and_never_serialize_raw_sources() {
+        let png = png();
         for failed_index in 0..4 {
             let runtime = TestRuntime::new().await;
             let rejected = format!("RAW_REJECTED_MCP_IMAGE_{failed_index}!");
             let mut content = vec![json!({"type":"text","text":"before"})];
             for index in 0..3 {
                 content.push(json!({"type":"image","mimeType":"image/png",
-                    "data": if index == failed_index { &rejected } else { PNG },
+                    "data": if index == failed_index { &rejected } else { &png },
                     "annotations":{"audience":["user"],"priority":0.75},
                     "_meta":{"vendor":{"index":index,"opaque":[true,null]}}
                 }));
@@ -291,10 +300,10 @@ mod tests {
             let imported = failed_index.min(3);
             assert_eq!(output.images.len(), imported);
             let serialized = serde_json::to_string(&output.value).unwrap();
-            assert!(!serialized.contains(PNG));
+            assert!(!serialized.contains(&png));
             assert!(!serialized.contains(&rejected) && !message.contains(&rejected));
             let png = base64::engine::general_purpose::STANDARD
-                .decode(PNG)
+                .decode(&png)
                 .unwrap();
             for image in &output.images {
                 assert_eq!(
@@ -346,7 +355,11 @@ mod tests {
     #[tokio::test]
     async fn declared_image_type_governs_admission_and_must_match_the_bytes() {
         let runtime = TestRuntime::new().await;
-        let jpeg = base64::engine::general_purpose::STANDARD.encode(b"\xff\xd8\xff\xe0 jpeg");
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(1, 1)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner());
         let result = json!({"content":[{"type":"image","mimeType":"image/jpeg","data":jpeg}]});
         let output = map(&result, &runtime).await.unwrap();
         let [stored] = output.images.as_slice() else {
@@ -362,15 +375,19 @@ mod tests {
                 "bytes": stored.blob.bytes,
             })
         );
-        // Valid PNG bytes under an unsupported or mismatched declaration are rejected.
-        for (mime, message) in [
-            ("image/svg+xml", "unsupported MCP image type"),
-            (
-                "image/jpeg",
-                "invalid MCP image: data does not match its declared image type",
-            ),
+        // The declaration names the source format, though an animation is stored as PNG.
+        let gif = base64::engine::general_purpose::STANDARD.encode(crate::tests::animated_gif());
+        let result = json!({"content":[{"type":"image","mimeType":"image/gif","data":gif}]});
+        let output = map(&result, &runtime).await.unwrap();
+        assert_eq!(output.images[0].format, crate::media::ImageFormat::Png);
+        // Valid bytes under an unsupported or mismatched declaration are rejected.
+        let mismatch = "invalid MCP image: data does not match its declared image type";
+        for (mime, data, message) in [
+            ("image/svg+xml", png(), "unsupported MCP image type"),
+            ("image/jpeg", png(), mismatch),
+            ("image/png", gif, mismatch),
         ] {
-            let result = json!({"content":[{"type":"image","mimeType":mime,"data":PNG}]});
+            let result = json!({"content":[{"type":"image","mimeType":mime,"data":data}]});
             let (error, output) = failed(map(&result, &runtime).await);
             assert!(error.contains(message), "{error}");
             assert!(output.images.is_empty());
@@ -401,6 +418,16 @@ mod tests {
             }
             assert_eq!(output.value["content"][2]["text"], "preserved");
         }
+        // An image past the count is refused before its data is read.
+        let image = json!({"type":"image","mimeType":"image/png","data":png()});
+        let mut content = vec![image; MAX_IMAGES_PER_SUBMISSION];
+        content.push(json!({"type":"image","mimeType":"image/png","data":"not base64!"}));
+        let (error, output) = failed(map(&json!({ "content": content }), &runtime).await);
+        assert!(
+            error.contains("MCP images exceed attachment limits"),
+            "{error}"
+        );
+        assert_eq!(output.images.len(), MAX_IMAGES_PER_SUBMISSION);
     }
 
     #[tokio::test]
@@ -411,7 +438,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
         );
         let upstream = json!({"content":[
-            {"type":"image", "mimeType":"image/png", "data":PNG},
+            {"type":"image", "mimeType":"image/png", "data":png()},
             {"type":"text", "text":"unchanged content"}
         ], "isError":false, "structuredContent":{"retained":true}});
         let error = map(&upstream, &runtime).await.unwrap_err();

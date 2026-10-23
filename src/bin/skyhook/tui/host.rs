@@ -8,6 +8,7 @@ use crate::launch::LaunchError;
 use skyhook::{
     agent::{ObservedEvent, SessionHandle},
     identity::SessionId,
+    provider::profile::ModelRef,
 };
 use std::sync::Arc;
 use tokio::sync::{
@@ -79,6 +80,21 @@ pub async fn observed(session: SessionHandle) -> Result<PreparedObservation, Lau
             Err(error.into())
         }
     }
+}
+
+/// Observe the resumed `session`, switched first to `model` when one is named,
+/// before anything runs, as a batch resume does.
+pub async fn resumed(
+    session: SessionHandle,
+    model: Option<&ModelRef>,
+) -> Result<PreparedObservation, LaunchError> {
+    if let Some(model) = model
+        && let Err(error) = session.activate_on(model).await
+    {
+        let _ = session.shutdown().await;
+        return Err(error.into());
+    }
+    observed(session).await
 }
 
 /// A launch whose prompts arrive on their own channel: a prompt then belongs to
@@ -458,6 +474,31 @@ mod tests {
             .select(row.expect("a locked row"));
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         slot.app.event(Event::Key(enter));
+    }
+
+    /// A resume that names a model runs the session on it from the start: the
+    /// switch is made before anything runs, not left for the next message.
+    #[tokio::test]
+    async fn a_resume_naming_a_model_switches_to_it_up_front() {
+        let (_root, host) = host().await;
+        let yaml = "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n      second:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n";
+        let config = skyhook::config::Config::from_yaml(yaml).unwrap();
+        let launch = Launch {
+            model: config.into_runtime().unwrap().default_model(),
+            ..host.slots[0].app.launch.clone()
+        };
+        let session = launch.create(None).await.unwrap();
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+        let second: ModelRef = "test/second".parse().unwrap();
+        let session = launch.create(Some(session.id())).await.unwrap();
+        let prepared = resumed(session, Some(&second)).await.unwrap();
+        let session = prepared.session().clone();
+        assert!(session.phase().runs());
+        let (tx, _) = mpsc::unbounded_channel();
+        let app = host.slots[0].app.sibling(Some(prepared), launch, tx);
+        assert_eq!(app.model, second);
+        session.shutdown().await.unwrap();
     }
 
     /// Switching away keeps a session only while there is something to come back

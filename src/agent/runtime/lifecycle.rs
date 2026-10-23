@@ -38,9 +38,12 @@ impl SessionRuntime {
         let (mcp, mut startup_warnings) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
         let root = AgentId::root(store.id());
-        let running = store.read(|state| state.agents.journaled(&root)?.contract.mode.clone());
-        let default = harness.mode.as_ref();
-        startup_warnings.extend(modes::drift_warning(running.as_ref(), &modes, default));
+        startup_warnings.extend(store.read(|state| {
+            let running = state.agents.journaled(&root);
+            running.map_or_else(Vec::new, |held| {
+                modes::drift_warnings(&harness, &held.contract)
+            })
+        }));
         let executor = ToolExecutor::with_authorization(
             builder.build(),
             authorization,
@@ -83,9 +86,11 @@ impl SessionRuntime {
     /// child, and every other outcome nobody read, whoever called the job, go on
     /// in the background.
     /// What this closes is dated when the stopped process last did something.
-    /// The same commit `resume`s the root, once it has settled them.
+    /// The same commit journals the root's `started` and `resume`s it, once it
+    /// has settled them.
     pub(super) async fn activate(
         &self,
+        started: Vec<(AgentId, SessionEvent)>,
         resume: impl FnOnce(&mut CoreState) + Send + 'static,
     ) -> Result<(), HarnessError> {
         let (mut events, outputs) = self.jobs.interrupt_running().await?;
@@ -103,6 +108,7 @@ impl SessionRuntime {
             let open = ledger.open_turns().into_iter().cloned();
             events.extend(open.map(|agent| (agent, SessionEvent::AgentInterrupted)));
             events.extend(state.jobs.reopened());
+            events.extend(started);
             // A reopened session waits for `continue` or a prompt, as an interrupted
             // one does: what it stopped, and the deliveries it closed with.
             let paused = move |state: &mut CoreState, _: &[_]| {
@@ -174,14 +180,13 @@ impl SessionRuntime {
             match facts.turn {
                 Turn::Busy if work.children => drop(facts.set_turn(Turn::Held)),
                 Turn::Busy => {
-                    facts.set_turn(Turn::Parked(TurnFailure::Interrupted));
-                    facts.turn_token.cancel();
+                    facts.stop();
                     // Input behind it has no turn left to join or follow; what
                     // arrives from here on is new input.
                     state.agents.hand_back(&agent, &state.jobs);
                 }
                 Turn::Held | Turn::Cancelled(Was::Held) => continue,
-                Turn::Idle | Turn::Parked(_) | Turn::Cancelled(Was::Idle) => {
+                Turn::Idle | Turn::Stopping | Turn::Parked(_) | Turn::Cancelled(Was::Idle) => {
                     let waits = takes && facts.turn == Turn::Idle;
                     // What begins an invocation yet to begin stays: its owner counted it.
                     let rejected = state.agents.hand_back(&agent, &state.jobs);
@@ -202,13 +207,14 @@ impl SessionRuntime {
         count
     }
 
-    /// Wait for the jobs of agents an interrupt stopped to publish their outcome:
-    /// an interrupt cancels model futures before their owning job has finished
-    /// journaling. Each such turn's token is cancelled and nothing admits it
-    /// further, so it always ends. A held turn is not among them: it unwinds
-    /// only once `continue` or new input moves it on. A launch the interrupt
-    /// stopped before it began can still begin, parked interrupted, after this
-    /// registers: its job is waited for too once it has.
+    /// Wait for the agents an interrupt stopped to unwind the work they took,
+    /// and for their jobs to publish their outcome: an interrupt cancels model
+    /// futures before their loops have let go of that work, and before their
+    /// owning jobs have finished journaling. Each such turn's token is cancelled
+    /// and nothing admits it further, so it always ends. A held turn is not
+    /// among them: it unwinds only once `continue` or new input moves it on. A
+    /// launch the interrupt stopped before it began can still begin, parked
+    /// interrupted, after this registers: its job is waited for too once it has.
     pub(super) async fn settle_interrupts(&self) {
         let running = |state: &mut CoreState| {
             let agents = state.agents.keys().cloned().collect::<Vec<_>>();
@@ -219,10 +225,14 @@ impl SessionRuntime {
             let keys = agent_keys.chain(preempted.iter().copied().map(Key::Job));
             let keys = keys.collect::<Vec<_>>();
             let published = move |state: &CoreState| {
-                let interrupted = |agent: &&AgentId| {
-                    (state.agents.get(*agent))
-                        .is_some_and(|facts| facts.turn == agents::INTERRUPTED)
-                };
+                let turn = |agent: &&AgentId| (state.agents.get(*agent)).map(|facts| &facts.turn);
+                if agents
+                    .iter()
+                    .any(|agent| turn(&agent) == Some(&Turn::Stopping))
+                {
+                    return None;
+                }
+                let interrupted = |agent: &&AgentId| turn(agent).is_some_and(Turn::interrupted);
                 let interrupted = agents
                     .iter()
                     .filter(interrupted)
@@ -278,8 +288,7 @@ impl SessionRuntime {
                     }
                     // Cancelled before its wait returns: the released wait must not
                     // reach its request boundary as a running turn.
-                    facts.set_turn(Turn::Parked(TurnFailure::Interrupted));
-                    facts.turn_token.cancel();
+                    facts.stop();
                     stopped.push(agent);
                 }
                 // Each link the interrupt stopped ends interrupted now, so its
@@ -371,7 +380,7 @@ mod tests {
         let mut checked = Vec::new();
         for (tool, schema) in surface
             .result_schemas()
-            .chain([("JobView", &views.one), ("JobView[]", &views.many)])
+            .chain([("JobView", &views.one), ("JobListing", &views.listing)])
         {
             checked.push(tool);
             violations(schema, tool.to_owned(), &mut found);
@@ -1010,13 +1019,9 @@ mod tests {
         session: SessionHandle,
         rests: Turn,
     ) -> SessionHandle {
-        let oversized = crate::media::Attachment::Image {
-            file: None,
-            image: crate::tests::png(&vec![0; crate::media::MAX_IMAGE_BYTES as usize]),
-        };
         let refused = QueuedPrompt {
             text: "oversized".into(),
-            attachments: vec![oversized],
+            attachments: crate::tests::over_limit_images().await,
             ..QueuedPrompt::default()
         };
         let failed = |session: &SessionHandle| {
@@ -1115,8 +1120,11 @@ mod tests {
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "redirected");
         let job = delegated(&session).await.unwrap();
         assert_eq!(job.state, JobState::Interrupted);
-        let continued = bounded(session.continue_turn_with(Selection::default())).await;
-        assert_eq!(continued.unwrap().children_resumed, 1);
+        // The root between turns has nothing to continue: the children alone
+        // resume, without the selection.
+        let test = session.selection(Some(&model_ref("test")), None).unwrap();
+        let continued = bounded(session.continue_turn_with(test)).await.unwrap();
+        assert!(continued.children_resumed == 1 && !continued.selection_applied);
         // Only the call asked for again still waits for the permit.
         prepared.add_permits(1);
         assert_eq!(terminal(&session, job.id).await.state, JobState::Completed);

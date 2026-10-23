@@ -1,8 +1,8 @@
 //! The specs a capability set sees: generated per agent from registered definitions.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use serde_json::Value;
@@ -43,7 +43,7 @@ impl ResultSchema {
         match self {
             Self::Json(schema) => schema,
             Self::JobViews(JobViewResult::One) => &crate::job::JOB_VIEW_SCHEMAS.one,
-            Self::JobViews(JobViewResult::Many) => &crate::job::JOB_VIEW_SCHEMAS.many,
+            Self::JobViews(JobViewResult::Listing) => &crate::job::JOB_VIEW_SCHEMAS.listing,
         }
     }
 }
@@ -107,7 +107,7 @@ pub(super) struct GeneratedToolDefinition {
 }
 
 /// Which agent a spec is generated for: root-only requirements bind only the root.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentLevel {
     Root,
     Child,
@@ -196,16 +196,27 @@ impl ToolSurface {
 
 pub(super) type CatalogTools<C, O> = BTreeMap<String, Arc<CatalogEntry<C, O>>>;
 
+type Surfaces = HashMap<(CapabilitySet, AgentLevel), Arc<ToolSurface>>;
+
 #[derive(Clone)]
 pub struct Catalog<C, O: OutputValue> {
     pub(super) tools: Arc<CatalogTools<C, O>>,
+    /// Surfaces generated so far; the tools never change, so neither do they.
+    surfaces: Arc<Mutex<Surfaces>>,
+}
+
+impl<C, O: OutputValue> Catalog<C, O> {
+    pub(super) fn new(tools: CatalogTools<C, O>) -> Self {
+        Self {
+            tools: Arc::new(tools),
+            surfaces: Arc::default(),
+        }
+    }
 }
 
 impl<C, O: OutputValue> Default for Catalog<C, O> {
     fn default() -> Self {
-        Self {
-            tools: Arc::default(),
-        }
+        Self::new(CatalogTools::default())
     }
 }
 
@@ -220,15 +231,21 @@ impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
         &self,
         capabilities: &CapabilitySet,
         agent: &crate::identity::AgentId,
-    ) -> ToolSurface {
-        let level = AgentLevel::of(agent);
-        let tools = self
-            .tools
-            .values()
-            .filter_map(|tool| {
-                (tool.spec(capabilities, level)).map(|spec| (spec.name.clone(), spec))
-            })
-            .collect();
-        ToolSurface { tools }
+    ) -> Arc<ToolSurface> {
+        let key = (capabilities.clone(), AgentLevel::of(agent));
+        let mut surfaces = self.surfaces.lock().unwrap_or_else(PoisonError::into_inner);
+        let surface = surfaces
+            .entry(key)
+            .or_insert_with_key(|(capabilities, level)| {
+                let tools = self
+                    .tools
+                    .values()
+                    .filter_map(|tool| {
+                        (tool.spec(capabilities, *level)).map(|spec| (spec.name.clone(), spec))
+                    })
+                    .collect();
+                Arc::new(ToolSurface { tools })
+            });
+        surface.clone()
     }
 }

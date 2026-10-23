@@ -34,7 +34,8 @@ struct SessionArgs {
     /// Resume an existing session id.
     #[arg(long)]
     resume: Option<SessionId>,
-    /// Select and remember the root model for a new session.
+    /// Select and remember the root model for a new session; a resumed session
+    /// switches its root to it before anything runs, a prompt or script included.
     #[arg(short = 'm', long = "model", value_name = "PROVIDER/MODEL")]
     model: Option<ModelRef>,
     /// Attach images to the first prompt.
@@ -406,6 +407,10 @@ mod tests {
             (&["--mode", "readonly", "batch", "-p", "hello"], false),
             (&["batch", "--resume", ID, "--mode", "m", "-s", "x"], false),
             (&["batch", "--resume", ID, "--mode", "m", "-p", "x"], true),
+            (
+                &["batch", "--resume", ID, "--model", "p/m", "-s", "x"],
+                true,
+            ),
         ] {
             let parsed = parse_from(std::iter::once(&"skyhook").chain(args));
             assert_eq!(parsed.is_ok(), valid, "{args:?}");

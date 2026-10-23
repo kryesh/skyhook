@@ -161,8 +161,8 @@ mod tests {
     async fn script_foreground_child_leaves_no_pending_reply() {
         const FINAL: &str = "readme-first-lines";
         let source = "const answer = await tool.agent({prompt:'read', model:'wait-test/child', name:'read-readme'}); \
-            const first = (await tool.wait({timeout:1})).result; \
-            const second = (await tool.wait({timeout:1})).result; \
+            const first = (await tool.wait({timeout:1})).result.reason; \
+            const second = (await tool.wait({timeout:1})).result.reason; \
             return [first, second];";
         let tracking = tracking_all(vec![
             (
@@ -187,7 +187,7 @@ mod tests {
             .await
             .unwrap()
             .output;
-        let expected = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
+        let expected = json!(["timeout", "timeout"]);
         assert_eq!(
             output.as_ref().map(|output| &output["value"]),
             Some(&expected),
@@ -347,10 +347,11 @@ mod tests {
             complete_background(&session, &child, "please add an addendum").await;
             assert!(pending(&session, &child));
         } else {
-            let send =
-                format!("return await tool.job({job}).send({{value:'please add an addendum'}});");
+            let send = format!(
+                "return (await tool.job({job}).send({{value:'please add an addendum'}})).unwrap();"
+            );
             let sent = bounded(session.run_script(send)).await.unwrap();
-            assert_eq!(sent.value["value"], json!({}));
+            assert_eq!(sent.value["value"], serde_json::Value::Null);
             // The input is queued for the child while A's invoke is gated.
             let queued = || runtime.agents(|agents| agents.get(&child).unwrap().inbox.len());
             assert_eq!(queued(), 1);
@@ -540,9 +541,10 @@ mod tests {
 
         // Send through the public job API; the child's next request proves delivery.
         let value = "parent-reply-request-marker";
-        let send = format!("return await tool.job({child_job}).send({{value:{value:?}}});");
+        let send =
+            format!("return (await tool.job({child_job}).send({{value:{value:?}}})).unwrap();");
         let sent = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(sent.value["value"], json!({}));
+        assert_eq!(sent.value["value"], serde_json::Value::Null);
         let child_request = tracking.pass(3).await;
         assert_reason(&child_request, "child-wait", "event");
         let messages = rendered(&child_request);

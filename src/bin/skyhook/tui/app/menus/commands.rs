@@ -216,9 +216,9 @@ impl App {
                 Err(error) => Err(error),
             };
             let result = match outcome {
-                // Only a continued root turn adopts a model change, and the
-                // gate above admits historical failures too, so report what
-                // actually happened rather than appearing to have retried.
+                // A root still running or waiting on children keeps its model,
+                // and the gate above admits historical failures too, so report
+                // what actually happened rather than appearing to have retried.
                 Ok(outcome) if outcome.is_empty() => {
                     notices.send(
                         "Nothing to continue: no retained turn is failed or interrupted".to_owned(),
@@ -228,7 +228,7 @@ impl App {
                 Ok(outcome) => {
                     if requested && !outcome.selection_applied {
                         notices.send(format!(
-                            "Continued {} child agent(s) unchanged; a model or mode change applies to the root turn only",
+                            "Continued {} child agent(s) unchanged; a root still running or waiting on children keeps its model and mode",
                             outcome.children_resumed,
                         ));
                     }
@@ -266,7 +266,7 @@ impl App {
             .store()
             .directory()
             .join(format!("conversation-{label}.md"));
-        let (tx, exporting) = (self.tx.clone(), self.exports.clone());
+        let (tx, exporting) = (self.tx.clone(), self.tasks.clone());
         tokio::spawn(async move {
             let window = match super::super::pages::whole(&session, &agent).await {
                 Ok(window) => window,
@@ -328,7 +328,7 @@ mod tests {
     use crate::tui::app::played::{observe_until, played_fixture};
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::identity::JobId;
-    use skyhook::session::SessionEvent;
+    use skyhook::session::{Message, SessionEvent, UserPart};
 
     #[tokio::test]
     async fn retry_children_without_selection_preserves_the_waiting_root_operation() {
@@ -400,11 +400,27 @@ mod tests {
                 result: Ok(()),
             }
         ));
+        // The continue joined the root's operation rather than running the root;
+        // the restarted child's failure may still reach the idle root as an
+        // ordinary delivery, in a turn of its own: each request the root makes
+        // answers one.
         app.work(continued);
-        let requested = |record: &std::sync::Arc<skyhook::session::EventRecord>| {
-            record.agent == root && matches!(record.event, SessionEvent::ModelRequested { .. })
-        };
-        assert!(!journal(&session).await.iter().any(requested));
+        let records = journal(&session).await;
+        let mut delivered = false;
+        for record in records.iter().filter(|record| record.agent == root) {
+            match &record.event {
+                SessionEvent::MessageCommitted {
+                    message: Message::User(parts),
+                } => {
+                    delivered =
+                        (parts.iter()).any(|part| matches!(part, UserPart::JobEvents { .. }));
+                }
+                SessionEvent::ModelRequested { .. } => {
+                    assert!(std::mem::take(&mut delivered), "{records:#?}");
+                }
+                _ => {}
+            }
+        }
         // Child retry neither replaces nor finishes the pending root operation.
         assert!(app.operation);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
@@ -448,7 +464,7 @@ mod tests {
         let (_root, mut app) = draft_fixture().await;
         app.command(Command::Commands);
         let menu = app.menu.as_mut().unwrap();
-        let MenuKind::Commands(items) = &menu.kind else {
+        let MenuKind::Commands(items) = menu.kind.clone() else {
             panic!("command menu")
         };
         for (command, label, shortcut) in [
@@ -472,15 +488,15 @@ mod tests {
             ("agents", Command::Agents),
             ("exit", Command::Exit),
         ] {
-            menu.input.set(query.into());
+            menu.filter(|input| input.set(query.into()));
             let filtered = menu.filtered();
             assert_eq!(filtered.len(), 1, "query: {query}");
             assert_eq!(items[filtered[0].index].value, expected);
         }
-        menu.input.set("/models".into());
+        menu.filter(|input| input.set("/models".into()));
         assert_eq!(items[menu.filtered()[0].index].value, Command::Model);
         for spec in COMMANDS.iter().filter(|spec| spec.palette) {
-            menu.input.set(format!("/{}", spec.command));
+            menu.filter(|input| input.set(format!("/{}", spec.command)));
             assert_eq!(items[menu.filtered()[0].index].value, spec.command);
         }
         // Typing a command id runs that command.

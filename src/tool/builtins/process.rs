@@ -252,7 +252,7 @@ const STDERR_PIPE: &str = "stderr pipe";
 
 /// After spawn the command may already have had effects.
 fn started(operation: Operation, subject: Subject) -> PartialContext {
-    PartialContext::new(operation, subject).effects(Effects::Started)
+    PartialContext::new(operation, subject).effects(Effects::Unknown)
 }
 
 enum ProcessCompletion {
@@ -556,7 +556,7 @@ mod tests {
         let diagnostic = result.unwrap_err().diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::Wait);
         assert_eq!(diagnostic.context.subject, Subject::Process);
-        assert_eq!(diagnostic.context.effects, Effects::Started);
+        assert_eq!(diagnostic.context.effects, Effects::Unknown);
         assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("3600")));
         let failed = jobs.list(agent).await.unwrap().last().unwrap().id;
         let view = jobs
@@ -572,7 +572,10 @@ mod tests {
             view["result"],
             json!({"signal":libc::SIGKILL,"stdout":"partial"})
         );
-        assert_eq!(view["presentation"]["notice"], "Output incomplete.");
+        assert_eq!(
+            view["presentation"]["notice"],
+            crate::job::Notice::OutputIncomplete.as_str()
+        );
     }
 
     #[tokio::test]
@@ -723,7 +726,7 @@ mod tests {
                 diagnostic.context.subject,
                 Subject::Label(TextCaptureField::Stdout.pointer().into())
             );
-            assert_eq!(diagnostic.context.effects, Effects::Started);
+            assert_eq!(diagnostic.context.effects, Effects::Unknown);
             assert_eq!(diagnostic.cause, opaque);
             bounded(producer.settle()).await.unwrap();
         }

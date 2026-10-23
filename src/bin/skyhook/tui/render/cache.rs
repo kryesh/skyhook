@@ -21,8 +21,7 @@ pub struct RenderState {
     pub selected: usize,
     pub highlights: super::super::tool_view::HighlightCache,
     pub(super) request_columns: RequestColumns,
-    /// The entries on screen when highlighting was last prepared.
-    prepared: std::ops::Range<usize>,
+    prepared: Prepared,
     /// The sidebar's grants, and what they were read for.
     pub(super) grants: Option<(GrantsKey, Grants)>,
     /// Entries laid out since the counter was last read, for tests.
@@ -45,7 +44,7 @@ impl RenderState {
             selected: 0,
             highlights: super::super::tool_view::HighlightCache::with_notify(notify),
             request_columns: RequestColumns::default(),
-            prepared: 0..0,
+            prepared: Prepared::default(),
             grants: None,
             #[cfg(test)]
             laid_out: 0,
@@ -74,6 +73,15 @@ impl RenderState {
             Top::Pending => Some(0),
         }
     }
+}
+
+/// What highlighting was last prepared for.
+#[derive(Default, PartialEq)]
+struct Prepared {
+    /// The entries on screen.
+    visible: std::ops::Range<usize>,
+    /// The prompt's fences.
+    prompt: Vec<super::super::tool_view::CodeKey>,
 }
 
 /// Where the view's top resolved to in the rows laid out.
@@ -106,11 +114,16 @@ pub(crate) fn anchor(app: &App, row: usize) -> Option<model::Anchor> {
         _ => {}
     }
     let history = app.content_cache.history();
-    let place = history.place_of(entry).and_then(|focus| {
+    let placed = history.place_of(entry).and_then(|focus| {
         let shown = history.place(focus)?;
         let start = rows.entry_start(shown.start)?;
         Some((focus, rows.entry_start(entry)? - start + offset))
     });
+    let place = match placed {
+        Some(placed) => model::Edge::At(placed),
+        None if (0..entry).any(|entry| history.place_of(entry).is_some()) => model::Edge::End,
+        None => model::Edge::Start,
+    };
     Some(model::Anchor {
         key: Some(key),
         offset,
@@ -119,12 +132,14 @@ pub(crate) fn anchor(app: &App, row: usize) -> Option<model::Anchor> {
 }
 
 /// Find `anchor` in the rows laid out now: its place, then its key among what that
-/// shows; one with no place by its key. It is pending until a window opened around it,
-/// and lost (none) once an open window, which reaches its place, does not hold it.
+/// shows; one with no place by its key, or at the first row when it is at the start. It
+/// is pending until a window opened around it, and lost (none) once an open window,
+/// which reaches its place, does not hold it; a place it read that shows nothing is
+/// found where it would show.
 fn resolve(app: &App, anchor: &model::Anchor) -> Option<Top> {
-    if app.window.as_ref().is_none_or(model::Window::opening) {
+    let Some(window) = app.window.as_ref().filter(|window| !window.opening()) else {
         return Some(Top::Pending);
-    }
+    };
     let rows = &app.render.rows;
     let entries = app.content_cache.entries();
     let at = |entry: usize| {
@@ -136,10 +151,17 @@ fn resolve(app: &App, anchor: &model::Anchor) -> Option<Top> {
         let key = entries.get(*entry).map(model::Entry::key);
         key.is_some_and(|key| Some(key) == anchor.key.as_ref())
     };
-    let Some((focus, into)) = anchor.place else {
-        return (0..entries.len()).find(keyed).and_then(at).map(Top::Row);
+    let model::Edge::At((focus, into)) = anchor.place else {
+        let found = (0..entries.len()).find(keyed).and_then(at);
+        let start = (anchor.place == model::Edge::Start).then_some(0);
+        return found.or(start).map(Top::Row);
     };
-    let shown = app.content_cache.history().place(focus)?;
+    let history = app.content_cache.history();
+    let shown = match history.place(focus) {
+        Some(shown) => shown,
+        None if window.holds(focus) => history.at(focus)..history.at(focus),
+        None => return None,
+    };
     if let Some(row) = shown.clone().find(keyed).and_then(at) {
         return Some(Top::Row(row));
     }
@@ -154,7 +176,7 @@ fn resolve(app: &App, anchor: &model::Anchor) -> Option<Top> {
 }
 
 /// Reflow changed entries, preserve scroll anchors, and reflow the text selection.
-pub(super) fn prepare_rows(app: &mut App, width: u16) {
+pub(super) fn prepare_rows(app: &mut App, width: u16, prompt: Option<&Document>) {
     let tab = app.tab;
     app.ensure_window();
     let window = app.window.as_ref().map(|window| window.id);
@@ -162,7 +184,6 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
         && app.render.window == window
         && app.render.width == width;
     app.rebuild_content();
-    app.render.highlights.poll();
     let reset = app.render.reset || !same;
     let changes = app.content_cache.take_changes();
     let changed = !changes.is_empty();
@@ -235,19 +256,25 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
         app.selection =
             (app.selection.take()).and_then(|selection| selection.reflow(&app.render.rows));
     }
-    // Highlight what is on screen first, then the selected and changed entries,
-    // newest first. The budget cannot hold every section of a long transcript.
+    // Highlight what is on screen first, the prompt then the entries, then the
+    // selected and changed entries, newest first. The budget cannot hold every
+    // section of a long transcript.
     let visible = visible_entries(app);
-    if reset || first_changed.is_some() || app.render.prepared != visible {
-        app.render.prepared = visible.clone();
+    let shown = Prepared {
+        visible: visible.clone(),
+        prompt: prompt.into_iter().flat_map(Document::keys).collect(),
+    };
+    if reset || first_changed.is_some() || app.render.prepared != shown {
+        app.render.prepared = shown;
         let selected = app.selected_entry();
         let order = visible.chain(selected).chain(dirty.iter().rev().copied());
         let (entries, rows) = (app.content_cache.entries(), &app.render.rows);
         let documents = order.filter_map(|index| Some((entries.get(index)?, index)));
-        app.render.highlights.prepare(
-            documents
-                .flat_map(|(entry, index)| entry.document().into_iter().chain(rows.fences(index))),
-        );
+        let documents = documents
+            .flat_map(|(entry, index)| entry.document().into_iter().chain(rows.fences(index)));
+        app.render
+            .highlights
+            .prepare(prompt.into_iter().chain(documents));
     }
 }
 
@@ -274,20 +301,20 @@ fn follow(app: &mut App) {
     }
 }
 
-/// The row at the view's top: where it resolved, else the newest rows'.
-fn top_row(app: &App) -> usize {
-    let rows = &app.render.rows;
-    let max = rows.len().saturating_sub(app.content_rect.height as usize);
-    app.render.scroll().map_or(max, |scroll| scroll.min(max))
+/// The rows in view, from its top down.
+pub(super) fn view_rows(app: &App) -> std::ops::Range<usize> {
+    let top = app.scroll_offset();
+    top..(top + app.content_rect.height as usize).min(app.render.rows.len())
 }
 
 /// Entries with a row inside the viewport.
 pub(crate) fn visible_entries(app: &App) -> std::ops::Range<usize> {
     let rows = &app.render.rows;
-    let height = app.content_rect.height as usize;
-    let top = top_row(app);
-    let bottom = (top + height).min(rows.len()).saturating_sub(1);
-    match (rows.locate(top), rows.locate(bottom)) {
+    let shown = view_rows(app);
+    if shown.is_empty() {
+        return 0..0;
+    }
+    match (rows.locate(shown.start), rows.locate(shown.end - 1)) {
         (Some((first, _)), Some((last, _))) => first..last + 1,
         _ => 0..0,
     }
@@ -297,12 +324,12 @@ pub(crate) fn visible_entries(app: &App) -> std::ops::Range<usize> {
 /// anchor is sought in, for the window to load.
 pub(super) fn near_view(app: &App) -> Vec<model::Near> {
     let rows = &app.render.rows;
-    let height = (app.content_rect.height as usize).max(1);
-    let top = top_row(app);
-    let reach = PREFETCH_SCREENS * height;
+    let shown = view_rows(app);
+    let top = shown.start;
+    let reach = PREFETCH_SCREENS * (app.content_rect.height as usize).max(1);
     let (from, to) = (
         top.saturating_sub(reach),
-        (top + height + reach).min(rows.len()),
+        (shown.end + reach).min(rows.len()),
     );
     let entries = app.content_cache.entries();
     let first = rows.locate(from).map_or(entries.len(), |(entry, _)| entry);
@@ -323,89 +350,44 @@ pub(super) fn near_view(app: &App) -> Vec<model::Near> {
     near.collect()
 }
 
-/// The whole history as the scrollbar spans it, in rows: those laid out, with the
-/// transcript's entries not loaded before and after them at the loaded entries' rows
-/// per entry, exact once all are loaded; an entry a row while none are. A list spans
-/// what it loaded.
-pub(crate) struct Track {
-    /// Rows before and after those laid out.
-    pub before: usize,
-    pub after: usize,
-    rows: usize,
-    /// The transcript's loaded ordinals, and how many entries it holds.
-    transcript: Option<(std::ops::Range<u64>, u64)>,
+/// What the view needs loaded, by the tab's own entries: from the one before what it
+/// shows to the one after, the records between them included, as scrolling reaches the
+/// next row only once they are loaded; the start or end when none lies that way, where
+/// what is not loaded begins. Its anchor while the rows do not hold it.
+pub(super) fn shown_edges(app: &App) -> std::ops::RangeInclusive<model::Edge> {
+    let shown = view_rows(app);
+    if !matches!(app.render.top, Top::Row(_) | Top::Latest) || shown.is_empty() {
+        let focus = app.focus_of_view();
+        return focus..=focus;
+    }
+    edge(app, shown.start, true)..=edge(app, shown.end - 1, false)
 }
 
-/// Where a row of the track lies: laid out, or in a transcript entry not loaded.
-pub(crate) enum Spot {
-    Row(usize),
-    Ordinal(u64),
-}
-
-impl Track {
-    pub(crate) fn of(app: &App) -> Self {
-        let rows = app.render.rows.len();
-        let mut track = Self {
-            before: 0,
-            after: 0,
-            rows,
-            transcript: None,
-        };
-        let Some(transcript) = app.window.as_ref().and_then(model::Window::transcript) else {
-            return track;
-        };
-        let entries = app.entry_count();
-        let keys = &transcript.run.keys;
-        let loaded = match (keys.first(), keys.last()) {
-            (Some(first), Some(last)) => *first..last + 1,
-            _ => {
-                let focus = match app.focus_of_view() {
-                    Some(model::Focus::Ordinal(ordinal)) => ordinal.min(entries),
-                    _ => entries,
-                };
-                focus..focus
-            }
-        };
-        let per = match loaded.end - loaded.start {
-            0 => 1.0,
-            count => rows as f64 / count as f64,
-        };
-        let share = |count: u64| (count as f64 * per).ceil() as usize;
-        track.before = share(loaded.start);
-        track.after = share(entries.saturating_sub(loaded.end));
-        track.transcript = Some((loaded, entries));
-        track
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.before + self.rows + self.after
-    }
-
-    /// What lies at `row` of the track.
-    pub(crate) fn locate(&self, row: usize) -> Spot {
-        let Some((loaded, entries)) = &self.transcript else {
-            return Spot::Row(row);
-        };
-        let ordinal = |rows: usize, span: usize, count: u64| {
-            (rows as f64 * count as f64 / span.max(1) as f64) as u64
-        };
-        let last = entries.saturating_sub(1);
-        if row < self.before {
-            return Spot::Ordinal(ordinal(row, self.before, loaded.start));
-        }
-        match row - self.before {
-            row if row < self.rows && !loaded.is_empty() => Spot::Row(row),
-            row => {
-                let past = entries.saturating_sub(loaded.end);
-                let row = row.saturating_sub(self.rows);
-                Spot::Ordinal((loaded.end + ordinal(row, self.after, past)).min(last))
-            }
-        }
+/// The tab's own entry next before (`up`) or after the one at `row`.
+fn edge(app: &App, row: usize, up: bool) -> model::Edge {
+    let rows = &app.render.rows;
+    let history = app.content_cache.history();
+    let entries = rows.entry_count();
+    let entry = rows.locate(row).map_or(entries, |(entry, _)| entry);
+    let own = history
+        .place_of(entry)
+        .and_then(|focus| history.place(focus));
+    let own = own.unwrap_or(entry..entry + 1);
+    let found = match up {
+        true => (0..own.start)
+            .rev()
+            .find_map(|entry| history.place_of(entry)),
+        false => (own.end..entries).find_map(|entry| history.place_of(entry)),
+    };
+    match (found, up) {
+        (Some(focus), _) => model::Edge::At(focus),
+        (None, true) => model::Edge::Start,
+        (None, false) => model::Edge::End,
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::super::app::{
         Work,
         played::{
@@ -422,7 +404,9 @@ mod tests {
     use std::sync::Arc;
 
     /// A session whose root journaled `count` statuses, one line each.
-    async fn statuses(count: usize) -> (tempfile::TempDir, App, SessionHandle) {
+    pub(in crate::tui::render) async fn statuses(
+        count: usize,
+    ) -> (tempfile::TempDir, App, SessionHandle) {
         let (root, app) = fixture().await;
         let session = app.session().unwrap().clone();
         let agent = session.root_agent().clone();
@@ -433,8 +417,49 @@ mod tests {
         (root, app, session)
     }
 
+    /// A session whose root journaled statuses of mixed heights, more than a window
+    /// keeps, with a run of records that show nothing, longer than it keeps beside the
+    /// view, after the first of them.
+    pub(in crate::tui::render) async fn mixed_history() -> (tempfile::TempDir, App, SessionHandle) {
+        let (root, app) = fixture().await;
+        let session = app.session().unwrap().clone();
+        let agent = session.root_agent().clone();
+        let long = "word ".repeat(60);
+        for status in 0..model::KEPT + 2 * model::PAGE {
+            let tail = if status / 100 % 2 == 1 {
+                long.as_str()
+            } else {
+                ""
+            };
+            let message = format!("status {status} {tail}");
+            session.record_status(agent.clone(), message).await.unwrap();
+            if status == model::KEPT / 2 {
+                for title in 0..model::KEPT / 2 + model::PAGE {
+                    session
+                        .rename(Some(format!("title {title}")))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        (root, app, session)
+    }
+
+    /// Draw until the window has nothing in flight, landing what it reads.
+    pub(in crate::tui::render) async fn settle(
+        app: &mut App,
+        work: &mut tokio::sync::mpsc::UnboundedReceiver<Work>,
+    ) {
+        draw(app);
+        while app.window.as_ref().is_some_and(model::Window::loading) {
+            let landed = recv(work).await;
+            app.work(landed);
+            draw(app);
+        }
+    }
+
     /// The first row in view, as text.
-    fn top(app: &App) -> String {
+    pub(in crate::tui::render) fn top(app: &App) -> String {
         let scroll = app.render.scroll().unwrap_or_default();
         app.render
             .rows
@@ -452,7 +477,7 @@ mod tests {
         let mut work = capture_work(&mut app);
         let loaded = app.loads;
         let anchored = |app: &App| match app.focus_of_view() {
-            Some(model::Focus::Ordinal(ordinal)) => ordinal,
+            model::Edge::At(model::Focus::Ordinal(ordinal)) => ordinal,
             focus => panic!("{focus:?}"),
         };
         let pages = bounded(async {
@@ -483,6 +508,69 @@ mod tests {
         .await;
         assert_eq!(app.loads - loaded, pages);
         assert_eq!(pages, (400 - model::PAGE).div_ceil(model::PAGE));
+    }
+
+    /// A run of records that show nothing, longer than a window keeps, is read across
+    /// a page at a time and never held: the view pages across it to the far side and
+    /// back to the newest entries, the window keeping no more than its budget.
+    #[tokio::test]
+    async fn the_view_crosses_records_that_show_nothing_holding_none() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (_root, app) = fixture().await;
+        let session = app.session().unwrap().clone();
+        let agent = session.root_agent().clone();
+        for side in 0..2 {
+            for status in 0..20 {
+                let message = format!("side {side} status {status}");
+                session.record_status(agent.clone(), message).await.unwrap();
+            }
+            for title in (side == 0)
+                .then_some(0..4 * model::KEPT)
+                .into_iter()
+                .flatten()
+            {
+                session
+                    .rename(Some(format!("title {title}")))
+                    .await
+                    .unwrap();
+            }
+        }
+        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
+        let mut work = capture_work(&mut app);
+        let kept = |app: &App| {
+            let transcript = app.window.as_ref().and_then(model::Window::transcript);
+            transcript.map_or(0, |transcript| transcript.run.kept().len())
+        };
+        for (code, end) in [
+            (KeyCode::PageUp, "side 0 status 0"),
+            (KeyCode::PageDown, "side 1 status 19"),
+        ] {
+            bounded(async {
+                loop {
+                    app.event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                    settle(&mut app, &mut work).await;
+                    assert!(kept(&app) <= model::KEPT, "{}", kept(&app));
+                    if draw(&mut app).contains(end) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        assert_eq!(app.render.top, Top::Latest);
+    }
+
+    /// A frame with no rows for the conversation, a tall draft and a notice taking
+    /// them, draws a view scrolled to its top.
+    #[tokio::test]
+    async fn a_frame_with_no_conversation_rows_draws_a_scrolled_view() {
+        let (_root, _app, session) = statuses(8).await;
+        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
+        app.editor.insert(&"line\n".repeat(10));
+        app.toast("notice");
+        app.scroll_to(Some(0));
+        draw_sized(&mut app, 80, 9);
+        assert_eq!(app.content_rect.height, 0);
     }
 
     /// A view scrolled into the transcript keeps its entry whatever replaces the rows
@@ -543,75 +631,12 @@ mod tests {
         app.event(crossterm::event::Event::Key(key));
         fill(&mut app, &mut work, 50).await;
         let paged = ahead + page;
-        assert_eq!(app.focus_of_view(), Some(model::Focus::Ordinal(paged)));
+        assert_eq!(
+            app.focus_of_view(),
+            model::Edge::At(model::Focus::Ordinal(paged))
+        );
         let status = format!("unobserved {}", 10 + page);
         assert!(top(&app).ends_with(&status), "{}", top(&app));
-    }
-
-    /// Pressing and dragging the scrollbar moves the view through the whole
-    /// transcript, the entries there loading as it arrives; paging on before they
-    /// land moves on from where it arrived.
-    #[tokio::test]
-    async fn dragging_the_scrollbar_moves_through_the_whole_transcript() {
-        use crossterm::event::{
-            Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        };
-        let (_root, _app, session) = statuses(400).await;
-        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
-        let mut work = capture_work(&mut app);
-        // The jump comes while the window reads the page above its start.
-        app.scroll_to(Some(0));
-        draw(&mut app);
-        assert!(app.window.as_ref().is_some_and(model::Window::loading));
-        let track = app.content_rect;
-        let mouse = |app: &mut App, kind, row| {
-            let (column, modifiers) = (track.right() - 1, KeyModifiers::NONE);
-            app.event(Event::Mouse(MouseEvent {
-                kind,
-                column,
-                row,
-                modifiers,
-            }));
-        };
-        let middle = track.y + track.height / 2;
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), track.y);
-        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), middle);
-        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), middle);
-        let ordinal = |app: &App| match app.focus_of_view() {
-            Some(model::Focus::Ordinal(ordinal)) => ordinal as usize,
-            focus => panic!("{focus:?}"),
-        };
-        draw(&mut app);
-        let jumped = ordinal(&app);
-        assert!((150..250).contains(&jumped), "{jumped}");
-        app.event(Event::Key(KeyEvent::new(
-            KeyCode::PageDown,
-            KeyModifiers::NONE,
-        )));
-        let paged = ordinal(&app);
-        assert_eq!(paged, jumped + track.height as usize);
-        // The first status in view.
-        let status = |app: &App| {
-            let scroll = app.render.scroll()?;
-            let mut rows = app
-                .render
-                .rows
-                .iter_from(scroll)
-                .take(4)
-                .map(|(_, row)| row.text());
-            rows.find_map(|text| text.strip_prefix("Status · status ")?.parse::<usize>().ok())
-        };
-        bounded(async {
-            draw(&mut app);
-            while app.window.as_ref().is_some_and(model::Window::loading) {
-                let landed = recv(&mut work).await;
-                app.work(landed);
-                draw(&mut app);
-            }
-        })
-        .await;
-        assert_eq!(ordinal(&app), paged);
-        assert!(status(&app).is_some(), "{}", top(&app));
     }
 
     /// A new width lays out the entries the window holds, never what it has not loaded.

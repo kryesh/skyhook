@@ -35,7 +35,7 @@ named_enum! {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CapabilitySet(BTreeSet<Capability>);
 
 impl CapabilitySet {

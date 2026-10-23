@@ -1,6 +1,7 @@
 //! Theme palette, terminal cell painting, and row decoration.
 
 use super::*;
+use std::ops::ControlFlow;
 
 pub(super) fn background(surface: Surface) -> Color {
     match surface {
@@ -58,46 +59,59 @@ pub(super) fn text(
         Style::default().fg(fg).bg(bg),
     );
 }
-/// Mark the part of `total` rows a `track` shows from row `top`, sized to the
-/// share in view; nothing when every row fits.
-pub(super) fn scroll_thumb(frame: &mut Frame, track: Rect, top: usize, total: usize, bg: Color) {
-    let visible = track.height as usize;
-    if total <= visible || visible == 0 {
-        return;
+/// The thumb of a track spanning `total`, where the view `shown` sits, flush with
+/// each end while the view reaches it; whether there is one, as none is drawn while
+/// the view shows everything.
+pub(super) fn scroll_thumb(
+    frame: &mut Frame,
+    track: Rect,
+    shown: std::ops::Range<f64>,
+    total: f64,
+    bg: Color,
+) -> bool {
+    if track.height == 0 || (shown.start <= 0.0 && shown.end >= total) {
+        return false;
     }
-    let length = (visible * visible / total).max(1);
-    let overflow = total - visible;
-    let start = top.min(overflow) * (visible - length) / overflow;
-    for y in start..start + length {
-        let cell = r(track.x, track.y + y as u16, 1, 1);
+    let cell = |at: f64| (at / total * f64::from(track.height)).round() as u16;
+    let start = cell(shown.start).min(track.height - 1);
+    let end = cell(shown.end).clamp(start + 1, track.height);
+    for y in start..end {
+        let cell = r(track.x, track.y + y, 1, 1);
         text(frame, cell, "▐", THEME.muted, bg);
     }
+    true
 }
 pub(super) fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
 
 /// Paint Markdown geometry without inserting decorative text into the source.
-pub(super) fn render_row_line(row: &Row, area: Rect, buffer: &mut Buffer, style: Style) {
-    if !row.layout.has_geometry() {
-        render_line(&row.line, area, buffer, style);
+pub(super) fn render_row_line(
+    line: &Line<'_>,
+    layout: &markdown::RowLayout,
+    area: Rect,
+    buffer: &mut Buffer,
+    style: Style,
+) {
+    if !layout.has_geometry() {
+        render_line(line, area, buffer, style);
         return;
     }
     let area = area.intersection(buffer.area);
     if area.is_empty() {
         return;
     }
-    buffer.set_style(area, style.patch(row.line.style));
-    let prefix_width = row.layout.prefix.width().min(area.width as usize);
+    buffer.set_style(area, style.patch(line.style));
+    let prefix_width = layout.prefix.width().min(area.width as usize);
     if prefix_width > 0 {
         render_line(
-            &row.layout.prefix,
+            &layout.prefix,
             r(area.x, area.y, prefix_width as u16, 1),
             buffer,
             style,
         );
     }
-    if let Some(code) = row.layout.code() {
+    if let Some(code) = layout.code() {
         let offset = code.indent();
         let rect = r(
             area.x.saturating_add(offset as u16),
@@ -108,56 +122,54 @@ pub(super) fn render_row_line(row: &Row, area: Rect, buffer: &mut Buffer, style:
         .intersection(area);
         buffer.set_style(rect, Style::default().bg(THEME.code_bg));
     }
-    if row.layout.decorative() {
+    if layout.decorative() {
         return;
     }
     let mut byte = 0;
     let mut column = prefix_width;
-    let (source_prefix, source_prefix_width) = row.layout.source_prefix();
-    let body_end = row.layout.code().map_or(area.width as usize, |code| {
+    let (source_prefix, source_prefix_width) = layout.source_prefix();
+    let body_end = layout.code().map_or(area.width as usize, |code| {
         code.body_end().min(area.width as usize)
     });
-    for grapheme in styled_cells(&row.line) {
+    let row = buffer.index_of(area.x, area.y);
+    each_cell(line, |symbol, size, style| {
         if byte == source_prefix {
-            column = row
-                .layout
+            column = layout
                 .code()
                 .map_or(prefix_width + source_prefix_width, |code| code.body_start());
         }
-        let size = grapheme.width;
         let in_prefix = byte < source_prefix;
         let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
         if !in_prefix && column + size > body_end {
-            break;
+            return ControlFlow::Break(());
         }
         if size > 0 && !prefix_clipped && column + size <= area.width as usize {
-            buffer[(area.x + column as u16, area.y)]
-                .set_symbol(grapheme.symbol)
-                .set_style(grapheme.style);
+            buffer.content[row + column]
+                .set_symbol(symbol)
+                .set_style(style);
         }
-        byte += grapheme.symbol.len();
+        byte += symbol.len();
         column += size;
-    }
+        ControlFlow::Continue(())
+    });
 }
 
-struct StyledCell<'a> {
-    symbol: &'a str,
-    width: usize,
-    style: Style,
-}
-
-/// `Line::styled_graphemes` with widths, over the cell primitive's ASCII fast path.
-fn styled_cells<'a>(line: &'a Line<'_>) -> impl Iterator<Item = StyledCell<'a>> {
-    line.spans.iter().flat_map(move |span| {
+/// Each printable grapheme of `line` with its cell width and style, until `paint`
+/// breaks.
+fn each_cell<'a>(
+    line: &'a Line<'_>,
+    mut paint: impl FnMut(&'a str, usize, Style) -> ControlFlow<()>,
+) {
+    for span in &line.spans {
         let style = line.style.patch(span.style);
-        cells(&span.content)
-            .filter(|(_, symbol, _)| !symbol.contains(char::is_control))
-            .map(move |(_, symbol, width)| StyledCell {
-                symbol,
-                width,
-                style,
-            })
-    })
+        for (_, symbol, width) in cells(&span.content) {
+            let printable =
+                matches!(symbol.as_bytes(), [b' '..=b'~']) || !symbol.contains(char::is_control);
+            if printable && paint(symbol, width, style).is_break() {
+                return;
+            }
+        }
+    }
 }
 
 /// Paint borrowed spans with an unwrapped Paragraph's clipping and styling:
@@ -171,31 +183,41 @@ pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, styl
     // Paragraph applies line style to glyphs, not continuation/trailing cells.
     // Markdown block backgrounds are painted separately from explicit geometry.
     buffer.set_style(area, style);
-    let graphemes = || {
-        let mut used = 0;
-        styled_cells(line)
-            .filter(move |g| g.width <= area.width as usize)
-            .take_while(move |g| {
-                used += g.width;
-                used <= area.width as usize
-            })
+    let fits = area.width as usize;
+    let width = || {
+        let mut total = 0;
+        shown(line, fits, |_, width, _| total += width);
+        total as u16
     };
-    let width = graphemes().map(|g| g.width as u16).sum::<u16>();
-    let mut x = area.x
-        + match line.alignment.unwrap_or(Alignment::Left) {
-            Alignment::Left => 0,
-            Alignment::Center => area.width / 2 - width / 2,
-            Alignment::Right => area.width - width,
-        };
-    for grapheme in graphemes() {
-        let width = grapheme.width as u16;
+    let offset = match line.alignment.unwrap_or(Alignment::Left) {
+        Alignment::Left => 0,
+        Alignment::Center => area.width / 2 - width() / 2,
+        Alignment::Right => area.width - width(),
+    };
+    let mut cell = buffer.index_of(area.x, area.y) + offset as usize;
+    shown(line, fits, |symbol, width, style| {
         if width != 0 {
-            buffer[(x, area.y)]
-                .set_symbol(grapheme.symbol)
-                .set_style(grapheme.style);
-            x += width;
+            buffer.content[cell].set_symbol(symbol).set_style(style);
+            cell += width;
         }
-    }
+    });
+}
+
+/// The graphemes of `line` an area `fits` cells wide shows: wider ones are
+/// skipped, and the first that overflows ends the line.
+fn shown<'a>(line: &'a Line<'_>, fits: usize, mut each: impl FnMut(&'a str, usize, Style)) {
+    let mut used = 0;
+    each_cell(line, |symbol, width, style| {
+        if width > fits {
+            return ControlFlow::Continue(());
+        }
+        used += width;
+        if used > fits {
+            return ControlFlow::Break(());
+        }
+        each(symbol, width, style);
+        ControlFlow::Continue(())
+    });
 }
 
 impl Row {
@@ -254,7 +276,13 @@ mod tests {
             let mut buffer = Buffer::empty(Rect::new(0, 0, width + 2, 1));
             buffer.set_style(buffer.area, Style::default().bg(THEME.agent));
             let style = Style::default().fg(THEME.fg).bg(THEME.agent);
-            render_row_line(row, Rect::new(1, 0, width, 1), &mut buffer, style);
+            render_row_line(
+                &row.line,
+                &row.layout,
+                Rect::new(1, 0, width, 1),
+                &mut buffer,
+                style,
+            );
             let left = 1 + row.layout.code().map_or(0, |code| code.indent());
             for x in 0..width + 2 {
                 let code = row.layout.code().is_some_and(|code| {
@@ -427,7 +455,10 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(1, 4);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             let frame = terminal
-                .draw(|frame| scroll_thumb(frame, r(0, 0, 1, 4), top, total, THEME.base))
+                .draw(|frame| {
+                    let shown = top as f64..(top + 4) as f64;
+                    scroll_thumb(frame, r(0, 0, 1, 4), shown, total as f64, THEME.base);
+                })
                 .unwrap();
             let cells = frame.buffer.content.iter();
             cells.map(|cell| cell.symbol()).collect::<String>()

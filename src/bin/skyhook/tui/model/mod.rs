@@ -25,7 +25,8 @@ pub use transcript::shown;
 #[cfg(test)]
 pub use window::KEPT;
 pub use window::{
-    CHILD_PAGE, ChildPage, Direction, Focus, LIST_PAGE, Loaded, Near, PAGE, Read, Want, Window,
+    CHILD_PAGE, ChildPage, Direction, Edge, Focus, LIST_PAGE, Loaded, Near, PAGE, Read, Want,
+    Window,
 };
 
 use super::tool_view::{Document, Run};
@@ -119,13 +120,14 @@ pub struct UnsavedStatus {
 
 /// A reading position that holds across layouts: on an entry by key, rows into it,
 /// and on the tab's own entry it belongs to (a transcript entry, a request or a root
-/// job), rows into what that shows, so it is found again when the entry is not. One
-/// with no key is a place not loaded, which is read where it is.
+/// job), rows into what that shows, so it is found again when the entry is not; one
+/// that belongs to none lies before or after them all. One with no key is a place not
+/// loaded, which is read where it is.
 #[derive(Clone, Debug)]
 pub struct Anchor {
     pub key: Option<EntryKey>,
     pub offset: usize,
-    pub place: Option<(Focus, usize)>,
+    pub place: Edge<(Focus, usize)>,
 }
 
 impl Anchor {
@@ -134,12 +136,21 @@ impl Anchor {
         Self {
             key: None,
             offset: 0,
-            place: Some((Focus::Ordinal(ordinal), 0)),
+            place: Edge::At((Focus::Ordinal(ordinal), 0)),
         }
     }
 
-    /// Where a window loads to show the anchor; none for the newest entries.
-    pub fn focus(&self) -> Option<Focus> {
+    /// The top of the tab, before its first entry.
+    pub fn start() -> Self {
+        Self {
+            key: None,
+            offset: 0,
+            place: Edge::Start,
+        }
+    }
+
+    /// Where a window loads to show the anchor.
+    pub fn focus(&self) -> Edge {
         self.place.map(|(focus, _)| focus)
     }
 }
@@ -447,11 +458,30 @@ impl Entry {
 
     pub(crate) fn titled(key: EntryKey, title: Title, body: String, surface: Surface) -> Self {
         let body = Clean::from(body);
-        let mut plain = title.line();
-        if !body.is_empty() {
-            plain.push('\n');
-            plain.push_str(&body);
-        }
+        let plain = titled_text(&title, &body);
+        Self::titled_plain(key, title, body, plain, surface)
+    }
+
+    /// A titled entry laying out `shown`, which abridges `whole`: its text, which copy
+    /// and export read, keeps the whole.
+    pub(crate) fn abridged(
+        key: EntryKey,
+        title: Title,
+        shown: String,
+        whole: String,
+        surface: Surface,
+    ) -> Self {
+        let plain = titled_text(&title, &Clean::from(whole));
+        Self::titled_plain(key, title, Clean::from(shown), plain, surface)
+    }
+
+    fn titled_plain(
+        key: EntryKey,
+        title: Title,
+        body: Clean,
+        plain: String,
+        surface: Surface,
+    ) -> Self {
         Self {
             body: EntryBody::Text {
                 title: Some(title),
@@ -460,6 +490,18 @@ impl Entry {
             },
             ..Self::new(key, String::new(), surface)
         }
+    }
+
+    /// A collapsible entry under a plain label, its body built only while open.
+    pub(crate) fn disclosed(
+        key: EntryKey,
+        label: impl Into<Clean>,
+        open: bool,
+        surface: Surface,
+        body: impl FnOnce() -> String,
+    ) -> Self {
+        let body = if open { body() } else { String::new() };
+        Self::titled(key, Title::disclosed(label, open), body, surface)
     }
 
     pub(crate) fn card(key: EntryKey, header: Vec<Run>, body: Option<Document>) -> Self {
@@ -480,6 +522,16 @@ impl Entry {
             ..Self::new(key, String::new(), Surface::Tool)
         }
     }
+}
+
+/// A titled entry's whole text: its title's line, then any body.
+fn titled_text(title: &Title, body: &str) -> String {
+    let mut plain = title.line();
+    if !body.is_empty() {
+        plain.push('\n');
+        plain.push_str(body);
+    }
+    plain
 }
 #[derive(Clone, Copy)]
 pub struct EntryView<'a> {

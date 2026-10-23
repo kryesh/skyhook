@@ -2,10 +2,18 @@
 //! dimension may still be selected in the entry, and any codec is admitted.
 
 use super::{Dialect, DialectConfig, DialectError, Profile, Scheme};
-use crate::provider::{
-    codec::{Codec, CodecName, SchemaConstraint, StateRole, chat_completions, messages, responses},
-    http::Transport,
+use crate::{
+    media::ImageLimits,
+    provider::{
+        codec::{
+            Codec, CodecName, SchemaConstraint, StateRole, chat_completions, messages, responses,
+        },
+        http::Transport,
+    },
 };
+
+/// What servers in general accept of an image: 4096 px and 3.5 MiB.
+pub(super) const IMAGES: ImageLimits = ImageLimits::new(4096, 7 * 512 * 1024);
 
 /// Provider-only options; request settings are declared separately.
 pub type Options = crate::provider::settings::Empty;
@@ -25,7 +33,7 @@ impl DialectConfig for Config {
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         let mut profile = Profile {
             key: Scheme::standard(codec),
-            ..Profile::new(base(codec), Transport::plain(), Dialect::Compatible)
+            ..Profile::new(base(codec), Transport::plain(), Dialect::Compatible, IMAGES)
         };
         profile.state_role(self.state_role, StateRole::User);
         Ok(profile)

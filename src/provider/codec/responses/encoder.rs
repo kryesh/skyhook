@@ -3,7 +3,7 @@ use super::*;
 use crate::provider::{
     codec::{
         Cache, CacheControl, CodecName,
-        common::{check_tool, system_text},
+        common::{PreparedImages, check_tool, system_text},
         placement::breakpoint,
         set_each,
     },
@@ -29,9 +29,10 @@ pub(crate) const BODY_FIELDS: &[&str] = &[
 
 pub(crate) fn encode(
     request: &ModelRequest,
+    images: PreparedImages<'_>,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
-    let input = super::input::encode(request, dialect)?;
+    let input = super::input::encode(request, images, dialect)?;
     let mut settings = serde_json::Map::from_iter([
         ("model".into(), json!(request.model)),
         ("stream".into(), json!(true)),
@@ -107,7 +108,7 @@ mod tests {
                 cyber_access_program: cyber,
                 ..Dialect::stateless()
             };
-            let body = encode(&req, &dialect).unwrap();
+            let body = encode(&req, Default::default(), &dialect).unwrap();
             assert_eq!(
                 body.get("access_programs"),
                 cyber.map(|cyber| json!({"cyber": cyber})).as_ref()
@@ -125,17 +126,17 @@ mod tests {
         for effort in [None, Some("high".into())] {
             let expected = effort.as_ref().map(|e| json!(e));
             req.reasoning = effort;
-            let body = encode(&req, &summarized).unwrap();
+            let body = encode(&req, Default::default(), &summarized).unwrap();
             assert_eq!(body["reasoning"]["summary"], "auto");
             assert_eq!(body["reasoning"].get("effort"), expected.as_ref());
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
         req.reasoning = Some("low".into());
         let silent = Dialect::stateless();
-        let body = encode(&req, &silent).unwrap();
+        let body = encode(&req, Default::default(), &silent).unwrap();
         assert_eq!(body["reasoning"], json!({"effort":"low"}));
         req.reasoning = Some("adaptive".into());
-        assert!(encode(&req, &silent).is_err());
+        assert!(encode(&req, Default::default(), &silent).is_err());
     }
 
     #[test]
@@ -144,7 +145,7 @@ mod tests {
         req.context.clear();
         req.max_output_tokens = None;
         let encoded = crate::provider::codec::Codec::Responses(Dialect::stateless())
-            .encode(&req, &"session".parse().unwrap())
+            .encode(&req, Default::default(), &"session".parse().unwrap())
             .unwrap();
         assert!(encoded.headers.is_empty());
         assert_eq!(
@@ -171,7 +172,7 @@ mod tests {
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
         req.reasoning = Some("high".into());
-        let body = encode(&req, &Dialect::stateless()).unwrap();
+        let body = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");
         let format = json!({"type":"json_schema", "name":"answer", "schema":schema});
@@ -185,7 +186,10 @@ mod tests {
         let schema = json!({"type":"object", "properties":{"n":{"type":"integer", "minimum":1}}});
         req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
         let format = json!({"type":"json_schema", "name":"answer", "strict":true, "schema":schema});
-        assert_eq!(encode(&req, &strict).unwrap()["text"]["format"], format);
+        assert_eq!(
+            encode(&req, Default::default(), &strict).unwrap()["text"]["format"],
+            format
+        );
     }
 
     #[test]
@@ -197,7 +201,7 @@ mod tests {
             cache: true,
         });
         assert!(
-            !encode(&req, &Dialect::stateless())
+            !encode(&req, Default::default(), &Dialect::stateless())
                 .unwrap()
                 .contains_key("prompt_cache_options")
         );
@@ -215,7 +219,7 @@ mod tests {
         };
         for lifetime in [HistoryLifetime::Extends, HistoryLifetime::Detached] {
             req.history_lifetime = lifetime;
-            let body = encode(&req, &explicit).unwrap();
+            let body = encode(&req, Default::default(), &explicit).unwrap();
             assert_eq!(body["prompt_cache_options"], json!({"mode":"explicit"}));
             assert_eq!(body["instructions"], "instructions");
             assert_eq!(body["input"], json!([]));
@@ -223,7 +227,9 @@ mod tests {
             let control = (lifetime == HistoryLifetime::Extends)
                 .then(|| json!({"type":"ephemeral", "ttl":"1h"}));
             assert_eq!(
-                encode(&req, &automatic).unwrap().get("cache_control"),
+                encode(&req, Default::default(), &automatic)
+                    .unwrap()
+                    .get("cache_control"),
                 control.as_ref()
             );
         }

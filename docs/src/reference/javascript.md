@@ -8,13 +8,14 @@ The runtime exposes:
 - `ArrayBuffer`, `DataView`, and typed arrays, including `Uint8Array.fromBase64`,
   `.fromHex`, `.toBase64()`, and `.toHex()`;
 - `performance.now()` for measuring elapsed milliseconds;
-- `await sleep(ms)` for asynchronous waits, resolving to `undefined`. The delay must be a finite,
-  nonnegative number of milliseconds within the host timer range; fractional values are accepted.
+- `await sleep(ms)` for asynchronous waits, resolving to `undefined`. The delay must be a number
+  of milliseconds from 0 to 2147483647, as for JavaScript timers; fractional values are accepted,
+  and any other value throws a `TypeError` at the call.
   Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;
 - `new WorkPool(concurrency).map(items, worker)` and `.run([fn1, fn2, ...])` as async iterables
   yielding successful `{index, value}` results in completion order. `run` requires exactly one
   array of functions, each called with no arguments—not variadic arguments. Invalid `run`
-  arguments throw before any task starts. Failures thrown by valid tasks are logged and skipped;
+  arguments, and a `map` worker that is not a function, throw before any task starts. Failures thrown by valid tasks are logged and skipped;
   remaining items continue. Early iterator closure stops scheduling and drains running work;
 - `await receive()` waits for the next JSON value sent to the script's own job ID with
   `tool.job(scriptJobId).send({value})`; the script must be launched with `bg: true`.
@@ -56,8 +57,10 @@ meta?: JobMetadata
 presentation?: Presentation
 ```
 
-Tool results omit absent fields and empty lists at every level. JavaScript receives the same
-JSON, so an absent field is `undefined`, as `x?: T` means in TypeScript.
+Tool results omit absent fields and empty lists at every level. Scripts read a field the
+response's schema declares but it lacks as `null`: `r.id`, `r.state` and `r.meta` are `null` on an
+ordinary completed call, and an absent `stdout` is `null`. The model's views stay sparse. Fields
+inside a previewed or paged `jobs({job})` result are not filled, since a preview may omit them.
 
 A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits `id` and `state`. `result` is the native tool payload. It is present exactly when the job
@@ -80,7 +83,8 @@ JavaScript receives complete data; model views may shorten fields as described i
 [saved job output](job-output.md#automatic-previews). A returned tool response keeps its complete
 fields whole in the script's own preview; a value taken out of it, such as `response.result`, is
 shortened like any other returned value.
-Tool descriptions' `Result` refers to the envelope's `.result`, not a separate wrapper. A successful
+Tool descriptions give a call's response as `JobView<T>`: the envelope, with the native result
+`T` at `.result`. A successful
 `jobs({job})` read of a failed target is still a successful tool invocation returning that failed
 `JobView`; `response.unwrap()` checks the observed job state and can therefore throw for that view.
 
@@ -104,14 +108,16 @@ failed views rather than JavaScript throws; programmer, serialization, `receive`
 still throw.
 
 Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
-typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`. The runtime does not provide
-Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`.
+typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`; they fail with their path
+otherwise. The runtime does not provide
+Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. Scripts
+cannot import modules, including the runtime's own.
 
 ## Script results and failures
 
 Every script result payload is `{value: <JavaScript return>, console?: <captured text>, failure?: <details>}`.
 Scripts without a return have `value: null`, silent scripts have no `console`, and `failure` is
-absent on success. In a script JobView, the payload is at `/result` and its return is at
+absent unless a failure has details. In a script JobView, the payload is at `/result` and its return is at
 `/result/value`; logs are at `/result/console`.
 
 `console.log(...values)` captures space-separated text, formatting objects as JSON. A running
@@ -124,18 +130,38 @@ Automatic previews can shorten displayed output without discarding captured outp
 [paging, search, or queries](job-output.md#paging-searching-and-querying) to inspect more. The **16 MiB limit applies to JavaScript
 source**, not console capture.
 
-On a script execution failure, the saved script payload is `{value: null, console?: <captured text>, failure?: <details>}`;
+On a script execution failure, the saved script payload is `{value, console?: <captured text>, failure?: <details>}`,
+where `value` is `null` unless only the returned value's conversion failed;
 the enclosing JobView is `failed` and carries its `error`: the thrown error's message and stack,
-or the JSON of any other thrown value. Console text belongs to the script result, not job
-metadata.
+or the JSON of any other thrown value. The message leads with the error's name unless it is
+plain `Error`. Stack frames are `skyhook-script:line:column` positions in the submitted body, or
+`end of source` for a syntax error where input ended early; frames outside the body are left
+out. Console text belongs to the script result, not job metadata.
 
 `failure` holds a thrown error's other properties: its `cause` and enumerable properties, such as
 the `job` and `code` of an unwrapped failed response, whose full view `tool.jobs({job})` reads.
 It is absent when there are none, so use the enclosing JobView's `state` and `error` to determine
 whether execution failed. Automatic previews can shorten it.
 
-A top-level `undefined` becomes JSON `null`; nested `undefined` is not coerced or removed and
-causes serialization failure.
+Returned values convert to JSON:
+
+- A top-level `undefined` becomes `null`.
+- Promises, builders and other thenables anywhere in the value are awaited.
+- An `Error` becomes an object of its `name`, `message`, `cause` and other properties.
+- An unpaired surrogate in a string becomes U+FFFD.
+- Anything else that is not JSON is a problem at its path, such as `$.items[2]`: an `undefined`
+  member or array element, non-finite numbers, `BigInt`s, functions, symbols, cycles, objects
+  other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
+  a member whose getter throws or whose promise rejects, reported with its error's message.
+
+Conversion runs after the body returns, so the body's own `try`/`catch` cannot catch its problems.
+A value with problems still fails the script, with an error listing them by path, but its saved
+`value` keeps everything else, with `null` in place of each problem; captured console text is
+kept as on any failure.
+
+Tool arguments convert the same way when the builder is made, so a failure throws at the call:
+`undefined` properties are omitted, while promises, builders, `Error`s and unpaired surrogates
+fail.
 
 ## Builder execution and policy
 
@@ -145,7 +171,8 @@ normal defaults. Use `.set(key, value)` to select an argument by name, for examp
 nonexistent fluent setter produces the usual JavaScript method-call error.
 
 Awaiting a builder executes it immediately. Returning builders recursively executes
-independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
+independent branches concurrently. Only returned values expand: inside the body, `await {a: builder}`
+awaits the object, not its members, so await each builder or use `Promise.all`. Calls use the same capabilities, approvals, path access checks,
 and saved-output behavior as direct tool calls. Scripts cannot invoke the `script` tool recursively.
 
 Failed tools retain any partial output (including captured process output on timeout) in the failed

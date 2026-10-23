@@ -696,7 +696,7 @@ mod tests {
             context: 0,
             start,
             offset,
-            limit: DEFAULT_LIMIT,
+            limit: DEFAULT_LIMIT.get(),
         }
     }
 
@@ -897,10 +897,10 @@ mod tests {
                 )
                 .unwrap()
             };
-            let plain = read(3, 0, DEFAULT_LIMIT, false);
+            let plain = read(3, 0, DEFAULT_LIMIT.get(), false);
             assert_eq!(plain.lines(), ["three", "four"]);
             assert_eq!(plain.total_lines, Some(4));
-            let found = read(3, 2, DEFAULT_LIMIT, true);
+            let found = read(3, 2, DEFAULT_LIMIT.get(), true);
             let expected = vec![numbered(3, "three"), numbered(4, "four")];
             assert_eq!(found.lines, PageLines::Numbered(expected));
             let first = read(3, 2, 1, true);

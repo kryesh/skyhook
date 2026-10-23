@@ -28,6 +28,9 @@ pub enum BatchError {
 pub enum Failure {
     #[error(transparent)]
     Operation(#[from] OperationError),
+    /// The resumed root's model, which the configuration no longer has.
+    #[error("unknown model `{0}`; resume with --model to run on another")]
+    ModelGone(skyhook::provider::profile::ModelRef),
     #[error("Interrupted by {0}")]
     Signal(&'static str),
     #[error("{0}; shutdown failed: {1}")]
@@ -69,6 +72,10 @@ pub async fn run(request: BatchRequest, input: InitialInput) -> Result<(), Batch
         Err(OperationError::from(error).into())
     } else {
         let operation = async {
+            // A resumed session switches to a named model before anything else runs.
+            if let (Some(_), Some(model)) = (request.resume, &request.model) {
+                session.activate_on(model).await?;
+            }
             for warning in session
                 .warnings()
                 .iter()
@@ -99,7 +106,11 @@ pub async fn run(request: BatchRequest, input: InitialInput) -> Result<(), Batch
             run_input(&session, &launch.workspace, input, mode).await
         };
         tokio::select! {
-            result = operation => result.map_err(Failure::from),
+            result = operation => result.map_err(|error| match error {
+                OperationError::Harness(HarnessError::UnknownModel(model))
+                    if request.resume.is_some() => Failure::ModelGone(model),
+                error => error.into(),
+            }),
             _ = terminate.recv() => Err(Failure::Signal("SIGTERM")),
             _ = hangup.recv() => Err(Failure::Signal("SIGHUP")),
             _ = interrupt.recv() => Err(Failure::Signal("SIGINT")),

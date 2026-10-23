@@ -1,7 +1,7 @@
 //! Entry geometry and layout.
 
 use super::super::tool_view::{
-    Document, DocumentLine, HighlightCache, Role, Run, Wrap, header_line,
+    Document, DocumentBlock, DocumentLine, HighlightCache, Role, Run, Wrap, header_line,
 };
 use super::*;
 
@@ -36,6 +36,13 @@ pub(super) struct EntryGeometry {
     /// Cells before the text of every row, left to a spinner.
     gutter: u16,
 }
+/// The row of an entry a logical line starts: its header, or a later one with
+/// its identity among the entry's text.
+enum Place {
+    Header,
+    Body(markdown::LineId),
+}
+
 impl EntryGeometry {
     pub(super) fn new(entry: &model::Entry, width: u16) -> Self {
         let framing = match entry.surface {
@@ -126,57 +133,105 @@ impl EntryGeometry {
             ..self.edge()
         }
     }
-    /// Wrap logical lines, the first as the header row; later lines and
-    /// continuations share the hanging indent. A line's lead is decoration
-    /// before its first row, and its continuations align under its text.
-    /// Returns how much of the header's lead was kept.
-    fn push_wrapped(&self, rows: &mut Vec<Row>, lines: Vec<DocumentLine>) -> usize {
-        let mut kept = 0;
-        let indent = usize::from(self.framing == Framing::Hanging);
-        let hanging = (self.body_width as usize).saturating_sub(indent).max(1);
+    /// The cells a header row's or a later row's text spans.
+    fn text_width(&self, header: bool) -> u16 {
+        if header {
+            self.header_width
+        } else {
+            let hanging = u16::from(self.framing == Framing::Hanging);
+            self.body_width.saturating_sub(hanging).max(1)
+        }
+    }
+    /// Wrap a header line and the blocks after it. Later lines and
+    /// continuations share the hanging indent. Returns how much of the
+    /// header's lead was kept, and the fences its Markdown highlights.
+    fn push_blocks<'a>(
+        &self,
+        rows: &mut Vec<Row>,
+        header: DocumentLine,
+        blocks: impl IntoIterator<Item = DocumentBlock<'a>>,
+        highlights: &HighlightCache,
+    ) -> (usize, Document) {
+        let kept = self.push_line(rows, header, Place::Header);
         let mut ids = markdown::TextIds::default();
-        for (index, DocumentLine { lead, text, wrap }) in lines.into_iter().enumerate() {
-            let id = match index {
-                0 => markdown::LineId::default(),
-                _ => ids.next(&text),
-            };
-            let width = if index == 0 {
-                self.header_width as usize
-            } else {
-                hanging
-            };
-            // As with code padding, source wins over decoration: the lead,
-            // blank on continuations, leaves room for the widest grapheme on
-            // every row of the line, including the narrower hanging rows.
-            let widest = (text.spans.iter())
-                .flat_map(|span| cells(&span.content))
-                .map(|(_, _, width)| width)
-                .max()
-                .unwrap_or(0);
-            let room = width.min(hanging).saturating_sub(widest.max(1));
-            let mut lead = truncated(lead, room);
-            lead.spans.retain(|span| !span.content.is_empty());
-            let lead_width = lead.width();
-            if index == 0 {
-                kept = lead_width;
-            }
-            let first = width - lead_width;
-            let rest = hanging.saturating_sub(lead_width).max(1);
-            let wrapped = match wrap {
-                Wrap::Hard => wrap_line(text, first, rest),
-                Wrap::Words => wrap_words(text, first),
-            };
-            for (part, line) in markdown::LayoutLine::wrapped(wrapped, id).enumerate() {
-                let mut row = self.row(line.line, index == 0 && part == 0, line.layout);
-                row.layout.prefix = match part {
-                    0 => lead.clone(),
-                    _ if lead_width == 0 => Line::default(),
-                    _ => Line::from(" ".repeat(lead_width)),
-                };
-                rows.push(row);
+        let mut fences = Document::default();
+        for block in blocks {
+            match block {
+                DocumentBlock::Line(line) => {
+                    let id = ids.next(&line.text);
+                    self.push_line(rows, line, Place::Body(id));
+                }
+                DocumentBlock::Markdown { source, indent } => {
+                    let laid = self.push_markdown(rows, &mut ids, source, indent, highlights);
+                    fences.sections.extend(laid.sections);
+                }
             }
         }
-        kept
+        (kept, fences)
+    }
+    /// Wrap a logical line at its `place`. Its lead is decoration before its
+    /// first row, and its continuations align under its text. Returns how much
+    /// of the lead was kept.
+    fn push_line(&self, rows: &mut Vec<Row>, line: DocumentLine, place: Place) -> usize {
+        let DocumentLine { lead, text, wrap } = line;
+        let (header, id) = match place {
+            Place::Header => (true, markdown::LineId::default()),
+            Place::Body(id) => (false, id),
+        };
+        let width = self.text_width(header) as usize;
+        let hanging = self.text_width(false) as usize;
+        // As with code padding, source wins over decoration: the lead,
+        // blank on continuations, leaves room for the widest grapheme on
+        // every row of the line, including the narrower hanging rows.
+        let widest = (text.spans.iter())
+            .flat_map(|span| cells(&span.content))
+            .map(|(_, _, width)| width)
+            .max()
+            .unwrap_or(0);
+        let room = width.min(hanging).saturating_sub(widest.max(1));
+        let mut lead = truncated(lead, room);
+        lead.spans.retain(|span| !span.content.is_empty());
+        let lead_width = lead.width();
+        let first = width - lead_width;
+        let rest = hanging.saturating_sub(lead_width).max(1);
+        let wrapped = match wrap {
+            Wrap::Hard => wrap_line(text, first, rest),
+            Wrap::Words => wrap_words(text, first),
+        };
+        for (part, line) in markdown::LayoutLine::wrapped(wrapped, id).enumerate() {
+            let mut row = self.row(line.line, header && part == 0, line.layout);
+            row.layout.prefix = match part {
+                0 => lead.clone(),
+                _ if lead_width == 0 => Line::default(),
+                _ => Line::from(" ".repeat(lead_width)),
+            };
+            rows.push(row);
+        }
+        lead_width
+    }
+    /// Lay out Markdown `indent` cells into the text, returning the fences it
+    /// highlights. Markdown that starts at the header row wraps whole at the
+    /// header's width.
+    fn push_markdown(
+        &self,
+        rows: &mut Vec<Row>,
+        ids: &mut markdown::TextIds,
+        source: &str,
+        indent: usize,
+        highlights: &HighlightCache,
+    ) -> Document {
+        let indent = u16::try_from(indent).unwrap_or(u16::MAX);
+        let width = self.text_width(rows.is_empty()).saturating_sub(indent);
+        let segment = ids.markdown(source);
+        let layout = markdown::layout_highlighted(source, true, width.into(), Some(highlights));
+        for line in layout.lines {
+            let layout = line.layout.in_segment(segment);
+            let mut row = self.row(line.line, rows.is_empty(), layout);
+            row.inset += indent;
+            row.text_width = row.text_width.saturating_sub(indent);
+            rows.push(row);
+        }
+        layout.fences
     }
 }
 
@@ -219,15 +274,15 @@ pub(super) fn update_entry_rows(
     if let Some(header) = entry.header() {
         let glyph = entry.disclosure().map(model::Disclosure::glyph);
         let glyph = glyph.map(|glyph| Run::new(glyph, Role::Indicator));
-        let mut lines = vec![DocumentLine {
+        let line = DocumentLine {
             lead: header_line(&Vec::from_iter(glyph)),
             text: header_line(header),
             wrap: Wrap::Hard,
-        }];
-        if let Some(body) = entry.document() {
-            lines.extend(body.layout_lines(Some(highlights)));
-        }
-        kept = geometry.push_wrapped(rows, lines);
+        };
+        let body = entry
+            .document()
+            .map(|body| body.layout_lines(Some(highlights)));
+        (kept, fences) = geometry.push_blocks(rows, line, body.into_iter().flatten(), highlights);
     } else if matches!(
         entry.surface,
         Surface::User | Surface::Agent | Surface::Reasoning
@@ -252,29 +307,19 @@ pub(super) fn update_entry_rows(
                 text,
                 wrap: Wrap::Words,
             };
-            kept = geometry.push_wrapped(rows, vec![line]);
+            kept = geometry.push_line(rows, line, Place::Header);
         }
         let body = entry.body();
         // Expanded reasoning omits the empty body; message boxes retain it.
         if !entry.expandable() || !body.is_empty() || boxed {
-            // A body that starts at the header row wraps whole at the header's width.
-            let width = if rows.is_empty() {
-                geometry.header_width
-            } else {
-                geometry.body_width
-            };
-            let layout = markdown::layout_highlighted(body, true, width.into(), Some(highlights));
-            fences = layout.fences;
-            for line in layout.lines {
-                let layout = line.layout.in_segment(markdown::Segment::Markdown);
-                rows.push(geometry.row(line.line, rows.is_empty(), layout));
-            }
+            let mut ids = markdown::TextIds::default();
+            fences = geometry.push_markdown(rows, &mut ids, body, 0, highlights);
         }
     } else {
         let body = entry.body();
         let body = (title.is_none() || !body.is_empty()).then_some(body);
         let body = body.iter().flat_map(|body| body.split('\n'));
-        let lines = title
+        let mut lines = title
             .map(|title| DocumentLine {
                 lead: title_lead(title),
                 text: Line::from(title.heading()),
@@ -285,9 +330,11 @@ pub(super) fn update_entry_rows(
                 lead: Line::default(),
                 text: Line::from(line.to_owned()),
                 wrap: Wrap::Hard,
-            }))
-            .collect();
-        kept = geometry.push_wrapped(rows, lines);
+            }));
+        if let Some(header) = lines.next() {
+            let lines = lines.map(DocumentBlock::Line);
+            (kept, _) = geometry.push_blocks(rows, header, lines, highlights);
+        }
     }
     // The spinner paints only where layout kept room: over a card's state
     // glyph after its kept disclosure glyph, in the gap of a title's lead
@@ -455,7 +502,7 @@ mod tests {
                     let area = Rect::new(0, 0, width, 1);
                     let mut buffer = Buffer::empty(area);
                     let text = Rect::new(row.paragraph_x(), 0, row.text_width, 1);
-                    render_row_line(row, text, &mut buffer, Style::default());
+                    render_row_line(&row.line, &row.layout, text, &mut buffer, Style::default());
                     (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
                 })
                 .collect();
@@ -599,6 +646,40 @@ mod tests {
                 assert_eq!(free > COUNTER_WIDTH, live, "{surface:?}");
             }
         }
+    }
+
+    /// Markdown in a card is laid out inside its indent, its fences are
+    /// highlighted, and blocks with the same source remain distinct lines.
+    #[test]
+    fn card_markdown_is_indented_highlighted_and_copied_as_rendered() {
+        let question = serde_json::json!({"id": "pick", "prompt": "Pick **one**\n\n```rust\nlet x = 1;\n```",
+            "options": [{"label": "A", "description": "Same *text*"},
+                {"label": "B", "description": "Same *text*"}]});
+        let output = serde_json::json!({"state": "waiting_input",
+            "presentation": {"question": {"questions": [question]}}});
+        let output = crate::tui::tool_view::tests::view(output);
+        let mut body = Document::default();
+        body.output(
+            Hints::new("agent", &serde_json::Value::Null),
+            Some(&output),
+            &[],
+        );
+        let header = vec![Run::new("agent", Role::ToolName)];
+        let entry = model::Entry::card(model::EntryKey::UnsavedStatus(1), header, Some(body));
+        let mut rows = Vec::new();
+        let (highlights, columns) = (HighlightCache::default(), RequestColumns::default());
+        let fences = update_entry_rows(&mut rows, &entry, 40, &highlights, columns);
+        assert_eq!(fences.highlight_sources().count(), 1);
+        let x = |text: &str| {
+            let row = rows.iter().find(|row| row.text() == text).unwrap();
+            row.paragraph_x()
+        };
+        assert_eq!(x("Pick one"), x("Question") + 2);
+        assert_eq!(x("Same text"), x("Question") + 4);
+        assert_eq!(
+            copy_from(rows, "Output"),
+            "Output\nQuestion\nPick one\n\nlet x = 1;\n• A\nSame text\n• B\nSame text"
+        );
     }
 
     #[test]

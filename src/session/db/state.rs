@@ -16,7 +16,7 @@ use super::{
 use crate::{
     agent::TurnFailure,
     identity::AgentId,
-    provider::{profile::ModelRef, protocol::UsageTotals},
+    provider::protocol::UsageTotals,
     session::{
         EntryKind, ResidentLedger, TitleSource,
         agent_state::{AgentState, Decided, Last, Marked, Outcome, Rows, stopped},
@@ -61,8 +61,6 @@ pub struct SessionSummary {
     pub last_millis: i64,
     /// How many entries the journal holds.
     pub entries: u64,
-    /// The root agent's applied model.
-    pub model: Option<ModelRef>,
     /// The root agent's applied mode.
     pub mode: Option<crate::tool::policy::ModeName>,
     /// The root agent's stopped turn, which resuming continues, if any. A root
@@ -153,27 +151,21 @@ pub(in crate::session) fn counters(db: &Db) -> DbResult<Counters> {
 /// Always one row, whether or not the session has a title or any activity.
 pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
     let root = db.query_row(
-        format!(
-            "SELECT p.provider, p.name, (SELECT mode_name FROM agent_mode WHERE entry = s.granted), \
-               s.last, f.failure, f.provider, f.detail, \
-               (SELECT phase FROM request_state WHERE request = s.request) \
-             FROM agent_state s JOIN agent a ON a.id = s.agent AND a.parent IS NULL \
-             JOIN model_profile p ON p.id = {PROFILED} LEFT JOIN failure f ON f.entry = s.last_entry"
-        ),
+        "SELECT (SELECT mode_name FROM agent_mode WHERE entry = s.granted), \
+           s.last, f.failure, f.provider, f.detail, \
+           (SELECT phase FROM request_state WHERE request = s.request) \
+         FROM agent_state s JOIN agent a ON a.id = s.agent AND a.parent IS NULL \
+         LEFT JOIN failure f ON f.entry = s.last_entry",
         Vec::new(),
         |row| {
-            let model = model_ref(&row.get::<String>(0)?, &row.get::<String>(1)?)?;
-            let mode = row.get::<Option<String>>(2)?.map(parsed).transpose()?;
-            let last = last_at(row, 3)?;
-            let phase = optional_enum_column::<PhaseKind>(row, 7)?;
+            let mode = row.get::<Option<String>>(0)?.map(parsed).transpose()?;
+            let last = last_at(row, 1)?;
+            let phase = optional_enum_column::<PhaseKind>(row, 5)?;
             let incomplete = phase.is_some_and(|phase| phase != PhaseKind::Completed);
-            Ok((model, mode, stopped(last.as_ref(), incomplete)))
+            Ok((mode, stopped(last.as_ref(), incomplete)))
         },
     )?;
-    let (model, mode, stopped) = match root {
-        Some((model, mode, stopped)) => (Some(model), mode, stopped),
-        None => (None, None, None),
-    };
+    let (mode, stopped) = root.unwrap_or_default();
     db.query_row(
         format!(
             "SELECT t.text, t.source, coalesce(({LAST_ACTIVITY}), 0), \
@@ -186,7 +178,6 @@ pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
                 title: title_at(row, 0)?,
                 last_millis: row.get(2)?,
                 entries: row.get(3)?,
-                model: model.clone(),
                 mode: mode.clone(),
                 stopped: stopped.clone(),
             })

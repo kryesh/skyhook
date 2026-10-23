@@ -312,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_owner_stops_draining_for_a_lingering_descendant() {
         use std::os::unix::fs::PermissionsExt as _;
-        use tokio::io::{Interest, unix::AsyncFd};
+        use tokio::{io::Interest, net::unix::pipe};
         struct Descendant(libc::pid_t);
         impl Drop for Descendant {
             fn drop(&mut self) {
@@ -347,10 +347,10 @@ mod tests {
             .open(format!("/proc/{}/fd/2", descendant.0))
             .unwrap();
         // A pipe's writer reports an error once no reader is left.
-        let stderr = AsyncFd::with_interest(stderr, Interest::ERROR).unwrap();
+        let stderr = pipe::Sender::from_file(stderr).unwrap();
         drop(owner);
         let closed = bounded(stderr.ready(Interest::ERROR)).await.unwrap();
-        assert!(closed.ready().is_error());
+        assert!(closed.is_error());
         drop((input, output, descendant));
     }
 

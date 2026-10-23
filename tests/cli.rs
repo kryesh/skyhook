@@ -249,6 +249,7 @@ mod dotenv {
     use std::ffi::OsString;
 
     const KEY: &str = "SKYHOOK_DOTENV_TEST_KEY";
+    const OTHER: &str = "SKYHOOK_DOTENV_TEST_OTHER";
 
     fn fixture() -> Fixture {
         let mut f = Fixture::new();
@@ -267,8 +268,8 @@ mod dotenv {
         id.expect("stdout must contain only the session ID");
     }
 
-    /// What a local command sees for `expansion`, optionally with an inherited value.
-    fn observed(f: &Fixture, expansion: &str, inherited: Option<&OsString>) -> Vec<u8> {
+    /// What a local command sees for `expansion`, with `inherited` values.
+    fn observed(f: &Fixture, expansion: &str, inherited: &[(&str, &OsString)]) -> Vec<u8> {
         let command = format!("printf '%s' \"{expansion}\" > env.out");
         f.write("invocation/run.js", &format!(
             "const result = (await tool.exec({{command:['sh', '-c', {}]}})).unwrap(); if (result.exit_code !== 0) throw new Error('command failed'); return result;",
@@ -276,9 +277,7 @@ mod dotenv {
         ));
         let mut command = f.batch();
         command.args(["--approve-all", "-s", "run.js"]);
-        if let Some(value) = inherited {
-            command.env(KEY, value);
-        }
+        command.envs(inherited.iter().copied());
         assert_headless_success(&output(&mut command));
         fs::read(f.path("env.out")).unwrap()
     }
@@ -296,18 +295,23 @@ mod dotenv {
             // Would abort startup if any of these files were read.
             f.write(path, "BROKEN='unterminated-secret\n");
         }
-        assert_eq!(observed(&f, &format!("${{{KEY}-absent}}"), None), b"absent");
-        let source = format!("\u{feff}export {KEY}=\"invocation-value\" # comment\n");
+        assert_eq!(observed(&f, &format!("${{{KEY}-absent}}"), &[]), b"absent");
+        let source = format!(
+            "\u{feff}export {KEY}=\"invocation-value\" # comment\n{OTHER}=invocation-value\n"
+        );
         f.write("invocation/.env", &source);
-        assert_eq!(observed(&f, &format!("${KEY}"), None), b"invocation-value");
-        for inherited in [
-            OsString::from("inherited-value"),
-            OsString::from(""),
+        assert_eq!(observed(&f, &format!("${KEY}"), &[]), b"invocation-value");
+        // Inherited values win, however empty or not Unicode.
+        let (empty, raw) = (
+            OsString::new(),
             OsString::from_vec(b"non-unicode-\xff".to_vec()),
-        ] {
-            let seen = observed(&f, &format!("${KEY}"), Some(&inherited));
-            assert_eq!(seen, inherited.into_vec());
-        }
+        );
+        let seen = observed(
+            &f,
+            &format!("${KEY}|${OTHER}"),
+            &[(KEY, &empty), (OTHER, &raw)],
+        );
+        assert_eq!(seen, b"|non-unicode-\xff");
     }
 
     #[test]
@@ -839,13 +843,9 @@ mod headless {
 
     #[test]
     fn prompt_stream_is_saved_without_terminal_output() {
-        use base64::Engine;
         let f = Fixture::new();
-        let pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=";
-        let pixel = base64::engine::general_purpose::STANDARD
-            .decode(pixel)
-            .unwrap();
-        fs::write(f.path("pixel.png"), pixel).unwrap();
+        let pixel = image::RgbImage::new(1, 1);
+        pixel.save(f.path("pixel.png")).unwrap();
         let (endpoint, server) = mock_provider();
         f.config(&endpoint, "");
         let args = ["-p", "mock-user-prompt", "--image", "pixel.png"];
@@ -882,20 +882,63 @@ mod headless {
             serde_json::from_str(&f.read(".skyhook/state.json")).unwrap();
         assert_eq!(remembered["model"], "test/first");
         let id = std::str::from_utf8(&saved.stdout).unwrap().trim();
-        let resumed = f.script(
-            "return 'resume-model';",
-            &["--resume", id, "-m", "test/first"],
-        );
+        // A resumed session switches to `--model` before anything runs, and keeps it.
+        let switched = f.script("return 'switched';", &["--resume", id, "-m", "test/first"]);
+        assert!(switched.status.success());
+        let resumed = f.script("return 'resumed';", &["--resume", id]);
         assert!(resumed.status.success());
         let sessions = f.path(".skyhook/sessions");
         let stats = skyhook::session::SessionStore::stats(&sessions, session_id(&resumed));
         let stats = block_on(stats).unwrap();
         let root = stats.agents[0].model.as_ref().unwrap();
-        assert_eq!(root.to_string(), "test/second");
+        assert_eq!(root.to_string(), "test/first");
         f.write(".skyhook/state.json", "invalid JSON");
         let warning = f.script("return 'warning';", &[]);
         assert!(warning.status.success());
         assert!(f.journal(&warning).contains("Could not read UI state"));
+    }
+
+    /// A resumed session whose model the configuration dropped runs nothing until
+    /// a resume names another, which it then keeps.
+    #[test]
+    fn a_resumed_session_whose_model_is_gone_runs_once_a_resume_names_another() {
+        use skyhook::session::SessionEvent::JobCreated;
+        let f = Fixture::new();
+        let first = f.read("config/skyhook/config.yaml");
+        let second = "      second:\n        model: second-model\n        max_context: 128000\n        max_output: 4096\n";
+        f.write("config/skyhook/config.yaml", &(first.clone() + second));
+        let created = f.script("return 'created';", &["-m", "test/second"]);
+        assert!(created.status.success(), "{}", f.journal(&created));
+        let id = session_id(&created).to_string();
+        f.write("config/skyhook/config.yaml", &first);
+        let jobs = |output: &Output| {
+            let records = f.records(output);
+            records
+                .iter()
+                .filter(|record| matches!(record.event, JobCreated { .. }))
+                .count()
+        };
+        let before = jobs(&created);
+        let gone = f.script("return 'gone';", &["--resume", &id]);
+        assert!(!gone.status.success());
+        let stderr = String::from_utf8_lossy(&gone.stderr);
+        assert!(
+            stderr.contains("unknown model `test/second`; resume with --model"),
+            "{stderr}"
+        );
+        assert!(
+            f.journal(&gone)
+                .contains("Failed: unknown model `test/second`")
+        );
+        assert_eq!(jobs(&gone), before);
+        let switched = f.script("return 'switched';", &["--resume", &id, "-m", "test/first"]);
+        assert!(switched.status.success(), "{}", f.journal(&switched));
+        let resumed = f.script("return 'resumed';", &["--resume", &id]);
+        assert!(resumed.status.success(), "{}", f.journal(&resumed));
+        let sessions = f.path(".skyhook/sessions");
+        let stats = skyhook::session::SessionStore::stats(&sessions, session_id(&resumed));
+        let root = block_on(stats).unwrap().agents[0].model.clone().unwrap();
+        assert_eq!(root.to_string(), "test/first");
     }
 
     #[test]

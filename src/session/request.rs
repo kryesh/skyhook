@@ -420,7 +420,7 @@ mod tests {
         let child = agent.child(1);
         let child_start = crate::session::tests::agent_started(directory.path());
         store.append(child.clone(), child_start).await.unwrap();
-        let png = crate::tests::png(b"image payload");
+        let png = crate::tests::png(b"image payload").await;
         let image = store
             .store_image(Some("test.png".into()), &png)
             .await

@@ -38,10 +38,8 @@ impl SessionRuntime {
             let viewer = turn.diagnostic_viewer();
             self.deliver_events(agent, viewer, &[]).await?;
             agent_context.refresh(&self.store, agent).await?;
+            agent_context.admits_images()?;
             let profile = agent_context.model.profile.profile.clone();
-            if !profile.supports_images && agent_context.contains_images() {
-                return Err(HarnessError::ImagesUnsupported(profile.model.clone()).into());
-            }
             let tail = agent_context.tail(|| self.runtime_state(&turn));
             // An overflow is the latest word on the context's size.
             let trigger = if overflowed {
@@ -100,7 +98,7 @@ impl SessionRuntime {
                     event: event.clone(),
                 });
             };
-            let provider = agent_context.provider.as_mut();
+            let provider = agent_context.provider()?;
             let attempted = self.attempt(
                 &turn,
                 provider,

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    media::{BlobRef, Image, ImageRef, MAX_IMAGE_BYTES},
+    media::{BlobRef, Image, ImageRef},
     named_enum::named_enum,
     newtype::string_newtype,
     tool::StreamEnd,
@@ -403,12 +403,6 @@ impl OutputContext {
         file: Option<String>,
         image: &Image,
     ) -> io::Result<ImageRef> {
-        if image.bytes().len() as u64 > MAX_IMAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "image exceeds byte limit",
-            ));
-        }
         let reference = ImageRef {
             file: file.clone(),
             format: image.format(),
@@ -989,7 +983,7 @@ pub(crate) mod tests {
         }
 
         poll_once(context.text_capture(TextCaptureField::Content)).await;
-        let image = Image::new(b"\x89PNG\r\n\x1a\nsource".to_vec()).unwrap();
+        let image = crate::tests::png(b"source").await;
         poll_once(context.store_image(None, &image)).await;
         let settling = tokio::spawn(async move { context.settle().await });
         let mut opened = None;

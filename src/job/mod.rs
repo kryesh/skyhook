@@ -34,7 +34,7 @@ pub(crate) mod output;
 pub use output::{
     CaptureDescriptor, CaptureKind, Continuation, ElementPage, FieldPointer, LinePage, Match,
     MatchPage, MemberPage, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
-    OutputSelection, OutputTruncation, PresentedOutput, omit_null_fields,
+    OutputSelection, OutputTruncation, PageLimit, PresentedOutput, omit_null_fields,
 };
 mod cancellation;
 pub(crate) use cancellation::{CANCELLATION_GRACE, CancelScope};
@@ -61,7 +61,7 @@ pub(crate) use lifecycle::woken;
 pub use pages::JobScope;
 pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
-pub(crate) use views::{JOB_VIEW_SCHEMAS, ViewKind, Waiting, release_records};
+pub(crate) use views::{JOB_VIEW_SCHEMAS, JobListing, ViewKind, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod index;
 use index::Lookup;

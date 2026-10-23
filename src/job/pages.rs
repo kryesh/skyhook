@@ -45,10 +45,21 @@ impl JobManager {
         &self,
         list: impl FnOnce(&crate::session::Journal) -> Result<Vec<JobId>, SessionError> + Send + 'static,
     ) -> Result<Vec<JobEnvelope>, JobError> {
+        let listed = self.listed_with(move |journal| Ok((list(journal)?, ())));
+        Ok(listed.await?.0)
+    }
+
+    /// [`Self::listed`], with what else `list` read.
+    pub(super) async fn listed_with<T: Send + 'static>(
+        &self,
+        list: impl FnOnce(&crate::session::Journal) -> Result<(Vec<JobId>, T), SessionError>
+        + Send
+        + 'static,
+    ) -> Result<(Vec<JobEnvelope>, T), JobError> {
         let manager = self.clone();
         let page = move || {
             let journal = manager.store().journal();
-            let listed = list(&journal)?;
+            let (listed, read) = list(&journal)?;
             // Only held jobs move: one a commit not yet applied moves is held until then.
             let (mut jobs, settled) = manager.inner.store.read(|state| {
                 let held = |id: &JobId| state.jobs.get(*id).map(|entry| entry.metadata(*id));
@@ -59,7 +70,7 @@ impl JobManager {
             let settled = Settled::read(&journal, &settled)?;
             jobs.extend(settled.into_iter().map(|(id, entry)| entry.metadata(id)));
             jobs.sort_by_key(|job| job.id);
-            Ok::<_, SessionError>(jobs)
+            Ok::<_, SessionError>((jobs, read))
         };
         Ok(self.store().reads().hold(page).await?)
     }

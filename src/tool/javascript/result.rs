@@ -13,13 +13,13 @@ use crate::{job::output::CompletedCapture, tool::ToolOutput};
 /// captured-field placeholder into the wire result.
 pub(crate) fn script_output(
     value: Value,
-    failure: Option<Value>,
+    failure: Option<Map<String, Value>>,
     console: Option<CompletedCapture>,
 ) -> ToolOutput {
     let mut result = Map::new();
     result.insert("value".into(), value);
     if let Some(failure) = failure {
-        result.insert("failure".into(), failure);
+        result.insert("failure".into(), Value::Object(failure));
     }
     ToolOutput::new(Value::Object(result)).with_captures(console.into_iter().collect())
 }

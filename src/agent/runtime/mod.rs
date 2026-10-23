@@ -13,7 +13,7 @@ use crate::{
     identity::{AgentId, JobId, SessionId},
     job::{CancelScope, CancellationToken, JobManager},
     mcp::{McpServerConfig, manager::McpManager},
-    media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
+    media::{MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::profile::{ModelName, ModelProfile, ModelRef, ProviderName},
     provider::protocol::{
         CutReason, LiveResponse, Outcome, Step as LiveStep, SystemSegment, ToolCall, ToolResult,
@@ -78,6 +78,7 @@ struct HarnessInner {
     workspace: PathBuf,
     session_root: PathBuf,
     models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    /// What a new session's root runs on.
     default_model: ModelRef,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
@@ -145,7 +146,8 @@ pub struct ContinueOutcome {
     /// Retained child agents restarted by this call.
     pub children_resumed: usize,
     /// Whether a requested model or mode change was applied. Only the continued root
-    /// turn can adopt one; resumed children keep their own.
+    /// turn can adopt one; resumed children keep their own, unless theirs is gone
+    /// and they move to the root's.
     pub selection_applied: bool,
 }
 
@@ -252,17 +254,21 @@ enum AgentCommand {
         options: Selection,
         done: oneshot::Sender<Result<(), HarnessError>>,
     },
-    /// Try again, as `continue` asks, the batch a failed turn held, claimed
-    /// with the selection that commits it.
-    Retry {
-        batch: queue::Batch,
+    /// Continue the root's turn, made busy from `resting` as it claimed this,
+    /// under `selection`, with the batch its failed turn held, claimed and
+    /// admitted, if any, as `continue` asks: `done` hears its answer.
+    Continue {
+        selection: Selection,
+        batch: Option<queue::Admitted>,
+        resting: Box<Turn>,
         done: RequestCompletion,
     },
 }
 
 impl AgentCommand {
-    /// Settle whoever waits on this command with `error`.
-    fn refuse(self, error: impl Fn() -> HarnessError) {
+    /// Settle whoever waits on this command with `error`, returning the batch it
+    /// claimed from a failed turn, for that turn to hold again while it waits.
+    fn refuse(self, error: impl Fn() -> HarnessError) -> Option<queue::Admitted> {
         match self {
             Self::QueuedInputs(inputs) => {
                 inputs.into_iter().for_each(|input| input.reject(error()))
@@ -274,11 +280,12 @@ impl AgentCommand {
             Self::Select { done, .. } => {
                 let _ = done.send(Err(error()));
             }
-            Self::Retry { batch, done } => {
-                batch.hand_back();
+            Self::Continue { batch, done, .. } => {
                 done.settle(Err(error()));
+                return batch;
             }
         }
+        None
     }
 }
 
@@ -296,8 +303,8 @@ enum AgentLaunch {
         capabilities: CapabilitySet,
     },
     /// An agent that started before, under its journaled contract narrowed to the
-    /// live configuration.
-    Resume,
+    /// live configuration, on model `on` where named.
+    Resume { on: Option<ModelRef> },
 }
 
 /// The turn state an agent resumes in.

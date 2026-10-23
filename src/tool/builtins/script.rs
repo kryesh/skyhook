@@ -44,28 +44,30 @@ pub(crate) fn install_script_tool(
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ScriptArgs {
-    /// Async JavaScript body.
+    /// Async JavaScript function body.
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. Native script result is {value,console?,failure?}: value is the returned JSON (null without return), console is captured console.log text/JSON, and failure is absent on success. The model receives a JobView with this script result. Read saved console at /result/console and returned-value fields under /result/value. No Node.js APIs or global `fetch` (use `tool.fetch(...)` for HTTP requests), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript function body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. The model receives `JobView<{value,console?,failure?}>`: value is the returned JSON (null without return), console the captured console.log text/JSON, failure a thrown error's other properties (such as cause), when it has any; the envelope's state/error report failure. No Node.js APIs or global `fetch` (use `tool.fetch(...)`), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Returns must be JSON: nested promises/builders are awaited and Errors become objects. Conversion runs after the body returns, beyond its try/catch: undefined members, BigInts, dates, typed arrays, functions, cycles and throwing or rejecting members become null and fail the script, listed by path. Arguments omit undefined properties.
 
-Tool calls return JobView envelopes; operational failures are `failed` envelopes, not throws. The native result is in `.result`. `response.unwrap()` returns it (`null` when absent) for a completed response, and otherwise throws an error carrying `.response`, `.output`, and, when present, `.job` and `.code`; inspect pending jobs with `tool.jobs({job:id})`. In scripts, an absent optional field (`x?`) is `undefined`. For example: `const response = await tool.read({path:"Cargo.toml"}); const file = response.unwrap();`. Builders also support `tool.read().path("Cargo.toml")` or `tool.read().set("path", "Cargo.toml")`. `.set(key, value)` accepts tool-schema argument names, including dynamically chosen keys; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
+Awaiting a tool call yields `JobView<T>`, an envelope with native result `T` at `.result`; operational failures are `failed` envelopes, not throws. Where data is:
+- a call: `r.result`, or `r.unwrap()`: the native payload itself (`r.unwrap().stdout`; `null` if none) when completed; otherwise it throws, with `.response`, `.output` (possibly `null`), and `.job` and `.code` when present
+- `tool.jobs()`: `r.unwrap().jobs`
+- `tool.jobs({job})`: the target's own view, `v.state` and `v.result`
+- `tool.jobs({job, field})`: a page at `v.presentation.preview`
+- `tool.job(id).cancel()`: `r.unwrap()` is the target's view
+Absent optional tool-response fields (`x?`) read as `null`. Example: `const file = (await tool.read({path:"Cargo.toml"})).unwrap();`. Builders also chain: `tool.read().path("Cargo.toml")`, or `.set(key, value)` for any argument name, including dynamic keys; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Builders nested in a returned value run concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. In the body, `await {a:builder}` does not await members: await each builder or use Promise.all.
 
-`await sleep(ms)`: finite nonnegative milliseconds within the host timer range; cancellation interrupts it. performance.now() measures elapsed milliseconds. Unawaited promises/sleeps do not keep scripts alive; use background jobs for lasting work.
+`await sleep(ms)`: 0 to 2147483647 milliseconds; cancellation interrupts it. performance.now() measures elapsed milliseconds. Unawaited promises/sleeps do not keep scripts alive; use background jobs for lasting work.
 
-`new WorkPool(n).map(items,worker)` or `.run([fn1,fn2,...])` returns an async iterable of {index,value} in completion order, at most n workers. run takes exactly one array of functions called with no arguments (not variadic); invalid arguments throw before any task starts. index identifies the original input; value is its result. Task failures are logged/skipped; breaking stops scheduling and awaits running workers.
+`new WorkPool(n).map(items,worker)` or `.run([fn1,fn2,...])` returns an async iterable of {index,value} in completion order, at most n workers. run takes exactly one array of functions called with no arguments; invalid arguments throw before any task starts. index identifies the original input; value is what the worker returned. Throws/rejections are logged/skipped; breaking stops scheduling and awaits running workers.
 ```js
-const {paths} = (await tool.glob({pattern: "src/**/*.rs"})).unwrap();
-const results = [];
-for await (const {index, value: response} of new WorkPool(4).map(
-  paths, path => tool.read({path})
-)) {
-  const value = response.unwrap();
-  results.push({index, path: paths[index], content: value.content});
+const paths = ["Cargo.toml", "justfile"], out = [];
+for await (const {index, value: r} of new WorkPool(2).map(paths, path => tool.read({path}))) {
+  out.push({index, content: r.unwrap().content});
 }
-return results;
+return out;
 ```
 
-For bg:true, await launch before using the positive integer job ID: `const j=await tool.exec({command:"make test",bg:true}); return await tool.jobs({job:j.id});`. Output inspection returns immediately without waiting. Do independent work first; use `await tool.wait({timeout:300})` to yield for an agent event or timeout, then inspect again. `wait({timeout?:seconds})` waits indefinitely if timeout is omitted/null; otherwise it accepts only positive integer seconds. Its `.result` is `{reason:"event"}` or `{reason:"timeout"}`; an event need not mean the job completed.
-`await receive()` waits for the next JSON value sent to this script's own job ID with `tool.job(scriptJobId).send({value})`; requires `script` with `bg:true`. Child-agent input is delivered automatically; do not use a script to receive it. Read or search saved output with tool.jobs({job:id, field:"/result/stdout"})."#;
+For bg:true, await the launch for its job ID. Inspection returns at once, so do independent work, then wait only while the job is unfinished: `const {id}=await tool.exec({command:"make test",bg:true}); let v=await tool.jobs({job:id}); while(["queued","running"].includes(v.state)){await tool.wait({timeout:300}); v=await tool.jobs({job:id});} return v;`. `wait({timeout?:seconds})` yields until an agent event or the timeout (indefinitely if omitted/null; otherwise positive integer seconds); its `.result` is `{reason, waited_s}`, reason "event", "timeout" or "cancelled"; an event need not mean the job completed.
+`await receive()` waits for the next value sent to this script's own job ID with `tool.job(scriptJobId).send({value})` and resolves to that value itself, not a JobView (the sender gets a JobView with no result); requires `script` with `bg:true`. Child-agent input is delivered automatically; do not use a script to receive it."#;

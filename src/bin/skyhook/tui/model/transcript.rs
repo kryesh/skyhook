@@ -2,7 +2,7 @@
 //! paged by ordinal as the lists are, and what presenting them reads, as their pages and
 //! the updates since leave it.
 
-use super::entries::Dep;
+use super::entries::{Dep, presents};
 use super::window::{List, PAGE};
 use skyhook::identity::JobId;
 use skyhook::session::{
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Transcript {
-    /// The ordinals loaded.
+    /// The ordinals read, and those kept: the records the conversation can show.
     pub run: List<u64>,
     records: HashMap<u64, Arc<EventRecord>>,
     /// What presenting the loaded records reads; their requests are the window's.
@@ -29,7 +29,7 @@ impl Transcript {
 
     /// The loaded records in ordinal order.
     pub fn records(&self) -> impl Iterator<Item = (u64, &Arc<EventRecord>)> + '_ {
-        (self.run.keys.iter()).map(|ordinal| (*ordinal, &self.records[ordinal]))
+        (self.run.kept().iter()).map(|ordinal| (*ordinal, &self.records[ordinal]))
     }
 
     /// Add what `page` read where it adjoins what is loaded, and what presenting it
@@ -60,17 +60,20 @@ impl Transcript {
         }
         self.facts.admitted.extend(admitted);
         self.facts.reported.extend(reported);
-        let ordinals = first..first + records.len() as u64;
-        if self
-            .run
-            .insert(page, ordinals.clone(), records.len() == PAGE)
-        {
+        let full = records.len() == PAGE;
+        let read: Vec<_> = (first..).zip(records).collect();
+        let kept = read
+            .iter()
+            .map(|(ordinal, record)| (*ordinal, presents(&record.event)));
+        if self.run.insert(page, kept, full) {
             // A page from an end reads the transcript afresh.
             if matches!(page, Page::First | Page::Last) {
                 self.records.clear();
             }
-            for (ordinal, record) in ordinals.zip(records) {
-                self.records.entry(ordinal).or_insert(record);
+            for (ordinal, record) in read {
+                if presents(&record.event) {
+                    self.records.entry(ordinal).or_insert(record);
+                }
             }
         }
         requests
@@ -88,22 +91,22 @@ impl Transcript {
         (fact, turn): (Option<Fact>, Option<i64>),
         reading: bool,
     ) -> (bool, Option<Dep>) {
-        let placed = self.run.push(ordinal);
+        let placed = self.run.push(ordinal, presents(&record.event));
         if placed {
             self.records.insert(ordinal, record.clone());
         }
-        let (run, records) = (&self.run.keys, &self.records);
+        let (run, records) = (self.run.kept(), &self.records);
         let holds = |sequence| reading || held(run, records, sequence);
         let call = self.facts.observe(record, fact, turn, holds);
         (placed, call.map(|(message, call)| Dep::Call(message, call)))
     }
 
-    /// Let go of the loaded records beyond those kept around the view's place `at`.
-    pub(super) fn trim(&mut self, at: usize) -> bool {
-        if !self.run.trim(at) {
+    /// Let go of the loaded records beyond those kept around the view's `shown` ones.
+    pub(super) fn trim(&mut self, shown: std::ops::Range<usize>) -> bool {
+        if !self.run.trim(shown) {
             return false;
         }
-        let run = &self.run.keys;
+        let run = self.run.kept();
         (self.records).retain(|ordinal, _| run.binary_search(ordinal).is_ok());
         true
     }
@@ -111,7 +114,7 @@ impl Transcript {
     /// Let go of what presenting records not loaded read, kept while a page that may
     /// hold them was in flight.
     pub(super) fn retain_facts(&mut self) {
-        let (run, records, facts) = (&self.run.keys, &self.records, &mut self.facts);
+        let (run, records, facts) = (self.run.kept(), &self.records, &mut self.facts);
         let held = |sequence| held(run, records, sequence);
         let message = |message: &skyhook::session::MessageSeq| held((*message).into());
         facts.answers.retain(|answer, _| message(answer));
@@ -162,17 +165,5 @@ pub fn shown(record: &EventRecord) -> Vec<JobId> {
             events.filter_map(JobEvent::job).collect()
         }
         _ => Vec::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    impl Transcript {
-        /// Every loaded record, in order.
-        pub(in crate::tui) fn loaded_records(&self) -> impl Iterator<Item = Arc<EventRecord>> + '_ {
-            self.records().map(|(_, record)| record.clone())
-        }
     }
 }

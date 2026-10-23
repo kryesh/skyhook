@@ -4,6 +4,7 @@
 use serde::Deserialize;
 
 use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
+use crate::media::ImageLimits;
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -19,6 +20,9 @@ use crate::provider::{
         headers::HeaderText,
     },
 };
+
+/// What the service accepts of an image: 6000 px and 20 MiB.
+pub(super) const IMAGES: ImageLimits = ImageLimits::new(6000, 20 * 1024 * 1024);
 
 fn chat() -> chat_completions::Dialect {
     chat_completions::Dialect {
@@ -113,7 +117,7 @@ impl DialectConfig for Config {
             errors: ERRORS,
             ..Transport::plain()
         };
-        let mut profile = Profile::new(codec, transport, Dialect::Openai);
+        let mut profile = Profile::new(codec, transport, Dialect::Openai, IMAGES);
         if self.organization.is_some() || self.project.is_some() {
             profile.discriminate("account", &(&self.organization, &self.project));
         }

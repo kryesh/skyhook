@@ -109,15 +109,21 @@ impl Footprint {
 #[derive(Default)]
 #[cfg_attr(debug_assertions, derive(Debug, PartialEq))]
 struct Index {
-    /// Each owner's jobs that a change or a request reads, by facet.
-    owned: HashMap<AgentId, BTreeMap<Facet, BTreeSet<JobId>>>,
+    /// Each owner's jobs that a change or a request reads, by facet. Ordered
+    /// rather than hashed: a session has few owners, and comparing agents is far
+    /// cheaper than hashing one.
+    owned: BTreeMap<AgentId, BTreeMap<Facet, BTreeSet<JobId>>>,
     children: HashMap<JobId, BTreeSet<JobId>>,
 }
 
 impl Index {
     fn add(&mut self, id: JobId, owner: &AgentId, footprint: &Footprint) {
-        for facet in footprint.0.iter().flatten() {
-            let owned = self.owned.entry(owner.clone()).or_default();
+        let mut facets = footprint.0.iter().flatten().peekable();
+        if facets.peek().is_none() {
+            return;
+        }
+        let owned = self.owned.entry(owner.clone()).or_default();
+        for facet in facets {
             owned.entry(*facet).or_default().insert(id);
         }
     }
@@ -523,11 +529,8 @@ impl Jobs {
     /// that can still run holds handles.
     #[cfg(debug_assertions)]
     pub(crate) fn assert_indexed(&self) {
-        let mut ids: Vec<_> = self.entries.keys().copied().collect();
-        ids.sort_unstable();
         let mut rebuilt = Index::default();
-        for id in ids {
-            let entry = &self.entries[&id];
+        for (&id, entry) in &self.entries {
             assert!(
                 entry.handles.is_none() || entry.end().is_none() || entry.restart().is_some(),
                 "job {id:?} holds handles though it cannot run"
@@ -577,11 +580,11 @@ impl Jobs {
 mod tests {
     use super::*;
 
-    /// `continue` restarts an interruption while something can. Without a
-    /// restarter, as a session without its agent runtime has, `continue`
-    /// restarts nothing, but a cancellation still ends it.
+    /// `continue` and input restart an interruption while something can.
+    /// Without a restarter, as a session without its agent runtime has, neither
+    /// restarts it, but a cancellation still ends it.
     #[tokio::test]
-    async fn continue_restarts_an_interruption_only_while_its_handler_can() {
+    async fn an_interruption_restarts_only_while_its_handler_can() {
         let crate::tests::TestRuntime {
             root, jobs, agent, ..
         } = crate::tests::TestRuntime::on_disk().await;
@@ -610,12 +613,25 @@ mod tests {
             };
             jobs.store().commit(Command::Continue, plan).await.unwrap()
         };
+        let running = async |jobs: &JobManager| {
+            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Running);
+        };
         interrupted(&jobs).await;
         assert_eq!(continued(&jobs).await, 1);
-        assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Running);
+        running(&jobs).await;
+        interrupted(&jobs).await;
+        jobs.send(id, Value::Null).await.unwrap();
+        running(&jobs).await;
         interrupted(&jobs).await;
         let restored = super::super::tests::reopen(jobs, root.path()).await;
         assert_eq!(continued(&restored).await, 0);
+        assert!(matches!(
+            restored.send(id, Value::Null).await,
+            Err(JobError::InputUnavailable {
+                reason: InputUnavailableReason::ResumeUnavailable,
+                ..
+            })
+        ));
         assert_eq!(
             restored.snapshot(id).await.unwrap().state,
             JobState::Interrupted

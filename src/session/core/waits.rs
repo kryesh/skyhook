@@ -221,6 +221,12 @@ impl Waits {
         other.waits.into_values().for_each(|wait| self.insert(wait));
     }
 
+    /// How many registered waits read `key`.
+    #[cfg(test)]
+    pub(super) fn reading(&self, key: &Key) -> usize {
+        self.keyed.get(key).map_or(0, BTreeSet::len)
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self {
             next: self.next,

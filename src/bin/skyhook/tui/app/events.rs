@@ -69,6 +69,8 @@ pub enum Work {
     Interrupted {
         count: usize,
     },
+    /// The session activated on the model chosen for its gone root's.
+    Activated(Result<(), skyhook::agent::HarnessError>),
     Title {
         ticket: Token,
         title: Result<Option<SessionTitle>, String>,
@@ -136,6 +138,13 @@ impl App {
                     // UI-only: nothing was stopped, so nothing is recorded.
                     self.toast("Nothing to interrupt");
                 }
+            }
+            Work::Activated(Ok(())) => {
+                self.resume_stopped_queue();
+            }
+            Work::Activated(Err(error)) => {
+                let error = crate::tui::format::harness_error(&error);
+                self.notice(format!("Could not switch the session's model: {error}"));
             }
             Work::Done { result }
             | Work::Continued {
@@ -217,16 +226,23 @@ impl App {
             }
             Work::Title { .. } => {}
             Work::Stopped => self.exit = true,
-            Work::HighlightsReady => {}
+            Work::HighlightsReady => {
+                self.render.highlights.poll();
+            }
         }
         self.dirty = true;
     }
     /// Report an operation's failure, except a failed journal: the session it
     /// stopped shows that.
     fn report(&self, error: &crate::launch::OperationError) {
-        if !error.journal_failed() {
-            self.root_notifier().send(error.to_string());
-        }
+        let notice = match error {
+            _ if error.journal_failed() => return,
+            crate::launch::OperationError::Harness(error) => {
+                crate::tui::format::harness_error(error)
+            }
+            error => error.to_string(),
+        };
+        self.root_notifier().send(notice);
     }
     pub fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
@@ -325,8 +341,7 @@ impl App {
                 match self.input_target() {
                     InputTarget::Menu => {
                         if let Some(menu) = &mut self.menu {
-                            menu.input.insert(&text);
-                            menu.select(0);
+                            menu.filter(|input| input.insert(&text));
                         }
                     }
                     InputTarget::Prompt
@@ -366,14 +381,16 @@ impl App {
                             && self.composer_rect.contains(point.into())
                         {
                             let options = self.prompt_options_rect.contains(point.into());
-                            self.scroll_prompt(options, step);
+                            let (view, len) = self.prompt_view(options);
+                            view.scroll(step, len);
                         } else if matches!(self.input_target(), InputTarget::Composer)
                             && self.composer_rect.contains(point.into())
                             && self.composer_overflows()
                         {
                             self.scroll_composer(step);
                         } else if self.tree_rect.contains(point.into()) {
-                            self.tree_scroll = self.tree_scroll.saturating_add_signed(step);
+                            let len = self.projection.visible(&self.selected).count();
+                            self.tree_view.scroll(step, len);
                         } else {
                             self.scroll(step);
                         }
@@ -513,17 +530,15 @@ impl App {
             _ => {}
         }
     }
-    /// Scroll to where row `y` sits down the scrollbar track: the whole history's span
-    /// spread over the track.
+    /// Scroll the view's top to where row `y` sits down the scrollbar track, which
+    /// spans the whole history; its last row is the end.
     fn scroll_to_track(&mut self, y: u16) {
         let track = self.content_rect;
-        let height = track.height as usize;
-        let max = crate::tui::render::Track::of(self)
-            .len()
-            .saturating_sub(height);
-        let along = usize::from(y.saturating_sub(track.y)).min(height.saturating_sub(1));
-        let top = (along * max).div_ceil(height.saturating_sub(1).max(1));
-        self.scroll_to_span((top < max).then_some(top));
+        let last = track.height.saturating_sub(1);
+        let along = y.saturating_sub(track.y).min(last);
+        let total = crate::tui::render::Track::of(self).total;
+        let at = f64::from(along) / f64::from(track.height) * total;
+        self.scroll_to_span((along < last).then_some(at));
     }
     pub(super) fn text_position(
         &self,
@@ -619,7 +634,7 @@ mod tests {
         let ticket = app.draft_ticket.clone();
         let queued = app.queued_input(Submission {
             text: "queued replacement".into(),
-            attachments: vec![png_attachment("image.png")],
+            attachments: vec![png_attachment("image.png").await],
         });
         app.queue = VecDeque::from([queued]);
         app.command(Command::Queue);
@@ -630,7 +645,7 @@ mod tests {
         assert!(!app.dirty);
         assert_eq!(
             app.editor.attachments(),
-            [png_attachment("image.png").into()]
+            [png_attachment("image.png").await.into()]
         );
     }
 
