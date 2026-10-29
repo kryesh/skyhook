@@ -10,13 +10,21 @@ set `CARGO_ZIGBUILD_ZIG_PATH`). `just setup` installs the remaining Rust-side to
 git clone https://github.com/kryesh/skyhook.git
 cd skyhook
 just setup
-just install   # release shims, release CLI embedding them, installed as ~/.local/bin/skyhook
+just install   # release shims and both applications, installed into ~/.local/bin
 ```
 
-The executable supports both the terminal interface and headless execution; make sure
-`~/.local/bin` is on `PATH`. For a local-only build without Zig, run `just build-release` instead
-and use `target/release/skyhook`. SSH use without an included shim
-returns an explicit missing-shim error.
+This installs `skyhook`, the general-purpose coding agent, and `skyhook-security`, the
+[security research companion](../guide/security.md). Both support the terminal interface and
+headless execution and embed the same SSH shims. Make sure `~/.local/bin` is on `PATH`.
+
+For a local-only build without Zig, run `just build-release` instead and use
+`target/release/skyhook` or `target/release/skyhook-security`. `just build` builds both applications
+in `target/debug`. SSH use without an included shim returns an explicit missing-shim error.
+
+Both applications use the ordinary Skyhook provider configuration and credentials. The companion
+also reads `security.yaml`; use `security.example.yaml` as a starting point and adjust its model
+assignments to match your `config.yaml`. See [security configuration](../guide/security.md#configuration)
+for discovery rules and research settings.
 
 See [development setup](../development/setup.md) for contributor commands and
 [shim builds](../development/remote-transport-and-shims.md#building-and-packaging-artifacts)

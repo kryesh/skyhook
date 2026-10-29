@@ -57,6 +57,12 @@ See the [installation guide](docs/src/getting-started/installation.md),
 For automation, see [headless execution](docs/src/guide/headless.md) and
 [JavaScript workflows](docs/src/scripting/introduction.md).
 
+For codebase security research, `skyhook-security` reuses your model configuration and the same
+terminal and session runtime. It keeps a research ledger inside each session: components swept
+once, flaws and the sources that reach them, candidate scenarios built from those flaws, and the
+work they still owe; then parallel review, optional empirical validation, and reports. See
+[security research](docs/src/guide/security.md) for configuration, runs, and reports.
+
 ## Development
 
 See [AGENTS.md](AGENTS.md) for the repository's contribution policy and

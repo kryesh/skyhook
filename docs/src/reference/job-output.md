@@ -24,7 +24,10 @@ Directory reads return grouped entries with file sizes, for example:
 Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names; empty `symlinks` and
 `other` groups are absent, and scripts read them as `null`.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
-An empty search result has `matches: {}`.
+An empty search result has `matches: {}`. A matched line longer than 1 KiB comes back as the text
+around its match, ending `(line truncated, N bytes)`. A file or directory the search cannot read
+is skipped and listed, as `skipped: [{path, reason}]` with reason `unlisted`, `unopened` or
+`unread`; the other files' matches stay, and `matches` is then incomplete.
 `targets` returns each target's routing and authentication metadata; fields a target does not set are absent.
 `target_add` completes without a result.
 All defaulted input fields are optional in tool schemas.
@@ -188,8 +191,8 @@ Pages prefer whole lines; oversized lines are split at UTF-8 boundaries. The pag
 fewer lines than `limit`: use the returned position rather than computing `start + limit`. Offsets
 beyond a line or inside a UTF-8 character are rejected. A start past the available lines returns an
 empty page with the total. Regex matching is case-sensitive unless inline flags override it.
-Matching supports lines up to 4 MiB and reports an explicit resource error for larger lines; ordinary
-paging can still read those lines.
+Matching supports lines up to 64 MiB and reports an explicit resource error for larger lines;
+ordinary paging can still read those lines.
 
 For closed fields, a missing `next_start` means no selected content remains. For running fields,
 `total_lines` describes currently captured output, and the numeric next position can be retried

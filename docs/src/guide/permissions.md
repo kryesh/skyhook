@@ -64,7 +64,13 @@ Capabilities are granted by the active [mode](#modes), or by a batch job's
 | `interactive` (runtime only) | Human-facing root questions, approval prompts, and sensitive authentication | Enabled by the terminal host; never in a batch job |
 | `mcp` | MCP server startup and MCP tool availability | Enabled |
 
-A capability list is exact; `[]` grants no policy capabilities. Unknown names and `interactive`
+Applications embedding Skyhook may declare additional namespaced capabilities, such as
+`security.verdict`. They follow the same mode, ceiling, and child-delegation restrictions as the
+built-ins. Only names declared by the application may be granted; ordinary Skyhook declares
+none. A host capability name is `<namespace>.<name>` (lowercase ASCII letters, digits and
+underscores, each component starting with a letter; at most 128 bytes in total).
+
+A capability list is exact; `[]` grants no policy capabilities. Undeclared names and `interactive`
 are errors in a mode and in `--capabilities`. The host supplies `interactive` independently of the
 list: the terminal always has it and `skyhook batch` never does, so an empty list does not disable
 the terminal interface or root questions. Per-agent depth restrictions narrow the result. Enable
@@ -132,3 +138,8 @@ connections. Per-server MCP requirements are additional gates, not grants.
 See [headless execution](headless.md) for noninteractive commands and authentication,
 [execution targets](execution-targets.md) for route approvals, and
 [MCP](../configuration/mcp.md) for trusted server startup and per-server gates.
+
+Sessions retain the application that created them, separately from their title and mode. Other
+applications can inspect them and read their statistics from the shared session directory, but
+cannot activate, rename, or otherwise change them. Reopening a session in its creating application
+is required to resume work.

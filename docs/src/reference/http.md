@@ -91,8 +91,9 @@ charsets, and HTML meta charsets where applicable. Without an `Accept` header, `
 that answer other requests with an empty page or a non-HTML variant return their HTML, while APIs
 that serve no HTML still return JSON; `readable` sends
 `text/html,application/xhtml+xml;q=0.9,*/*;q=0.8`.
-`save_to` saves the response to a file on success instead of embedding the payload, and ignores
-`response_format`. Errors or cancellation do not replace an existing destination.
+`save_to` saves the response to a file on success instead of embedding the payload, creating
+missing parent directories, and ignores `response_format`. Errors or cancellation do not replace
+an existing destination.
 
 HTML is returned as `{kind: "page", title, byline?, site_name?, language?, scope, markdown}`.
 `scope` is `article` when the page has a readable main article, and `markdown` holds only that
@@ -129,7 +130,8 @@ JobView rather than a rejected promise. The error names the operation in progres
 cause: an I/O kind with its OS error code when the failure carries one (such as `connection refused
 (OS error 111)`), or a fixed message such as `the TLS handshake failed` or `response exceeds
 max_bytes`. A failure after the request was sent notes that the request may have executed; a
-`save_to` failure that left its destination untouched also reports that it is unchanged.
+`save_to` failure that left its destination untouched also reports that it is unchanged, unless it
+created directories to hold it, which remain.
 Failure messages never copy underlying error text, query strings, credentials, headers, or bodies;
 URLs are reduced to their origin. A response's `duration` is measured inside fetch on the execution
 target; it does not include SSH startup or initial tool approval.

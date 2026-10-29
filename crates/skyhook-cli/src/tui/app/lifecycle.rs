@@ -1,0 +1,527 @@
+use super::*;
+use crate::launch::LaunchError;
+
+/// What a new session is created for, and the model and mode it starts with.
+pub(super) enum PendingStart {
+    Input(Box<QueuedInput>),
+    Script {
+        path: PathBuf,
+        model: ModelRef,
+        mode: ModeName,
+    },
+}
+impl PendingStart {
+    fn selection(&self) -> (&ModelRef, &ModeName) {
+        match self {
+            Self::Input(input) => (&input.model, &input.mode),
+            Self::Script { model, mode, .. } => (model, mode),
+        }
+    }
+}
+
+impl App {
+    /// Invariant: at most one creation is in flight. Every caller is gated by
+    /// `busy()`/`creating`, so a `Started` completion is the current one.
+    pub(super) fn begin_session(&mut self, action: PendingStart) {
+        if self.creating.is_some() {
+            return;
+        }
+        let (model, mode) = action.selection();
+        let Ok(configured) = self.launch.model.config().select_model(model) else {
+            let unavailable = skyhook::agent::HarnessError::UnknownModel(model.clone());
+            self.notice(crate::tui::format::harness_error(&unavailable));
+            self.pause(Paused::Stopped);
+            return self.park_action(action);
+        };
+        let launch = Launch {
+            model: configured,
+            permissions: crate::launch::Permissions::Mode(mode.clone()),
+            ..self.launch.clone()
+        };
+        let scope = match self.scope.as_mut().map(super::scope::ScopePanel::freeze) {
+            None => None,
+            Some(Ok(reply)) => Some(reply),
+            Some(Err(invalid)) => {
+                // Delivery waits for an explicit retry once the field is corrected,
+                // never the first value that happens to parse mid-edit.
+                self.scope_invalid(invalid);
+                self.pause(Paused::Stopped);
+                return self.park_action(action);
+            }
+        };
+        self.creating = Some(action);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let opening = crate::Opening::New(scope.as_ref());
+            let result = match launch.create(opening).await {
+                Ok(session) => crate::tui::host::observed(session, &launch, opening, None).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = tx.send(Work::Started { result })
+                && let Work::Started {
+                    result: Ok(prepared),
+                } = error.0
+            {
+                let _ = prepared.session().shutdown().await;
+            }
+        });
+        self.dirty = true;
+    }
+    pub(super) fn session_started(&mut self, prepared: PreparedObservation) {
+        let pending = self.creating.take();
+        let draft = self.root_agent().clone();
+        let attached_draft = match &self.phase {
+            Phase::Draft { root } => Some(root.clone()),
+            Phase::Open { attached_draft, .. } => attached_draft.clone(),
+        };
+        let PreparedObservation {
+            active,
+            shown:
+                super::observation::Shown {
+                    snapshot,
+                    projection,
+                    window,
+                    ..
+                },
+        } = prepared;
+        self.phase = Phase::Open {
+            observation: active,
+            attached_draft,
+        };
+        self.snapshot = *snapshot;
+        self.forget_unread_responses();
+        self.projection = *projection;
+        self.window = window.map(|window| *window);
+        self.selected = self.root_agent().clone();
+        self.views.transfer(&draft, self.selected.clone());
+        for status in &mut self.unsaved_status {
+            if status.agent == draft {
+                status.agent = self.selected.clone();
+            }
+        }
+        self.content_cache = model::ContentCache::default();
+        self.render.reset_session();
+        self.refresh();
+        self.show_warnings();
+        self.load_title();
+        if self.stopping {
+            self.finish_shutdown();
+            return;
+        }
+        match pending {
+            Some(action) if self.paused.is_some() => self.park_action(action),
+            Some(PendingStart::Input(input)) => {
+                self.own_queue().push_front(*input);
+                self.deliver_queue();
+            }
+            Some(PendingStart::Script { path, .. }) => self.start_script(path),
+            None => {}
+        }
+    }
+    /// Settle an action whose session was not created: input returns to the
+    /// head of the queue, and a script is dropped.
+    fn park_action(&mut self, action: PendingStart) {
+        match action {
+            PendingStart::Input(input) => {
+                self.own_queue().push_front(*input);
+                self.refresh_menu();
+            }
+            PendingStart::Script { path, .. } => {
+                self.notice(format!("Script {} was not run", path.display()));
+            }
+        }
+    }
+    pub(super) fn start_failed(&mut self, error: LaunchError) {
+        self.pause(Paused::Stopped);
+        self.notice(error.to_string());
+        if let Some(panel) = self.scope.as_mut() {
+            panel.reopen();
+            self.scope_changed();
+        }
+        if let Some(action) = self.creating.take() {
+            self.park_action(action);
+        }
+        if self.stopping {
+            self.finish_shutdown();
+        }
+    }
+    /// Submit the command-line prompt. When an image cannot be read, keep the
+    /// prompt as an editable draft so the user can fix it and resend.
+    pub async fn start_prompt(&mut self, text: String, images: Vec<PathBuf>) {
+        match crate::launch::read_images(&self.launch.workspace, &images).await {
+            Ok(attachments) => self.submit(Submission { text, attachments }),
+            Err(error) => {
+                self.notice(error.to_string());
+                self.replace_draft(Submission {
+                    text,
+                    attachments: Vec::new(),
+                });
+                self.dirty = true;
+            }
+        }
+    }
+    pub fn start_script(&mut self, path: PathBuf) {
+        if self.busy() {
+            self.toast("Wait for the current operation before starting a script");
+            return;
+        }
+        let Some(session) = self.session().cloned() else {
+            let (model, mode) = (self.model.clone(), self.mode.clone());
+            return self.begin_session(PendingStart::Script { path, model, mode });
+        };
+        self.operation = true;
+        self.set_title(&path.display().to_string());
+        let tx = self.tx.clone();
+        let status = self.status.clone();
+        tokio::spawn(async move {
+            status.flush().await;
+            let result = async {
+                let source = tokio::fs::read_to_string(path).await?;
+                match session.run_script(source).await {
+                    // The interrupt that withdrew it reports it.
+                    Ok(_) | Err(skyhook::agent::HarnessError::Interrupted) => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            .await;
+            let _ = tx.send(Work::Done { result });
+        });
+    }
+    pub fn shutdown(&mut self) {
+        if self.stopping {
+            return;
+        }
+        self.pause_queue(Paused::Stopped);
+        self.stopping = true;
+        // A creation task owns a handle which must arrive before teardown.
+        if self.creating.is_none() {
+            self.finish_shutdown();
+        }
+        self.dirty = true;
+    }
+    pub(super) fn finish_shutdown(&mut self) {
+        let session = self.session().cloned();
+        let tx = self.tx.clone();
+        let notices = self.root_notifier();
+        let status = self.status.clone();
+        tokio::spawn(async move {
+            status.flush().await;
+            if let Some(session) = &session
+                && let Err(e) = session.shutdown().await
+                && !e.journal_failed()
+            {
+                notices.send(e.to_string());
+            }
+            status.flush().await;
+            // Closed before the host lets go of the slot, so it reopens at once;
+            // shutdown has reported any journal failure.
+            if let Some(session) = session {
+                let _ = session.close().await;
+            }
+            let _ = tx.send(Work::Stopped);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn unreadable_start_image_keeps_the_prompt_as_a_draft() {
+        let (_root, mut app) = draft_fixture().await;
+        app.start_prompt("long prompt".into(), vec!["typo.png".into()])
+            .await;
+        assert_eq!(app.editor.expanded_text(), "long prompt");
+        assert!(app.editor.attachments().is_empty());
+        assert!(app.history.is_empty() && app.queue.is_empty());
+        assert!(app.creating.is_none() && app.session().is_none());
+    }
+
+    async fn started(rx: &mut mpsc::UnboundedReceiver<Work>) -> PreparedObservation {
+        let Work::Started {
+            result: Ok(prepared),
+        } = next_lifecycle(rx).await
+        else {
+            panic!("session creation should succeed");
+        };
+        prepared
+    }
+
+    async fn fail_creation(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Work>) {
+        let work = next_lifecycle(rx).await;
+        assert!(matches!(work, Work::Started { result: Err(_), .. }));
+        app.work(work);
+    }
+
+    /// Model proofs cannot be invalidated after selection, so fail creation at
+    /// the real filesystem boundary instead.
+    fn block_sessions(app: &App) {
+        std::fs::create_dir_all(app.launch.sessions.parent().unwrap()).unwrap();
+        std::fs::write(&app.launch.sessions, "not a directory").unwrap();
+    }
+
+    fn queued(app: &App) -> Vec<(&str, String, &[Attachment])> {
+        let rows = app.queue.iter();
+        rows.map(|row| {
+            (
+                &*row.submission.text,
+                row.model.to_string(),
+                &row.submission.attachments[..],
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn first_submit_creates_once_and_preserves_queue_models_and_draft() {
+        let (_root, mut app) = draft_fixture().await;
+        let broken_skill = app.launch.workspace.join(".agents/skills/broken");
+        std::fs::create_dir_all(&broken_skill).unwrap();
+        let mut rx = capture_work(&mut app);
+        for command in [Command::Export, Command::Retry] {
+            app.command(command);
+        }
+        assert!(app.session().is_none() && !app.launch.sessions.exists());
+        app.submit("first input".into());
+        assert!(app.creating.is_some() && app.session().is_none());
+        app.model = "test/second".parse().unwrap();
+        let attachments = vec![png_attachment("queued.png").await];
+        app.submit(Submission {
+            text: "second input".into(),
+            attachments,
+        });
+        app.editor.set("still composing".into());
+        app.editor.insert_paste("unsent attachment".into());
+        let prepared = started(&mut rx).await;
+        assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
+        app.session_started(prepared);
+        // The session cannot take the second row's model, so the batch stays queued whole.
+        assert!(app.creating.is_none() && app.paused.is_some());
+        let image = [png_attachment("queued.png").await];
+        assert_eq!(
+            queued(&app),
+            [
+                ("first input", "test/first".to_owned(), &[][..]),
+                ("second input", "test/second".to_owned(), &image[..])
+            ]
+        );
+        let second = app.remove_queued(app.queue[1].id).unwrap();
+        app.command(Command::Resume);
+        app.tick();
+        assert!(app.busy());
+        bounded(async {
+            while app.history.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
+        assert_eq!(app.history, ["first input"]);
+        assert_eq!(app.model, "test/second".parse().unwrap());
+        assert_eq!(second.model, "test/second".parse().unwrap());
+        assert_eq!(
+            app.editor.expanded_text(),
+            "still composingunsent attachment"
+        );
+        let pastes: Vec<_> = app.editor.pastes().map(|(_, text)| text).collect();
+        assert_eq!(pastes, ["unsent attachment"]);
+        app.status.flush().await;
+        let session = app.session().unwrap();
+        let records = journal(session).await;
+        assert!(!session.warnings().is_empty());
+        for warning in session.warnings() {
+            let status = format!("Startup warning: {warning}");
+            assert!(!records.iter().any(|record| matches!(
+                &record.event, SessionEvent::Status { message } if message == &status
+            )));
+            assert!(unsaved(&app, session.root_agent()).contains(&status));
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_creation_retains_inputs_and_can_resume_without_duplicate_creation() {
+        let (_root, mut app) = draft_fixture().await;
+        let mut rx = capture_work(&mut app);
+        block_sessions(&app);
+        let attachments = vec![png_attachment("first.png").await];
+        app.submit(Submission {
+            text: "first".into(),
+            attachments,
+        });
+        app.model = "test/second".parse().unwrap();
+        app.submit("second".into());
+        app.editor.set("new draft".into());
+        fail_creation(&mut app, &mut rx).await;
+        assert!(!app.busy() && app.paused.is_some() && app.session().is_none());
+        let image = [png_attachment("first.png").await];
+        assert_eq!(
+            queued(&app),
+            [
+                ("first", "test/first".to_owned(), &image[..]),
+                ("second", "test/second".to_owned(), &[])
+            ]
+        );
+        assert_eq!(app.editor.text(), "new draft");
+        std::fs::remove_file(&app.launch.sessions).unwrap();
+        app.command(Command::Resume);
+        app.tick();
+        assert!(app.creating.is_some());
+        app.tick();
+        assert_eq!(app.queue.len(), 1);
+        let prepared = started(&mut rx).await;
+        app.shutdown();
+        app.session_started(prepared);
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
+        assert!(
+            app.history.is_empty(),
+            "shutdown must suppress the pending prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_model_keeps_the_input_queued_and_pauses() {
+        let (_root, mut app) = draft_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
+        app.model = "test/removed".parse().unwrap();
+        app.submit("input".into());
+        app.status.flush().await;
+        let notices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|work| match work {
+                Work::LocalStatus { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            ["model `test/removed` is not configured; choose another with /model"]
+        );
+        assert!(app.paused.is_some() && app.creating.is_none());
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_failed_creation() {
+        let (_root, mut app) = draft_fixture().await;
+        let mut rx = capture_work(&mut app);
+        block_sessions(&app);
+        app.submit("unsent".into());
+        app.shutdown();
+        assert!(!app.exit);
+        fail_creation(&mut app, &mut rx).await;
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit && app.launch.sessions.is_file());
+    }
+
+    /// A failed journal stops the session as a crash would: its queued rows go,
+    /// its conversation shows why once, and it stays open until it is closed.
+    #[tokio::test]
+    async fn a_failed_journal_stops_the_session_and_shows_why_in_its_conversation() {
+        use super::super::played::{observe_until, played_fixture};
+        use skyhook::identity::SessionId;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
+        app.submit("first".into());
+        let _turn = model.turn().await;
+        bounded(async {
+            while !app.queue.is_empty() {
+                let work = recv(&mut rx).await;
+                app.work(work);
+            }
+        })
+        .await;
+        app.submit("queued".into());
+        assert_eq!(app.queue.len(), 1);
+        let foreign = AgentId::root(SessionId::generate().unwrap());
+        let refused = session.record_status(foreign, "elsewhere".into()).await;
+        assert!(refused.is_err());
+        observe_until(&mut app, |app| app.queue.is_empty()).await;
+        app.status.flush().await;
+        while let Ok(work) = rx.try_recv() {
+            app.work(work);
+        }
+        assert!(!app.exit && app.queue.is_empty());
+        app.rebuild_content();
+        let shown = (app.entries().iter())
+            .filter(|entry| entry.text().contains("could not write the session journal"));
+        assert_eq!(shown.count(), 1);
+        app.command(Command::Close);
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
+    }
+
+    /// What a failed journal cut short reads as stopped where it is already
+    /// shown, as its own update would show it: a job's card on the Jobs tab,
+    /// a request's row on the Requests tab, and a child its background work
+    /// kept alive after it answered as interrupted, out of the live tree.
+    #[tokio::test]
+    async fn a_failed_journal_stops_the_calls_it_cut_short() {
+        use super::super::played::{
+            answered, ask, call, children, count, observe_until, played_fixture,
+        };
+        use crate::tui::model::AgentDisplayState;
+        use serde_json::json;
+        use skyhook::identity::SessionId;
+        use skyhook::job::JobState;
+        use skyhook::provider::protocol::ContextId;
+        for tab in [model::Tab::Jobs, model::Tab::Requests] {
+            let (_root, mut app, mut played, session) = played_fixture().await;
+            app.tab = tab;
+            super::super::tests::settled(&mut app).await;
+            let root = app.root_agent().clone();
+            let _asked = ask(&session, "delegate");
+            let task = json!({"prompt": "work", "bg": true});
+            played
+                .turn()
+                .await
+                .end(vec![call("agent", "agent", task, 0)]);
+            // The root's next request stays open while its child answers.
+            let mut turns = [played.turn().await, played.turn().await];
+            if turns[0].context == ContextId::from(&root) {
+                turns.swap(0, 1);
+            }
+            let [child_turn, _turn] = turns;
+            let work = json!({"source": "await sleep(60000);", "bg": true});
+            child_turn.end(vec![call("work", "script", work, 0)]);
+            played.turn().await.answer("done");
+            let shown = |app: &App| {
+                let mut entries = app.entries().iter().rev();
+                entries.find_map(|entry| {
+                    let call = matches!(entry.key(), model::EntryKey::Request(_));
+                    (call || entry.job_id().is_some()).then_some(entry.timing)
+                })
+            };
+            // Folded as the host folds, so only what the update changed rebuilds.
+            observe_until(&mut app, |app| {
+                matches!(shown(app), Some(model::Timing::Since(_)))
+                    && count(&app.journal, answered) == 1
+            })
+            .await;
+            assert!(app.projection.has_active_children());
+            let foreign = AgentId::root(SessionId::generate().unwrap());
+            let refused = session.record_status(foreign, "elsewhere".into()).await;
+            assert!(refused.is_err());
+            observe_until(&mut app, |app| app.snapshot.phase.failure().is_some()).await;
+            let stopped = shown(&app);
+            assert!(
+                matches!(stopped, Some(model::Timing::Took { .. })),
+                "{tab:?}"
+            );
+            let child = children(&app.journal).remove(0);
+            let mut agents = app.projection.agents.iter();
+            let child = agents.find(|info| info.id == child).unwrap();
+            let interrupted = AgentDisplayState::Job(JobState::Interrupted);
+            assert_eq!(
+                app.projection.status(child, &app.snapshot),
+                interrupted,
+                "{tab:?}"
+            );
+            assert!(!app.projection.has_active_children(), "{tab:?}");
+        }
+    }
+}

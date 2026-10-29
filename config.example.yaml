@@ -252,11 +252,11 @@ providers:
 #     transport: "streamable_http"
 #     url: "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
 #     capabilities: ["read", "write"]
-#     headers_env: { Authorization: "MY_MCP_AUTHORIZATION" } # Env var, not secret.
-#     # The variable must be set to a valid HTTP header value, e.g. Bearer ...
-#     # Missing/non-Unicode variables fail startup; empty values are passed through.
+#     headers: # A literal, {env: NAME} or {command: "..."}, as a provider's headers.
+#       Authorization: { env: "MY_MCP_AUTHORIZATION" } # e.g. Bearer ...
+#     # Missing/blank variables and failed commands fail startup.
 #     # Connect first. Start this optional local command ONLY if the endpoint is unreachable,
 #     # never for authentication or protocol errors. cwd/env require start_command.
 #     start_command: ["my-http-mcp-server", "--port", "8080"]
-# Stdio requires start_command and rejects url/headers_env; HTTP requires url.
+# Stdio requires start_command and rejects url/headers; HTTP requires url.
 # Unknown fields/capabilities, invalid combinations, and invalid timeouts are errors.

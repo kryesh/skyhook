@@ -51,8 +51,9 @@ controls whether and how the model receives a fresh `<skyhook_state>` snapshot w
 The snapshot shows the host's current local date, active jobs, and the caller's todo list.
 Empty job and todo sections are omitted. This is a compact model-facing view, not the JSON
 returned by job or todo tools; scripts should use those tools to inspect state.
-Dynamic snapshots are still recorded with model requests; this mode is not a data-retention or
-provider-cache control.
+Dynamic snapshots are still recorded with model requests; this mode is not a data-retention
+control. It does affect prompt caching: see `state_mode` for when `persist` keeps more of the
+history cached.
 
 ### Reading job progress
 

@@ -2005,6 +2005,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "linux-ssh"
+version = "0.4.0"
+dependencies = [
+ "mimalloc",
+ "skyhook",
+ "tokio",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3185,6 +3194,7 @@ version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -3516,17 +3526,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
-name = "skyhook-agent"
-version = "0.3.0"
+name = "skyhook"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bytes",
  "chrono",
- "clap",
- "crossterm",
  "dom_query",
  "dom_smoothie",
- "dotenvy",
  "encoding_rs",
  "futures-util",
  "getrandom 0.4.3",
@@ -3542,16 +3549,12 @@ dependencies = [
  "jsonschema",
  "libc",
  "libsql",
- "mimalloc",
  "png",
- "pulldown-cmark",
- "ratatui",
  "rcgen",
  "reqwest",
  "rmcp",
  "rmp-serde",
  "rquickjs",
- "rust-embed",
  "rustls",
  "schemars",
  "serde",
@@ -3564,15 +3567,71 @@ dependencies = [
  "sha2",
  "sse-stream",
  "struson",
- "syntect",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "zeroize",
+]
+
+[[package]]
+name = "skyhook-cli"
+version = "0.4.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dotenvy",
+ "futures-util",
+ "ignore",
+ "image",
+ "indexmap",
+ "libc",
+ "mimalloc",
+ "pulldown-cmark",
+ "ratatui",
+ "rust-embed",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "serde_path_to_error",
+ "skyhook",
+ "syntect",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",
+]
+
+[[package]]
+name = "skyhook-security"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "http",
+ "indexmap",
+ "libsql",
+ "mimalloc",
+ "pulldown-cmark",
+ "schemars",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "serde_with",
+ "sha2",
+ "skyhook",
+ "skyhook-cli",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -17,17 +17,22 @@ setup:
 # Debug CLI; reads whatever is in target/shims live from disk.
 [positional-arguments]
 run *args:
-    cargo run --locked --features tui -- "$@"
+    cargo run --locked -p skyhook-cli -- "$@"
 
-# Debug CLI; reads whatever is in target/shims live from disk.
+# Debug security companion; reads whatever is in target/shims live from disk.
+[positional-arguments]
+run-security *args:
+    cargo run --locked -p skyhook-security -- "$@"
+
+# Debug applications; read whatever is in target/shims live from disk.
 build:
-    cargo build --locked --features tui
+    cargo build --locked -p skyhook-cli -p skyhook-security
 
-# Release CLI; embeds whatever is in target/shims at compile time.
+# Release applications; embed whatever is in target/shims at compile time.
 build-release:
     # rust-embed cannot see newly added files; force the embedding module to rebuild.
-    touch src/bin/skyhook/embedded_shims.rs
-    cargo build --locked --release --features tui
+    touch crates/skyhook-cli/src/embedded_shims.rs
+    cargo build --locked --release -p skyhook-cli -p skyhook-security
 
 # Debug builds of every shim, staged into target/shims.
 build-shims: (_shims "dev")
@@ -35,20 +40,21 @@ build-shims: (_shims "dev")
 # Size-optimised builds of every shim, staged into target/shims.
 build-shims-release: (_shims "release")
 
-# Release shims, then a release CLI that embeds them.
+# Release shims, then release applications that embed them.
 build-full: build-shims-release build-release
 
-# Build everything for release and install the CLI as ~/.local/bin/skyhook.
+# Build everything for release and install both applications into ~/.local/bin.
 install: build-full
     install -Dm 755 target/release/skyhook ~/.local/bin/skyhook
+    install -Dm 755 target/release/skyhook-security ~/.local/bin/skyhook-security
 
 # Run the test suite with nextest.
 test:
-    cargo nextest run --locked --all-targets --all-features
+    cargo nextest run --locked --workspace --all-targets
 
 # Lint all targets.
 lint:
-    cargo clippy --locked --all-targets --all-features -- -D warnings
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # Format all Rust code.
 fmt:
@@ -83,7 +89,6 @@ _shims mode:
 # Build the linux-ssh shim for every target in linux_ssh_targets, staged into target/shims.
 _shims_linux_ssh profile dir:
     for triple in {{ linux_ssh_targets }}; do \
-        cargo zigbuild --locked --profile {{ profile }} --bin linux-ssh \
-            --features shim-bin --target "$triple"; \
+        cargo zigbuild --locked --profile {{ profile }} -p linux-ssh --target "$triple"; \
         install -Dm 755 "target/$triple/{{ dir }}/linux-ssh" "target/shims/linux-ssh-${triple%%-*}"; \
     done

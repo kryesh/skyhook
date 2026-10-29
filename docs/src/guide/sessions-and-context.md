@@ -9,7 +9,17 @@ behind does not create an empty saved session. Resuming an existing session stil
 Use `--resume SESSION_ID` to reopen a session. The CLI stores session logs and looks for
 saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` selects the workspace
 (default: the current directory). It does not search parent or sibling workspaces. Sessions
-written by an incompatible earlier session format cannot be reopened.
+written by an incompatible earlier session format cannot be reopened and are left out of
+`/sessions`, as are a product's own sessions whose product data, such as Skyhook Security's
+research, an incompatible earlier version wrote.
+
+Skyhook's file tools never open a database this process holds open: searches skip an open
+session's `session.db`, `session.db-wal` and `session.db-shm`, and reading, replacing or removing
+them, or removing a directory that contains them, is refused, since closing any handle to such a
+file would release the database's locks. A session opening while a file tool reads its files
+waits briefly for the read to finish. To inspect a live session from outside, open it read-only
+without its shared memory index changing, for example
+`sqlite3 'file:.skyhook/sessions/<id>/session.db?mode=ro&readonly_shm=1'`.
 
 The terminal keeps several sessions open at once. `/new` opens a draft beside the current session,
 and `/sessions` lists the open and saved sessions: the current session first, then the other
@@ -24,15 +34,21 @@ still waiting for its main agent is listed and opens as idle, as described below
 that was held open when the list was shown, by another Skyhook instance or because it was still
 closing here. Choosing one that was closing here opens it once it has closed; one another instance
 holds cannot be opened until that instance closes it, and choosing it says so. A saved session whose
-status cannot be read shows no status symbol. Each row's id, event count, mode, and last activity
-time sit at the right. When a row is too narrow, they give way from the left, id first, then event
-count, mode, and time, so titles keep at least 30 columns; longer titles are cut short with `…`.
+status cannot be read shows no status symbol. Each row's id, event count, mode, last activity
+time, and creating host sit at the right. When a row is too narrow, they give way from the left,
+id first and host last, so titles keep at least 30 columns; longer titles are cut short with `…`.
 Choosing an open session switches to it, choosing a saved one opens it alongside. Sessions you
 switch away from keep working, and the notice line reports when one of them has a pending question
 or permission request or has failed. A session you switch away from with nothing running, nothing
 waiting on you, and nothing typed or queued is closed, so other Skyhook instances can open it; it
 stays in the list as a saved session. `/close` shuts down the current session only; quitting shuts
 down all of them.
+
+Sessions created by another Skyhook product are labelled with their host and **view-only** in
+history and the terminal header. You can inspect agents, requests, jobs and saved output, copy
+text, and export the conversation. The composer, rename, model/mode selection, continuation,
+interruption and job cancellation are unavailable; reopening and closing never activate these
+sessions. Use the creating product to continue or change them.
 
 A session is named after the first message you send it. Rename it with `/rename` (`Ctrl+X L`) or
 by clicking its title in the sidebar. A title you set stays until you change it, whatever the

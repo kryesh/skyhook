@@ -13,12 +13,23 @@ The runtime exposes:
   and any other value throws a `TypeError` at the call.
   Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;
 - `new WorkPool(concurrency).map(items, worker)` and `.run([fn1, fn2, ...])` as async iterables
-  yielding successful `{index, value}` results in completion order. `run` requires exactly one
-  array of functions, each called with no arguments—not variadic arguments. Invalid `run`
-  arguments, and a `map` worker that is not a function, throw before any task starts. Failures thrown by valid tasks are logged and skipped;
-  remaining items continue. Early iterator closure stops scheduling and drains running work;
+  yielding `{index, value}` results in completion order, or `{index, error}` for a task that
+  threw; remaining items continue. `run` requires exactly one array of functions, each called
+  with no arguments—not variadic arguments. Invalid `run` arguments, and a `map` worker that is
+  not a function, throw before any task starts. Early iterator closure stops scheduling and
+  drains running work;
+- `.feed(next, worker, {wake})` for work that becomes ready over time: whenever a slot frees it
+  calls `await next(running, free)` (a `Map` of running keys to their items, and how many slots
+  are free), starts the returned items whose `key` (a string or number) is not already running,
+  and yields `{key, item, value}` or `{key, item, error}` as each completes. Items beyond the free
+  slots wait and start, in order, before `next` is called again. It ends when nothing is running
+  and `next` starts nothing. An optional `wake` function (such as `receive`) is called while work
+  runs and raced alongside it: each value it resolves yields `{wake: value}`. A wake still pending
+  when the feed ends is released, so the input it would have taken goes to the next `receive()`;
 - `await receive()` waits for the next JSON value sent to the script's own job ID with
-  `tool.job(scriptJobId).send({value})`; the script must be launched with `bg: true`.
+  `tool.job(scriptJobId).send({value})`; the script must be launched with `bg: true`. Values
+  arrive in order. Calling `release()` on a receive you no longer await hands its value, taken or
+  not, to the next `receive()`.
   This is script input, not child-agent input: agents receive owner updates automatically.
 
 For example, pass the task functions to `run` in one array:
@@ -34,6 +45,21 @@ for await (const {index, value} of new WorkPool(2).run([
 }
 return results;
 ```
+
+## Memory limit
+
+Each script call has a **512 MiB (536,870,912-byte) QuickJS allocation limit**. This covers
+runtime-managed memory, including JavaScript objects, strings, and JavaScript-created
+ArrayBuffer and typed-array storage. Freed memory restores capacity; the limit is not a
+cumulative allocation, execution-time, or token budget.
+
+An allocation that exceeds the limit throws an out-of-memory error. Scripts can catch it;
+an uncaught error fails the call. Keep headroom for temporary allocations during result
+conversion and serialization.
+
+This is not a total process-memory limit. Rust-side tool results, host bookkeeping, and
+other native allocations are outside the budget, and concurrent script calls each have
+their own allowance.
 
 ## Saved output and serialization
 
@@ -76,7 +102,12 @@ running, is answered with this same failure shape.
 `presentation` is absent when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups `preview`, `shape`, `truncated`, `captures`,
 `question`, and `notice`, each present only when it has content, and precedes `result`. Read a
-text page as `r.presentation.preview.lines` and a question as `r.presentation.question`.
+text page as `r.presentation.preview.lines` and a question as `r.presentation.question`,
+`{questions}`. Presentation never shortens a question. A script never sees a question its
+`tool.agent(...)` child asks: the call keeps waiting for the child's result while the question
+reaches the script's agent as a job event, and a foreground script's own call moves to the
+background so that agent can answer (see
+[delegation](../scripting/jobs-and-agents.md#delegation-and-child-input)).
 Truncation entries keep their source paths rooted at `/result/...`.
 
 JavaScript receives complete data; model views may shorten fields as described in
@@ -145,13 +176,13 @@ whether execution failed. Automatic previews can shorten it.
 
 Returned values convert to JSON:
 
-- A top-level `undefined` becomes `null`.
+- As in `JSON.stringify`, an `undefined` member is omitted, and a top-level `undefined` or an
+  `undefined` array element becomes `null`.
 - Promises, builders and other thenables anywhere in the value are awaited.
 - An `Error` becomes an object of its `name`, `message`, `cause` and other properties.
 - An unpaired surrogate in a string becomes U+FFFD.
-- Anything else that is not JSON is a problem at its path, such as `$.items[2]`: an `undefined`
-  member or array element, non-finite numbers, `BigInt`s, functions, symbols, cycles, objects
-  other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
+- Anything else that is not JSON is a problem at its path, such as `$.items[2]`: non-finite
+  numbers, `BigInt`s, functions, symbols, cycles, objects other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
   a member whose getter throws or whose promise rejects, reported with its error's message.
 
 Conversion runs after the body returns, so the body's own `try`/`catch` cannot catch its problems.
@@ -160,8 +191,8 @@ A value with problems still fails the script, with an error listing them by path
 kept as on any failure.
 
 Tool arguments convert the same way when the builder is made, so a failure throws at the call:
-`undefined` properties are omitted, while promises, builders, `Error`s and unpaired surrogates
-fail.
+`undefined` properties are omitted, while `undefined` array elements, promises, builders, `Error`s
+and unpaired surrogates fail.
 
 ## Builder execution and policy
 

@@ -1,0 +1,896 @@
+//! Structured tool failure facts and their single capability-aware renderer.
+//!
+//! Sites remain facts until presentation: durable messages must not embed a target
+//! alias that a later, less privileged reader is not allowed to discover.
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    execution::ExecutionLocation,
+    identity::JobId,
+    job::JobError,
+    named_enum::named_enum,
+    target::TargetRef,
+    tool::{ToolPlacement, output::escape_pointer_segment, policy::CapabilitySet},
+};
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum Operation {
+        Execute = "execute",
+        Validate = "validate",
+        Authorize = "authorize",
+        Connect = "connect",
+        Inspect = "inspect",
+        Canonicalize = "canonicalize",
+        Read = "read",
+        ReadDirectory = "read_directory",
+        Create = "create",
+        CreateDirectories = "create_directories",
+        Write = "write",
+        Copy = "copy",
+        Remove = "remove",
+        Rename = "rename",
+        SetPermissions = "set_permissions",
+        SyncFile = "sync_file",
+        OpenDirectory = "open_directory",
+        SyncDirectory = "sync_directory",
+        Capture = "capture",
+        CreateCapture = "create_capture",
+        ReadCapture = "read_capture",
+        WriteCapture = "write_capture",
+        FinishCapture = "finish_capture",
+        StoreImage = "store_image",
+        Prepare = "prepare",
+        Spawn = "spawn",
+        Wait = "wait",
+        Terminate = "terminate",
+        Deserialize = "deserialize",
+        Lookup = "lookup",
+        Load = "load",
+        Save = "save",
+        Send = "send",
+        Receive = "receive",
+    }
+}
+
+impl Operation {
+    /// The effects of a failure whose site names none: an operation that only
+    /// observes has no destination to report on.
+    const fn unset_effects(self) -> Effects {
+        match self {
+            Self::Inspect | Self::Lookup | Self::Wait => Effects::ReadOnly,
+            _ => Effects::Unknown,
+        }
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum Effects {
+        Unknown = "unknown",
+        NotStarted = "not_started",
+        Unchanged = "unchanged",
+        ReadOnly = "read_only",
+        DestinationReplaced = "destination_replaced",
+        PartialChange = "partial_change",
+        OutputIncomplete = "output_incomplete",
+    }
+}
+
+named_enum! {
+    /// What a request sent over the network, to an MCP server or to a remote
+    /// target may have done there, independent of the local [`Effects`].
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum RequestEffects {
+        Unknown = "unknown",
+        MayHaveExecuted = "may_have_executed",
+    }
+}
+
+/// An explicitly selected safe subject, never arbitrary serialized arguments.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum Subject {
+    None,
+    Path(
+        #[serde(with = "crate::execution::native_path")]
+        #[schemars(with = "String")]
+        PathBuf,
+    ),
+    WorkingDirectory(
+        #[serde(with = "crate::execution::native_path")]
+        #[schemars(with = "String")]
+        PathBuf,
+    ),
+    StagingFile(
+        #[serde(with = "crate::execution::native_path")]
+        #[schemars(with = "String")]
+        PathBuf,
+    ),
+    ParentDirectory(
+        #[serde(with = "crate::execution::native_path")]
+        #[schemars(with = "String")]
+        PathBuf,
+    ),
+    DirectoryEntry(
+        #[serde(with = "crate::execution::native_path")]
+        #[schemars(with = "String")]
+        PathBuf,
+    ),
+    Argument(String),
+    Tool(String),
+    Job(JobId),
+    Process,
+    Label(String),
+}
+
+impl Subject {
+    pub fn path(path: impl AsRef<Path>) -> Self {
+        Self::Path(path.as_ref().to_owned())
+    }
+    pub fn working_directory(path: impl AsRef<Path>) -> Self {
+        Self::WorkingDirectory(path.as_ref().to_owned())
+    }
+    /// A JSON pointer into the tool arguments: the spelling schema validation reports.
+    pub fn argument<S: AsRef<str>>(segments: impl IntoIterator<Item = S>) -> Self {
+        Self::Argument(
+            segments
+                .into_iter()
+                .map(|segment| format!("/{}", escape_pointer_segment(segment.as_ref())))
+                .collect(),
+        )
+    }
+}
+
+/// Invocation is resolved by the executor, not by the tool or renderer.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum FailureSite {
+    Invocation,
+    Host,
+    Execution(ExecutionLocation),
+}
+
+impl FailureSite {
+    /// Where a tool so placed fails: the host, or where it runs.
+    pub fn bound(location: &ExecutionLocation, placement: ToolPlacement) -> Self {
+        match placement {
+            ToolPlacement::Host => Self::Host,
+            ToolPlacement::InheritWorkspace | ToolPlacement::TargetedWorkspace => {
+                Self::Execution(location.clone())
+            }
+        }
+    }
+}
+
+/// Rendering facts belong to the viewer, not the operation that produced the error.
+#[derive(Clone, Copy)]
+pub(crate) struct DiagnosticViewer<'a> {
+    pub capabilities: &'a CapabilitySet,
+    /// The viewing agent's location; a host viewer has none and sees every detail.
+    location: Option<&'a ExecutionLocation>,
+}
+
+impl<'a> DiagnosticViewer<'a> {
+    pub(crate) fn new(capabilities: &'a CapabilitySet, location: &'a ExecutionLocation) -> Self {
+        Self {
+            capabilities,
+            location: Some(location),
+        }
+    }
+
+    pub(crate) fn location(&self) -> Option<&'a ExecutionLocation> {
+        self.location
+    }
+}
+
+/// Capability-only inspection is a host view; agent presentation supplies its location.
+impl<'a> From<&'a CapabilitySet> for DiagnosticViewer<'a> {
+    fn from(capabilities: &'a CapabilitySet) -> Self {
+        Self {
+            capabilities,
+            location: None,
+        }
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum PathRole {
+        Requested = "requested",
+        Resolved = "resolved",
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct PathFact {
+    pub role: PathRole,
+    #[serde(with = "crate::execution::native_path")]
+    #[schemars(with = "String")]
+    pub path: PathBuf,
+}
+
+/// The resolved facts persistence, the wire and the renderer see.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct DiagnosticContext {
+    pub operation: Operation,
+    pub subject: Subject,
+    pub site: FailureSite,
+    pub effects: Effects,
+    pub request: RequestEffects,
+    pub paths: Vec<PathFact>,
+}
+
+/// The facts a failure site chose. Each boundary nearer the caller fills what
+/// is still unset with [`PartialContext::or`]; nothing set is ever replaced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialContext {
+    operation: Option<(Operation, Subject)>,
+    site: Option<FailureSite>,
+    effects: Option<Effects>,
+    request: Option<RequestEffects>,
+    paths: Vec<PathFact>,
+}
+
+impl PartialContext {
+    pub fn new(operation: Operation, subject: Subject) -> Self {
+        Self {
+            operation: Some((operation, subject)),
+            ..Self::default()
+        }
+    }
+    #[must_use]
+    pub fn path(mut self, role: PathRole, path: impl AsRef<Path>) -> Self {
+        self.paths.push(PathFact {
+            role,
+            path: path.as_ref().to_owned(),
+        });
+        self
+    }
+    #[must_use]
+    pub(crate) fn paths(mut self, paths: Vec<PathFact>) -> Self {
+        self.paths = paths;
+        self
+    }
+    /// Name what failed, keeping the stage already chosen; the neutral stage
+    /// otherwise.
+    #[must_use]
+    pub fn subject(mut self, subject: Subject) -> Self {
+        let operation = self
+            .operation
+            .map_or(Operation::Execute, |(operation, _)| operation);
+        self.operation = Some((operation, subject));
+        self
+    }
+    #[must_use]
+    pub fn at(mut self, site: FailureSite) -> Self {
+        self.site = Some(site);
+        self
+    }
+    #[must_use]
+    pub fn effects(mut self, effects: Effects) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+    #[must_use]
+    pub fn request(mut self, request: RequestEffects) -> Self {
+        self.request = Some(request);
+        self
+    }
+    /// Fill the facts this context leaves unset from `fallback`.
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            operation: self.operation.or(fallback.operation),
+            site: self.site.or(fallback.site),
+            effects: self.effects.or(fallback.effects),
+            request: self.request.or(fallback.request),
+            paths: if self.paths.is_empty() {
+                fallback.paths
+            } else {
+                self.paths
+            },
+        }
+    }
+    /// Unset facts resolve to the neutral spellings: a plain execution failure
+    /// at the invocation whose effects are its operation's.
+    pub fn resolve(self) -> DiagnosticContext {
+        let (operation, subject) = self
+            .operation
+            .unwrap_or((Operation::Execute, Subject::None));
+        DiagnosticContext {
+            operation,
+            subject,
+            site: self.site.unwrap_or(FailureSite::Invocation),
+            effects: self.effects.unwrap_or(operation.unset_effects()),
+            request: self.request.unwrap_or(RequestEffects::Unknown),
+            paths: self.paths,
+        }
+    }
+}
+
+/// A resolved context, restored from persistence or the wire, has every fact set.
+impl From<DiagnosticContext> for PartialContext {
+    fn from(context: DiagnosticContext) -> Self {
+        Self {
+            operation: Some((context.operation, context.subject)),
+            site: Some(context.site),
+            effects: Some(context.effects),
+            request: Some(context.request),
+            paths: context.paths,
+        }
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum IoKind {
+        NotFound = "not_found",
+        PermissionDenied = "permission_denied",
+        AlreadyExists = "already_exists",
+        InvalidInput = "invalid_input",
+        InvalidData = "invalid_data",
+        TimedOut = "timed_out",
+        Interrupted = "interrupted",
+        UnexpectedEof = "unexpected_eof",
+        BrokenPipe = "broken_pipe",
+        ConnectionRefused = "connection_refused",
+        ConnectionReset = "connection_reset",
+        ConnectionAborted = "connection_aborted",
+        NotConnected = "not_connected",
+        WouldBlock = "would_block",
+        HostUnreachable = "host_unreachable",
+        NetworkUnreachable = "network_unreachable",
+        NetworkDown = "network_down",
+        AddressInUse = "address_in_use",
+        AddressNotAvailable = "address_not_available",
+        WriteZero = "write_zero",
+        Unsupported = "unsupported",
+        OutOfMemory = "out_of_memory",
+        IsADirectory = "is_a_directory",
+        NotADirectory = "not_a_directory",
+        DirectoryNotEmpty = "directory_not_empty",
+        ReadOnlyFilesystem = "read_only_filesystem",
+        StorageFull = "storage_full",
+        Other = "other",
+    }
+}
+
+impl From<io::ErrorKind> for IoKind {
+    fn from(kind: io::ErrorKind) -> Self {
+        match kind {
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            io::ErrorKind::InvalidInput => Self::InvalidInput,
+            io::ErrorKind::InvalidData => Self::InvalidData,
+            io::ErrorKind::TimedOut => Self::TimedOut,
+            io::ErrorKind::Interrupted => Self::Interrupted,
+            io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
+            io::ErrorKind::ConnectionReset => Self::ConnectionReset,
+            io::ErrorKind::ConnectionAborted => Self::ConnectionAborted,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            io::ErrorKind::HostUnreachable => Self::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable => Self::NetworkUnreachable,
+            io::ErrorKind::NetworkDown => Self::NetworkDown,
+            io::ErrorKind::AddrInUse => Self::AddressInUse,
+            io::ErrorKind::AddrNotAvailable => Self::AddressNotAvailable,
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::WriteZero => Self::WriteZero,
+            io::ErrorKind::Unsupported => Self::Unsupported,
+            io::ErrorKind::OutOfMemory => Self::OutOfMemory,
+            io::ErrorKind::IsADirectory => Self::IsADirectory,
+            io::ErrorKind::NotADirectory => Self::NotADirectory,
+            io::ErrorKind::DirectoryNotEmpty => Self::DirectoryNotEmpty,
+            io::ErrorKind::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+            io::ErrorKind::StorageFull => Self::StorageFull,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum Cause {
+    Io {
+        kind: IoKind,
+        code: Option<i32>,
+        detail: Option<String>,
+    },
+    InvalidArguments(String),
+    Denied(String),
+    Cancelled,
+    Interrupted,
+    InputClosed,
+    Message(String),
+    Json,
+    /// The tool needs a capability this context lacks: it is unavailable here,
+    /// which is not a policy denial.
+    Unavailable {
+        tool: String,
+    },
+    UnknownTool {
+        tool: String,
+    },
+    /// A script-only tool called directly by the model.
+    ModelHidden {
+        tool: String,
+    },
+    ScriptUnavailable {
+        tool: String,
+    },
+    UnknownJob {
+        job: JobId,
+    },
+    JobAlreadyTerminal {
+        job: JobId,
+    },
+}
+
+impl Cause {
+    pub fn io(error: &io::Error) -> Self {
+        Self::Io {
+            kind: error.kind().into(),
+            code: error.raw_os_error(),
+            detail: error.get_ref().map(|reason| safe_text(&reason.to_string())),
+        }
+    }
+
+    /// Opaque subsystem messages may contain arguments, credentials or payloads.
+    /// Redaction changes only detail, never classification or the originating OS code.
+    pub(crate) fn redact_io_detail(&mut self) {
+        if let Self::Io { detail, .. } = self {
+            *detail = None;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub context: DiagnosticContext,
+    pub cause: Cause,
+}
+
+/// A failure's facts before its boundaries have filled them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialDiagnostic {
+    pub context: PartialContext,
+    pub cause: Cause,
+}
+
+impl PartialDiagnostic {
+    pub const fn new(context: PartialContext, cause: Cause) -> Self {
+        Self { context, cause }
+    }
+    pub const fn is_denial(&self) -> bool {
+        matches!(self.cause, Cause::Denied(_))
+    }
+    #[must_use]
+    pub fn or(mut self, fallback: PartialContext) -> Self {
+        self.context = self.context.or(fallback);
+        self
+    }
+    pub fn resolve(self) -> Diagnostic {
+        Diagnostic::new(self.context.resolve(), self.cause)
+    }
+    pub(crate) fn session(error: &crate::session::SessionError) -> Self {
+        use crate::session::SessionError::*;
+        use Cause::Message;
+        let cause = match error {
+            Io(error) => {
+                let mut cause = Cause::io(error);
+                cause.redact_io_detail();
+                cause
+            }
+            Unconfirmed(_) => Message(crate::session::JOURNAL_FAILED.into()),
+            JournalFailed(failure) => return Self::session(failure.cause()),
+            Refused(phase) => Message(format!("the session is {phase}")),
+            Database(_) => Message("session database operation failed".into()),
+            ModelRequestReplay { sequence, reason } => Message(format!(
+                "cannot reconstruct model request at sequence {sequence}: {reason}"
+            )),
+            InvalidCompaction { sequence, reason } => Message(format!(
+                "invalid compaction at sequence {sequence}: {reason}"
+            )),
+            WriterLost => Message("session writer was lost".into()),
+            Task(_) => Message("session task failed".into()),
+            NotFound(session) => Message(format!("session {session} was not found")),
+            Random(_) => Message("session identifier generation failed".into()),
+            AlreadyOpen(session) => Message(format!("session {session} is already open")),
+            UnsupportedVersion(version) => {
+                Message(format!("unsupported session version {version}"))
+            }
+            WrongSession => Message("event belongs to another session".into()),
+            IllegalTransition { sequence } => Message(format!(
+                "journal entry {sequence} changes a job's phase illegally"
+            )),
+            Blob { reason, .. } => Message(format!("stored blob {reason}")),
+        };
+        Self::new(PartialContext::default().at(FailureSite::Host), cause)
+    }
+}
+
+impl From<Diagnostic> for PartialDiagnostic {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::new(diagnostic.context.into(), diagnostic.cause)
+    }
+}
+
+impl Diagnostic {
+    pub const fn new(context: DiagnosticContext, cause: Cause) -> Self {
+        Self { context, cause }
+    }
+    pub const fn is_denial(&self) -> bool {
+        matches!(self.cause, Cause::Denied(_))
+    }
+    /// A worker is authoritative about its path, never about a session target alias.
+    /// All worker execution sites map to the host's trusted connection destination.
+    pub fn bind_worker(&mut self, location: &ExecutionLocation) {
+        self.context.site = FailureSite::Execution(location.clone());
+    }
+    /// Render for a host viewer. Agent-facing presentation also supplies its target.
+    pub fn render(&self, capabilities: &CapabilitySet) -> String {
+        self.render_for(capabilities.into())
+    }
+
+    pub(crate) fn render_for(&self, viewer: DiagnosticViewer<'_>) -> String {
+        let capabilities = viewer.capabilities;
+        let mut text = self.context.operation.as_str().replace('_', " ");
+        text.push_str(&match &self.context.subject {
+            Subject::None => String::new(),
+            Subject::Path(path) => format!(" path {}", quoted_path(path)),
+            Subject::WorkingDirectory(path) => format!(" working directory {}", quoted_path(path)),
+            Subject::StagingFile(path) => format!(" staging file for {}", quoted_path(path)),
+            Subject::ParentDirectory(path) => format!(" parent directory {}", quoted_path(path)),
+            Subject::DirectoryEntry(path) => format!(" directory entry {}", quoted_path(path)),
+            Subject::Argument(path) => format!(" argument {}", quoted(path)),
+            Subject::Tool(tool) => format!(" tool {}", quoted(tool)),
+            Subject::Job(job) => format!(" job {job}"),
+            Subject::Process => " process".into(),
+            Subject::Label(label) => format!(" {}", safe_text(label)),
+        });
+        for path in &self.context.paths {
+            text.push_str(&format!(
+                " ({} {})",
+                path.role.as_str(),
+                quoted_path(&path.path)
+            ));
+        }
+        text.push_str(" failed");
+        match &self.context.site {
+            FailureSite::Invocation => {}
+            FailureSite::Host => {
+                if viewer
+                    .location
+                    .is_some_and(|location| location.target != TargetRef::Root)
+                {
+                    text.push_str(" on session host");
+                }
+            }
+            FailureSite::Execution(location) => {
+                match capabilities.visible_target(&location.target) {
+                    Some(target) => {
+                        text.push_str(&format!(" on target {}", quoted(target.as_str())))
+                    }
+                    None => text.push_str(" in execution workspace"),
+                }
+                // The workspace is relevant even for an absolute requested path: cwd
+                // can fail before that requested operation starts.
+                text.push_str(&format!(
+                    " (workspace {})",
+                    quoted_path(&location.workspace)
+                ));
+            }
+        }
+        text.push_str(": ");
+        match &self.cause {
+            Cause::Io { kind, code, detail } => {
+                text.push_str(&kind.as_str().replace('_', " "));
+                if let Some(code) = code {
+                    text.push_str(&format!(" (OS error {code})"));
+                }
+                if let Some(detail) = detail {
+                    text.push_str(&format!(": {}", safe_text(detail)));
+                }
+            }
+            Cause::InvalidArguments(message) | Cause::Message(message) => {
+                text.push_str(&safe_text(message))
+            }
+            Cause::Denied(reason) => {
+                text.push_str("permission denied");
+                if !reason.is_empty() {
+                    text.push_str(&format!(" ({})", safe_text(reason)));
+                }
+            }
+            Cause::Cancelled => text.push_str("operation cancelled"),
+            Cause::Interrupted => text.push_str("operation interrupted; completion is unknown"),
+            Cause::InputClosed => text.push_str("tool input channel is closed"),
+            Cause::Json => text.push_str("invalid JSON data"),
+            Cause::Unavailable { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is unavailable in this context"
+            ))),
+            Cause::UnknownTool { tool } => {
+                text.push_str(&safe_text(&format!("unknown tool `{tool}`")))
+            }
+            Cause::ModelHidden { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is not exposed for direct model calls"
+            ))),
+            Cause::ScriptUnavailable { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is not available in scripts"
+            ))),
+            Cause::UnknownJob { job } => text.push_str(&JobError::Unknown(*job).to_string()),
+            Cause::JobAlreadyTerminal { job } => {
+                text.push_str(&JobError::AlreadyTerminal(*job).to_string())
+            }
+        }
+        text.push_str(match self.context.request {
+            RequestEffects::Unknown => "",
+            RequestEffects::MayHaveExecuted => "; request may have executed",
+        });
+        text.push_str(match self.context.effects {
+            Effects::Unknown | Effects::ReadOnly => "",
+            Effects::NotStarted => "; operation did not start",
+            Effects::Unchanged => "; destination unchanged",
+            Effects::DestinationReplaced => "; destination replaced; durability is uncertain",
+            Effects::PartialChange => "; partial changes may remain",
+            Effects::OutputIncomplete => "; output incomplete",
+        });
+        text
+    }
+}
+
+/// Remove an opaque I/O source message at a boundary that can contain secrets,
+/// retaining its typed kind and OS code without interpreting the message.
+pub(crate) fn opaque_io(error: impl std::borrow::Borrow<io::Error>) -> io::Error {
+    let error = error.borrow();
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => error.kind().into(),
+    }
+}
+
+/// Show control characters as escapes, so untrusted names and messages can
+/// neither drive a terminal nor fake line structure.
+pub fn escape_controls(value: impl std::fmt::Display) -> String {
+    let mut output = String::new();
+    for character in value.to_string().chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// Bound externally opaque text and remove terminal controls and URL credentials.
+/// This is presentation sanitization, never failure classification.
+pub(crate) fn safe_text(value: &str) -> String {
+    let mut text = String::new();
+    for word in value.split_whitespace() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let mut word = word
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect::<String>();
+        if let Some(scheme) = word.find("://") {
+            let authority = scheme + 3;
+            let end = word[authority..]
+                .find(['/', '?', '#'])
+                .map_or(word.len(), |i| authority + i);
+            if let Some(at) = word[authority..end].rfind('@') {
+                word.replace_range(authority..authority + at + 1, "[redacted]@");
+            }
+        }
+        text.push_str(&word);
+        if text.chars().count() > 512 {
+            text = text.chars().take(512).collect();
+            text.push('…');
+            break;
+        }
+    }
+    text
+}
+
+fn quoted_path(path: &Path) -> String {
+    match path.to_str() {
+        Some(path) => quoted(path),
+        None => {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            let escaped = bytes
+                .iter()
+                .take(512)
+                .flat_map(|byte| byte.escape_ascii())
+                .map(char::from)
+                .collect::<String>();
+            format!(
+                "native path bytes `{}`{}",
+                escaped.replace('`', "\\`"),
+                if bytes.len() > 512 { "…" } else { "" }
+            )
+        }
+    }
+}
+
+pub(crate) fn quoted(value: &str) -> String {
+    let escaped = value
+        .chars()
+        .take(512)
+        .flat_map(char::escape_debug)
+        .collect::<String>();
+    let suffix = if value.chars().count() > 512 {
+        "…"
+    } else {
+        ""
+    };
+    format!("`{}`{suffix}", escaped.replace('`', "\\`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::invocation::OperationError;
+    use serde_json::json;
+    #[test]
+    fn rendering_preserves_paths_but_hides_targets_and_opaque_credentials() {
+        let diagnostic = Diagnostic::new(
+            PartialContext::new(Operation::Read, Subject::path("two  spaces\n\u{1b}[2J"))
+                .at(FailureSite::Execution(ExecutionLocation::named(
+                    "bastion".parse().unwrap(),
+                    "/work".into(),
+                )))
+                .resolve(),
+            Cause::Message("failed https://user:password@example.test/path\n\u{1b}oops".into()),
+        );
+        let text = diagnostic.render(&CapabilitySet::default());
+        assert!(text.contains("two  spaces\\n\\u{1b}[2J"));
+        for secret in ["bastion", "password", "\u{1b}"] {
+            assert!(!text.contains(secret));
+        }
+        let mut host = diagnostic.clone();
+        host.context.site = FailureSite::Host;
+        let capabilities = CapabilitySet::default();
+        let local = ExecutionLocation::root("/local".into());
+        let remote = ExecutionLocation::named("worker".parse().unwrap(), "/remote".into());
+        assert!(
+            !host
+                .render_for(DiagnosticViewer::new(&capabilities, &local))
+                .contains("on session host")
+        );
+        assert!(
+            host.render_for(DiagnosticViewer::new(&capabilities, &remote))
+                .contains("on session host")
+        );
+        use std::os::unix::ffi::OsStringExt;
+        let mut diagnostic = diagnostic;
+        let path = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        diagnostic.context.subject = Subject::path(PathBuf::from(path));
+        let decoded: Diagnostic =
+            serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
+        assert_eq!(decoded, diagnostic);
+        let text = decoded.render(&CapabilitySet::default());
+        assert!(text.contains("\\xff"));
+        assert!(!text.contains('�'));
+    }
+    #[test]
+    fn normalization_retains_facts_and_output() {
+        let context =
+            PartialContext::new(Operation::Deserialize, Subject::argument(["items", "0"]))
+                .at(FailureSite::Host)
+                .effects(Effects::OutputIncomplete);
+        let wire = Diagnostic::new(
+            PartialContext::default().resolve(),
+            Cause::Io {
+                kind: IoKind::PermissionDenied,
+                code: Some(2),
+                detail: Some("remote reason".into()),
+            },
+        );
+        let native = serde_json::from_str::<serde_json::Value>("{private-payload").unwrap_err();
+        for (error, cause) in [
+            (OperationError::from(native), Cause::Json),
+            (
+                OperationError::io(io::Error::other("filesystem reason")),
+                Cause::io(&io::Error::other("filesystem reason")),
+            ),
+            (
+                OperationError::from_diagnostic(wire.clone(), None),
+                wire.cause,
+            ),
+        ] {
+            let error = error
+                .with_result(1_u8)
+                .context(context.clone())
+                .with_result(7)
+                .try_map_output(|value| Ok::<_, ()>(u16::from(value)))
+                .unwrap();
+            let (diagnostic, output) = error.into_parts();
+            assert_eq!(diagnostic.cause, cause);
+            assert_eq!(diagnostic.context, context.clone().resolve());
+            assert_eq!(output, Some(7_u16));
+            let text = diagnostic.render(&CapabilitySet::default());
+            assert!(!text.contains("private-payload"));
+            // Every fact of a restored diagnostic counts as chosen.
+            let decoded =
+                serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
+            let restored = OperationError::from_diagnostic(decoded, output).or(
+                PartialContext::new(Operation::Copy, Subject::path("fallback")),
+            );
+            assert_eq!(restored.into_parts(), (diagnostic, output));
+        }
+    }
+
+    #[test]
+    fn session_normalization_preserves_classification_and_redacts_opaque_details() {
+        use crate::{
+            db::DbError,
+            job::JobError,
+            session::SessionError,
+            tool::{ToolError, ToolOutput},
+        };
+        use std::sync::Arc;
+
+        const SECRET: &str = "private-session-payload";
+        for (error, message) in [
+            (
+                SessionError::Database(DbError::Corrupt(SECRET.into())),
+                "database operation failed",
+            ),
+            (
+                SessionError::Refused(crate::session::SessionPhase::Closed),
+                "session is closed",
+            ),
+            (
+                SessionError::Unconfirmed(None),
+                crate::session::JOURNAL_FAILED,
+            ),
+        ] {
+            let diagnostic = PartialDiagnostic::session(&error).resolve();
+            assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains(message)));
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            let text = diagnostic.render(&CapabilitySet::default());
+            assert!(!text.contains(SECRET));
+        }
+        let fallback = PartialContext::new(
+            Operation::WriteCapture,
+            Subject::Job(JobId::new(7).unwrap()),
+        )
+        .effects(Effects::OutputIncomplete);
+        let cases: [fn() -> io::Error; 2] = [
+            || io::Error::other(SECRET),
+            || io::Error::from_raw_os_error(13),
+        ];
+        for make in cases {
+            let mut expected = Cause::io(&make());
+            expected.redact_io_detail();
+            assert_eq!(Cause::io(&opaque_io(make())), expected);
+            assert_eq!(
+                ToolError::io(make()).opaque_io().diagnostic().cause,
+                expected
+            );
+            for error in [
+                ToolError::from(SessionError::Io(make())),
+                ToolError::from(Arc::new(SessionError::Io(make()))),
+                ToolError::from(JobError::from(SessionError::Io(make()))),
+            ] {
+                let (diagnostic, output) = error
+                    .with_result(ToolOutput::new(json!({"partial": true})))
+                    .or(fallback.clone())
+                    .into_parts();
+                assert_eq!(diagnostic.cause, expected);
+                assert_eq!(
+                    diagnostic.context,
+                    fallback.clone().at(FailureSite::Host).resolve()
+                );
+                assert_eq!(output.unwrap().value, json!({"partial": true}));
+            }
+        }
+    }
+}

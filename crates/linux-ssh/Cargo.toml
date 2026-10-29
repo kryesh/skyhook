@@ -1,0 +1,20 @@
+[package]
+name = "linux-ssh"
+description = "Skyhook SSH worker shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "linux-ssh"
+path = "src/main.rs"
+test = false
+bench = false
+doc = false
+
+[dependencies]
+skyhook.workspace = true
+mimalloc.workspace = true
+tokio.workspace = true

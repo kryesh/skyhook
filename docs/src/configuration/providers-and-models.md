@@ -19,7 +19,7 @@ Different models on one provider may use different supported codecs:
 | `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. Response schemas are sent as written, in strict mode on `responses`. Extra field: `state_role` (default `user`). |
 | `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas are sent in strict mode, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Reasoning summaries need a verified organisation; an unverified one is refused, so set `reasoning_summary: null` for it. Extra fields: `organization`, `project`. |
 | `anthropic` | `messages` | `base_url` defaults to `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`, `state_role` (default `system`). |
-| `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. Response schemas are sent in strict mode. |
+| `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. Each conversation's identity rides the `session-id` and `thread-id` headers and `prompt_cache_key`, which the service keys cache affinity on; the service caches implicitly, so `explicit_caching` is refused. Response schemas are sent in strict mode. |
 | `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching (on Responses, through OpenRouter's automatic caching), and each conversation keeps its routing affinity. Response schemas are sent in strict mode on `chat_completions` and `responses`. Extra fields: `routing`, `cache_ttl: "5m"` or `"1h"` on every codec, and `state_role` (default `user`). `routing` is sent on every codec as OpenRouter's `provider` preferences and `models` fallbacks: `order` (provider slugs to try first; a preference unless `allow_fallbacks: false`, which restricts routing to them), `only` (provider slugs allowed), `ignore` (provider slugs skipped), `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, and `fallback_models`. A response schema always sets `require_parameters`. |
 | `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind `anthropic`, Chat replays signed thinking and takes prompt caching. Behind `openai`, Chat and Responses take OpenAI's conventions, with neither. Behind `bedrock`, which serves both families, they take OpenAI's conventions too, but Chat still replays the thinking blocks the proxy returns, and both Chat and `messages` replay unsigned thinking until signed thinking appears. Response schemas are sent in strict mode on `chat_completions` and `responses`, except behind `anthropic`, which does not honour it. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Each conversation's identity rides `x-litellm-session-id`, which LiteLLM's session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind `openai` or `bedrock` also send it as `prompt_cache_key`, which LiteLLM passes on for the service's own cache affinity. LiteLLM refuses `prompt_cache_key` for every model it serves through Bedrock's Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock's OpenAI endpoint. Serve Claude through `messages`, whatever its upstream. For the others, send the identity in the header alone with `cache_key: {header: "x-litellm-session-id"}`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
 
@@ -122,7 +122,8 @@ model that switches away from Responses must clear inherited ones with `null`.
 
 `explicit_caching: true`, as a provider default or beside `model`, switches a
 `chat_completions` or `responses` request to explicit prompt caching
-(`prompt_cache_options: {mode: "explicit"}`): the backend caches only at the breakpoints
+(`prompt_cache_options: {mode: "explicit"}`) on every dialect but `codex`, which refuses the
+setting: the backend caches only at the breakpoints
 Skyhook marks, never on the changing runtime state, so later requests can reuse the prefix.
 Both mark the end of the stable history and the point where each earlier request's history
 ended, and Chat also the stable system prompt, up to four breakpoints a request: the newest
@@ -250,9 +251,13 @@ not an enforced minimum.
 `state_mode` controls how per-request runtime state (date, active jobs, and todos) reaches the model.
 `dynamic` (the default) sends a fresh state with each request; the model sees only the current one.
 `persist` keeps each state in the conversation, at the cost of keeping every one in context until
-compaction. Use it for models that bind signed reasoning to the exact earlier conversation (such
-as Claude Fable 5.1) when the provider cannot hide earlier state, for example Claude reached
-through a Chat Completions or Responses proxy. `none` sends no runtime state, except to a
+compaction; a state the latest kept one already shows is not repeated. Use it for models that bind
+signed reasoning to the exact earlier conversation (such as Claude Fable 5.1) when the provider
+cannot hide earlier state, for example Claude reached through a Chat Completions or Responses
+proxy. Use it too where a large state (many jobs or todos) defeats prompt caching: `chat_completions`
+and `responses` cannot hide an earlier state, so under `dynamic` each request leaves out the
+previous one's, and a provider that reuses only where an earlier request ended, as `codex` does,
+then reuses little of the history. `none` sends no runtime state, except to a
 compaction summary, which needs the current todo list to reconcile it. See
 [runtime state](../reference/runtime-state.md) for what the model receives.
 
@@ -355,12 +360,12 @@ for server options.
 
 For every provider, **transient/network failures retry until success or cancellation**,
 with no attempt limit. This includes connection failures, interrupted streams, timeouts,
-rate limits, temporary server errors, and an expired command-sourced credential
-([authentication](authentication.md#api-keys-and-environment-files)). Other authentication,
-billing (exhausted quota, credit, or spend limit, however the service reports it),
-invalid-request, and malformed-response errors stop the request instead of retrying. So does a
-response with neither visible text nor a tool call, such as reasoning alone; cut off at
-`max_output`, it reports that the output limit was reached.
+rate limits, temporary server errors, an expired command-sourced credential
+([authentication](authentication.md#api-keys-and-environment-files)), and a response with
+neither visible text nor a tool call, such as reasoning alone. Other authentication, billing
+(exhausted quota, credit, or spend limit, however the service reports it), invalid-request, and
+malformed-response errors stop the request instead of retrying. So do refusals, and a response
+cut off at `max_output` with nothing to act on, which reports that the output limit was reached.
 
 A valid server `Retry-After` hint—delay-seconds or an HTTP-date—sets the delay,
 even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous

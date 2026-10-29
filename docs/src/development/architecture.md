@@ -1,7 +1,7 @@
 # Library architecture
 
-The `skyhook-agent` package exposes the `skyhook` library crate. The CLI is a host of that
-library, not a separate agent implementation. Provider protocols, terminal interaction, and
+The `skyhook` crate is the library. The `skyhook-cli` crate is a host of that library, not a
+separate agent implementation. Provider protocols, terminal interaction, and
 local or remote execution meet at shared runtime boundaries.
 
 See [embedding](embedding.md) for host API and replay contracts,
@@ -23,12 +23,85 @@ See [embedding](embedding.md) for host API and replay contracts,
 A session's isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines' files.
 
+## Shared CLI host
+
+`skyhook-cli` is the one terminal and batch host: command admission, `.env` loading, the shared
+`auth`/`dump`/`stats` commands, batch execution, the terminal UI, UI preferences and embedded
+shims. A product binary supplies a `Product`: an `Identity` (host name, branding, theme, UI-state
+file, whether the root's mode is fixed), its session arguments and optional commands, a
+configuration edit applied before admission, and a `SessionFactory` that prepares each of its own
+sessions and may ask for a scope form before the first message. Sessions carry the creating host's
+name; another host's session opens view-only, and the library refuses to activate it. All products
+share `.skyhook/sessions`, the shims and the capability rules; see
+[sharing the CLI and terminal](embedding.md#sharing-the-cli-and-terminal).
+
+### Security research product
+
+`skyhook-security` owns its layered `security.yaml` (loaded by the shared layered loader),
+embedded research modes replacing presets whole (each session renders their marked PoC parts
+for its launch's PoC policy, so only a launch that may test reads them), model-role hints, native
+tools, a report writer, and research tables it keeps in each of its sessions' own `session.db`
+beside the journal as a session [extension](embedding.md#sharing-the-cli-and-terminal). A
+session is the run: it records the run as it opens, with the revision it started at and the PoC
+policy of the launch working it, and a resumed session continues it. The run's PoC artifacts and current reports live in subdirectories
+of the session directory. The [security guide](../guide/security.md) describes the research
+behaviour; this section covers how it is held.
+
+The root agent receives the run's facts as host state with each request, cached per store write
+generation; the agents below it get none, and the facts they need travel in their briefs.
+Workflow attention is read separately from the live journal on each root request: when no child
+agents are active, a live root script whose latest `startable` page offered no work but held
+tests gets a reminder to check approvals, unblocks, slots and scope questions. The scheduling
+call identifies the script, not its name or source. Job transitions do not invalidate the
+research cache, so this read is uncached.
+The reminder neither grants approval nor interrupts an in-flight tool call.
+Coverage, which is costlier, is read only for the Research tab, `runs` and the `coverage` query.
+The Research tab renders those facts as a page of typed blocks, which the host lays out once per
+page, disclosure and width and only turns its spinners as it draws.
+
+The store is a compact ledger rather than a code graph, and what the guide calls a state is
+derived from its records rather than stored. Flaws, paths, candidates and premises carry
+revisions that material writes bump, and a restating write leaves them alone; assessments,
+verdicts, exposure decisions and the resolutions of candidates' conditions record the revisions
+they saw, so a candidate's status and confidence follow from its records at its current revision
+and a changed candidate is owed assessment again with no action. Tests record a separate count
+of contradictions, so only those reopen them. What a candidate relies on is derived
+(`candidate_condition`): its links to its own, deployment and flaw conditions, and its member
+flaws' conditions. Root flaws are derived by following `enables`
+relations back from a candidate's members; a finding is keyed by the set of scenarios it
+publishes at their assessment, verdict and test (its generation, which the report queue's basis
+also names), and its status is derived by comparing that set with its group's reportable one. A
+finding stores its reporter's prose in typed rows beside the facts it states, and the sizes and
+digests of the artifacts it copies. `reports/` is a projection of the current findings that the
+orchestrator's `generate` renders from the store alone, so a populate whose commit is unknown is
+settled by what the store holds and no store write touches files.
+
+Coverage is the review plan. Units the store plans in reaction to a record are planned by the
+root agent, so the agent whose record caused them may complete them; each triggering
+record plans afresh, and the scheduler, not the store, keeps duplicates to one agent. A
+contract's check is owed rather than planned: the `check` queue derives it from what bore on
+the contract after its latest check, ordered by the audit events that recorded them rather than
+by clock, and a check planned while owed is the run's. Queues are
+plain reads of open units of one kind, of candidates owing a phase, or of root flaws owing a
+report; work settled once is owed again only when a record it rests on is newer than its latest
+attempt, again by audit event. The orchestrator's scheduler reads the store's bounded
+`startable` page, offered only under `security.coordinate`, passing the subjects it
+runs, the attempts it spent and the tests it may start (slots, approvals and unblocks), and
+holds each subject from launch until its child finishes. The host capabilities
+`security.research`, `security.verdict` and `security.test` gate every research mutation, and
+`security.coordinate` scheduling and report generation; the store enforces lifecycle, not
+permissions. Read-only tool actions and the host state run on the session's read pool beside its one writer, whose research callers take turns
+without holding a thread; an action whose work is mostly files (recording a test, generating a
+report) runs outside that turn, its transactions still taking the writer one at a time.
+Everything a write decides reads inside the write's own transaction.
+
 ## Configuration and provider entries
 
 `config` loads and layers configuration, admits it, resolves model selections, and builds the
-model catalog; it does not interpret provider entries. Layering takes each named entry whole from one
-file and stamps every provider with that file (`ConfigHome`), beside which its Skyhook-managed
-credentials live. `provider::dialect` owns the entries
+model catalog; it does not interpret provider entries. Typed `LayeredConfig` schemas share one
+loader for discovery, whole-entry merging and diagnostics; only the main `Config` schema
+interprets provider and MCP provenance, stamping every provider with its defining file
+(`ConfigHome`), beside which its Skyhook-managed credentials live. `provider::dialect` owns the entries
 (`RawProviderConfig`, `ProviderSettings`, `ProviderModels`): each dialect module declares its
 provider-only `Options` (connection rules and any Skyhook-managed `Login`) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
@@ -36,7 +109,8 @@ inheritable request settings. Request defaults and model settings are typed part
 complete, independently validated codec and transport profile. The shared `Request` also carries
 `service_tier`, a body field on every codec, `explicit_caching` for Chat and Responses, and the
 Responses-only selections (`reasoning_summary`, `access_programs`); admission refuses an effective
-one on any other codec, and each dialect's Responses preset declares its summary default. Its
+one on any other codec, and a dialect refuses one its service does not take (Codex refuses
+`explicit_caching`). Each dialect's Responses preset declares its summary default. Its
 `image_limits` replace the per-image limits each dialect declares in its profile.
 
 ## Provider boundary and lifetime
@@ -75,18 +149,33 @@ compaction. A child whose invocation has resolved, with nothing left for it to t
 loop and context are released, and the input that resumes it opens a fresh context under the same
 identity from its history. A model change prepares its replacement before committing the selection
 and preserves journal history. Reselecting the current model keeps the current context. A mode
-change also replaces the prompt and tool surface and invalidates earlier bound reasoning. Resume
-opens a fresh provider context under the same context identity, or none for a root whose model the
-configuration no longer has: the session still activates for writes, and only running the root
+change also replaces the prompt and tool surface and invalidates earlier bound reasoning. A host
+may add a persona to every agent's prompt; a resumed agent keeps its recorded prompt until a mode
+change rebuilds it. Resume opens a fresh provider context under the same context identity, or none for a root whose
+model the configuration no longer has: the session still activates for writes, and only running the root
 fails with `UnknownModel` until a selection, or `activate_on`, which journals the switch in the
 activation commit, moves it to a configured model. A child whose own model is gone restarts on the
 root's committed model, journaled as it starts. `continue` restarts retryable children in one
 commit, then claims and admits the root's held batch in one step, so nothing withdraws from it
 meanwhile and a refused batch is held again unchanged while the children run on.
 
+Each harness is built for one `identity::HostName`, the application creating sessions; the
+session stores that origin and exposes it through its summary, stats and `SessionStarted`. Another
+host's session can be opened for reading, and the activation boundary refuses to run or change it
+with `HarnessError::HostMismatch`. Host identity does not partition the shared session root.
+
+A host's `ResumeHook` (`agent/runtime/resume.rs`; its contract is in
+[embedding](embedding.md#interruption-continuation-and-shutdown)) is ordered by the core. Each
+call waiting on it joins a set in the core, in the change that also arms what leaves it, so a call
+abandoned as it joins leaves too. An interrupt empties that set in the same change that stops
+turns, counting what it withdrew, and so does the shutdown transition. A call is let in only by
+leaving that set in a core change after the hook finished, whether it succeeded or failed, so an
+interrupt that lands as the hook finishes still withdraws it.
+
 The session owns the durable conversation (`session::Message`): user text and attachments, job
 events (child replies and presented job views), parent input and compaction summaries, assistant
-items, tool results, and the agent's state (date, live jobs, todos) as a message of its own. Providers receive it rendered:
+items, tool results, and the agent's state (date, live jobs, todos, and a host-supplied section)
+as a message of its own. Providers receive it rendered:
 state becomes a context state entry and job events runtime text, so the provider layer knows
 nothing about jobs or todos, and those renderers are part of the session format.
 
@@ -103,10 +192,10 @@ without deleting the durable transcript.
 A `ModelRequest` carries its context as one ordered list of typed entries: messages, and runtime
 state the harness wrote, with how long the state stays in the model's view (`StateLifetime`). A
 profile's `state_mode` sends each request's own state (`current`, `dynamic`), commits it to the
-conversation (`persisted`, `persist`), or omits it (`none`). Everything before the first current
-state is a prefix later requests extend under the same context settings until compaction replaces
-it. Only a state whose request produced no response later drops out of it, since nothing is bound
-to it.
+conversation unless it equals the latest committed one (`persisted`, `persist`), or omits it
+(`none`). Everything before the first current state is a prefix later requests extend under the
+same context settings until compaction replaces it. Only a state whose request produced no
+response later drops out of it, since nothing is bound to it.
 
 The journal records each request's tail. The projection gives each committed response the state
 its request sent, the request of the attempt that completed with it, and later requests send
@@ -116,8 +205,9 @@ reads only the latest dynamic state. Each codec places state in its dialect's `S
 protocol's harness role, or user content where a server has none mid-conversation; never inside
 tool output. A Messages dialect may make system-role state turn-scoped, which lets that codec
 resend superseded state hidden from the model and keep the conversation unchanged for reasoning
-bound to it; every other placement omits superseded state. A state not followed by a response or
-the end of the context is omitted everywhere: its request produced nothing bound to it.
+bound to it; every other placement omits superseded state, so the wire request stops extending
+the previous one where that state was, which `persist` avoids. A state not followed by a response
+or the end of the context is omitted everywhere: its request produced nothing bound to it.
 
 `history_lifetime` communicates cache reuse without prescribing a provider implementation:
 
@@ -201,7 +291,8 @@ reopens interrupted.
 A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
 transient recovery does not rerun completed tools. An expired command-sourced credential is
-transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
+transient: the provider discards it on a 401 and the retry fetches a fresh one, and so is a
+completed response with no nonblank text or call, unless it is a refusal or an output cut. Other
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
 Context-window recovery and unusable compaction summaries have their own bounded recovery path;
 a checkpoint that breaks a journal invariant is not retried. Which cut or empty responses commit
@@ -239,7 +330,9 @@ coordinator, and job supervision rather than separate tool implementations. Ever
 once, before authorization: a typed registration may declare an admission step that turns its
 parsed input into the value its handler receives, so its checks run at the boundary rather than in
 the handler. The admitted value names its path arguments, which are resolved in place, and derives
-its permissions, so an inadmissible call never asks for approval. Path admission (`tool::path`)
+its permissions, so an inadmissible call never asks for approval. It may also choose the schema
+its job's result follows, which presentation and scripts read and tool descriptions leave out,
+for a tool whose result shape varies by action. Path admission (`tool::path`)
 resolves a requested path where the call runs: relative to the workspace, through existing
 symbolic links, as the tool will use it (an existing entry, a write target, or a removal). The
 resolved path, not the spelling the caller gave, is what the call asks permission for, over the
@@ -250,6 +343,13 @@ asked for as the path it would be, under a decision that may not ask anyone, and
 allowed, so no prompt or error reveals what lies outside. The host planner and a remote worker assemble an
 invocation's permissions by one rule, and a capability the caller lacks makes the tool unavailable
 rather than denied.
+
+`Capability::Host(HostCapability)` extends the built-in permission vocabulary with namespaced
+`namespace.name` identifiers a host declares on its builder; ceilings, modes, native tools and
+MCP requirements may only use declared names, and every authorization gate treats them like
+built-ins. The journal records capability names as data, so another host's names read back
+without its declarations. The session database is format 30; formats are clean breaks without
+migration.
 
 The executor coordinates host-owned jobs and their persistence. A job's lifecycle (queued,
 awaiting approval, running, waiting for input, finished), its startup lease and its single
@@ -283,23 +383,38 @@ Saved output and model-visible presentation are separate. A finished result is s
 compact document with its large parts in captures (`job/output/saved.rs`), and read back through
 bounded streaming readers (`job/output/json.rs`). The large parts are written before the finish,
 staged: no reader lists them until the finish that references them commits, so that transaction
-stays small whatever the result's size, and opening a session removes those a finish never
-committed. JavaScript receives complete results, while the journal retains the exact previews
+stays small whatever the result's size. A finish that prepares its output again, as a stale
+finish retries, replaces what it staged before at the same field, and opening a session removes
+those a finish never committed. JavaScript receives complete results, while the journal retains the exact previews
 delivered to the model. [Saved job output](../reference/job-output.md) documents the user-facing
 limits.
 
-Each script runs in a fresh QuickJS runtime (`tool/javascript`). Its runtime is embedded ES
+Each script runs in a fresh QuickJS runtime (`tool/javascript`) with a 512 MiB engine allocation
+limit set before context creation. This does not cap Rust-side bridge or job memory; allocation
+failures use ordinary JavaScript error handling. Its runtime is embedded ES
 modules (`tool/javascript/js`), compiled to bytecode once per process and instantiated per
 script; the submitted body is compiled separately, as its own module, so failure reports
 can keep only its frames. One conversion turns tool arguments and returned values into JSON at
 the host boundary (`bridge.rs`), and the host fills a response's declared absent fields with
-`null` there, from the same schemas that declare its presentations
+`null` there, from the schema its job stores, which also declares its presentations
 (`job/output/projection.rs`).
 
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
 reaches committed history stays pending for delivery
-(`agent/runtime/wait/delivery.rs`, `job/delivery.rs`).
+(`agent/runtime/wait/delivery.rs`, `job/delivery.rs`). A foreground child's replies stay queued
+for its call instead. Its completed result saves them: the finish drops them from the queue, and
+journals only while the replies queued are those its prepared output saves, preparing the output
+again otherwise (`job/lifecycle.rs`). A call let go of before it returns, or returning anything
+else, leaves them to delivery (`job/entry.rs`). A question is the owner's, whoever waits on the
+job: while it is pending, it and the replies queued before it are pending for the owner
+together, and a foreground wait keeps waiting for the outcome. Folding the ask record also
+releases the model-level foreground call blocked on the job, the job's own or that of the
+script whose calls wait on it, which then returns the job unfinished, presenting and
+acknowledging neither (`job/persistence.rs`, `job/delivery.rs`). What a waiting job asks is part of
+its phase, each question by the ask job waiting for its answer: an ask's end retires its question
+in the same commit, which asks the rest again or lets the job run on, and a reply is accepted into
+each ask's mailbox at most once, so a repeated reply answers nothing again (`job/questions.rs`).
 
 Process tools leave stdin unconnected, capture stdout and stderr, and detach from the controlling
 terminal (`tool/builtins/process.rs`), so a program that prompts uses the session's askpass helper,
@@ -313,7 +428,15 @@ returns otherwise. The helper, its environment and prompt attribution are descri
 
 Each durable session is one SQLite database, `session.db`, holding the append-only, normalized
 event ledger beside its blobs, saved job results and captures; `session/schema.sql` documents the
-tables and the few JSON columns. Each open session has one core thread (`session/core/mod.rs`)
+tables and the few JSON columns. Closing any descriptor of a file releases every POSIX lock the
+process holds on it, SQLite's included, so one registry under one lock (`db::live`) records both
+each database the process has open (its file, `-wal`, `-shm` and `-journal`, by identity and by
+name) and every handle another in-process opener holds (`fs::OpenFile`, by identity). An opener
+refuses a live database's file and registers its handle under the lock; a database registers
+before SQLite opens it, waiting at most the busy timeout for handles on its files to close;
+replacing or removing a file decides and acts under the lock, and removing a tree reserves it
+under the lock, so no database registers inside it, then removes it outside; walks pass over live
+files. Each open session has one core thread (`session/core/mod.rs`)
 that owns the only writer and the one in-memory fold of what live work reads of the journal (each
 agent's newest request, the resident jobs and agents, todos and targets, the next sequence and the
 last activity, never the records themselves) and, never journaled, each running agent's turn and
@@ -353,8 +476,8 @@ nothing; it only aborts the I/O in flight, such as a provider stream or a proces
 
 A registered wait declares the agents and jobs it reads, and decides from the state alone before
 it takes anything. A change decides again only the waits whose agents or jobs it touched,
-repeating while what they take touches more, and every wait on a session-wide change (phase, flow
-or activation); each agent's activity is likewise read again only when the change touched that
+repeating while what they take touches more, and every wait on a session-wide change (phase, flow,
+activation or a resume withdrawal); each agent's activity is likewise read again only when the change touched that
 agent.
 
 ### Resident set
@@ -411,7 +534,11 @@ transactions; a session held in memory reads through its writer's connection ins
 keeps a fixed few read connections, each on a thread of its own, and a read waits for one rather
 than opening another. Reads are async, and one waiting for
 a connection holds no thread. The core reads on a connection of its own, so its reads never wait
-behind other reads.
+behind other reads. The pool and the turn it takes are `db` primitives; the journal and the
+security store each supply how their readers open. The CLI host turns SQLite's allocation
+statistics off for the process at startup (`db::configure_process`): counting takes one global
+mutex, which would serialise readers that otherwise run in parallel. The library never changes
+process-wide SQLite state on its own.
 
 ### Observation
 
@@ -425,15 +552,18 @@ snapshots, by index. A page reads at least what the observation applied, and eve
 is an update at the next ordinal of its agent, so a host placing updates by ordinal misses nothing
 and repeats nothing; a lagging host observes again and reads its pages again, never the history.
 Live updates the journal does not carry, such as streamed deltas and capture notices, never wait
-on the core's commands or its state lock, only on the observation's lock, which a commit holds
-from its fold through COMMIT to its publication and a subscriber holds while it copies the views.
-A capture write notifies observers of its run once, then again only after something reads that
-run's output or the run finishes, so a burst of writes costs a bounded number of updates.
+on the core's commands, its state lock or the database, only on the observation's lock, which a
+commit takes after COMMIT to fold its records into the views and publish them, and a subscriber
+holds while it copies the views. A capture write notifies observers of its run once, then again
+only after something reads that run's output or the run finishes; a streamed delta likewise
+notifies observers of its response once, then again only after something reads that response or
+a record of its agent applies, or a new observation copies the views. A burst of writes or deltas
+costs a bounded number of updates, so a token stream alone never makes an observer lag.
 
-Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/src/agent/runtime),
-[providers](https://github.com/kryesh/skyhook/tree/main/src/provider),
-[tools](https://github.com/kryesh/skyhook/tree/main/src/tool), and
-[sessions](https://github.com/kryesh/skyhook/tree/main/src/session).
+Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/agent/runtime),
+[providers](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/provider),
+[tools](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/tool), and
+[sessions](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/session).
 
 ## Terminal history window
 
@@ -496,4 +626,4 @@ Whenever entries are laid out again (new text, a reply settling, a resize), the 
 re-resolved against the new rows. It survives only if its endpoints still exist and the text they
 select is unchanged; otherwise it is dropped rather than moved to other text.
 
-Source: [rendering](https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook/tui/render).
+Source: [rendering](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-cli/src/tui/render).

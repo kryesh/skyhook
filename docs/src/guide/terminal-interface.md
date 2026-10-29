@@ -140,8 +140,8 @@ The interface stores the last submitted model and mode and the sidebar setting i
 `.skyhook/state.json`, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.
 
-A sidebar beside the conversation shows the session's title on its first line; click it to rename
-the session. Below, it lists the MCP servers the viewed agent can use, with their startup status,
+A sidebar beside the conversation shows the application's name, then the session's title; click
+the title to rename the session. Below, it lists the MCP servers the viewed agent can use, with their startup status,
 and the viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the
 root agent of a new session these are what the mode of the next message grants, so cycling modes
 changes them. Once the root agent runs, choosing a mode for the next message that changes what it
@@ -149,6 +149,9 @@ runs, including its own mode after the configuration redefined it, previews the 
 `+` marks a server that mode would add, and a server it would remove is greyed out. A section with
 nothing to list is left out, title included. The sidebar is shown by default; `Ctrl+X B` or
 `/sidebar` toggles it.
+Host-defined capabilities show the titles their product declares; a foreign session's recorded
+capabilities fall back to their namespaced names. Long labels are shortened with `…`. A foreign view-only session shows **Recorded capabilities**, not grants
+from the current product's modes or MCP configuration, and its title cannot be renamed.
 Terminals narrower than 100 columns hide it without changing the saved setting.
 
 The bottom bar uses this format:
@@ -158,7 +161,8 @@ default · openai/fast (gpt-5-mini) · 3f9c2a7d…       8.4k · 200k(31.2k) · 
 ```
 
 The left side is the mode, the configured `provider/model` name with its API model ID in
-parentheses when the two differ, and the session ID. The statistics are session output tokens,
+parentheses when the two differ, the working directory (prefixed `view-only` for another
+product's session), and the session ID. The statistics are session output tokens,
 session total input tokens (uncached input), and the selected agent's context occupancy as the
 last response that reported its prompt counted it
 (tokens/model capacity). Session totals include children and compaction; a count a provider did
@@ -183,11 +187,12 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X F`, `@` | Attach a workspace file |
 | `Ctrl+X B`, `/sidebar` | Toggle the sidebar |
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
+| `Ctrl+X O`, `/scope` | Edit the draft's scope panel at the top of the root's conversation, when the application has one |
 | `Ctrl+X ←`, `Ctrl+X →` | Previous/next of Conversation, Requests, Jobs (wrapping) |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | View the agent above/below in the tree (wrapping) and focus the tree |
 | `↑`, `↓`, `PageUp`, `PageDown` in the tree | View the agent above/below, or a page above/below, at its latest activity |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
-| `Tab`, `Shift+Tab` | Next/previous [mode](permissions.md#modes) in the composer; next/previous row in the tree or conversation |
+| `Tab`, `Shift+Tab` | Next/previous [mode](permissions.md#modes) in the composer; next/previous row in the tree or conversation. With a fixed root mode, `Shift+Tab` moves between a draft's scope panel fields and the composer, scrolling the panel into view |
 | `Ctrl+X P`, `/mode` | Choose the mode from a list |
 | Click a pane | Focus composer, tree, or conversation |
 | `Enter` | Send/queue, select, expand |
@@ -235,7 +240,7 @@ spinners of blocks and tool cards are not selected. In a table, selection follow
 reading order rather than the drawn grid: each table cell copies as one line, whole however it
 wraps, without borders or padding, and an empty cell copies as an empty line. Each copy reports
 how many characters it sent to the terminal; the terminal does not confirm that it accepted them.
-The workspace path is centered in the top bar. The bottom bar shows the model, session ID,
+The top line holds the tabs. The bottom bar shows the model, the workspace, the session ID
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file
 (press `Esc` to keep a typed `@`): image files attach as images and other files as text.
@@ -287,3 +292,14 @@ a free-form answer. For answering agent questions from a script, see
 
 See [sessions and context](sessions-and-context.md) for compaction and persistence,
 and the [CLI reference](../reference/cli.md) for startup options.
+
+### Product-provided views and actions
+
+An embedding product can add read-only tabs after the built-in inspectors. Cycle them with the
+same tab shortcuts or click their headers. Their data refreshes in the background, so loading a
+view does not block typing, switching sessions or resizing the terminal. A view that takes the
+whole screen may keep the agent tree: in a column beside it on a terminal at least 100 columns
+wide, headed by how many agents run and in which modes, or below it on a narrower one. There,
+`Tab` and `Shift+Tab` move between the view and the agents, `↑`/`↓` step through the agents
+without leaving the view, and clicking an agent or pressing `Enter` on it opens its conversation,
+as choosing it from the Agents palette does.

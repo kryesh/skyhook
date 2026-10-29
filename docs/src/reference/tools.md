@@ -38,16 +38,14 @@ See the [JavaScript response contract](javascript.md#responseunwrap-and-native-r
 `read({path})` reads only regular files. A file is text when it is valid UTF-8 without NUL bytes;
 any other file is attached if it decodes as a supported image (PNG, JPEG, GIF or WebP) and
 rejected otherwise.
-`replace({path, old, new, count?})` edits files of at most 4 MiB, both before and after the
-replacement.
+`replace({path, old, new, count?})` edits files of at most 64 MiB, both before and after the
+replacement; `old` and `new` together are at most 4 MiB, as is `write` content.
 
 ## Creating files with `write`
 
-`write({path, content})` atomically creates or replaces a UTF-8 file. Set the optional
-`create_parents: true` to create missing parent directories recursively before writing, for example
-`write({path: "reports/run/summary.md", content: "...", create_parents: true})`.
-It defaults to `false`, so a missing parent directory causes the call to fail. As in the operating
-system, `..` cannot follow a directory that does not exist yet, so `missing/../file` fails either way.
+`write({path, content})` atomically creates or replaces a UTF-8 file, creating missing parent
+directories first, for example `write({path: "reports/run/summary.md", content: "..."})`. As in the
+operating system, `..` cannot follow a directory that does not exist yet, so `missing/../file` fails.
 
 `write({path, source: {path, target?}})` copies another file's bytes exactly, including binary
 files of any size. Supply exactly one of `content` or `source`. The destination is always in the

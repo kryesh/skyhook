@@ -111,7 +111,8 @@ search locations: `~/.agents/skills` plus `.agents/skills` along workspace ances
 how its model requests ended, what each agent delegated, and which tools it called. Like
 `--resume`, it finds the session in the selected workspace's history
 (`<workspace>/.skyhook/sessions`). It needs no configuration, credentials, or terminal, and it
-can read a session another process still has open.
+can read a session another process still has open. Sessions from other Skyhook products share
+this history; all report formats identify the creating host, and `--list` includes a Host column.
 
 | Option | Meaning |
 | --- | --- |

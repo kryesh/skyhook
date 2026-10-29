@@ -1,0 +1,242 @@
+//! Adapt the startup MCP catalog to the ordinary, policy-gated tool registry.
+
+mod arguments;
+mod naming;
+mod result;
+
+use super::manager::McpManager;
+use crate::{
+    session::SessionStore,
+    tool::{
+        RegistryError, ToolContext, ToolOptions, ToolPlacement, ToolRegistryBuilder,
+        policy::{Capability, ResourceId},
+        registry::Invocation,
+    },
+};
+use arguments::Arguments;
+use naming::tool_names;
+use result::map_result;
+use serde_json::Value;
+use std::sync::Arc;
+
+/// Register valid discovered tools, reporting individual failures without losing
+/// the rest of the catalog. The root and its children share the same manager.
+/// MCP calls always execute on the host, even from a remote workspace.
+pub fn register(
+    builder: &mut ToolRegistryBuilder,
+    manager: Arc<McpManager>,
+    store: SessionStore,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let generated_names = tool_names(manager.catalog(), |name| builder.contains_name(name));
+    for (discovered, name) in manager.catalog().iter().zip(generated_names) {
+        let server = discovered.server.as_str();
+        let tool = &discovered.tool;
+        let adapted = match Arguments::new(Value::Object((*tool.input_schema).clone())) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                warnings.push(format!("MCP tool {server}/{} skipped: {error}", tool.name));
+                continue;
+            }
+        };
+        let options = ToolOptions::new(discovered.capabilities.clone())
+            .requires(Capability::Mcp)
+            .external_schema()
+            .background()
+            .placement(ToolPlacement::Host)
+            .internal_result(|_| result::schema())
+            .permission_resource(ResourceId::mcp(server, tool.name.as_ref()));
+        let manager = manager.clone();
+        let store = store.clone();
+        let server = server.to_owned();
+        let upstream_name = tool.name.to_string();
+        let description = format!(
+            "MCP tool {server}/{upstream_name}. {}{}",
+            tool.description.as_deref().unwrap_or(""),
+            if adapted.wrapped {
+                " Pass the upstream tool input in arguments; bg controls the Skyhook job."
+            } else {
+                ""
+            },
+        );
+        let schema = adapted.schema.clone();
+        if let Err(error) = builder.register_schema(
+            name,
+            description,
+            schema,
+            options,
+            move |arguments| adapted.admit(arguments),
+            move |arguments| {
+                let (manager, store) = (manager.clone(), store.clone());
+                let (server, upstream_name) = (server.clone(), upstream_name.clone());
+                Invocation::new(move |context: ToolContext| async move {
+                    let cancellation = context.cancellation_token();
+                    let result = manager.call(&server, &upstream_name, arguments, cancellation);
+                    map_result(result.await?, &store).await
+                })
+            },
+        ) {
+            let error = match error {
+                RegistryError::Schema(_) => "input schema cannot be registered".to_owned(),
+                error => error.to_string(),
+            };
+            warnings.push(format!(
+                "MCP tool {}/{} skipped: {error}",
+                discovered.server, tool.name
+            ));
+        }
+    }
+    warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        job::CancellationToken,
+        tests::{RecordingPolicy, TestRuntime},
+        tool::executor::InvocationKind,
+        tool::{executor::ToolExecutor, policy::CapabilitySet},
+    };
+    use serde_json::json;
+
+    const FIXTURE: &str = r#"
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req: continue
+    method = req['method']
+    if method == 'initialize':
+        result = {'protocolVersion':req['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'adapter-test','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[
+          {'name':'native','inputSchema':{'type':'object','properties':{'count':{'type':'integer','minimum':1,'default':1},'title':{'type':'string'},'format':{'type':'string'},'$schema':{'type':'string'}},'required':['count'],'additionalProperties':False}},
+          {'name':'open','inputSchema':{'type':'object'}},
+          {'name':'invalid','inputSchema':{'type':'array'}}]}
+    elif method == 'tools/call':
+        arguments = req['params']['arguments']
+        result = {'content':[{'type':'text','text':json.dumps(arguments)},{'type':'text','text':'plain'}], 'structuredContent':{'tool':req['params']['name'],'arguments':arguments},'isError':False}
+    else: result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+"#;
+
+    fn without(capability: Capability) -> CapabilitySet {
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(&capability);
+        capabilities
+    }
+
+    #[tokio::test]
+    async fn registration_dispatch_capabilities_and_permissions() {
+        let runtime = TestRuntime::new().await;
+        let config = serde_json::from_value(json!({
+            "transport":"stdio", "start_command":["python3","-u","-c",FIXTURE],
+            "capabilities":["read","exec"]
+        }))
+        .unwrap();
+        let mut configs = std::collections::BTreeMap::from([("fixture".to_owned(), config)]);
+        let defaults = CapabilitySet::default();
+        let manager = McpManager::connect(
+            &configs,
+            &defaults,
+            &std::env::temp_dir(),
+            CancellationToken::new(),
+        )
+        .await;
+        let manager = Arc::new(manager);
+        assert_eq!(manager.catalog().len(), 3, "{:?}", manager.warnings());
+        // Registration must use admitted catalog policy, not a later config join.
+        configs.clear();
+        assert_eq!(
+            manager.catalog()[0].capabilities,
+            [Capability::Read, Capability::Exec]
+        );
+        let mut builder = ToolRegistryBuilder::default();
+        let warnings = register(&mut builder, manager.clone(), runtime.store.clone());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid"));
+        let registry = builder.build();
+        let (native, open) = ("mcp_fixture_native", "mcp_fixture_open");
+        for name in [native, open] {
+            assert_eq!(registry.get(name).unwrap().placement(), ToolPlacement::Host);
+        }
+        for missing in [Capability::Exec, Capability::Mcp] {
+            let tool = registry.get(native).unwrap();
+            assert!(
+                tool.spec(&without(missing), crate::tool::registry::AgentLevel::Root)
+                    .is_err()
+            );
+        }
+        let policy = RecordingPolicy::allowing();
+        let root = runtime.root.path().to_path_buf();
+        let executor = ToolExecutor::new(registry, policy.clone(), runtime.jobs.clone(), root);
+        let agent = || runtime.agent.clone();
+        let disabled = executor.clone().with_capabilities(without(Capability::Mcp));
+        let count = json!({"count":1});
+        assert!(
+            disabled
+                .execute(agent(), native, count.clone(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            disabled
+                .execute_as(InvocationKind::Script, agent(), native, count, None)
+                .await
+                .is_err()
+        );
+        assert!(policy.requests.lock().unwrap().is_empty());
+        // Upstream-schema rejection is an admission failure: like a typed tool's,
+        // it is refused before a job or an approval exists.
+        for invalid in [json!({"count":"bad"}), json!({})] {
+            assert!(
+                executor
+                    .execute(agent(), native, invalid, None)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(policy.requests.lock().unwrap().is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
+        let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();
+        let native_input =
+            json!({"count":2,"title":"user title","format":"user format","$schema":"user data"});
+        let output = executor
+            .execute(agent(), native, native_input.clone(), None)
+            .await;
+        let output = output.unwrap().output.value;
+        assert_eq!(arguments(&output), native_input);
+        // Text blocks holding JSON read as it, under a result schema the
+        // protocol fixes and tool descriptions leave out.
+        assert_eq!(
+            output["content"],
+            json!([{"type":"text","text":native_input},{"type":"text","text":"plain"}])
+        );
+        let surface = executor.surface_for_agent(&runtime.agent);
+        assert!(surface.get(native).unwrap().result_schema.is_none());
+        let wrapped = json!({"bg":"upstream","target":"upstream"});
+        let input = json!({ "arguments": wrapped });
+        let output = executor.execute(agent(), open, input, None).await;
+        assert_eq!(arguments(&output.unwrap().output.value), wrapped);
+        let input = json!({"arguments":{"bg":"upstream"},"bg":true});
+        let output = executor
+            .execute_as(InvocationKind::Script, agent(), open, input, None)
+            .await
+            .unwrap();
+        assert!(output.background);
+        let envelope = runtime.jobs.wait(output.job, true).await.unwrap();
+        assert_eq!(
+            arguments(&envelope.output.unwrap()),
+            json!({"bg":"upstream"})
+        );
+        for request in policy.requests.lock().unwrap().iter() {
+            assert_eq!(request.permissions.len(), 2);
+            assert!(request.permissions.iter().all(|permission| {
+                ["native", "open"]
+                    .into_iter()
+                    .any(|tool| permission.resource == ResourceId::mcp("fixture", tool))
+            }));
+        }
+        manager.shutdown().await;
+    }
+}

@@ -1,9 +1,11 @@
 # Skyhook
 
-- Library: `skyhook`.
-- Binaries:
-  - `skyhook` — CLI; feature `tui`.
-  - `linux-ssh` — SSH shim; feature `shim-bin`.
+Cargo workspace under `crates/`:
+
+- `skyhook` — the library.
+- `skyhook-cli` — shared CLI/terminal host library and the `skyhook` binary.
+- `skyhook-security` — flaw-first security research companion binary.
+- `linux-ssh` — SSH shim binary.
 
 Architecture: `docs/src/development/architecture.md`.
 
@@ -47,7 +49,7 @@ Architecture: `docs/src/development/architecture.md`.
 - Investigate load-sensitive failures. Stress new tests coordinating gated provider steps:
 
   ```sh
-  cargo nextest run --all-features -E 'test(<name>)' --stress-count 200 --no-fail-fast
+  cargo nextest run --workspace -E 'test(<name>)' --stress-count 200 --no-fail-fast
   ```
 - Tests belong in a `tests` module at the bottom of the file containing the logic they
   test; tests of a module's functionality go in that module's top-level file. Avoid
@@ -61,5 +63,5 @@ just lint
 just test
 ```
 
-For direct Cargo verification, use `--all-targets --all-features` where supported
-to include the CLI/TUI.
+For direct Cargo verification, use `--workspace --all-targets` so every crate and its
+integration tests are included.

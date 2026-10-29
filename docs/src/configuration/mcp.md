@@ -20,7 +20,8 @@ mcp:
     transport: "streamable_http"
     url: "http://127.0.0.1:8080/mcp"    # Full MCP endpoint, not an API root.
     capabilities: ["read", "write"]
-    headers_env: { Authorization: "MY_MCP_AUTHORIZATION" }
+    headers:
+      Authorization: { env: "MY_MCP_AUTHORIZATION" }
     # Optional local startup fallback, only when the endpoint is unreachable:
     # start_command: ["my-http-mcp-server", "--port", "8080"]
 ```
@@ -28,7 +29,7 @@ mcp:
 ## Connections and credentials
 
 `start_command` is an argument vector, not shell text; its first element must name a nonempty
-executable. Stdio requires it and rejects `url` and `headers_env`. Streamable HTTP requires an
+executable. Stdio requires it and rejects `url` and `headers`. Streamable HTTP requires an
 absolute HTTP(S) `url`. It connects first, and only starts the optional command if the endpoint is
 unreachable—not on authentication, protocol, or other server errors. `cwd` and `env` apply only to
 `start_command`; HTTP connections without a startup command must omit them. Relative `cwd` is
@@ -40,11 +41,13 @@ the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as `WORKERS: "4"`.
 
-HTTP `headers_env` maps header names to environment-variable names. The variable's complete value
-is sent as the header (for example, `MY_MCP_AUTHORIZATION` can contain `Bearer ...`); secrets do not
-belong in YAML. Missing or non-Unicode variables, invalid header names, and values that cannot be
-encoded as HTTP headers prevent that server's connection from starting. Empty header values are
-passed through to the server. Do not put secrets in `start_command` arguments or literal `env` values.
+HTTP `headers` maps header names to values in the forms a provider's
+[`headers`](authentication.md) take: a literal, `env: NAME`, or `command: "..."`. The complete value
+is sent as the header (for example, `MY_MCP_AUTHORIZATION` can contain `Bearer ...`). Invalid or
+repeated header names, blank values and invalid literals are refused with the configuration. An
+environment value is read, and a command run, when the connection starts; a missing, blank or
+invalid value, or a failed command, prevents that server's connection from starting. Prefer `env`
+or `command` for secrets, and do not put them in `start_command` arguments or literal `env` values.
 
 ## Trust and permissions
 
@@ -90,5 +93,6 @@ Call a tool with `tool[name](...)` or its fluent builder. Calls return the
 output in failed jobs.
 
 Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
-bounds discovery and response sizes, and does not replay a call with an uncertain outcome after
-a connection failure. Cancellation cannot undo effects that already occurred on the server.
+bounds discovery sizes and each message a server sends, at 64 MiB; a larger stdio message is
+discarded, the call it answered ends at its call timeout, and the server keeps serving other
+calls. Skyhook does not replay a call with an uncertain outcome after a connection failure. Cancellation cannot undo effects that already occurred on the server.

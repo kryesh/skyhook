@@ -15,6 +15,7 @@
 - [Permissions and capabilities](guide/permissions.md)
 - [Execution targets](guide/execution-targets.md)
 - [Instructions and skills](guide/instructions-and-skills.md)
+- [Security research](guide/security.md)
 
 # Configuration
 

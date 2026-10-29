@@ -103,7 +103,11 @@ and missing information leaves the requester unknown rather than failing the pro
 session shuts down, its authentication refuses to start another askpass server.
 
 Each askpass server keeps its helper and socket in a private temporary directory and accepts
-only peers running as its own user. This prevents other local users from injecting
+only peers running as its own user. That directory, like the managed agent's, is made under
+`XDG_RUNTIME_DIR` when that is set and writable, and otherwise under the temporary directory: a
+socket path must fit the platform's short limit (`sun_path`, 108 bytes on Linux and 104 on macOS),
+which a deep `TMPDIR` exceeds. When neither gives a socket path within the limit, the directory is
+made under `/tmp`, so binding never fails on path length. This prevents other local users from injecting
 prompts or obtaining answers through the socket; it is not an isolation boundary against other
 processes running as the same user. Dropping the server cancels its task and removes its temporary
 files.
@@ -137,13 +141,13 @@ Git contains source only, not prebuilt shim binaries. To build a native Linux SS
 Zig or UI dependencies:
 
 ```sh
-cargo build --bin linux-ssh --features shim-bin
+cargo build -p linux-ssh
 ```
 
 This Cargo command builds the binary but does not stage it into `target/shims/`. See
 [development setup](setup.md) for the recipe list, including the combined shim and CLI build.
 
-Source: [remote module](https://github.com/kryesh/skyhook/tree/main/src/remote),
-[shim binary](https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh),
-[CLI catalog](https://github.com/kryesh/skyhook/blob/main/src/bin/skyhook/embedded_shims.rs), and
+Source: [remote module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/remote),
+[shim binary](https://github.com/kryesh/skyhook/tree/main/crates/linux-ssh),
+[CLI catalog](https://github.com/kryesh/skyhook/blob/main/crates/skyhook-cli/src/embedded_shims.rs), and
 [build recipes](https://github.com/kryesh/skyhook/blob/main/justfile).

@@ -1,0 +1,289 @@
+//! Built-in and namespaced host permissions, including their stable wire names.
+
+use std::{collections::BTreeSet, fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+
+use crate::newtype::string_newtype;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("host capability must be namespace.name, each component matching [a-z][a-z0-9_]*")]
+pub struct InvalidHostCapability;
+
+fn valid_component(component: &str) -> bool {
+    component
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_lowercase)
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+string_newtype! {
+    /// A host-defined permission, named `namespace.name`.
+    #[derive(PartialOrd, Ord)]
+    pub struct HostCapability(InvalidHostCapability) = |name| name
+        .split_once('.')
+        .is_some_and(|(namespace, name)| valid_component(namespace) && valid_component(name))
+        .then_some(())
+        .ok_or(InvalidHostCapability);
+}
+
+/// A host capability and the title the user sees it under; see [`Capability::title`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCapabilityDeclaration {
+    pub name: HostCapability,
+    pub title: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Capability {
+    Read,
+    Write,
+    Exec,
+    Network,
+    Targets,
+    /// Forward an SSH agent Skyhook does not own (`ssh.external_agent`).
+    SshAgent,
+    Agents,
+    Interactive,
+    Mcp,
+    Host(HostCapability),
+}
+
+impl Capability {
+    /// Every built-in capability. Host capabilities are declared separately by each host.
+    pub const ALL: [Self; 9] = [
+        Self::Read,
+        Self::Write,
+        Self::Exec,
+        Self::Network,
+        Self::Targets,
+        Self::SshAgent,
+        Self::Agents,
+        Self::Interactive,
+        Self::Mcp,
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Exec => "exec",
+            Self::Network => "network",
+            Self::Targets => "targets",
+            Self::SshAgent => "ssh_agent",
+            Self::Agents => "agents",
+            Self::Interactive => "interactive",
+            Self::Mcp => "mcp",
+            Self::Host(name) => name.as_str(),
+        }
+    }
+
+    /// What the user sees this capability as. A host capability takes its title from
+    /// `declared`; one declared elsewhere, such as another host's, keeps its name.
+    pub fn title<'a>(&'a self, declared: &'a [HostCapabilityDeclaration]) -> &'a str {
+        match self {
+            Self::Read => "Read files",
+            Self::Write => "Write files",
+            Self::Exec => "Run commands",
+            Self::Network => "Fetch from the network",
+            Self::Targets => "Use remote targets",
+            Self::SshAgent => "External SSH agent",
+            Self::Agents => "Start child agents",
+            Self::Interactive => "Ask you questions",
+            Self::Mcp => "Use MCP tools",
+            Self::Host(name) => declared
+                .iter()
+                .find(|declaration| declaration.name == *name)
+                .map_or(name.as_str(), |declaration| declaration.title),
+        }
+    }
+}
+
+impl FromStr for Capability {
+    type Err = InvalidHostCapability;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.as_str() == name)
+            .map_or_else(|| name.parse().map(Self::Host), Ok)
+    }
+}
+
+impl TryFrom<String> for Capability {
+    type Error = InvalidHostCapability;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        name.parse()
+    }
+}
+
+impl From<Capability> for String {
+    fn from(capability: Capability) -> Self {
+        match capability {
+            Capability::Host(name) => name.into(),
+            builtin => builtin.as_str().to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A set of capabilities; it serialises as its sorted list.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapabilitySet(BTreeSet<Capability>);
+
+impl CapabilitySet {
+    /// Construct an exact empty set, unlike the enabled-by-default session set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(BTreeSet::new())
+    }
+
+    pub fn contains(&self, capability: &Capability) -> bool {
+        self.0.contains(capability)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn insert(&mut self, capability: Capability) {
+        self.0.insert(capability);
+    }
+
+    pub fn remove(&mut self, capability: &Capability) {
+        self.0.remove(capability);
+    }
+
+    #[must_use]
+    pub fn for_agent(&self, available_depth: usize) -> Self {
+        let mut capabilities = self.clone();
+        if available_depth == 0 {
+            capabilities.remove(&Capability::Agents);
+        }
+        capabilities
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.0.iter()
+    }
+
+    /// The target as a viewer holding these capabilities may see it: only one
+    /// that can select targets learns which target anything ran on.
+    pub(crate) fn visible_target<'a>(
+        &self,
+        target: &'a crate::target::TargetRef,
+    ) -> Option<&'a crate::target::TargetRef> {
+        self.contains(&Capability::Targets).then_some(target)
+    }
+}
+
+/// What a mode grants. Interaction follows the host, so a mode never lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CapabilitySet", into = "CapabilitySet")]
+pub struct ModeCapabilities(CapabilitySet);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("interactive is controlled by the runtime host, not the capability allowlist")]
+pub struct InteractiveListed;
+
+impl TryFrom<CapabilitySet> for ModeCapabilities {
+    type Error = InteractiveListed;
+
+    fn try_from(capabilities: CapabilitySet) -> Result<Self, Self::Error> {
+        match capabilities.contains(&Capability::Interactive) {
+            true => Err(InteractiveListed),
+            false => Ok(Self(capabilities)),
+        }
+    }
+}
+
+impl From<ModeCapabilities> for CapabilitySet {
+    fn from(capabilities: ModeCapabilities) -> Self {
+        capabilities.0
+    }
+}
+
+impl ModeCapabilities {
+    /// Every default session capability a host does not supply.
+    pub fn general() -> Self {
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(&Capability::Interactive);
+        Self(capabilities)
+    }
+
+    pub fn set(&self) -> &CapabilitySet {
+        &self.0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.0.iter()
+    }
+}
+
+impl FromIterator<Capability> for CapabilitySet {
+    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl Default for CapabilitySet {
+    fn default() -> Self {
+        Self(BTreeSet::from([
+            Capability::Read,
+            Capability::Write,
+            Capability::Exec,
+            Capability::Network,
+            Capability::Agents,
+            Capability::Interactive,
+            Capability::Mcp,
+        ]))
+    }
+}
+
+impl std::ops::BitAnd for &CapabilitySet {
+    type Output = CapabilitySet;
+
+    fn bitand(self, other: Self) -> CapabilitySet {
+        CapabilitySet(&self.0 & &other.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_parse_builtin_and_valid_host_names_only() {
+        let host: Capability = "host.review".parse().unwrap();
+        assert_eq!(host, Capability::Host("host.review".parse().unwrap()));
+        for capability in Capability::ALL.into_iter().chain([host]) {
+            let json = serde_json::to_value(&capability).unwrap();
+            assert_eq!(json, capability.as_str());
+            assert_eq!(
+                serde_json::from_value::<Capability>(json).unwrap(),
+                capability
+            );
+        }
+        for name in [
+            "",
+            "read.",
+            "Host.name",
+            "host.name.more",
+            "host-name.action",
+        ] {
+            assert!(name.parse::<HostCapability>().is_err(), "{name:?}");
+        }
+        assert!(serde_json::from_str::<Capability>("\"unknown\"").is_err());
+    }
+}

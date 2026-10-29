@@ -19,18 +19,44 @@ selecting them individually. A child-only retry leaves a parent waiting on work 
 does not add a root model request. Retrying without an instruction continues the same history
 without adding a synthetic message.
 
-A child's final reply is its job's result. A background child's earlier visible text replies
-arrive as message events without waiting for the child job to finish. Events carry
-`kind: "message"`, the child job `id`, optional `name`, and `text`.
+A child's result is `{messages?, reply}`: `reply` is its final reply. A background child's
+earlier visible text replies arrive as message events without waiting for the child job to
+finish. Events carry `kind: "message"`, the child job `id`, optional `name`, and `text`.
 They reach the parent at a model-request boundary, not by interrupting an in-flight request.
 Pending messages survive session restart. Reading a background job's output does not consume
 its message events.
 
 Message delivery does not mean the child has finished: completion also requires its owned work
 and queued inputs to be resolved. A completed background child's notification carries the final
-reply in `.result`; earlier replies are not concatenated into it. A foreground child returns its
-final reply in the call's `.result`, with no progress or later message events. The parent cannot
-make another model request until its foreground calls return.
+reply in `.result.reply`; earlier replies are not concatenated into it. A foreground child's
+earlier visible replies are not message events: its result saves them in `messages`, oldest
+first, each `{text, at}` with `at` the RFC 3339 UTC time it was made. Like any large result, a
+long `messages` is shortened in the call's view and listed in `presentation.truncated`; read the
+rest with `jobs({job, field: "/result/messages", index})`. Replies a session restart cuts off
+from a call whose child still ran arrive as message events. `messages` is absent when there are
+none. The parent cannot make another model request until its foreground calls return.
+
+When a child asks, the model's own foreground call blocked on it moves to the background, so the
+model's turn goes on and it can answer. That call is either its own `agent` call, which returns
+the child's job:
+
+```json
+{"id": 12, "state": "waiting_input", "presentation": {"notice": "This child agent asked a question, ..."}}
+```
+
+or its foreground `script` call, when the script's `tool.agent(...)` waits on the child, which
+returns the script's job, `{id, state: "running", presentation: {notice}}`. The script keeps
+running, and its completion arrives as a job event. A script's own `tool.agent(...)` call never
+moves: in a foreground or background script it keeps waiting until the child finishes and
+resolves with the child's result.
+
+The question goes to the child's parent agent, the agent whose model or script made the call,
+never the script itself or a further ancestor. It arrives as the same job event a background
+child's question produces, after the replies the child made before it, as message events, in the
+same delivery: a parent parked in `wait` wakes for it. A child the model's own call let go of is
+then a background job: its later replies arrive as message events and its completion as a job
+event. A script's `tool.agent(...)` result saves in `messages` only the replies not delivered as
+message events. Nothing repeats a reply.
 
 Child names are scoped to their caller: `A` and `B` may each create a child named `worker`, but
 all scripts owned by `A` share `A`'s child-name scope. A child retains its name even after
