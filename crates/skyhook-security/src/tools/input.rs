@@ -204,13 +204,15 @@ struct Field {
 }
 
 impl Arguments {
-    /// An object's properties, or the alternatives' of an internally tagged enum: required
-    /// only where every alternative requires it, with the tag taking each one's value.
+    /// An object's properties, or the alternatives' of a tagged or untagged enum: required
+    /// only where every alternative requires it, with a tag taking each one's value.
     /// Defaults are left out; the signature marks what may be omitted.
     fn of(schema: Schema) -> Self {
         let mut schema = schema.to_value();
         let doc = (schema.get("description").and_then(Value::as_str)).map(str::to_owned);
-        let alternatives = match schema.get_mut("oneOf").map(Value::take) {
+        let alternatives = (schema.get_mut("oneOf").map(Value::take))
+            .or_else(|| schema.get_mut("anyOf").map(Value::take));
+        let alternatives = match alternatives {
             Some(Value::Array(alternatives)) => alternatives,
             _ => vec![schema],
         };

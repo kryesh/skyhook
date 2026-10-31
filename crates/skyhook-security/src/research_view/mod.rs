@@ -1,8 +1,6 @@
 //! The run as the orchestrator and the Research tab see it: one read, two renderings.
 use std::fmt::Display;
 
-use skyhook::identity::JobId;
-
 use skyhook_cli::{
     ExtensionView,
     page::{
@@ -11,12 +9,8 @@ use skyhook_cli::{
     },
 };
 
-use crate::{
-    session::drift_warning,
-    store::{
-        ComponentCoverage, ContractState, OpenTest, Outcome, PathCoverage, Phase, PlanStanding,
-        Revision, RunFacts, RunState, Status, Store, Synthesis, UnitKind,
-    },
+use crate::store::{
+    FlawStatus, Phase, PremiseStatus, RunFacts, RunState, Status, Store, Synthesis,
 };
 
 mod sections;
@@ -30,48 +24,10 @@ pub const VIEWS: &[ExtensionView] = &[ExtensionView {
 }];
 
 impl RunFacts {
-    fn drifted(&self, current: &Revision) -> bool {
-        self.run.revision != *current
-    }
-
-    /// The orchestrator's section of its runtime state, with `current` the checkout as
-    /// last read and `waiting` the live workflows whose latest scheduling page held tests
-    /// with nothing to start.
-    pub fn state(&self, current: &Revision) -> String {
-        self.state_with(current, &[])
-    }
-
-    pub fn state_with(&self, current: &Revision, waiting: &[JobId]) -> String {
-        let drift = match self.drifted(current) {
-            true => format!(
-                "drift: recorded {}; recheck affected evidence\n",
-                self.run.revision
-            ),
-            false => String::new(),
-        };
-        let owed: Vec<String> = (self.synthesis.findings.iter())
-            .filter(|(_, count)| **count > 0)
-            .map(|(phase, count)| format!("{phase}={count}"))
-            .collect();
-        let owed = match owed.is_empty() {
-            true => "none".to_owned(),
-            false => owed.join(" "),
-        };
-        let attention: String = waiting
-            .iter()
-            .map(|script| {
-                format!(
-                    "Workflow script {script} has no active child agents; its latest startable \
-                     page offered no work and held tests for approval, an unblock or a slot. Check \
-                     pending PoC approvals, pending tests and test slots, and read the latest \
-                     scope's asked conditions. Handle any outstanding user decisions before \
-                     waiting for the script to finish; polling alone will not supply them. Never \
-                     infer approval from this reminder.\n"
-                )
-            })
-            .collect();
+    /// The orchestrator's section of its runtime state.
+    pub fn state(&self) -> String {
         format!(
-            "run: {}\nrevision: {current}\n{drift}poc: {}\nworkers: {}\nplan: {}\nowed: {owed}\nartifacts: {}\n{attention}",
+            "run: {}\npoc: {}\nworkers: {}\nplan: {}\nartifacts: {}\n",
             self.run.id,
             self.run.poc,
             self.run.options.workers,
@@ -84,119 +40,89 @@ impl RunFacts {
 impl RunState {
     /// The Research tab: the run, where its plan stands, where each phase stands and
     /// counts that use the width, then the record sections with what `disclosed` shows.
-    pub fn page(
-        &self,
-        store: &Store,
-        current: &Revision,
-        disclosed: &Disclosed,
-        tests: &[OpenTest],
-    ) -> Result<Page, crate::store::Error> {
-        let coverage = &store.coverage()?;
+    pub fn page(&self, store: &Store, disclosed: &Disclosed) -> Result<Page, crate::store::Error> {
         let facts = &self.facts;
         let synthesis = &facts.synthesis;
-        let mut header = vec![
+        let coverage = &self.coverage;
+        let header = vec![
             fact("run", facts.run.id.to_string()),
-            fact("revision", current.to_string()),
             fact("threshold", facts.run.options.threshold.to_string()),
             fact("poc", facts.run.poc.to_string()),
             fact("workers", facts.run.options.workers.to_string()),
         ];
-        if facts.drifted(current) {
-            let warning = drift_warning(&facts.run.revision, current);
-            header.push(Fact {
-                label: "drift".to_owned(),
-                value: Cell::new(warning, Tone::Warning),
-            });
-        }
-        let open = |kind| synthesis.tally(kind).open;
         let plan = Fact {
             label: "plan".to_owned(),
             value: Cell::new(
                 synthesis.line(),
-                match &synthesis.standing {
-                    PlanStanding::NotPlanned => Tone::Muted,
-                    PlanStanding::InProgress => Tone::Accent,
-                    _ if synthesis.complete() && synthesis.limited() == 0 => Tone::Success,
-                    PlanStanding::Ended { .. } => Tone::Warning,
+                if synthesis.complete() {
+                    Tone::Success
+                } else if Work::of(synthesis, &Phase::ALL).active {
+                    Tone::Accent
+                } else {
+                    Tone::Warning
                 },
             ),
         };
-        let units = |kind| synthesis.tally(kind).total();
-        let done = |kind| synthesis.tally(kind).ended(Outcome::Completed);
-        let blocked = |kind| synthesis.tally(kind).ended(Outcome::Blocked);
-        let questions = [UnitKind::Question, UnitKind::FollowUp].map(|kind| synthesis.tally(kind));
-        let open_questions = questions.iter().map(|tally| tally.open).sum::<u64>();
-        let blocked_questions = questions
-            .iter()
-            .map(|tally| tally.ended(Outcome::Blocked))
-            .sum::<u64>();
-        let finding = |phases: &[Phase]| {
-            phases
-                .iter()
-                .map(|phase| synthesis.owed(*phase))
-                .sum::<u64>()
+        let work = |phases: &[Phase]| Work::of(synthesis, phases);
+        let began = |phases: &[Phase]| {
+            (phases.iter()).any(|phase| coverage.tasks.get(phase).is_some_and(|count| *count > 0))
         };
-        let progress = &self.progress;
+        let questions = [Phase::Settle, Phase::Chain];
+        let owed =
+            |phases: &[Phase]| -> u64 { phases.iter().map(|phase| synthesis.owed(*phase)).sum() };
+        let mut test = work(&[Phase::Test]);
+        test.exhausted |= self.open_tests.iter().any(|open| !open.live);
         let pipeline = vec![
             stage(
                 "target",
-                progress.components,
-                0,
-                false,
-                progress.components > 0,
+                coverage.components,
+                Work::default(),
+                coverage.components > 0,
             ),
             stage(
                 "paths",
-                progress.paths,
-                u64::from(progress.sources > 0 && progress.paths == 0),
-                false,
-                progress.paths > 0,
+                coverage.paths,
+                Work {
+                    active: coverage.sources > 0 && coverage.paths == 0,
+                    exhausted: false,
+                },
+                coverage.paths > 0,
             ),
             stage(
                 "sweep",
-                format!("{}/{}", done(UnitKind::Sweep), units(UnitKind::Sweep)),
-                open(UnitKind::Sweep),
-                blocked(UnitKind::Sweep) > 0,
-                units(UnitKind::Sweep) > 0,
-            ),
-            stage(
-                "path review",
-                format!(
-                    "{}/{}",
-                    coverage.paths_in(PathCoverage::Checked),
-                    progress.paths
-                ),
-                open(UnitKind::PathReview) + synthesis.owed(Phase::Assess),
-                blocked(UnitKind::PathReview) > 0,
-                units(UnitKind::PathReview) > 0,
+                format!("{}/{}", coverage.swept, coverage.paths),
+                work(&[Phase::Sweep]),
+                coverage.swept > 0,
             ),
             stage(
                 "questions",
-                open_questions,
-                open_questions,
-                blocked_questions > 0,
-                units(UnitKind::Question) + units(UnitKind::FollowUp) > 0,
+                owed(&questions),
+                work(&questions),
+                began(&questions),
+            ),
+            stage(
+                "assess",
+                synthesis.owed(Phase::Assess),
+                work(&[Phase::Assess]),
+                began(&[Phase::Assess]),
             ),
             stage(
                 "review",
                 synthesis.owed(Phase::Review),
-                synthesis.owed(Phase::Review),
-                false,
-                self.reviewed,
+                work(&[Phase::Review]),
+                began(&[Phase::Review]),
             ),
             stage(
-                "poc",
-                finding(&[Phase::Poc, Phase::PocPending]),
-                synthesis.owed(Phase::Poc),
-                synthesis.owed(Phase::PocPending) > 0,
-                self.tested,
+                "test",
+                synthesis.owed(Phase::Test),
+                test,
+                began(&[Phase::Test]),
             ),
             stage(
                 "report",
-                self.findings,
-                synthesis.owed(Phase::Report),
-                false,
-                self.findings > 0,
+                coverage.findings,
+                work(&[Phase::Report]),
+                coverage.findings > 0,
             ),
         ];
         let count = |value: u64| Cell::from(value.to_string());
@@ -210,73 +136,58 @@ impl RunState {
                 },
             )
         };
-        let inspected = coverage.components_in(ComponentCoverage::Inspected);
-        let checked = coverage.paths_in(PathCoverage::Checked);
+        let premises =
+            |status: PremiseStatus| coverage.premises.get(&status).copied().unwrap_or_default();
+        let flaws = |status: FlawStatus| coverage.flaws.get(&status).copied().unwrap_or_default();
+        let unreached = synthesis.unreached.len() as u64;
         let coverage_panel = Panel {
             title: "Coverage".to_owned(),
             columns: Vec::new(),
             rows: vec![
-                row("sources", count(self.progress.sources), None),
-                row("paths", count(self.progress.paths), None),
+                row("sources", count(coverage.sources), None),
+                row("paths", count(coverage.paths), None),
                 row(
-                    "  checked",
-                    count(checked),
+                    "  swept",
+                    count(coverage.swept),
                     Some(Meter {
-                        value: checked,
-                        total: self.progress.paths,
+                        value: coverage.swept,
+                        total: coverage.paths,
                     }),
                 ),
+                row("  unswept", flagged(coverage.paths - coverage.swept), None),
                 row(
-                    "  unchecked",
-                    flagged(coverage.paths_in(PathCoverage::Unchecked)),
+                    "  exhausted",
+                    flagged(synthesis.exhausted(Phase::Sweep)),
                     None,
                 ),
+                row("components", count(coverage.components), None),
+                row("  reached", count(coverage.components - unreached), None),
+                row("  mapped only", flagged(unreached), None),
                 row(
-                    "  unreached",
-                    flagged(coverage.paths_in(PathCoverage::Unreached)),
+                    "premises undecided",
+                    count(premises(PremiseStatus::Undecided)),
                     None,
                 ),
-                row("components", count(self.progress.components), None),
-                row(
-                    "  inspected",
-                    count(inspected),
-                    Some(Meter {
-                        value: inspected,
-                        total: self.progress.components,
-                    }),
-                ),
-                row(
-                    "  reached",
-                    count(coverage.components_in(ComponentCoverage::Reached)),
-                    None,
-                ),
-                row(
-                    "  mapped only",
-                    count(coverage.components_in(ComponentCoverage::Mapped)),
-                    None,
-                ),
-                row("deferred", flagged(coverage.deferred), None),
-                row(
-                    "contracts",
-                    (ContractState::ALL.iter())
-                        .map(|state| format!("{} {state}", coverage.contracts_in(*state)))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                        .into(),
-                    None,
-                ),
-                row("unchallenged", flagged(coverage.unchallenged), None),
-                row("open flaws", count(self.progress.flaws), None),
+                row("  asked", flagged(synthesis.asked.len() as u64), None),
+                row("  disputed", flagged(coverage.disputed), None),
+                row("flaws suspected", count(flaws(FlawStatus::Suspected)), None),
+                row("  contained", count(flaws(FlawStatus::Contained)), None),
+                row("  refuted", count(flaws(FlawStatus::Refuted)), None),
             ],
+        };
+        let candidates = |status: Status| {
+            coverage
+                .candidates
+                .get(&status)
+                .copied()
+                .unwrap_or_default()
         };
         let shown = || (Status::ALL.into_iter()).filter(|status| *status != Status::Merged);
         // The funnel compares statuses with each other, so the largest fills its bar.
-        let largest = (shown().map(|status| self.progress.candidates_in(status)))
-            .max()
-            .unwrap_or_default();
+        let largest = shown().map(candidates).max().unwrap_or_default();
         let mut rows: Vec<PanelRow> = shown()
             .map(|status| {
-                let value = self.progress.candidates_in(status);
+                let value = candidates(status);
                 row(
                     &words(status),
                     count(value),
@@ -287,13 +198,12 @@ impl RunState {
                 )
             })
             .collect();
-        // Open tests are shown as read now; they change what the candidates show, not owe.
-        let (proving, abandoned) =
-            (tests.iter()).fold((0, 0), |(live, dead), test| match test.live {
-                true => (live + 1, dead),
-                false => (live, dead + 1),
-            });
-        rows.push(row("proving", count(proving), None));
+        let abandoned = self.open_tests.iter().filter(|open| !open.live).count() as u64;
+        rows.push(row(
+            "proving",
+            count(self.open_tests.len() as u64 - abandoned),
+            None,
+        ));
         if abandoned > 0 {
             rows.push(row("test abandoned", flagged(abandoned), None));
         }
@@ -302,38 +212,33 @@ impl RunState {
             columns: Vec::new(),
             rows,
         };
-        let plan_panel = plan_panel(synthesis);
         let mut blocks = vec![
             Block::Facts(header),
             Block::Facts(vec![plan]),
             Block::Pipeline(pipeline),
-            Block::Panels(vec![coverage_panel, funnel, plan_panel]),
+            Block::Panels(vec![coverage_panel, funnel, tasks_panel(synthesis)]),
         ];
-        blocks.extend(sections(store, self, coverage, disclosed, tests)?);
+        blocks.extend(sections(store, self, disclosed)?);
         Ok(Page { blocks })
     }
 }
 
-/// Plan units of each kind: open, completed, and ended with a limitation (blocked,
-/// inconclusive or deferred, which the plan line counts apart).
-fn plan_panel(synthesis: &Synthesis) -> Panel {
+/// Each task phase's running tasks and exhausted subjects.
+fn tasks_panel(synthesis: &Synthesis) -> Panel {
     Panel {
-        title: "Plan".to_owned(),
-        columns: vec!["open".to_owned(), "done".to_owned(), "limited".to_owned()],
-        rows: UnitKind::ALL
-            .iter()
-            .map(|kind| {
+        title: "Tasks".to_owned(),
+        columns: vec!["running".to_owned(), "exhausted".to_owned()],
+        rows: (Phase::ALL.into_iter())
+            .map(|phase| {
                 let cell = |count: u64, tone| match count {
                     0 => Cell::new("0", Tone::Muted),
                     count => Cell::new(count.to_string(), tone),
                 };
-                let tally = synthesis.tally(*kind);
                 PanelRow {
-                    label: words(kind),
+                    label: words(phase),
                     values: vec![
-                        cell(tally.open, Tone::Accent),
-                        cell(tally.ended(Outcome::Completed), Tone::Normal),
-                        cell(tally.limited(), Tone::Warning),
+                        cell(synthesis.running(phase), Tone::Accent),
+                        cell(synthesis.exhausted(phase), Tone::Warning),
                     ],
                     meter: None,
                 }
@@ -361,89 +266,73 @@ fn row(label: &str, value: Cell, meter: Option<Meter>) -> PanelRow {
     }
 }
 
-/// At work while anything is owed, else blocked when some of it ended blocked, done once
-/// it has started, or not reached yet.
-fn state(owed: u64, blocked: bool, started: bool) -> StageState {
-    if owed > 0 {
-        StageState::Active
-    } else if blocked {
-        StageState::Blocked
-    } else if started {
-        StageState::Done
-    } else {
-        StageState::Pending
+/// Where a stage's phases stand: at work while any of it is owed or running, blocked when
+/// some of it is exhausted (for tests, also while one waits on the user).
+#[derive(Clone, Copy, Default)]
+struct Work {
+    active: bool,
+    exhausted: bool,
+}
+
+impl Work {
+    fn of(synthesis: &Synthesis, phases: &[Phase]) -> Self {
+        Self {
+            active: (phases.iter())
+                .any(|phase| synthesis.owed(*phase) + synthesis.running(*phase) > 0),
+            exhausted: (phases.iter()).any(|phase| synthesis.exhausted(*phase) > 0),
+        }
+    }
+
+    /// At work, else blocked, done once it has started, or not reached yet.
+    fn state(self, started: bool) -> StageState {
+        if self.active {
+            StageState::Active
+        } else if self.exhausted {
+            StageState::Blocked
+        } else if started {
+            StageState::Done
+        } else {
+            StageState::Pending
+        }
     }
 }
 
-fn stage(label: &str, value: impl Display, owed: u64, blocked: bool, started: bool) -> Stage {
+fn stage(label: &str, value: impl Display, work: Work, started: bool) -> Stage {
     Stage {
         label: label.to_owned(),
         value: value.to_string(),
-        state: state(owed, blocked, started),
+        state: work.state(started),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use skyhook_cli::page::Disclosed;
+
     use super::*;
     use crate::store::{
-        PocResult,
-        tests::{fixture, poc, report_input, revision, root_of, validated},
+        PremiseScope,
+        tests::{fixture, premise},
     };
 
-    /// Review and PoC read as done once their work ran, whatever the candidates moved on
-    /// A held workflow is named in the root's state only while it waits, and the rest of the
-    /// state is unchanged by it.
+    /// The coverage panel counts undecided premises of both scopes.
     #[test]
-    fn waiting_workflow_attention_is_appended_to_the_root_state() {
+    fn undecided_premises_count_both_scopes() {
         let (_session, store, actor) = fixture();
-        let facts = store.run_facts().unwrap();
-        let current = revision();
-        let plain = facts.state(&current);
-        assert!(!plain.contains("Workflow script"));
-        assert_eq!(facts.state_with(&current, &[]), plain);
-
-        let workflow = skyhook::identity::JobId::new(4242).unwrap();
-        let waiting = facts.state_with(&current, &[workflow]);
-        assert!(waiting.starts_with(&plain), "{waiting}");
-        let attention = &waiting[plain.len()..];
-        assert!(
-            attention.starts_with("Workflow script 4242 has no active child agents"),
-            "{attention}"
-        );
-        assert!(attention.contains("pending PoC approvals"), "{attention}");
-        assert!(attention.ends_with('\n'));
-        let _ = (store, actor);
-    }
-
-    /// to: here a failed test of a scenario since reported.
-    #[test]
-    fn stages_are_done_once_their_work_ran() {
-        let (_session, store, actor) = fixture();
-        let id = validated(&store, &actor);
-        poc(&store, &actor, id, PocResult::Failed);
-        let root = root_of(&store, id);
-        let version = store.report_generation(root).unwrap().key;
-        store
-            .record_finding(&actor, &report_input(root), &version, &[])
+        for scope in [PremiseScope::Code, PremiseScope::Deployment] {
+            premise(&store, &actor, scope);
+        }
+        let page = (store.run_state().unwrap())
+            .page(&store, &Disclosed::default())
             .unwrap();
-        let state = store.run_state().unwrap();
-        let page = (state.page(&store, &revision(), &Disclosed::default(), &[])).unwrap();
-        let stages = (page.blocks.iter())
+        let undecided = (page.blocks.iter())
             .find_map(|block| match block {
-                Block::Pipeline(stages) => Some(stages),
+                Block::Panels(panels) => (panels.iter())
+                    .flat_map(|panel| &panel.rows)
+                    .find(|row| row.label == "premises undecided"),
                 _ => None,
             })
-            .expect("a pipeline");
-        let stage = |label: &str| {
-            (stages.iter())
-                .find(|stage| stage.label == label)
-                .unwrap_or_else(|| panic!("a {label} stage"))
-                .state
-        };
-        assert_eq!(
-            ["review", "poc", "report"].map(stage),
-            [StageState::Done; 3]
-        );
+            .unwrap();
+        assert_eq!(undecided.values[0].text, "2");
     }
 }

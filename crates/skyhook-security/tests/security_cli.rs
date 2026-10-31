@@ -390,7 +390,6 @@ fn a_run_sends_host_state_with_layered_roles() {
     assert!(state.contains(&format!("run: {run}\n")));
     assert!(state.contains("poc: yes\n"));
     assert_eq!(f.column(&run, "SELECT threshold FROM run"), ["high"]);
-    assert!(!state.contains("drift:"));
     let encoded = request.to_string();
     assert!(encoded.contains("WORKSPACE_ROLE_HINT"));
     assert!(!encoded.contains("UNASSIGNED_MODEL_HINT"));
@@ -463,48 +462,29 @@ fn dump_config_layers_security_files() {
 
 const CANDIDATE_SOURCE: &str = "int parse(unsigned len) {\n  char buffer[4] = {0};\n  if (len > sizeof buffer) {\n    return buffer[len];\n  }\n  return 0;\n}\n";
 
-/// Records one scope and one validated candidate, and leaves `flaw` bound for the caller.
+/// Records one deployment premise and one validated candidate, and leaves `flaw` bound for
+/// the caller.
 const VALIDATED_CANDIDATE: &str = r#"
 const research = async action => (await tool.research(action)).unwrap();
-await research({action:'add_scope',description:'first-run-scope'});
+await research({action:'upsert',kind:'premise',title:'first-run-premise',body:'the parser is enabled',scope:'deployment'});
 const at = line => ({file:'fixture.c',start_line:line,end_line:line});
-const source = await research({action:'add_source',kind:'network',trust:'unauthenticated',entry:at(1),description:'Untrusted request length in the assumed deployment'});
-const component = await research({action:'add_component',name:'parser',description:'fixture parser',files:['fixture.c']});
-const path = await research({action:'add_path',description:'request length parsing',sources:[source],reaches:[{component,note:'parse is the entry point'}]});
-const flaw = await research({action:'add_flaw',component,title:'Out-of-bounds read',statement:'An oversized length indexes past the buffer',operation:'memory_read',deficiency:{guard:'bounds_check',deficiency:'missing'},effects:[{property:'confidentiality',note:'adjacent memory'}],evidence:[{location:at(4),role:'operation',stance:'supports',note:'Read beyond the allocation'}]});
-await research({action:'add_exposure',flaw,path,outcome:'contributes',conditions:'len exceeds the buffer',note:'Oversized request selects the unsafe branch',route:[{location:at(3),basis:'inspected',note:'the length check admits it'}]});
-const candidate = await research({action:'add_candidate',title:'Out-of-bounds read',description:'Oversized length reaches an unsafe read',cwe:125,members:[{flaw,step:null}],paths:[path]});
-await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:H/SC:N/SI:N/SA:N',confidence:'established',rationale:'Remote unauthenticated disclosure and process failure in the assumed deployment'});
-await research({action:'verdict',candidate,verdict:{kind:'validated'},rationale:'Reviewed the guard, the route and the read'});
+const component = await research({action:'upsert',kind:'component',title:'parser',body:'fixture parser',files:['fixture.c']});
+const source = await research({action:'upsert',kind:'source',title:'request',body:'Untrusted request length in the assumed deployment',location:at(1),trust:'untrusted'});
+const path = await research({action:'upsert',kind:'path',title:'request length parsing',body:'the length reaches parse'});
+await research({action:'link',links:[{path_source:{path,source}},{path_step:{path,component,location:at(3),note:'the length check admits it'}}]});
+const flaw = await research({action:'upsert',kind:'flaw',title:'Out-of-bounds read',body:'An oversized length indexes past the buffer',component,location:at(4),cwe:125});
+const candidate = await research({action:'upsert',kind:'candidate',title:'Out-of-bounds read',body:'Oversized length reaches an unsafe read',path,flaws:[flaw]});
+await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:H/SC:N/SI:N/SA:N',note:'Remote unauthenticated disclosure and process failure in the assumed deployment'});
+await research({action:'verdict',candidate,verdict:'validated',note:'Reviewed the guard, the path and the read'});
 "#;
 
 #[test]
 fn native_tools_report_into_and_scope_to_their_session_run() {
     let f = Fixture::new();
     f.write("fixture.c", CANDIDATE_SOURCE);
-    let content = serde_json::json!({
-        "title": "Bounds-check fixture",
-        "summary": "Analytically reviewed; no empirical demonstration.",
-        "analysis": "The recorded len > capacity guard reaches the out-of-bounds read.",
-        "impact": "The assumed deployment exposes adjacent memory to an unauthenticated reader.",
-        "remediation": "Reject indexes outside the buffer length before access.",
-        "reproduction": {
-            "prerequisites": ["Use only the disposable local fixture."],
-            "steps": [{
-                "instruction": "Review fixture.c at the guarded buffer access.",
-                "expected_result": "The selected branch permits an index beyond the buffer."
-            }],
-            "outcome": {
-                "kind": "unobserved",
-                "expected_result": "An unsafe read under the recorded preconditions.",
-                "limitations": "Code review only; the fixture was not executed."
-            },
-            "cleanup": ["No live environment was created."]
-        }
-    });
     f.write(
         "report.js",
-        &format!("{VALIDATED_CANDIDATE}\n(await tool.finding_report({{action:'populate', ...{content}, root: flaw}})).unwrap();\nreturn (await tool.finding_report({{action:'generate'}})).unwrap();"),
+        &format!("{VALIDATED_CANDIDATE}\n(await tool.research({{action:'report', root: flaw, title: 'Bounds-check fixture', body: 'Analytically reviewed; no empirical demonstration.'}})).unwrap();\nreturn (await tool.research({{action:'generate'}})).unwrap();"),
     );
     let first = session_id(&output(
         f.batch()
@@ -524,11 +504,11 @@ fn native_tools_report_into_and_scope_to_their_session_run() {
         serde_json::from_slice(&fs::read(report.join("finding.json")).unwrap()).unwrap();
     assert_eq!(document["run"], first_run);
 
-    // Native tools are scoped to the session's run: a new session sees no scopes, a
+    // Native tools are scoped to the session's run: a new session sees no premises, a
     // resume sees its own, and a resume cannot narrow the fixed root's capabilities.
     f.write(
         "query.js",
-        "return (await tool.research_query({action:'scopes'})).unwrap();",
+        "return (await tool.research_query({action:'list', kind:'premise'})).unwrap();",
     );
     let query = |extra: &[&str]| {
         output(
@@ -543,8 +523,11 @@ fn native_tools_report_into_and_scope_to_their_session_run() {
     let runs = f.runs();
     assert_eq!(runs.len(), 2);
     assert!(
-        f.column(&second.to_string(), "SELECT description FROM scope")
-            .is_empty()
+        f.column(
+            &second.to_string(),
+            "SELECT title FROM node WHERE kind='premise'"
+        )
+        .is_empty()
     );
     assert_eq!(session_id(&query(&["--resume", &first.to_string()])), first);
     assert_admission_failure(&query(&[
@@ -554,8 +537,8 @@ fn native_tools_report_into_and_scope_to_their_session_run() {
         "read",
     ]));
     assert_eq!(
-        f.column(&first_run, "SELECT description FROM scope"),
-        ["first-run-scope"]
+        f.column(&first_run, "SELECT title FROM node WHERE kind='premise'"),
+        ["first-run-premise"]
     );
     assert_eq!(f.runs(), runs);
 }

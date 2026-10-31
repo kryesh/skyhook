@@ -64,6 +64,10 @@ pub enum HarnessError {
     /// The harness's [`ResumeHook`](super::ResumeHook) failed; the next work calls it again.
     #[error("the session could not resume: {0}")]
     Resume(Box<dyn std::error::Error + Send + Sync>),
+    /// The harness's [`HostState`](super::HostState) could not read an agent's events; the
+    /// request they would ride is not made.
+    #[error("host events could not be read: {0}")]
+    HostEvents(Box<dyn std::error::Error + Send + Sync>),
     #[error("child-agent nesting limit reached")]
     ChildDepth,
     #[error("image limits were exceeded")]

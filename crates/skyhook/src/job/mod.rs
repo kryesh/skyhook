@@ -64,7 +64,7 @@ pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
 pub(crate) use questions::Asked;
 use questions::Asking;
-pub(crate) use views::{JOB_VIEW_SCHEMAS, JobListing, ViewKind, Waiting, release_records};
+pub(crate) use views::{JOB_VIEW_SCHEMAS, JobListing, Release, ViewKind, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod index;
 use index::Lookup;
@@ -194,9 +194,43 @@ pub struct ChildReply {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What a job's work completed with.
+#[derive(Clone)]
+pub enum Completion {
+    Output(ToolOutput),
+    /// A child agent's final reply: its result saves it after the replies
+    /// before it that its foreground call carries.
+    Reply(String),
+}
+
+impl Completion {
+    /// The output saved for this completion, carrying `messages` before a reply.
+    fn saved(self, messages: Vec<ChildReply>) -> ToolOutput {
+        match self {
+            Self::Output(output) => output,
+            Self::Reply(reply) => {
+                let result = ChildResult { messages, reply };
+                ToolOutput::new(serde_json::to_value(result).expect("a child result serializes"))
+            }
+        }
+    }
+}
+
+impl From<ToolOutput> for Completion {
+    fn from(output: ToolOutput) -> Self {
+        Self::Output(output)
+    }
+}
+
+impl From<Completion> for ToolOutput {
+    fn from(completion: Completion) -> Self {
+        completion.saved(Vec::new())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum JobOutcome {
-    Completed(ToolOutput),
+    Completed(Completion),
     /// Completed by a tool whose native result type is unit.
     NoResult,
     /// The cause decides whether the job failed, was cancelled, or was interrupted.
@@ -216,18 +250,6 @@ impl JobOutcome {
                 output: None,
             },
         }
-    }
-
-    /// A child's completed result, saving `messages` as the replies before it.
-    fn carrying(self, messages: Vec<ChildReply>) -> Self {
-        let Self::Completed(mut output) = self else {
-            return self;
-        };
-        if let Ok(result) = ChildResult::deserialize(&output.value) {
-            let result = ChildResult { messages, ..result };
-            output.value = serde_json::to_value(result).expect("a child result serializes");
-        }
-        Self::Completed(output)
     }
 
     fn end(&self) -> JobEnd {
@@ -250,9 +272,9 @@ impl From<crate::tool::ToolError> for JobOutcome {
     }
 }
 
-impl From<Result<ToolOutput, crate::tool::ToolError>> for JobOutcome {
-    fn from(result: Result<ToolOutput, crate::tool::ToolError>) -> Self {
-        result.map_or_else(Into::into, Self::Completed)
+impl<T: Into<Completion>> From<Result<T, crate::tool::ToolError>> for JobOutcome {
+    fn from(result: Result<T, crate::tool::ToolError>) -> Self {
+        result.map_or_else(Into::into, |completed| Self::Completed(completed.into()))
     }
 }
 
@@ -305,7 +327,7 @@ pub(crate) type ResumeHandler = Arc<
             Option<Value>,
             mpsc::Receiver<Value>,
         )
-            -> futures_util::future::BoxFuture<'static, Result<ToolOutput, crate::tool::ToolError>>
+            -> futures_util::future::BoxFuture<'static, Result<Completion, crate::tool::ToolError>>
         + Send
         + Sync,
 >;
@@ -891,7 +913,7 @@ pub(crate) mod tests {
             self.test_install(id).await;
             let handler: ResumeHandler = Arc::new(move |_, _| {
                 let answer = answer.clone();
-                Box::pin(async move { Ok(ToolOutput::new(answer)) })
+                Box::pin(async move { Ok(ToolOutput::new(answer).into()) })
             });
             self.test_resume_with(id, handler);
             id
@@ -915,12 +937,18 @@ pub(crate) mod tests {
             registered.insert((self.store().id(), id), handler);
         }
 
+        /// Complete agent job `job` with its child's final reply.
+        pub(crate) async fn test_reply(&self, job: JobId, reply: &str) {
+            let completed = JobOutcome::Completed(Completion::Reply(reply.to_owned()));
+            self.finish(job, completed).await.unwrap();
+        }
+
         pub(super) async fn test_finish(&self, job: JobId, output: Value) {
             self.test_complete(job, ToolOutput::new(output)).await;
         }
 
         pub(super) async fn test_complete(&self, job: JobId, output: ToolOutput) {
-            self.finish(job, JobOutcome::Completed(output))
+            self.finish(job, JobOutcome::Completed(output.into()))
                 .await
                 .unwrap();
         }

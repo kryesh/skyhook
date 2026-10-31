@@ -1,17 +1,15 @@
-//! The Markdown of `reports/`: each root's README and reproduction, each test's page and the
-//! index. Every page opens with flat front matter its body repeats, uses fixed headings,
-//! links only to files by relative path within its root's folder (or between a root's README
-//! and the index), and sets authored text below its own headings with raw HTML neutralised.
+//! The Markdown of `reports/`: each root's README, each test's page and the index. Every
+//! page opens with flat front matter its body repeats, uses fixed headings, links only to
+//! files by relative path within its root's folder (or between a root's README and the
+//! index), and sets authored text below its own headings with raw HTML neutralised.
 
 use std::fmt::Write as _;
 
 use super::{
-    Document, IndexEntry, PocFolder,
-    prose::{block as authored, line},
+    Document, IndexEntry, TestFolder,
+    prose::{block as authored, label, line},
 };
-use crate::store::{
-    ConfidenceTier, Gate, PocAttempt, ReportScenario, ReproductionOutcome, Resolution,
-};
+use crate::store::{ArtifactRole, ReportedTest, TestResult};
 
 /// Flat YAML front matter of scalar `fields`, never read back by tooling.
 fn front_matter(fields: &[(&str, String)]) -> String {
@@ -48,392 +46,100 @@ fn code(text: &str) -> String {
     format!("{fence}{pad}{text}{pad}{fence}")
 }
 
-/// The headline's empirical standing, with what a test that did not demonstrate it recorded.
-fn testing(document: &Document) -> String {
-    match &document.snapshot.content.headline.poc {
-        Some(poc) if document.headline.confidence == ConfidenceTier::Demonstrated => {
-            format!("Confirmed by review; demonstrated by PoC {}.", poc.id)
-        }
-        Some(poc) => format!(
-            "Confirmed by review; not demonstrated: PoC {} {}.",
-            poc.id, poc.result
-        ),
-        None => "Confirmed by review; empirically untested.".to_owned(),
+/// The roles a confirmed test records no artifact of, of the two a confirmation shows.
+fn missing(test: &ReportedTest) -> Vec<ArtifactRole> {
+    match test.result {
+        TestResult::Confirmed => [ArtifactRole::Attack, ArtifactRole::Control]
+            .into_iter()
+            .filter(|role| !test.artifacts.iter().any(|artifact| artifact.role == *role))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-/// A scenario's conditions, each with what it gates and how it was resolved.
-fn premises(scenario: &ReportScenario) -> String {
-    let mut text = String::new();
-    for condition in &scenario.candidate.premises {
-        let premise = &condition.premise;
-        let gates = match condition.gates {
-            Gate::Metric { metric } => format!(" (gates {metric})"),
-            Gate::Scenario => String::new(),
-        };
-        let _ = write!(
-            text,
-            "- Premise {}{gates}: {}",
-            premise.id,
-            line(&premise.statement)
-        );
-        match (premise.resolution.as_ref()).filter(|resolution| resolution.current) {
-            Some(resolution) => {
-                let _ = write!(text, " ({}", resolution.resolution.kind());
-                if let Resolution::Holds {
-                    deployment: Some(deployment),
-                } = resolution.resolution
-                {
-                    let _ = write!(text, ", deployment fact {deployment} of the scope");
-                }
-                let _ = writeln!(text, "): {}", line(&resolution.note));
-            }
-            None => text.push_str(" (open)\n"),
+/// A test's result, with the artifacts a confirmation lacks.
+fn result(test: &ReportedTest) -> String {
+    let missing = missing(test);
+    match missing.is_empty() {
+        true => test.result.to_string(),
+        false => {
+            let roles: Vec<_> = missing.iter().map(|role| role.as_str()).collect();
+            format!("{}, no {} artifact", test.result, roles.join(" or "))
         }
     }
-    text
-}
-
-/// The headline scenario as the store holds it: the root flaw, the paths and sources it
-/// starts from, each member flaw with its classification, possible effects and each path's
-/// route to it, then the premises the assessment rests on.
-fn scenario(document: &Document) -> String {
-    let content = &document.snapshot.content;
-    let candidate = &content.headline.candidate;
-    let mut text = format!(
-        "## Scenario\n\nRoot flaw {}: {}. Candidate {}: {}.\n\n{}",
-        content.root.flaw.id,
-        line(&content.root.flaw.title),
-        candidate.candidate.id,
-        line(&candidate.candidate.title),
-        note(document, &content.headline)
-    );
-    for path in &content.paths {
-        let sources: Vec<String> = path.sources.iter().map(ToString::to_string).collect();
-        let _ = writeln!(
-            text,
-            "- Path {}: {} (sources {})",
-            path.id,
-            line(&path.description),
-            sources.join(", ")
-        );
-    }
-    for source in &content.sources {
-        let _ = writeln!(
-            text,
-            "- Source {} ({}, {}): {}; entry {}",
-            source.id,
-            source.kind,
-            source.trust,
-            line(&source.description),
-            code(&source.entry.to_string())
-        );
-    }
-    if let Some(cwe) = candidate.cwe {
-        let _ = writeln!(text, "- CWE-{cwe}");
-    }
-    text.push('\n');
-    for (member, flaw) in candidate.members.iter().zip(&content.flaws) {
-        let summary = &flaw.flaw;
-        match member.step {
-            Some(step) => {
-                let _ = write!(text, "### Step {step}\n\nFlaw {}", summary.id);
-            }
-            None => {
-                let _ = write!(text, "### Flaw {}\n\nFlaw {}", summary.id, summary.id);
-            }
-        }
-        let _ = write!(text, ": {}. {}", line(&summary.title), summary.operation);
-        if let Some(deficiency) = flaw.deficiency {
-            let _ = write!(text, " · {} · {}", deficiency.guard, deficiency.deficiency);
-        }
-        let _ = write!(text, "\n\n{}\n", authored(&flaw.statement, 3));
-        for effect in &flaw.effects {
-            let _ = writeln!(
-                text,
-                "- {}: {}",
-                effect.property,
-                line(effect.note.as_str())
-            );
-        }
-        text.push('\n');
-        for exposure in (candidate.exposures.iter()).filter(|exposure| exposure.flaw == summary.id)
-        {
-            let _ = write!(
-                text,
-                "Along path {} ({}): {}\n\n",
-                exposure.path,
-                exposure.outcome,
-                line(&exposure.conditions)
-            );
-            for (index, step) in exposure.route.iter().enumerate() {
-                let _ = writeln!(
-                    text,
-                    "{}. {} ({}): {}",
-                    index + 1,
-                    code(&step.location.to_string()),
-                    step.basis,
-                    line(step.note.as_str())
-                );
-            }
-            text.push('\n');
-        }
-    }
-    if !candidate.premises.is_empty() {
-        text.push_str("## Premises\n\n");
-        text.push_str(&premises(&content.headline));
-        text.push('\n');
-    }
-    text
-}
-
-/// The reporter's note on a scenario, as its own paragraph.
-fn note(document: &Document, scenario: &ReportScenario) -> String {
-    (document.content.notes.iter())
-        .find(|note| note.candidate == scenario.candidate.candidate.id)
-        .map_or_else(String::new, |note| {
-            format!("{}\n", authored(note.note.as_str(), 3))
-        })
-}
-
-/// The reporter's account of what a test showed, as its own paragraph.
-fn narrative(document: &Document, poc: &PocAttempt, level: usize) -> String {
-    (document.content.narratives.iter())
-        .find(|narrative| narrative.poc == poc.id)
-        .map_or_else(String::new, |narrative| {
-            format!("{}\n", authored(narrative.narrative.as_str(), level))
-        })
-}
-
-/// The root's other scenarios, each with its severity, standing, test and own conditions.
-fn variants(document: &Document) -> String {
-    let variants = &document.snapshot.content.variants;
-    if variants.is_empty() {
-        return String::new();
-    }
-    let mut text = String::from("## Variants\n\nOther scenarios this root flaw leads to:\n\n");
-    for variant in variants {
-        let candidate = &variant.candidate;
-        let _ = write!(
-            text,
-            "### Candidate {}\n\nTitle: {}. {} · {} ({:.1}) · {} · {}\n\n{}\n{}",
-            candidate.candidate.id,
-            line(&candidate.candidate.title),
-            variant.assessment.severity,
-            code(&variant.assessment.vector.to_string()),
-            variant.assessment.score,
-            candidate.candidate.status,
-            candidate
-                .candidate
-                .confidence
-                .map_or("", ConfidenceTier::as_str),
-            authored(&candidate.description, 3),
-            note(document, variant)
-        );
-        if let Some(poc) = &variant.poc {
-            let _ = writeln!(
-                text,
-                "- Test: [PoC {}](poc-{}/poc.md), {}",
-                poc.id, poc.id, poc.result
-            );
-        }
-        for exposure in &candidate.exposures {
-            let _ = writeln!(
-                text,
-                "- Along path {} (flaw {}): {}",
-                exposure.path,
-                exposure.flaw,
-                line(&exposure.conditions)
-            );
-        }
-        text.push_str(&premises(variant));
-        text.push('\n');
-    }
-    text
-}
-
-/// Each stated test's page and artifacts, by role.
-fn artifacts(document: &Document) -> String {
-    if document.pocs.is_empty() {
-        return String::new();
-    }
-    let mut text = String::from("## PoC artifacts\n\n");
-    for manifest in &document.pocs {
-        let _ = writeln!(
-            text,
-            "- [PoC {}]({}/poc.md), candidate {}: {} files",
-            manifest.poc,
-            manifest.folder,
-            manifest.candidate,
-            manifest.files.len()
-        );
-        for file in &manifest.files {
-            let _ = writeln!(
-                text,
-                "  - {}: [{}]({}/{}), {} bytes",
-                file.role, file.path, manifest.folder, file.path, file.bytes
-            );
-        }
-    }
-    text.push('\n');
-    text
 }
 
 pub(super) fn readme(document: &Document) -> String {
-    let content = &document.snapshot.content;
-    let input = &document.content;
-    let headline = &content.headline;
-    let root = content.root.flaw.id;
-    let assessed = document.headline;
-    let mut text = front_matter(&[
-        ("type", "finding".to_owned()),
-        ("root", root.to_string()),
-        ("status", "current".to_owned()),
+    let headline = document.headline;
+    let mut fields = vec![
+        ("type", "report".to_owned()),
+        ("root", document.root.to_string()),
+        ("finding", document.finding.to_string()),
         ("severity", document.severity.to_string()),
-        ("headline", assessed.candidate.to_string()),
-        ("headline_severity", assessed.severity.to_string()),
-        ("headline_score", format!("{:.1}", assessed.score)),
-        ("headline_vector", assessed.vector.to_string()),
-        ("headline_confidence", assessed.confidence.to_string()),
-    ]);
+        ("headline", headline.candidate.to_string()),
+        ("confidence", headline.confidence.to_string()),
+    ];
+    if let Some(cwe) = document.cwe {
+        fields.push(("cwe", format!("CWE-{cwe}")));
+    }
+    let mut text = front_matter(&fields);
     let _ = write!(
         text,
-        "# Root flaw {root}\n\nTitle: {}\n\nStatus: current. Severity: {}, the most severe of its \
-         scenarios. Headline: candidate {}, {}, score {:.1}, confidence {}. {} See the \
-         [index](../index.md).\n\n\
-         ## Summary\n\n{}\n## Analysis\n\n{}\n## Impact\n\n{}\n{}\
-         ## CVSS 4.0\n\nThe headline scenario, scored for the impact if every premise holds.\n\n\
-         - Vector: {}\n- CVSS-B score: {:.1} ({})\n- Confidence: {}\n\n{}\n\
-         ## Analytical validation evidence\n\n{}\n",
-        line(input.title.as_str()),
+        "# {}\n\nRoot flaw {}, severity {}. Headline: candidate {}, {} ({:.1}), {}. \
+         Machine-readable: [finding.json](finding.json); all reports: \
+         [index](../index.md).\n\n## Scenarios\n\n",
+        line(document.title),
+        document.root,
         document.severity,
-        assessed.candidate,
-        assessed.severity,
-        assessed.score,
-        assessed.confidence,
-        testing(document),
-        authored(input.summary.as_str(), 2),
-        authored(input.analysis.as_str(), 2),
-        authored(input.impact.as_str(), 2),
-        scenario(document),
-        code(&assessed.vector.to_string()),
-        assessed.score,
-        assessed.severity,
-        assessed.confidence,
-        authored(&headline.assessment.rationale, 2),
-        authored(&headline.validation.evidence, 2),
+        headline.candidate,
+        headline.severity,
+        headline.score,
+        headline.confidence,
     );
-    if let Some(poc) = &headline.poc {
-        let _ = write!(
-            text,
-            "## Empirical record\n\n[PoC {}](poc-{}/poc.md): {}.\n\n{}\n{}",
-            poc.id,
-            poc.id,
-            poc.result,
-            authored(&poc.evidence, 2),
-            narrative(document, poc, 2)
-        );
+    let header = &[
+        "Candidate",
+        "Path",
+        "Chain",
+        "Vector",
+        "Score",
+        "Severity",
+        "Status",
+        "Confidence",
+        "Test",
+    ];
+    let rows = (document.scenarios.iter())
+        .map(|scenario| {
+            let chain: Vec<_> = scenario.chain.iter().map(ToString::to_string).collect();
+            let test = match &scenario.test {
+                Some(test) => format!(
+                    "[test {}](test-{}/test.md) {}",
+                    test.id,
+                    test.id,
+                    result(test)
+                ),
+                None => "untested".to_owned(),
+            };
+            vec![
+                format!("{} {}", scenario.candidate, line(&scenario.title)),
+                format!("{} {}", scenario.path, line(&scenario.path_title)),
+                chain.join(" → "),
+                code(&scenario.vector.to_string()),
+                format!("{:.1}", scenario.vector.score()),
+                scenario.severity.to_string(),
+                scenario.state.to_string(),
+                scenario.confidence.to_string(),
+                test,
+            ]
+        })
+        .collect();
+    skyhook_cli::Table {
+        header,
+        numeric_from: header.len(),
+        rows,
     }
-    text.push_str(&variants(document));
-    let _ = write!(
-        text,
-        "## Remediation\n\n{}\n",
-        authored(input.remediation.as_str(), 2),
-    );
-    for section in &input.sections {
-        let _ = write!(
-            text,
-            "## {}\n\n{}\n",
-            line(section.heading.as_str()),
-            authored(section.body.as_str(), 2)
-        );
-    }
-    text.push_str(
-        "## Reproduction\n\nSee [repro.md](repro.md) for reporter-authored instructions.\n\n",
-    );
-    text.push_str(&artifacts(document));
-    text
-}
-
-pub(super) fn reproduction(document: &Document) -> String {
-    let reproduction = &document.content.reproduction;
-    let root = document.snapshot.content.root.flaw.id;
-    let mut text = front_matter(&[
-        ("type", "reproduction".to_owned()),
-        ("root", root.to_string()),
-    ]);
-    let _ = write!(
-        text,
-        "# Reproduction\n\nRoot flaw {root}. {} These instructions are supplied by the reporter; \
-         report generation executes nothing. See the [report](README.md).\n\n## Prerequisites\n\n",
-        testing(document),
-    );
-    if reproduction.prerequisites.is_empty() {
-        text.push_str("No additional prerequisites were supplied.\n\n");
-    } else {
-        for prerequisite in &reproduction.prerequisites {
-            let _ = writeln!(text, "{}", authored(prerequisite.as_str(), 2));
-        }
-    }
-    text.push_str("## Steps\n\n");
-    for (index, step) in reproduction.steps.iter().enumerate() {
-        let _ = write!(
-            text,
-            "### Step {}\n\n{}\n",
-            index + 1,
-            authored(step.instruction.as_str(), 3),
-        );
-        for cited in &step.artifacts {
-            let file = (document.pocs.iter())
-                .filter(|folder| folder.poc == cited.poc)
-                .flat_map(|folder| folder.files.iter().map(move |file| (folder, file)))
-                .find(|(_, file)| file.reference == cited.reference);
-            if let Some((folder, file)) = file {
-                let _ = writeln!(
-                    text,
-                    "- Uses [{}]({}/{}) from PoC {}",
-                    file.path, folder.folder, file.path, folder.poc
-                );
-            }
-        }
-        if !step.artifacts.is_empty() {
-            text.push('\n');
-        }
-        let _ = write!(
-            text,
-            "Expected:\n\n{}\n",
-            authored(step.expected_result.as_str(), 3),
-        );
-    }
-    match &reproduction.outcome {
-        ReproductionOutcome::Unobserved {
-            expected_result,
-            limitations,
-        } => {
-            let _ = write!(
-                text,
-                "## Expected outcome (not observed)\n\n{}\n## Limitations\n\n{}\n",
-                authored(expected_result.as_str(), 2),
-                authored(limitations.as_str(), 2)
-            );
-        }
-        ReproductionOutcome::Observed { observed_result } => {
-            let _ = write!(
-                text,
-                "## Observed outcome\n\n{}\n",
-                authored(observed_result.as_str(), 2)
-            );
-        }
-    }
-    text.push_str("## Cleanup instructions\n\n");
-    if reproduction.cleanup.is_empty() {
-        text.push_str("No cleanup instructions were supplied. No cleanup was performed.\n\n");
-    } else {
-        for instruction in &reproduction.cleanup {
-            let _ = writeln!(text, "{}", authored(instruction.as_str(), 2));
-        }
-    }
-    text.push_str(&artifacts(document));
+    .markdown(&mut text);
+    text.push('\n');
+    text.push_str(&authored(document.body, 1));
     text
 }
 
@@ -445,43 +151,48 @@ fn image(path: &str) -> bool {
         .any(|extension| lower.ends_with(extension))
 }
 
-pub(super) fn poc(document: &Document, manifest: &PocFolder, poc: &PocAttempt) -> String {
-    let root = document.snapshot.content.root.flaw.id;
+pub(super) fn test(document: &Document, folder: &TestFolder) -> String {
+    let test = folder.test;
     let mut text = front_matter(&[
-        ("type", "poc".to_owned()),
-        ("root", root.to_string()),
-        ("poc", poc.id.to_string()),
-        ("result", poc.result.to_string()),
+        ("type", "test".to_owned()),
+        ("root", document.root.to_string()),
+        ("test", test.id.to_string()),
+        ("candidate", folder.candidate.to_string()),
+        ("result", test.result.to_string()),
     ]);
     let _ = write!(
         text,
-        "# PoC {}\n\nRoot flaw {root}. A test of candidate {} against validation {}: {}. See the \
-         [report](../README.md). Checksums are in [SHA256SUMS](SHA256SUMS) and the record in \
-         [poc.json](poc.json).\n\n## Evidence\n\n{}\n{}## Artifacts\n\n",
-        poc.id,
-        poc.candidate,
-        poc.validation,
-        poc.result,
-        authored(&poc.evidence, 2),
-        narrative(document, poc, 2)
+        "# Test {}\n\nRoot flaw {}. A test of candidate {}: {}. See the [report](../README.md). \
+         Checksums are in [SHA256SUMS](SHA256SUMS) and the record in [test.json](test.json).\n\n",
+        test.id,
+        document.root,
+        folder.candidate,
+        result(test),
     );
+    if let Some(note) = &test.note {
+        let _ = write!(text, "## Account\n\n{}\n", authored(note, 2));
+    }
+    if let Some(environment) = &test.environment {
+        let _ = write!(text, "## Environment\n\n{}\n", authored(environment, 2));
+    }
+    text.push_str("## Artifacts\n\n");
     let mut role = None;
-    for file in &manifest.files {
-        if role != Some(file.role) {
+    for file in &folder.files {
+        let artifact = file.artifact;
+        if role != Some(artifact.role) {
             if role.is_some() {
                 text.push('\n');
             }
-            let _ = write!(text, "### {}\n\n", file.role);
-            role = Some(file.role);
+            let _ = write!(text, "### {}\n\n", artifact.role);
+            role = Some(artifact.role);
         }
         let _ = writeln!(
             text,
-            "- [{}]({}), {} bytes, SHA-256 {}, from {}",
+            "- [{}]({}), SHA-256 {}, from {}",
             file.path,
             file.path,
-            file.bytes,
-            code(&file.sha256.to_string()),
-            code(file.reference.as_str())
+            code(&skyhook::media::BlobDigest::from_bytes(artifact.digest).to_string()),
+            code(artifact.reference.as_str())
         );
         if image(&file.path) {
             let _ = write!(text, "\n  ![{}]({})\n", file.path, file.path);
@@ -519,7 +230,7 @@ pub(super) fn index(entries: &[IndexEntry]) -> String {
             let headline = entry.headline;
             vec![
                 entry.root.to_string(),
-                format!("[{}]({})", line(entry.title.as_str()), entry.report),
+                format!("[{}]({})", label(entry.title), entry.report),
                 entry.severity.to_string(),
                 format!("candidate {}", headline.candidate),
                 headline.severity.to_string(),

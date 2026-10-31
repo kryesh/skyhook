@@ -171,7 +171,8 @@ impl SessionRuntime {
         let capabilities = (selected.mode.as_ref())
             .map_or(&turn.settings.capabilities, |change| &change.capabilities);
         let viewer = crate::tool::diagnostic::DiagnosticViewer::new(capabilities, turn.location);
-        match self.deliver_events(turn.agent, viewer, &preceding).await {
+        let delivery = self.deliver_events(turn.agent, viewer, &preceding, Boundary::Jobs);
+        match delivery.await {
             Ok(None) | Err(HarnessError::Interrupted) => None,
             Ok(Some(_)) => {
                 selected.install(turn, context);

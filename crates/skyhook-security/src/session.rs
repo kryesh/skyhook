@@ -1,9 +1,12 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use skyhook::{
-    agent::{HarnessBuilder, HostState, HostStateFuture, ResumeFuture, ResumeHook, SessionHandle},
+    agent::{
+        HarnessBuilder, HostEventsFuture, HostState, HostStateFuture, ResumeFuture, ResumeHook,
+        SessionHandle,
+    },
     identity::{AgentId, SessionId},
-    session::{ExtensionDb, SessionStore},
+    session::{ExtensionDb, HostCursor, HostEvent, SessionStore},
 };
 
 use skyhook_cli::{
@@ -15,7 +18,7 @@ use skyhook_cli::{
 use crate::{
     cvss::Severity,
     presets, research_view,
-    store::{OpenTest, PocPolicy, Revision, RunFacts, RunOptions, RunState, Store, Tree},
+    store::{EventId, PocPolicy, RunFacts, RunOptions, RunState, Store},
     tools,
 };
 
@@ -169,11 +172,10 @@ impl SessionFactory for ResearchFactory {
             let research = Arc::new(ResearchSession {
                 scope,
                 resize: self.resize,
-                workspace: context.workspace.to_owned(),
-                current: std::sync::Mutex::new(revision(context.workspace).await),
                 facts: Cached::default(),
                 state: Cached::default(),
                 page: Cached::default(),
+                quiet: Default::default(),
             });
             let builder = builder
                 .modes(presets::for_policy(self.modes.clone(), scope.poc))
@@ -194,18 +196,18 @@ pub struct ResearchSession {
     /// A new run's threshold and workers, and the PoC policy this launch works the run under.
     scope: Scope,
     resize: Option<std::num::NonZeroU16>,
-    workspace: std::path::PathBuf,
-    /// The checkout as last read, as this launch's work began; drift is measured against the
-    /// run's.
-    current: std::sync::Mutex<Revision>,
-    /// The run's facts the orchestrator's host state last read, reused until research
-    /// changes.
-    facts: Cached<Generation, RunFacts>,
-    /// The run state the Research page last read, reused until research changes.
-    state: Cached<Generation, RunState>,
+    /// The run's facts the orchestrator's host state last read, reused until research or an
+    /// agent's job moves on.
+    facts: Cached<Watermark, RunFacts>,
+    /// The run state the Research page last read, reused until research or an agent's job
+    /// moves on.
+    state: Cached<Watermark, RunState>,
     /// The last Research page, with what it was read at and for: an unchanged store and
     /// disclosure read nothing.
-    page: Cached<PageKey, skyhook_cli::page::Page>,
+    page: Cached<(Watermark, Disclosed), skyhook_cli::page::Page>,
+    /// Each agent found with nothing to be told at a research generation and cursor: it stays
+    /// so until research is written.
+    quiet: std::sync::Mutex<std::collections::HashMap<AgentId, (u64, Option<HostCursor>)>>,
 }
 
 /// The last value read, with the key it was read under.
@@ -235,12 +237,31 @@ impl<K: PartialEq, T> Cached<K, T> {
     }
 }
 
-/// One session's research at the write generation it was read at.
-type Generation = (SessionId, Option<u64>);
+/// One session's research as of its write generation and the journal's latest agent job
+/// transition: a job beginning or ending is no research write, yet it moves what is running,
+/// exhausted or being proven.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Watermark {
+    session: SessionId,
+    generation: Option<u64>,
+    journal: Option<i64>,
+}
 
-/// What a Research page was read at and for: the open tests are read on every refresh,
-/// since a job ending is no research write.
-type PageKey = (Generation, Disclosed, Vec<OpenTest>);
+impl Watermark {
+    /// Read before the snapshot it keys begins, so a value cached under it is never older.
+    async fn of(store: &Store) -> Result<Self, skyhook_cli::Error> {
+        let generation = store.generation();
+        let reader = store.clone();
+        let journal = store
+            .reading(move || reader.journal_mark().map_err(skyhook_cli::Error::from))
+            .await?;
+        Ok(Self {
+            session: store.id(),
+            generation,
+            journal,
+        })
+    }
+}
 
 /// The research of a session opened by this product's harness.
 fn research(session: &SessionStore) -> Result<Store, skyhook_cli::Error> {
@@ -265,6 +286,53 @@ impl HostState for ResearchSession {
             text.parse().ok()
         })
     }
+
+    /// What others changed of the work the agent's job began, since its cursor.
+    fn events<'a>(
+        &'a self,
+        extension: &'a ExtensionDb,
+        agent: &'a AgentId,
+        since: Option<HostCursor>,
+    ) -> HostEventsFuture<'a> {
+        Box::pin(async move {
+            let store = Store::of(extension);
+            let generation = store.generation();
+            let quiet = |generation| {
+                let quiet = self.quiet.lock().expect("research quiet agents");
+                quiet.get(agent) == Some(&(generation, since))
+            };
+            if generation.is_some_and(quiet) {
+                return Ok(None);
+            }
+            let after = since
+                .map(|cursor| EventId::try_from(cursor.get()))
+                .transpose()?;
+            let (reader, actor) = (store.clone(), agent.clone());
+            let read = store.reading(move || {
+                reader
+                    .changes(&actor, after)
+                    .map_err(skyhook_cli::Error::from)
+            });
+            match read.await? {
+                Some((through, changes)) => {
+                    let serde_json::Value::Object(view) = serde_json::to_value(changes)? else {
+                        return Err("research changes are not an object".into());
+                    };
+                    Ok(Some(HostEvent {
+                        through: HostCursor::try_from(through.get())?,
+                        view: view.try_into()?,
+                    }))
+                }
+                None => {
+                    if let Some(generation) = generation {
+                        let mut quiet = self.quiet.lock().expect("research quiet agents");
+                        quiet.insert(agent.clone(), (generation, since));
+                    }
+                    Ok(None)
+                }
+            }
+        })
+    }
 }
 
 /// What this launch changes about a run it reopens, applied once its work begins.
@@ -273,7 +341,6 @@ impl ResumeHook for ResearchSession {
         Box::pin(async move {
             // The resumed run keeps its workers unless this launch's flag resizes them, and
             // continues under this launch's PoC policy.
-            self.checkout().await;
             let store = Store::of(extension);
             let (resize, poc) = (self.resize, self.scope.poc);
             store
@@ -302,24 +369,15 @@ impl SessionExtension for ResearchSession {
     ) -> HookFuture<'_, Arc<skyhook_cli::page::Page>> {
         Box::pin(async move {
             let store = research(session.store())?;
-            // Read before the snapshot begins, so a page cached under it is never older.
-            let generation = store.generation();
-            let reader = store.clone();
-            let tests = store
-                .reading(move || reader.open_tests().map_err(skyhook_cli::Error::from))
-                .await?;
-            let key = ((store.id(), generation), open.clone(), tests.clone());
-            let read = async move {
-                let state = self.snapshot(session.store()).await?;
-                let (reader, current) = (store.clone(), self.current());
+            let mark = Watermark::of(&store).await?;
+            let read = async {
+                let state = cached(&self.state, mark, store.clone(), Store::run_state).await?;
+                let (reader, open) = (store.clone(), open.clone());
                 store
-                    .reading(move || {
-                        (state.page(&reader, &current, &open, &tests))
-                            .map_err(skyhook_cli::Error::from)
-                    })
+                    .reading(move || (state.page(&reader, &open)).map_err(skyhook_cli::Error::from))
                     .await
             };
-            self.page.get(key, read).await
+            self.page.get((mark, open.clone()), read).await
         })
     }
 
@@ -347,10 +405,9 @@ impl SessionExtension for ResearchSession {
                     .await?;
             }
             let scope = self.scope;
-            let current = self.current();
             store
                 .writing(move || {
-                    started.start_run(scope.options, &current, scope.poc)?;
+                    started.start_run(scope.options, scope.poc)?;
                     Ok::<_, skyhook_cli::Error>(())
                 })
                 .await?;
@@ -360,94 +417,39 @@ impl SessionExtension for ResearchSession {
 }
 
 impl ResearchSession {
-    /// Research facts can be cached; whether the workflow needs its owner cannot, since
-    /// the journal records job transitions independently of research writes.
     async fn root_state(&self, store: Store) -> Result<String, skyhook_cli::Error> {
-        let facts = cached(&self.facts, store.clone(), Store::run_facts).await?;
-        let reader = store.clone();
-        let waiting = store
-            .reading(move || reader.waiting_workflows().map_err(skyhook_cli::Error::from))
-            .await?;
-        Ok(facts.state_with(&self.current(), &waiting))
-    }
-
-    async fn snapshot(&self, session: &SessionStore) -> Result<Arc<RunState>, skyhook_cli::Error> {
-        cached(&self.state, research(session)?, Store::run_state).await
-    }
-
-    /// Read the checkout again as this launch's work begins.
-    async fn checkout(&self) -> Revision {
-        let current = revision(&self.workspace).await;
-        current.clone_into(&mut self.current.lock().expect("checkout"));
-        current
-    }
-
-    /// The checkout as last read.
-    fn current(&self) -> Revision {
-        self.current.lock().expect("checkout").clone()
+        let mark = Watermark::of(&store).await?;
+        let facts = cached(&self.facts, mark, store, Store::run_facts).await?;
+        Ok(facts.state())
     }
 }
 
-/// What `read` gives for the session's research, reused while no research write followed.
+/// What `read` gives for the session's research, reused while it stands at `mark`.
 async fn cached<T: Send + Sync + 'static>(
-    cache: &Cached<Generation, T>,
+    cache: &Cached<Watermark, T>,
+    mark: Watermark,
     store: Store,
     read: fn(&Store) -> crate::store::Result<T>,
 ) -> Result<Arc<T>, skyhook_cli::Error> {
-    // Read before the snapshot begins, so a value cached under it is never older.
-    let key = (store.id(), store.generation());
     let reader = store.clone();
     let read = store.reading(move || read(&reader).map_err(skyhook_cli::Error::from));
-    cache.get(key, read).await
-}
-
-pub fn drift_warning(recorded: &Revision, current: &Revision) -> String {
-    format!(
-        "Warning: revision drift: the run recorded {recorded}, the checkout is now {current}. Recheck affected evidence; a tree state is not a content snapshot."
-    )
-}
-
-pub(crate) async fn revision(workspace: &Path) -> Revision {
-    async fn git(workspace: &Path, args: &[&str]) -> Option<Vec<u8>> {
-        let mut command = tokio::process::Command::new("git");
-        command
-            .arg("-C")
-            .arg(workspace)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
-            .await
-            .ok()?
-            .ok()?;
-        output.status.success().then_some(output.stdout)
-    }
-    let commit = git(workspace, &["rev-parse", "--verify", "HEAD"])
-        .await
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.trim().parse().ok());
-    let tree = match git(
-        workspace,
-        &["status", "--porcelain", "--untracked-files=normal"],
-    )
-    .await
-    {
-        Some(output) if output.is_empty() => Tree::Clean,
-        Some(_) => Tree::Dirty,
-        None => Tree::Unknown,
-    };
-    Revision { commit, tree }
+    cache.get(mark, read).await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use skyhook::provider::{
         Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
         protocol::{ContextId, ModelRequest, ToolDefinition},
     };
 
     use super::*;
-    use crate::store::tests::{harness as builder, harness_on};
+    use crate::{
+        store::tests::{harness as builder, harness_on},
+        tools::tests::bounded,
+    };
 
     fn context<'a>(workspace: &'a Path, opening: Opening<'a>) -> SessionContext<'a> {
         SessionContext {
@@ -548,9 +550,9 @@ mod tests {
                 actions.unwrap().iter().any(|offered| offered == action)
             };
             assert!(offered("research_query", "startable"));
-            assert!(offered("finding_report", "generate"));
+            assert!(offered("research", "generate"));
             let script = session.run_script(
-                "return [await tool.research_query({action: 'startable', limit: 1}), await tool.finding_report({action: 'generate'})].map(r => r.error);",
+                "return [await tool.research_query({action: 'startable', limit: 1}), await tool.research({action: 'generate'})].map(r => r.error);",
             );
             assert_eq!(
                 script.await.unwrap().value["value"],
@@ -571,11 +573,10 @@ mod tests {
         let host = ResearchSession {
             scope: scope(PocPolicy::No),
             resize: None,
-            workspace: workspace.to_owned(),
-            current: std::sync::Mutex::new(revision(workspace).await),
             facts: Cached::default(),
             state: Cached::default(),
             page: Cached::default(),
+            quiet: Default::default(),
         };
         let root = session.root_agent();
         let extension = session.store().extension().unwrap();
@@ -588,6 +589,76 @@ mod tests {
         assert!(host.state(extension, &root.child(1)).await.is_none());
         session.shutdown().await.unwrap();
         session.close().await.unwrap();
+    }
+
+    /// A child is told, as a host event, of the root's change to the work its job began, past
+    /// its cursor once; the root, which has no task, is told nothing.
+    #[tokio::test]
+    async fn a_child_is_told_of_changes_to_its_begun_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = open(
+            &factory(PocPolicy::No, None),
+            directory.path(),
+            Opening::New(None),
+        )
+        .await;
+        let store = research(session.store()).unwrap();
+        let root = session.root_agent().clone();
+        let worker = store.clone();
+        let (child, path) = tokio::task::spawn_blocking(move || {
+            use crate::store::tests::{begun, component, path, text};
+            let decoder = component(&worker, &root, "decoder");
+            let stream = path(&worker, &root, "stream", &[decoder]);
+            let (child, _, _) = begun(&worker, &crate::store::Begin::Sweep(vec![stream]));
+            let renamed = crate::store::Upsert::Path(crate::store::Change::Edit(
+                stream,
+                crate::store::Edit {
+                    title: None,
+                    body: Some(text("socket to inflate")),
+                    detail: (),
+                },
+            ));
+            worker.upsert(&root, &renamed).unwrap();
+            (child, stream)
+        })
+        .await
+        .unwrap();
+        let research = session.store().extension().unwrap();
+        let host = ResearchSession {
+            scope: scope(PocPolicy::No),
+            resize: None,
+            facts: Cached::default(),
+            state: Cached::default(),
+            page: Cached::default(),
+            quiet: Default::default(),
+        };
+        let told = host.events(research, &child, None).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::Value::Object(told.view.fields().clone()),
+            serde_json::json!({"research_changes": [{"phase": "sweep", "node": path, "count": 1,
+                "latest": told.through.get(), "kinds": ["edited"], "recent": [
+                {"id": told.through.get(), "kind": "edited", "nodes": [{"node": path, "effect": "changed"}]},
+            ]}]})
+        );
+        assert!(
+            host.events(research, &child, Some(told.through))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            host.events(research, session.root_agent(), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let unknown = HostCursor::try_from(0).unwrap();
+        assert!(
+            host.events(research, &child, Some(unknown)).await.is_err(),
+            "a cursor the store cannot read fails rather than reads as nothing"
+        );
+        // The child stands in for a launch the journal never recorded, which shutdown trips on.
+        let _ = session.shutdown().await;
     }
 
     /// Viewing a reopened session changes nothing; this launch's settings apply once its
@@ -636,5 +707,112 @@ mod tests {
         assert!(store.initialized().unwrap());
         recovered.shutdown().await.unwrap();
         recovered.close().await.unwrap();
+    }
+
+    /// A provider whose requests wait until the test lets them fail, telling it each began.
+    #[derive(Clone)]
+    struct Gated {
+        invoked: Arc<tokio::sync::Notify>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+    impl Provider for Gated {
+        fn open_context(&self, _: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+    impl ProviderContext for Gated {
+        fn invoke(&mut self, _: ModelRequest) -> ResponseStream {
+            self.invoked.notify_one();
+            let gate = self.gate.clone();
+            Box::pin(futures_util::stream::once(async move {
+                let _closed = gate.acquire().await;
+                Err(ProviderErrorKind::Authentication.error("released"))
+            }))
+        }
+    }
+
+    /// The root's plan line and the Research page follow a task's job ending, which the
+    /// journal records with no research write.
+    #[tokio::test]
+    async fn a_job_ending_moves_the_cached_state_and_page() {
+        use skyhook_cli::page::Block;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let provider = Gated {
+            invoked: Arc::default(),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let factory = factory(PocPolicy::No, None);
+        let context = context(workspace, Opening::New(None));
+        let builder = harness_on(workspace, Arc::new(provider.clone()));
+        let prepared = factory.prepare(builder, context).await.unwrap();
+        let session = prepared.builder.build().await.unwrap().new_session().await;
+        let session = session.unwrap();
+        prepared.extension.opened(&session, context).await.unwrap();
+        let host = ResearchSession {
+            scope: scope(PocPolicy::No),
+            resize: None,
+            facts: Cached::default(),
+            state: Cached::default(),
+            page: Cached::default(),
+            quiet: Default::default(),
+        };
+        let store = research(session.store()).unwrap();
+        let root = session.root_agent().clone();
+        let decoder = crate::store::tests::component(&store, &root, "decoder");
+        let stream = crate::store::tests::path(&store, &root, "stream", &[decoder]);
+        let extension = session.store().extension().unwrap();
+        let plan = async || {
+            let state = host.state(extension, &root).await.unwrap();
+            let line = state
+                .as_str()
+                .lines()
+                .find(|line| line.starts_with("plan: "));
+            line.unwrap().to_owned()
+        };
+        // The Tasks panel's running sweeps.
+        let running = async || {
+            let page = (host.refresh(0, session.clone(), Disclosed::default()).await).unwrap();
+            let tasks = (page.blocks.iter())
+                .find_map(|block| match block {
+                    Block::Panels(panels) => panels.iter().find(|panel| panel.title == "Tasks"),
+                    _ => None,
+                })
+                .unwrap();
+            let sweep = tasks.rows.iter().find(|row| row.label == "sweep").unwrap();
+            sweep.values[0].text.clone()
+        };
+        let script = session.run_script("return (await tool.agent({prompt: 'Sweep.'})).state;");
+        let working = async {
+            bounded(provider.invoked.notified()).await;
+            let index = store
+                .read(|db| {
+                    crate::store::stored(
+                        db,
+                        "SELECT child_index FROM agent WHERE owner_job IS NOT NULL",
+                        Vec::new(),
+                        |row| Ok(row.get::<u32>(0)?),
+                    )
+                })
+                .unwrap();
+            let sweep = crate::store::Begin::Sweep(vec![stream]);
+            store.begin(&root.child(index), &sweep).unwrap();
+            assert_eq!(plan().await, "plan: nothing owed; 1 running");
+            assert_eq!(running().await, "1");
+            provider.gate.close();
+            store.generation()
+        };
+        tokio::pin!(script);
+        let generation = tokio::select! {
+            _ = &mut script => unreachable!("the child waits on its provider"),
+            began = working => began,
+        };
+        let ended = bounded(script).await;
+        assert_eq!(ended.unwrap().value["value"], "failed");
+        assert_eq!(store.generation(), generation, "no research write");
+        assert_eq!(plan().await, "plan: owed: 1 sweep");
+        assert_eq!(running().await, "0");
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
     }
 }

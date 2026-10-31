@@ -320,7 +320,10 @@ fn captures(db: &Db, (job, generation): (u64, i64)) -> DbResult<Vec<CaptureRow>>
     )
 }
 
-fn saved_output(db: &Db, (job, generation): (u64, i64)) -> DbResult<Option<SavedOutput>> {
+pub(super) fn saved_output(
+    db: &Db,
+    (job, generation): (u64, i64),
+) -> DbResult<Option<SavedOutput>> {
     let Some((result, captures_complete)) = db.query_row(
         "SELECT result, captures_complete FROM job_output WHERE job = ?1 AND generation = ?2",
         params![job, generation],

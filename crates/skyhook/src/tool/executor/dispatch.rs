@@ -329,7 +329,7 @@ fn run(
     dispatch: InvocationDispatch<PreparedConnection>,
     tool: &str,
     context: ToolContext,
-) -> BoxFuture<'static, Result<ToolOutput, ToolError>> {
+) -> BoxFuture<'static, Result<crate::job::Completion, ToolError>> {
     let tool = tool.to_owned();
     Box::pin(async move {
         match dispatch {
@@ -340,6 +340,7 @@ fn run(
             } => connection
                 .execute(tool, Value::Object(arguments), &context)
                 .await
+                .map(Into::into)
                 .map_err(RemoteError::into_tool_error),
         }
     })
@@ -347,10 +348,10 @@ fn run(
 
 /// Cancellation determines the outcome, not whether already observed effects or
 /// output happened. Apply its precedence once, before binding failure facts.
-pub(crate) fn cancellation_result(
-    result: Result<ToolOutput, ToolError>,
+pub(crate) fn cancellation_result<T: Into<ToolOutput>>(
+    result: Result<T, ToolError>,
     cancelled: bool,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<T, ToolError> {
     if !cancelled {
         return result;
     }
@@ -358,7 +359,7 @@ pub(crate) fn cancellation_result(
         Err(error) => error.into_facts(),
         Ok(output) => (
             PartialDiagnostic::new(PartialContext::default(), Cause::Cancelled),
-            Some(output),
+            Some(output.into()),
         ),
     };
     diagnostic.cause = Cause::Cancelled;
@@ -420,7 +421,7 @@ mod tests {
                 .request(RequestEffects::MayHaveExecuted)
                 .with_result(ToolOutput::new(serde_json::json!({"partial":true})));
             let context = error.diagnostic().context;
-            let (diagnostic, output) = cancellation_result(Err(error), true)
+            let (diagnostic, output) = cancellation_result::<ToolOutput>(Err(error), true)
                 .unwrap_err()
                 .into_parts();
             assert_eq!(diagnostic.cause, Cause::Cancelled);

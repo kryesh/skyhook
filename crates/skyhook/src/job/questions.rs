@@ -108,12 +108,26 @@ enum Routed {
 impl JobManager {
     /// Ask `asked` of job `id`, after what it already asks: an ask job its own
     /// question, or the agent job its child's questions are answered through.
+    /// An ask that ended before this registers it was retired by its end, so it
+    /// is left out, and nothing is asked when none is left.
     pub(crate) async fn request_input(&self, id: JobId, asked: Vec<Asked>) -> Result<(), JobError> {
-        let ask = move |entry: &JobFacts| {
-            let asking = entry.asking().cloned().unwrap_or_default();
-            asking.with(asked).map(JobChange::Ask)
+        let declared: Vec<_> = std::iter::once(id)
+            .chain(asked.iter().map(|asked| asked.ask))
+            .collect();
+        let ask = move |state: &CoreState| {
+            let unended = |asked: &Asked| state.job(asked.ask).is_ok_and(|ask| ask.end().is_none());
+            let asked: Vec<_> = asked.into_iter().filter(unended).collect();
+            if asked.is_empty() {
+                return Ok(Plan::new(Vec::new(), |_, _| ()));
+            }
+            let asking = state.job(id)?.asking().cloned().unwrap_or_default();
+            let change = JobChange::Ask(asking.with(asked)?);
+            lifecycle::journaled(state, id, change, Rejected::input)
         };
-        self.journal_change(id, ask, Rejected::input).await
+        self.inner
+            .store
+            .commit_on(declared, Command::Journal, ask)
+            .await
     }
 
     /// The agent job whose owner answers ask job `ask`: the nearest one it runs
@@ -241,7 +255,7 @@ mod tests {
     }
 
     fn answered() -> JobOutcome {
-        JobOutcome::Completed(ToolOutput::new(json!("answered")))
+        JobOutcome::Completed(ToolOutput::new(json!("answered")).into())
     }
 
     /// A reply reaches each ask it answers once, however often it repeats and
@@ -284,6 +298,21 @@ mod tests {
         second_worker.fail(answered()).await;
         assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
         assert!(!jobs.answer(owner, json!("update")).await.unwrap());
+    }
+
+    /// An ask that ends between finding the job it is answered through and asking
+    /// it there is not asked: the job runs on, asking nothing.
+    #[tokio::test]
+    async fn an_ask_ended_before_it_is_asked_is_left_out() {
+        let (_root, jobs, owner, mut asks) = asking(1).await;
+        let (ask, _input, worker) = asks.pop().unwrap();
+        assert_eq!(jobs.answered_through(ask).unwrap(), owner);
+        worker.fail(answered()).await;
+        jobs.request_input(owner, asked_by(ask, "late"))
+            .await
+            .unwrap();
+        assert_eq!(questions(&jobs, owner), None);
+        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
     }
 
     /// One question's answer is the whole reply, even one keyed by its id.

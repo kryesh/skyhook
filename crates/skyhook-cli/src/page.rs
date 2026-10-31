@@ -1,6 +1,6 @@
 //! A structured page an extension view supplies. The host lays it out with its own theme,
 //! width, reflow, disclosure and scrolling; a product only describes what it shows.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// How an extension view shares the frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,7 +104,22 @@ pub struct Record {
     pub key: RecordKey,
     pub cells: Vec<Cell>,
     /// Supplied only while the record is open.
-    pub detail: Option<Vec<Detail>>,
+    pub detail: Option<RecordDetail>,
+}
+
+/// An open record's detail, as far as the viewer has extended its continued entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordDetail {
+    pub lines: Vec<Detail>,
+    /// Its continued entries go on past those shown; each "more" shows
+    /// [`Disclosed::PAGE`] more.
+    pub more: bool,
+}
+
+impl From<Vec<Detail>> for RecordDetail {
+    fn from(lines: Vec<Detail>) -> Self {
+        Self { lines, more: false }
+    }
 }
 
 /// One labelled line of a record's detail; a line without a label continues the one above.
@@ -175,7 +190,8 @@ impl Default for Disclosure {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Opened {
     limit: usize,
-    records: BTreeSet<RecordKey>,
+    /// Each open record with how many continued entries its detail shows.
+    records: BTreeMap<RecordKey, usize>,
 }
 
 impl Disclosed {
@@ -195,12 +211,11 @@ impl Disclosed {
         }
     }
 
-    pub fn is_open(&self, section: SectionKey, record: &RecordKey) -> bool {
+    /// How many continued entries an open record's detail shows; none while it is closed.
+    pub fn detail(&self, section: SectionKey, record: &RecordKey) -> Option<usize> {
         match &self.0 {
-            Disclosure::Shown(sections) => {
-                (sections.get(&section)).is_some_and(|opened| opened.records.contains(record))
-            }
-            Disclosure::Whole => false,
+            Disclosure::Shown(sections) => sections.get(&section)?.records.get(record).copied(),
+            Disclosure::Whole => None,
         }
     }
 
@@ -215,21 +230,28 @@ impl Disclosed {
                 if sections.remove(section).is_none() {
                     let opened = Opened {
                         limit: Self::PAGE,
-                        records: BTreeSet::new(),
+                        records: BTreeMap::new(),
                     };
                     sections.insert(*section, opened);
                 }
             }
             Toggle::Record(section, record) => {
                 if let Some(opened) = sections.get_mut(section)
-                    && !opened.records.remove(record)
+                    && opened.records.remove(record).is_none()
                 {
-                    opened.records.insert(record.clone());
+                    opened.records.insert(record.clone(), Self::PAGE);
                 }
             }
             Toggle::More(section) => {
                 if let Some(opened) = sections.get_mut(section) {
                     opened.limit = opened.limit.saturating_add(Self::PAGE);
+                }
+            }
+            Toggle::MoreDetail(section, record) => {
+                if let Some(shown) =
+                    (sections.get_mut(section)).and_then(|opened| opened.records.get_mut(record))
+                {
+                    *shown = shown.saturating_add(Self::PAGE);
                 }
             }
         }
@@ -242,13 +264,16 @@ pub enum Toggle {
     Section(SectionKey),
     Record(SectionKey, RecordKey),
     More(SectionKey),
+    /// More of an open record's continued detail entries.
+    MoreDetail(SectionKey, RecordKey),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A record opens only within its open section, and closing the section closes it.
+    /// A record opens only within its open section, and closing the section closes it; its
+    /// detail's continued entries extend apart from the section's records.
     #[test]
     fn records_open_only_within_an_open_section() {
         const ITEMS: SectionKey = SectionKey("items");
@@ -259,9 +284,12 @@ mod tests {
         assert_eq!(open, Disclosed::default());
         open.apply(&Toggle::Section(ITEMS));
         open.apply(&record);
-        assert!(open.is_open(ITEMS, &key));
+        assert_eq!(open.detail(ITEMS, &key), Some(Disclosed::PAGE));
+        open.apply(&Toggle::MoreDetail(ITEMS, key.clone()));
+        assert_eq!(open.detail(ITEMS, &key), Some(2 * Disclosed::PAGE));
+        assert_eq!(open.limit(ITEMS), Some(Disclosed::PAGE));
         open.apply(&Toggle::Section(ITEMS));
         open.apply(&Toggle::Section(ITEMS));
-        assert!(!open.is_open(ITEMS, &key));
+        assert_eq!(open.detail(ITEMS, &key), None);
     }
 }

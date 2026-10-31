@@ -73,6 +73,13 @@ pub(super) struct AgentArgs {
     pub(super) workspace: Option<String>,
 }
 
+/// The brief in an agent call's stored arguments, which keep the envelope the executor took
+/// off before the handler.
+#[derive(Deserialize)]
+pub(crate) struct Brief {
+    pub(crate) prompt: String,
+}
+
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
@@ -204,7 +211,7 @@ fn register_child_agent(
     };
     let models: Vec<_> = models.iter().filter_map(hinted).collect();
     let modes = modes.clone();
-    builder.register::<AgentArgs, crate::job::ChildResult, _, _>(
+    builder.register_checked(
         crate::tool::builtins::names::AGENT,
         "Start a child agent. Names are unique among your own installed children, including terminal children (number a script's launches from `jobs.length + older` of `tool.jobs({all:true,limit:1})`); other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Follow-ups arrive automatically at its next model-request boundary. Earlier replies arrive as events, except that a foreground call's result carries them as `messages`, as its saved output, which a truncated view pages with jobs({job, field}); the final reply is the result's `reply`. When a child asks, your own foreground call blocked on it moves to the background, so you can answer: an agent call returns the child's job in state waiting_input, a script call the script's job, still running; its earlier replies and then its question arrive as events. A script's tool.agent call keeps waiting for the child's result. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
@@ -234,9 +241,10 @@ fn register_child_agent(
                 target: input.target.clone(),
                 workspace: input.workspace.clone(),
             }),
-        move |context, input| {
+        Ok,
+        move |input: AgentArgs| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            async move {
+            registry::AdmittedInvocation::reply(move |context| async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let owner = context.agent();
                 let unstarted = || ToolError::failed("parent agent never started")
@@ -252,7 +260,7 @@ fn register_child_agent(
                 let launched = runtime.launch_child(child.clone(), launch, call);
                 let answer = launched.await.map_err(|error| launch_error(error, &child))?;
                 run_child_request(&runtime, &context, &child, answer).await
-            }
+            })
         },
     )?;
     Ok(())
@@ -377,12 +385,11 @@ pub(super) fn child_resume_handler(
                 })?;
                 let content = value.iter().map(owner_input).collect();
                 let answer = restart_child(&runtime, job, &child, content).await?;
-                let result = run_child_request(&runtime, &context, &child, answer).await?;
-                Ok(crate::tool::ToolOutput::new(json!(result)))
+                run_child_request(&runtime, &context, &child, answer).await
             };
             // As dispatch ran the call: a cancellation requested before the restart
             // took its child stops the child starting, and is the outcome.
-            let result = resumed.await;
+            let result = resumed.await.map(crate::job::Completion::Reply);
             crate::tool::executor::cancellation_result(result, cancelled.is_cancelled())
         })
     })
@@ -475,7 +482,7 @@ async fn run_child_request(
     context: &crate::tool::ToolContext,
     child: &crate::identity::AgentId,
     mut done_rx: super::dispatch::ChildAnswer,
-) -> Result<crate::job::ChildResult, ToolError> {
+) -> Result<String, ToolError> {
     let job = context.job();
     // Resumption runs this outside dispatch, which would otherwise bind the host site.
     let failure = |operation, effects| {
@@ -496,13 +503,12 @@ async fn run_child_request(
                         other => ToolError::failed(other),
                     }))?;
                 let inputs = context.drain_input_or_close().await;
-                let result = crate::job::ChildResult { messages: Vec::new(), reply };
-                if inputs.is_empty() { return Ok(result); }
+                if inputs.is_empty() { return Ok(reply); }
                 // Owner input continues this invocation instead of finishing the job, so
                 // the answer above, held for its result, is released as a reply.
                 let content = inputs.iter().map(owner_input).collect();
                 done_rx = restart_child(runtime, job, child, content).await
-                    .map_err(|error| error.with_result(crate::tool::ToolOutput::new(json!(result))))?;
+                    .map_err(|error| error.with_result(crate::job::Completion::Reply(reply).into()))?;
             }
             value = context.receive() => {
                 let value = match value {

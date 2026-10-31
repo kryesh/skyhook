@@ -39,11 +39,24 @@ pub(crate) type AdmittedInvocation = Invocation<ToolContext, ToolOutput>;
 /// A call's arguments once validated: always a JSON object.
 pub type Arguments = Map<String, Value>;
 
-pub trait OutputValue: std::fmt::Debug + Send + 'static {
+pub trait OutputValue: Sized + std::fmt::Debug + Send + 'static {
+    /// What an invocation producing this output completes with.
+    type Completion: From<Self> + Send;
+
     fn from_value(value: Value) -> Self;
 }
 
-impl<K: std::fmt::Debug + Send + 'static> OutputValue for super::output::Output<K> {
+impl OutputValue for ToolOutput {
+    type Completion = crate::job::Completion;
+
+    fn from_value(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl OutputValue for super::output::ProducedOutput {
+    type Completion = Self;
+
     fn from_value(value: Value) -> Self {
         Self::new(value)
     }
@@ -64,17 +77,28 @@ pub struct CatalogEntry<C, O: OutputValue> {
 
 /// A one-shot handler with its admitted input retained, not reconstructed from JSON.
 /// The closure erases the input type without a downcast or a mismatched tool/input pair.
-type InvocationFuture<O> = BoxFuture<'static, Result<O, OperationError<O>>>;
+type InvocationFuture<O> =
+    BoxFuture<'static, Result<<O as OutputValue>::Completion, OperationError<O>>>;
 
-pub(crate) struct Invocation<C, O> {
+pub(crate) struct Invocation<C, O: OutputValue> {
     run: Box<dyn FnOnce(C) -> InvocationFuture<O> + Send>,
     result_policy: ToolResultPolicy,
 }
 
-impl<C, O> Invocation<C, O> {
+impl<C, O: OutputValue> Invocation<C, O> {
     pub(crate) fn new<Fut>(run: impl FnOnce(C) -> Fut + Send + 'static) -> Self
     where
         Fut: Future<Output = Result<O, OperationError<O>>> + Send + 'static,
+    {
+        Self::completing(move |context| {
+            let run = run(context);
+            async move { run.await.map(Into::into) }
+        })
+    }
+
+    fn completing<Fut>(run: impl FnOnce(C) -> Fut + Send + 'static) -> Self
+    where
+        Fut: Future<Output = Result<O::Completion, OperationError<O>>> + Send + 'static,
     {
         Self {
             run: Box::new(move |context| Box::pin(run(context))),
@@ -89,9 +113,7 @@ impl<C, O> Invocation<C, O> {
     pub(crate) fn call(self, context: C) -> InvocationFuture<O> {
         (self.run)(context)
     }
-}
 
-impl<C, O: OutputValue> Invocation<C, O> {
     /// An invocation whose job completes without a result.
     pub(crate) fn unit<Fut>(run: impl FnOnce(C) -> Fut + Send + 'static) -> Self
     where
@@ -108,6 +130,17 @@ impl<C, O: OutputValue> Invocation<C, O> {
 }
 
 impl AdmittedInvocation {
+    /// A child agent call's invocation, which completes with its child's final reply.
+    pub(crate) fn reply<Fut>(run: impl FnOnce(ToolContext) -> Fut + Send + 'static) -> Self
+    where
+        Fut: Future<Output = Result<String, ToolError>> + Send + 'static,
+    {
+        Self::completing(move |context| {
+            let run = run(context);
+            async move { run.await.map(crate::job::Completion::Reply) }
+        })
+    }
+
     /// An invocation whose response is another job's presented view rather than
     /// a native value wrapped in this call's own envelope.
     pub(crate) fn job_view<Fut>(run: impl FnOnce(ToolContext) -> Fut + Send + 'static) -> Self
@@ -133,7 +166,7 @@ type ArgumentAdmission<C, O> =
 /// resolved in place, then it becomes the invocation.
 pub(crate) type Admitted<C, O> = Box<dyn AdmittedInput<C, O>>;
 
-pub(crate) trait AdmittedInput<C, O>: Send {
+pub(crate) trait AdmittedInput<C, O: OutputValue>: Send {
     /// Filesystem inputs/outputs the admitted input names.
     fn paths(&mut self) -> Vec<PathArgument<'_>>;
     /// Permissions derived from the admitted input.

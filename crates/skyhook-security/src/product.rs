@@ -19,8 +19,8 @@ use skyhook_cli::{
 use crate::{
     config::SecurityConfig,
     cvss::Severity,
-    session::{ResearchFactory, Scope, revision},
-    store::{PocPolicy, Revision, Run, Store},
+    session::{ResearchFactory, Scope},
+    store::{PocPolicy, Run, Store},
 };
 
 /// Red emphasis in place of Skyhook's blue; code keeps the shared syntax palette.
@@ -138,9 +138,7 @@ impl Product for Security {
             } => {
                 let root = workspace_session_root(&workspace);
                 let store = Store::inspect(&root, session).await?;
-                let current = revision(&workspace).await;
-                let text =
-                    tokio::task::spawn_blocking(move || run_detail(&store, &current)).await??;
+                let text = tokio::task::spawn_blocking(move || run_detail(&store)).await??;
                 print!("{text}");
                 Ok(())
             }
@@ -154,8 +152,8 @@ impl Product for Security {
                     return Ok(());
                 }
                 let mut table = Table {
-                    header: &["Session", "Created", "Revision", "Findings"],
-                    numeric_from: 3,
+                    header: &["Session", "Created", "Findings"],
+                    numeric_from: 2,
                     rows: Vec::new(),
                 };
                 let mut unavailable = Vec::new();
@@ -165,7 +163,6 @@ impl Product for Security {
                             table.rows.push(vec![
                                 run.id.to_string(),
                                 run.created.to_rfc3339(),
-                                run.revision.to_string(),
                                 findings.to_string(),
                             ]);
                         }
@@ -200,7 +197,7 @@ async fn runs(
                 async {
                     let store = Store::inspect(root, id).await?;
                     let read = move || {
-                        Ok::<_, crate::store::Error>((store.run()?, store.finding_count()?))
+                        Ok::<_, crate::store::Error>((store.run()?, store.coverage()?.findings))
                     };
                     Ok::<_, Error>(tokio::task::spawn_blocking(read).await??)
                 }
@@ -215,19 +212,18 @@ async fn runs(
 }
 
 /// One run as plain text: the Research page with every section open in full, as the store
-/// holds it against the checkout `current`; never a report the agents should write.
-fn run_detail(store: &Store, current: &Revision) -> Result<String, crate::store::Error> {
+/// holds it; never a report the agents should write.
+fn run_detail(store: &Store) -> Result<String, crate::store::Error> {
     let state = store.run_state()?;
-    let tests = store.open_tests()?;
     let mut out = String::new();
-    (state.page(store, current, &Disclosed::whole(), &tests)?).render(&mut out);
+    (state.page(store, &Disclosed::whole())?).render(&mut out);
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::tests::{component, fixture, revision};
+    use crate::store::tests::{component, fixture};
 
     /// A run's detail lists every record of a section, however many there are.
     #[test]
@@ -237,7 +233,7 @@ mod tests {
         for index in 0..count {
             component(&store, &actor, &format!("part{index}"));
         }
-        let detail = run_detail(&store, &revision()).unwrap();
+        let detail = run_detail(&store).unwrap();
         let listed = (detail.lines())
             .filter(|line| {
                 (line.split_whitespace().last()).is_some_and(|name| name.starts_with("part"))

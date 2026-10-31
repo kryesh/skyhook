@@ -1,4 +1,5 @@
-//! Job notifications as the model received them, headed by the job's current state.
+//! Job notifications as the model received them, headed by the job's current state, and
+//! host events as the host gave them.
 
 use super::super::tool_view::{Document, Hints, Role, Run};
 use super::entries::Inputs;
@@ -80,6 +81,14 @@ pub(super) fn job_event_entries(
                         body.line("Notification received by model", Role::Muted);
                         let args = job.map_or(&Value::Null, |job| &job.arguments);
                         body.output(Hints::new(tool, args), Some(job_view), &[]);
+                    }
+                }
+                JobEvent::Host(host) => {
+                    header.push(Run::new("host", Role::ToolName));
+                    if let Some(body) = &mut body {
+                        body.line("Host event received by model", Role::Muted);
+                        let view = Value::Object(host.view.fields().clone());
+                        body.historical_output(Hints::new("host", &Value::Null), &view);
                     }
                 }
             }

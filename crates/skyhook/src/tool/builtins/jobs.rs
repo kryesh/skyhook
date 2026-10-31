@@ -360,7 +360,7 @@ mod tests {
         let pending = pending_lease.id();
         let completed_lease = jobs.create(spec("completed")).await.unwrap();
         let completed = completed_lease.id();
-        let finished = JobOutcome::Completed(ToolOutput::new(Value::Null));
+        let finished = JobOutcome::Completed(ToolOutput::new(Value::Null).into());
         jobs.finish(completed, finished).await.unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, jobs.clone()).unwrap();
@@ -435,7 +435,7 @@ mod tests {
             ..JobSpec::test(agent.clone(), "done")
         };
         let done = jobs.test_create(spec).await;
-        let finished = JobOutcome::Completed(ToolOutput::new(json!("result")));
+        let finished = JobOutcome::Completed(ToolOutput::new(json!("result")).into());
         jobs.finish(done, finished).await.unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, jobs.clone()).unwrap();

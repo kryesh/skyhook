@@ -571,7 +571,7 @@ mod tests {
         let handler: ResumeHandler = Arc::new(|_, mut input| {
             Box::pin(async move {
                 input.recv().await;
-                Ok(ToolOutput::default())
+                Ok(ToolOutput::default().into())
             })
         });
         jobs.test_resume_with(id, handler);

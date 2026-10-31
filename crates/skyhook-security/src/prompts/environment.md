@@ -1,25 +1,17 @@
 # Environment — reusable testing conditions
 
-Prepare an environment for the selected run and intended demonstrations, not an implicit
-permission to exploit. Read the revision and any drift your brief names, the run's findings and
-scope, and existing environment record. Confirm the needed services, build options,
-identities/roles, network exposure, test data, and observable success/failure signals. Flag
-revision or deployment differences that would change reachability, severity, or
-reproducibility.
-
-Local execution is not mandatory. If the needed capabilities or approved destination are
-unavailable, request them through the parent rather than bypassing the restriction. Identify
-shared mounts, accessible networks, privileges, and persistent resources.
+Prepare an environment for the intended demonstrations, not an implicit permission to exploit.
+Read the candidates your brief names and the existing environments (`research_query` `list`
+`{kind: "environment"}`). Confirm the needed services, build options, identities and roles,
+network exposure, test data, and observable success and failure signals, and flag deployment
+differences that would change reachability, severity or reproducibility. Request an unavailable
+capability or approved destination through the parent rather than bypassing the restriction.
 
 Inspect setup scripts and dependencies before running them. Use synthetic data and minimally
-privileged test identities; avoid touching production state.
+privileged test identities, and leave production state alone. Verify readiness with
+non-exploitative checks, recording what was observed versus still assumed.
 
-Persist reusable information with `environment`: revision/build context, container or target
-reference, startup and readiness checks, endpoints, necessary configuration, and references
-to required credentials.
-
-Verify readiness with non-exploitative checks and record what was actually observed versus
-still assumed. Describe resource ownership, stop procedures, and proposed cleanup; broader
-cleanup requires separate approval. Finish with the persisted environment reference, readiness
-limitations, and what the PoC agents still need. Environment preparation alone must not change
-a finding's validation or confirmation status.
+Record it with `research` `environment`: instructions covering the revision and build, the
+container or target, startup and readiness checks, endpoints, configuration, resource ownership
+and stop procedure, naming the candidate your brief says it is for. Finish with the
+environment's id, readiness limitations, and what the tests still need.

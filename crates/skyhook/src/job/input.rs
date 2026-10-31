@@ -384,7 +384,7 @@ mod tests {
         assert!(taken(accepts(first)));
         let failed = crate::tool::ToolError::failed("refused before installing a child");
         jobs.finish(first, failed.into()).await.unwrap();
-        let completed = JobOutcome::Completed(crate::tool::ToolOutput::new(Value::Null));
+        let completed = JobOutcome::Completed(crate::tool::ToolOutput::new(Value::Null).into());
         jobs.finish(second, completed).await.unwrap();
         assert!(taken(accepts(launch(&runtime.agent).await)));
         let other =
@@ -409,7 +409,7 @@ mod tests {
         let handler: ResumeHandler = Arc::new(move |value, _| {
             invoked.fetch_add(1, Ordering::SeqCst);
             let value = value.unwrap_or_else(|| serde_json::json!("resumed"));
-            Box::pin(async move { Ok(ToolOutput::new(value)) })
+            Box::pin(async move { Ok(ToolOutput::new(value).into()) })
         });
         jobs.test_resume_with(lease.id(), handler);
         (lease, calls)

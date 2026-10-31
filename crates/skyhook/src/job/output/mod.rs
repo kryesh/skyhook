@@ -374,21 +374,10 @@ impl JobManager {
             return Ok(None);
         }
         let output = Output::of(self.store(), envelope.id, envelope.invocation);
-        let product = output
-            .reads
-            .clone()
-            .hold(move || {
-                let saved = Saved::load(&output)?;
-                (saved.product.as_ref())
-                    .map(|product| {
-                        let mut document = hydrate(&saved, product.document())?;
-                        Ok(product.result.is_some().then(|| document["result"].take()))
-                    })
-                    .transpose()
-            })
+        (output.reads.clone())
+            .hold(move || Saved::load(&output)?.result())
             .await
-            .map_err(|error| JobError::Output(Box::new(error)))?;
-        Ok(product.flatten())
+            .map_err(|error| JobError::Output(Box::new(error)))
     }
 }
 
@@ -689,9 +678,9 @@ mod tests {
                     let outcome = match outcome {
                         "cancelled" => ToolError::cancelled().into(),
                         "failed" => ToolError::failed("injected failure").into(),
-                        _ => JobOutcome::Completed(crate::tool::ToolOutput::new(
-                            json!({"abandoned":null}),
-                        )),
+                        _ => JobOutcome::Completed(
+                            crate::tool::ToolOutput::new(json!({"abandoned":null})).into(),
+                        ),
                     };
                     manager.finish(id, outcome).await.unwrap();
                 }
@@ -730,7 +719,7 @@ mod tests {
         ] {
             let output = available.then(|| crate::tool::ToolOutput::new(Value::Null));
             let outcome = match state {
-                JobState::Completed => JobOutcome::Completed(output.unwrap()),
+                JobState::Completed => JobOutcome::Completed(output.unwrap().into()),
                 JobState::Failed => JobOutcome::Failed {
                     diagnostic: ToolError::failed("failure").into_facts().0,
                     output,

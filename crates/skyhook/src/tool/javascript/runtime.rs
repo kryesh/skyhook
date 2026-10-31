@@ -1249,6 +1249,35 @@ return [await second, await third].map(received => received.value);
         assert_eq!(result, json!(["one", "two"]));
     }
 
+    /// Values released by feeds that end with their wakes taken but unread reach later
+    /// receives in the order they arrived.
+    #[test]
+    fn released_receives_keep_their_arrival_order() {
+        let result = evaluate_wrapper(
+            r#"
+const answers = [], wakes = [];
+__skyhookHostCall = () => new Promise(resolve => answers.push(value => {
+  resolve(JSON.stringify({outcome: "ok", value: {value}, presented: {}}));
+}));
+const fed = () => {
+  let offered = false;
+  const next = async () => offered ? [] : (offered = true, [{key: 1}]);
+  const wake = () => { const received = receive(); wakes.push(received); return received; };
+  return new WorkPool(1).feed(next, async () => "done", {wake});
+};
+const feeds = [fed(), fed()];
+for (const feed of feeds) await feed.next();
+for (const [index, value] of ["one", "two"].entries()) {
+  answers.shift()(value);
+  await wakes[index];
+}
+for (const feed of feeds) await feed.return();
+return [await receive(), await receive()].map(received => received.value);
+"#,
+        );
+        assert_eq!(result, json!(["one", "two"]));
+    }
+
     #[test]
     fn arguments_convert_when_a_builder_is_made() {
         let result = evaluate_wrapper(

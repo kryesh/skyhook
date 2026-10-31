@@ -32,6 +32,7 @@ pub(super) use decode::{Entries, agent_paths, decode_records, u64_of};
 pub(super) use encode::Encoder;
 pub use encode::agent_row;
 pub(crate) use job::JobRow;
+pub(in crate::session) use job::agent_job;
 pub(super) use job::{creations, job_rows, write_status};
 pub(super) use message::Scope;
 pub(super) use output::remove_staged;
@@ -52,7 +53,7 @@ pub(super) use wal::{Checkpointer, Log};
 pub(super) const SCHEMA: Schema = Schema {
     sql: include_str!("../schema.sql"),
     application_id: 0x534B_5948,
-    user_version: 27,
+    user_version: 28,
 };
 /// Store `bytes` under `digest`, their digest, once.
 pub(super) fn insert_blob(db: &Db, digest: BlobDigest, bytes: &[u8]) -> DbResult<()> {

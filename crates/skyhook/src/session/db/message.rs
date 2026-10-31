@@ -13,7 +13,10 @@ use crate::{
         AssistantItem, ItemId, ItemKind, Position, Provenance, Replay, TextBlock, ToolCall,
         ToolResult,
     },
-    session::{JobEvent, Message, RuntimeState, SessionEvent, StateJob, StateJobKind, UserPart},
+    session::{
+        HostCursor, HostEvent, JobEvent, Message, RuntimeState, SessionEvent, StateJob,
+        StateJobKind, UserPart,
+    },
 };
 
 named_enum! {
@@ -42,6 +45,7 @@ named_enum! {
     pub(super) enum JobEventKind {
         Message = "message",
         Job = "job",
+        Host = "host",
     }
 }
 
@@ -231,6 +235,19 @@ fn job_events(db: &Db, part: i64, events: &[JobEvent]) -> DbResult<()> {
                     "INSERT INTO user_part_job_event (part, position, kind, job, view) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![part, position, JobEventKind::Job, job.get(), json(view)?],
+                )?;
+            }
+            JobEvent::Host(host) => {
+                db.execute(
+                    "INSERT INTO user_part_job_event (part, position, kind, cursor, view) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        part,
+                        position,
+                        JobEventKind::Host,
+                        host.through.get(),
+                        json(&host.view)?
+                    ],
                 )?;
             }
         }
@@ -465,6 +482,16 @@ fn job_event(row: &Row) -> DbResult<JobEvent> {
             &row.get::<Option<String>>(6)?
                 .ok_or_else(|| corrupt("job view has no document"))?,
         )?)),
+        JobEventKind::Host => JobEvent::Host(HostEvent {
+            through: HostCursor::try_from(
+                (row.get::<Option<i64>>(7)?).ok_or_else(|| corrupt("host event has no cursor"))?,
+            )
+            .map_err(|error| corrupt(error.to_string()))?,
+            view: parse_json(
+                &row.get::<Option<String>>(6)?
+                    .ok_or_else(|| corrupt("host event has no view"))?,
+            )?,
+        }),
     })
 }
 
@@ -608,7 +635,7 @@ impl Messages {
             job_events: grouped(
                 db,
                 scope.query(
-                    "SELECT e.part, e.kind, e.job, e.name, e.source, e.text, e.view \
+                    "SELECT e.part, e.kind, e.job, e.name, e.source, e.text, e.view, e.cursor \
                      FROM user_part_job_event e {scope} ORDER BY e.part, e.position",
                     Owner::Part,
                 )?,

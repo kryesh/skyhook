@@ -24,7 +24,10 @@ mod projection;
 mod request;
 pub mod stats;
 
-pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
+pub use content::{
+    HostCursor, HostEvent, HostView, JobEvent, Message, NegativeCursor, RuntimeState, StateJob,
+    StateJobKind, UserPart, ViewNamesKind,
+};
 pub use core::SessionPhase;
 
 use crate::db::DbError;
@@ -42,7 +45,7 @@ pub use event::{
     ModelPurpose, ProfileSnapshot, RecordSeq, Refused, RequestSeq, RetryDelay, SessionEvent,
     TitleSource, Truncation,
 };
-pub use extension::{Extension, ExtensionDb, Unconfirmed};
+pub use extension::{AgentJobTexts, Extension, ExtensionDb, Unconfirmed};
 pub use ledger::{
     Fact, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
 };
@@ -563,6 +566,15 @@ impl SessionStore {
     /// Read the core's state.
     pub(crate) fn read<T>(&self, read: impl FnOnce(&CoreState) -> T) -> T {
         read(&self.inner.shared.read())
+    }
+
+    /// Run `read` against one snapshot of the committed journal.
+    #[cfg(test)]
+    pub(crate) fn test_read<T>(
+        &self,
+        read: impl FnOnce(&crate::db::Db) -> crate::db::DbResult<T>,
+    ) -> crate::db::DbResult<T> {
+        self.test_reads().read(read)
     }
 
     /// Every committed record, including an ephemeral session's.

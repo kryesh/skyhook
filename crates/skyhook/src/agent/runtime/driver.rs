@@ -1412,7 +1412,7 @@ mod tests {
             claim_completed(&session, job).await;
             let answer = bounded(received).await.unwrap().unwrap();
             assert_eq!(answer, "initial");
-            let result = JobOutcome::Completed(ToolOutput::new(answer.into()));
+            let result = JobOutcome::Completed(ToolOutput::new(answer.into()).into());
             jobs.finish(owner, result).await.unwrap();
             let delivery = jobs.pending_delivery(&session.root).await.unwrap();
             assert!(delivery.messages().is_empty());
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     async fn claim_completed(session: &SessionHandle, job: JobId) {
-        let outcome = JobOutcome::Completed(ToolOutput::default());
+        let outcome = JobOutcome::Completed(ToolOutput::default().into());
         session.runtime.jobs.finish(job, outcome).await.unwrap();
         session.runtime.jobs.test_claim(job).await.unwrap();
     }

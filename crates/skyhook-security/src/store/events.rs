@@ -1,238 +1,475 @@
-use chrono::{DateTime, Utc};
+//! The audit log: every write is one event naming the nodes it bears on, each with the
+//! strongest effect it has on it. A write names its direct marks; one rule carries them
+//! along the graph: a premise moves the standing of the flaws and paths relying on it, a source
+//! passes its effect to the paths it enters, and a flaw or path passes its effect to the live
+//! candidates holding it. Some marks move their node's own work alone: a candidate taking or
+//! losing a flaw as its root leaves the flaw's other candidates unmoved, and a path marked swept
+//! or unswept leaves its candidates unmoved. A flaw joining or leaving a chain at another place
+//! is only concerned.
+
+use std::collections::{BTreeMap, HashMap};
+
 use libsql::Row;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use skyhook::db::{Db, enum_column, params};
+use serde::Serialize;
+use skyhook::{
+    db::{Db, enum_column, params},
+    identity::SessionId,
+};
 
 use super::*;
 
-/// Declares [`EventRecord`] once with, per variant, the column that selects it and the
-/// statement that records it, so writing and reading an event's record cannot disagree.
-macro_rules! event_records {
-    ($($variant:ident($id:ident) = $select:literal, $insert:expr;)*) => {
-        /// The record an event describes, read with that record's own action.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-        #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
-        pub enum EventRecord {
-            $($variant($id),)*
-        }
+/// How one write bears on each node it names, the strongest effect kept: marks the rule
+/// carries along the graph, and marks that stay on their node.
+#[derive(Default)]
+pub(super) struct Marks {
+    carried: BTreeMap<NodeId, EventEffect>,
+    alone: BTreeMap<NodeId, EventEffect>,
+}
 
-        /// The selected record columns, one per variant in declaration order.
-        macro_rules! record_columns {
-            () => {
-                concat!($($select, ",",)*)
-            };
-        }
+fn strongest(marks: &mut BTreeMap<NodeId, EventEffect>, node: NodeId, effect: EventEffect) {
+    let held = marks.entry(node).or_insert(effect);
+    *held = (*held).max(effect);
+}
 
-        impl EventRecord {
-            /// One constructor per selected record column, in [`record_columns!`] order.
-            const DECODERS: &[fn(i64) -> Self] = &[$(|id| Self::$variant($id(id))),*];
-            const COLUMNS: i32 = Self::DECODERS.len() as i32;
+impl Marks {
+    pub(super) fn of(node: impl Into<NodeId>, effect: EventEffect) -> Self {
+        let mut marks = Self::default();
+        marks.mark(node, effect);
+        marks
+    }
 
-            fn insert(self) -> (&'static str, i64) {
-                match self {
-                    $(Self::$variant(id) => ($insert, id.0),)*
-                }
-            }
+    pub(super) fn mark(&mut self, node: impl Into<NodeId>, effect: EventEffect) {
+        strongest(&mut self.carried, node.into(), effect);
+    }
 
-            /// The one non-null record column from `offset`.
-            fn decode(row: &Row, offset: i32) -> Result<Option<Self>> {
-                for (column, decode) in (offset..).zip(Self::DECODERS) {
-                    if let Some(id) = row.get::<Option<i64>>(column)? {
-                        return Ok(Some(decode(id)));
-                    }
-                }
-                Ok(None)
+    /// Mark `node` standing for its own work alone, carried nowhere.
+    pub(super) fn alone(&mut self, node: impl Into<NodeId>) {
+        strongest(&mut self.alone, node.into(), EventEffect::Standing);
+    }
+
+    /// Mark alone the flaws leaving and taking a chain's root role, when it moved.
+    pub(super) fn rerooted(&mut self, before: Option<FlawId>, after: Option<FlawId>) {
+        if before != after {
+            for flaw in [before, after].into_iter().flatten() {
+                self.alone(flaw);
             }
         }
-    };
+    }
+
+    /// The marks that move what a node's work rests on, as `[[node, effect], ...]`.
+    fn moving(&self) -> Result<String> {
+        let moving: Vec<(i64, EventEffect)> = (self.carried.iter())
+            .filter(|(_, effect)| **effect >= EventEffect::Standing)
+            .map(|(node, effect)| (node.0, *effect))
+            .collect();
+        json_list(&moving)
+    }
+
+    /// Mark each `(node, effect)` row `sql` selects from the moving marks bound as `?1`.
+    fn carry(&mut self, db: &Db, sql: &'static str) -> Result<()> {
+        let carried = rows(db, sql, params![self.moving()?], |row| {
+            Ok((NodeId(row.get(0)?), enum_column::<EventEffect>(row, 1)?))
+        })?;
+        for (node, effect) in carried {
+            self.mark(node, effect);
+        }
+        Ok(())
+    }
+
+    /// Every mark, with what the carried ones carry along the graph as it stands after the
+    /// write.
+    fn propagated(mut self, db: &Db) -> Result<BTreeMap<NodeId, EventEffect>> {
+        self.carry(
+            db,
+            "SELECT fp.flaw,'standing' FROM json_each(?1) j JOIN flaw_premise fp ON \
+             fp.premise=j.value->>0 UNION SELECT pp.path,'standing' FROM json_each(?1) j JOIN \
+             path_premise pp ON pp.premise=j.value->>0 UNION SELECT ps.path,j.value->>1 FROM \
+             json_each(?1) j JOIN path_source ps ON ps.source=j.value->>0",
+        )?;
+        self.carry(
+            db,
+            "SELECT cf.candidate,j.value->>1 FROM json_each(?1) j JOIN candidate_flaw cf ON \
+             cf.flaw=j.value->>0 JOIN node n ON n.id=cf.candidate WHERE n.merged_into IS NULL \
+             UNION ALL SELECT c.node,j.value->>1 FROM json_each(?1) j JOIN candidate c ON \
+             c.path=j.value->>0 JOIN node n ON n.id=c.node WHERE n.merged_into IS NULL",
+        )?;
+        for (node, effect) in self.alone {
+            strongest(&mut self.carried, node, effect);
+        }
+        Ok(self.carried)
+    }
 }
 
-macro_rules! reference {
-    ($column:literal) => {
-        concat!(
-            "INSERT INTO event_record(event,",
-            $column,
-            ") VALUES (?1,?2)"
-        )
-    };
-}
-
-event_records! {
-    Scope(ScopeId) = "r.scope", reference!("scope");
-    Principal(PrincipalId) = "r.principal", reference!("principal");
-    Source(SourceId) = "r.source", reference!("source");
-    Component(ComponentId) = "r.component", reference!("component");
-    Path(PathId) = "r.path", reference!("path");
-    Unit(UnitId) = "r.unit", reference!("unit");
-    Outcome(OutcomeId) = "r.outcome", reference!("outcome");
-    Guarantee(GuaranteeId) = "r.guarantee", reference!("guarantee");
-    RetrySite(RetrySiteId) = "r.retry_site", reference!("retry_site");
-    Deferred(DeferredId) = "r.deferred", reference!("deferred");
-    Relation(RelationId) = "r.relation", reference!("relation");
-    Undermining(UnderminingId) = "r.undermining", reference!("undermining");
-    Premise(PremiseId) = "r.premise", reference!("premise");
-    Resolution(ResolutionId) = "r.resolution", reference!("resolution");
-    Refutation(RefutationId) = "r.refutation", reference!("refutation");
-    Evidence(EvidenceId) = "r.evidence", reference!("evidence");
-    Exposure(ExposureId) = "r.exposure", reference!("exposure");
-    Assessment(AssessmentId) = "r.assessment", reference!("assessment");
-    Validation(ValidationId) = "r.validation", reference!("validation");
-    Poc(PocId) = "r.poc", reference!("poc");
-    PocStart(PocStartId) = "r.poc_start", reference!("poc_start");
-    Environment(EnvironmentId) = "r.environment", reference!("environment");
-    Finding(FindingId) = "r.finding", reference!("finding");
-}
-
-/// A flaw or candidate an event concerns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(
-    tag = "kind",
-    content = "id",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum Subject {
-    Flaw(FlawId),
-    Candidate(CandidateId),
-}
-
-/// `note` is the actor's own words, or the text of the record the event wrote.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Event {
-    pub id: EventId,
-    pub kind: EventKind,
-    pub actor: AgentId,
-    pub record: Option<EventRecord>,
-    pub note: Option<String>,
-    pub at: DateTime<Utc>,
-}
-
-/// What an event holds beyond its kind and subjects.
-#[derive(Clone, Copy)]
-pub(super) enum Detail<'a> {
-    /// The actor's words, which no record holds.
-    Note(&'a str),
-    Record(EventRecord),
-}
-
-/// Append an audit event about `subjects`, returning its id.
-pub(super) fn audit(
+/// Record one event of `kind` by `actor`, part of the tasks it and the agents above it hold:
+/// `write` makes its changes knowing the event, and names the nodes it bears on directly; the
+/// event then names them and what they carry.
+pub(super) fn audit<T>(
     db: &Db,
     actor: &AgentId,
     kind: EventKind,
-    detail: Detail,
-    subjects: &[Subject],
-) -> Result<EventId> {
-    let actor = actor_row(db, actor)?;
-    let event = db.insert(
-        "INSERT INTO event(kind,actor,at) VALUES (?1,?2,?3)",
-        params![kind, actor, now()],
+    note: Option<&Text>,
+    write: impl FnOnce(EventId) -> Result<(T, Marks)>,
+) -> Result<T> {
+    let agent = agent_row(db, actor)?;
+    let event = EventId(db.insert(
+        "INSERT INTO event(agent,at,kind,note) VALUES (?1,?2,?3,?4)",
+        params![agent, now(), kind, note],
+    )?);
+    db.execute(
+        "WITH RECURSIVE line(agent) AS (SELECT ?2 UNION ALL SELECT g.parent FROM line l JOIN \
+         agent g ON g.id=l.agent WHERE g.parent IS NOT NULL) INSERT INTO event_task(event,task) \
+         SELECT DISTINCT ?1,t.id FROM line l JOIN agent a ON a.id=l.agent JOIN task t ON \
+         t.job=a.owner_job",
+        params![event, agent],
     )?;
-    for subject in subjects {
-        match subject {
-            Subject::Flaw(flaw) => db.execute(
-                "INSERT INTO flaw_event(event,flaw) VALUES (?1,?2) ON CONFLICT DO NOTHING",
-                params![event, flaw.0],
-            )?,
-            Subject::Candidate(candidate) => db.execute(
-                "INSERT INTO candidate_event(event,candidate) VALUES (?1,?2) ON CONFLICT DO NOTHING",
-                params![event, candidate.0],
-            )?,
-        };
+    let (written, marks) = write(event)?;
+    for (node, effect) in marks.propagated(db)? {
+        db.execute(
+            "INSERT INTO event_node(event,node,effect) VALUES (?1,?2,?3)",
+            params![event, node, effect],
+        )?;
     }
-    match detail {
-        Detail::Note(note) => {
-            db.execute(
-                "INSERT INTO event_note(event,note) VALUES (?1,?2)",
-                params![event, note],
-            )?;
-        }
-        Detail::Record(record) => record_event(db, event, record)?,
-    }
-    Ok(EventId(event))
+    Ok(written)
 }
 
-fn record_event(db: &Db, event: i64, record: EventRecord) -> Result<()> {
-    let (sql, id) = record.insert();
-    db.execute(sql, params![event, id])?;
-    Ok(())
+/// A node an event names and how it bears on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Mark {
+    pub node: NodeId,
+    pub effect: EventEffect,
 }
 
-/// Events from `$from`, keyed by `$key`, past `?1` with limit `?2`; the filter, if
-/// any, binds `?3`.
-macro_rules! events_sql {
-    ($from:literal, $key:literal, $filter:literal) => {
-        concat!(
-            "SELECT e.id,e.kind,e.at,",
-            actor_columns!(),
-            ",",
-            record_columns!(),
-            "coalesce(n.note,ph.description,pu.question,oc.note,g.statement,d.reason,rl.note,\
-             pr.statement,rs.note,rf.reason,ev.note,ex.note,sa.rationale,v.evidence,p.evidence) ",
-            $from,
-            " JOIN actor a ON a.id=e.actor \
-             LEFT JOIN event_note n ON n.event=e.id LEFT JOIN event_record r ON r.event=e.id \
-             LEFT JOIN path ph ON ph.id=r.path \
-             LEFT JOIN plan_unit pu ON pu.id=r.unit LEFT JOIN outcome oc ON oc.id=r.outcome \
-             LEFT JOIN guarantee g ON g.id=r.guarantee LEFT JOIN deferred d ON d.id=r.deferred \
-             LEFT JOIN relation rl ON rl.id=r.relation LEFT JOIN premise pr ON pr.id=r.premise \
-             LEFT JOIN premise_resolution rs ON rs.id=r.resolution \
-             LEFT JOIN flaw_refutation rf ON rf.id=r.refutation LEFT JOIN evidence ev ON ev.id=r.evidence \
-             LEFT JOIN exposure ex ON ex.id=r.exposure LEFT JOIN assessment sa ON sa.id=r.assessment \
-             LEFT JOIN validation v ON v.id=r.validation LEFT JOIN poc p ON p.id=r.poc \
-             WHERE ",
-            $key,
-            ">?1",
-            $filter,
-            " ORDER BY ",
-            $key,
-            " LIMIT ?2"
-        )
+/// `note` is the actor's own words.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct Event {
+    pub id: EventId,
+    pub kind: EventKind,
+    pub agent: AgentId,
+    pub at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub nodes: Vec<Mark>,
+}
+
+impl Keyed for Event {
+    fn key(&self) -> i64 {
+        self.id.0
+    }
+}
+
+/// Events read as `e`, decoded by [`event_row`] without their nodes; a condition follows.
+macro_rules! event_select {
+    () => {
+        "SELECT e.id,e.kind,e.agent,e.at,e.note FROM event e WHERE "
     };
 }
 
-impl Store {
-    /// All audit events, or the events about one flaw or candidate.
-    pub fn events(&self, subject: Option<Subject>, page: Page) -> Result<Listing<Event>> {
-        self.read(|db| {
-            let (sql, filter): (&'static str, _) = match subject {
-                None => (events_sql!("FROM event e", "e.id", ""), Vec::new()),
-                Some(Subject::Flaw(flaw)) => (
-                    events_sql!(
-                        "FROM flaw_event s JOIN event e ON e.id=s.event",
-                        "s.event",
-                        " AND s.flaw=?3"
-                    ),
-                    params![flaw.0],
-                ),
-                Some(Subject::Candidate(candidate)) => (
-                    events_sql!(
-                        "FROM candidate_event s JOIN event e ON e.id=s.event",
-                        "s.event",
-                        " AND s.candidate=?3"
-                    ),
-                    params![candidate.0],
-                ),
+/// An event as its row holds it: its agent is a journal row, and its nodes are apart.
+struct Logged {
+    id: EventId,
+    kind: EventKind,
+    agent: i64,
+    at: DateTime<Utc>,
+    note: Option<String>,
+}
+
+fn event_row(row: &Row) -> Result<Logged> {
+    Ok(Logged {
+        id: EventId(row.get(0)?),
+        kind: enum_column(row, 1)?,
+        agent: row.get(2)?,
+        at: time(row.get(3)?)?,
+        note: row.get(4)?,
+    })
+}
+
+/// `events` with their agents and the nodes each names.
+fn completed(db: &Db, session: SessionId, events: Vec<Logged>) -> Result<Vec<Event>> {
+    let ids: Vec<i64> = events.iter().map(|event| event.id.0).collect();
+    let mut nodes = BTreeMap::<i64, Vec<Mark>>::new();
+    for (event, mark) in rows(
+        db,
+        "SELECT en.event,en.node,en.effect FROM json_each(?1) j JOIN event_node en ON \
+         en.event=j.value ORDER BY en.event,en.node",
+        params![json_list(&ids)?],
+        |row| {
+            let mark = Mark {
+                node: NodeId(row.get(1)?),
+                effect: enum_column(row, 2)?,
             };
-            let mut params = params![page.after, page.limit()];
-            params.extend(filter);
-            let events = rows(db, sql, params, event_row)?;
-            Ok(Listing::keyset(events, page))
+            Ok((row.get::<i64>(0)?, mark))
+        },
+    )? {
+        nodes.entry(event).or_default().push(mark);
+    }
+    let mut agents = HashMap::new();
+    (events.into_iter())
+        .map(|event| {
+            let agent = match agents.get(&event.agent) {
+                Some(agent) => Clone::clone(agent),
+                None => {
+                    let agent = agent_id(db, session, event.agent)?;
+                    agents.insert(event.agent, agent.clone());
+                    agent
+                }
+            };
+            Ok(Event {
+                id: event.id,
+                kind: event.kind,
+                agent,
+                at: event.at,
+                note: event.note,
+                nodes: nodes.remove(&event.id.0).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// The agent of journal row `row`, by its path of child indexes from the root.
+fn agent_id(db: &Db, session: SessionId, row: i64) -> Result<AgentId> {
+    let path = rows(
+        db,
+        "WITH RECURSIVE up(id,child,depth) AS (SELECT id,child_index,0 FROM agent WHERE id=?1 \
+         UNION ALL SELECT a.id,a.child_index,up.depth+1 FROM up JOIN agent g ON g.id=up.id JOIN \
+         agent a ON a.id=g.parent) SELECT child FROM up WHERE child IS NOT NULL ORDER BY depth \
+         DESC",
+        params![row],
+        |row| Ok(row.get::<u32>(0)?),
+    )?;
+    Ok((path.into_iter()).fold(AgentId::root(session), |agent, index| agent.child(index)))
+}
+
+/// The first `limit` events the agent of journal job `job` recorded, oldest first.
+pub(super) fn of_job(db: &Db, session: SessionId, job: i64, limit: usize) -> Result<Vec<Event>> {
+    let events = rows(
+        db,
+        concat!(
+            event_select!(),
+            "e.agent=(SELECT id FROM agent WHERE owner_job=?2) ORDER BY e.id LIMIT ?1"
+        ),
+        params![limit, job],
+        event_row,
+    )?;
+    completed(db, session, events)
+}
+
+impl Store {
+    /// Every event, or the events naming `node`, oldest first.
+    pub fn history(&self, node: Option<NodeId>, page: Page) -> Result<Listing<Event>> {
+        let session = self.id();
+        self.read(|db| {
+            let events = match node {
+                None => rows(
+                    db,
+                    concat!(event_select!(), "e.id>?1 ORDER BY e.id LIMIT ?2"),
+                    params![page.after, page.limit()],
+                    event_row,
+                )?,
+                Some(node) => rows(
+                    db,
+                    "SELECT e.id,e.kind,e.agent,e.at,e.note FROM event_node en JOIN event e ON \
+                     e.id=en.event WHERE en.node=?3 AND en.event>?1 ORDER BY en.event LIMIT ?2",
+                    params![page.after, page.limit(), node],
+                    event_row,
+                )?,
+            };
+            Ok(Listing::keyset(completed(db, session, events)?, page))
         })
     }
 }
 
-/// The first column of [`events_sql!`] after the actor's.
-const RECORD_OFFSET: i32 = 4;
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::tests::{
+            HIGH, assess, child_agent, fixture, last_event, marks, premise, scenario, test, text,
+            validated,
+        },
+        *,
+    };
 
-fn event_row(row: &Row) -> Result<Event> {
-    Ok(Event {
-        id: EventId(row.get(0)?),
-        kind: enum_column(row, 1)?,
-        at: time(row.get(2)?)?,
-        actor: actor_column(row, 3)?,
-        record: EventRecord::decode(row, RECORD_OFFSET)?,
-        note: row.get(RECORD_OFFSET + EventRecord::COLUMNS)?,
-    })
+    /// A write's effects flow premise → flaw/path and source → path → candidate: a flaw edit
+    /// makes its candidates `changed`, a premise decision makes its flaws, paths and their
+    /// candidates `standing`, a path step or a source edit makes the candidates along the path
+    /// `changed`, and a test record moves only its own candidate. A candidate taking a flaw as
+    /// its root moves that flaw, not its other candidates; a flaw joining or leaving a chain at
+    /// another place is only concerned.
+    #[test]
+    fn effects_propagate_along_the_graph() {
+        let (_session, store, actor) = fixture();
+        let decoder = validated(&store, &actor, "decoder");
+        let (candidate, flaw, path) = (decoder.candidate, decoder.flaw, decoder.path);
+        let other = scenario(&store, &actor, "parser").candidate;
+        let [on_flaw, on_path] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let links = [
+            Link::FlawPremise {
+                flaw,
+                premise: on_flaw,
+            },
+            Link::PathPremise {
+                path,
+                premise: on_path,
+            },
+        ];
+        store.link(&actor, &links).unwrap();
+        let concerns = |node: NodeId| (node, EventEffect::Concerns);
+        let standing = |node: NodeId| (node, EventEffect::Standing);
+        let changed = |node: NodeId| (node, EventEffect::Changed);
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                standing(path.into()),
+                standing(flaw.into()),
+                standing(candidate.into()),
+                concerns(on_flaw.into()),
+                concerns(on_path.into()),
+            ]
+        );
+
+        let edit = Edit {
+            title: None,
+            body: Some(text("the copy is unbounded on retry")),
+            detail: FlawEdit::default(),
+        };
+        store
+            .upsert(&actor, &Upsert::Flaw(Change::Edit(flaw, edit)))
+            .unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [changed(flaw.into()), changed(candidate.into())]
+        );
+
+        for premise in [on_flaw, on_path] {
+            let decided = StatusChange::Premise(premise, PremiseStatus::Holds);
+            store.set_status(&actor, decided, &text("traced")).unwrap();
+        }
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                standing(path.into()),
+                standing(candidate.into()),
+                changed(on_path.into())
+            ]
+        );
+
+        let component = decoder.component;
+        let step = Link::PathStep {
+            path,
+            component,
+            location: None,
+            note: text("retries"),
+            position: Some(0),
+        };
+        store.link(&actor, &[step]).unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                concerns(component.into()),
+                changed(path.into()),
+                changed(candidate.into())
+            ]
+        );
+
+        let NodeView::Path(view) = store.node(path.into()).unwrap() else {
+            panic!("a path")
+        };
+        let source = view.sources[0].id;
+        let edit = Edit {
+            title: None,
+            body: None,
+            detail: SourceEdit {
+                location: None,
+                trust: Some(Trust::Authenticated),
+            },
+        };
+        store
+            .upsert(&actor, &Upsert::Source(Change::Edit(source, edit)))
+            .unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                changed(path.into()),
+                changed(source.into()),
+                changed(candidate.into())
+            ]
+        );
+
+        let (tester, _) = child_agent(&store, skyhook::job::JobState::Running);
+        test(&store, &tester, candidate, TestResult::Failed);
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [standing(candidate.into())]
+        );
+        assess(&store, &actor, other, HIGH);
+        assert_eq!(marks(&store, last_event(&store)), [standing(other.into())]);
+
+        let ahead = super::super::tests::flaw(&store, &actor, decoder.component);
+        let sibling = super::super::tests::candidate(&store, &actor, path, &[ahead, flaw]);
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                concerns(path.into()),
+                concerns(flaw.into()),
+                standing(ahead.into()),
+                changed(sibling.into())
+            ],
+            "a root taken moves its flaw alone, a place behind it only concerns its flaw"
+        );
+        let edit = Edit {
+            title: None,
+            body: None,
+            detail: CandidateEdit {
+                path: None,
+                chain: Some(vec![ahead].try_into().unwrap()),
+            },
+        };
+        store
+            .upsert(&actor, &Upsert::Candidate(Change::Edit(sibling, edit)))
+            .unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [concerns(flaw.into()), changed(sibling.into())]
+        );
+    }
+
+    /// History pages through the events naming a node, oldest first, each with the nodes it
+    /// names, how it bears on them, and the agent that recorded it.
+    #[test]
+    fn history_pages_a_nodes_events_with_their_marks() {
+        let (_session, store, actor) = fixture();
+        let decoder = scenario(&store, &actor, "decoder");
+        let (candidate, flaw) = (decoder.candidate, decoder.flaw);
+        let (child, _) = child_agent(&store, skyhook::job::JobState::Running);
+        assess(&store, &child, candidate, HIGH);
+        let page = Page::new(0, skyhook::Bounded::new::<1>());
+        let first = store.history(Some(candidate.into()), page).unwrap();
+        assert_eq!(first.items[0].kind, EventKind::Created);
+        assert!(first.items[0].nodes.contains(&Mark {
+            node: flaw.into(),
+            effect: EventEffect::Standing
+        }));
+        let after = first.next_after.expect("a full page continues");
+        let rest = store
+            .history(Some(candidate.into()), Page::new(after, page.limit))
+            .unwrap();
+        let assessed = &rest.items[0];
+        assert_eq!(
+            (assessed.kind, &assessed.agent, assessed.note.as_deref()),
+            (EventKind::Assessed, &child, Some("scored"))
+        );
+        assert_eq!(
+            assessed.nodes,
+            [Mark {
+                node: candidate.into(),
+                effect: EventEffect::Standing
+            }]
+        );
+        let all = Listing::drain(|page| store.history(None, page)).unwrap();
+        assert_eq!(all.last().unwrap().id, assessed.id);
+        assert!(
+            all.iter()
+                .all(|event| event.agent == actor || event.agent == child)
+        );
+    }
 }

@@ -490,7 +490,7 @@ mod tests {
                     .await
                     .unwrap();
                 for job in [job, root_job] {
-                    let outcome = JobOutcome::Completed(ToolOutput::default());
+                    let outcome = JobOutcome::Completed(ToolOutput::default().into());
                     runtime.jobs.finish(job, outcome).await.unwrap();
                 }
                 fixture.script.release(1);
@@ -639,7 +639,7 @@ mod tests {
             .await
             .unwrap()
             .into_test_id();
-        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"content":output})));
+        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"content":output})).into());
         runtime.jobs.finish(lease, outcome).await.unwrap();
         fixture.add_history(20_000).await;
         let mut selected = summary_json();

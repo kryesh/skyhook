@@ -360,7 +360,8 @@ fn section_rows(section: &Section, open: &Disclosed, width: usize) -> Vec<PageLi
     heading.extend(row(titles.collect()));
     lines.push(toggled(Line::from(heading), own()));
     for record in &section.records {
-        let glyph = model::Disclosure::new(open.is_open(section.key, &record.key)).glyph();
+        let opened = open.detail(section.key, &record.key).is_some();
+        let glyph = model::Disclosure::new(opened).glyph();
         let mut spans = vec![Span::raw(" ".repeat(RECORD_INDENT)), muted(glyph)];
         spans.extend(row(record.cells.iter().map(span).collect()));
         let toggle = Toggle::Record(section.key, record.key.clone());
@@ -369,7 +370,12 @@ fn section_rows(section: &Section, open: &Disclosed, width: usize) -> Vec<PageLi
             Some(toggle.clone()),
         ));
         if let Some(detail) = &record.detail {
-            lines.extend(detail_rows(detail, width, &toggle));
+            lines.extend(detail_rows(&detail.lines, width, &toggle));
+            if detail.more {
+                let more = muted(format!("{}… more", " ".repeat(DETAIL_INDENT)));
+                let toggle = Toggle::MoreDetail(section.key, record.key.clone());
+                lines.push(toggled(Line::from(more), Some(toggle)));
+            }
         }
     }
     let shown = section.records.len() as u64;

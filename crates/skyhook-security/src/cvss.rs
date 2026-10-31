@@ -61,24 +61,6 @@ skyhook::named_enum! {
     }
 }
 
-impl BaseMetric {
-    /// The metric's least severe value.
-    pub const fn floor(self) -> &'static str {
-        match self {
-            Self::AttackVector => "P",
-            Self::AttackComplexity | Self::PrivilegesRequired => "H",
-            Self::AttackRequirements => "P",
-            Self::UserInteraction => "A",
-            Self::VulnerableConfidentiality
-            | Self::VulnerableIntegrity
-            | Self::VulnerableAvailability
-            | Self::SubsequentConfidentiality
-            | Self::SubsequentIntegrity
-            | Self::SubsequentAvailability => "N",
-        }
-    }
-}
-
 skyhook::named_enum! {
     /// Severity ordering is the CVSS qualitative scale; the default shortlist threshold is high.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
@@ -392,11 +374,6 @@ impl Cvss40 {
             BaseMetric::SubsequentIntegrity => s.integrity.as_str(),
             BaseMetric::SubsequentAvailability => s.availability.as_str(),
         }
-    }
-
-    /// Whether `metric` scores at its least severe value.
-    pub fn at_floor(&self, metric: BaseMetric) -> bool {
-        self.code(metric) == metric.floor()
     }
 
     pub fn severity(&self) -> Severity {

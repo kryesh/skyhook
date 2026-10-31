@@ -1,7 +1,8 @@
 //! Authored text set into a generated page, read as CommonMark parses it so it never
 //! reshapes the page around it: its headings sit below the page's, raw HTML shows as
-//! written, a code block it leaves open is closed before the page goes on, and text set
-//! within a line pairs no delimiter with the line around it.
+//! written, a code block it leaves open is closed before the page goes on, text set
+//! within a line pairs no delimiter with the line around it, and a link's text holds no
+//! link of its own.
 
 use std::ops::Range;
 
@@ -18,11 +19,33 @@ fn escaped(text: &str, at: usize) -> bool {
     text[..at].bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1
 }
 
+/// Where authored text is set in a generated page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    /// As blocks of its own.
+    Blocks,
+    /// Within a line.
+    Line,
+    /// Within a line, as a link's text.
+    Label,
+}
+
+fn autolink(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Start(Tag::Link {
+            link_type: LinkType::Autolink | LinkType::Email,
+            ..
+        })
+    )
+}
+
 /// The bytes of `text` from `from` that read as markup the text around them can reshape:
-/// every ASCII punctuation character of raw HTML, so it shows as written, and with `inline`
+/// every ASCII punctuation character of raw HTML, so it shows as written; within a line,
 /// each backtick outside code and each emphasis delimiter forming no emphasis of its own, so
-/// text set within a line pairs with nothing around it.
-fn exposed(text: &str, from: usize, inline: bool) -> Vec<usize> {
+/// it pairs with nothing around it; and as a link's text, each bracket outside code and each
+/// autolink's opening, so it holds no link of its own.
+fn exposed(text: &str, from: usize, setting: Setting) -> Vec<usize> {
     let events = events(text);
     let bytes = text.as_bytes();
     let mut marks: Vec<usize> = (events.iter())
@@ -30,20 +53,11 @@ fn exposed(text: &str, from: usize, inline: bool) -> Vec<usize> {
         .flat_map(|(_, range)| range.clone())
         .filter(|at| bytes[*at].is_ascii_punctuation())
         .collect();
-    if inline {
+    if setting != Setting::Blocks {
         // Code spans and autolinks read their contents verbatim, escapes included. They never
         // nest or overlap, so in document order their ranges are ordered by start.
         let verbatim: Vec<&Range<usize>> = (events.iter())
-            .filter(|(event, _)| {
-                matches!(
-                    event,
-                    Event::Code(_)
-                        | Event::Start(Tag::Link {
-                            link_type: LinkType::Autolink | LinkType::Email,
-                            ..
-                        })
-                )
-            })
+            .filter(|(event, _)| matches!(event, Event::Code(_)) || autolink(event))
             .map(|(_, range)| range)
             .collect();
         let delimiters = (events.iter())
@@ -55,11 +69,16 @@ fn exposed(text: &str, from: usize, inline: bool) -> Vec<usize> {
             after > 0 && verbatim[after - 1].contains(at)
         };
         let ticks = text.match_indices('`').map(|(at, _)| at);
+        let brackets = (text.match_indices(['[', ']']).map(|(at, _)| at))
+            .filter(|_| setting == Setting::Label);
         marks.extend(
-            ticks
-                .chain(delimiters)
+            (ticks.chain(delimiters).chain(brackets))
                 .filter(|at| !escaped(text, *at) && !shielded(at)),
         );
+        if setting == Setting::Label {
+            let opened = events.iter().filter(|(event, _)| autolink(event));
+            marks.extend(opened.map(|(_, range)| range.start));
+        }
     }
     marks.retain(|at| *at >= from);
     marks.sort_unstable();
@@ -82,9 +101,9 @@ fn spliced<'a>(text: &str, edits: impl IntoIterator<Item = (Range<usize>, &'a st
 
 /// `text` with every byte [`exposed`] finds backslash-escaped, parsed again to confirm none
 /// is left: an escape can leave other delimiters unpaired.
-fn escape(mut text: String, from: usize, inline: bool) -> String {
+fn escape(mut text: String, from: usize, setting: Setting) -> String {
     loop {
-        let marks = exposed(&text, from, inline);
+        let marks = exposed(&text, from, setting);
         if marks.is_empty() {
             return text;
         }
@@ -163,21 +182,36 @@ pub(super) fn block(text: &str, level: usize) -> String {
     }
     // Only line breaks go: the last line may be code, whose trailing whitespace is content.
     let text = text.trim_end_matches('\n');
-    let mut text = close(demote(&escape(text.to_owned(), 0, false), level));
+    let mut text = close(demote(&escape(text.to_owned(), 0, Setting::Blocks), level));
     text.push('\n');
     text
 }
 
-/// Authored text set within a line of generated text: its line breaks become spaces, and a
+/// Authored text set within a line of generated text: its line breaks become spaces, a
 /// backtick or emphasis delimiter that pairs with nothing of its own is escaped so it pairs
-/// with nothing else in the line either.
+/// with nothing else in the line either, and a trailing backslash is escaped so it escapes
+/// nothing generated after it.
 pub(super) fn line(text: &str) -> String {
+    inline(text, Setting::Line)
+}
+
+/// Authored text set as a link's text within a line: as [`line`], with every bracket and
+/// autolink escaped so it holds no link of its own and closes nothing early.
+pub(super) fn label(text: &str) -> String {
+    inline(text, Setting::Label)
+}
+
+fn inline(text: &str, setting: Setting) -> String {
     // A leading word keeps the text inline, as it is within the page's line.
     const LEAD: &str = "x ";
     let flat: Vec<&str> = (text.split(['\r', '\n']))
         .filter(|line| !line.is_empty())
         .collect();
-    escape(format!("{LEAD}{}", flat.join(" ")), LEAD.len(), true).split_off(LEAD.len())
+    let mut text = escape(format!("{LEAD}{}", flat.join(" ")), LEAD.len(), setting);
+    if escaped(&text, text.len()) {
+        text.push('\\');
+    }
+    text.split_off(LEAD.len())
 }
 
 #[cfg(test)]
@@ -280,6 +314,38 @@ mod tests {
                 (0, format!("Root flaw 1: {text}. Candidate 2: {text} (x).")),
                 "{page}"
             );
+        }
+    }
+
+    /// A link's text holds no link of its own and closes nothing early: each link it
+    /// sets stays one link around the authored text, read as written.
+    #[test]
+    fn authored_labels_hold_no_link() {
+        for (authored, text) in [
+            ("[x](y)", "[x](y)"),
+            ("a ] b", "a ] b"),
+            ("[a [b", "[a [b"),
+            ("![i](j)", "![i](j)"),
+            ("<http://a_b> and `]`", "<http://a_b> and ]"),
+            ("a \\", "a \\"),
+            ("`a \\", "`a \\"),
+        ] {
+            let page = format!("[{}](u) and [{}](v)\n", label(authored), label(authored));
+            let (mut depth, mut links, mut rendered) = (0, Vec::new(), String::new());
+            for (event, _) in events(&page) {
+                match event {
+                    Event::Start(Tag::Link { dest_url, .. }) => {
+                        depth += 1;
+                        links.push((depth, dest_url.to_string()));
+                    }
+                    Event::End(TagEnd::Link) => depth -= 1,
+                    Event::Text(value) | Event::Code(value) => rendered.push_str(&value),
+                    _ => {}
+                }
+            }
+            let expected = [(1, "u".to_owned()), (1, "v".to_owned())];
+            assert_eq!(links, expected, "{page}");
+            assert_eq!(rendered, format!("{text} and {text}"), "{page}");
         }
     }
 }

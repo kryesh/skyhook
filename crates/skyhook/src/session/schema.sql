@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 27). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 28). Tables are STRICT;
 -- subtype rows reference entry(seq), whose kind the decoder requires them to match.
 -- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
 -- saturate to i64::MAX.
@@ -292,20 +292,24 @@ CREATE TABLE message_state_todo (
 
 CREATE TABLE job_event_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- A job-events notification: a child's reply (message) or a job's presented view (job).
--- Like a tool result, the view is the JSON document the model received.
+-- A job-events notification: a child's reply (message), a job's presented view (job), or
+-- the host's view of what its log held for the agent through `cursor` (host). Like a tool
+-- result, a view is the JSON document the model received.
 CREATE TABLE user_part_job_event (
   part INTEGER NOT NULL REFERENCES user_part(id),
   position INTEGER NOT NULL CHECK (position >= 0),
   kind TEXT NOT NULL REFERENCES job_event_kind(name),
-  job INTEGER NOT NULL REFERENCES job(id),
+  job INTEGER REFERENCES job(id),
   name TEXT,
   source INTEGER REFERENCES message_commit(entry),
   text TEXT,
   view TEXT CHECK (view IS NULL OR json_valid(view)),
+  cursor INTEGER,
   PRIMARY KEY (part, position),
   CHECK ((kind = 'message') = (source IS NOT NULL AND text IS NOT NULL)),
-  CHECK ((kind = 'job') = (view IS NOT NULL)),
+  CHECK ((kind IN ('job', 'host')) = (view IS NOT NULL)),
+  CHECK ((kind = 'host') = (job IS NULL)),
+  CHECK ((kind = 'host') = (cursor IS NOT NULL)),
   CHECK (kind = 'message' OR name IS NULL)
 ) STRICT, WITHOUT ROWID;
 
@@ -538,14 +542,16 @@ CREATE TABLE agent_outcome (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- Each started agent as the agent fold leaves it, written in the transaction of the
 -- records that change it. Pointers name the records whose rows hold each fact: the start
 -- or the latest model change (profile) and mode change (grants), the todos the latest
--- replacement or checkpoint set, the message or failure its last turn stands on, and
--- what ended its work since its latest request.
+-- replacement or checkpoint set, the message holding the latest host event it was given,
+-- the message or failure its last turn stands on, and what ended its work since its
+-- latest request.
 CREATE TABLE agent_state (
   agent INTEGER PRIMARY KEY REFERENCES agent(id),
   profiled INTEGER NOT NULL REFERENCES entry(seq),
   granted INTEGER NOT NULL REFERENCES entry(seq),
   todos INTEGER REFERENCES entry(seq),
   checkpoint INTEGER REFERENCES compaction(entry),
+  host_events INTEGER REFERENCES message_commit(entry),
   request INTEGER REFERENCES model_request(entry),
   -- Its newest history is input its model has yet to answer.
   awaiting INTEGER NOT NULL CHECK (awaiting IN (0,1)),

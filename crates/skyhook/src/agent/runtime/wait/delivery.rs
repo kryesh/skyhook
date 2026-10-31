@@ -1,10 +1,21 @@
-//! Snapshot and present durable child messages and job notifications.
+//! Snapshot and present durable child messages, job notifications and host events.
 use super::SessionRuntime;
 use crate::{
-    job::{JobError, JobView, Notification},
-    session::{JobEvent, Message, MessageSeq, UserPart},
+    job::{CancellationToken, JobError, Notification},
+    session::{HostCursor, HostEvent, JobEvent, Message, MessageSeq, UserPart},
     tool::diagnostic::DiagnosticViewer,
 };
+
+/// Where a delivery is made, which decides whether it presents the host's events.
+#[derive(Clone, Copy)]
+pub(in crate::agent::runtime) enum Boundary<'a> {
+    /// A request is about to be made anyway: the host's events join it, read under
+    /// the turn's cancellation.
+    Request(&'a CancellationToken),
+    /// Delivery that may start or continue work: job events alone, so the host's
+    /// events never do.
+    Jobs,
+}
 
 impl SessionRuntime {
     /// Commit the owner's pending events as its next message, after its
@@ -16,9 +27,18 @@ impl SessionRuntime {
         agent: &crate::identity::AgentId,
         viewer: impl Into<DiagnosticViewer<'a>> + Copy,
         preceding: &[crate::session::SessionEvent],
+        boundary: Boundary<'_>,
     ) -> Result<Option<MessageSeq>, crate::agent::runtime::HarnessError> {
         loop {
-            let pending = self.jobs.pending_delivery(agent).await?;
+            let mut pending = self.jobs.pending_delivery(agent).await?;
+            if let Boundary::Request(cancellation) = boundary {
+                let since = self
+                    .store
+                    .read(|state| state.agent_states.host_cursor(agent));
+                if let Some(event) = self.host_events(agent, since, cancellation).await? {
+                    pending.with_host(since, event);
+                }
+            }
             let Some(content) = self.job_event_content(&pending, viewer.into()).await else {
                 return Ok(None);
             };
@@ -26,6 +46,26 @@ impl SessionRuntime {
             match pending.commit(preceding.to_vec(), message).await {
                 Err(JobError::Stale) => {}
                 committed => return Ok(Some(committed?)),
+            }
+        }
+    }
+
+    /// What the host has for `agent` after `since`, read unless `cancellation` ends it first.
+    async fn host_events(
+        &self,
+        agent: &crate::identity::AgentId,
+        since: Option<HostCursor>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<HostEvent>, crate::agent::runtime::HarnessError> {
+        let (Some(host), Some(extension)) = (&self.harness.host_state, self.store.extension())
+        else {
+            return Ok(None);
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(crate::agent::runtime::HarnessError::Interrupted),
+            events = host.events(extension, agent, since) => {
+                events.map_err(crate::agent::runtime::HarnessError::HostEvents)
             }
         }
     }
@@ -52,17 +92,10 @@ impl SessionRuntime {
                 )
                 .await
                 .map(crate::job::PresentedOutput::into_job_view);
-            events.push(JobEvent::Job(Box::new(view.unwrap_or_else(|error| {
-                JobView {
-                    id: Some(job.id),
-                    state: Some(job.state.presented()),
-                    result: None,
-                    error: Some(error.diagnostic().render_for(viewer)),
-                    meta: None,
-                    presentation: None,
-                }
-            }))));
+            let view = view.unwrap_or_else(|error| job.unpresentable_view(viewer, &error));
+            events.push(JobEvent::Job(Box::new(view)));
         }
+        events.extend(pending.host().cloned().map(JobEvent::Host));
         (!events.is_empty()).then_some(UserPart::JobEvents { events })
     }
 }
@@ -70,9 +103,13 @@ impl SessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
-    use crate::agent::runtime::tests::{count, found, pending, until_pending};
+    use crate::agent::runtime::tests::{
+        Requests, count, found, pending, scripted_provider, shutdown_session, until_pending,
+    };
     use crate::agent::runtime::*;
     use crate::job::{JobSpec, JobState};
+    use crate::session::{HostCursor, HostEvent};
+    use serde_json::Value;
 
     /// Every runtime job-event envelope of the request, as its parsed entries.
     /// `agent_messages`/`events` flatten across envelopes; batching claims need the
@@ -1112,7 +1149,7 @@ mod tests {
         let held = crate::session::tests::hold_connection(&runtime.store);
         tokio::pin!(competing);
         assert!(futures_util::poll!(competing.as_mut()).is_pending());
-        let deliver = runtime.deliver_events(owner, &runtime.capabilities, &[]);
+        let deliver = runtime.deliver_events(owner, &runtime.capabilities, &[], Boundary::Jobs);
         tokio::pin!(deliver);
         assert!(futures_util::poll!(deliver.as_mut()).is_pending());
         drop(held);
@@ -1148,11 +1185,11 @@ mod tests {
         let (content, read) = pending_content(&session).await;
         assert!(serde_json::to_string(&content).unwrap().contains(text));
         let result = crate::tool::ToolOutput::new(json!("result"));
-        let outcome = crate::job::JobOutcome::Completed(result);
+        let outcome = crate::job::JobOutcome::Completed(result.into());
         jobs.finish(job, outcome).await.unwrap();
         let stale = read.commit(Vec::new(), Message::User(vec![content])).await;
         assert!(matches!(stale, Err(crate::job::JobError::Stale)));
-        let delivered = runtime.deliver_events(owner, &runtime.capabilities, &[]);
+        let delivered = runtime.deliver_events(owner, &runtime.capabilities, &[], Boundary::Jobs);
         let sequence = bounded(delivered)
             .await
             .unwrap()
@@ -1185,6 +1222,7 @@ mod tests {
             .map(|event| match event {
                 JobEvent::Message(reply) => reply.text.clone(),
                 JobEvent::Job(view) => format!("{:?}", (view.id, view.state)),
+                JobEvent::Host(host) => format!("{:?}", host.through),
             })
             .collect()
     }
@@ -1268,6 +1306,206 @@ mod tests {
         let expected = completion.map(|job| json!(job.get()));
         assert_eq!(completions, expected.into_iter().collect::<Vec<_>>());
         bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// A host whose log is `entries`, giving an agent every entry past its cursor as one
+    /// event; each read is recorded with the cursor it was asked from, then waits until
+    /// the log is `open`.
+    struct Log {
+        entries: std::sync::Mutex<Vec<i64>>,
+        reads: tokio::sync::watch::Sender<Vec<Option<HostCursor>>>,
+        open: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Log {
+        fn new(entries: &[i64], open: bool) -> Arc<Self> {
+            Arc::new(Self {
+                entries: std::sync::Mutex::new(entries.to_vec()),
+                reads: tokio::sync::watch::Sender::new(Vec::new()),
+                open: tokio::sync::watch::Sender::new(open),
+            })
+        }
+
+        fn push(&self, entry: i64) {
+            self.entries.lock().unwrap().push(entry);
+        }
+
+        fn reads(&self) -> Vec<Option<HostCursor>> {
+            self.reads.borrow().clone()
+        }
+    }
+
+    impl crate::agent::HostState for Log {
+        fn state<'a>(
+            &'a self,
+            _: &'a crate::session::ExtensionDb,
+            _: &'a AgentId,
+        ) -> crate::agent::HostStateFuture<'a> {
+            Box::pin(std::future::ready(None))
+        }
+
+        fn events<'a>(
+            &'a self,
+            _: &'a crate::session::ExtensionDb,
+            _: &'a AgentId,
+            since: Option<HostCursor>,
+        ) -> crate::agent::HostEventsFuture<'a> {
+            Box::pin(async move {
+                self.reads.send_modify(|reads| reads.push(since));
+                (self.open.subscribe().wait_for(|open| *open).await).unwrap();
+                let entries = self.entries.lock().unwrap();
+                let after: Vec<i64> = (entries.iter().copied())
+                    .filter(|entry| since.is_none_or(|since| *entry > since.get()))
+                    .collect();
+                let view = json!({ "entries": after });
+                let Some(last) = after.last() else {
+                    return Ok(None);
+                };
+                Ok(Some(HostEvent {
+                    through: at(*last),
+                    view: view.as_object().unwrap().clone().try_into().unwrap(),
+                }))
+            })
+        }
+    }
+
+    fn at(position: i64) -> HostCursor {
+        HostCursor::try_from(position).unwrap()
+    }
+
+    /// A harness keeping host tables, answered by `provider`, whose host is `log`.
+    fn hosted(root: &Path, provider: Arc<Script>, log: &Arc<Log>) -> HarnessBuilder {
+        let builder = crate::agent::runtime::tests::test_builder(
+            root,
+            &root.join("sessions"),
+            provider,
+            false,
+        );
+        (builder.session_extension(Some(crate::session::tests::TABLES))).host_state(log.clone())
+    }
+
+    /// The entries of each host event the request presents.
+    fn host_entries(request: &ModelRequest) -> Vec<Value> {
+        (envelopes(request).into_iter().flatten())
+            .filter(|event| event["kind"] == "host")
+            .map(|event| event["entries"].clone())
+            .collect()
+    }
+
+    /// The host is read only as a request is about to be made, and what it has joins that
+    /// request once. A host event alone wakes no `wait`, keeps no answered invocation open
+    /// and starts no turn: it rides the next request that happens anyway.
+    #[tokio::test]
+    async fn a_host_event_rides_the_next_request_once_and_starts_nothing() {
+        let steps = [
+            response(vec![call("hold", "wait", json!({"timeout":1}))]),
+            response(vec![answer()]),
+            response(vec![answer()]),
+            response(vec![answer()]),
+        ];
+        let tracking = Script::new(
+            steps.into_iter().map(|step| Step::new(step).gated()),
+            &Default::default(),
+        );
+        let log = Log::new(&[1], true);
+        let root = tempfile::tempdir().unwrap();
+        let harness = hosted(root.path(), tracking.clone(), &log);
+        let session = ephemeral_session(&harness.build().await.unwrap()).await;
+        let turn = spawn_prompt(&session, "start");
+        assert_eq!(host_entries(&tracking.request(0).await), [json!([1])]);
+        log.push(2);
+        tracking.release(0);
+        time_out(&session, &session.root, 1, 1).await;
+        let after_wait = tracking.request(1).await;
+        assert_reason(&after_wait, "hold", "timeout");
+        assert_eq!(host_entries(&after_wait), [json!([1]), json!([2])]);
+        log.push(3);
+        tracking.release(1);
+        assert_eq!(bounded(turn).await.unwrap().unwrap(), "done");
+        assert!(!tracking.requested_from(2));
+        let next = spawn_prompt(&session, "next");
+        let request = tracking.pass(2).await;
+        assert_eq!(host_entries(&request), [json!([1]), json!([2]), json!([3])]);
+        bounded(next).await.unwrap().unwrap();
+        let cursors = [None, Some(1), Some(2)].map(|position| position.map(at));
+        assert_eq!(log.reads(), cursors);
+        session.shutdown().await.unwrap();
+    }
+
+    /// The cursor commits with the event it delivers: a retried request and a reopened
+    /// session read past it, so nothing is given twice, at the top of its range too.
+    #[tokio::test]
+    async fn the_host_cursor_survives_retry_and_reopen() {
+        use crate::agent::runtime::tests::answer;
+        let requests = Default::default();
+        let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
+        let steps = [
+            Step::fail(failure),
+            Step::new(answer("recovered")),
+            Step::new(answer("reopened")),
+        ];
+        let log = Log::new(&[i64::MAX - 1], true);
+        let root = tempfile::tempdir().unwrap();
+        let script = Script::new(steps, &requests);
+        let harness = hosted(root.path(), script, &log).build().await.unwrap();
+        let session = harness.new_session().await.unwrap();
+        let id = session.id();
+        bounded(session.prompt("fails")).await.unwrap_err();
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "recovered");
+        shutdown_session(session).await;
+        log.push(i64::MAX);
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert_eq!(bounded(resumed.prompt("again")).await.unwrap(), "reopened");
+        shutdown_session(resumed).await;
+        let cursor = Some(at(i64::MAX - 1));
+        assert_eq!(log.reads(), [None, cursor, cursor]);
+        let delivered: Vec<_> = (requests.lock().unwrap().iter())
+            .map(|served| host_entries(served))
+            .collect();
+        let (first, second) = (json!([i64::MAX - 1]), json!([i64::MAX]));
+        assert_eq!(
+            delivered,
+            [
+                vec![first.clone()],
+                vec![first.clone()],
+                vec![first, second]
+            ]
+        );
+    }
+
+    /// An interrupt while the host is read drops the read: nothing commits, and the next
+    /// request is given the event from the same cursor.
+    #[tokio::test]
+    async fn an_interrupt_during_the_host_read_commits_nothing() {
+        let requests: Requests = Default::default();
+        let steps = [crate::agent::runtime::tests::answer("delivered")];
+        let log = Log::new(&[1], false);
+        let root = tempfile::tempdir().unwrap();
+        let script = scripted_provider(&requests, steps);
+        let harness = hosted(root.path(), script, &log).build().await.unwrap();
+        let session = ephemeral_session(&harness).await;
+        let interrupt = async {
+            let mut reads = log.reads.subscribe();
+            bounded(reads.wait_for(|reads| !reads.is_empty()))
+                .await
+                .unwrap();
+            session.interrupt().await
+        };
+        let (held, interrupted) = tokio::join!(bounded(session.prompt("held")), interrupt);
+        held.unwrap_err();
+        assert_eq!(interrupted, 1);
+        assert!(requests.lock().unwrap().is_empty());
+        let root = session.root_agent();
+        let cursor = |session: &SessionHandle| {
+            (session.runtime.store).read(|state| state.agent_states.host_cursor(root))
+        };
+        assert_eq!(cursor(&session), None);
+        log.open.send_replace(true);
+        assert_eq!(bounded(session.prompt("again")).await.unwrap(), "delivered");
+        assert_eq!(host_entries(&requests.lock().unwrap()[0]), [json!([1])]);
+        assert_eq!(log.reads(), [None, None]);
+        assert_eq!(cursor(&session), Some(at(1)));
         session.shutdown().await.unwrap();
     }
 }

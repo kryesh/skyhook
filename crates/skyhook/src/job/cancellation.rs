@@ -297,7 +297,7 @@ mod tests {
             output.streams = streams;
             let outcome = match error {
                 Some(error) => error.context(context.clone()).with_result(output).into(),
-                None => JobOutcome::Completed(output),
+                None => JobOutcome::Completed(output.into()),
             };
             jobs.finish(id, outcome).await.unwrap();
             let mut expected = jobs.snapshot(id).await.unwrap();

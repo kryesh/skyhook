@@ -1,7 +1,7 @@
-//! What the orchestrator's scheduler starts next: the ready queue entries in pipeline
-//! order, leaving out what is running, what was tried enough, what running work holds back,
-//! later-stage work an earlier-stage unit holds back and the tests it may not start yet, a
-//! page at a time. Questions and follow-ups come with the ready units sharing a record with
+//! What the orchestrator's scheduler starts next: the offered queue entries in pipeline
+//! order, leaving out what is running, what running work holds back, later-stage work a ready
+//! earlier-stage premise or flaw holds back, and the tests it may not start yet, a page at a
+//! time. Premises and flaws come with the ready entries of their phase sharing a node with
 //! them, which go to one agent.
 
 use std::collections::BTreeSet;
@@ -11,19 +11,9 @@ use serde::{Deserialize, Serialize};
 use skyhook::{
     Bounded,
     db::{Db, params},
-    identity::JobId,
 };
 
 use super::*;
-
-/// Work tried enough on one basis; the same subject on another basis is new work.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Attempt {
-    pub subject: WorkSubject,
-    #[serde(default)]
-    pub basis: Option<Basis>,
-}
 
 /// Where a page of startable work continues: after key `after` of `phase`'s queue.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
@@ -33,7 +23,7 @@ pub struct Cursor {
     pub after: i64,
 }
 
-/// An entry to start now, with the ready units its agent takes too.
+/// An entry to start now, with the ready entries its agent takes too.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Startable {
     pub phase: Phase,
@@ -52,7 +42,7 @@ pub struct Startables {
     pub held: bool,
 }
 
-/// The tests the scheduler may start now; the rest of the poc and poc_pending work waits.
+/// The tests the scheduler may start now; the rest wait.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Tests {
@@ -62,147 +52,97 @@ pub struct Tests {
     /// Candidates the user approved a test of, under the launch's `ask` policy.
     #[serde(default)]
     pub approved: Vec<CandidateId>,
-    /// Candidates whose pending test may start again.
+    /// Pending tests whose blocker the user resolved: each admits only the resumption of the
+    /// pending test it names, while that test is its candidate's latest.
     #[serde(default)]
-    pub unblocked: Vec<CandidateId>,
+    pub unblocked: Vec<TestId>,
 }
 
 impl Tests {
-    /// Whether `entry`'s test may start under `policy`, slots aside; None for other work.
+    /// Whether `entry`'s test may start under `policy`, slots aside; none for other work.
     fn admits(&self, policy: PocPolicy, phase: Phase, entry: &QueueEntry) -> Option<bool> {
-        let WorkSubject::Candidate(candidate) = entry.subject else {
-            return None;
-        };
-        match phase {
-            Phase::Poc => Some(policy == PocPolicy::Yes || self.approved.contains(&candidate)),
-            Phase::PocPending => Some(self.unblocked.contains(&candidate)),
-            _ => None,
-        }
+        (phase == Phase::Test).then(|| match entry.pending {
+            Some(pending) => self.unblocked.contains(&pending),
+            None => policy == PocPolicy::Yes || self.approved.contains(&CandidateId(entry.node.0)),
+        })
     }
 }
 
-/// The ids of the units naming a record of the lists `?1`-`?5`, as [`named`] binds them:
-/// each kind is matched where it is stored, so every branch reads an index. A filter on
-/// `unit_about` reaches every arm of the view, scanning those that cannot match.
-macro_rules! naming {
-    () => {
-        "SELECT id FROM plan_unit WHERE flaw IN (SELECT value FROM json_each(?1)) UNION ALL \
-         SELECT id FROM plan_unit WHERE candidate IN (SELECT value FROM json_each(?2)) UNION ALL \
-         SELECT unit FROM unit_invariant WHERE guarantee IN (SELECT value FROM json_each(?3)) \
-         UNION ALL SELECT unit FROM unit_invariant WHERE premise IN (SELECT value FROM \
-         json_each(?4)) UNION ALL SELECT k.unit FROM json_each(?5) j JOIN contract c ON \
-         c.component=j.value->>0 AND c.function=j.value->>1 JOIN unit_check k ON k.contract=c.id"
-    };
-}
-
-/// Unit `u` is one of the kinds `?6` lists, open and ready.
-macro_rules! ready_of {
-    () => {
-        concat!(
-            "u.kind IN (SELECT value FROM json_each(?6)) AND ",
-            queues::open_unit!("u"),
-            " AND ",
-            queues::unit_ready!()
-        )
-    };
-}
-
-/// Records as the five lists [`naming`] matches each kind of by its own columns.
-fn named<'a>(records: impl IntoIterator<Item = &'a About>) -> Result<Vec<libsql::Value>> {
-    let (mut flaws, mut candidates, mut guarantees, mut premises, mut functions) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for record in records {
-        match record {
-            About::Flaw(id) => flaws.push(id.0),
-            About::Candidate(id) => candidates.push(id.0),
-            About::Guarantee(id) => guarantees.push(id.0),
-            About::Premise(id) => premises.push(id.0),
-            About::Function {
-                component,
-                function,
-            } => functions.push((component.0, function)),
-        }
-    }
-    Ok(params![
-        json_list(&flaws)?,
-        json_list(&candidates)?,
-        json_list(&guarantees)?,
-        json_list(&premises)?,
-        json_list(&functions)?
-    ])
-}
-
-/// Work that holds other work back: what is running or about to start.
+/// Work that holds other work back: what is running or about to start. Bundled work and the
+/// work sharing a node with it hold each other.
 struct Work {
-    subject: WorkSubject,
-    about: Vec<About>,
+    node: NodeId,
+    bundled: bool,
+    about: Vec<NodeId>,
 }
 
 impl Work {
-    fn of(entry: &QueueEntry) -> Self {
+    fn of(phase: Phase, entry: &QueueEntry) -> Self {
         Self {
-            subject: entry.subject,
+            node: entry.node,
+            bundled: phase.bundled(),
             about: entry.about.clone(),
         }
     }
 
-    /// Running work holds the units it touches, and running units the work touching them.
-    fn holds(&self, entry: &QueueEntry) -> bool {
-        let unit = |subject| matches!(subject, WorkSubject::Unit(_));
-        self.subject == entry.subject
-            || ((unit(self.subject) || unit(entry.subject))
+    /// Live tasks' subjects, and nodes the scheduler launched work on, each merged one as the
+    /// node it was merged into, which count as bundled work when a bundled phase works their
+    /// kind.
+    fn running(db: &Db, live: &[(Phase, NodeId)], launched: &[NodeId]) -> Result<Vec<Self>> {
+        let launched = rows(
+            db,
+            "SELECT coalesce(n.merged_into,n.id) FROM json_each(?1) j JOIN node n ON n.id=j.value \
+             ORDER BY j.key",
+            params![json_list(launched)?],
+            |row| Ok(NodeId(row.get(0)?)),
+        )?;
+        let nodes: Vec<NodeId> = (live.iter().map(|(_, node)| *node))
+            .chain(launched.iter().copied())
+            .collect();
+        let about = queues::about(db, &nodes)?;
+        let work = |node: NodeId, phase: Option<Phase>| {
+            let (bundled, about) = match about.get(&node) {
+                Some((kind, about)) => {
+                    let bundled = match phase {
+                        Some(phase) => phase.bundled(),
+                        None => (Phase::ALL.iter())
+                            .any(|phase| phase.bundled() && phase.subject() == *kind),
+                    };
+                    (bundled, about.clone())
+                }
+                None => (false, Vec::new()),
+            };
+            Self {
+                node,
+                bundled,
+                about,
+            }
+        };
+        Ok((live.iter())
+            .map(|(phase, node)| work(*node, Some(*phase)))
+            .chain(launched.iter().map(|node| work(*node, None)))
+            .collect())
+    }
+
+    fn holds(&self, phase: Phase, entry: &QueueEntry) -> bool {
+        self.node == entry.node
+            || ((self.bundled || phase.bundled())
                 && self.about.iter().any(|about| entry.about.contains(about)))
     }
 }
 
-/// The unit phases of `phases` as a JSON list of their unit kinds.
-fn kinds(phases: impl Iterator<Item = Phase>) -> Result<String> {
-    json_list(&phases.filter_map(Phase::unit).collect::<Vec<_>>())
-}
-
 impl Store {
-    /// Live root workflows whose latest scheduling page held tests but offered no work,
-    /// while the session has no active child agents. Read from the journal on every root request:
-    /// job completion does not change the research generation. The scheduling call identifies
-    /// the workflow without relying on a script's name or source, even beside a polling script.
-    pub(crate) fn waiting_workflows(&self) -> Result<Vec<JobId>> {
-        self.read(|db| {
-            rows(
-                db,
-                "SELECT script.id FROM job script JOIN entry e ON e.seq=script.created \
-                 JOIN agent owner ON owner.id=e.agent AND owner.parent IS NULL \
-                 JOIN job_status ss ON ss.job=script.id JOIN job_state sk ON sk.name=ss.state \
-                 JOIN job query ON query.id=(SELECT q.id FROM job q LEFT JOIN tool_call t \
-                     ON t.item=q.origin_call WHERE q.parent=script.id AND q.tool='research_query' \
-                     AND json_extract(coalesce(q.arguments,t.arguments),'$.action')='startable' \
-                     ORDER BY q.id DESC LIMIT 1) \
-                 JOIN job_status qs ON qs.job=query.id AND qs.state='completed' \
-                 JOIN job_output o ON o.job=query.id AND o.generation=(SELECT max(generation) \
-                     FROM job_output WHERE job=query.id) \
-                 WHERE script.role='script' AND NOT sk.terminal \
-                 AND json_extract(o.result,'$.held')=1 AND json_array_length(o.result,'$.items')=0 \
-                 AND json_extract(o.result,'$.next') IS NULL \
-                 AND NOT EXISTS (SELECT 1 FROM job child JOIN job_status cs ON cs.job=child.id \
-                     JOIN job_state ck ON ck.name=cs.state WHERE child.role='agent' AND NOT ck.terminal) \
-                 ORDER BY script.id",
-                Vec::new(),
-                |row| {
-                    JobId::new(row.get::<i64>(0)? as u64)
-                        .map_err(|_| corrupt("invalid workflow job id").into())
-                },
-            )
-        })
-    }
-
-    /// The next page of work that can start now, earliest pipeline stage first:
-    /// none of `running`, no attempt in `spent`, nothing running work holds back or a
-    /// ready earlier-stage unit touches, and no test beyond what `tests` admits. A question
-    /// or follow-up carries every other such unit sharing a record with it, and what one page
-    /// starts holds back the rest of it as running work would. Reading reserves nothing.
+    /// The next page of work that can start now, earliest pipeline stage first: what the
+    /// queues offer (no live task, not exhausted, counting `spent` work exhausted while owed at
+    /// its basis), none of `running` (launched, perhaps not yet begun) or held back by it or by
+    /// live tasks, nothing a ready earlier-stage bundled entry touches, and no test beyond what
+    /// `tests` admits. A premise or flaw carries every other such entry of its phase sharing a
+    /// node with it, and what one page starts holds back the rest of it as running work would.
+    /// Reading reserves nothing.
     pub fn startable(
         &self,
-        running: &[WorkSubject],
-        spent: &[Attempt],
+        running: &[NodeId],
+        spent: &[SpentWork],
         tests: &Tests,
         after: Option<Cursor>,
         limit: Bounded<1, 1000>,
@@ -213,21 +153,21 @@ impl Store {
             Some(cursor) => phases.iter().position(|phase| *phase == cursor.phase),
             None => Some(0),
         };
-        let bundled = kinds((phases.iter().copied()).filter(|phase| phase.bundled()))?;
         let wanted = u64::from(limit) as usize;
+        let spent = &queues::Spent::of(spent)?;
         self.read(|db| {
             let policy = runs::run(db)?.poc;
-            let mut busy = running_work(db, running)?;
+            let mut busy = Work::running(db, &queues::live_subjects(db)?, running)?;
             let (mut items, mut slots, mut held) = (Vec::new(), tests.slots, false);
             for &phase in phases.iter().skip(first.unwrap_or(phases.len())) {
-                let tested = matches!(phase, Phase::Poc | Phase::PocPending);
+                let tested = phase == Phase::Test;
                 // With no slot left, the first test passed over shows that tests wait.
                 if tested && slots == 0 && held {
                     continue;
                 }
-                let earlier = kinds(
-                    (phases.iter().copied()).filter(|earlier| earlier.stage() < phase.stage()),
-                )?;
+                let earlier: Vec<Phase> = (phases.iter().copied())
+                    .filter(|earlier| earlier.bundled() && earlier.stage() < phase.stage())
+                    .collect();
                 // Tests are paged whole: the ones `tests` admits may lie far behind the rest.
                 let mut page = Page::new(
                     after
@@ -240,13 +180,11 @@ impl Store {
                     },
                 );
                 'phase: loop {
-                    let listing = queues::page(db, phase, page)?;
-                    let touched = touched(db, &listing, &earlier)?;
+                    let listing = queues::page(db, phase, page, spent)?;
+                    let touched = touched(db, &listing, &earlier, spent)?;
                     for entry in listing.items {
                         let key = entry.key();
-                        if spent.iter().any(|attempt| {
-                            attempt.subject == entry.subject && attempt.basis == entry.basis
-                        }) || busy.iter().any(|work| work.holds(&entry))
+                        if busy.iter().any(|work| work.holds(phase, &entry))
                             || entry.about.iter().any(|about| touched.contains(about))
                         {
                             continue;
@@ -262,11 +200,11 @@ impl Store {
                             slots -= 1;
                         }
                         let bundle = match phase.bundled() {
-                            true => partners(db, &entry, &bundled, &busy, spent)?,
+                            true => partners(db, phase, &entry, &busy, spent)?,
                             false => Vec::new(),
                         };
-                        busy.push(Work::of(&entry));
-                        busy.extend(bundle.iter().map(Work::of));
+                        busy.push(Work::of(phase, &entry));
+                        busy.extend(bundle.iter().map(|entry| Work::of(phase, entry)));
                         items.push(Startable {
                             phase,
                             entry,
@@ -295,104 +233,47 @@ impl Store {
     }
 }
 
-/// What each running subject is about.
-fn running_work(db: &Db, running: &[WorkSubject]) -> Result<Vec<Work>> {
-    let (mut units, mut candidates, mut contracts) = (Vec::new(), Vec::new(), Vec::new());
-    for subject in running {
-        match subject {
-            WorkSubject::Unit(id) => units.push(*id),
-            WorkSubject::Candidate(id) => candidates.push(*id),
-            WorkSubject::Contract(id) => contracts.push(*id),
-            WorkSubject::Root(_) => {}
+/// The nodes of `listing`'s entries that a ready entry of the `earlier` bundled phases is
+/// about.
+fn touched(
+    db: &Db,
+    listing: &Listing<QueueEntry>,
+    earlier: &[Phase],
+    spent: &queues::Spent,
+) -> Result<BTreeSet<NodeId>> {
+    let nodes: BTreeSet<NodeId> = (listing.items.iter())
+        .flat_map(|entry| entry.about.iter().copied())
+        .collect();
+    let mut touched = BTreeSet::new();
+    if nodes.is_empty() {
+        return Ok(touched);
+    }
+    let named: Vec<NodeId> = nodes.iter().copied().collect();
+    for &phase in earlier {
+        for entry in queues::naming(db, phase, &named, spent)? {
+            touched.extend(
+                entry
+                    .about
+                    .into_iter()
+                    .filter(|about| nodes.contains(about)),
+            );
         }
     }
-    let (mut units, mut candidates, mut contracts) = (
-        queues::units_about(db, &units)?,
-        queues::candidates_about(db, &candidates)?,
-        queues::contracts_about(db, &contracts)?,
-    );
-    Ok((running.iter())
-        .map(|subject| Work {
-            subject: *subject,
-            about: match subject {
-                WorkSubject::Unit(id) => units.remove(id),
-                WorkSubject::Candidate(id) => candidates.remove(id),
-                WorkSubject::Contract(id) => contracts.remove(id),
-                WorkSubject::Root(_) => None,
-            }
-            .unwrap_or_default(),
-        })
-        .collect())
+    Ok(touched)
 }
 
-/// The records of `listing`'s entries that a ready unit of the `earlier` kinds names.
-fn touched(db: &Db, listing: &Listing<QueueEntry>, earlier: &str) -> Result<BTreeSet<About>> {
-    let records: Vec<&About> = (listing.items.iter())
-        .flat_map(|entry| &entry.about)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if records.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let mut params = named(records.iter().copied())?;
-    params.extend(params![earlier]);
-    Ok(rows(
-        db,
-        concat!(
-            "SELECT flaw,candidate,guarantee,premise,component,function FROM unit_about WHERE \
-             unit IN (SELECT u.id FROM plan_unit u WHERE u.id IN (",
-            naming!(),
-            ") AND ",
-            ready_of!(),
-            ")"
-        ),
-        params,
-        |row| queues::about_columns(row, 0),
-    )?
-    .into_iter()
-    .filter(|about| records.contains(&about))
-    .collect())
-}
-
-/// The other ready units of the `bundled` kinds sharing a record with `head` that nothing
-/// holds back, in id order.
+/// The other ready entries of `phase` sharing a node with `head` that nothing holds back, in
+/// key order.
 fn partners(
     db: &Db,
+    phase: Phase,
     head: &QueueEntry,
-    bundled: &str,
     busy: &[Work],
-    spent: &[Attempt],
+    spent: &queues::Spent,
 ) -> Result<Vec<QueueEntry>> {
-    let mut params = named(&head.about)?;
-    params.extend(params![bundled]);
-    let found = rows(
-        db,
-        concat!(
-            "SELECT u.id,u.question FROM plan_unit u WHERE u.id IN (",
-            naming!(),
-            ") AND ",
-            ready_of!(),
-            " ORDER BY u.id"
-        ),
-        params,
-        |row| Ok((UnitId(row.get(0)?), row.get::<String>(1)?)),
-    )?;
-    let ids: Vec<UnitId> = found.iter().map(|(id, _)| *id).collect();
-    let mut about = queues::units_about(db, &ids)?;
-    Ok((found.into_iter())
-        .map(|(id, title)| QueueEntry {
-            subject: WorkSubject::Unit(id),
-            title,
-            basis: None,
-            about: about.remove(&id).unwrap_or_default(),
-        })
-        .filter(|unit| {
-            unit.subject != head.subject
-                && !busy.iter().any(|work| work.holds(unit))
-                && !spent
-                    .iter()
-                    .any(|attempt| attempt.subject == unit.subject && attempt.basis.is_none())
+    Ok((queues::naming(db, phase, &head.about, spent)?.into_iter())
+        .filter(|entry| {
+            entry.node != head.node && !busy.iter().any(|work| work.holds(phase, entry))
         })
         .collect())
 }
@@ -400,122 +281,143 @@ fn partners(
 #[cfg(test)]
 mod tests {
     use super::{
-        super::tests::{fixture, follow_up_unit, shortlisted, text},
+        super::{
+            queues::tests::queued,
+            tests::{
+                HIGH, assess, begun, fixture, premise, scenario, sweep, test, text, validated,
+                verdict,
+            },
+        },
         *,
     };
 
-    /// The latest scheduling page, not names or a count of scripts, identifies a held
-    /// workflow; live child agents and pages offering work or unheld tests do not.
-    #[test]
-    fn waiting_workflows_follow_the_latest_page_and_live_jobs() {
-        use super::super::tests::{child_agent, end_job, journal_job};
-        use skyhook::job::JobState;
-
-        let (_session, store, _) = fixture();
-        let held = Startables {
-            items: Vec::new(),
-            next: None,
-            held: true,
-        };
-        let workflow = journal_job(&store, None, None);
-        let _poller = journal_job(&store, None, None);
-        assert!(store.waiting_workflows().unwrap().is_empty());
-        journal_job(&store, Some(workflow), Some(&held));
-        assert_eq!(store.waiting_workflows().unwrap(), [workflow]);
-
-        for state in [JobState::Queued, JobState::Running, JobState::WaitingInput] {
-            let (_, child) = child_agent(&store, state);
-            assert!(store.waiting_workflows().unwrap().is_empty());
-            end_job(&store, child);
-            assert_eq!(store.waiting_workflows().unwrap(), [workflow]);
-        }
-
-        let ready = Startables {
-            items: vec![Startable {
-                phase: Phase::Poc,
-                entry: QueueEntry {
-                    subject: WorkSubject::Candidate(CandidateId(1)),
-                    title: "ready".into(),
-                    basis: None,
-                    about: Vec::new(),
-                },
-                bundle: Vec::new(),
-            }],
-            next: None,
-            held: true,
-        };
-        journal_job(&store, Some(workflow), Some(&ready));
-        assert!(store.waiting_workflows().unwrap().is_empty());
-        let unheld = Startables {
-            items: Vec::new(),
-            next: None,
-            held: false,
-        };
-        journal_job(&store, Some(workflow), Some(&unheld));
-        assert!(store.waiting_workflows().unwrap().is_empty());
-        let paged = Startables {
-            items: Vec::new(),
-            next: Some(Cursor {
-                phase: Phase::Poc,
-                after: 1,
-            }),
-            held: true,
-        };
-        journal_job(&store, Some(workflow), Some(&paged));
-        assert!(store.waiting_workflows().unwrap().is_empty());
-        journal_job(&store, Some(workflow), Some(&held));
-        assert_eq!(store.waiting_workflows().unwrap(), [workflow]);
-
-        end_job(&store, workflow.get() as i64);
-        assert!(store.waiting_workflows().unwrap().is_empty());
-    }
-
-    /// Ready work starts in pipeline order: follow-ups sharing a candidate go to one agent
-    /// and hold back that candidate's review, and running or spent work starts nothing.
+    /// Ready work starts in pipeline order: settling looks at premises sharing a flaw go to one
+    /// agent and hold back the review of the candidate resting on them, running work holds
+    /// what shares a node with it, and decided premises release the review.
     #[test]
     fn startable_work_follows_the_pipeline_and_its_holds() {
-        let (_directory, store, actor) = fixture();
-        let candidate = shortlisted(&store, &actor);
-        let units = [(); 2].map(|()| {
-            let work = follow_up_unit(Some(candidate), None, Vec::new());
-            store.plan_unit(&actor, &work).unwrap()
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        sweep(&store, scenario.path);
+        assess(&store, &actor, scenario.candidate, HIGH);
+        let premises = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let links = premises.map(|premise| Link::FlawPremise {
+            flaw: scenario.flaw,
+            premise,
         });
-        let [first, second] = units.map(WorkSubject::Unit);
-        let started = |running: &[WorkSubject], spent: &[Attempt]| {
+        store.link(&actor, &links).unwrap();
+        let [first, second] = premises.map(NodeId::from);
+        let started = |running: &[NodeId]| {
             let page = store
-                .startable(
-                    running,
-                    spent,
-                    &Tests::default(),
-                    None,
-                    Bounded::new::<10>(),
-                )
+                .startable(running, &[], &Tests::default(), None, Bounded::new::<10>())
                 .unwrap();
             (page.items.into_iter())
                 .map(|item| {
-                    let bundle = item.bundle.iter().map(|unit| unit.subject).collect();
-                    (item.entry.subject, bundle)
+                    let bundle = item.bundle.iter().map(|entry| entry.node).collect();
+                    (item.entry.node, bundle)
                 })
-                .collect::<Vec<(WorkSubject, Vec<WorkSubject>)>>()
+                .collect::<Vec<(NodeId, Vec<NodeId>)>>()
         };
-        assert_eq!(started(&[], &[]), [(first, vec![second])]);
-        assert!(started(&[first], &[]).is_empty());
-        let spent = [first, second].map(|subject| Attempt {
-            subject,
-            basis: None,
-        });
-        assert!(
-            started(&[], &spent).is_empty(),
-            "ready units hold the review"
-        );
-        for unit in units {
-            store
-                .record_outcome(&actor, unit, Outcome::Blocked, &text("stub"), &[])
-                .unwrap();
+        assert_eq!(started(&[]), [(first, vec![second])]);
+        assert!(started(&[first]).is_empty());
+        for premise in premises {
+            let holds = StatusChange::Premise(premise, PremiseStatus::Holds);
+            store.set_status(&actor, holds, &text("checked")).unwrap();
         }
+        assert_eq!(started(&[]), [(scenario.candidate.into(), Vec::new())]);
+    }
+
+    /// A live task's subject merged away is still worked, as the node it was merged into: that
+    /// node is not offered, and it holds back what shares a node with it.
+    #[test]
+    fn a_live_task_works_the_node_its_subject_was_merged_into() {
+        let (_session, store, actor) = fixture();
+        let (merged, kept) = (scenario(&store, &actor, "a"), scenario(&store, &actor, "b"));
+        for path in [merged.path, kept.path] {
+            sweep(&store, path);
+        }
+        let code = premise(&store, &actor, PremiseScope::Code);
+        let link = Link::FlawPremise {
+            flaw: kept.flaw,
+            premise: code,
+        };
+        store.link(&actor, &[link]).unwrap();
+        begun(&store, &Begin::Assess(vec![merged.candidate]));
+        let merge = Merge::Candidate {
+            candidate: merged.candidate,
+            into: kept.candidate,
+            note: text("same"),
+        };
+        store.merge(&actor, &merge).unwrap();
+        assert!(queued(&store, Phase::Assess).is_empty());
+        let page =
+            (store.startable(&[], &[], &Tests::default(), None, Bounded::new::<10>())).unwrap();
         assert_eq!(
-            started(&[], &spent),
-            [(WorkSubject::Candidate(candidate), Vec::new())]
+            (page.items.iter())
+                .map(|item| (item.phase, item.entry.node))
+                .collect::<Vec<_>>(),
+            [(Phase::Chain, merged.flaw.into())],
+            "only the flaw the merge left unchained starts"
         );
+    }
+
+    /// Work the scheduler launched on a node merged away before its child began holds the node
+    /// it was merged into.
+    #[test]
+    fn launched_work_holds_the_node_its_subject_was_merged_into() {
+        let (_session, store, actor) = fixture();
+        let (merged, kept) = (scenario(&store, &actor, "a"), scenario(&store, &actor, "b"));
+        for path in [merged.path, kept.path] {
+            sweep(&store, path);
+        }
+        let merge = Merge::Candidate {
+            candidate: merged.candidate,
+            into: kept.candidate,
+            note: text("same"),
+        };
+        store.merge(&actor, &merge).unwrap();
+        let running = [merged.candidate.into()];
+        let page = (store.startable(&running, &[], &Tests::default(), None, Bounded::new::<10>()))
+            .unwrap();
+        assert!(
+            !(page.items.iter()).any(|item| item.entry.node == kept.candidate.into()),
+            "{:?}",
+            page.items
+        );
+    }
+
+    /// An unblock admits only the pending test it names: a resumption that records another
+    /// pending test waits for an answer of its own. A pending test of a replaced verdict is not
+    /// resumed: the new verdict owes a test of its own.
+    #[test]
+    fn an_unblock_admits_only_the_pending_test_it_answers() {
+        let (_session, store, actor) = fixture();
+        let scenario = validated(&store, &actor, "decoder");
+        sweep(&store, scenario.path);
+        let id = scenario.candidate;
+        let first = test(&store, &actor, id, TestResult::Pending);
+        let started = |unblocked: &[TestId]| {
+            let tests = Tests {
+                slots: 1,
+                approved: Vec::new(),
+                unblocked: unblocked.to_vec(),
+            };
+            let page = (store.startable(&[], &[], &tests, None, Bounded::new::<10>())).unwrap();
+            let entries = page
+                .items
+                .iter()
+                .map(|item| (item.entry.node, item.entry.pending));
+            (entries.collect::<Vec<_>>(), page.held)
+        };
+        assert_eq!(started(&[]), (Vec::new(), true));
+        assert_eq!(started(&[first]), (vec![(id.into(), Some(first))], false));
+        test(&store, &actor, id, TestResult::Pending);
+        assert_eq!(
+            started(&[first]),
+            (Vec::new(), true),
+            "a new pending test waits"
+        );
+        verdict(&store, &actor, id, Verdict::Validated);
+        assert_eq!(started(&[]), (vec![(id.into(), None)], false));
     }
 }

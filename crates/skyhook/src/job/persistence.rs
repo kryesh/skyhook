@@ -158,7 +158,7 @@ impl Jobs {
         &self,
         agent: &AgentId,
         origin: &ModelCallOrigin,
-    ) -> Option<JobId> {
+    ) -> Option<JobEnvelope> {
         self.iter()
             .find(|(_, entry)| {
                 entry.agent == *agent
@@ -166,7 +166,7 @@ impl Jobs {
                     && entry.child().is_some()
                     && entry.origin.as_ref() == Some(origin)
             })
-            .map(|(id, _)| id)
+            .map(|(id, entry)| entry.envelope(id))
     }
 
     /// What reopening settles for the foreground jobs nothing holds any more,
@@ -480,7 +480,9 @@ impl JobManager {
         let running: Vec<_> = self.facts(|jobs| jobs.running().map(running).collect());
         let (mut interrupted, mut outputs) = (Vec::new(), Vec::new());
         for (run @ Run(job, _), agent) in running {
-            let (change, output) = self.finished(run, ToolError::interrupted().into()).await?;
+            let (change, output) = self
+                .finished(run, ToolError::interrupted().into(), Vec::new())
+                .await?;
             interrupted.push((agent, change.event(job)));
             outputs.extend(output);
         }
@@ -813,7 +815,7 @@ mod tests {
                     .with_images(vec![outcome_image()])
             };
             let outcome = match case {
-                0 => JobOutcome::Completed(result()),
+                0 => JobOutcome::Completed(result().into()),
                 1 => ToolError::failed("failed").into(),
                 2 => ToolError::failed("partial failure")
                     .with_result(result())
@@ -903,7 +905,7 @@ mod tests {
         let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, mut input| {
             Box::pin(async move {
                 input.recv().await;
-                Ok(ToolOutput::new(serde_json::json!({"reply": "done"})))
+                Ok(crate::job::Completion::Reply("done".to_owned()))
             })
         });
         jobs.test_resume_with(job, handler);
@@ -960,8 +962,7 @@ mod tests {
             let job = lease.id();
             let reply = commit(&jobs, &child, job, "progress").await;
             if finished {
-                jobs.test_finish(job, serde_json::json!({"reply": "done"}))
-                    .await;
+                jobs.test_reply(job, "done").await;
             }
             assert!(!jobs.has_pending(&owner));
             abandon(lease);

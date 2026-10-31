@@ -67,6 +67,22 @@ impl Message {
         }
     }
 
+    /// How far the host event it delivers went, if it delivers one.
+    pub(crate) fn host_cursor(&self) -> Option<HostCursor> {
+        let Self::User(parts) = self else {
+            return None;
+        };
+        (parts.iter())
+            .flat_map(|part| match part {
+                UserPart::JobEvents { events } => events.as_slice(),
+                _ => &[],
+            })
+            .find_map(|event| match event {
+                JobEvent::Host(host) => Some(host.through),
+                _ => None,
+            })
+    }
+
     /// Drop replay bound to the conversation that produced it, keeping display text. Changing
     /// that conversation, as compaction or a mode switch does, invalidates such replay; other
     /// replay is kept.
@@ -170,12 +186,14 @@ impl StateJobKind {
     }
 }
 
-/// One entry of a job-events notification: a child's reply or a job's presented view.
+/// One entry of a job-events notification: a child's reply, a job's presented view, or
+/// what the host had for the agent as its request was made.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobEvent {
     Message(AgentMessage),
     Job(Box<JobView>),
+    Host(HostEvent),
 }
 
 impl JobEvent {
@@ -184,13 +202,101 @@ impl JobEvent {
         match self {
             Self::Message(message) => Some(message.id),
             Self::Job(view) => view.id,
+            Self::Host(_) => None,
         }
+    }
+}
+
+/// A position in a host's own ordered log, opaque to the harness: a non-negative integer, which
+/// the journal stores as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(try_from = "i64", into = "i64")]
+pub struct HostCursor(i64);
+
+impl HostCursor {
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("host cursor {0} is negative")]
+pub struct NegativeCursor(pub i64);
+
+impl TryFrom<i64> for HostCursor {
+    type Error = NegativeCursor;
+
+    fn try_from(position: i64) -> Result<Self, NegativeCursor> {
+        match position {
+            0.. => Ok(Self(position)),
+            _ => Err(NegativeCursor(position)),
+        }
+    }
+}
+
+impl From<HostCursor> for i64 {
+    fn from(cursor: HostCursor) -> Self {
+        cursor.0
+    }
+}
+
+/// What a host's log held for an agent through `through`, as the document the model reads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HostEvent {
+    pub through: HostCursor,
+    pub view: HostView,
+}
+
+/// A host event's document: an object sent beside `"kind": "host"`, so it names no `kind` of
+/// its own.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
+pub struct HostView(serde_json::Map<String, serde_json::Value>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a host event's view names a `kind` of its own")]
+pub struct ViewNamesKind;
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for HostView {
+    type Error = ViewNamesKind;
+
+    fn try_from(view: serde_json::Map<String, serde_json::Value>) -> Result<Self, ViewNamesKind> {
+        match view.contains_key("kind") {
+            true => Err(ViewNamesKind),
+            false => Ok(Self(view)),
+        }
+    }
+}
+
+impl HostView {
+    pub fn fields(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+}
+
+/// An event as the model reads it: a host event is its view alone.
+struct Sent<'a>(&'a JobEvent);
+
+impl Serialize for Sent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let JobEvent::Host(host) = self.0 else {
+            return self.0.serialize(serializer);
+        };
+        let fields = host.view.fields();
+        let mut map = serializer.serialize_map(Some(fields.len() + 1))?;
+        map.serialize_entry("kind", "host")?;
+        for (key, value) in fields {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
 }
 
 /// The text a job-events notification sends the model.
 fn job_events_text(events: &[JobEvent]) -> String {
-    let json = serde_json::to_string(events).expect("job events serialize");
+    let sent: Vec<_> = events.iter().map(Sent).collect();
+    let json = serde_json::to_string(&sent).expect("job events serialize");
     format!("<skyhook_job_events>\n{json}\n</skyhook_job_events>")
 }
 
@@ -280,6 +386,18 @@ fn cell(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::TodoStatus;
+
+    /// A host event's view naming its own `kind` is refused where it is built and where the
+    /// journal reads it back.
+    #[test]
+    fn a_host_view_names_no_kind() {
+        let named = serde_json::json!({"kind": "notice", "changes": []});
+        let serde_json::Value::Object(map) = named.clone() else {
+            panic!("an object")
+        };
+        assert_eq!(HostView::try_from(map), Err(ViewNamesKind));
+        assert!(serde_json::from_value::<HostView>(named).is_err());
+    }
 
     fn location() -> ExecutionLocation {
         ExecutionLocation::root("/project".into())

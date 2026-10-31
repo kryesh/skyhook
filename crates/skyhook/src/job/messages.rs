@@ -336,8 +336,7 @@ mod tests {
         let (_root, manager, owner, child, job) = child_job(false).await;
         let texts = many_replies(&manager, (&owner, &child), job).await;
         answer(&manager, &child, job, "final").await;
-        let result = serde_json::json!({"reply": "final"});
-        manager.test_finish(job, result).await;
+        manager.test_reply(job, "final").await;
         let present = async |args| {
             let view = manager.present_output(args, &Default::default()).await;
             serde_json::from_value::<JobView>(view.unwrap()).unwrap()

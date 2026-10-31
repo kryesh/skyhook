@@ -99,8 +99,7 @@ impl Spliced {
                         .captures
                         .get(field)
                         .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
-                    let mut source =
-                        reader::CaptureReader::new(saved.output.reads.clone(), capture.id);
+                    let mut source = reader::CaptureReader::new(saved.reads.clone(), capture.id);
                     let extent = source.extent()?;
                     let mut prefix = Vec::new();
                     // One byte more, so that a cut sees what follows it.

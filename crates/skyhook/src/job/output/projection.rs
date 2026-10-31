@@ -445,7 +445,7 @@ mod tests {
         let output = ToolOutput::new(value);
         let outcome = match error {
             Some(message) => ToolError::failed(message).with_result(output).into(),
-            None => JobOutcome::Completed(output),
+            None => JobOutcome::Completed(output.into()),
         };
         manager.finish(id, outcome).await.unwrap();
         (root, manager, id)

@@ -1,31 +1,17 @@
-use std::{fmt, num::NonZeroU16, str::FromStr};
+use std::{fmt, num::NonZeroU16};
 
+use libsql::Value;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_with::{DeserializeFromStr, SerializeDisplay};
-use skyhook::{
-    Bounded, Prose,
-    identity::{decode_hex, write_hex},
-    named_enum, string_newtype,
-};
+use skyhook::{Bounded, db::Sql, named_enum, string_newtype};
 
-use super::{Error, Record};
-use crate::cvss::Severity;
+use super::Error;
+pub use super::artifacts::Inadmissible;
+pub use crate::cvss::Severity;
 
-/// The id of a record a lookup can miss, with the table that holds it.
-pub(crate) trait RecordId: Copy + Into<i64> {
-    const RECORD: Record;
-    /// Selects the row with id `?1`.
-    const KNOWN: &'static str;
-}
-
-/// A positive SQLite row id; one naming a [`Record`] carries it and its table.
+/// A positive SQLite row id.
 macro_rules! ids {
-    ($($name:ident $(: $record:ident in $table:literal)?),* $(,)?) => {$(
-        $(impl RecordId for $name {
-            const RECORD: Record = Record::$record;
-            const KNOWN: &'static str = concat!("SELECT 1 FROM ", $table, " WHERE id=?1");
-        })?
+    ($($name:ident),* $(,)?) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "i64", into = "i64")]
         pub struct $name(pub(super) i64);
@@ -44,41 +30,165 @@ macro_rules! ids {
             }
         }
         impl From<$name> for i64 { fn from(value: $name) -> Self { value.0 } }
+        impl Sql for $name { fn sql(self) -> Value { Value::Integer(self.0) } }
         impl fmt::Display for $name { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
     )*};
 }
 
 ids!(
-    ScopeId: Scope in "scope",
-    DeploymentId: Deployment in "deployment",
-    PrincipalId: Principal in "principal",
-    SourceId: Source in "source",
-    LocationId,
-    ComponentId: Component in "component",
-    PathId: Path in "path",
-    UnitId: Unit in "plan_unit",
-    OutcomeId,
-    GuaranteeId: Guarantee in "guarantee",
-    RetrySiteId,
-    DeferredId: Deferred in "deferred",
-    FlawId: Flaw in "flaw",
-    RefutationId: Refutation in "flaw_refutation",
-    RelationId,
-    UnderminingId,
-    PremiseId: Premise in "premise",
-    ResolutionId,
-    EvidenceId,
-    ExposureId: Exposure in "exposure",
-    CandidateId: Candidate in "candidate",
-    AssessmentId: Assessment in "assessment",
-    ValidationId: Validation in "validation",
-    PocId: Poc in "poc",
-    PocStartId,
+    NodeId,
+    ComponentId,
+    PathId,
+    SourceId,
+    PremiseId,
+    FlawId,
+    CandidateId,
+    FindingId,
+    EventId,
+    TaskId,
+    TestId,
     EnvironmentId,
-    ContractId: Contract in "contract",
-    FindingId: Finding in "finding",
-    EventId
+    EvidenceId,
+    LocationId,
 );
+
+/// The id of a node of one kind.
+pub trait KindId: Copy + Into<NodeId> + Into<i64> {
+    const KIND: NodeKind;
+    fn of(node: NodeId) -> Self;
+}
+
+macro_rules! kind_ids {
+    ($($name:ident: $kind:ident),* $(,)?) => {$(
+        impl KindId for $name {
+            const KIND: NodeKind = NodeKind::$kind;
+            fn of(node: NodeId) -> Self { Self(node.0) }
+        }
+        impl From<$name> for NodeId { fn from(value: $name) -> Self { Self(value.0) } }
+    )*};
+}
+
+kind_ids!(
+    ComponentId: Component,
+    PathId: Path,
+    SourceId: Source,
+    PremiseId: Premise,
+    FlawId: Flaw,
+    CandidateId: Candidate,
+    FindingId: Finding,
+);
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum NodeKind {
+        Component = "component", Path = "path", Source = "source", Premise = "premise",
+        Flaw = "flaw", Candidate = "candidate", Finding = "finding",
+    }
+}
+
+named_enum! {
+    /// Work the scheduler derives: paths owing a sweep, premises a settling look, flaws a
+    /// chain, candidates an assessment, a review or a test, and root flaws a report.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum Phase {
+        Sweep = "sweep", Settle = "settle", Chain = "chain", Assess = "assess",
+        Review = "review", Test = "test", Report = "report",
+    }
+}
+impl Phase {
+    /// The kind of node its work is about.
+    pub const fn subject(self) -> NodeKind {
+        match self {
+            Self::Sweep => NodeKind::Path,
+            Self::Settle => NodeKind::Premise,
+            Self::Chain | Self::Report => NodeKind::Flaw,
+            Self::Assess | Self::Review | Self::Test => NodeKind::Candidate,
+        }
+    }
+
+    /// Its place in the pipeline: each stage's work feeds the next, so work at an earlier
+    /// stage goes first and holds back the later work it touches.
+    pub const fn stage(self) -> u8 {
+        match self {
+            Self::Sweep => 0,
+            Self::Settle | Self::Chain => 1,
+            Self::Assess => 2,
+            Self::Review => 3,
+            Self::Test => 4,
+            Self::Report => 5,
+        }
+    }
+
+    /// Whether its entries go out in bundles: one agent takes every ready one sharing a node.
+    pub const fn bundled(self) -> bool {
+        matches!(self, Self::Settle | Self::Chain)
+    }
+}
+
+named_enum! {
+    /// Who can drive a source's input.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum Trust { Untrusted = "untrusted", Authenticated = "authenticated", Local = "local", Privileged = "privileged" }
+}
+named_enum! {
+    /// Whether a premise is about the code, or a deployment condition only the user answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum PremiseScope { Code = "code", Deployment = "deployment" }
+}
+// The statuses a request sets are inlined, so that its `status` takes any of them.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum PremiseStatus { Holds = "holds", Fails = "fails", Undecided = "undecided" }
+}
+// A flaw is suspected until it is refuted, or contained: real, with no observable consequence
+// found.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum FlawStatus { Suspected = "suspected", Contained = "contained", Refuted = "refuted" }
+}
+// Whether a path's sweep is done. Any agent marks it.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum PathStatus { Swept = "swept", Unswept = "unswept" }
+}
+named_enum! {
+    /// A review's conclusion; its rationale is the verdict event's note.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum Verdict { Validated = "validated", Disproved = "disproved", Excluded = "excluded", Unproven = "unproven" }
+}
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum EventKind {
+        Created = "created", Edited = "edited", Linked = "linked", Unlinked = "unlinked",
+        Evidence = "evidence", Merged = "merged", Status = "status", Assessed = "assessed",
+        Verdict = "verdict", Tested = "tested", Environment = "environment", Began = "began",
+        Reported = "reported",
+    }
+}
+named_enum! {
+    /// A candidate's standing, derived from its results and what they rest on. A noted
+    /// candidate is validated, and another of its root group stands validated and demonstrated
+    /// at its severity or above.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum Status {
+        Identified = "identified", BelowThreshold = "below_threshold", Shortlisted = "shortlisted",
+        Validated = "validated", Noted = "noted", Disproved = "disproved", Excluded = "excluded",
+        Unproven = "unproven", Merged = "merged",
+    }
+}
+named_enum! {
+    /// How far an assessed candidate is established, lowest first: conjectured while a premise
+    /// of its chain is undecided or contradicts it, confirmed by a standing positive verdict and
+    /// demonstrated by a confirmed test of an uncontradicted chain.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum ConfidenceTier {
+        Conjectured = "conjectured", Established = "established", Confirmed = "confirmed",
+        Demonstrated = "demonstrated",
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextError {
@@ -102,164 +212,13 @@ string_newtype! {
     }, schema = schemars::json_schema!({"type": "string", "pattern": "\\S", "maxLength": 1_000_000});
 }
 
-impl From<Prose> for Text {
-    fn from(prose: Prose) -> Self {
-        Self(String::from(prose))
-    }
-}
-
 named_enum! {
-    /// Work a pool reads: open plan units of one kind, candidates owing an assessment, a
-    /// review or a test, or root flaws owing a report. `poc_pending` lists candidates whose
-    /// test waits on the user or the environment.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Phase {
-        Sweep = "sweep", PathReview = "path_review", Question = "question", FollowUp = "follow_up",
-        Check = "check", Assess = "assess", Review = "review", Poc = "poc",
-        PocPending = "poc_pending", Report = "report",
-    }
-}
-impl Phase {
-    /// The plan units a unit phase pools; none for candidate work.
-    pub const fn unit(self) -> Option<UnitKind> {
-        match self {
-            Self::Sweep => Some(UnitKind::Sweep),
-            Self::PathReview => Some(UnitKind::PathReview),
-            Self::Question => Some(UnitKind::Question),
-            Self::FollowUp => Some(UnitKind::FollowUp),
-            Self::Check
-            | Self::Assess
-            | Self::Review
-            | Self::Poc
-            | Self::PocPending
-            | Self::Report => None,
-        }
-    }
-
-    /// Whether its units go out in bundles: one agent takes every ready one sharing a record.
-    pub const fn bundled(self) -> bool {
-        matches!(self, Self::Question | Self::FollowUp)
-    }
-
-    /// Its place in the pipeline: each stage's work feeds the next, so work at an earlier
-    /// stage goes first and holds back the later work it touches.
-    pub const fn stage(self) -> u8 {
-        match self {
-            Self::Sweep => 0,
-            Self::PathReview => 1,
-            Self::Question | Self::FollowUp | Self::Check => 2,
-            Self::Assess => 3,
-            Self::Review => 4,
-            Self::Poc | Self::PocPending => 5,
-            Self::Report => 6,
-        }
-    }
-}
-named_enum! {
-    /// What a plan unit covers: one component swept once, one path reviewed against its
-    /// components' contracts, a question, or a follow-up any agent added.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum UnitKind {
-        Sweep = "sweep", PathReview = "path_review", Question = "question", FollowUp = "follow_up",
-    }
-}
-named_enum! {
-    /// How a plan unit ended; the note carries its limitation.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Outcome { Completed = "completed", Blocked = "blocked", Inconclusive = "inconclusive", Deferred = "deferred" }
-}
-named_enum! {
-    /// Derived from a candidate's records at its current revision; only a merge is stored.
-    /// A noted candidate holds a positive verdict that owes no test of its own: in each root
-    /// group it belongs to, a demonstrated scenario stands at its severity or above. What its
-    /// tests showed is its [`ConfidenceTier`].
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Status {
-        Identified = "identified", BelowThreshold = "below_threshold", Shortlisted = "shortlisted",
-        Validated = "validated", Noted = "noted", Rejected = "rejected", Unproven = "unproven",
-        Reported = "reported", Merged = "merged",
-    }
-}
-named_enum! {
-    /// How well the evidence supports an assessment's premises, kept apart from severity:
-    /// the tiers an assessor picks.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Confidence { Conjectured = "conjectured", Plausible = "plausible", Established = "established" }
-}
-named_enum! {
-    /// A candidate's confidence, lowest first: its assessment's tier, then `confirmed` while
-    /// a positive verdict stands and `demonstrated` once a test of it is confirmed.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum ConfidenceTier {
-        Conjectured = "conjectured", Plausible = "plausible", Established = "established",
-        Confirmed = "confirmed", Demonstrated = "demonstrated",
-    }
-}
-named_enum! {
-    /// What a location contributes: the triggering input, the operation that misbehaves,
-    /// a guard on the way, state the scenario depends on, or context.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum EvidenceRole { Trigger = "trigger", Operation = "operation", Guard = "guard", State = "state", Context = "context" }
-}
-named_enum! {
-    /// Whether evidence supports or contradicts the record it is about. Contradicting
-    /// evidence is a material change: it reopens every decision about the record.
+    /// Whether evidence supports or contradicts the node it is about. Contradicting evidence
+    /// changes the node, reopening the work that read it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum Stance { Supports = "supports", Contradicts = "contradicts", Context = "context" }
 }
-named_enum! {
-    /// How two flaws relate: one root cause, one's effect supplying the other's
-    /// precondition, or mutually exclusive outcomes of one trigger.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum RelationKind { SameRootCause = "same_root_cause", Enables = "enables", AlternativeOutcome = "alternative_outcome" }
-}
-impl RelationKind {
-    /// Whether `a` and `b` name the same relation in either order.
-    pub(super) const fn symmetric(self) -> bool {
-        !matches!(self, Self::Enables)
-    }
-}
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-    pub enum VerdictKind { Validated = "validated", Rejected = "rejected", Unproven = "unproven" }
-}
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-    pub enum RejectionReason { Disproved = "disproved", PolicyExcluded = "policy_excluded" }
-}
-/// A review's conclusion. A rejection says why: the mechanism was disproved, or the scope's
-/// policy keeps a real finding out of reports, citing the current scope's deployment fact
-/// excluding it, if any. A duplicate is merged instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Verdict {
-    Validated,
-    Unproven,
-    Disproved,
-    PolicyExcluded {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        deployment: Option<DeploymentId>,
-    },
-}
-impl Verdict {
-    /// The stored verdict and the reason a rejection carries.
-    pub(super) const fn stored(self) -> (VerdictKind, Option<RejectionReason>) {
-        match self {
-            Self::Validated => (VerdictKind::Validated, None),
-            Self::Unproven => (VerdictKind::Unproven, None),
-            Self::Disproved => (VerdictKind::Rejected, Some(RejectionReason::Disproved)),
-            Self::PolicyExcluded { .. } => {
-                (VerdictKind::Rejected, Some(RejectionReason::PolicyExcluded))
-            }
-        }
-    }
-    pub(super) const fn deployment(self) -> Option<DeploymentId> {
-        match self {
-            Self::PolicyExcluded { deployment } => deployment,
-            Self::Validated | Self::Unproven | Self::Disproved => None,
-        }
-    }
-}
+
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     /// A test's outcome. Confirmed and failed (a run that did not demonstrate the scenario,
@@ -267,187 +226,35 @@ named_enum! {
     /// environment and settles nothing; unavailable (the environment cannot run a real
     /// demonstration) and declined (the user turned this one down) settle the test as
     /// untested.
-    pub enum PocResult {
+    pub enum TestResult {
         Confirmed = "confirmed", Failed = "failed", Pending = "pending",
         Unavailable = "unavailable", Declined = "declined",
     }
 }
+
 named_enum! {
-    /// What a PoC artifact shows: the attack, the control run on the same build that
+    /// What a test artifact shows: the attack, the control run on the same build that
     /// the guard holds or the benign input is handled, an observation, the harness, or notes.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum ArtifactRole { Attack = "attack", Control = "control", Observation = "observation", Harness = "harness", Notes = "notes" }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PocArtifact {
+pub struct TestArtifact {
     /// Path relative to the run's artifacts directory; must be a regular file there.
     pub reference: ArtifactReference,
     pub role: ArtifactRole,
 }
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum EventKind {
-        Recorded = "recorded", Updated = "updated", Merged = "merged", Refuted = "refuted",
-        Resolved = "resolved", Assessed = "assessed", Validated = "validated",
-        PocStarted = "poc_started", PocRecorded = "poc_recorded",
-        EnvironmentRecorded = "environment_recorded",
-        Reported = "reported",
-    }
-}
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum SourceKind { Network = "network", Stdio = "stdio", File = "file", Env = "env", Ipc = "ipc", Argv = "argv", Other = "other" }
-}
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Trust { Unauthenticated = "unauthenticated", Authenticated = "authenticated", Local = "local", Privileged = "privileged" }
-}
-impl Trust {
-    /// Whether input from this trust level is attacker-influenced.
-    pub const fn untrusted(self) -> bool {
-        !matches!(self, Self::Privileged)
-    }
-}
-named_enum! {
-    /// What a guarantee or premise is about: the bound an operation stays within, that
-    /// repeated attempts progress or end, what a returned status means, how long an object
-    /// lives, who may act, or which state holds.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum InvariantKind {
-        Bounds = "bounds", Progress = "progress", StatusContract = "status_contract",
-        Lifetime = "lifetime", Authorization = "authorization", State = "state", Other = "other",
-    }
-}
-impl InvariantKind {
-    /// Whether a mistaken guarantee or premise of this kind on attacker input corrupts
-    /// memory, hangs, retries unsafely or leaves state a later step trusts.
-    pub const fn load_bearing(self) -> bool {
-        !matches!(self, Self::Authorization | Self::Other)
-    }
-}
-named_enum! {
-    /// Where a contract stands by its latest check (`contract_standing`).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum ContractState { Unsettled = "unsettled", Open = "open", Supported = "supported", Broken = "broken" }
-}
-named_enum! {
-    /// The instructions around a reproduction's steps.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    pub enum InstructionPart { Prerequisite = "prerequisite", Cleanup = "cleanup" }
-}
-named_enum! {
-    /// What a status asking its caller to retry or supply more input can mean at one site:
-    /// the input ran out, the input is invalid, or some other failure.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum RetryClass { InputExhausted = "input_exhausted", Invalid = "invalid", Other = "other" }
-}
-named_enum! {
-    /// What a flaw makes its code report for the wrong reason: a returned status, an error,
-    /// or state it leaves for others. Every consumer of that value inherits the flaw.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Misreport { Status = "status", Error = "error", State = "state" }
-}
-named_enum! {
-    /// What the operation a flaw lies in does.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum OperationKind {
-        MemoryWrite = "memory_write", MemoryRead = "memory_read", LifetimeRelease = "lifetime_release",
-        MemoryUse = "memory_use", Interpreter = "interpreter", FilesystemPath = "filesystem_path",
-        PrivilegedOperation = "privileged_operation", StateMutation = "state_mutation",
-        DataExposure = "data_exposure", ExternalRequest = "external_request", Redirect = "redirect",
-        Deserialize = "deserialize", CredentialUse = "credential_use",
-        ResourceConsumption = "resource_consumption", ControlFlow = "control_flow",
-        LogWrite = "log_write",
-    }
-}
-named_enum! {
-    /// What a security guard establishes before the operation it protects.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum GuardKind {
-        Authn = "authn", Authz = "authz", Ownership = "ownership", StatePrecondition = "state_precondition",
-        InputValidation = "input_validation", BoundsCheck = "bounds_check", LifetimeCheck = "lifetime_check",
-        Canonicalisation = "canonicalisation", Integrity = "integrity", RateLimit = "rate_limit",
-        Csrf = "csrf", Origin = "origin", ErrorHandling = "error_handling",
-    }
-}
-named_enum! {
-    /// How a required guard fails: it does not exist, a path avoids it, it checks the
-    /// wrong subject, it is too weak, or its subject can change before the operation.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum DeficiencyKind {
-        Missing = "missing", Bypassable = "bypassable", WrongSubject = "wrong_subject",
-        Insufficient = "insufficient", Stale = "stale",
-    }
-}
-named_enum! {
-    /// The security property a possible effect harms.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum Property { Confidentiality = "confidentiality", Integrity = "integrity", Availability = "availability" }
-}
-named_enum! {
-    /// How far review reached into a component: inspected once a completed sweep covered
-    /// every file, otherwise reached by some path, otherwise only mapped.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum ComponentCoverage { Mapped = "mapped", Reached = "reached", Inspected = "inspected" }
-}
 
 named_enum! {
-    /// Whether a path's review is checked: it reaches no recorded component, some flaw of
-    /// what it reaches still lacks its standing decision, or none does.
+    /// How an event bears on a node it names, weakest first: it only concerns it, it moves
+    /// the node's standing, or it changes the node itself.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum PathCoverage { Unreached = "unreached", Unchecked = "unchecked", Checked = "checked" }
+    pub enum EventEffect { Concerns = "concerns", Standing = "standing", Changed = "changed" }
 }
 
-named_enum! {
-    /// What a candidate's condition gates: the scenario, or one CVSS base metric.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-    pub enum GateKind { Scenario = "scenario", Metric = "metric" }
-}
-named_enum! {
-    /// What a deployment fact of the scope is about.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum DeploymentKind {
-        BuildFlag = "build_flag", Platform = "platform", HostBehaviour = "host_behaviour",
-        InputBound = "input_bound", Other = "other",
-    }
-}
-named_enum! {
-    /// Whether the deployment in scope admits a fact or excludes it, or has not answered it.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum DeploymentStance { Admitted = "admitted", Excluded = "excluded", Unanswered = "unanswered" }
-}
-named_enum! {
-    /// A row of the `verdict_refusal` view, as the refusal it reports.
-    #[derive(Clone, Copy)]
-    pub(super) parsed enum RefusalKind {
-        NoPath = "no_path", Refuted = "refuted", NoContribution = "no_contribution",
-        MetricAboveFloor = "metric_above_floor", OpenPremise = "open_premise",
-        FailedPremise = "failed_premise",
-    }
-}
-named_enum! {
-    /// How a premise is resolved ([`Resolution`]); one without a resolution is open.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-    pub enum ResolutionKind { Holds = "holds", Fails = "fails", Asked = "asked" }
-}
-named_enum! {
-    /// One path's decision about one flaw: it cannot drive it, it drives it without a
-    /// security consequence, or it contributes to a candidate.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum ExposureOutcome { Unreachable = "unreachable", NoConsequence = "no_consequence", Contributes = "contributes" }
-}
-named_enum! {
-    /// How a route step is known: read in the code, inferred from it, or assumed.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum RouteBasis { Inspected = "inspected", Inferred = "inferred", Assumed = "assumed" }
-}
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum CredentialReferenceKind { EnvironmentVariable = "environment_variable", SecretManager = "secret_manager" }
-}
-
-/// Maximum number of run-owned artifact references accepted by one PoC attempt.
+/// Maximum number of run-owned artifact references accepted by one test.
 pub const MAX_ARTIFACTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -481,75 +288,6 @@ string_newtype! {
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("endpoint requires HTTP(S) without credentials, query parameters or fragments")]
-pub struct InvalidEndpoint;
-
-string_newtype! {
-    /// An absolute HTTP(S) address without userinfo, query or fragment.
-    pub struct Endpoint(InvalidEndpoint) = |value| {
-        let uri: http::Uri = value.parse().map_err(|_| InvalidEndpoint)?;
-        if !matches!(uri.scheme_str(), Some("http" | "https"))
-            || uri.authority().is_none_or(|a| a.as_str().contains('@'))
-            || uri.query().is_some()
-            || value.contains('#')
-        {
-            return Err(InvalidEndpoint);
-        }
-        Ok(())
-    }, schema = schemars::json_schema!({
-        "type": "string",
-        "description": "An absolute HTTP(S) address without userinfo, query or fragment."
-    });
-}
-
-/// A full git object id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SerializeDisplay, DeserializeFromStr)]
-pub enum GitOid {
-    Sha1([u8; 20]),
-    Sha256([u8; 32]),
-}
-impl fmt::Display for GitOid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sha1(bytes) => write_hex(bytes, f),
-            Self::Sha256(bytes) => write_hex(bytes, f),
-        }
-    }
-}
-impl FromStr for GitOid {
-    type Err = Error;
-    fn from_str(value: &str) -> Result<Self, Error> {
-        decode_hex(value)
-            .map(Self::Sha1)
-            .or_else(|| decode_hex(value).map(Self::Sha256))
-            .ok_or(Error::GitOid)
-    }
-}
-
-named_enum! {
-    /// Whether the checkout had changes beyond its commit; unknown when Git could not say.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-    pub enum Tree { Clean = "clean", Dirty = "dirty", Unknown = "unknown" }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Revision {
-    pub commit: Option<GitOid>,
-    pub tree: Tree,
-}
-
-/// The commit, or `unavailable` outside a repository, and the tree's state.
-impl fmt::Display for Revision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.commit {
-            Some(commit) => write!(f, "{commit}")?,
-            None => f.write_str("unavailable")?,
-        }
-        write!(f, " tree={}", self.tree)
-    }
-}
-
 /// A keyset page: records after `after`, at most `limit` of them.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -561,7 +299,7 @@ impl Page {
     pub const fn new(after: i64, limit: Bounded<1, 1000>) -> Self {
         Self { after, limit }
     }
-    pub(super) fn limit(self) -> i64 {
+    pub(crate) fn limit(self) -> i64 {
         u64::from(self.limit) as i64
     }
 }
@@ -609,7 +347,7 @@ impl<T> IntoIterator for Listing<T> {
 }
 impl<T: Keyed> Listing<T> {
     /// A full page continues after its last key; a shorter one is the end.
-    pub(super) fn keyset(items: Vec<T>, page: Page) -> Self {
+    pub(crate) fn keyset(items: Vec<T>, page: Page) -> Self {
         let next_after = (items.len() as i64 == page.limit())
             .then(|| items.last().map(Keyed::key))
             .flatten();
@@ -621,34 +359,6 @@ impl<T: Keyed> Listing<T> {
 pub trait Keyed {
     fn key(&self) -> i64;
 }
-macro_rules! keyed {
-    ($($type:ty => $field:ident),* $(,)?) => {$(
-        impl Keyed for $type {
-            fn key(&self) -> i64 {
-                self.$field.get()
-            }
-        }
-    )*};
-}
-keyed!(
-    super::events::Event => id,
-    super::scope::Scope => id,
-    super::scope::Principal => id,
-    super::scope::Source => id,
-    super::components::Component => id,
-    super::components::Guarantee => id,
-    super::paths::Path => id,
-    super::plan::PlanUnit => id,
-    super::flaws::FlawSummary => id,
-    super::flaws::Relation => id,
-    super::flaws::Exposure => id,
-    super::candidates::CandidateSummary => id,
-    super::candidates::Assessment => id,
-    super::workflow::ValidationAttempt => id,
-    super::workflow::PocAttempt => id,
-    super::report::Finding => id,
-    super::environment::Environment => id,
-);
 
 named_enum! {
     /// Whether a launch demonstrates validated candidates against an authorized environment.
@@ -714,13 +424,8 @@ impl Location {
             function,
         })
     }
-    pub fn in_function(self, function: Text) -> FunctionLocation {
-        FunctionLocation(Self {
-            function: Some(function),
-            ..self
-        })
-    }
 }
+
 impl<F: Into<Option<Text>>> TryFrom<LocationInput<F>> for Location {
     type Error = Error;
     fn try_from(value: LocationInput<F>) -> Result<Self, Error> {
@@ -743,19 +448,8 @@ impl fmt::Display for Location {
     }
 }
 
-/// A file region in the function containing it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(try_from = "LocationInput<Text>")]
-pub struct FunctionLocation(Location);
-impl TryFrom<LocationInput<Text>> for FunctionLocation {
-    type Error = Error;
-    fn try_from(value: LocationInput<Text>) -> Result<Self, Error> {
-        Location::try_from(value).map(Self)
-    }
-}
-impl std::ops::Deref for FunctionLocation {
-    type Target = Location;
-    fn deref(&self) -> &Location {
-        &self.0
+impl Sql for &Text {
+    fn sql(self) -> Value {
+        Value::Text(self.as_str().to_owned())
     }
 }

@@ -59,8 +59,10 @@ pub use queue::{
 mod builder;
 mod dispatch;
 mod tools;
+pub(crate) use tools::Brief;
 mod wait;
 use dispatch::CreatedCall;
+use wait::Boundary;
 mod driver;
 mod lifecycle;
 mod recovery;

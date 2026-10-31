@@ -213,7 +213,9 @@ impl Dictionaries<'_> {
         values: &[T],
         flags: impl Fn(T) -> [bool; N],
     ) -> DbResult<()> {
-        self.columns(table, columns, values, |value| flags(value).map(i64::from))
+        self.columns(table, columns, values, |value| {
+            flags(value).map(|flag| Value::Integer(flag.into()))
+        })
     }
 
     /// `table` holds `values`, each with its position among them as its `rank`, so SQL
@@ -225,16 +227,19 @@ impl Dictionaries<'_> {
                 .position(|other| other.as_str() == value.as_str())
         };
         self.columns(table, ["rank"], values, |value| {
-            [rank(value).expect("ranks values it lists") as i64]
+            [Value::Integer(
+                rank(value).expect("ranks values it lists") as i64
+            )]
         })
     }
 
-    fn columns<T: NamedEnum, const N: usize>(
+    /// `table` holds `values`, each with its `cells`, one per column of `columns`.
+    pub fn columns<T: NamedEnum, const N: usize>(
         &self,
         table: &'static str,
         columns: [&str; N],
         values: &[T],
-        cells: impl Fn(T) -> [i64; N],
+        cells: impl Fn(T) -> [Value; N],
     ) -> DbResult<()> {
         let columns: String = columns.map(|column| format!(", {column}")).concat();
         let columns = format!("name{columns}");
@@ -249,7 +254,7 @@ impl Dictionaries<'_> {
             let statement = db.prepare(sql)?;
             for value in values {
                 let mut params = params![*value];
-                params.extend(expected[value.as_str()].map(Sql::sql));
+                params.extend(expected[value.as_str()].clone());
                 statement.execute(params)?;
             }
         }
@@ -265,7 +270,7 @@ impl Dictionaries<'_> {
                     return Err(DbError::Dictionary(table));
                 };
                 for (column, cell) in cells.into_iter().enumerate() {
-                    if row.get_value(column as i32 + 1)? != Value::Integer(cell) {
+                    if row.get_value(column as i32 + 1)? != cell {
                         return Err(DbError::Dictionary(table));
                     }
                 }

@@ -12,6 +12,7 @@ use crate::{
         diagnostic::{Effects, Operation, Subject},
     },
 };
+pub(super) use delivery::Boundary;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -419,7 +420,7 @@ pub(super) mod tests {
             ..JobSpec::test(owner.clone(), "wait-fixture")
         };
         let id = jobs.test_running(spec).await.into_test_id();
-        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"value":value})));
+        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"value":value})).into());
         jobs.finish(id, outcome).await.unwrap();
         id
     }

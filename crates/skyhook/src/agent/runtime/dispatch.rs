@@ -431,25 +431,17 @@ pub(super) fn unrun_results<'a>(
 /// The result of a foreground delegation a restart kept as the released job `job`:
 /// not a failure; the retained child resumes on continue or owner input and reports
 /// as a job event.
-pub(super) fn released_result(call_id: &str, name: &str, job: JobId) -> SessionEvent {
-    let view = crate::job::JobView {
-        id: Some(job),
-        state: Some(crate::job::JobState::Interrupted),
-        presentation: crate::job::Presentation {
-            notice: Some(crate::job::Notice::ChildReleased),
-            ..Default::default()
-        }
-        .into_option(),
-        result: None,
-        error: None,
-        meta: None,
-    };
-    let output = crate::tool::ToolOutput::new(view.into_value());
+pub(super) fn released_result(
+    call_id: &str,
+    name: &str,
+    job: &crate::job::JobEnvelope,
+) -> SessionEvent {
+    let view = job.released_view(crate::job::Release::Restarted);
     let result = ToolResult {
         call_id: call_id.into(),
         name: name.into(),
-        result: output.value,
-        images: output.images,
+        result: view.into_value(),
+        images: Vec::new(),
         is_error: false,
     };
     SessionEvent::MessageCommitted {

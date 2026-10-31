@@ -382,6 +382,16 @@ pub(crate) enum ViewKind {
     Inspection,
 }
 
+/// Why the model's own foreground call let go of its unfinished job.
+#[derive(Clone, Copy)]
+pub(crate) enum Release {
+    /// Its child asked, or a script's child did; the job runs on.
+    Asked,
+    /// A restart interrupted it while its child ran: the restart journals the
+    /// interrupt in the same commit as the release, so the job ends interrupted.
+    Restarted,
+}
+
 impl JobView {
     pub fn state(&self) -> JobState {
         self.state.unwrap_or(JobState::Completed)
@@ -471,18 +481,44 @@ impl JobEnvelope {
     }
 
     /// The model's own foreground call that let go of its unfinished job, which
-    /// reports through delivery from then on: a child that asked, or a script
-    /// whose child did, says so.
-    pub(crate) fn released_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
-        let notice = match self.role {
-            JobRole::Script => Some(Notice::ScriptChildAsked),
-            _ => (self.state == JobState::WaitingInput).then_some(Notice::ChildAsked),
+    /// reports through delivery from then on, as `release` leaves it: a child that
+    /// asked, or a script whose child did, says so. A release is not the job's
+    /// outcome, so it presents no failure.
+    pub(crate) fn released_view(&self, release: Release) -> JobView {
+        let (state, notice) = match release {
+            Release::Asked => {
+                let notice = match self.role {
+                    JobRole::Script => Some(Notice::ScriptChildAsked),
+                    _ => (self.state == JobState::WaitingInput).then_some(Notice::ChildAsked),
+                };
+                (self.state.presented(), notice)
+            }
+            Release::Restarted => (JobState::Interrupted, Some(Notice::ChildReleased)),
         };
-        let presentation = Presentation {
-            notice,
-            ..Presentation::default()
-        };
-        self.view(viewer.into(), ViewKind::Response, None, presentation)
+        JobView {
+            id: Some(self.id),
+            state: Some(state),
+            presentation: Presentation {
+                notice,
+                ..Presentation::default()
+            }
+            .into_option(),
+            ..JobView::default()
+        }
+    }
+
+    /// The job as a view that could not present its output shows it: why not.
+    pub(crate) fn unpresentable_view<'a>(
+        &self,
+        viewer: impl Into<DiagnosticViewer<'a>>,
+        error: &crate::tool::ToolError,
+    ) -> JobView {
+        JobView {
+            id: Some(self.id),
+            state: Some(self.state.presented()),
+            error: Some(error.diagnostic().render_for(viewer.into())),
+            ..JobView::default()
+        }
     }
 
     /// Background handles, listings and inspection always retain launch metadata.

@@ -30,13 +30,13 @@ use crate::{
 };
 
 /// A registration's admitted input with the hooks and handler that consume it.
-struct TypedInput<A, C, O> {
+struct TypedInput<A, C, O: OutputValue> {
     input: A,
     hooks: Arc<ArgumentHooks<A>>,
     invoke: Arc<dyn Fn(A) -> Invocation<C, O> + Send + Sync>,
 }
 
-impl<A: Send, C, O> AdmittedInput<C, O> for TypedInput<A, C, O> {
+impl<A: Send, C, O: OutputValue> AdmittedInput<C, O> for TypedInput<A, C, O> {
     fn paths(&mut self) -> Vec<PathArgument<'_>> {
         (self.hooks.paths.as_ref()).map_or_else(Vec::new, |paths| paths(&mut self.input))
     }
@@ -669,7 +669,9 @@ mod tests {
         let arguments = serde_json::json!({"content":"native evidence"});
         let arguments = arguments.as_object().unwrap();
         let admitted = tool.admit(arguments).unwrap().invoke();
-        let output = admitted.call(context).await.unwrap();
+        let crate::job::Completion::Output(output) = admitted.call(context).await.unwrap() else {
+            panic!("a product completes with its output");
+        };
         assert_eq!(output.value, serde_json::json!({}));
         assert_eq!(output.captures.len(), 1);
         assert!(output.captures[0].matches(job, "/result/content"));

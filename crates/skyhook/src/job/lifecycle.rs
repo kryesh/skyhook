@@ -102,36 +102,16 @@ impl JobManager {
         }
     }
 
-    /// Journal the change `change` makes of a job, refused, as `refused` reports
-    /// it, when the phase does not admit its step.
-    pub(super) async fn journal_change(
-        &self,
-        id: JobId,
-        change: impl FnOnce(&JobFacts) -> Result<JobChange, JobError> + Send + 'static,
-        refused: fn(Rejected, JobId) -> JobError,
-    ) -> Result<(), JobError> {
-        let changed = move |state: &CoreState| {
-            let entry = state.job(id)?;
-            let change = change(entry)?;
-            entry
-                .steps(change.step())
-                .map_err(|rejected| refused(rejected, id))?;
-            let journaled = vec![(entry.agent.clone(), change.event(id))];
-            Ok(Plan::new(journaled, move |state, _| {
-                asked(state, id, change)
-            }))
-        };
+    /// A lease's startup transition. Its stage guarantees the order, so the only
+    /// phase that refuses is a job finished underneath it.
+    pub(super) async fn advance(&self, id: JobId, state: JobTransition) -> Result<(), JobError> {
+        let change = JobChange::Advance(state);
+        let refused = |_, job| JobError::AlreadyTerminal(job);
+        let changed = move |state: &CoreState| journaled(state, id, change, refused);
         self.inner
             .store
             .commit_on([id], Command::Journal, changed)
             .await
-    }
-
-    /// A lease's startup transition. Its stage guarantees the order, so the only
-    /// phase that refuses is a job finished underneath it.
-    pub(super) async fn advance(&self, id: JobId, state: JobTransition) -> Result<(), JobError> {
-        let change = move |_: &JobFacts| Ok(JobChange::Advance(state));
-        (self.journal_change(id, change, |_, job| JobError::AlreadyTerminal(job))).await
     }
 
     /// Publish the outcome of invocation `run` as its completion owner, once no
@@ -186,14 +166,11 @@ impl JobManager {
                 let carried = replies.iter().map(|queued| queued.child_reply()).collect();
                 Some((sources(replies), carried))
             });
-            let (saved, attempt, again) = match saved.await? {
-                Some((saved, carried)) => {
-                    let attempt = outcome.clone().carrying(carried);
-                    (Some(saved), attempt, Some(outcome))
-                }
-                None => (None, outcome, None),
+            let (saved, attempt, carried, again) = match saved.await? {
+                Some((saved, carried)) => (Some(saved), outcome.clone(), carried, Some(outcome)),
+                None => (None, outcome, Vec::new(), None),
             };
-            let (finish, output) = self.finished(run, attempt).await?;
+            let (finish, output) = self.finished(run, attempt, carried).await?;
             let finished = move |state: &CoreState| {
                 let entry = state.jobs.get(id).ok_or(JobError::Unknown(id))?;
                 (entry.ends(run, end).then_some(())).ok_or(JobError::AlreadyTerminal(id))?;
@@ -227,17 +204,18 @@ impl JobManager {
 
     /// The change that ends invocation `run` with `outcome`, with the output it
     /// saves unless an earlier finish of the run saved one; refused unless that
-    /// invocation is current and its phase admits the end. The output is prepared
-    /// here, off the core.
+    /// invocation is current and its phase admits the end. A child's reply saves
+    /// `carried` before it. The output is prepared here, off the core.
     pub(super) async fn finished(
         &self,
         run: Run,
         outcome: JobOutcome,
+        carried: Vec<ChildReply>,
     ) -> Result<(JobChange, Option<Prepared>), JobError> {
         let Run(id, invocation) = run;
         let end = outcome.end();
         let (output, mut diagnostic) = match outcome {
-            JobOutcome::Completed(output) => (Some(output), None),
+            JobOutcome::Completed(completion) => (Some(completion.saved(carried)), None),
             JobOutcome::NoResult => (None, None),
             JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
         };
@@ -305,6 +283,24 @@ pub(crate) fn woken(state: &mut CoreState, id: JobId) {
     if let Some(owner) = pending.map(|entry| entry.agent.clone()) {
         state.agents.wake(&owner);
     }
+}
+
+/// The plan journaling `change` of job `id`, refused, as `refused` reports it,
+/// when the phase does not admit its step.
+pub(super) fn journaled(
+    state: &CoreState,
+    id: JobId,
+    change: JobChange,
+    refused: fn(Rejected, JobId) -> JobError,
+) -> Result<Plan<()>, JobError> {
+    let entry = state.job(id)?;
+    entry
+        .steps(change.step())
+        .map_err(|rejected| refused(rejected, id))?;
+    let journaled = vec![(entry.agent.clone(), change.event(id))];
+    Ok(Plan::new(journaled, move |state, _| {
+        asked(state, id, change)
+    }))
 }
 
 /// Apply what the journal does not record of `change` to job `id`: what it asks,
@@ -439,8 +435,11 @@ mod tests {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
         let id = jobs.test_create(JobSpec::test(agent, "large")).await;
         let large = serde_json::json!({"text": "x".repeat(64 * 1024)});
-        let outcome = || JobOutcome::Completed(crate::tool::ToolOutput::new(large.clone()));
-        let (_, abandoned) = jobs.finished(jobs.run(id).await, outcome()).await.unwrap();
+        let outcome = || JobOutcome::Completed(crate::tool::ToolOutput::new(large.clone()).into());
+        let (_, abandoned) = jobs
+            .finished(jobs.run(id).await, outcome(), Vec::new())
+            .await
+            .unwrap();
         assert!(abandoned.is_some_and(|rows| rows.is_ok_and(|rows| !rows.staged.is_empty())));
         jobs.finish(id, outcome()).await.unwrap();
         let replayed = jobs.test_replay().test_snapshot(id).await.unwrap();
@@ -487,7 +486,7 @@ mod tests {
                 .await;
             let (id, run) = (lease.id(), jobs.run(lease.id()).await);
             let (_input, _worker) = lease.split();
-            let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")));
+            let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")).into());
             let outcomes = [
                 completed,
                 ToolError::cancelled().into(),
@@ -554,10 +553,10 @@ mod tests {
         let (id, run) = (lease.id(), jobs.run(lease.id()).await);
         let (_input, _worker) = lease.split();
         let handler: ResumeHandler = Arc::new(|_, mut input| {
-            Box::pin(async move { Ok(ToolOutput::new(input.recv().await.unwrap())) })
+            Box::pin(async move { Ok(ToolOutput::new(input.recv().await.unwrap()).into()) })
         });
         jobs.test_resume_with(id, handler);
-        let stale = || JobOutcome::Completed(ToolOutput::new(serde_json::json!("stale")));
+        let stale = || JobOutcome::Completed(ToolOutput::new(serde_json::json!("stale")).into());
         let (release, released) = tokio::sync::oneshot::channel();
         let late = super::super::supervisor::spawn_completion(jobs.clone(), run, async move {
             released.await.unwrap();
@@ -711,7 +710,7 @@ mod tests {
                 assert_eq!(jobs.test_create(spec).await, id);
                 jobs.test_install(id).await;
                 let handler: ResumeHandler = Arc::new(|value, _| {
-                    Box::pin(async move { Ok(ToolOutput::new(value.unwrap())) })
+                    Box::pin(async move { Ok(ToolOutput::new(value.unwrap()).into()) })
                 });
                 jobs.test_resume_with(id, handler);
                 jobs.test_finish(id, serde_json::json!("previous")).await;

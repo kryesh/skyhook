@@ -10,8 +10,8 @@ use crate::{
     identity::AgentId,
     provider::protocol::{Usage, UsageTotals},
     session::{
-        CompletedOutcome, EventRecord, Fact, ModelPurpose, RecordSeq, RequestPhase, RequestRecord,
-        RequestSeq, ResidentLedger, SessionEvent, ledger::Folded,
+        CompletedOutcome, EventRecord, Fact, HostCursor, ModelPurpose, RecordSeq, RequestPhase,
+        RequestRecord, RequestSeq, ResidentLedger, SessionEvent, ledger::Folded,
     },
     tool::policy::CapabilitySet,
 };
@@ -66,6 +66,8 @@ pub(crate) struct AgentState {
     /// The replacement or checkpoint that set its todos, and its latest checkpoint.
     pub(crate) todos: Option<RecordSeq>,
     pub(crate) checkpoint: Option<RecordSeq>,
+    /// The message holding the latest host event it was given, and how far that went.
+    pub(crate) host_events: Option<(RecordSeq, HostCursor)>,
     /// What its last completed response reported, which its next request compacts
     /// for, while no checkpoint answered it and its model and mode are unchanged since.
     pub(crate) reported: Option<(RequestSeq, Usage)>,
@@ -91,6 +93,7 @@ impl AgentState {
             available_depth,
             todos: None,
             checkpoint: None,
+            host_events: None,
             reported: None,
             gauged: None,
             last: None,
@@ -172,6 +175,11 @@ impl AgentStates {
 
     pub(crate) fn get(&self, agent: &AgentId) -> Option<&AgentState> {
         self.agents.get(agent)
+    }
+
+    /// How far the latest host event `agent` was given went.
+    pub(crate) fn host_cursor(&self, agent: &AgentId) -> Option<HostCursor> {
+        (self.agents.get(agent)?.host_events).map(|(_, through)| through)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&AgentId, &AgentState)> {
@@ -272,6 +280,9 @@ impl AgentStates {
                         request,
                         turn,
                     });
+                }
+                if let Some(through) = message.host_cursor() {
+                    state.host_events = Some((at, through));
                 }
                 let last = match message.answers() {
                     true => Last::Answered,

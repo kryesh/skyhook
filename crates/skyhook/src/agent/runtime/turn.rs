@@ -34,7 +34,7 @@ impl SessionRuntime {
                 context_failures = 0;
             }
             let viewer = turn.diagnostic_viewer();
-            self.deliver_events(agent, viewer, &[]).await?;
+            (self.deliver_events(agent, viewer, &[], Boundary::Request(cancellation))).await?;
             agent_context.refresh(&self.store, agent).await?;
             agent_context.admits_images()?;
             let profile = agent_context.model.profile.profile.clone();
@@ -271,7 +271,8 @@ impl SessionRuntime {
                 // Events that arrived during the request precede the answer.
                 let joined = async {
                     let viewer = turn.diagnostic_viewer();
-                    let delivered = self.deliver_events(agent, viewer, &[]).await?;
+                    let delivered =
+                        (self.deliver_events(agent, viewer, &[], Boundary::Jobs)).await?;
                     Ok::<_, super::queue::Refusal>(
                         delivered.is_some()
                             || (self.consume_queued_inputs(&mut turn, agent_context)).await?,

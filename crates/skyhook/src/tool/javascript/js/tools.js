@@ -98,32 +98,41 @@ export function install(manifests, ended, call) {
 
 // One host receive runs at a time on behalf of the waiting callers, oldest first. A
 // value no caller waits for is kept for the next one, so releasing an abandoned receive
-// never loses input: release() drops a waiting call, or hands the value it already took,
-// which came before any still unclaimed, to the oldest waiting call or the front of the
-// inbox.
+// never loses input: release() drops a waiting call, or hands the value it already took
+// to the oldest waiting call, or back among the kept values in the order they arrived.
 function inbox() {
   const kept = [], waiters = [];
-  let pulling = false;
+  let pulling = false, arrived = 0;
+  const keep = entry => {
+    const later = kept.findIndex(other => other.order > entry.order);
+    kept.splice(later < 0 ? kept.length : later, 0, entry);
+  };
   const pull = () => {
     if (pulling || !waiters.length) return;
     pulling = true;
     request({type: "receive"}).then(
-      value => { pulling = false; const waiter = waiters.shift(); if (waiter) waiter.take(value); else kept.push(value); pull(); },
+      value => {
+        pulling = false;
+        const entry = {value, order: arrived++}, waiter = waiters.shift();
+        if (waiter) waiter.take(entry); else keep(entry);
+        pull();
+      },
       error => { pulling = false; waiters.shift()?.reject(error); pull(); },
     );
   };
   return () => {
     let waiter;
     const received = new Promise((resolve, reject) => {
-      waiter = {reject, taken: false, value: undefined, take: value => { waiter.taken = true; waiter.value = value; resolve(value); }};
+      waiter = {reject, taken: undefined, take: entry => { waiter.taken = entry; resolve(entry.value); }};
     });
     const release = () => {
       const index = waiters.indexOf(waiter);
       if (index >= 0) waiters.splice(index, 1);
       else if (waiter.taken) {
-        waiter.taken = false;
+        const entry = waiter.taken;
+        waiter.taken = undefined;
         const oldest = waiters.shift();
-        if (oldest) oldest.take(waiter.value); else kept.unshift(waiter.value);
+        if (oldest) oldest.take(entry); else keep(entry);
       }
     };
     if (kept.length) waiter.take(kept.shift());

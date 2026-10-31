@@ -221,7 +221,7 @@ mod tests {
                     turn(jobs, child).await;
                     turned.notify_one();
                     release.acquire().await.unwrap().forget();
-                    Ok(ToolOutput::default())
+                    Ok(ToolOutput::default().into())
                 })
             }
         });

@@ -105,10 +105,8 @@ macro_rules! actions {
     };
 }
 
-mod environment;
 mod input;
 mod query;
-mod report;
 mod research;
 
 use std::sync::Arc;
@@ -247,32 +245,41 @@ pub fn registry() -> Result<ToolRegistry, RegistryError> {
     let mut builder = ToolRegistryBuilder::default();
     research::register(&mut builder)?;
     query::register(&mut builder)?;
-    environment::register(&mut builder)?;
-    report::register(&mut builder)?;
     Ok(builder.build())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{future::Future, sync::Arc, time::Duration};
 
     use serde_json::json;
-    use skyhook::{
-        agent::SessionHandle,
-        tool::policy::{Approval, AuthorizationRequest, Policy, PolicyDecision},
-    };
+    use skyhook::agent::SessionHandle;
 
     use super::*;
     use crate::{
         capabilities::SecurityCapability,
-        store::{PocPolicy, RunOptions, tests::revision},
+        store::{NodeId, NodeView, PathId, PocPolicy, RunOptions},
     };
 
-    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+    pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
         tokio::time::timeout(Duration::from_secs(30), future)
             .await
-            .expect("tool test deadline")
+            .expect("test deadline")
     }
+
+    /// Records one source, component and path through it, a flaw on the component and a
+    /// candidate of it along the path, assessed critical; binds their ids.
+    const DISCOVER: &str = r#"
+        const research = async action => (await tool.research(action)).unwrap();
+        const at = (file, line) => ({file, start_line: line, end_line: line});
+        const component = await research({action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']});
+        const source = await research({action:'upsert',kind:'source',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'});
+        const path = await research({action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'});
+        await research({action:'link',links:[{path_source:{path,source}},{path_step:{path,component,note:'parse is called on every request'}}]});
+        const flaw = await research({action:'upsert',kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120});
+        const candidate = await research({action:'upsert',kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',path,flaws:[flaw]});
+        await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',note:'unauthenticated request controls memory corruption'});
+    "#;
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -281,15 +288,39 @@ mod tests {
     }
     impl Fixture {
         async fn new(capabilities: CapabilitySet) -> Self {
-            Self::with_policy(capabilities, Arc::new(skyhook::tool::policy::AllowAll)).await
+            Self::built(capabilities, crate::store::tests::harness).await
         }
 
-        async fn with_policy(capabilities: CapabilitySet, policy: Arc<dyn Policy>) -> Self {
+        /// A session whose children are [`Children`] deciding by brief with `then`, with
+        /// every mode and the capabilities they need.
+        async fn with_children(then: impl Fn(&str) -> Then + Send + Sync + 'static) -> Self {
+            let children = Arc::new(Children(Arc::new(then)));
+            let capabilities = capabilities(
+                [
+                    Capability::Write,
+                    Capability::Exec,
+                    Capability::Network,
+                    Capability::Agents,
+                    Capability::Mcp,
+                ]
+                .into_iter()
+                .chain(SecurityCapability::ALL.map(SecurityCapability::capability)),
+            );
+            let harness = move |root: &std::path::Path| {
+                crate::store::tests::harness_on(root, children).modes(crate::presets::modes())
+            };
+            Self::built(capabilities, harness).await
+        }
+
+        async fn built(
+            capabilities: CapabilitySet,
+            harness: impl FnOnce(&std::path::Path) -> skyhook::agent::HarnessBuilder,
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let registry = registry().unwrap();
-            let harness = crate::store::tests::harness(root.path())
+            let harness = harness(root.path())
                 .capabilities(capabilities)
-                .policy(policy)
+                .policy(Arc::new(skyhook::tool::policy::AllowAll))
                 .tools(registry.clone())
                 .build()
                 .await
@@ -297,7 +328,7 @@ mod tests {
             let session = harness.new_session().await.unwrap();
             let store = Store::of(session.store().extension().unwrap());
             tokio::task::spawn_blocking(move || {
-                store.start_run(RunOptions::default(), &revision(), PocPolicy::Yes)
+                store.start_run(RunOptions::default(), PocPolicy::Yes)
             })
             .await
             .unwrap()
@@ -346,21 +377,13 @@ mod tests {
             Some(names)
         }
 
-        /// One path reaching one component with one flaw it contributes to, raised as an
-        /// assessed candidate; `expose` false leaves the flaw undecided.
-        async fn discover(&self, expose: bool) -> Value {
-            self.script(format!(r#"
-            const research = async action => (await tool.research(action)).unwrap();
-            const at = (file, line) => ({{file, start_line: line, end_line: line}});
-            const source = await research({{action:'add_source',kind:'network',trust:'unauthenticated',entry:at('input.c',1),description:'raw request bytes'}});
-            const component = await research({{action:'add_component',name:'parser',description:'request parser',files:['input.c']}});
-            const path = await research({{action:'add_path',description:'raw request parsing',sources:[source],reaches:[{{component,note:'parse is called on every request'}}]}});
-            const flaw = await research({{action:'add_flaw',component,title:'Unchecked copy',statement:'the request length is copied into a fixed buffer',operation:'memory_write',deficiency:{{guard:'bounds_check',deficiency:'missing'}},effects:[{{property:'integrity',note:'adjacent memory'}}],evidence:[{{location:at('input.c',8),role:'operation',stance:'supports',note:'no bounds check'}}]}});
-            if ({expose}) await research({{action:'add_exposure',flaw,path,outcome:'contributes',conditions:'the request sets the length',note:'direct call',route:[{{location:at('input.c',3),basis:'inspected',note:'length passed through'}}]}});
-            const candidate = await research({{action:'add_candidate',title:'Unchecked copy',description:'request length overflows a fixed buffer',cwe:120,members:[{{flaw,step:null}}],paths:[path]}});
-            await research({{action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',confidence:'established',rationale:'unauthenticated request controls memory corruption'}});
-            return {{source,path,component,flaw,candidate}};
-        "#)).await
+        /// One path from one source through one component, with one flaw on it raised as an
+        /// assessed candidate.
+        async fn discover(&self) -> Value {
+            self.script(format!(
+                "{DISCOVER}\nreturn {{source, path, component, flaw, candidate}};"
+            ))
+            .await
         }
 
         async fn close(self) {
@@ -368,12 +391,7 @@ mod tests {
         }
     }
 
-    const RESEARCH_TOOLS: [&str; 4] = [
-        "research",
-        "research_query",
-        "environment",
-        "finding_report",
-    ];
+    const RESEARCH_TOOLS: [&str; 2] = ["research", "research_query"];
 
     fn capabilities(extra: impl IntoIterator<Item = Capability>) -> CapabilitySet {
         [Capability::Read].into_iter().chain(extra).collect()
@@ -398,50 +416,45 @@ mod tests {
         template(prompt).split_once('\n').unwrap().1
     }
 
-    /// Each capability admits its action group at the surface, and the executor
-    /// refuses an action outside the surfaced schema before it reaches the store.
+    /// Each capability admits its action group at the surface, and the executor refuses an
+    /// action outside the surfaced schema before it reaches the store.
     #[tokio::test]
     async fn actions_follow_capabilities_at_the_surface_and_the_executor() {
-        let [research, verdict, test] = [
-            SecurityCapability::Research,
-            SecurityCapability::Verdict,
-            SecurityCapability::Test,
-        ]
-        .map(SecurityCapability::capability);
+        let [research, verdict, test, coordinate] =
+            SecurityCapability::ALL.map(SecurityCapability::capability);
         let fixture = Fixture::new(all_capabilities()).await;
         let read = capabilities([]);
         let researcher = capabilities([research.clone()]);
-        let reviewer = capabilities([verdict.clone()]);
-        let writer = capabilities([verdict.clone(), Capability::Write]);
+        let owned = |actions: &[&str]| Some(actions.iter().map(|a| a.to_string()).collect());
         for (granted, tool, actions) in [
             (&read, "research", None),
-            (&read, "finding_report", None),
-            (&read, "environment", None),
-            (&researcher, "environment", Some(&["add_environment"][..])),
             (
-                &capabilities([Capability::Write]),
-                "environment",
-                Some(&["list"][..]),
+                &read,
+                "research_query",
+                owned(&["history", "list", "node", "synthesis"]),
             ),
-            (&reviewer, "research", None),
-            (&reviewer, "finding_report", None),
+            (
+                &capabilities([verdict.clone()]),
+                "research",
+                owned(&["begin"]),
+            ),
+            (
+                &capabilities([verdict.clone(), Capability::Write]),
+                "research",
+                owned(&["begin", "report"]),
+            ),
             (
                 &capabilities([test.clone()]),
                 "research",
-                Some(&["record_poc", "start_poc"][..]),
+                owned(&["begin", "test"]),
             ),
-            (&writer, "finding_report", Some(&["populate"][..])),
             (
-                &capabilities([SecurityCapability::Coordinate.capability()]),
-                "finding_report",
-                Some(&["generate"][..]),
+                &capabilities([coordinate]),
+                "research",
+                owned(&["generate"]),
             ),
         ] {
-            assert_eq!(
-                fixture.actions(granted, tool),
-                actions.map(|actions| actions.iter().map(|a| a.to_string()).collect()),
-                "{tool}"
-            );
+            assert_eq!(fixture.actions(granted, tool), actions, "{tool}");
         }
         // Only the root mode schedules the run and writes its reports out.
         for (mode, granted) in crate::presets::modes() {
@@ -451,27 +464,25 @@ mod tests {
             };
             let root = mode == crate::presets::root();
             assert_eq!(offers("research_query", "startable"), root, "{mode}");
-            assert_eq!(offers("finding_report", "generate"), root, "{mode}");
+            assert_eq!(offers("research", "generate"), root, "{mode}");
         }
-        // A validator decides verdicts; a tester records what it observes and plans
-        // follow-ups, but never decides verdicts.
+        // A validator decides verdicts; a tester records what it observes, but never decides
+        // verdicts.
         for (granted, with, without) in [
-            (&researcher, &["add_candidate"][..], &["verdict"][..]),
+            (
+                &researcher,
+                &["upsert", "assess"][..],
+                &["verdict", "test"][..],
+            ),
             (
                 &capabilities([research.clone(), verdict]),
-                &["add_candidate", "reassess", "verdict"],
-                &["record_poc"],
+                &["upsert", "verdict"],
+                &["test"],
             ),
             (
                 &capabilities([research, test]),
-                &[
-                    "add_evidence",
-                    "add_unit",
-                    "record_poc",
-                    "start_poc",
-                    "undermine",
-                ],
-                &["verdict", "reassess"],
+                &["evidence", "begin", "test"],
+                &["verdict"],
             ),
         ] {
             let actions = fixture.actions(granted, "research").unwrap();
@@ -484,16 +495,12 @@ mod tests {
         fixture.close().await;
 
         let fixture = Fixture::new(researcher).await;
-        assert_eq!(
-            fixture.script("return typeof tool.finding_report;").await,
-            "undefined"
-        );
         let history = || fixture.success("research_query", json!({"action":"history"}));
         let before = history().await["items"].clone();
         let denied = fixture
             .call(
                 "research",
-                json!({"action":"verdict","candidate":1,"verdict":{"kind":"unproven"},"rationale":"x"}),
+                json!({"action":"verdict","candidate":1,"verdict":"unproven","note":"x"}),
             )
             .await;
         assert_eq!(denied["state"], "failed", "{denied}");
@@ -502,97 +509,6 @@ mod tests {
             before,
             "refused actions must not write audit records"
         );
-        fixture.close().await;
-    }
-
-    /// Research is recorded as the calling agent's, and queries read it back by their filters.
-    #[tokio::test]
-    async fn research_is_attributed_to_the_calling_agent() {
-        let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
-        let ids = fixture.discover(true).await;
-        let listed = fixture
-            .success(
-                "research_query",
-                json!({"action":"candidates","filter":{"path":ids["path"],"severity":"critical","operation":"memory_write"}}),
-            )
-            .await;
-        assert_eq!(listed["items"][0]["id"], ids["candidate"]);
-        assert_eq!(listed["items"][0]["status"], "shortlisted");
-        let history = fixture
-            .success(
-                "research_query",
-                json!({"action":"history","subject":{"kind":"candidate","id":ids["candidate"]}}),
-            )
-            .await;
-        assert!(!history["items"].as_array().unwrap().is_empty());
-        for event in history["items"].as_array().unwrap() {
-            assert_eq!(event["actor"], fixture.session.root_agent().to_string());
-        }
-        fixture.close().await;
-    }
-
-    /// A finding's write-up round-trips through the tools: populated, generated, read back
-    /// whole in the shape populate takes and populated again. Research bookkeeping and report
-    /// publication ask for no approval beyond the tools' own capabilities: reports are the
-    /// session's files, not the workspace's.
-    #[tokio::test]
-    async fn report_tools_round_trip_the_write_up_without_filesystem_approval() {
-        struct NoWrites;
-        impl Policy for NoWrites {
-            fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
-                assert!(request.permissions.iter().all(|permission| !matches!(
-                    permission.capability,
-                    Capability::Host(_) | Capability::Write
-                )));
-                Approval::Decided(PolicyDecision::allow())
-            }
-        }
-        let fixture = Fixture::with_policy(all_capabilities(), Arc::new(NoWrites)).await;
-        let ids = fixture.discover(true).await;
-        let candidate = ids["candidate"].clone();
-        fixture.success("research", json!({"action":"verdict","candidate":candidate,"verdict":{"kind":"validated"},"rationale":"reviewed the traced route"})).await;
-        let report = json!({
-            "action":"populate","root":ids["flaw"],"title":"Unchecked request copy", "summary":"Attacker-controlled length reaches a fixed-size copy.",
-            "analysis":"The traced route reaches the copy without a length check.","impact":"Out-of-bounds write can corrupt process memory.",
-            "remediation":"Reject lengths exceeding the destination capacity before copying.",
-            "reproduction":{"prerequisites":["Build the target with memory checking in a disposable environment."],
-                "steps":[{"instruction":"Send the oversized request to the local test listener.","expected_result":"The bounds checker reports the copy write."}],
-                "outcome":{"kind":"unobserved","expected_result":"The oversized request reaches the unchecked copy.","limitations":"Source review only; this report has no empirical test."},
-                "cleanup":["Stop the disposable test listener."]}
-        });
-        let mut stepless = report.clone();
-        stepless["reproduction"]["steps"] = json!([]);
-        let refused = fixture.call("finding_report", stepless).await;
-        let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("`/reproduction/steps`"), "{refused}");
-        let first = fixture.success("finding_report", report).await;
-        let generated = fixture
-            .success("finding_report", json!({"action":"generate"}))
-            .await;
-        assert_eq!(generated["reports"], json!([ids["flaw"]]));
-
-        let read = json!({"action":"finding","root":ids["flaw"]});
-        let mut write_up =
-            fixture.success("research_query", read.clone()).await["write_up"].clone();
-        write_up["notes"] = json!([{"candidate":candidate,"note":"Any request reaches it."}]);
-        // A write-up beyond the preview budget reads back whole.
-        write_up["analysis"] = json!("Each request reaches the copy unchecked.\n".repeat(2000));
-        let mut populate = write_up.clone();
-        populate["action"] = json!("populate");
-        let repeated = fixture.success("finding_report", populate).await;
-        assert_eq!(
-            (&repeated["id"], &repeated["status"]),
-            (&first["id"], &json!("current"))
-        );
-        // The view a model reads of the call shows the write-up whole.
-        let view = fixture
-            .script(format!(
-                "await tool.research_query({read}); const jobs = (await tool.jobs({{all: true}})).unwrap().jobs; \
-                 return await tool.jobs({{job: jobs.filter(j => j.meta.tool === 'research_query').pop().id}});"
-            ))
-            .await;
-        let stored = view["result"]["write_up"].clone();
-        assert_eq!(stored, write_up);
         fixture.close().await;
     }
 
@@ -606,30 +522,28 @@ mod tests {
                 .map(SecurityCapability::capability),
         ))
         .await;
-        let unit = json!({"action":"add_unit","kind":"question","question":"can the copy overrun?","stopping":"a counterexample or a proof"});
-        let mut unknown = unit.clone();
+        let component =
+            json!({"action":"upsert","kind":"component","title":"parser","body":"parses"});
+        let mut unknown = component.clone();
         unknown["priority"] = json!("high");
         let refused = fixture.call("research", unknown).await;
         assert_eq!(refused["state"], "failed", "{refused}");
-        fixture.success("research", unit).await;
-        // Schema validation refuses a nested id below 1 at its path, before deserializing.
+        fixture.success("research", component).await;
+        let error = |response: &Value| response["error"].as_str().unwrap_or_default().to_owned();
+        // Schema validation refuses a nested id below 1, before deserializing.
         let zero = fixture
             .call(
                 "research",
-                json!({"action":"add_path","description":"entry","sources":[0],"reaches":[]}),
+                json!({"action":"link","links":[{"path_source":{"path":0,"source":1}}]}),
             )
             .await;
-        let error = |response: &Value| response["error"].as_str().unwrap_or_default().to_owned();
-        assert!(
-            error(&zero).contains("`/sources/0`") && error(&zero).contains("minimum 1"),
-            "{zero}"
-        );
+        assert!(error(&zero).contains("minimum 1"), "{zero}");
         // An action's arguments sit beside it: a missing required one is refused at its
         // name, and so is another action's, even null.
         let missing = fixture
-            .call("research_query", json!({"action":"unit"}))
+            .call("research_query", json!({"action":"node"}))
             .await;
-        assert!(error(&missing).contains("`/unit`"), "{missing}");
+        assert!(error(&missing).contains("`/id`"), "{missing}");
         for argument in [json!({}), Value::Null] {
             let stray = fixture
                 .call(
@@ -639,41 +553,19 @@ mod tests {
                 .await;
             assert!(error(&stray).contains("`/page`"), "{stray}");
         }
-        // A union admits only the action's own alternative.
-        let other = fixture
-            .call(
+        // A status is one its node's kind takes.
+        for (call, tool) in [
+            (
+                json!({"action":"set_status","premise":1,"status":"swept","note":"n"}),
+                "research",
+            ),
+            (
+                json!({"action":"list","kind":"flaw","status":"holds"}),
                 "research_query",
-                json!({"action":"flaws","filter":{"status":"validated"}}),
-            )
-            .await;
-        assert!(error(&other).contains("`/filter/status`"), "{other}");
-        // A resolution carries only what its kind takes: a deployment fact only when the
-        // condition holds, a flaw only when it fails.
-        for resolution in [
-            json!({"kind":"fails","deployment":1}),
-            json!({"kind":"asked","flaw":1}),
+            ),
         ] {
-            let refused = fixture
-                .call(
-                    "research",
-                    json!({"action":"resolve","premise":1,"resolution":resolution,"note":"n"}),
-                )
-                .await;
-            assert!(error(&refused).contains("`/resolution`"), "{refused}");
-        }
-        // A verdict carries only what its kind takes: a deployment fact only on a policy
-        // exclusion.
-        for verdict in [
-            json!({"kind":"disproved","deployment":1}),
-            json!({"kind":"validated","deployment":1}),
-        ] {
-            let refused = fixture
-                .call(
-                    "research",
-                    json!({"action":"verdict","candidate":1,"verdict":verdict,"rationale":"e"}),
-                )
-                .await;
-            assert!(error(&refused).contains("`/verdict`"), "{refused}");
+            let refused = fixture.call(tool, call).await;
+            assert_eq!(refused["state"], "failed", "{refused}");
         }
         fixture
             .success("research_query", json!({"action":"history"}))
@@ -681,7 +573,8 @@ mod tests {
         fixture.close().await;
     }
 
-    /// The names an object literal at the start of `source` spells, spreads aside.
+    /// The names an object literal at the start of `source` spells, spreads and computed keys
+    /// aside.
     fn literal_keys(source: &str) -> Vec<&str> {
         let (mut entries, mut depth, mut quote, mut start) = (Vec::new(), 0, None, 1);
         for (at, c) in source.char_indices() {
@@ -705,13 +598,15 @@ mod tests {
             }
         }
         (entries.into_iter().map(str::trim))
-            .filter(|entry| !entry.is_empty() && !entry.starts_with("..."))
+            .filter(|entry| {
+                !entry.is_empty() && !entry.starts_with("...") && !entry.starts_with('[')
+            })
             .map(|entry| entry.split(':').next().unwrap().trim())
             .collect()
     }
 
     /// Every research tool call a mode's templates spell, and every action its prose names
-    /// after the tool (`research` `outcome`), names an action that mode surfaces, a call with
+    /// after the tool (`research` `begin`), names an action that mode surfaces, a call with
     /// only arguments that action's signature lists. The template tests run with every
     /// capability, so only this ties a call to the grant of the mode whose prompt holds it;
     /// argument values are checked by running the templates.
@@ -779,45 +674,52 @@ mod tests {
         fixture.close().await;
     }
 
-    /// The report script reads a root's reportable scenarios, their tests and the previous
-    /// finding's write-up, and lists the fields still empty, before and after a finding.
+    /// The report script reads a root's reportable scenarios with the test each stands on and the
+    /// previous report, before and after a report.
     #[tokio::test]
-    async fn the_report_script_reads_the_group_and_its_previous_write_up() {
+    async fn the_report_script_reads_the_group_and_its_previous_report() {
         let fixture = Fixture::new(all_capabilities()).await;
-        let ids = fixture.discover(true).await;
+        let ids = fixture.discover().await;
         let candidate = ids["candidate"].clone();
-        fixture.success("research", json!({"action":"verdict","candidate":candidate,"verdict":{"kind":"validated"},"rationale":"reviewed the traced route"})).await;
+        let verdict = json!({"action":"verdict","candidate":candidate,"verdict":"validated","note":"reviewed the path"});
+        let test =
+            json!({"action":"test","candidate":candidate,"result":"failed","note":"no crash"});
+        fixture.success("research", verdict.clone()).await;
+        fixture.success("research", test.clone()).await;
+        fixture.success("research", verdict).await;
+        let settling = fixture.success("research", test).await;
+        fixture.success("research", json!({"action":"test","candidate":candidate,"result":"pending","note":"needs a board"})).await;
         let body = template_body(include_str!("../prompts/report.md"));
         let script = format!("const root = {};\n{body}", ids["flaw"]);
         let first = fixture.script(script.clone()).await;
         assert_eq!(first["scenarios"][0]["id"], candidate, "{first}");
-        assert_eq!(first["prior"], Value::Null, "{first}");
-        let text = "Settled from the traced route.";
-        let report = json!({"action":"populate","root":ids["flaw"],"title":text,"summary":text,"analysis":text,"impact":text,"remediation":text,
-            "reproduction":{"prerequisites":[],"steps":[{"instruction":text,"expected_result":text}],
-                "outcome":{"kind":"unobserved","expected_result":text,"limitations":text},"cleanup":[]}});
-        let finding = fixture.success("finding_report", report).await;
+        assert_eq!(
+            first["scenarios"][0]["test"]["id"], settling,
+            "the test the report states: {first}"
+        );
+        assert_eq!(first["previous"], Value::Null, "{first}");
+        let report = json!({"action":"report","root":ids["flaw"],"title":"Unchecked copy","body":"## Summary\n\nAny request overflows."});
+        let finding = fixture.success("research", report).await;
         let again = fixture.script(script).await;
         assert_eq!(
-            (&again["prior"], &again["empty"]),
-            (
-                &json!({"id": finding["id"], "status": "current"}),
-                &json!([format!("notes: {candidate}")])
-            ),
+            (&again["previous"]["id"], &again["previous"]["current"]),
+            (&finding, &json!(true)),
             "{again}"
         );
         fixture.close().await;
     }
 
-    /// The validation script lists what the candidate's verdict still waits on: here only an
-    /// open condition gating its scenario.
+    /// The validation script lists what the candidate's verdict still rests on: here an
+    /// undecided premise of its flaw.
     #[tokio::test]
-    async fn the_validation_script_lists_an_open_condition() {
+    async fn the_validation_script_lists_an_undecided_premise() {
         let fixture = Fixture::new(all_capabilities()).await;
-        let ids = fixture.discover(true).await;
-        let condition = fixture
-            .success("research", json!({"action":"add_premise","on":{"kind":"candidate","id":ids["candidate"],"gates":{"kind":"scenario"}},"kind":"state","statement":"the listener is enabled"}))
+        let ids = fixture.discover().await;
+        let premise = fixture
+            .success("research", json!({"action":"upsert","kind":"premise","title":"the listener is enabled","body":"set at startup","scope":"code"}))
             .await;
+        let link = json!({"action":"link","links":[{"flaw_premise":{"flaw":ids["flaw"],"premise":premise}}]});
+        fixture.success("research", link).await;
         let body = template_body(include_str!("../prompts/validate.md"));
         let result = fixture
             .script(format!("const candidate = {};\n{body}", ids["candidate"]))
@@ -825,7 +727,8 @@ mod tests {
         assert_eq!(
             result["gaps"],
             json!([format!(
-                "premise {condition} (gates the scenario) is open: the listener is enabled"
+                "code premise {premise} of flaw {} is undecided: the listener is enabled",
+                ids["flaw"]
             )]),
             "{result}"
         );
@@ -844,12 +747,12 @@ mod tests {
         }
         let target = include_str!("../prompts/target.md");
         let body = template_body(target.split_once("```\n").unwrap().1);
-        let map = r#"[{name: "net", description: "network input", patterns: ["src/net/**"]}, {name: "core", description: "the rest", patterns: ["src/**"]}]"#;
+        let map = r#"[{title: "net", body: "network input", patterns: ["src/net/**"]}, {title: "core", body: "the rest", patterns: ["src/**"]}]"#;
         let result = fixture.script(format!("const map = {map};\n{body}")).await;
         let mut files = Vec::new();
         for id in result["components"].as_array().unwrap() {
-            let dossier = json!({"action":"dossier","component":id});
-            files.push(fixture.success("research_query", dossier).await["files"].clone());
+            let node = json!({"action":"node","id":id});
+            files.push(fixture.success("research_query", node).await["files"].clone());
         }
         assert_eq!(
             files,
@@ -862,37 +765,38 @@ mod tests {
         fixture.close().await;
     }
 
-    /// The paths script groups sources by the handoff each records, whatever its file is
-    /// called, names the component owning it, and lists sources without one.
+    /// The paths script groups the one-source paths its children record by their first step,
+    /// whatever its file is called, and lists a path without one.
     #[tokio::test]
-    async fn the_paths_script_groups_sources_by_their_recorded_handoff() {
+    async fn the_paths_script_groups_paths_by_their_first_step() {
         let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
-        let at = |file: &str, line: u32| json!({"file": file, "start_line": line, "end_line": line, "function": null});
-        let component = fixture
-            .success("research", json!({"action":"add_component","name":"parser","description":"request parser","files":["src/a b:c.c"]}))
-            .await;
-        let source = |line: u32, handoff: Value| json!({"action":"add_source","kind":"network","trust":"unauthenticated","entry":at("src/entry.c", line),"description":"request","handoff":handoff});
-        let mut ids = Vec::new();
-        for (line, handoff) in [
-            (1, json!({"at": at("src/a b:c.c", 9), "calls": "parse"})),
-            (2, json!({"at": at("src/a b:c.c", 9), "calls": "parse"})),
-            (3, json!({"at": at("vendor/x.c", 4), "calls": "decode"})),
-            (4, Value::Null),
-        ] {
-            ids.push(fixture.success("research", source(line, handoff)).await);
-        }
+        let result = fixture.script(r#"
+            const research = async action => (await tool.research(action)).unwrap();
+            const at = (file, line) => ({file, start_line: line, end_line: line});
+            const parser = await research({action:'upsert',kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']});
+            const decoder = await research({action:'upsert',kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']});
+            const paths = [];
+            for (const [component, line] of [[parser, 9], [parser, 9], [decoder, 4], [null, 0]]) {
+                const path = await research({action:'upsert',kind:'path',title:`entry ${paths.length}`,body:'request'});
+                if (component) await research({action:'link',links:[{path_step:{path,component,location:at(component === parser ? 'src/a b:c.c' : 'vendor/x.c', line),note:'calls'}}]});
+                paths.push(path);
+            }
+            return {parser, decoder, paths};
+        "#).await;
         let body = template_body(include_str!("../prompts/paths.md"));
-        let result = fixture
+        let grouped = fixture
             .script(format!("const workers = 1, inputs = [];\n{body}"))
             .await;
+        let at = |file: &str, line: u32| json!({"file": file, "start_line": line, "end_line": line, "function": null});
+        let paths = &result["paths"];
         assert_eq!(
-            result["handoffs"],
+            grouped["handoffs"],
             json!([
-                {"at": at("src/a b:c.c", 9), "calls": "parse", "component": component, "sources": [ids[0], ids[1]]},
-                {"at": at("vendor/x.c", 4), "calls": "decode", "component": null, "sources": [ids[2]]},
+                {"component": result["parser"], "at": at("src/a b:c.c", 9), "paths": [paths[0], paths[1]]},
+                {"component": result["decoder"], "at": at("vendor/x.c", 4), "paths": [paths[2]]},
             ])
         );
-        assert_eq!(result["unmatched"], json!([ids[3]]));
+        assert_eq!(grouped["unmatched"], json!([paths[3]]));
         fixture.close().await;
     }
 
@@ -902,13 +806,48 @@ mod tests {
     async fn scripts_read_an_omitted_optional_result_field_as_null() {
         let fixture = Fixture::new(all_capabilities()).await;
         let result = fixture.script(r#"
-            const at = {file: 'input.c', start_line: 1, end_line: 1};
-            const source = (await tool.research({action: 'add_source', kind: 'network', trust: 'unauthenticated', entry: at, description: 'request'})).unwrap();
-            const one = (await tool.research_query({action: 'source', source})).unwrap();
-            const page = (await tool.research_query({action: 'sources'})).unwrap();
-            return [one.handoff, page.items[0].handoff, page.next_after].map(field => field === null);
+            const premise = (await tool.research({action: 'upsert', kind: 'premise', title: 'bounded', body: 'by the caller', scope: 'code'})).unwrap();
+            const one = (await tool.research_query({action: 'node', id: premise})).unwrap();
+            const page = (await tool.research_query({action: 'list', kind: 'premise'})).unwrap();
+            return [one.location, one.merged_into, page.next_after].map(field => field === null);
         "#).await;
         assert_eq!(result, json!([true, true, true]));
+        fixture.close().await;
+    }
+
+    /// The sweep's measuring script sizes each file of the components its path's steps enter
+    /// from the directory listings, leaving out a listed file no step's component holds.
+    #[tokio::test]
+    async fn the_sweep_script_measures_its_files() {
+        let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
+        for (file, bytes) in [
+            ("src/a.c", 10),
+            ("src/b.c", 3),
+            ("src/other.c", 5),
+            ("main.c", 1),
+        ] {
+            let path = fixture._root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x".repeat(bytes)).unwrap();
+        }
+        let path = fixture.script(r#"
+            const research = async action => (await tool.research(action)).unwrap();
+            const parser = await research({action:'upsert',kind:'component',title:'parser',body:'parses',files:['src/a.c','src/b.c']});
+            const main = await research({action:'upsert',kind:'component',title:'main',body:'starts',files:['main.c']});
+            const path = await research({action:'upsert',kind:'path',title:'request',body:'request'});
+            await research({action:'link',links:[{path_step:{path,component:main,note:'reads'}},{path_step:{path,component:parser,note:'parses'}}]});
+            return path;
+        "#).await;
+        let body = template_body(include_str!("../prompts/path-sweep.md"));
+        let result = fixture
+            .script(format!("const path = {path};\n{body}"))
+            .await;
+        assert_eq!(
+            result,
+            json!({"steps": 2, "files": 3, "bytes": 14, "largest": [
+                {"file": "src/a.c", "bytes": 10}, {"file": "src/b.c", "bytes": 3}, {"file": "main.c", "bytes": 1},
+            ]})
+        );
         fixture.close().await;
     }
 
@@ -928,96 +867,240 @@ mod tests {
             .await
     }
 
-    /// Plans `units` follow-ups.
-    async fn follow_ups(fixture: &Fixture, units: usize) {
-        fixture
-            .script(format!(
-                "for (let i = 0; i < {units}; i++) (await tool.research({{action: 'add_unit', kind: 'follow_up', question: `question ${{i}}`, stopping: 'settled'}})).unwrap();"
-            ))
-            .await;
+    /// What a scripted child does once it has begun the work its brief names.
+    #[derive(Clone, Copy, Debug)]
+    enum Then {
+        Fail,
+        /// Fails before it begins.
+        Unbegun,
+        /// Records the `research` action made of the first subject it began, then replies.
+        Record(fn(&Value) -> Value),
+        /// Runs until it is cancelled.
+        Hang,
     }
 
-    /// Stubs whose every child fails, counting launches and the rows the scheduler reads.
-    const FAILING: &str = "let rows = 0, launched = 0;
-        const real = globalThis.tool;
+    /// Marks the path it began swept.
+    const SWEEP: Then = Then::Record(
+        |path| json!({"action": "set_status", "path": path, "status": "swept", "note": "walked it"}),
+    );
+
+    /// The assessment a scripted researcher records of `candidate`.
+    fn assessment(candidate: &Value) -> Value {
+        json!({"action": "assess", "candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"})
+    }
+
+    type Decide = Arc<dyn Fn(&str) -> Then + Send + Sync>;
+
+    /// A provider standing in for every child the scheduler launches: a child's first
+    /// response begins the work its brief names, as a child's first call does, and its next
+    /// does what the decision makes of its brief.
+    struct Children(Decide);
+
+    struct Child {
+        then: Decide,
+        responses: usize,
+    }
+
+    impl skyhook::provider::Provider for Children {
+        fn open_context(
+            &self,
+            _: skyhook::provider::protocol::ContextId,
+        ) -> Result<Box<dyn skyhook::provider::ProviderContext>, skyhook::provider::ProviderError>
+        {
+            Ok(Box::new(Child {
+                then: self.0.clone(),
+                responses: 0,
+            }))
+        }
+    }
+
+    impl skyhook::provider::ProviderContext for Child {
+        fn invoke(
+            &mut self,
+            request: skyhook::provider::protocol::ModelRequest,
+        ) -> skyhook::provider::ResponseStream {
+            use futures_util::StreamExt;
+            use skyhook::provider::{
+                ProviderErrorKind,
+                protocol::{
+                    AssistantItem, BlockId, Completion, Entry, ItemId, Message, ResponseEvent,
+                    TextBlock, ToolCall, UserContent,
+                },
+            };
+            let brief = (request.context.iter())
+                .find_map(|entry| match entry {
+                    Entry::Message(Message::User(content)) => {
+                        content.iter().find_map(|content| match content {
+                            UserContent::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("a child is launched with its brief");
+            let id = |id: &str| ItemId::try_from(id.to_owned()).unwrap();
+            let call = |name: &str, arguments: Value| {
+                let call = ToolCall::new(name, name, arguments).unwrap();
+                let item = AssistantItem::ToolCall {
+                    id: id(name),
+                    position: 0.into(),
+                    call,
+                };
+                Ok(Completion::tool_use(vec![item]).unwrap())
+            };
+            let answer = || {
+                let text = TextBlock {
+                    id: BlockId::try_from("reply:0".to_owned()).unwrap(),
+                    position: 0.into(),
+                    text: "done".to_owned(),
+                };
+                let item = AssistantItem::Text {
+                    id: id("reply"),
+                    position: 0.into(),
+                    blocks: vec![text],
+                };
+                Ok(Completion::answer(vec![item]).unwrap())
+            };
+            let work = begin(&brief);
+            let failed = || Err(ProviderErrorKind::Authentication.error("the child failed"));
+            self.responses += 1;
+            let completion = match (self.responses, (self.then)(&brief)) {
+                (1, Then::Unbegun) => failed(),
+                (1, _) => call("research", work),
+                (2, Then::Fail) => failed(),
+                (2, Then::Hang) => return futures_util::stream::pending().boxed(),
+                (2, Then::Record(action)) => call("research", action(&work["subjects"][0])),
+                _ => answer(),
+            };
+            futures_util::stream::iter([completion.map(ResponseEvent::End)]).boxed()
+        }
+    }
+
+    /// The `research` `begin` call a brief asks for, from the phase and the node ids the
+    /// scheduler names in it: "Settle premises 4 (…), 5 (…).".
+    fn begin(brief: &str) -> Value {
+        let (head, _) = brief.split_once(|c: char| c.is_ascii_digit()).unwrap();
+        let phase = match head.trim().trim_end_matches('s') {
+            "Sweep path" => "sweep",
+            "Settle premise" => "settle",
+            "Chain flaw" => "chain",
+            "Assess candidate" => "assess",
+            "Review candidate" => "review",
+            "Demonstrate candidate" => "test",
+            "Report root flaw" => "report",
+            other => panic!("no phase is briefed as {other:?}"),
+        };
+        let subjects: Vec<u64> = (brief.split("), "))
+            .map(|entry| {
+                let id = entry.trim_start_matches(|c: char| !c.is_ascii_digit());
+                let end = id.find(|c: char| !c.is_ascii_digit()).unwrap_or(id.len());
+                id[..end].parse().unwrap()
+            })
+            .collect();
+        json!({"action": "begin", "phase": phase, "subjects": subjects})
+    }
+
+    /// Stubs recording each launch's brief before the real child runs, and a `receive` no
+    /// steering reaches.
+    const RECORDING: &str = "const started = [], real = globalThis.tool;
         const tool = {
-            jobs: real.jobs, research: real.research,
-            agent: async () => (launched++, {id: 8, state: 'failed', error: 'stub'}),
-            research_query: async action => { const result = await real.research_query(action); try { rows += result.unwrap().items?.length ?? 0; } catch {} return result; },
+            jobs: real.jobs, research: real.research, research_query: real.research_query,
+            agent: args => (started.push(args.prompt), real.agent(args)),
         };
         const receive = () => new Promise(() => {});";
 
+    /// `count` paths, each through a component of its own and owing a sweep.
+    async fn sweeps(fixture: &Fixture, count: usize) -> Vec<PathId> {
+        use crate::store::tests::{component, path};
+        let store = Store::of(fixture.session.store().extension().unwrap());
+        let agent = fixture.session.root_agent().clone();
+        tokio::task::spawn_blocking(move || {
+            (0..count)
+                .map(|i| {
+                    let name = format!("part{i}");
+                    let component = component(&store, &agent, &name);
+                    path(&store, &agent, &name, &[component])
+                })
+                .collect()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The scheduler's launch briefs, each cut to its phase and first node.
+    const BRIEFS: &str = "started.map(p => p.match(/^\\D+\\d+/)[0])";
+
     /// The orchestrator's scheduler reads only what it starts: with one worker and a long
-    /// queue, the rows it reads grow with the work, not with its square.
+    /// queue, the rows it reads grow with the work, not with its square. Every child fails,
+    /// so each sweep is tried twice before it is exhausted.
     #[tokio::test]
     async fn the_scheduler_reads_a_bounded_page_per_launch() {
-        const UNITS: usize = 30;
-        let fixture = Fixture::new(all_capabilities()).await;
-        follow_ups(&fixture, UNITS).await;
-        let stubs = format!("{FAILING}\nconst workers = 1;");
-        let returned = "{rows, launched, left: outcome.left}";
-        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
-        // Every follow-up, each launched twice before it is blocked.
-        assert_eq!(result["launched"], json!(2 * UNITS), "{result}");
-        assert_eq!(result["left"], json!({}), "{result}");
+        const SWEEPS: usize = 30;
+        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        sweeps(&fixture, SWEEPS).await;
+        let stubs = "let rows = 0;
+            const real = globalThis.tool;
+            const tool = {
+                jobs: real.jobs, research: real.research, agent: real.agent,
+                research_query: async action => { const result = await real.research_query(action); if (action.action === 'startable') rows += result.unwrap().items.length; return result; },
+            };
+            const receive = () => new Promise(() => {});
+            const workers = 1;";
+        let returned = "{rows, exhausted: outcome.synthesis.exhausted.length}";
+        let result = run_template(&fixture, stubs, &scheduler(PocPolicy::No), returned).await;
+        assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
         let rows = result["rows"].as_u64().unwrap() as usize;
-        assert!(rows <= 4 * UNITS, "{rows} rows for {UNITS} units");
+        assert!(rows <= 2 * SWEEPS, "{rows} rows for {SWEEPS} sweeps");
         fixture.close().await;
     }
 
     /// A pool wider than the largest page still reads its work a page at a time.
     #[tokio::test]
     async fn the_scheduler_pages_a_pool_wider_than_a_page() {
-        let fixture = Fixture::new(all_capabilities()).await;
-        follow_ups(&fixture, 2).await;
-        let stubs = format!("{FAILING}\nconst workers = 1001;");
-        let returned = "{launched, left: outcome.left}";
+        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        sweeps(&fixture, 2).await;
+        let stubs = format!("{RECORDING}\nconst workers = 1001;");
+        let returned = "{launched: started.length, exhausted: outcome.synthesis.exhausted.length}";
         let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
-        assert_eq!(result, json!({"launched": 4, "left": {}}));
+        assert_eq!(result, json!({"launched": 4, "exhausted": 2}));
         fixture.close().await;
     }
 
-    /// A child that asks keeps its `tool.agent` call, and so its unit, running until it
-    /// finishes, and its real outcome is the attempt's: the unit is neither retried nor
-    /// blocked.
+    /// A child holds its node from its launch until it begins its task, which holds it from
+    /// then on: a launch still waiting to begin is not launched again.
     #[tokio::test]
-    async fn the_scheduler_holds_an_asking_childs_unit_until_it_finishes() {
-        const UNITS: usize = 6;
-        // Every launch but the asking child's retry.
-        const LAUNCHES: usize = 2 * UNITS - 1;
-        let fixture = Fixture::new(all_capabilities()).await;
-        follow_ups(&fixture, UNITS).await;
-        // The asking child finishes after every other launch, ending its unit.
+    async fn the_scheduler_holds_a_launched_subject_until_its_child_begins() {
+        const SWEEPS: usize = 6;
+        const LAUNCHES: usize = 2 * SWEEPS;
+        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        sweeps(&fixture, SWEEPS).await;
+        // The first launch begins once every other sweep is exhausted.
         let stubs = format!(
-            "let launched = 0, asking = null, finish;
+            "let launched = 0, waiting = null, begin;
             const held = [], real = globalThis.tool;
-            const finished = new Promise(resolve => finish = resolve);
-            const answered = async () => {{
-                await finished;
-                (await real.research({{action: 'outcome', unit: asking, outcome: 'deferred', note: 'answered'}})).unwrap();
-                return {{id: 7, state: 'completed', result: {{reply: 'settled'}}}};
-            }};
+            const others = new Promise(resolve => begin = resolve);
             const tool = {{
                 jobs: real.jobs, research: real.research,
                 research_query: async action => {{
-                    if (action.action === 'startable' && asking !== null && launched < {LAUNCHES}) held.push(action.running.some(s => s.kind === 'unit' && s.id === asking));
+                    if (action.action === 'startable' && waiting !== null) held.push(action.running.includes(waiting));
                     return real.research_query(action);
                 }},
-                agent: async ({{prompt}}) => {{
-                    if (++launched === {LAUNCHES}) finish();
-                    if (asking !== null || !prompt.startsWith('Follow-up')) return {{id: 8, state: 'failed', error: 'stub'}};
-                    asking = Number(prompt.match(/\\d+/)[0]);
-                    return answered();
+                agent: async args => {{
+                    if (++launched === {SWEEPS} * 2 - 1) begin();
+                    if (launched > 1) return real.agent(args);
+                    waiting = Number(args.prompt.match(/\\d+/)[0]);
+                    await others;
+                    waiting = null;
+                    return real.agent(args);
                 }},
             }};
             const receive = () => new Promise(() => {{}});
             const workers = 2;"
         );
-        let returned = "{launched, held, left: outcome.left, unit: (await real.research_query({action: 'unit', unit: asking})).unwrap()}";
+        let returned = "{launched, held, exhausted: outcome.synthesis.exhausted.length}";
         let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
         assert_eq!(result["launched"], json!(LAUNCHES), "{result}");
-        assert_eq!(result["left"], json!({}), "{result}");
-        assert_eq!(result["unit"]["outcome"]["note"], "answered", "{result}");
+        assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
         let held = result["held"].as_array().unwrap();
         assert!(
             !held.is_empty() && held.iter().all(|running| running == true),
@@ -1026,145 +1109,325 @@ mod tests {
         fixture.close().await;
     }
 
-    /// The store passes over the tests the scheduler may not start: one slot and an
-    /// approval reach the approved test behind many unapproved ones, then the report
-    /// behind them all, a page per launch; with tests still held, it waits for steering.
-    #[tokio::test]
-    async fn the_scheduler_reaches_work_behind_held_tests_in_one_read() {
-        use crate::store::{
-            PocResult, Store,
-            tests::{poc, root_of, validated},
-        };
-        const HELD: usize = 30;
-        let fixture = Fixture::new(all_capabilities()).await;
-        let store = Store::of(fixture.session.store().extension().unwrap());
-        let agent = fixture.session.root_agent().clone();
-        let (approved, root) = tokio::task::spawn_blocking(move || {
-            let actor = agent;
-            for _ in 0..HELD {
-                validated(&store, &actor);
+    /// `count` candidates on one parser component along one path a source enters, which owes
+    /// its sweep: each on a flaw of its own, or all on the first one's, sharing its root;
+    /// identified, or assessed and validated. Returns the path and each candidate with its root.
+    async fn candidates(fixture: &Fixture, count: usize, shared: bool, validated: bool) -> Value {
+        fixture.script(format!(r#"
+            const research = async action => (await tool.research(action)).unwrap();
+            const at = (file, line) => ({{file, start_line: line, end_line: line}});
+            const component = await research({{action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']}});
+            const path = await research({{action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'}});
+            const source = await research({{action:'upsert',kind:'source',title:'request',body:'the raw request',location:at('input.c',1),trust:'untrusted'}});
+            await research({{action:'link',links:[{{path_source:{{path,source}}}},{{path_step:{{path,component,note:'parse is called on every request'}}}}]}});
+            const candidates = [];
+            let flaw;
+            for (let i = 0; i < {count}; i++) {{
+                if (i === 0 || !{shared}) flaw = await research({{action:'upsert',kind:'flaw',title:`Unchecked copy ${{i}}`,body:'the request length is copied into a fixed buffer',component,location:at('input.c',8 + i)}});
+                const candidate = await research({{action:'upsert',kind:'candidate',title:`Unchecked copy ${{i}}`,body:'request length overflows a fixed buffer',path,flaws:[flaw]}});
+                if ({validated}) {{
+                    await research({{...{assess},candidate}});
+                    await research({{action:'verdict',candidate,verdict:'validated',note:'reviewed the path'}});
+                }}
+                candidates.push({{candidate, root: flaw}});
+            }}
+            return {{path, candidates}};
+        "#, assess = assessment(&Value::Null))).await
+    }
+
+    /// A decision that lets the first child briefed with `prefix` and a node never begin, nor
+    /// any later child briefed so with that node, and `otherwise` decide the rest.
+    fn unbegun_first(
+        prefix: &'static str,
+        otherwise: fn(&str) -> Then,
+    ) -> impl Fn(&str) -> Then + Send + Sync + 'static {
+        let first = std::sync::Mutex::new(None::<String>);
+        move |brief| {
+            let Some(rest) = brief.strip_prefix(prefix) else {
+                return otherwise(brief);
+            };
+            let node = rest.split(' ').next().unwrap().to_owned();
+            let mut first = first.lock().unwrap();
+            match *first.get_or_insert_with(|| node.clone()) == node {
+                true => Then::Unbegun,
+                false => otherwise(brief),
             }
-            let approved = validated(&store, &actor);
-            let tested = validated(&store, &actor);
-            poc(&store, &actor, tested, PocResult::Confirmed);
-            store.set_poc_policy(PocPolicy::Ask).unwrap();
-            (json!(approved), json!(root_of(&store, tested)))
+        }
+    }
+
+    fn sweeps_then_fail(brief: &str) -> Then {
+        match brief.starts_with("Sweep") {
+            true => SWEEP,
+            false => Then::Fail,
+        }
+    }
+
+    async fn set_policy(fixture: &Fixture, poc: PocPolicy) {
+        let store = Store::of(fixture.session.store().extension().unwrap());
+        tokio::task::spawn_blocking(move || store.set_poc_policy(poc))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A child that fails before it begins its task counts toward its node's two tries in the
+    /// run: the node is launched twice, then listed exhausted with its last child's reply,
+    /// though the store holds no task of it. Running no more, it takes no test slot: with one,
+    /// the next test runs and none is held.
+    #[tokio::test]
+    async fn the_scheduler_returns_a_subject_whose_children_never_began() {
+        let fixture =
+            Fixture::with_children(unbegun_first("Demonstrate candidate ", sweeps_then_fail)).await;
+        let made = candidates(&fixture, 2, false, true).await;
+        let [first, second] = [0, 1].map(|i| made["candidates"][i].clone());
+        set_policy(&fixture, PocPolicy::Yes).await;
+        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
+        let body = scheduler(PocPolicy::Yes).replace("const pocSlots = 0;", "const pocSlots = 1;");
+        let returned = "{tests: started.filter(p => p.startsWith('Demonstrate')).map(p => Number(p.match(/\\d+/)[0])), held: outcome.held, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node]), reply: outcome.synthesis.exhausted[0].reply}";
+        let mut result = run_template(&fixture, &stubs, &body, returned).await;
+        let reply = result["reply"].take();
+        let (c1, c2) = (&first["candidate"], &second["candidate"]);
+        assert_eq!(
+            result,
+            json!({
+                "tests": [c1, c1, c2, c2],
+                "held": false,
+                "exhausted": [["test", c1], ["test", c2], ["report", first["root"]], ["report", second["root"]]],
+                "reply": null,
+            })
+        );
+        let reply = reply.as_str().unwrap();
+        assert!(reply.contains("the child failed"), "{reply}");
+        fixture.close().await;
+    }
+
+    /// A node spent on children that never began is exhausted for the rest of the run, so what
+    /// waits on its exhaustion goes ahead: the test of a candidate sharing its root, then the
+    /// root's report.
+    #[tokio::test]
+    async fn a_spent_test_releases_its_root_group_in_the_same_run() {
+        let fixture =
+            Fixture::with_children(unbegun_first("Demonstrate candidate ", sweeps_then_fail)).await;
+        let made = candidates(&fixture, 2, true, true).await;
+        set_policy(&fixture, PocPolicy::Yes).await;
+        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
+        let body = scheduler(PocPolicy::Yes).replace("const pocSlots = 0;", "const pocSlots = 1;");
+        let returned = format!(
+            "{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
+        );
+        let (c1, c2, root) = (
+            &made["candidates"][0]["candidate"],
+            &made["candidates"][1]["candidate"],
+            &made["candidates"][0]["root"],
+        );
+        let (test, report) = ("Demonstrate candidate", format!("Report root flaw {root}"));
+        assert_eq!(
+            run_template(&fixture, &stubs, &body, &returned).await,
+            json!({
+                "started": [format!("Sweep path {}", made["path"]), format!("{test} {c1}"), format!("{test} {c1}"),
+                    format!("{test} {c2}"), format!("{test} {c2}"), &report, &report],
+                "exhausted": [["test", c1], ["test", c2], ["report", root]],
+            })
+        );
+        fixture.close().await;
+    }
+
+    /// A second launch that settles the work it was spent on suppresses nothing: the
+    /// assessment's first child never begins and its second records it, so the candidate's
+    /// review starts in the same run and nothing is exhausted.
+    #[tokio::test]
+    async fn a_launch_that_settles_spent_work_releases_its_next_phase() {
+        let assessments = std::sync::atomic::AtomicBool::new(false);
+        let fixture = Fixture::with_children(move |brief| {
+            if brief.starts_with("Sweep") {
+                SWEEP
+            } else if brief.starts_with("Assess") {
+                match assessments.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    false => Then::Unbegun,
+                    true => Then::Record(assessment),
+                }
+            } else {
+                Then::Record(|candidate| {
+                    json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"})
+                })
+            }
         })
-        .await
-        .unwrap();
+        .await;
+        let made = candidates(&fixture, 1, false, false).await;
+        let stubs = format!("{RECORDING}\nconst workers = 1;");
+        let returned = format!("{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted}}");
+        let candidate = &made["candidates"][0]["candidate"];
+        assert_eq!(
+            run_template(&fixture, &stubs, &scheduler(PocPolicy::No), &returned).await,
+            json!({
+                "started": [format!("Sweep path {}", made["path"]), format!("Assess candidate {candidate}"),
+                    format!("Assess candidate {candidate}"), format!("Review candidate {candidate}")],
+                "exhausted": [],
+            })
+        );
+        fixture.close().await;
+    }
+
+    /// The scheduler returns with held tests and nothing else to start; run again with an
+    /// approval and a slot, the store passes over the tests it may still not start to reach
+    /// the approved one, a page per launch. Two children leaving that test owed exhaust it,
+    /// which releases its root's report.
+    #[tokio::test]
+    async fn the_scheduler_returns_held_tests_and_reaches_the_approved_one_when_rerun() {
+        const CANDIDATES: usize = 31;
+        let fixture = Fixture::with_children(sweeps_then_fail).await;
+        let made = candidates(&fixture, CANDIDATES, false, true).await;
+        let approved = made["candidates"][CANDIDATES - 1].clone();
+        set_policy(&fixture, PocPolicy::Ask).await;
         let stubs = "let reads = 0;
             const started = [], real = globalThis.tool;
             const tool = {
                 jobs: real.jobs, research: real.research,
                 research_query: action => (action.action === 'startable' && reads++, real.research_query(action)),
-                agent: async ({prompt}) => (started.push(prompt.match(/^\\D+\\d+/)[0]), {id: 8, state: 'failed', error: 'stub'}),
+                agent: args => (started.push(args.prompt), real.agent(args)),
             };
-            const receive = () => reads >= 5 ? Promise.resolve({stop: true}) : new Promise(() => {});
+            const receive = () => new Promise(() => {});
             const workers = 1, artifacts = 'artifacts';";
-        let body = scheduler(PocPolicy::Ask);
-        let inputs = [
-            (
-                "new Set(/* under ask: candidates the user approved */)",
-                format!("new Set([{approved}])"),
-            ),
-            ("let pocSlots = 0;", "let pocSlots = 1;".to_owned()),
-        ];
-        let body = inputs.iter().fold(body, |body, (input, value)| {
-            assert!(body.contains(input), "{input}");
-            body.replace(input, value)
-        });
-        let returned = "{reads, started, left: Object.keys(outcome.left)}";
-        let result = run_template(&fixture, stubs, &body, returned).await;
-        // What was tried twice and is still owed is left.
-        let (test, report) = (
-            format!("Demonstrate candidate {approved}"),
-            format!("Report root flaw {root}"),
-        );
+        let returned = format!("{{reads, started: {BRIEFS}, held: outcome.held}}");
+        let run = async |inputs: Vec<(&'static str, String)>| {
+            let body = inputs
+                .iter()
+                .fold(scheduler(PocPolicy::Ask), |body, (input, value)| {
+                    assert!(body.contains(input), "{input}");
+                    body.replace(input, value)
+                });
+            run_template(&fixture, stubs, &body, &returned).await
+        };
         assert_eq!(
-            result,
-            json!({"reads": 5, "started": [&test, &test, &report, &report], "left": ["poc", "report"]})
+            run(Vec::new()).await,
+            json!({"reads": 2, "started": [format!("Sweep path {}", made["path"])], "held": true})
+        );
+        let test = format!("Demonstrate candidate {}", approved["candidate"]);
+        let report = format!("Report root flaw {}", approved["root"]);
+        let rerun = run(vec![
+            (
+                "[/* under ask: candidates the user approved */]",
+                format!("[{}]", approved["candidate"]),
+            ),
+            ("const pocSlots = 0;", "const pocSlots = 1;".to_owned()),
+        ]);
+        assert_eq!(
+            rerun.await,
+            json!({"reads": 5, "started": [&test, &test, &report, &report], "held": true})
         );
         fixture.close().await;
     }
 
-    /// An owed check's child is briefed with its contract, and plans the check by naming it.
+    /// A sweep's and a chain's children are briefed with the path and the flaw and their
+    /// titles; a sweep two children left owed is exhausted, which releases the chain it held
+    /// back.
     #[tokio::test]
-    async fn the_scheduler_briefs_an_owed_check_with_its_contract() {
-        use crate::store::{
-            Store,
-            tests::{component, path, reviewed},
-        };
-        let fixture = Fixture::new(all_capabilities()).await;
+    async fn the_scheduler_briefs_sweeps_and_chains_and_exhausts_what_children_leave_owed() {
+        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        let path = sweeps(&fixture, 1).await[0];
         let store = Store::of(fixture.session.store().extension().unwrap());
         let agent = fixture.session.root_agent().clone();
-        tokio::task::spawn_blocking(move || {
-            let actor = agent;
-            let decoder = component(&store, &actor, "decoder");
-            path(&store, &actor, "stream", &[decoder]);
-            reviewed(&store, &actor);
+        let flaw = tokio::task::spawn_blocking(move || {
+            let NodeView::Path(view) = store.node(path.into()).unwrap() else {
+                panic!("a path")
+            };
+            let component = view.steps[0].component.id.get().try_into().unwrap();
+            crate::store::tests::flaw(&store, &agent, component)
         })
         .await
         .unwrap();
-        let stubs = "const started = [], real = globalThis.tool;
-            (await real.research({action: 'retry_site', location: {file: 'decoder/lib.c', start_line: 9, end_line: 9, function: 'DecodeStream'}, status: 'NEEDS_MORE_INPUT', class: 'invalid'})).unwrap();
-            const owed = (await real.research_query({action: 'startable', limit: 1000})).unwrap().items.find(e => e.phase === 'check').subject;
-            let planned;
-            const tool = {
-                jobs: real.jobs, research: real.research, research_query: real.research_query,
-                agent: async ({prompt}) => {
-                    started.push(prompt.match(/^\\D+\\d+/)[0]);
-                    const contract = prompt.match(/^Check contract (\\d+)\\./)?.[1];
-                    if (contract) planned = (await real.research({action: 'add_check', contract: Number(contract), question: 'does it keep its contract?', stopping: 'a guarantee or a flaw'})).unwrap();
-                    return {id: 8, state: 'failed', error: 'stub'};
-                },
-            };
-            const receive = () => new Promise(() => {});
-            const workers = 1;";
-        let returned = "{owed, started: started, check: (await real.research_query({action: 'unit', unit: planned})).unwrap().check.contract}";
-        let result = run_template(&fixture, stubs, &scheduler(PocPolicy::No), returned).await;
-        let (contract, unit) = (&result["check"], result["started"][1].as_str().unwrap());
-        assert_eq!(result["owed"], json!({"kind": "contract", "id": contract}));
-        assert_eq!(
-            result["started"],
-            json!([format!("Check contract {contract}"), unit, unit])
+        let stubs = format!("{RECORDING}\nconst workers = 1;");
+        let returned =
+            "{started, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}";
+        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
+        let (sweep, chain) = (
+            format!("Sweep path {path} (part0)."),
+            format!("Chain flaw {flaw} (unbounded copy)."),
         );
-        assert!(unit.starts_with("Question unit "), "{unit}");
+        assert_eq!(
+            result,
+            json!({
+                "started": [&sweep, &sweep, &chain, &chain],
+                "exhausted": [["sweep", path], ["chain", flaw]],
+            })
+        );
         fixture.close().await;
     }
 
-    /// The component's measuring script sizes each of its files from the directory listings,
-    /// leaving out a listed file the component does not hold.
+    /// The scheduler keeps nothing the store does not: killed while one child runs and a
+    /// relaunch waits to begin, a new scheduler gives the node whose child failed once
+    /// exactly one more try, and the killed child's node its second, then each is exhausted.
     #[tokio::test]
-    async fn the_component_script_measures_its_files() {
-        let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
-        for (file, bytes) in [
-            ("src/a.c", 10),
-            ("src/b.c", 3),
-            ("src/other.c", 5),
-            ("main.c", 1),
-        ] {
-            let path = fixture._root.path().join(file);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, "x".repeat(bytes)).unwrap();
-        }
-        let component = fixture
-            .success("research", json!({"action":"add_component","name":"parser","description":"request parser","files":["src/a.c","src/b.c","main.c"]}))
-            .await;
-        let unit = fixture
-            .success(
-                "research",
-                json!({"action":"add_unit","kind":"sweep","component":component}),
-            )
-            .await;
-        let body = template_body(include_str!("../prompts/component.md"));
-        let result = fixture
-            .script(format!("const unit = {unit};\n{body}"))
-            .await;
+    async fn a_rerun_scheduler_carries_over_what_the_killed_one_tried() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        // The parser's children run until the first scheduler is killed; every other fails.
+        let killing = Arc::new(AtomicBool::new(true));
+        let hangs = killing.clone();
+        let fixture = Fixture::with_children(move |brief| {
+            match brief.contains("(part1)") && hangs.load(SeqCst) {
+                true => Then::Hang,
+                false => Then::Fail,
+            }
+        })
+        .await;
+        let paths = sweeps(&fixture, 2).await;
+        let (decoder, parser) = (paths[0], paths[1]);
+        // The decoder's second launch never reaches its child.
+        let killed = format!(
+            "{RECORDING}
+            tool.agent = args => (started.push(args.prompt), started.filter(p => p === args.prompt).length > 1 && args.prompt.includes('(part0)') ? new Promise(() => {{}}) : real.agent(args));
+            const workers = 2;"
+        );
+        let store = Store::of(fixture.session.store().extension().unwrap());
+        let mut updates = fixture.session.store().observe().updates;
+        let tried = async {
+            loop {
+                let store = store.clone();
+                let tasks = tokio::task::spawn_blocking(move || store.tasks(10).unwrap())
+                    .await
+                    .unwrap();
+                let state = |path: PathId| {
+                    (tasks.iter())
+                        .filter(|task| task.subjects == [NodeId::from(path)])
+                        .map(|task| task.state)
+                        .collect::<Vec<_>>()
+                };
+                use skyhook::job::JobState::{Failed, Running};
+                if state(decoder) == [Failed] && state(parser) == [Running] {
+                    break;
+                }
+                // A begun task's call and a job's move each journal a record; a lag skipped some.
+                if let Err(tokio::sync::broadcast::error::RecvError::Closed) = updates.recv().await
+                {
+                    panic!("the session closed");
+                }
+            }
+            let script = (fixture.session.jobs().active(fixture.session.root_agent()))
+                .into_iter()
+                .find(|job| job.tool == "script")
+                .unwrap();
+            fixture.session.cancel_job(script.id).await.unwrap();
+            killing.store(false, SeqCst);
+        };
+        // Killed, the script fails; what it left is the store's.
+        let run = fixture
+            .session
+            .run_script(format!("{killed}\n{}", scheduler(PocPolicy::No)));
+        let _ = bounded(async { tokio::join!(run, tried) }).await;
+
+        let stubs = format!("{RECORDING}\nconst workers = 2;");
+        let returned =
+            "{started, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}";
+        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
         assert_eq!(
             result,
-            json!({"component": component, "files": 3, "bytes": 14, "largest": [
-                {"file": "src/a.c", "bytes": 10}, {"file": "src/b.c", "bytes": 3}, {"file": "main.c", "bytes": 1},
-            ]})
+            json!({
+                "started": [
+                    format!("Sweep path {decoder} (part0)."),
+                    format!("Sweep path {parser} (part1)."),
+                ],
+                "exhausted": [["sweep", decoder], ["sweep", parser]],
+            })
         );
         fixture.close().await;
     }

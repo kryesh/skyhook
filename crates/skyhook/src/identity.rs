@@ -12,7 +12,7 @@ crate::newtype::string_newtype! {
 }
 
 /// Exactly `N` bytes of hexadecimal in either case.
-pub fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+pub(crate) fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     // Radix parsing alone would accept a leading `+`.
     if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -24,7 +24,7 @@ pub fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-pub fn write_hex(bytes: &[u8], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+pub(crate) fn write_hex(bytes: &[u8], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     bytes
         .iter()
         .try_for_each(|byte| write!(formatter, "{byte:02x}"))

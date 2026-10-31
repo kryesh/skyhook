@@ -3,95 +3,49 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use skyhook::{
-    db::{Db, DbResult, Dictionaries, Seeding, enum_column, params},
+    db::{Db, DbResult, Dictionaries, Seeding, bytes, enum_column, params},
     identity::SessionId,
     session::{Extension, ExtensionDb, SessionError},
 };
 
 use super::*;
-use crate::cvss::BaseMetric;
 
 /// The research tables every security session keeps beside its journal.
 pub const EXTENSION: Extension = Extension {
-    sql: include_str!("schema.sql"),
-    format: 1,
+    sql: concat!(include_str!("schema.sql"), bearing::derived_views!()),
+    format: 12,
     seed,
 };
 
 fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     let dictionaries = Dictionaries(db, seeding);
-    dictionaries.names("poc_policy_kind", &PocPolicy::ALL)?;
-    dictionaries.ranked("severity_kind", &Severity::ALL)?;
-    dictionaries.names("confidence_kind", &Confidence::ALL)?;
-    dictionaries.names("evidence_role", &EvidenceRole::ALL)?;
-    dictionaries.names("evidence_stance", &Stance::ALL)?;
-    dictionaries.names("relation_kind", &RelationKind::ALL)?;
-    dictionaries.names("verdict_kind", &VerdictKind::ALL)?;
-    dictionaries.names("rejection_reason", &RejectionReason::ALL)?;
-    dictionaries.names("poc_result_kind", &PocResult::ALL)?;
-    dictionaries.names("artifact_role", &ArtifactRole::ALL)?;
-    dictionaries.names("instruction_part", &InstructionPart::ALL)?;
-    dictionaries.names("event_kind", &EventKind::ALL)?;
-    dictionaries.names("credential_reference_kind", &CredentialReferenceKind::ALL)?;
-    dictionaries.names("source_kind", &SourceKind::ALL)?;
-    dictionaries.flagged("trust_kind", ["untrusted"], &Trust::ALL, |trust| {
-        [trust.untrusted()]
+    dictionaries.names("node_kind", &NodeKind::ALL)?;
+    dictionaries.columns("task_phase", ["subject", "stage"], &Phase::ALL, |phase| {
+        [
+            libsql::Value::Text(phase.subject().as_str().to_owned()),
+            libsql::Value::Integer(phase.stage().into()),
+        ]
     })?;
-    dictionaries.flagged(
-        "invariant_kind",
-        ["load_bearing"],
-        &InvariantKind::ALL,
-        |kind| [kind.load_bearing()],
-    )?;
-    dictionaries.names("misreport_kind", &Misreport::ALL)?;
-    dictionaries.names("retry_class", &RetryClass::ALL)?;
-    dictionaries.names("unit_kind", &UnitKind::ALL)?;
-    dictionaries.names("outcome_kind", &Outcome::ALL)?;
-    dictionaries.names("operation_kind", &OperationKind::ALL)?;
-    dictionaries.names("guard_kind", &GuardKind::ALL)?;
-    dictionaries.names("deficiency_kind", &DeficiencyKind::ALL)?;
-    dictionaries.names("property_kind", &Property::ALL)?;
-    dictionaries.names("resolution_kind", &ResolutionKind::ALL)?;
-    dictionaries.names("deployment_kind", &DeploymentKind::ALL)?;
-    dictionaries.names("deployment_stance", &DeploymentStance::ALL)?;
-    dictionaries.names("tree_state", &Tree::ALL)?;
-    dictionaries.names("exposure_outcome", &ExposureOutcome::ALL)?;
-    dictionaries.names("route_basis", &RouteBasis::ALL)?;
-    dictionaries.names("gate_kind", &GateKind::ALL)?;
-    dictionaries.names("cvss_metric", &BaseMetric::ALL)
+    dictionaries.names("trust_kind", &Trust::ALL)?;
+    dictionaries.names("premise_scope", &PremiseScope::ALL)?;
+    dictionaries.names("premise_status", &PremiseStatus::ALL)?;
+    dictionaries.names("flaw_status", &FlawStatus::ALL)?;
+    dictionaries.ranked("severity_kind", &Severity::ALL)?;
+    dictionaries.names("verdict_kind", &Verdict::ALL)?;
+    dictionaries.names("stance_kind", &Stance::ALL)?;
+    dictionaries.names("test_result", &TestResult::ALL)?;
+    dictionaries.names("artifact_role", &ArtifactRole::ALL)?;
+    dictionaries.names("event_kind", &EventKind::ALL)?;
+    dictionaries.ranked("event_effect", &EventEffect::ALL)?;
+    dictionaries.names("poc_policy_kind", &PocPolicy::ALL)
 }
 
-/// The root flaws whose latest finding is not withdrawn.
-pub(super) fn findings(db: &Db) -> Result<u64> {
-    count(
-        db,
-        concat!(
-            "SELECT count(*) FROM finding f WHERE ",
-            report::latest_finding!("f"),
-            " AND ",
-            queues::group_reportable!("f.root")
-        ),
-        Vec::new(),
-    )
-}
-
-pub(super) fn revision_columns(row: &libsql::Row, offset: i32) -> Result<Revision> {
-    Ok(Revision {
-        commit: row
-            .get::<Option<String>>(offset)?
-            .map(|text| text.parse())
-            .transpose()?,
-        tree: enum_column(row, offset + 1)?,
-    })
-}
-
-/// The run: its session, when it began, the revision it started at, its options, and the PoC
-/// policy of the launch working it. A report states it without what a later launch changes.
+/// The run: its session, when it began, its options, and the PoC policy of the launch
+/// working it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Run {
     pub id: SessionId,
     pub created: DateTime<Utc>,
-    pub revision: Revision,
     #[serde(flatten)]
     pub options: RunOptions,
     #[serde(skip)]
@@ -101,26 +55,27 @@ pub struct Run {
 pub(super) fn run(db: &Db) -> Result<Run> {
     optional(
         db,
-        "SELECT s.public_id,r.created,r.revision,r.tree,r.threshold,r.workers,r.poc FROM run r \
-         JOIN session s",
+        "SELECT s.public_id,r.created,r.threshold,r.workers,r.poc FROM run r JOIN session s",
         Vec::new(),
         |row| {
             Ok(Run {
-                id: session_column(row, 0)?,
+                id: SessionId::from_bytes(bytes(row.get(0)?)?),
                 created: time(row.get(1)?)?,
-                revision: revision_columns(row, 2)?,
                 options: RunOptions {
-                    threshold: enum_column(row, 4)?,
-                    workers: u16::try_from(row.get::<i64>(5)?)
+                    threshold: enum_column(row, 2)?,
+                    workers: u16::try_from(row.get::<i64>(3)?)
                         .ok()
                         .and_then(std::num::NonZeroU16::new)
                         .ok_or_else(|| corrupt("invalid stored worker count"))?,
                 },
-                poc: enum_column(row, 6)?,
+                poc: enum_column(row, 4)?,
             })
         },
     )?
-    .ok_or_else(|| Record::Run.missing())
+    .ok_or(Error::NotFound {
+        record: Record::Run,
+        id: None,
+    })
 }
 
 impl Store {
@@ -151,7 +106,7 @@ impl Store {
         self.0.directory()
     }
 
-    /// Where this run's PoC artifacts live; `record_poc` references resolve below it.
+    /// Where this run's test artifacts live; test records reference files below it.
     pub fn artifact_root(&self) -> PathBuf {
         self.directory().join("artifacts")
     }
@@ -167,24 +122,12 @@ impl Store {
         self.read(|db| exists(db, "SELECT 1 FROM run", Vec::new()))
     }
 
-    /// Record the run as its session opens, at `revision` under the launch's PoC policy.
-    pub fn start_run(
-        &self,
-        options: RunOptions,
-        revision: &Revision,
-        poc: PocPolicy,
-    ) -> Result<()> {
+    /// Record the run as its session opens, under the launch's PoC policy.
+    pub fn start_run(&self, options: RunOptions, poc: PocPolicy) -> Result<()> {
         self.write(|db| {
             db.execute(
-                "INSERT INTO run(id,created,threshold,workers,revision,tree,poc) VALUES (1,?1,?2,?3,?4,?5,?6)",
-                params![
-                    now(),
-                    options.threshold,
-                    options.workers.get(),
-                    revision.commit.map(|commit| commit.to_string()),
-                    revision.tree,
-                    poc
-                ],
+                "INSERT INTO run(id,created,threshold,workers,poc) VALUES (1,?1,?2,?3,?4)",
+                params![now(), options.threshold, options.workers.get(), poc],
             )?;
             Ok(())
         })
@@ -208,10 +151,5 @@ impl Store {
 
     pub fn run(&self) -> Result<Run> {
         self.read(run)
-    }
-
-    /// How many root flaws a standing finding reports.
-    pub fn finding_count(&self) -> Result<u64> {
-        self.read(findings)
     }
 }

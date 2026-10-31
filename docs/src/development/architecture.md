@@ -42,58 +42,103 @@ embedded research modes replacing presets whole (each session renders their mark
 for its launch's PoC policy, so only a launch that may test reads them), model-role hints, native
 tools, a report writer, and research tables it keeps in each of its sessions' own `session.db`
 beside the journal as a session [extension](embedding.md#sharing-the-cli-and-terminal). A
-session is the run: it records the run as it opens, with the revision it started at and the PoC
-policy of the launch working it, and a resumed session continues it. The run's PoC artifacts and current reports live in subdirectories
-of the session directory. The [security guide](../guide/security.md) describes the research
-behaviour; this section covers how it is held.
+session is the run: it records the run as it opens, with the PoC policy of the launch working
+it, and a resumed session continues it. The run's test artifacts and current reports live in
+subdirectories of the session directory. The [security guide](../guide/security.md) describes
+the research behaviour; this section covers how it is held.
 
-The root agent receives the run's facts as host state with each request, cached per store write
-generation; the agents below it get none, and the facts they need travel in their briefs.
-Workflow attention is read separately from the live journal on each root request: when no child
-agents are active, a live root script whose latest `startable` page offered no work but held
-tests gets a reminder to check approvals, unblocks, slots and scope questions. The scheduling
-call identifies the script, not its name or source. Job transitions do not invalidate the
-research cache, so this read is uncached.
-The reminder neither grants approval nor interrupts an in-flight tool call.
-Coverage, which is costlier, is read only for the Research tab, `runs` and the `coverage` query.
-The Research tab renders those facts as a page of typed blocks, which the host lays out once per
-page, disclosure and width and only turns its spinners as it draws.
+The root agent receives the run's facts as host state with each request; the agents below it get
+none, and the facts they need travel in their briefs. Running and exhausted work depend on the
+state of agent jobs, which changes without a research write, so every cached read that touches
+them (host state, the Research page and its open tests) keys on a journal watermark, the latest
+agent job transition or finish, beside the store's write generation. The Research tab renders
+those facts as a page of typed blocks, which the host lays out once per page, disclosure and
+width and only turns its spinners as it draws.
 
-The store is a compact ledger rather than a code graph, and what the guide calls a state is
-derived from its records rather than stored. Flaws, paths, candidates and premises carry
-revisions that material writes bump, and a restating write leaves them alone; assessments,
-verdicts, exposure decisions and the resolutions of candidates' conditions record the revisions
-they saw, so a candidate's status and confidence follow from its records at its current revision
-and a changed candidate is owed assessment again with no action. Tests record a separate count
-of contradictions, so only those reopen them. What a candidate relies on is derived
-(`candidate_condition`): its links to its own, deployment and flaw conditions, and its member
-flaws' conditions. Root flaws are derived by following `enables`
-relations back from a candidate's members; a finding is keyed by the set of scenarios it
-publishes at their assessment, verdict and test (its generation, which the report queue's basis
-also names), and its status is derived by comparing that set with its group's reportable one. A
-finding stores its reporter's prose in typed rows beside the facts it states, and the sizes and
-digests of the artifacts it copies. `reports/` is a projection of the current findings that the
-orchestrator's `generate` renders from the store alone, so a populate whose commit is unknown is
-settled by what the store holds and no store write touches files.
+The store is one graph. Every object is a `node` of one kind (component, path, source,
+premise, flaw, candidate, finding) with a title and a body; a per-kind detail table shares its
+id, and a composite key to `node(id, kind)` makes the schema guarantee a detail row's kind.
+Edges are tables between detail rows: a path's ordered steps through components and its
+sources, the premises a flaw or a path relies on, and a candidate's ordered chain of flaws,
+whose first is its root. Ordered edges keep positions 0..n-1 through the writes that move them.
+Duplicate premises, flaws and candidates merge; the other kinds are corrected by relinking. A
+merge repoints every edge of the merged node to the survivor, and `merged_into` is one hop, so
+readers never resolve merges on edges; an id argument naming a merged node resolves to the
+survivor at the boundary.
 
-Coverage is the review plan. Units the store plans in reaction to a record are planned by the
-root agent, so the agent whose record caused them may complete them; each triggering
-record plans afresh, and the scheduler, not the store, keeps duplicates to one agent. A
-contract's check is owed rather than planned: the `check` queue derives it from what bore on
-the contract after its latest check, ordered by the audit events that recorded them rather than
-by clock, and a check planned while owed is the run's. Queues are
-plain reads of open units of one kind, of candidates owing a phase, or of root flaws owing a
-report; work settled once is owed again only when a record it rests on is newer than its latest
-attempt, again by audit event. The orchestrator's scheduler reads the store's bounded
-`startable` page, offered only under `security.coordinate`, passing the subjects it
-runs, the attempts it spent and the tests it may start (slots, approvals and unblocks), and
-holds each subject from launch until its child finishes. The host capabilities
-`security.research`, `security.verdict` and `security.test` gate every research mutation, and
-`security.coordinate` scheduling and report generation; the store enforces lifecycle, not
-permissions. Read-only tool actions and the host state run on the session's read pool beside its one writer, whose research callers take turns
-without holding a thread; an action whose work is mostly files (recording a test, generating a
-report) runs outside that turn, its transactions still taking the writer one at a time.
-Everything a write decides reads inside the write's own transaction.
+Every write is one `event` in one audit log, by the journal's agent row, with the actor's note,
+and `event_node` names each node it bears on with the strongest of three ordered effects:
+`concerns`, `standing` or `changed`. A write names its direct marks, and one rule carries
+them along the graph as it stands after the write: a premise moves the standing of the flaws
+and paths relying on it, a source passes its effect to the paths it enters, and a flaw or path
+passes its effect to the live candidates holding it. Some marks stand on their node alone: a
+candidate taking or losing a flaw as its root marks that flaw alone, so its other candidates are
+re-owed only when the flaw itself changes, and marking a path swept or unswept moves only its
+sweep. A chain is edited whole through its candidate; a flaw joining or leaving it at another
+place is only concerned, and a chain's work also rests on the verdicts of the candidates holding
+its flaw and on the chain edits it joins or leaves, so a disproval or a leave releases the flaw
+with fresh tries. Results are recorded in place and stamped with the event that recorded them
+(`candidate.assessed`, `candidate.reviewed`, a path's `swept`, a finding's `reported`, and the
+`decided` or `judged` of a premise's or flaw's latest status, restated or not); nothing counts
+revisions. An assessment, verdict, report, flaw judgement or test's verdict recorded within a task
+of its phase on its subject stands on that task's basis rather than on its own event, so another
+agent's change after the task began owes the work again.
+
+What each phase's work on a node reads is its phase's arm of one relation, generated per phase with
+the node bound in every arm so it seeks by node (`bearing`): standing or changed events for a sweep,
+settle, chain or report (the root's and each current member's), changed events for an assessment,
+all but test records for a review, and verdicts, assessments, test records and environments for a
+test. Every arm leaves out what was recorded within a task of that phase on the node: `event_task`
+names the tasks an event's agent and the agents above it held when it was recorded, so a phase's own
+work, its helpers' included, never moves what it rests on. Two events are never left out: a merge,
+which work on the survivor rests on whoever made it, and a pending test's record, which a test
+resumes rather than repeats. A basis is that relation's latest event, or the node's latest while the
+relation has none, so owed work always rests on one; work is owed while its result predates its
+basis, and a notice is one of its events after a task began. Candidate standing (`candidate_state`)
+and confidence are derived views over those results, the chain's flaw and premise statuses, and the
+root group's demonstrations. A premise's or flaw's status counts once set at or after its latest
+material edit or merge into it, but those made within its own settle or chain (`premise_state`,
+`flaw_state`); an edit since reads it as undecided or suspected again, so its settle or chain is
+owed again. A test records the verdict it tested, and one settling test per candidate
+(`settling_test`: its latest that is not pending when that is a decline, which stands across
+verdicts, or else its latest recorded at its latest verdict) decides its demonstration, its
+testing's settlement and what its report states; `finding_scenario` is the validated and noted
+members a root's finding reports.
+
+Scheduling is derived; nothing is planned. Work started is a log: a `task` belongs to the
+journal job of the agent that began it (an agent without a job cannot begin), and its
+`task_node` rows name each subject with its basis, several for a bundle; the keys pin a
+subject's kind to its phase's. A task has no end of its own: its state is the job's
+`job_status`, and its work is done when its subject is no longer owed. A subject is offered
+while its phase owes it, no task of it is live, and fewer than two of its tasks began at its
+current basis; `startable` pages the offered entries in pipeline order, leaving out what running
+work holds and later work an earlier ready bundle touches, and admitting tests by slots,
+approvals and unblocked pending tests. The orchestrator's scheduler keeps only its own run's
+launch replies: an entry launched twice at one basis is passed back as spent, which the one
+exhaustion predicate every queue and hold shares compares with the phase's current basis as it
+does a task's. The synthesis counts owed, running and exhausted work, the undecided deployment
+premises a review waits on, and the components no path reaches. An environment recorded beneath
+a test task is for that test's candidate unless it names another.
+
+An agent with tasks is told of others' changes as a host event: for each subject of its job's tasks,
+the bearing relation's events after the task began and after its cursor (for a subject merged away,
+from the merge that retired it on), which leaves out those the agent or one beneath it recorded.
+Each changed subject gets one digest, never omitted: the event count, the latest event and the kinds seen, with
+its few newest events and their strongest marks, so a delivery is bounded by subjects times recent
+events; the latest event read is the cursor. Nothing is stored: the subscription is the task log. An
+agent found with nothing to be told is skipped until research is written again.
+
+`reports/` is a projection of the findings that report their scenarios as they stand, which the
+orchestrator's `generate` renders from the store alone: a folder per root, replaced in one step
+when what renders changed, holding the reporter's markdown beneath a generated scenario table
+and a folder per stated test whose artifacts are copied only while they match the digest the
+test recorded. The host capabilities `security.research`, `security.verdict` and
+`security.test` gate every research write, and `security.coordinate` scheduling and report
+generation; the store refuses nothing but boundary parsing, unknown ids and integrity, so
+unwanted work is prevented by not scheduling it. Read-only tool actions, the host state and host
+events run on the session's read pool beside its one writer, whose research callers take turns
+without holding a thread; an action whose work is mostly files (recording a test, generating
+reports) runs outside that turn, its transactions still taking the writer one at a time.
 
 ## Configuration and provider entries
 
@@ -402,7 +447,10 @@ the host boundary (`bridge.rs`), and the host fills a response's declared absent
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
 reaches committed history stays pending for delivery
-(`agent/runtime/wait/delivery.rs`, `job/delivery.rs`). A foreground child's replies stay queued
+(`agent/runtime/wait/delivery.rs`, `job/delivery.rs`). A host's events join only the delivery
+before a request, read under the turn's cancellation: the agent's cursor is journal state, a
+pointer from `agent_state` to the message holding its latest host event, moved by that commit,
+and nothing that decides whether an agent has work to take or a wait has resolved reads them. A foreground child's replies stay queued
 for its call instead. Its completed result saves them: the finish drops them from the queue, and
 journals only while the replies queued are those its prepared output saves, preparing the output
 again otherwise (`job/lifecycle.rs`). A call let go of before it returns, or returning anything

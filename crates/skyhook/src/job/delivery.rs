@@ -1,7 +1,7 @@
 //! Lifecycle delivery, claims, and wait semantics.
 
 use super::*;
-use crate::session::Message;
+use crate::session::{HostCursor, HostEvent, Message};
 
 /// Aggregate child-reply bytes one notification batches; a single oversized
 /// reply is still admitted.
@@ -55,6 +55,8 @@ pub(crate) struct Notification {
     /// What each envelope presents.
     deliveries: Vec<Delivery>,
     messages: Vec<AgentMessage>,
+    /// The host's event, read after how far the owner's last one went then.
+    host: Option<(Option<HostCursor>, HostEvent)>,
 }
 
 impl Notification {
@@ -66,12 +68,22 @@ impl Notification {
         &self.envelopes
     }
 
+    pub(crate) fn host(&self) -> Option<&HostEvent> {
+        self.host.as_ref().map(|(_, event)| event)
+    }
+
+    /// Present the host's `event` too, which it read after `since`.
+    pub(crate) fn with_host(&mut self, since: Option<HostCursor>, event: HostEvent) {
+        self.host = Some((since, event));
+    }
+
     /// Commit the owner's `message` presenting this batch, after the owner's
     /// `preceding` entries that apply to it, with an acknowledgement row for each
-    /// job outcome and child reply it delivers, in one transaction. Refused
-    /// [`JobError::Interrupted`] once the owner's turn is not busy, and
-    /// [`JobError::Stale`] when any of them is no longer pending as it was read, so
-    /// the owner presents what is pending now instead.
+    /// job outcome and child reply it delivers, in one transaction; a host event
+    /// moves the owner's cursor as it commits. Refused [`JobError::Interrupted`]
+    /// once the owner's turn is not busy, and [`JobError::Stale`] when any of them is
+    /// no longer pending as it was read, or the owner was given a host event since,
+    /// so the owner presents what is pending now instead.
     pub(crate) async fn commit(
         self,
         preceding: Vec<SessionEvent>,
@@ -82,6 +94,7 @@ impl Notification {
             owner,
             deliveries,
             messages,
+            host,
             ..
         } = self;
         let store = manager.inner.store.clone();
@@ -101,7 +114,10 @@ impl Notification {
                     (child.messages.iter()).any(|m| m.reply.message == reply.message)
                 })
             });
-            if !(current && queued) {
+            let unmoved = host
+                .as_ref()
+                .is_none_or(|(since, _)| state.agent_states.host_cursor(&owner) == *since);
+            if !(current && queued && unmoved) {
                 return Err(JobError::Stale);
             }
             let at = preceding.len();
@@ -237,6 +253,7 @@ impl JobManager {
             envelopes,
             deliveries,
             messages,
+            host: None,
         })
     }
 

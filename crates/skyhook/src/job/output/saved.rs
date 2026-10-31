@@ -60,7 +60,7 @@ impl Product {
 /// A snapshot of the saved product and capture registrations. Capture bytes stay
 /// in the database and are read live, so an open capture can still grow.
 pub(crate) struct Saved {
-    pub(super) output: Output,
+    pub(super) reads: crate::session::Reads,
     pub(super) product: Option<Product>,
     /// Pointers the product references.
     pub(super) fields: BTreeSet<FieldPointer>,
@@ -71,13 +71,21 @@ pub(crate) struct Saved {
 
 impl Saved {
     pub(crate) fn load(output: &Output) -> Result<Self, ToolError> {
-        let run = output.run();
-        output.changes.read(run);
+        output.changes.read(output.run());
+        let rows = output.reads.saved(output.run()).map_err(database)?;
+        Self::of(output.reads.clone(), rows)
+    }
+
+    /// What a run saved, from its `rows`; capture bytes are read through `reads`.
+    pub(crate) fn of(
+        reads: crate::session::Reads,
+        rows: crate::session::SavedRows,
+    ) -> Result<Self, ToolError> {
         let crate::session::SavedRows {
             output: saved,
             captures,
             presented,
-        } = output.reads.saved(run).map_err(database)?;
+        } = rows;
         let (product, fields) = match saved {
             Some(saved) => {
                 let result = saved.result.as_deref().map(serde_json::from_str);
@@ -90,7 +98,7 @@ impl Saved {
             None => (None, BTreeSet::new()),
         };
         Ok(Self {
-            output: output.clone(),
+            reads,
             product,
             fields,
             presented,
@@ -104,10 +112,7 @@ impl Saved {
     /// Any registered capture at `field`, complete or not.
     pub(super) fn capture(&self, field: &FieldPointer) -> Option<Source> {
         self.captures.get(field).map(|capture| {
-            Source::Capture(reader::CaptureReader::new(
-                self.output.reads.clone(),
-                capture.id,
-            ))
+            Source::Capture(reader::CaptureReader::new(self.reads.clone(), capture.id))
         })
     }
 
@@ -119,7 +124,7 @@ impl Saved {
             .contains(field)
             .then(|| self.captures.get(field))
             .flatten()?;
-        let source = reader::CaptureReader::new(self.output.reads.clone(), capture.id);
+        let source = reader::CaptureReader::new(self.reads.clone(), capture.id);
         Some(if capture.detection == Some(json::Detection::Sequence) {
             let source = BufReader::with_capacity(IO_BUFFER_BYTES, source);
             Box::new(json::SequenceArray::new(source))
@@ -324,6 +329,17 @@ pub(super) fn serialized_bytes(
     let mut budget = Budget(limit);
     serde_json::to_writer(&mut budget, value)?;
     Ok(limit - budget.0)
+}
+
+impl Saved {
+    /// The saved result with its stored fields installed; none until the run saved one.
+    pub(crate) fn result(&self) -> Result<Option<Value>, ToolError> {
+        let Some(product) = &self.product else {
+            return Ok(None);
+        };
+        let mut document = hydrate(self, product.document())?;
+        Ok(product.result.is_some().then(|| document["result"].take()))
+    }
 }
 
 /// Install referenced fields into the document.

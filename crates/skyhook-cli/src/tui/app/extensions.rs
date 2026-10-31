@@ -287,11 +287,12 @@ mod tests {
                     .take(open.limit(ITEMS).unwrap_or(0))
                     .map(|item| {
                         let key = RecordKey(item.to_string());
-                        let detail = open.is_open(ITEMS, &key).then(|| {
+                        let detail = open.detail(ITEMS, &key).map(|_| {
                             vec![Detail {
                                 label: Some("about".to_owned()),
                                 cells: vec![Cell::from(format!("detail of {item}"))],
                             }]
+                            .into()
                         });
                         Record {
                             key,
@@ -500,7 +501,7 @@ mod tests {
         key(&mut app, KeyCode::Enter, M::NONE);
         load(&mut app, &extension, &mut work).await;
         let (_, open) = bounded(reads.recv()).await.unwrap();
-        assert!(open.is_open(ITEMS, &RecordKey("59".to_owned())));
+        assert!(open.detail(ITEMS, &RecordKey("59".to_owned())).is_some());
         assert!(draw_sized(&mut app, 90, 30).contains("detail of 59"));
 
         app.scroll(isize::MAX / 2);
@@ -562,7 +563,7 @@ mod tests {
         click(&mut app, detail);
         load(&mut app, &extension, &mut work).await;
         let (_, open) = bounded(reads.recv()).await.unwrap();
-        assert!(!open.is_open(ITEMS, &RecordKey("59".to_owned())));
+        assert!(open.detail(ITEMS, &RecordKey("59".to_owned())).is_none());
         assert!(!draw_sized(&mut app, 90, 30).contains("detail of 59"));
         app.session().unwrap().shutdown().await.unwrap();
     }

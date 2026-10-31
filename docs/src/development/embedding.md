@@ -157,10 +157,11 @@ meters, and `Section`s, collapsible tables of records that each open to their de
 carry a `Tone`, not a colour. The host lays the page out with its own theme, reflowing panels
 and dropping section columns by priority as the width shrinks, and owns disclosure and
 scrolling, so a product needs no terminal code. `Disclosed` says which sections are open, how
-many of their records to supply (`Disclosed::PAGE` at a time), and which records are open:
-supply records and detail only for those. The host reads the shown view about once a second
-and again at once when the viewer opens or closes something. Futures must be
-cancellation-safe. Sanitize untrusted text before returning it.
+many of their records to supply (`Disclosed::PAGE` at a time), and which records are open,
+each with how many of its detail's continued entries to supply, likewise a page at a time: supply
+records and detail only for those, and mark a detail that has more entries than it shows. The
+host reads the shown view about once a second and again at once when the viewer opens or closes
+something. Futures must be cancellation-safe. Sanitize untrusted text before returning it.
 
 Foreign sessions remain view-only: the host hides the composer and title editing
 and withholds the commands that would write, while inspection, transcript copy and export
@@ -258,6 +259,17 @@ read what the host keeps in the session and answer per agent. The host renders t
 workflow's identity, policy and progress, rather than prefixing them to the user's first
 message. Keep it to the agents that act on it: the state changes between requests, so every
 character of it is input a provider's prompt cache cannot reuse.
+
+`HostState::events` gives an agent news from the host's own ordered log instead: what it holds
+for the agent after `since`, the `HostCursor` the agent's last host event went `through`, or from
+its start. A cursor is any non-negative `i64` position (`HostCursor::try_from`), stored as it is.
+The harness asks only as a request is about to be made, so a host event never starts a turn,
+reopens an answered one, keeps an invocation open or ends a `wait`: it joins the job events
+delivered with that request, as `{"kind":"host", …view}` with the view the host built
+(`HostView::try_from` an object naming no `kind` of its own), and commits in one transaction
+with its cursor. Each event is given once, across retries, compaction and reopening; an
+interrupt during the read commits nothing, and a failed read fails the request
+(`HarnessError::HostEvents`). The default gives none.
 
 ## Session origin and host capabilities
 

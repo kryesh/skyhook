@@ -70,10 +70,23 @@ pub trait QuestionHandler: Send + Sync {
 
 pub type HostStateFuture<'a> = Pin<Box<dyn Future<Output = Option<crate::Prose>> + Send + 'a>>;
 
-/// The host's own section of each agent's runtime state.
+pub type HostEventsFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Option<crate::session::HostEvent>,
+                    Box<dyn std::error::Error + Send + Sync>,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// The host's own section of each agent's runtime state, and the events it has for
+/// each agent.
 ///
-/// Rendered by the host, placed by the harness: it joins every request's state block
-/// and the compaction summary's, so what it says is never lost to compaction.
+/// Rendered by the host, placed by the harness: the state joins every request's state
+/// block and the compaction summary's, so what it says is never lost to compaction.
 pub trait HostState: Send + Sync {
     /// The section for `agent`'s next request in a session with the host's tables,
     /// `extension`; `None` adds nothing to that request. An interrupt drops the
@@ -83,6 +96,21 @@ pub trait HostState: Send + Sync {
         extension: &'a crate::session::ExtensionDb,
         agent: &'a AgentId,
     ) -> HostStateFuture<'a>;
+
+    /// What the host's log holds for `agent` after `since`, how far the last event it
+    /// was given went, or from its start when it was given none. Asked only as a
+    /// request is about to be made: the event joins the job events delivered with it,
+    /// in one commit with how far it went, so each is given once and none starts,
+    /// reopens or keeps open the agent's work, or ends a wait. `None` gives nothing; a
+    /// failure fails the request. An interrupt drops the future and commits nothing.
+    fn events<'a>(
+        &'a self,
+        _extension: &'a crate::session::ExtensionDb,
+        _agent: &'a AgentId,
+        _since: Option<crate::session::HostCursor>,
+    ) -> HostEventsFuture<'a> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 pub type ResumeFuture<'a> =

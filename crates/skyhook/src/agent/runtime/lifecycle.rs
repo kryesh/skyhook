@@ -120,7 +120,7 @@ impl SessionRuntime {
             for (agent, origin, name) in ledger.unanswered() {
                 events.push(match state.jobs.released_delegation(agent, &origin) {
                     Some(job) => {
-                        let result = dispatch::released_result(&origin.call_id, name, job);
+                        let result = dispatch::released_result(&origin.call_id, name, &job);
                         (agent.clone(), result)
                     }
                     None => dispatch::unrun_results([(agent, origin, name)].into_iter(), error)
@@ -520,6 +520,19 @@ mod tests {
         let held = held.into_iter().find(|job| job.tool == "agent").unwrap();
         assert!(released.contains(&held.id));
         assert_eq!(held.state, JobState::Interrupted);
+        // Its call is answered as the released job, not as a failure.
+        let answered = records.iter().find_map(|record| match &record.event {
+            SessionEvent::MessageCommitted {
+                message: crate::session::Message::Tool(result),
+            } if record.agent == resumed.root && result.name == "agent" => Some(result),
+            _ => None,
+        });
+        let answered = answered.unwrap();
+        let notice = crate::job::Notice::ChildReleased.as_str();
+        let view =
+            json!({"id": held.id, "state": "interrupted", "presentation": {"notice": notice}});
+        assert_eq!(answered.result, view);
+        assert!(!answered.is_error);
         bounded(resumed.continue_turn()).await.unwrap();
         assert_eq!(terminal(&resumed, held.id).await.state, JobState::Completed);
         shutdown_session(resumed).await;

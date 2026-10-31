@@ -12,8 +12,19 @@ use super::{DATABASE_FILE, Reads, SessionError, SharedDb, db};
 use crate::{
     blocking,
     db::{Db, DbError, DbResult, Own, Seeding, Turn, params},
-    identity::SessionId,
+    identity::{JobId, SessionId},
+    job::{ChildResult, output::Saved},
 };
+
+/// An agent job's brief and final reply as the journal holds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentJobTexts {
+    /// The prompt its launch gave the child.
+    pub prompt: String,
+    /// The reply its latest saved result carries; none until the child replied, or when its
+    /// run saved no reply.
+    pub reply: Option<String>,
+}
 
 /// Tables a product keeps in every session it creates, under a format of their own.
 /// They are mutable, unlike the journal's, and only the product's harness opens them:
@@ -186,6 +197,38 @@ impl ExtensionDb {
         }
     }
 
+    /// Reads that run outside [`read`](Self::read): on the reader a
+    /// [`reading`](Self::reading) holds, otherwise on the writer's connection.
+    fn reads(&self) -> Reads {
+        match (&self.reads, &self.access) {
+            (Reads::Pool(pool), _) if pool.holds() => self.reads.clone(),
+            (_, Access::Session { db, .. }) => Reads::writer(db.clone()),
+            (reads, Access::Inspecting) => reads.clone(),
+        }
+    }
+
+    /// `job`'s brief and its child's latest reply, read whole, when it launched a child
+    /// agent; none for another job. The brief and the reply are each read in a snapshot of
+    /// their own, outside any [`read`](Self::read).
+    pub fn agent_job_texts(&self, job: JobId) -> Result<Option<AgentJobTexts>, DbError> {
+        let Some((prompt, run)) = self.read(|db| db::agent_job(db, job))? else {
+            return Ok(None);
+        };
+        let corrupt =
+            |error: &dyn std::fmt::Display| db::corrupt(format!("agent job result: {error}"));
+        let reads = self.reads();
+        let rows = run.map(|run| reads.saved(run)).transpose()?;
+        let result = (rows.map(|rows| Saved::of(reads, rows)?.result()))
+            .transpose()
+            .map_err(|error| corrupt(&error))?
+            .flatten();
+        let reply = (result.map(serde_json::from_value::<ChildResult>))
+            .transpose()
+            .map_err(|error| corrupt(&error))?
+            .map(|result| result.reply);
+        Ok(Some(AgentJobTexts { prompt, reply }))
+    }
+
     /// Run `write` in one immediate transaction on the session's writer and commit it.
     /// A failed COMMIT is reported as [`Unconfirmed`], apart from work that rolled back.
     pub fn write<T, E: From<DbError> + From<Unconfirmed>>(
@@ -248,6 +291,42 @@ pub(crate) mod tests {
 
     pub(crate) fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
         Dictionaries(db, seeding).names("fixture_kind", &crate::job::JobState::ALL)
+    }
+
+    /// An agent job yields its brief and its child's reply whole, one the saved document
+    /// holds as a capture included, whether read beside a held reader or not; another job
+    /// yields none.
+    #[tokio::test]
+    async fn an_agent_jobs_texts_read_its_reply_whole() {
+        use crate::job::{JobManager, JobRole, JobSpec};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let store = SessionStore::create(&sessions, "test".parse().unwrap(), Some(TABLES))
+            .await
+            .unwrap();
+        let agent = crate::session::tests::started(&store, root.path()).await;
+        let jobs = JobManager::new(store.clone());
+        let spec = JobSpec {
+            role: JobRole::Agent,
+            arguments: serde_json::json!({"prompt": "brief"}),
+            ..JobSpec::test(agent.clone(), "agent")
+        };
+        let child = jobs.test_running(spec).await.into_test_id();
+        let tool = (jobs.test_running(JobSpec::test(agent, "exec")).await).into_test_id();
+        // Longer than a saved document keeps a string inline.
+        let reply = "r".repeat(5000);
+        jobs.test_reply(child, &reply).await;
+        let tables = store.extension().unwrap().clone();
+        let expected = Some(AgentJobTexts {
+            prompt: "brief".into(),
+            reply: Some(reply),
+        });
+        assert_eq!(tables.agent_job_texts(child).unwrap(), expected);
+        let held = tables.clone();
+        let read = move || Ok::<_, SessionError>(held.agent_job_texts(child)?);
+        assert_eq!(tables.reading(read).await.unwrap(), expected);
+        assert_eq!(tables.agent_job_texts(tool).unwrap(), None);
+        store.close().await.unwrap();
     }
 
     pub(crate) const TABLES: Extension = Extension {

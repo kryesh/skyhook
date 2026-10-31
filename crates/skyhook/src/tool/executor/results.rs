@@ -25,7 +25,7 @@ impl ToolExecutor {
         if !waited.state.is_terminal() {
             return Ok(released(
                 job,
-                waited.released_view(self.diagnostic_viewer()),
+                waited.released_view(crate::job::Release::Asked),
             ))
             .into();
         }
@@ -216,7 +216,7 @@ mod tests {
     use serde_json::json;
 
     async fn complete(runtime: &crate::tests::TestRuntime, job: JobId, value: serde_json::Value) {
-        let outcome = crate::job::JobOutcome::Completed(ToolOutput::new(value));
+        let outcome = crate::job::JobOutcome::Completed(ToolOutput::new(value).into());
         runtime.jobs.finish(job, outcome).await.unwrap();
     }
 

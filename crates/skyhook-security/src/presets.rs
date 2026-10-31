@@ -44,6 +44,14 @@ fn mode(
     }
 }
 
+/// Prompt files joined, each followed by its separator. A file's trailing newlines are not
+/// part of it, so only the separators decide the text between parts.
+fn joined(parts: &[(&str, &str)]) -> String {
+    (parts.iter())
+        .flat_map(|(part, separator)| [part.trim_end_matches('\n'), separator])
+        .collect()
+}
+
 /// Mode instructions as a launch under `poc` reads them: a block from `<!-- if poc -->` to
 /// `<!-- end -->` only while the policy may test, one from `<!-- if no poc -->` only while it
 /// may not. The root's instructions change with the policy, so a launch under another policy
@@ -86,50 +94,54 @@ pub fn modes() -> IndexMap<ModeName, Mode> {
         ("target", mode(
             &[Network], &[Research],
             include_str!("prompts/target.md"),
-            Some("Select the research target, its boundaries and assumptions, and map the code into components."),
+            Some("Select the research target, record its deployment premises, and map the code into components."),
         )),
         ("paths", mode(
             &[], &[Research],
             include_str!("prompts/paths.md"),
-            Some("Inventory the entry points an actor can drive and group them into paths that share one interpretation."),
+            Some("Inventory the entry points an actor can drive and group them into paths that share one flow."),
         )),
         ("sources-file", mode(
             &[], &[Research],
             include_str!("prompts/sources-file.md"),
-            Some("Record one file's entry points as sources and name each one's handoff."),
+            Some("Record one file's entry points as sources, each on a path of its own up to its handoff."),
         )),
-        ("component", mode(
+        ("sweep", mode(
             &[], &[Research],
-            concat!(include_str!("prompts/sweep.md"), "\n", include_str!("prompts/component.md")),
-            Some("Sweep one component once, splitting a large one into parts: its flaws, guarantees, checks and unexamined regions."),
+            &joined(&[
+                (include_str!("prompts/sweep-rules.md"), "\n\n"),
+                (include_str!("prompts/path-sweep.md"), "\n"),
+            ]),
+            Some("Sweep one path once, splitting a long one into stretches: its flaws, the premises they and its flow rely on, and its candidates."),
         )),
-        ("component-part", mode(
+        ("sweep-part", mode(
             &[], &[Research],
-            concat!(include_str!("prompts/sweep.md"), "\n", include_str!("prompts/component-part.md")),
-            Some("Sweep one part of a large component: its flaws, local guarantees, checks and unexamined regions."),
-        )),
-        ("path-review", mode(
-            &[], &[Research],
-            concat!(
-                include_str!("prompts/path-review.md"), " ", include_str!("prompts/exposure.md"),
-                " ", include_str!("prompts/path-review-candidates.md"), "\n",
-                include_str!("prompts/cvss.md"), "\n", include_str!("prompts/path-review-end.md"),
-            ),
-            Some("Review one path against the components it reaches, or assess one candidate."),
+            &joined(&[
+                (include_str!("prompts/sweep-rules.md"), "\n\n"),
+                (include_str!("prompts/sweep-part.md"), "\n"),
+            ]),
+            Some("Sweep one stretch of a long path: its flaws, the premises they rely on, and its candidates."),
         )),
         ("question", mode(
             &[Network], &[Research],
             include_str!("prompts/question.md"),
-            Some("Settle the questions or follow-ups assigned, each with its own outcome, and record what settles them."),
+            Some("Settle premises from the code, or chain flaws into candidates."),
+        )),
+        ("assess", mode(
+            &[], &[Research],
+            &joined(&[
+                (include_str!("prompts/assess.md"), "\n\n"),
+                (include_str!("prompts/cvss.md"), "\n"),
+            ]),
+            Some("Score one candidate's CVSS 4.0 vector were every premise to hold."),
         )),
         ("validate", mode(
             &[Exec, Network], &[Research, Verdict],
-            concat!(
-                include_str!("prompts/validate.md"), "\n", include_str!("prompts/cvss.md"), "\n",
-                include_str!("prompts/validate-verdict.md"), "\n",
-                include_str!("prompts/exposure.md"), "\n\n", include_str!("prompts/validate-end.md"),
-            ),
-            Some("Independently review one candidate: settle its premises and routes, then record a verdict."),
+            &joined(&[
+                (include_str!("prompts/validate.md"), "\n\n"),
+                (include_str!("prompts/cvss.md"), "\n"),
+            ]),
+            Some("Independently review one candidate: settle what it rests on, then record a verdict."),
         )),
         ("environment", mode(
             &[Write, Exec, Network], &[Research],
@@ -144,7 +156,7 @@ pub fn modes() -> IndexMap<ModeName, Mode> {
         ("report", mode(
             &[Write, Exec, Network], &[Verdict],
             include_str!("prompts/report.md"),
-            Some("Write one root flaw's evidence-based report, covering its group's validated scenarios, with reproducible artifact references."),
+            Some("Write one root flaw's evidence-based report, covering its group's validated scenarios, citing its tests."),
         )),
     ]
     .into_iter()

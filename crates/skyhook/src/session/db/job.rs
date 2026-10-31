@@ -372,17 +372,55 @@ pub(in crate::session) fn creations(
         .collect())
 }
 
+/// Selects `$columns` then the arguments job `j` was created with, from `j` joined to its
+/// origin call `c` and `$from`: a job keeps no copy of its call's arguments unless they
+/// were repaired.
+macro_rules! created {
+    ($columns:literal, $from:literal) => {
+        concat!(
+            "SELECT ",
+            $columns,
+            ", coalesce(j.arguments, c.arguments) \
+             FROM job j LEFT JOIN tool_call c ON c.item = j.origin_call ",
+            $from
+        )
+    };
+}
+
+/// `job`'s brief, and its latest run that saved output, when it launched a child agent,
+/// read in `db`'s snapshot of the journal; none for another job.
+pub(in crate::session) fn agent_job(
+    db: &Db,
+    job: JobId,
+) -> DbResult<Option<(String, Option<crate::job::Run>)>> {
+    let Some((generation, arguments)) = db.query_row(
+        created!(
+            "(SELECT max(generation) FROM job_output WHERE job = j.id)",
+            "WHERE j.id = ?1 AND j.role = 'agent'"
+        ),
+        params![job],
+        |row| Ok((row.get::<Option<u32>>(0)?, row.get::<String>(1)?)),
+    )?
+    else {
+        return Ok(None);
+    };
+    let launch: crate::agent::Brief = serde_json::from_str(&arguments)
+        .map_err(|error| corrupt(format!("agent job arguments: {error}")))?;
+    let run = generation.map(|generation| crate::job::Run(job, Invocation::nth(generation)));
+    Ok(Some((launch.prompt, run)))
+}
+
 /// Job creations, transitions, finishes and deliveries.
 pub(super) fn events(events: &mut Events) -> DbResult<()> {
     let db = events.db;
     let mut schemas = Schemas::default();
-    let creations = "SELECT j.created, j.id, j.parent, j.origin_call, m.entry, c.call_id, \
-         j.tool, j.name, j.role, coalesce(j.arguments, c.arguments), j.output_schema, \
-         j.accepts_input, j.background, t.name, j.location_workspace \
-         FROM job j JOIN target t ON t.id = j.location_target \
-         LEFT JOIN tool_call c ON c.item = j.origin_call \
+    let creations = created!(
+        "j.created, j.id, j.parent, j.origin_call, m.entry, c.call_id, j.tool, j.name, j.role, \
+         j.output_schema, j.accepts_input, j.background, t.name, j.location_workspace",
+        "JOIN target t ON t.id = j.location_target \
          LEFT JOIN assistant_item i ON i.id = c.item \
-         LEFT JOIN message_commit m ON m.message = i.message {scope}";
+         LEFT JOIN message_commit m ON m.message = i.message {scope}"
+    );
     events.load(creations, "j.created", |row| {
         let origin = match (
             row.get::<Option<i64>>(3)?,
@@ -403,14 +441,14 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             tool: row.get(6)?,
             role: enum_column(row, 8)?,
             name: row.get::<Option<String>>(7)?.map(parsed).transpose()?,
-            arguments: parse_json(&row.get::<String>(9)?)?,
+            arguments: parse_json(&row.get::<String>(14)?)?,
             output_schema: row
-                .get::<Option<Vec<u8>>>(10)?
+                .get::<Option<Vec<u8>>>(9)?
                 .map(|digest| schemas.get(db, BlobDigest::from_bytes(bytes(digest)?)))
                 .transpose()?,
-            accepts_input: row.get(11)?,
-            background: row.get(12)?,
-            location: location(row.get(13)?, row.get(14)?)?,
+            accepts_input: row.get(10)?,
+            background: row.get(11)?,
+            location: location(row.get(12)?, row.get(13)?)?,
         })
     })?;
     let transitions = "SELECT entry, job, state FROM job_transition {scope}";
@@ -473,4 +511,91 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             })
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        job::{Invocation, JobEnd, JobRole, JobTransition, Run, output::Presented},
+        provider::protocol::{AssistantItem, ToolCall},
+        session::{
+            Command, CoreState, Message, ModelContext, ModelPurpose, Plan, SessionError,
+            db::OutputRows,
+            tests::{attempt, job_created, profile, requested},
+        },
+        tests::TestRuntime,
+    };
+
+    /// An agent job yields the brief it was launched with, whether its model call or
+    /// itself holds its arguments with whatever envelope they carry, and its latest run that
+    /// saved output; another job yields none.
+    #[tokio::test]
+    async fn an_agent_jobs_brief_and_latest_run_are_read_from_the_journal() {
+        let TestRuntime { store, agent, .. } = TestRuntime::new().await;
+        let append = async |event| store.append(agent.clone(), event).await.unwrap().sequence;
+        let context = ModelContext::test(ModelPurpose::Agent, profile());
+        let context = append(SessionEvent::ModelContext { context }).await;
+        let request = append(requested(context)).await.request();
+        append(attempt(request, 1)).await;
+        let launch = json!({"prompt": "child request", "depth": 0, "name": "child-1", "bg": false});
+        let call = ToolCall::new("call", "agent", launch.clone()).unwrap();
+        let message = Message::Assistant(vec![AssistantItem::tool_call("item", 0, call)]);
+        let message = append(SessionEvent::MessageCommitted { message }).await;
+        let [called, scripted, script] = [1, 2, 3].map(|id| JobId::new(id).unwrap());
+        let mut created = job_created(called, JobRole::Agent);
+        if let SessionEvent::JobCreated {
+            origin, arguments, ..
+        } = &mut created
+        {
+            *origin = Some(ModelCallOrigin {
+                message: message.message(),
+                call_id: "call".into(),
+            });
+            *arguments = launch;
+        }
+        append(created).await;
+        let mut created = job_created(scripted, JobRole::Agent);
+        if let SessionEvent::JobCreated { arguments, .. } = &mut created {
+            *arguments = json!({"prompt": "script request"});
+        }
+        append(created).await;
+        append(job_created(script, JobRole::Script)).await;
+        let finish = async |generation, reply: &str| {
+            let rows = OutputRows {
+                run: Run(called, Invocation::nth(generation)),
+                result: Some(json!({ "reply": reply }).to_string()),
+                captures_complete: true,
+                fields: Vec::new(),
+                staged: Vec::new(),
+                presented: Presented::new(),
+            };
+            let finished = SessionEvent::JobFinished {
+                job: called,
+                state: JobEnd::Completed,
+                diagnostic: None,
+                images: Vec::new(),
+            };
+            let entries = vec![(agent.clone(), finished)];
+            let plan =
+                |_: &CoreState| Ok::<_, SessionError>(Plan::journal(entries).saving([Ok(rows)]));
+            store.commit(Command::Journal, plan).await.unwrap();
+        };
+        finish(0, "first").await;
+        append(SessionEvent::JobStateChanged {
+            job: called,
+            state: JobTransition::Running,
+        })
+        .await;
+        finish(1, "done").await;
+        let read = |job| {
+            let read = store.test_read(|db| agent_job(db, job)).unwrap();
+            read.map(|(prompt, run)| (prompt, run.map(Run::key)))
+        };
+        assert_eq!(read(called), Some(("child request".into(), Some((1, 1)))));
+        assert_eq!(read(scripted), Some(("script request".into(), None)));
+        assert_eq!(read(script), None);
+    }
 }
