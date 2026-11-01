@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -270,7 +270,11 @@ longer matches. Workers don’t know host job IDs, so their prompts carry only t
 and missing information leaves the requester unknown rather than failing the prompt. Once the
 session shuts down, its authentication refuses to start another askpass server.</p>
 <p>Each askpass server keeps its helper and socket in a private temporary directory and accepts
-only peers running as its own user. This prevents other local users from injecting
+only peers running as its own user. That directory, like the managed agent’s, is made under
+<code>XDG_RUNTIME_DIR</code> when that is set and writable, and otherwise under the temporary directory: a
+socket path must fit the platform’s short limit (<code>sun_path</code>, 108 bytes on Linux and 104 on macOS),
+which a deep <code>TMPDIR</code> exceeds. When neither gives a socket path within the limit, the directory is
+made under <code>/tmp</code>, so binding never fails on path length. This prevents other local users from injecting
 prompts or obtaining answers through the socket; it is not an isolation boundary against other
 processes running as the same user. Dropping the server cancels its task and removes its temporary
 files.</p>
@@ -303,13 +307,13 @@ from an unsupported remote platform. Library hosts inject their own <a href="emb
 rather than inheriting the CLI catalog.</p>
 <p>Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without
 Zig or UI dependencies:</p>
-<pre><code class="language-sh">cargo build --bin linux-ssh --features shim-bin
+<pre><code class="language-sh">cargo build -p linux-ssh
 </code></pre>
 <p>This Cargo command builds the binary but does not stage it into <code>target/shims/</code>. See
 <a href="setup.html">development setup</a> for the recipe list, including the combined shim and CLI build.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/remote">remote module</a>,
-<a href="https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh">shim binary</a>,
-<a href="https://github.com/kryesh/skyhook/blob/main/src/bin/skyhook/embedded_shims.rs">CLI catalog</a>, and
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/remote">remote module</a>,
+<a href="https://github.com/kryesh/skyhook/tree/main/crates/linux-ssh">shim binary</a>,
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook-cli/src/embedded_shims.rs">CLI catalog</a>, and
 <a href="https://github.com/kryesh/skyhook/blob/main/justfile">build recipes</a>.</p>
 
                     </main>

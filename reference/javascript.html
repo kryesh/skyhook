@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -188,16 +188,28 @@
 <li><code>ArrayBuffer</code>, <code>DataView</code>, and typed arrays, including <code>Uint8Array.fromBase64</code>,
 <code>.fromHex</code>, <code>.toBase64()</code>, and <code>.toHex()</code>;</li>
 <li><code>performance.now()</code> for measuring elapsed milliseconds;</li>
-<li><code>await sleep(ms)</code> for asynchronous waits, resolving to <code>undefined</code>. The delay must be a finite,
-nonnegative number of milliseconds within the host timer range; fractional values are accepted.
+<li><code>await sleep(ms)</code> for asynchronous waits, resolving to <code>undefined</code>. The delay must be a number
+of milliseconds from 0 to 2147483647, as for JavaScript timers; fractional values are accepted,
+and any other value throws a <code>TypeError</code> at the call.
 Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;</li>
 <li><code>new WorkPool(concurrency).map(items, worker)</code> and <code>.run([fn1, fn2, ...])</code> as async iterables
-yielding successful <code>{index, value}</code> results in completion order. <code>run</code> requires exactly one
-array of functions, each called with no arguments—not variadic arguments. Invalid <code>run</code>
-arguments throw before any task starts. Failures thrown by valid tasks are logged and skipped;
-remaining items continue. Early iterator closure stops scheduling and drains running work;</li>
+yielding <code>{index, value}</code> results in completion order, or <code>{index, error}</code> for a task that
+threw; remaining items continue. <code>run</code> requires exactly one array of functions, each called
+with no arguments—not variadic arguments. Invalid <code>run</code> arguments, and a <code>map</code> worker that is
+not a function, throw before any task starts. Early iterator closure stops scheduling and
+drains running work;</li>
+<li><code>.feed(next, worker, {wake})</code> for work that becomes ready over time: whenever a slot frees it
+calls <code>await next(running, free)</code> (a <code>Map</code> of running keys to their items, and how many slots
+are free), starts the returned items whose <code>key</code> (a string or number) is not already running,
+and yields <code>{key, item, value}</code> or <code>{key, item, error}</code> as each completes. Items beyond the free
+slots wait and start, in order, before <code>next</code> is called again. It ends when nothing is running
+and <code>next</code> starts nothing. An optional <code>wake</code> function (such as <code>receive</code>) is called while work
+runs and raced alongside it: each value it resolves yields <code>{wake: value}</code>. A wake still pending
+when the feed ends is released, so the input it would have taken goes to the next <code>receive()</code>;</li>
 <li><code>await receive()</code> waits for the next JSON value sent to the script’s own job ID with
-<code>tool.job(scriptJobId).send({value})</code>; the script must be launched with <code>bg: true</code>.
+<code>tool.job(scriptJobId).send({value})</code>; the script must be launched with <code>bg: true</code>. Values
+arrive in order. Calling <code>release()</code> on a receive you no longer await hands its value, taken or
+not, to the next <code>receive()</code>.
 This is script input, not child-agent input: agents receive owner updates automatically.</li>
 </ul>
 <p>For example, pass the task functions to <code>run</code> in one array:</p>
@@ -211,6 +223,17 @@ for await (const {index, value} of new WorkPool(2).run([
 }
 return results;
 </code></pre>
+<h2 id="memory-limit"><a class="header" href="#memory-limit">Memory limit</a></h2>
+<p>Each script call has a <strong>512 MiB (536,870,912-byte) QuickJS allocation limit</strong>. This covers
+runtime-managed memory, including JavaScript objects, strings, and JavaScript-created
+ArrayBuffer and typed-array storage. Freed memory restores capacity; the limit is not a
+cumulative allocation, execution-time, or token budget.</p>
+<p>An allocation that exceeds the limit throws an out-of-memory error. Scripts can catch it;
+an uncaught error fails the call. Keep headroom for temporary allocations during result
+conversion and serialization.</p>
+<p>This is not a total process-memory limit. Rust-side tool results, host bookkeeping, and
+other native allocations are outside the budget, and concurrent script calls each have
+their own allowance.</p>
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
 <p>Read or search saved command output with <code>tool.jobs({job: commandJobId, field: "/result/stdout"})</code>.
 A <code>jobs</code> read returns the existing JobView for that job; it does not add another wrapper.
@@ -227,8 +250,10 @@ error?: string
 meta?: JobMetadata
 presentation?: Presentation
 </code></pre>
-<p>Tool results omit absent fields and empty lists at every level. JavaScript receives the same
-JSON, so an absent field is <code>undefined</code>, as <code>x?: T</code> means in TypeScript.</p>
+<p>Tool results omit absent fields and empty lists at every level. Scripts read a field the
+response’s schema declares but it lacks as <code>null</code>: <code>r.id</code>, <code>r.state</code> and <code>r.meta</code> are <code>null</code> on an
+ordinary completed call, and an absent <code>stdout</code> is <code>null</code>. The model’s views stay sparse. Fields
+inside a previewed or paged <code>jobs({job})</code> result are not filled, since a preview may omit them.</p>
 <p>A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits <code>id</code> and <code>state</code>. <code>result</code> is the native tool payload. It is present exactly when the job
 has a result, and a loaded literal <code>null</code> result stays <code>result: null</code>. A tool with nothing to
@@ -242,13 +267,19 @@ running, is answered with this same failure shape.</p>
 <p><code>presentation</code> is absent when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups <code>preview</code>, <code>shape</code>, <code>truncated</code>, <code>captures</code>,
 <code>question</code>, and <code>notice</code>, each present only when it has content, and precedes <code>result</code>. Read a
-text page as <code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
+text page as <code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>,
+<code>{questions}</code>. Presentation never shortens a question. A script never sees a question its
+<code>tool.agent(...)</code> child asks: the call keeps waiting for the child’s result while the question
+reaches the script’s agent as a job event, and a foreground script’s own call moves to the
+background so that agent can answer (see
+<a href="../scripting/jobs-and-agents.html#delegation-and-child-input">delegation</a>).
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
 <a href="job-output.html#automatic-previews">saved job output</a>. A returned tool response keeps its complete
 fields whole in the script’s own preview; a value taken out of it, such as <code>response.result</code>, is
 shortened like any other returned value.
-Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.result</code>, not a separate wrapper. A successful
+Tool descriptions give a call’s response as <code>JobView&lt;T&gt;</code>: the envelope, with the native result
+<code>T</code> at <code>.result</code>. A successful
 <code>jobs({job})</code> read of a failed target is still a successful tool invocation returning that failed
 <code>JobView</code>; <code>response.unwrap()</code> checks the observed job state and can therefore throw for that view.</p>
 <h2 id="responseunwrap-and-native-results"><a class="header" href="#responseunwrap-and-native-results"><code>response.unwrap()</code> and native results</a></h2>
@@ -265,12 +296,14 @@ logging, returning, and saving the envelope retain plain JSON. Nested payloads, 
 failed views rather than JavaScript throws; programmer, serialization, <code>receive</code>, and sleep errors
 still throw.</p>
 <p>Before returning results, convert <code>BigInt</code> values to strings, dates with <code>.toISOString()</code>, and
-typed arrays with <code>Array.from(bytes)</code>, <code>.toBase64()</code>, or <code>.toHex()</code>. The runtime does not provide
-Node.js APIs, <code>fetch</code>, <code>URL</code>, <code>TextEncoder</code>/<code>TextDecoder</code>, or <code>setTimeout</code>/<code>setInterval</code>.</p>
+typed arrays with <code>Array.from(bytes)</code>, <code>.toBase64()</code>, or <code>.toHex()</code>; they fail with their path
+otherwise. The runtime does not provide
+Node.js APIs, <code>fetch</code>, <code>URL</code>, <code>TextEncoder</code>/<code>TextDecoder</code>, or <code>setTimeout</code>/<code>setInterval</code>. Scripts
+cannot import modules, including the runtime’s own.</p>
 <h2 id="script-results-and-failures"><a class="header" href="#script-results-and-failures">Script results and failures</a></h2>
 <p>Every script result payload is <code>{value: &lt;JavaScript return&gt;, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>.
 Scripts without a return have <code>value: null</code>, silent scripts have no <code>console</code>, and <code>failure</code> is
-absent on success. In a script JobView, the payload is at <code>/result</code> and its return is at
+absent unless a failure has details. In a script JobView, the payload is at <code>/result</code> and its return is at
 <code>/result/value</code>; logs are at <code>/result/console</code>.</p>
 <p><code>console.log(...values)</code> captures space-separated text, formatting objects as JSON. A running
 script’s captured text can be inspected with
@@ -280,23 +313,43 @@ available output; they do not subscribe to future writes or wait for script comp
 Automatic previews can shorten displayed output without discarding captured output; use
 <a href="job-output.html#paging-searching-and-querying">paging, search, or queries</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
 source</strong>, not console capture.</p>
-<p>On a script execution failure, the saved script payload is <code>{value: null, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>;
+<p>On a script execution failure, the saved script payload is <code>{value, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>,
+where <code>value</code> is <code>null</code> unless only the returned value’s conversion failed;
 the enclosing JobView is <code>failed</code> and carries its <code>error</code>: the thrown error’s message and stack,
-or the JSON of any other thrown value. Console text belongs to the script result, not job
-metadata.</p>
+or the JSON of any other thrown value. The message leads with the error’s name unless it is
+plain <code>Error</code>. Stack frames are <code>skyhook-script:line:column</code> positions in the submitted body, or
+<code>end of source</code> for a syntax error where input ended early; frames outside the body are left
+out. Console text belongs to the script result, not job metadata.</p>
 <p><code>failure</code> holds a thrown error’s other properties: its <code>cause</code> and enumerable properties, such as
 the <code>job</code> and <code>code</code> of an unwrapped failed response, whose full view <code>tool.jobs({job})</code> reads.
 It is absent when there are none, so use the enclosing JobView’s <code>state</code> and <code>error</code> to determine
 whether execution failed. Automatic previews can shorten it.</p>
-<p>A top-level <code>undefined</code> becomes JSON <code>null</code>; nested <code>undefined</code> is not coerced or removed and
-causes serialization failure.</p>
+<p>Returned values convert to JSON:</p>
+<ul>
+<li>As in <code>JSON.stringify</code>, an <code>undefined</code> member is omitted, and a top-level <code>undefined</code> or an
+<code>undefined</code> array element becomes <code>null</code>.</li>
+<li>Promises, builders and other thenables anywhere in the value are awaited.</li>
+<li>An <code>Error</code> becomes an object of its <code>name</code>, <code>message</code>, <code>cause</code> and other properties.</li>
+<li>An unpaired surrogate in a string becomes U+FFFD.</li>
+<li>Anything else that is not JSON is a problem at its path, such as <code>$.items[2]</code>: non-finite
+numbers, <code>BigInt</code>s, functions, symbols, cycles, objects other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
+a member whose getter throws or whose promise rejects, reported with its error’s message.</li>
+</ul>
+<p>Conversion runs after the body returns, so the body’s own <code>try</code>/<code>catch</code> cannot catch its problems.
+A value with problems still fails the script, with an error listing them by path, but its saved
+<code>value</code> keeps everything else, with <code>null</code> in place of each problem; captured console text is
+kept as on any failure.</p>
+<p>Tool arguments convert the same way when the builder is made, so a failure throws at the call:
+<code>undefined</code> properties are omitted, while <code>undefined</code> array elements, promises, builders, <code>Error</code>s
+and unpaired surrogates fail.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
 <p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
 normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
 <code>tool.read().set("path", "README.md")</code>. Unknown <code>.set</code> keys throw a <code>TypeError</code>; calling a
 nonexistent fluent setter produces the usual JavaScript method-call error.</p>
 <p>Awaiting a builder executes it immediately. Returning builders recursively executes
-independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
+independent branches concurrently. Only returned values expand: inside the body, <code>await {a: builder}</code>
+awaits the object, not its members, so await each builder or use <code>Promise.all</code>. Calls use the same capabilities, approvals, path access checks,
 and saved-output behavior as direct tool calls. Scripts cannot invoke the <code>script</code> tool recursively.</p>
 <p>Failed tools retain any partial output (including captured process output on timeout) in the failed
 JobView’s <code>.result</code>; JavaScript operational failures do not reject the builder promise. Use

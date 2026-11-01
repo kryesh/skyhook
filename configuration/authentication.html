@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -258,9 +258,7 @@ independently. Login does not require the provider to have models.</p>
 <code>https://chatgpt.com/backend-api</code>. Requests go to <code>codex/responses</code> beneath it, and <code>--check</code> to
 <code>wham/usage</code>, so a mirror serves both beneath one root. <code>auth_url</code> must
 use HTTPS (HTTP only on a loopback host) and carry no credentials, query, or fragment; a path prefix
-is kept. Skyhook never imports, reads, or modifies the official Codex client’s credential files.
-Secure Codex credential storage currently requires Unix; other platforms fail explicitly rather than
-writing tokens without private file permissions.</p>
+is kept. Skyhook never imports, reads, or modifies the official Codex client’s credential files.</p>
 <p>Credentials are kept in a <code>credentials/</code> directory next to the configuration file that defines the
 provider, as <code>&lt;provider&gt;.json</code>. For a provider in the user configuration that is
 <code>~/.config/skyhook/credentials/</code> (or under <code>$XDG_CONFIG_HOME/skyhook</code>). For a provider the workspace

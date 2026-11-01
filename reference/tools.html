@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -188,34 +188,37 @@
 <p><code>exec({command})</code> runs a string with <code>/bin/sh -lc</code>, or an array as a program and arguments without
 shell parsing: <code>exec({command: "cargo test 2&gt;&amp;1 | tail"})</code> or <code>exec({command: ["cargo", "test"]})</code>.</p>
 <p><code>jobs()</code> lists the current agent’s active jobs, excluding the listing call and its containing script.
-<code>jobs({all:true})</code> includes completed history, and the listing payload is in the envelope’s <code>.result</code>.
+<code>jobs({all:true})</code> includes completed history. A listing returns <code>{jobs, older}</code>: the newest
+<code>limit</code> jobs (100 by default), oldest first, and how many older ones it left out, omitted when
+none were. The listing payload is in the envelope’s <code>.result</code>.
 <code>jobs({job})</code> reads that job’s saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
 <a href="job-output.html#paging-searching-and-querying">output selections</a> <code>field</code> and <code>limit</code>, with
 <code>start</code>, <code>offset</code>, <code>pattern</code>, and <code>context</code> for text, or <code>index</code> and <code>query</code> for JSON.
-<code>all</code> cannot be combined with <code>job</code>, and selections require <code>job</code>. Scripts also control jobs with
-<code>tool.job(id).send({value})</code> and <code>.cancel()</code>.</p>
+<code>all</code> cannot be combined with <code>job</code>, and the other selections require <code>job</code> unless they restate
+their defaults. Scripts also control jobs with <code>tool.job(id).send({value})</code> and <code>.cancel()</code>.</p>
 <p>Use <code>wait({timeout?: seconds})</code> (or <code>await tool.wait(...)</code> in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view’s <code>.result</code> is
-<code>{reason:"event"}</code> or <code>{reason:"timeout"}</code>. Omitted or null <code>timeout</code> waits indefinitely;
-a supplied timeout must be a positive integer number of seconds. An event does not guarantee a
-particular job has completed; inspect its current status. See
-<a href="../scripting/jobs-and-agents.html#waiting-for-background-work">waiting for background work</a> for
-when a wait resolves.</p>
+<code>{reason, waited_s}</code>: <code>reason</code> is <code>"event"</code>, <code>"timeout"</code> or <code>"cancelled"</code>, and <code>waited_s</code> counts the
+whole seconds waited. A cancelled wait is a failed view that still carries this result. Omitted or
+null <code>timeout</code> waits indefinitely; a supplied timeout must be a positive integer number of seconds.
+An event does not guarantee a particular job has completed; inspect its current status. See
+<a href="../scripting/jobs-and-agents.html#waiting-for-background-work">waiting for background work</a> for when
+a wait resolves.</p>
 <p>See the <a href="javascript.html#responseunwrap-and-native-results">JavaScript response contract</a> for
 <code>response.unwrap()</code>, serialization, and operational-failure behavior. In this reference,
 <code>tool.jobs({job})</code> and other inspection calls return views for reading their
 <code>presentation</code> fields; use the task-specific contracts below for their payloads.</p>
 <h2 id="reading-and-replacing-text"><a class="header" href="#reading-and-replacing-text">Reading and replacing text</a></h2>
 <p><code>read({path})</code> reads only regular files. A file is text when it is valid UTF-8 without NUL bytes;
-any other file is attached if it is a supported image and rejected otherwise.
-<code>replace({path, old, new, count?})</code> edits files of at most 4 MiB, both before and after the
-replacement.</p>
+any other file is attached if it decodes as a supported image (PNG, JPEG, GIF or WebP) and
+rejected otherwise.
+<code>replace({path, old, new, count?})</code> edits files of at most 64 MiB, both before and after the
+replacement; <code>old</code> and <code>new</code> together are at most 4 MiB, as is <code>write</code> content.</p>
 <h2 id="creating-files-with-write"><a class="header" href="#creating-files-with-write">Creating files with <code>write</code></a></h2>
-<p><code>write({path, content})</code> atomically creates or replaces a UTF-8 file. Set the optional
-<code>create_parents: true</code> to create missing parent directories recursively before writing, for example
-<code>write({path: "reports/run/summary.md", content: "...", create_parents: true})</code>.
-It defaults to <code>false</code>, so a missing parent directory causes the call to fail.</p>
+<p><code>write({path, content})</code> atomically creates or replaces a UTF-8 file, creating missing parent
+directories first, for example <code>write({path: "reports/run/summary.md", content: "..."})</code>. As in the
+operating system, <code>..</code> cannot follow a directory that does not exist yet, so <code>missing/../file</code> fails.</p>
 <p><code>write({path, source: {path, target?}})</code> copies another file’s bytes exactly, including binary
 files of any size. Supply exactly one of <code>content</code> or <code>source</code>. The destination is always in the
 caller’s target and workspace. The source is read on its own target: the caller’s when <code>target</code>

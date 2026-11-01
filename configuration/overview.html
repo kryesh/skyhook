@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -370,9 +370,10 @@ providers:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
     # reasoning_summary: null
-    # Responses-only selections, sent only when set. Availability depends on the
-    # endpoint, model, and account; faster tiers can cost more.
+    # Sent only when set, on any codec. Availability depends on the endpoint, model,
+    # and account; faster tiers can cost more.
     # service_tier: "priority"         # wire tier ID, sent as written
+    # Responses-only selection, sent only when set.
     # Cybersecurity access program (standard, daybreak_blue, or daybreak_red); the
     # model and account must be eligible: https://developers.openai.com/api/docs/guides/daybreak
     # access_programs:
@@ -407,6 +408,11 @@ providers:
     #   command: "op read 'op://Private/Anthropic/api-key'"
     # Cache breakpoints default to five minutes; the hour costs more to write:
     # cache_ttl: "1h"
+    # Larger images are downscaled or re-encoded for each request; the stored original
+    # is kept. Each dialect has defaults (here 8000 px and 7.5 MiB); a limit left out keeps it:
+    # image_limits:
+    #   max_edge: 4096     # longest edge, in pixels
+    #   max_bytes: 5242880 # encoded size, in bytes; at most 8 MiB
     models:
       # https://platform.claude.com/docs/en/about-claude/models/overview
       opus:
@@ -492,10 +498,8 @@ providers:
     base_url: "http://127.0.0.1:8080/v1"
     # A compatible entry may still place each dimension itself, for example a server
     # that spells the reasoning replay field differently or ignores max_completion_tokens:
-    # reasoning_replay:
-    #   field: "reasoning"
-    # output_limit:
-    #   field: "max_tokens"
+    # reasoning_replay: "reasoning"
+    # output_limit: "max_tokens"
     # Fixed request headers apply to every dialect (proxies, attribution); each value
     # takes the same three forms as api_key:
     # headers:
@@ -578,13 +582,13 @@ providers:
 #     transport: "streamable_http"
 #     url: "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
 #     capabilities: ["read", "write"]
-#     headers_env: { Authorization: "MY_MCP_AUTHORIZATION" } # Env var, not secret.
-#     # The variable must be set to a valid HTTP header value, e.g. Bearer ...
-#     # Missing/non-Unicode variables fail startup; empty values are passed through.
+#     headers: # A literal, {env: NAME} or {command: "..."}, as a provider's headers.
+#       Authorization: { env: "MY_MCP_AUTHORIZATION" } # e.g. Bearer ...
+#     # Missing/blank variables and failed commands fail startup.
 #     # Connect first. Start this optional local command ONLY if the endpoint is unreachable,
 #     # never for authentication or protocol errors. cwd/env require start_command.
 #     start_command: ["my-http-mcp-server", "--port", "8080"]
-# Stdio requires start_command and rejects url/headers_env; HTTP requires url.
+# Stdio requires start_command and rejects url/headers; HTTP requires url.
 # Unknown fields/capabilities, invalid combinations, and invalid timeouts are errors.
 </code></pre>
 
@@ -592,7 +596,7 @@ providers:
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../guide/instructions-and-skills.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../guide/security.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -606,7 +610,7 @@ providers:
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../guide/instructions-and-skills.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../guide/security.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

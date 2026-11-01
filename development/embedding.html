@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,25 +181,171 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="embedding"><a class="header" href="#embedding">Embedding</a></h1>
-<p>The <code>skyhook-agent</code> package exposes the <code>skyhook</code> Rust library crate. Hosts supply configuration,
+<p>The <code>skyhook</code> crate is the Rust library. Hosts supply configuration,
 a workspace, model selection, and interaction handlers rather than depending on terminal UI
 state. See <a href="architecture.html">library architecture</a> for responsibility boundaries and the internal
 request lifecycle.</p>
+<h2 id="layered-host-configuration-and-model-hints"><a class="header" href="#layered-host-configuration-and-model-hints">Layered host configuration and model hints</a></h2>
+<p><code>Config::resolve(workspace, explicit).await</code> loads the main <code>config.yaml</code> without building
+providers or looking up credentials. Hosts with another YAML schema use the same loader through
+<code>config::resolve_layers::&lt;T&gt;(workspace, explicit).await</code>, implementing <code>config::LayeredConfig</code>
+on their own deserializable type:</p>
+<pre><code class="language-rust ignore">use std::{collections::BTreeMap, convert::Infallible};
+use serde::Deserialize;
+use skyhook::config::{LayeredConfig, resolve_layers};
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HostConfig {
+    profiles: BTreeMap&lt;String, Profile&gt;,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    description: String,
+}
+
+impl LayeredConfig for HostConfig {
+    type Error = Infallible;
+    const FILE_NAME: &amp;'static str = "host.yaml";
+    const NAMED_ENTRIES: &amp;'static [&amp;'static str] = &amp;["profiles"];
+
+    fn missing() -&gt; Option&lt;Self&gt; {
+        Some(Self::default())
+    }
+}
+
+let loaded = resolve_layers::&lt;HostConfig&gt;(workspace, explicit_host_config).await?;
+let host_config = loaded.config;</code></pre>
+<p>Discovery selects the first usable user file: <code>$XDG_CONFIG_HOME/skyhook/&lt;FILE_NAME&gt;</code>, then
+<code>$HOME/.config/skyhook/&lt;FILE_NAME&gt;</code>. Rejected candidates remain in <code>loaded.report</code>; their fields
+never enter the configuration. The workspace’s <code>.skyhook/&lt;FILE_NAME&gt;</code> overlays that file, or can
+stand alone. A malformed workspace file is fatal. An explicit path disables all discovery, even
+workspace resolution, and must exist.</p>
+<p><code>NAMED_ENTRIES</code> lists top-level maps whose entries replace same-named entries whole while keeping
+other names; every other top-level value is replaced whole, and defaults apply after merging. A
+schema’s <code>admit_layer</code> validates each candidate file and the effective document; <code>LayerSources::entry</code>
+names the file behind a named entry for source-relative paths. The generic loader does not
+interpret <code>providers</code> or <code>mcp</code>; those belong to the main <code>Config</code> schema.</p>
+<p>Omitting <code>missing()</code> requires a discovered file. Returning defaults permits absent discovered
+files, but never hides rejected files or a missing explicit path; the defaults still undergo
+admission. Empty YAML, <code>null</code>, and non-mapping documents are always invalid.
+<code>LayerResolutionError</code> names the schema file and retains its <code>ConfigReport</code> through <code>report()</code>.</p>
+<p>Before sealing a <code>Config</code>, hosts can edit a configured model’s profile through
+<code>model_profile_mut(&amp;ModelRef)</code>, which returns <code>ConfigError::Model</code> for an unknown provider or
+model. Clearing a hint removes that model from the choices offered to agents, not from the
+configured catalog. Hosts can also assign the public <code>default_model: Option&lt;ModelRef&gt;</code> before
+calling <code>into_runtime()</code>, which validates the selection. Edits affect the new runtime generation
+only, not previously sealed configurations.</p>
+<h2 id="sharing-the-cli-and-terminal"><a class="header" href="#sharing-the-cli-and-terminal">Sharing the CLI and terminal</a></h2>
+<p>The <code>skyhook-cli</code> crate is the shared host. A product implements <code>Product</code> with an <code>Args</code> type
+implementing <code>clap::Args</code>, a <code>Command</code> implementing <code>clap::Subcommand</code> (<code>NoArgs</code> and
+<code>NoCommand</code> for unused extension points), and an <code>Identity</code>: the <code>HostName</code> its sessions are
+tagged with, the <code>tables</code> it keeps in them (see below), display name, about text, the
+placeholder shown in an empty conversation, a <code>state_file</code> path relative to <code>.skyhook</code> for that
+product’s remembered model, mode and sidebar setting, a <code>RootMode</code> (<code>Switchable</code>, or <code>Fixed</code> to keep the root in the configured default mode
+and refuse <code>--mode</code>), a <code>Theme</code>, and the <code>HostCapabilityDeclaration</code>s its modes grant, which
+the host declares on every session the product opens, another host’s included. A theme is a UI palette of semantic roles (surfaces,
+emphasis, strong, accent, success/warning/error) plus a syntax palette of explicit <code>Rgb</code>
+colours for highlighted code; a
+product usually supplies its own UI palette and keeps <code>SyntaxPalette::DEFAULT</code> so code reads the
+same in every product. Its session arguments work at the root, under <code>batch</code> and for
+<code>dump config</code>; shared <code>auth</code>, <code>dump skills</code> and <code>stats</code>, and its extra commands take only their
+own arguments. Session history is always <code>.skyhook/sessions</code>. The host reads <code>approve_all</code> from
+<code>config.yaml</code> itself (<code>HostConfig</code>); it is not a library setting.</p>
+<p>A thin binary retains its own global allocator and starts in this order:</p>
+<pre><code class="language-rust ignore">fn main() {
+    skyhook::remote::askpass_main();
+    // SAFETY: no threads or runtime have been started.
+    unsafe { skyhook_cli::main(MyProduct) }
+}</code></pre>
+<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> and configures SQLite for
+the process before starting Tokio, so the process must still be single-threaded; help and version
+need no <code>.env</code> or configuration.</p>
+<p>The extension points are:</p>
+<ul>
+<li><code>Product::configure(&amp;self, &amp;mut Config, Args, SessionContext&lt;'_&gt;)</code> returns <code>Configured</code>: the
+product’s own <code>ConfigReport</code>, which the host renders beside the main configuration’s, and an
+<code>Arc&lt;dyn SessionFactory&gt;</code>. It edits the resolved configuration before runtime admission
+(product settings, model defaults, modes, MCP entries); <code>dump config</code> serializes the result and
+a session runs with it. <code>command</code> handles the product’s own subcommands.</li>
+<li><code>SessionFactory::form(&amp;self, SessionContext&lt;'_&gt;) -&gt; Option&lt;ScopeForm&gt;</code> is the scope a new
+session’s draft is written with (<code>cli::form</code>): choice and integer fields with defaults, and a
+message used when the draft is submitted empty. The terminal shows it at the top of the root’s
+conversation beside the composer, sends its values with the first message and freezes it once
+the session starts; a failed start leaves it editable. The values reach <code>prepare</code> in the
+context’s <code>Opening::New</code>. Batch runs pass no form.</li>
+<li><code>SessionFactory::prepare(&amp;self, HarnessBuilder, SessionContext&lt;'_&gt;)</code> returns
+<code>HookFuture&lt;'_, PreparedSession&gt;</code>: the customized builder and an <code>Arc&lt;dyn SessionExtension&gt;</code>.
+<code>SessionContext</code> holds the canonical workspace, <code>headless</code>, and its <code>Opening</code>: <code>New</code> with the
+form’s answers, if any, or <code>Resume(SessionId)</code>. A draft calls it on first submission; the host
+tags the builder with the product’s host name and tables and calls it only for the product’s
+own sessions, so a foreign session opens view-only with no extension.</li>
+<li><code>SessionExtension::opened(&amp;self, &amp;SessionHandle, SessionContext&lt;'_&gt;) -&gt; HookFuture&lt;'_, ()&gt;</code>
+runs before the first input; associate a new session with its product resources here, and
+finish a setup an interruption left undone. A reopened session may only be viewed, so change
+nothing else. Failure shuts the session down.</li>
+<li>What this launch changes about a reopened session’s work (as the security product applies its
+<code>--workers</code>) goes in a <code>skyhook::agent::ResumeHook</code> registered on the prepared
+builder with <code>HarnessBuilder::resume_hook</code>; the library runs it before that session’s first
+work (see <a href="#interruption-continuation-and-shutdown">Interruption, continuation, and shutdown</a>).</li>
+</ul>
+<p>Hooks before <code>opened</code> create no sessions and write nothing to stdout; a batch run prints the
+session ID first. A product that keeps its own data in each session declares it as
+<code>Identity::tables</code>, an <code>Extension { sql, format, seed }</code> the host passes to
+<code>HarnessBuilder::session_extension</code>: the harness creates those tables in every session it creates
+and checks their format on every one of its own it reopens. <code>SessionStore::summary</code>, given the
+host and its tables, refuses one of the host’s own sessions that check would refuse, so the
+session switcher leaves it out and <code>--resume</code> refuses it before <code>prepare</code>, as for an earlier
+session format; other hosts’ sessions are still listed, view-only. The harness hands host state
+and the resume hook the tables as an <code>ExtensionDb</code> on the session’s own writer and read pool;
+tools reach them through <code>ToolContext::extension()</code>, and the extension’s terminal hooks through
+the session (<code>SessionStore::extension()</code>); a write whose commit failed reports <code>Unconfirmed</code>, since it may have committed. Another host’s harness opens such a session without them; <code>ExtensionDb::inspect</code> reads
+them read-only without opening it. Files of the product’s own go in subdirectories of the
+session directory. <code>HookFuture</code> is a boxed <code>Send</code> future returning <code>Result&lt;T, cli::Error&gt;</code>.</p>
+<h3 id="per-session-terminal-views-and-actions"><a class="header" href="#per-session-terminal-views-and-actions">Per-session terminal views and actions</a></h3>
+<p><code>SessionExtension::views()</code> returns a stable slice of <code>ExtensionView { title, frame }</code>. These
+tabs follow Conversation, Requests, and Jobs and share their keyboard cycling and clickable
+headers. <code>ViewFrame::Session</code> draws a view inside the session’s chrome; <code>ViewFrame::Page { agents }</code>
+gives it the frame below the tab strip, keeping only the footer, any prompt awaiting an answer
+and, with <code>AgentPane::Live</code>, the live agents: a column beside the page on a terminal at least 100
+columns wide, the usual band below it on a narrower one. <code>AgentPane::Hidden</code> leaves them out.</p>
+<p><code>refresh(view, SessionHandle, Disclosed) -&gt; HookFuture&lt;'_, page::Page&gt;</code> loads <code>views()[view]</code>
+off the UI thread, as the extension’s own session sees it. A <code>Page</code> is a list of typed blocks:
+<code>Facts</code> (label and value pairs), a <code>Pipeline</code> of stages, <code>Panels</code> of labelled values and
+meters, and <code>Section</code>s, collapsible tables of records that each open to their detail. Cells
+carry a <code>Tone</code>, not a colour. The host lays the page out with its own theme, reflowing panels
+and dropping section columns by priority as the width shrinks, and owns disclosure and
+scrolling, so a product needs no terminal code. <code>Disclosed</code> says which sections are open, how
+many of their records to supply (<code>Disclosed::PAGE</code> at a time), and which records are open,
+each with how many of its detail’s continued entries to supply, likewise a page at a time: supply
+records and detail only for those, and mark a detail that has more entries than it shows. The
+host reads the shown view about once a second and again at once when the viewer opens or closes
+something. Futures must be cancellation-safe. Sanitize untrusted text before returning it.</p>
+<p>Foreign sessions remain view-only: the host hides the composer and title editing
+and withholds the commands that would write, while inspection, transcript copy and export
+remain available. <code>SessionHandle::host()</code> identifies the recorded origin and <code>is_view_only()</code>
+reports whether this harness may activate it; library activation checks remain authoritative.</p>
 <h2 id="constructing-a-harness-and-session"><a class="header" href="#constructing-a-harness-and-session">Constructing a harness and session</a></h2>
 <p>The configuration-backed entry point is:</p>
-<pre><code class="language-rust ignore">let harness = config
-    .into_runtime()?
-    .select_model(&amp;name)?
-    .harness_builder(workspace)?
+<pre><code class="language-rust ignore">let model = config.into_runtime()?.select_model(&amp;name)?;
+let harness = HarnessBuilder::configured(&amp;model, workspace, host)?
     .build()
     .await?;
 let session = harness.new_session().await?;</code></pre>
 <p><code>into_runtime()</code> admits an immutable configuration generation, including any edits the host made
 to the <code>Config</code>; <code>select_model(&amp;name)</code> binds the host’s explicit choice, a <code>ModelRef</code> parsed from
 <code>provider/model</code>, to that generation. Admission and selection precede provider construction,
-credential lookup, and workspace access. <code>harness_builder(workspace)</code> returns a <code>HarnessBuilder</code>
-that can be customized before <code>build().await</code>; hosts supplying their own providers and model
-profiles can instead start with <code>HarnessBuilder::new(workspace)</code>.</p>
+credential lookup, and workspace access. <code>HarnessBuilder::configured(&amp;model, workspace, host)</code>
+returns a builder for the application <code>host</code> serving that configuration, which can be customized before <code>build().await</code>; hosts
+supplying their own providers and model profiles can instead start with
+<code>HarnessBuilder::new(workspace, host)</code>. Skills are a builder input (<code>skills(HostSkills)</code>): the
+harness discovers nothing on its own, so an embedder decides whether <code>HostSkills::discover</code> runs.
+A provider that needs a login reports it as a typed <code>LoginRequired</code> whose remedy names the host’s
+own <code>auth login</code> command (<code>host</code>, or the <code>program</code> passed to <code>Config::login</code>), including in a
+session’s request errors; a <code>LoginFlow</code> signs in through a host-supplied <code>LoginPresenter</code> rather
+than the terminal.</p>
 <p>The configuration-backed builder carries the configured modes and selects the configured default.
 <code>mode(name)</code> selects another, and <code>capabilities(set)</code> limits what modes can grant; <code>build()</code> rejects
 a selected mode the modes do not declare, whichever was set first. A builder without modes gives the
@@ -209,7 +355,7 @@ turn carries, rejecting a <code>provider/model</code> or mode the session does n
 retain the active model and mode. A mode change applies to the root agent from the boundary that
 consumes it, not retroactively to children it already started. A session runs the harness’s modes
 and capability ceiling, whatever it ran under before. A reopened session reports modes the
-configuration redefined or removed in <code>startup_warnings()</code> and changes nothing while viewed, nor
+configuration redefined or removed in <code>warnings()</code> and changes nothing while viewed, nor
 when calls such as <code>rename</code>, <code>record_status</code> or <code>cancel_job</code> activate it. The next work that runs
 the root (a prompt, continue, job delivery or <code>run_script</code>) decides its mode once: the selected
 one, else its own as configured now, or the default mode once its own is gone (without a default
@@ -220,14 +366,20 @@ differs from that mode’s latest journaled one records a new edition, which the
 auditing. <code>SessionHandle::changes_mode(mode)</code> reports whether the root’s next message in <code>mode</code>
 would change what it runs.</p>
 <p>Each <code>SessionEvent::TitleSet</code> records its <code>TitleSource</code>: <code>Prompt</code>, <code>User</code> or <code>Generated</code>.
-<code>SessionHandle::set_title(title)</code> gives a session an automatic title from its first input (a prompt
-or a script) and leaves a titled session alone; <code>rename(Some(title))</code> sets the user’s title, and
+<code>SessionHandle::set_title(title)</code> gives an automatic title to a session that has neither a title
+nor a first prompt to take one from, and leaves any other alone. <code>run_script</code> titles nothing: the
+terminal titles a session its script starts with the script’s path, and a headless <code>--script</code>
+leaves the session untitled. <code>rename(Some(title))</code> sets the user’s title, and
 <code>rename(None)</code> journals a <code>TitleCleared</code> that returns the session to its automatic title.
 <code>title().await</code> reads the title the session list shows, as a <code>SessionTitle</code> with its text and
 <code>TitleSource</code>: the user’s newest title unless cleared since, otherwise the newest <code>Prompt</code> or
 <code>Generated</code> title, otherwise the first text the user sent the root agent, as a <code>Prompt</code> title.</p>
 <p>Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
-and an embedded shim catalog. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
+and an embedded shim catalog. A <code>Policy</code> answers <code>Approval::Decided</code> for what it settles by itself
+and <code>Approval::Ask</code> for what it asks someone, asking nothing until that future is polled. A call
+that may not ask anyone, because a path it names outside the workspace does not exist, drops an
+<code>Ask</code> unpolled and is refused with <code>PolicyDecision::refused()</code>, the reason a person’s denial
+should carry so the two cannot be told apart. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
 <code>PromptAnswer</code>: <code>Secret</code> for passwords, passphrases and keyboard-interactive prompts, and
 <code>Confirmed</code> or <code>Rejected</code> for the confirmation kinds (<code>SensitivePromptKind::is_confirmation</code>), which
 cover host keys and agent key use. A handler error means no answer could be obtained; <code>Rejected</code> is a
@@ -237,58 +389,213 @@ to the host (the CLI performs its own startup loading).</p>
 an override supplied by <code>Config::session_root</code>, is passed through unchanged: a relative path is
 relative to the process working directory, not the workspace or configuration file. The CLI selects
 its own workspace-local session root.</p>
+<h2 id="persona-and-prompt-templates"><a class="header" href="#persona-and-prompt-templates">Persona and prompt templates</a></h2>
+<p>A host keeps its persona and mode instructions as embedded Tera templates, which the library
+renders for each agent. <code>skyhook::templates!</code> embeds each named file from the invoking crate’s
+<code>src/prompts</code>, as a <code>Source::Template</code>, rendered by Tera, or a <code>Source::Verbatim</code>, such as a
+script shown to the model, included as written and never parsed. A file’s final newline is not
+part of it, so an include can sit mid-line. <code>Templates::with(sources, &amp;sample)</code> registers them
+beside the library’s templates, which they can include by name, for a serializable section type
+<code>H</code>.</p>
+<p><code>Prompts::host(&amp;templates, &amp;section, persona)</code> and <code>HarnessBuilder::prompts</code> give a session the
+host’s section, fixed for the session, and its persona template, placed in every agent’s system
+prompt after the built-in role text and before the runtime’s workspace, tool, capability and
+mode instructions. Templates are named by a <code>TemplateName</code>, the name they are registered under.
+A mode whose <code>instructions</code> is <code>Instructions::Template(name)</code> is told that template; configuration spells only text, and <code>dump config</code> leaves a template out. Each template
+renders from the agent’s context (<code>role</code>, <code>available_depth</code>, <code>capabilities</code>, <code>mode</code>,
+<code>location</code>, <code>job_view</code>) with the section’s fields as top-level names, when the agent’s contract
+is fixed: <code>Prompts::edition</code> renders a mode’s instructions for an agent entering it.</p>
+<p>The journal keeps what rendered: a mode’s edition records its instructions’ text, and an
+agent’s prompt as sent. A resumed agent keeps its recorded prompt until a mode change rebuilds
+it, and a reopened root whose mode now renders otherwise warns of a changed mode. One whose mode
+no longer renders for it opens all the same, warning with the error, which the work that next runs
+the root in that mode returns.</p>
+<p>Registration refuses a template that reads a top-level name its context does not define,
+counting the names its includes read, so a misspelled setting fails at registration rather than
+rendering as false. Names nested in a value (<code>capabilities.agents</code>) are not checked.</p>
+<h2 id="host-state"><a class="header" href="#host-state">Host state</a></h2>
+<p><code>HarnessBuilder::host_state(Arc&lt;dyn HostState&gt;)</code> lets the host add its own section to an
+agent’s runtime state. The harness asks for the section before each request and before a
+compaction summary, places it inside the state block beside the date, live jobs and todos, and
+journals it with the state. It is asked with the host’s tables in the session (its
+<code>session_extension</code>, so only the host’s own sessions have a section) and the agent, so it can
+read what the host keeps in the session and answer per agent. The host renders the text itself;
+<code>None</code> adds nothing to that request. Use it for facts an agent needs current, such as a
+workflow’s identity, policy and progress, rather than prefixing them to the user’s first
+message. Keep it to the agents that act on it: the state changes between requests, so every
+character of it is input a provider’s prompt cache cannot reuse.</p>
+<p><code>HostState::events</code> gives an agent news from the host’s own ordered log instead: what it holds
+for the agent after <code>since</code>, the <code>HostCursor</code> the agent’s last host event went <code>through</code>, or from
+its start. A cursor is any non-negative <code>i64</code> position (<code>HostCursor::try_from</code>), stored as it is.
+The harness asks only as a request is about to be made, so a host event never starts a turn,
+reopens an answered one, keeps an invocation open or ends a <code>wait</code>: it joins the job events
+delivered with that request, as <code>{"kind":"host", …view}</code> with the view the host built
+(<code>HostView::try_from</code> an object naming no <code>kind</code> of its own), and commits in one transaction
+with its cursor. Each event is given once, across retries, compaction and reopening; an
+interrupt during the read commits nothing, and a failed read fails the request
+(<code>HarnessError::HostEvents</code>). The default gives none.</p>
+<h2 id="session-origin-and-host-capabilities"><a class="header" href="#session-origin-and-host-capabilities">Session origin and host capabilities</a></h2>
+<p><code>HarnessBuilder::new(workspace, host)</code> names the application creating a session. <code>HostName</code>
+(in <code>skyhook::identity</code>) is nonblank; choose a stable tag such as the binary’s name, not a
+session title or mode. Tags do not change the session root: hosts
+share <code>&lt;workspace&gt;/.skyhook/sessions</code> unless they explicitly override it.</p>
+<p><code>SessionHandle::host()</code> and <code>SessionStore::host()</code> expose the persisted origin;
+<code>SessionSummary::host</code>, <code>SessionStats::host</code>, and <code>SessionEvent::SessionStarted::host</code> retain
+it for listing, accounting, and journal exports. <code>resume_session</code> may open another host’s
+session for inspection; <code>SessionHandle::is_view_only()</code> identifies that case, and every call
+that would change the session fails with <code>HarnessError::HostMismatch { session, host }</code>. Host
+tags prevent accidental cross-application activation, not access by other processes with
+filesystem write permission.</p>
+<p>Declare application-specific capabilities with <code>HarnessBuilder::host_capabilities</code>. Declaration
+alone does not grant authority: include <code>Capability::Host(name)</code> in the ceiling and the modes
+that need it, just like built-ins.</p>
+<pre><code class="language-rust ignore">use skyhook::tool::policy::{Capability, HostCapability, HostCapabilityDeclaration};
+
+let verdict: HostCapability = "security.verdict".parse()?;
+let builder = builder.host_capabilities([HostCapabilityDeclaration {
+    name: verdict.clone(),
+    title: "Decide verdicts",
+}]);
+let options = ToolOptions::default().requires(Capability::Host(verdict));</code></pre>
+<p><code>Capability::title</code> names a capability for the user: a built-in label, a host capability’s
+declared title, or the name of one the given declarations leave out, such as another host’s. The
+terminal shows a product’s capabilities under the titles its <code>Identity</code> declares.</p>
+<p>Names have exactly two components, <code>&lt;namespace&gt;.&lt;name&gt;</code>, each starting with a lowercase ASCII
+letter and continuing with lowercase letters, digits, or underscores. <code>build()</code> rejects
+undeclared host names in the ceiling, any mode, native tool requirements, or MCP requirements
+with <code>HarnessError::UndeclaredHostCapability</code>. Host capabilities use the existing mode, ceiling,
+delegation subset, and tool gates.</p>
 <h2 id="host-observation-api"><a class="header" href="#host-observation-api">Host observation API</a></h2>
-<p><code>SessionHandle::observe()</code> returns a snapshot and receiver sharing an atomic revision
-boundary. Apply updates to the snapshot in revision order with <code>ObservationSnapshot::apply</code>.
-Once the session no longer runs (viewed, failed or closed), the snapshot reads every request,
-response, job and turn it left going as interrupted at its last activity; <code>apply</code> returns the jobs
-and requests an update read that way, which no update of their own reports.
-It contains:</p>
+<p><code>SessionHandle::store()</code> is the session’s journal. Its <code>observe()</code> returns an <code>Observation</code>: the
+session’s live part, an <code>ObservationSnapshot</code>, and a receiver of the updates after it, sharing an
+atomic revision boundary. It copies only what the session holds live, so it costs the same however
+long the session is, and a host may call it whenever it needs a fresh start. Its <code>applied()</code> is
+the newest record the session has applied, without observing. The snapshot holds:</p>
 <ul>
-<li>Durable records keyed by their original journal sequence.</li>
-<li>The request ledger: each logical request’s lifecycle phase, outcome, and usage, folded from
-those records. Host statistics and displays read request state from it.</li>
-<li>Every job as the session state holds it: its owner, call arguments, state, failure, current
+<li><code>applied</code>, the newest record it folds, after which every record arrives as an update, and
+<code>last_activity</code>, when the newest record that is the session’s activity was journaled.</li>
+<li><code>requests</code>, each agent’s newest request, with its lifecycle phase, outcome and usage.</li>
+<li><code>jobs</code>, the jobs the session holds: their owner, call arguments, state, failure, current
 invocation, and when that invocation ran. A job’s update arrives just before the record that
-moved it.</li>
-<li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
-arrival order, then the authoritative blocks once the response has ended.</li>
-<li>Current agent activity, with when its turn began (or, once it is no longer busy, when that
-turn ended), and the context gauge: each agent’s occupancy as its last committed response
-reported it, folded from the journal and cleared by a checkpoint.</li>
+moved it. <code>RuntimeEvent::JobsUnheld</code> names the jobs the session let go of, which the snapshot
+drops; a job’s last update is its final view until a record moves it again.</li>
+<li><code>activity</code>, each agent’s current activity, with when its turn began (or, once it is no longer
+busy, when that turn ended); an agent that stops running, as a parked child does, gets an
+update with none.</li>
+<li><code>views</code>, what the records fold into beside the committed state: <code>responses</code>, the live
+responses keyed by agent and logical request (their streamed blocks in arrival order, then the
+authoritative blocks once the response has ended; an agent’s responses are its latest turn’s,
+and one that settled without committing, failed or interrupted, stays until the agent’s next
+agent request, as a reopened session also shows it); <code>context</code>, the context gauge, each agent’s
+occupancy as its last committed response reported it, cleared by a checkpoint; and <code>entries</code>,
+how many entries each agent’s transcript holds.</li>
+<li><code>usage</code>, the usage each agent’s requests reported.</li>
 </ul>
-<p>Live response deltas are provisional, not additional committed messages. A new attempt of the
-same logical request resets its live response without removing durable attempt records. On
-receiver lag, obtain a fresh observation and replace <strong>both</strong> the snapshot and receiver; continuing
-with only one can leave a gap or apply stale live state.</p>
-<p><code>inspect_jobs</code> (a synchronous read of an agent’s jobs), <code>inspect_output</code>,
-<code>inspect_output_with_captures</code>, and <code>inspect_output_fields</code> are host inspection APIs. They do not
+<p>Apply updates in revision order with <code>ObservationSnapshot::apply</code>. Once the session no longer runs
+(viewed, failed or closed), the snapshot reads every request, response, job and turn it left going
+as interrupted at its last activity. <code>apply</code> returns what an update changed beyond what it
+carries: <code>entry</code>, the ordinal its record took in its agent’s transcript (none for a record the
+snapshot already folds); <code>stopped</code>, the jobs and requests read as interrupted that way, which no
+update of their own reports; <code>requests</code>, the requests its record changed; <code>superseded</code>, the
+request of its agent that a newer one replaced, as it left it; <code>fact</code>, what the fold decided of
+its record that presenting it reads (a <code>session::Fact</code>: the request an assistant message
+committed under, the message whose call a result answered, or that a failed turn ended on its
+request’s failure); and <code>unheld</code>, the jobs the session let go of, as they left them.</p>
+<p><code>RuntimeEvent::OutputChanged { job, invocation }</code> reports that a run captured output after its
+output was last read, by any reader; it carries no output. Read it with
+<code>inspect_output_with_captures</code>. No further one is posted for that run until its output is read
+again or the run finishes, whose job update reports the final output.</p>
+<p><code>RuntimeEvent::ResponseChanged { agent, request }</code> reports that a response streamed after it was
+last read; it carries no deltas. Read the response as it streamed so far with
+<code>SessionStore::response(agent, request)</code> and replace it in <code>views.responses</code>; a read may run ahead
+of updates still queued, which fold after it. No further one is posted for that response until it
+is read again, a record of its agent applies, or a new observation is taken. Live responses are
+provisional, not additional committed messages. A new attempt of the same logical request resets
+its live response without removing durable attempt records. On receiver lag, obtain a fresh
+observation and replace <strong>both</strong> the snapshot and receiver, then read again the pages on display;
+continuing with only one can leave a gap or apply stale live state.</p>
+<h3 id="reading-history-in-pages"><a class="header" href="#reading-history-in-pages">Reading history in pages</a></h3>
+<p>History is read in pages after observing, through the handle’s <code>store()</code> (a <code>SessionStore</code>) and
+<code>jobs()</code> (a <code>JobManager</code>), each in one snapshot of the journal. A <code>Page</code> is the first or last of a
+list, or the entries after or before a key, which it never includes:</p>
+<ul>
+<li><code>transcript(agent, page, limit)</code> returns consecutive entries of one agent’s transcript by
+ordinal, with their <code>facts</code>: what presenting them reads beyond them, as the journal leaves it
+(the requests they make or answer, each answer’s request and when its turn began, the result
+of each call they made and the calls that started a job, and the failed turns a request’s
+failure reports), so a host can show any page on its own. <code>PageFacts::observe</code> folds an
+update’s record and its <code>fact</code> into them.</li>
+<li><code>jobs().page(JobScope::Roots(owner) | JobScope::Children(parent), page, limit)</code> returns an
+owner’s jobs that do not nest under a parent (<code>JobEnvelope::nests</code>: a job its owner’s script
+issued), or a parent’s children whoever created them, in id order; <code>jobs().views(ids)</code> returns
+jobs by id.</li>
+<li><code>requests(agent, page, limit)</code> returns an agent’s requests as the journal leaves them.</li>
+<li><code>agents()</code> returns every agent the session started as the records that say what a host shows
+of it (its start, latest model and mode changes, latest todos and the latest record that ended
+a turn), when the turn that record ended began and ended, when its open turn began, and its
+owner job, read through <code>through</code>: a summary’s records repeat any update through it.</li>
+<li><code>failed_after(agent, record)</code> says whether an agent journaled a failed turn after a record.</li>
+</ul>
+<p>A page sees at least what the observation applied. A host places an update’s record at the
+ordinal <code>apply</code> reports, counted on from the snapshot’s <code>views.entries</code>: a record at an ordinal a page
+holds is one the page already shows, and every later one is news. Requests and jobs read as the
+snapshot holds them where it holds them, and as their page read them otherwise; a page in flight
+when the session lets a job go may have read it before its final view, which <code>apply</code> hands over in
+<code>unheld</code>, as it hands over a request a newer one replaced in <code>superseded</code>.</p>
+<h3 id="inspection-and-host-records"><a class="header" href="#inspection-and-host-records">Inspection and host records</a></h3>
+<p><code>inspect_output_with_captures</code> and <code>jobs().inspect_output_fields</code> are host inspection APIs. They do not
 claim jobs or consume agent notifications. <code>cancel_job</code> is the separate operation that requests
-cancellation. <code>startup_warnings</code>, <code>warnings</code>, and <code>mcp_servers</code> expose startup diagnostics and MCP
+cancellation. <code>warnings</code> and <code>mcp_servers</code> expose startup diagnostics and MCP
 discovery outcomes without inserting diagnostics into model context or writing directly to a
 terminal. <code>record_status</code> likewise records host-facing status, not a user message.</p>
 <p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
-checklists from observed records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
+checklists from records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
 <h2 id="interruption-continuation-and-shutdown"><a class="header" href="#interruption-continuation-and-shutdown">Interruption, continuation, and shutdown</a></h2>
 <p><code>prompt</code> and <code>prompt_with_options</code> submit input and wait for its turn. <code>interrupt</code> stops active
 turns while retaining child jobs for continuation, and returns how many turns and unstarted child
-agents it stopped. If that is more than none, job deliveries start no turn until
+agents it stopped, and calls it withdrew from waiting on the resume hook. If it stopped any turn or
+agent, job deliveries start no turn until
 <code>continue_turn_with</code> or new input: they stay pending for that request. An interrupt also hands
 back input no agent has taken yet: a pending <code>prompt</code> returns <code>Interrupted</code>, and each
-<code>QueuedPromptReceipt</code> from <code>enqueue_prompts</code> resolves <code>Interrupted</code>. Explicit job cancellation is
-non-resumable.
+<code>QueuedPromptReceipt</code> from <code>enqueue_prompts</code> resolves <code>Interrupted</code>. Queued prompts are checked
+when a request boundary takes them, all of them as one batch. A batch the session refuses fails
+the turn, whose <code>AgentFailed</code> record says why, and waits with it: its receipts stay pending, each
+prompt can still be withdrawn (<code>QueuedPromptCancellation::is_retained</code> tells such a prompt) until
+<code>continue_turn_with</code> takes the batch to try again under its selection, together with anything
+queued since. It checks the batch as a request boundary would before it changes anything, and from
+then on the root runs it as a turn: a batch those checks or the selection refuse waits again
+unchanged, together with anything queued meanwhile, and the call returns why. One that an interrupt
+stops first also waits again unchanged, but the interrupt hands back what was queued meanwhile
+(<code>Interrupted</code>), as it does any input no turn has taken. An interrupt leaves a waiting batch
+waiting; a <code>prompt</code> hands it back (<code>Interrupted</code>), and so does an interrupt that overtakes the
+refusal itself, after which the root rests unless a turn is still open. Closing the session drops
+it. Explicit job cancellation is non-resumable.
 <code>continue_turn_with</code> continues failed or interrupted work without duplicating its input and can
-select a model or mode for the continued root turn. Its <code>ContinueOutcome</code> distinguishes a root
-answer from resumed children and reports whether the selection applied: restarting children does
-not imply that a waiting or live root also ran. <code>continue_turn</code> uses default options and returns
-the root answer, or an empty string when there is none.</p>
+select a model or mode for the continued root turn. It always restarts the interrupted or failed
+children first; a root turn or batch refused afterwards returns why without undoing that. Its
+<code>ContinueOutcome</code> distinguishes a root answer from resumed children and reports whether the
+selection applied: only a continued root turn applies it, and restarting children does not imply
+that a waiting or live root also ran. <code>continue_turn</code> uses default options and returns the root
+answer, or an empty string when there is none.</p>
+<p><code>HarnessBuilder::resume_hook</code> registers a <code>ResumeHook</code> whose <code>resumed(&amp;ExtensionDb)</code> runs once
+per launch for each of the host’s own sessions with its tables that it reopens, before the first prompt,
+<code>enqueue_prompts</code>, <code>continue_turn_with</code> or <code>run_script</code>; a session only viewed never runs it, nor
+does one this launch created. <code>SessionHandle::resume_work</code> runs it on its own, for work the host
+prepares before sending it. A failure refuses that work with <code>HarnessError::Resume</code> (the first
+queued prompt says why, the rest of its batch resolve <code>Interrupted</code>), and the next work calls it
+again. An interrupt withdraws every call still waiting on it, even one whose hook succeeded or
+failed as the interrupt landed: each returns <code>Interrupted</code>, starts nothing, and counts in what
+<code>interrupt</code> returns. The interrupt leaves its turns continuable as any interrupt does. A hook the
+interrupt cut short is dropped and runs again for the next work; one that finished does not.
+<code>shutdown</code> withdraws the calls waiting on it in the same way and returns only once each call’s
+hook has ended, so nothing the hook does follows it.</p>
 <p>Use <code>Harness::resume_session</code> to reopen durable state. The session opens to view: it journals
 nothing, and its observation reads it stopped at its last activity, until the first call that
 changes it, such as a prompt, <code>continue_turn_with</code>, a script, a status, a title or a job
-cancellation. That call first prepares the root agent; if the root cannot run, for example because
-its model is no longer configured, the call fails and the session stays viewed. Otherwise the
+cancellation. That call first prepares the root agent; if that fails, for example because its
+provider cannot open a conversation, the call fails and the session stays viewed. Otherwise the
 runtime reconciles interrupted work in one transaction before starting agents. Shutting down a
 viewed session stops nothing and journals nothing: it closes the session, releasing it for another
 open, and later calls that would change it are refused. Work the previous process left open is
@@ -299,10 +606,19 @@ A root turn that failed or was interrupted before the session closed can still b
 that closed idle with job deliveries pending resumes interrupted too, so <code>continue_turn_with</code> or new
 input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
-configuration.</p>
-<p>Session databases use format 22. Earlier formats are not migrated and cannot be resumed with
-this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
-new session.</p>
+configuration.
+A session whose root’s recorded model is no longer configured still opens and activates, and
+<code>warnings</code> says so: calls that only write, such as a title, a status or a job
+cancellation, work as usual. Only running the root fails, with <code>HarnessError::UnknownModel</code> and
+before anything is journaled: a script, or a direct prompt, a continuation or an
+<code>enqueue_prompts</code> call of which no prompt names a configured model. A selection naming one
+replaces the model, as does <code>SessionHandle::activate_on</code>, which a viewed session journals in the
+commit that activates it. Job deliveries that would wake the root before then begin a turn that
+fails as any failed turn does, journaled, and stay pending for the input that names a model. A child whose own model is gone restarts
+on the root’s, journaled as a model change; with the root’s gone too, its restart fails alone.</p>
+<p>Session database formats are clean breaks (the current one is named in
+<a href="architecture.html">architecture</a>): earlier formats are not migrated and cannot be resumed; retain a
+compatible Skyhook version to inspect them, or start a new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. It interrupts
 the session as a crash would: child agents still running end interrupted and can be continued once
@@ -320,7 +636,8 @@ whose <code>new_session</code> caller gave up, is removed.
 A write the session journal cannot take stops the session as a crash would: the call that met it,
 calls it cut short and every later call return <code>SessionError::JournalFailed</code> with the first
 cause; <code>shutdown</code> and <code>close</code> report it too and still release the session. Its observation reads
-the phase as failed. <code>SessionHandle::phase</code> tells whether the session still runs and journals.
+the phase as failed and otherwise shows what reopening the session would; an observation attached
+before then no longer follows it once it folds that phase, and observes again. <code>SessionHandle::phase</code> tells whether the session still runs and journals.
 A session belongs to the Tokio runtime that created or resumed it: use it only from that runtime,
 and keep the runtime running until the session is closed.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
@@ -334,18 +651,27 @@ architecture. A missing matching artifact produces an explicit deployment error.
 See <a href="remote-transport-and-shims.html">remote transport and shims</a> for build, packaging, and deployment
 behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
-<p><code>SessionStore::read_records(root, id).await</code> returns sequence-ordered records from a read-only
-database snapshot without acquiring the session’s writer lock. A live owner may continue writing;
-archive inspection neither takes ownership nor resumes unfinished work.
-<code>SessionStore::is_open(root, id).await</code> reports whether a store in any process holds the session.
-It takes the session lock shared for an instant; an open racing it retries once before failing
-with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id).await</code> reads a session list row without
-decoding the session, including its title as <code>SessionHandle::title</code> reads it, in <code>last_millis</code> the
-time of its newest record that <code>SessionEvent::is_activity</code> (closing a session is not), and, in
-<code>stopped</code>, the failed or interrupted turn that resuming the root agent would continue, if any. <code>stopped</code> reads only the root’s journaled turns, so a session that closed idle with job
-deliveries pending has none, yet resumes interrupted.</p>
-<p>The SQLite layout is versioned by <code>session::SESSION_FORMAT_VERSION</code>. Opening a database validates
-its identity and version; there is no migration or compatibility layer for earlier layouts.</p>
+<p><code>SessionStore::read_records(root, id).await</code> returns every record, in sequence order, from a
+read-only database snapshot without acquiring the session’s writer lock: an explicit export of the
+whole journal. A live owner may continue writing; archive inspection neither takes ownership nor
+resumes unfinished work. <code>SessionStore::is_open(root, id).await</code> reports whether a store in any
+process holds the session. It takes the session lock shared for an instant; an open racing it
+retries once before failing with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id).await</code> reads a
+session list row without decoding the session, including its title as <code>SessionStore::title</code>
+reads it, in <code>last_millis</code> the time of its newest record that <code>SessionEvent::is_activity</code> (closing
+a session is not), and, in <code>stopped</code>, the failed or interrupted turn that resuming the root agent
+would continue, if any. <code>stopped</code> reads only the root’s journaled turns, so a session that closed
+idle with job deliveries pending has none, yet resumes interrupted.
+<code>SessionStore::stats(root, id).await</code> reads, the same way, the statistics <code>skyhook stats</code> reports:
+aggregates over the whole journal, its requests read a page at a time, so its memory does not grow
+with the session.</p>
+<p>The SQLite layout is versioned. Opening a database validates its identity and version; there is no
+migration or compatibility layer for earlier layouts.</p>
+<p>An embedder that runs the library without <code>skyhook_cli::main</code> may call
+<code>skyhook::db::configure_process()</code> once at startup, before any other thread or SQLite use. It turns
+off SQLite’s allocation statistics, whose global mutex serialises parallel readers, but it also
+disables SQLite memory accounting for everything else in the process, so the library never calls
+it on its own.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
 <p>The journal records inputs at the shared <code>Provider</code> boundary, not codec-specific request bodies
 or authentication headers:</p>
@@ -377,22 +703,24 @@ the session format: a change to either is a database version bump. Failed and in
 requests keep their recorded inputs; usage identifies the originating request, including summary
 requests and failed attempts.</li>
 </ul>
-<p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the <code>provider/model</code> name the
+<p><code>SessionStore::reconstruct_model_request(sequence).await</code> returns the <code>provider/model</code> name the
 request was issued under and the reconstructed <code>ModelRequest</code> for a <code>model_requested</code> sequence,
-using sequence-ordered records from <code>SessionStore</code>. It checks the request’s context, checkpoint
-and history bound as an append does, so other records fail with a <code>ReplayError</code>. Attachments and
-tool images reference content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request, &amp;mut cache)</code>
-on an owning <code>SessionStore</code> loads their contents for provider encoding, reusing and then keeping
-exactly this request’s blobs in <code>cache</code>; unlike <code>read_records</code>, opening a store acquires the
-session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
-API-specific wire encoding or a replay of the external call.</p>
+read from the session’s journal. It checks the request’s context (its agent’s newest for that
+purpose), checkpoint and history bound, and that an agent request follows a result for every call
+its agent made, as an append does, so other records fail with a <code>ReplayError</code>. Attachments and
+tool images reference content-addressed blobs by SHA-256;
+<code>load_blobs(&amp;mut request, &amp;mut cache)</code> on the same store loads their contents for provider
+encoding, reusing and then keeping exactly this request’s blobs in <code>cache</code>. Both need an owning
+<code>SessionStore</code>; unlike <code>read_records</code>, opening a store acquires the session’s writer lock.
+Reconstruction reproduces Skyhook’s provider-neutral input, not an API-specific wire encoding or a
+replay of the external call.</p>
 <p>The <code>ModelRequest</code> contract preserves the typed context entries and <code>history_lifetime</code> cache hints.
 See <a href="architecture.html#history-transient-state-and-caching">history, transient state, and caching</a>
 for their semantics and provider rationale.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs">configuration admission</a>,
-<a href="https://github.com/kryesh/skyhook/blob/main/src/agent/runtime/session.rs">session handle</a>,
-<a href="https://github.com/kryesh/skyhook/blob/main/src/agent/observation.rs">observation</a>, and
-<a href="https://github.com/kryesh/skyhook/blob/main/src/session/request.rs">request reconstruction</a>.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/config/runtime.rs">configuration admission</a>,
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/agent/runtime/session.rs">session handle</a>,
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/agent/observation.rs">observation</a>, and
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/session/request.rs">request reconstruction</a>.</p>
 
                     </main>
 

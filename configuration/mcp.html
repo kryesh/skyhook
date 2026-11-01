@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -199,13 +199,14 @@ legacy HTTP+SSE transport is not supported.</p>
     transport: "streamable_http"
     url: "http://127.0.0.1:8080/mcp"    # Full MCP endpoint, not an API root.
     capabilities: ["read", "write"]
-    headers_env: { Authorization: "MY_MCP_AUTHORIZATION" }
+    headers:
+      Authorization: { env: "MY_MCP_AUTHORIZATION" }
     # Optional local startup fallback, only when the endpoint is unreachable:
     # start_command: ["my-http-mcp-server", "--port", "8080"]
 </code></pre>
 <h2 id="connections-and-credentials"><a class="header" href="#connections-and-credentials">Connections and credentials</a></h2>
 <p><code>start_command</code> is an argument vector, not shell text; its first element must name a nonempty
-executable. Stdio requires it and rejects <code>url</code> and <code>headers_env</code>. Streamable HTTP requires an
+executable. Stdio requires it and rejects <code>url</code> and <code>headers</code>. Streamable HTTP requires an
 absolute HTTP(S) <code>url</code>. It connects first, and only starts the optional command if the endpoint is
 unreachable—not on authentication, protocol, or other server errors. <code>cwd</code> and <code>env</code> apply only to
 <code>start_command</code>; HTTP connections without a startup command must omit them. Relative <code>cwd</code> is
@@ -216,11 +217,13 @@ command runs in the session workspace, whichever file defines the server; MCP co
 the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as <code>WORKERS: "4"</code>.</p>
-<p>HTTP <code>headers_env</code> maps header names to environment-variable names. The variable’s complete value
-is sent as the header (for example, <code>MY_MCP_AUTHORIZATION</code> can contain <code>Bearer ...</code>); secrets do not
-belong in YAML. Missing or non-Unicode variables, invalid header names, and values that cannot be
-encoded as HTTP headers prevent that server’s connection from starting. Empty header values are
-passed through to the server. Do not put secrets in <code>start_command</code> arguments or literal <code>env</code> values.</p>
+<p>HTTP <code>headers</code> maps header names to values in the forms a provider’s
+<a href="authentication.html"><code>headers</code></a> take: a literal, <code>env: NAME</code>, or <code>command: "..."</code>. The complete value
+is sent as the header (for example, <code>MY_MCP_AUTHORIZATION</code> can contain <code>Bearer ...</code>). Invalid or
+repeated header names, blank values and invalid literals are refused with the configuration. An
+environment value is read, and a command run, when the connection starts; a missing, blank or
+invalid value, or a failed command, prevents that server’s connection from starting. Prefer <code>env</code>
+or <code>command</code> for secrets, and do not put them in <code>start_command</code> arguments or literal <code>env</code> values.</p>
 <h2 id="trust-and-permissions"><a class="header" href="#trust-and-permissions">Trust and permissions</a></h2>
 <p><strong>Trust boundary:</strong> configured startup commands are trusted configuration, including commands
 from a workspace <code>.skyhook/config.yaml</code> overlay. Review workspace config before use. They run during
@@ -258,8 +261,9 @@ and skipped individually.</p>
 <a href="../reference/javascript.html#saved-output-and-serialization">saved-output image handling</a>, and server-reported errors retain their
 output in failed jobs.</p>
 <p>Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
-bounds discovery and response sizes, and does not replay a call with an uncertain outcome after
-a connection failure. Cancellation cannot undo effects that already occurred on the server.</p>
+bounds discovery sizes and each message a server sends, at 64 MiB; a larger stdio message is
+discarded, the call it answered ends at its call timeout, and the server keeps serving other
+calls. Skyhook does not replay a call with an uncertain outcome after a connection failure. Cancellation cannot undo effects that already occurred on the server.</p>
 
                     </main>
 

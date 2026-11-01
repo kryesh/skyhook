@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -221,8 +221,9 @@ controls whether and how the model receives a fresh <code>&lt;skyhook_state&gt;<
 <p>The snapshot shows the host’s current local date, active jobs, and the caller’s todo list.
 Empty job and todo sections are omitted. This is a compact model-facing view, not the JSON
 returned by job or todo tools; scripts should use those tools to inspect state.
-Dynamic snapshots are still recorded with model requests; this mode is not a data-retention or
-provider-cache control.</p>
+Dynamic snapshots are still recorded with model requests; this mode is not a data-retention
+control. It does affect prompt caching: see <code>state_mode</code> for when <code>persist</code> keeps more of the
+history cached.</p>
 <h3 id="reading-job-progress"><a class="header" href="#reading-job-progress">Reading job progress</a></h3>
 <p>Job rows identify the job, parent, tool, optional name, state, age, and child-agent progress.
 Directly visible jobs have <code>-</code> as their parent; nested active child agents identify their

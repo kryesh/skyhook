@@ -1,0 +1,648 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Security research - Skyhook</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-26aae551.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Skyhook</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kryesh/skyhook" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kryesh/skyhook/edit/main/docs/src/src/guide/security.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="security-research"><a class="header" href="#security-research">Security research</a></h1>
+<p><code>skyhook-security</code> is a companion application built from the same library and terminal host as
+<code>skyhook</code>. It researches a selected part of a target: a codebase, or without source a deployed
+service or API, a network daemon or a binary, recording the flaws it finds,
+how each entry point reaches them, the vulnerability candidates they support, reviews, and
+empirical validation attempts. It is not a sound static analyzer: a flaw, route or candidate is
+a research hypothesis, not proof that a path is executable or a vulnerability exists. Reports
+identify assumptions and coverage gaps.</p>
+<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
+<p>The companion reuses the ordinary user and workspace <code>config.yaml</code>: providers, model settings,
+credentials, execution targets, and MCP servers are not copied into another file, and
+<code>skyhook auth</code> manages the same credentials. Additional settings live in <code>security.yaml</code>, with
+the same user-directory discovery and workspace overlay rules; the workspace file is
+<code>.skyhook/security.yaml</code>. <code>--security-config PATH</code> selects one explicit security file and
+disables discovery for that file alone; <code>--config PATH</code> independently selects the ordinary
+configuration. <code>skyhook-security dump config</code> shows the effective shared configuration with
+security modes, model hints, and merged MCP entries applied, without opening a run or session.
+The embedded modes’ instructions render for each agent, so the dump leaves them out.</p>
+<p>Model assignments refer to the <strong>configured</strong> <code>provider/model</code> names, not the identifiers sent
+to a provider. A model can serve several roles, and several models can serve one role.
+Assignments become model-selection hints rather than mandatory bindings: orchestrators choose
+appropriate models when delegating, and unassigned models are not offered as explicit
+delegation choices. The roles are <code>orchestrator</code>, <code>explorer</code>, <code>validator</code>, <code>environment</code>,
+<code>poc</code>, and <code>reporter</code>; a role is not a mode name. A session that starts with no role hints
+configured reports it as a diagnostic.</p>
+<pre><code class="language-yaml"># Replace these names with entries in your ordinary config.yaml.
+models:
+  main/reasoner:
+    roles: [orchestrator, validator]
+    hint: Prefer for complex cross-component reasoning.
+  local/coder:
+    roles: [explorer]
+    hint: Prefer for focused code exploration.
+
+shortlist: high
+live: ask
+</code></pre>
+<p>The first configured orchestrator model is the companion’s default model; an explicit <code>--model</code>
+or the remembered model takes precedence. The root agent always runs in the <code>orchestrate</code> mode:
+<code>--mode</code> and batch <code>--capabilities</code> are refused, and the terminal offers no mode switch;
+children take their modes from the agent tool.</p>
+<p><code>shortlist</code> is the CVSS 4.0 severity a candidate needs to enter review; it defaults to <code>high</code>.
+CVSS keeps an authenticated-user flaw with limited impact below that line, so set <code>shortlist: medium</code>
+for web and other logic-heavy targets where such findings matter. The severity a candidate is
+assessed at is the impact if its unresolved conditions hold, so uncertainty never lowers it.
+<code>workers</code> is how many agents the orchestrator’s scheduler runs at once (default 6). It
+is the default for a new run; the run keeps what it started with, and a later launch’s
+<code>--workers</code> can change it. It guides the agents and is not an enforced cap.
+<code>live</code> decides whether agents work against a running target, probing it and demonstrating
+findings: <code>ask</code>, <code>yes</code> or <code>no</code>; omitting it asks interactively and defaults to <code>no</code> in batch
+mode. See <a href="https://github.com/kryesh/skyhook/blob/main/security.example.yaml"><code>security.example.yaml</code></a>
+for the complete shape.</p>
+<p>Security settings can also add MCP servers (replacing same-named <code>config.yaml</code> entries) and
+override embedded modes. A <code>modes</code> entry replaces that named embedded mode <strong>whole</strong>, including
+its capabilities, instructions, and delegation hint. A parent must hold every capability its
+child mode needs, which is why <code>orchestrate</code> holds <code>exec</code> and <code>network</code>. Every embedded mode holds
+<code>read</code>, <code>mcp</code> and <code>agents</code>; the table below lists what each adds. All of them stay subject to the
+usual approvals, and <code>targets</code> is granted by none. The companion declares five
+capabilities, which follow the same ceiling and delegation rules as built-ins:</p>
+<ul>
+<li><code>security.research</code> permits recording research: components, sources, paths, premises,
+flaws, candidates and their links, evidence, merges, statuses, assessments, and environments.</li>
+<li><code>security.verdict</code> permits writing reports; together with <code>security.research</code>, review
+verdicts.</li>
+<li><code>security.test</code> permits recording tests. It is separate so a PoC agent can also record
+research without deciding verdicts.</li>
+<li><code>security.scheduled</code> permits beginning the work the orchestrator’s scheduler assigns; only
+the modes it launches, and <code>orchestrate</code>, which launches them, hold it.</li>
+<li><code>security.coordinate</code> permits scheduling the run and writing its reports out; only
+<code>orchestrate</code> holds it.</li>
+</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Embedded mode</th><th>Security capabilities</th><th>Additional built-in capabilities</th></tr>
+</thead>
+<tbody>
+<tr><td><code>orchestrate</code> (root)</td><td>every security capability</td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>target</code></td><td><code>security.research</code></td><td><code>network</code></td></tr>
+<tr><td><code>question</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>sweep-part</code></td><td><code>security.research</code></td><td>none</td></tr>
+<tr><td><code>paths</code>, <code>sources</code></td><td><code>security.research</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>sweep</code>, <code>assess</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td>none</td></tr>
+<tr><td><code>probe</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>validate</code></td><td><code>security.research</code>, <code>security.scheduled</code>, <code>security.verdict</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>environment</code></td><td><code>security.research</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>poc</code></td><td><code>security.research</code>, <code>security.scheduled</code>, <code>security.test</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>report</code></td><td><code>security.research</code>, <code>security.scheduled</code>, <code>security.verdict</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>sources</code> holds <code>exec</code> and <code>network</code> for binary images and live enumeration, which most
+<code>sources</code> agents, reading one code file, never use; <code>paths</code> holds them to launch <code>sources</code>. A <code>question</code> agent settling a premise the code alone
+cannot decide may, under a live policy, run a bounded experiment or measurement in a recorded
+environment, or have a child run it, and decide the premise from what it observed against its
+control.</p>
+<p>How far a child may delegate is set by its launch’s depth. The embedded templates launch
+coordinators (<code>sweep</code>, <code>probe</code>, <code>validate</code>, <code>poc</code>) with depth 2 and every other mode with depth
+1, so any agent can delegate part of its work or a focused check when it is more than it can
+cover well; agents may choose otherwise.</p>
+<h2 id="research-pipeline"><a class="header" href="#research-pipeline">Research pipeline</a></h2>
+<p>The root orchestrator drives the pipeline through delegated research modes; the research store
+holds one graph of what the agents found and derives the work each part of it still owes;
+nothing is planned. <code>target</code> maps the code, binaries and interfaces into components, mapping
+what it cannot read by what its material shows, and records the deployment premises your
+request settles, each actor’s intended capabilities among them, and each interface in scope
+under a short name; when your scope includes dependencies, it records each locked version a
+published advisory affects as a flaw at its manifest entry. Under a live policy, when the map
+records interfaces, the orchestrator arranges an environment serving them before <code>paths</code>, under
+<code>ask</code> once you approve its scope. <code>paths</code> has a <code>sources</code> child record the entry points of each
+file and of each interface an environment serves, each on the path its flow matches or one of
+its own up to its handoff, then relinks the sources, path premises and candidate actions of paths
+sharing a handoff onto one path and extends each through the components it reaches.</p>
+<p>After <code>paths</code>, one scheduler runs every phase together within <code>workers</code>: each subject starts as
+soon as its own prerequisites are met rather than when a whole phase ends. Ready work starts in
+pipeline order — sweeps and probes, settles and chains, assessments, reviews, tests, reports —
+and later work waits only on earlier-stage work, ready or running, that touches it; unrelated
+later work fills the remaining slots. Settles and chains go out in bundles: one child takes every ready
+entry of its phase that shares a node with the first. Work on a node that running work is about
+waits for it, so one agent works a node at a time and the next starts with its findings in view.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Subject</th><th>Owed while</th><th>Mode</th></tr>
+</thead>
+<tbody>
+<tr><td>Sweep</td><td>path</td><td>it is unswept and a recorded source entering it sits in code; a path is swept once, and a later correction of its steps owes nothing; marking it unswept offers its sweep again</td><td><code>sweep</code> (long paths in <code>sweep-part</code> stretches)</td></tr>
+<tr><td>Probe</td><td>path</td><td>it is unswept, no recorded source entering it sits in code, and the launch does live work and an environment for any candidate serves each interface its sources sit on, or they sit only in binaries; a new environment for any candidate serving one of those interfaces (any one, for binaries only), unless recorded within a probe, gives an unswept probe fresh tries</td><td><code>probe</code></td></tr>
+<tr><td>Settle</td><td>code premise</td><td>it is undecided, or disputed since its decision, and a live flaw or unretracted path relies on it</td><td><code>question</code></td></tr>
+<tr><td>Chain</td><td>flaw</td><td>it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate holds it; ready once no path’s sweep or probe is pending</td><td><code>question</code></td></tr>
+<tr><td>Assess</td><td>candidate</td><td>no assessment stands at what it rests on: its own, its chain’s, its flaws’ or its paths’ material changes</td><td><code>assess</code></td></tr>
+<tr><td>Review</td><td>candidate</td><td>it is assessed at or above the shortlist and no verdict stands; ready once no premise of its chain is undecided while its settle is pending or the user is asked it</td><td><code>validate</code></td></tr>
+<tr><td>Test</td><td>candidate</td><td>it is validated, not noted, untested or reopened, and leads its root group; or its latest test is pending</td><td><code>poc</code></td></tr>
+<tr><td>Report</td><td>root flaw</td><td>its group has a reportable scenario its finding does not report as it stands; ready once no member owes an assessment, review or test</td><td><code>report</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Each child first begins a task on its subjects; a subject with a running task is not offered
+again, and one two tasks left owed while no other agent changed what it rests on is
+<strong>exhausted</strong> (what a task’s own agent and its helpers record never counts, save a pending test
+and a merge),
+releasing the work it held back, until that changes. A child that ends without beginning its
+task, such as one whose provider fails, counts toward those two within one scheduler run, and
+the orchestrator tells you what is exhausted with the children’s replies. The scheduler stops
+once nothing it could start is left, unless you ask it to stop sooner or give a budget; a test
+waiting on an approval or an unblock comes back held, and the orchestrator asks you, then runs
+it again with your answers. Every scheduling fact is in the store, so running the
+scheduler again, after a stop, a crash or a resume, continues where the last run stopped. The
+orchestrator runs one at a time.</p>
+<p>A child working a task is told, with its next request, of what other agents changed of what
+its work rests on since it began: each change once, as a digest per changed subject (how many
+changes, the latest, their kinds, and the newest few with the nodes each moved most), so it can
+re-read them before deciding. Its own changes and its helpers’ are left out,
+and the root, which works no task, is told nothing.</p>
+<p>The research graph holds nodes of a few kinds, each with a title and a body:</p>
+<ul>
+<li>A <strong>component</strong> is implementation, by the files and named interfaces it owns; its body notes its
+concurrency: what runs its code, the state it shares, and what serialises access to it.</li>
+<li>A <strong>source</strong> is one entry point an actor drives, with its location and trust (untrusted,
+authenticated, local or privileged); a location has one source, so recording another there
+returns the one recorded, and merging a source frees its location for the source it merged
+into. A read of state an attacker-driven flow writes, such as a
+stored record or session, is a source too, trusted as its least-privileged writer;
+configuration read at startup is trusted as the operator, and a CI job others can trigger as
+whoever can trigger it.</li>
+<li>A <strong>path</strong> is an ordered flow of steps through components, each at a location with a note,
+from the sources that share it.</li>
+<li>A <strong>premise</strong> is a prerequisite: internal state or logic a flaw needs to reach unintended
+state, or a path needs to carry input there. A failing premise contradicts the candidates
+resting on it. It is code-scoped, about the target’s own logic and decided by reading or
+observing it, or deployment-scoped, decided by you, and holds, fails, or is undecided.</li>
+<li>A <strong>flaw</strong> is a local defect at a location in a component, with an optional CWE, the
+premises it depends on, and a status: suspected, confirmed (a verified defect with no chain
+to an observable consequence found so far) or refuted.</li>
+<li>A <strong>candidate</strong> is an ordered chain of flaws to an observable vulnerability, its first flaw
+its root, through its <strong>actions</strong>: the paths its scenario performs, in order, the first where
+the attacker starts. A path may repeat, as in a race with itself. Candidates sharing a root
+flaw are its <strong>group</strong>, tested and reported together; a candidate merged into another adds,
+after the other’s own actions, each path it performed as often as it did beyond the other.</li>
+<li>A <strong>finding</strong> is a root flaw’s report.</li>
+</ul>
+<p>A <strong>location</strong> is a code region (file and lines, in its function), an address range of a binary
+image at its link base (in its symbol), or an operation of a recorded interface in that
+interface’s own terms (a route template, a method, a message type), at one of its fields when
+narrower. A location names an interface, never an address, so it stays the same across
+deployments. <strong>Evidence</strong> is a location with a stance on one node: it supports, contradicts or
+gives context; one made in an environment names it.
+Contradicting evidence after a premise’s decision or a flaw’s refutation disputes it and owes its
+settle or chain again; an edit of its substance since reads it as undecided or suspected until it is
+decided or judged again. Any agent may raise a candidate, a flaw or a premise at any time, left unsettled for the work that
+checks it (except a deployment premise your request settles), and merge
+a duplicate of any kind but a finding into the node it repeats, which takes its edges; restating
+what is recorded changes nothing. A source, path or component recorded in error is retracted with
+<code>set_status</code> and a note: it shows as retracted but owes no work, holds none back and leaves every
+count, and the premises a retracted path relies on stand in no candidate’s chain, until marked
+<code>recorded</code> (a path <code>unswept</code>) again. Retracting or restoring a path owes the reviews and reports
+of the candidates performing it again.</p>
+<p>Candidates are assessed with a CVSS 4.0 base vector (CVSS-B) scored for the impact if every
+premise of its chain holds; the native scorer applies the shortlist threshold. A build option,
+configuration or deployment other than the default, or a race window the attacker must win,
+makes Attack Requirements present and is a premise. Attack Vector, Privileges Required and the
+other exploitability metrics come from what the attacker must hold or face before the first
+action, plus anything a later action needs that no earlier action supplied; access or privilege
+gained during the scenario is never a prerequisite. A score rests only on what the candidate’s
+premises establish: a condition that would raise a metric becomes its own candidate, the same
+chain with that condition as a premise, so the root’s report leads with whichever validates. A
+review records <strong>validated</strong> (every
+premise holds), <strong>disproved</strong> (a chain flaw is refuted or a code premise fails), <strong>excluded</strong> (a
+deployment premise fails, so the deployment keeps a real finding out of reports) or <strong>unproven</strong>
+(a premise stays undecided). A verdict counts while nothing it judged changed after it, and an
+unproven one only while a premise of its chain is undecided: a premise decision or dispute owes
+the review again, and a material change of the candidate, its chain, a path it performs or a
+source entering one owes the assessment again too. A candidate’s confidence is <strong>conjectured</strong>
+while a premise of its chain is undecided or contradicts it, <strong>established</strong> otherwise,
+<strong>confirmed</strong> while a positive verdict stands, and <strong>demonstrated</strong> once its settling test (its
+latest test that is not pending, recorded at its latest verdict) is confirmed and its chain
+uncontradicted. A validated candidate no more severe than a demonstrated one of its group is
+<strong>noted</strong> rather than tested.</p>
+<p><strong>Deployment premises</strong> stand for what only you can answer. <code>target</code> records the ones your
+request settles as holding or failing. One raised later and left undecided is never settled by
+an agent: it holds back the reviews resting on it and is listed in the synthesis as asked. When
+the scheduler returns, the orchestrator puts the asked premises, and those an unproven candidate
+rests on, to you as one question, records each answer as the premise holding or failing, which
+sends their candidates back to review, and runs the scheduler again.</p>
+<p>The synthesis a scheduler run ends with lists the work each phase owes and has running, each
+exhausted subject with its last agent’s reply, the deployment premises asked of you, the
+candidates left unproven with their undecided premises, the components no path reaches, and the
+interfaces paths without code wait on an environment for (under <code>live: no</code>, every interface such
+a path enters on). After each return the orchestrator also has a <code>question</code> agent review the loose
+ends it lists, the premises of exhausted settles and those an unproven candidate rests on: each is
+settled, given what would settle it, or reopened. Exhausted work is terminal: the orchestrator
+closes the run once a pass changes nothing, with nothing owed or held, everything asked put to
+you, and that review moving nothing. It then always writes the current reports out and lists
+exhausted work as incomplete and each root flaw without a current report as having none. Every agent that records a conclusion (a premise decided, a flaw
+judged, a verdict, a test result) checks the code around it for flaws or candidates it implies.
+All of this is agent-discovered evidence and analytical conclusion, not a symbolic proof or a
+substitute for empirical validation.</p>
+<h2 id="runs-and-sessions"><a class="header" href="#runs-and-sessions">Runs and sessions</a></h2>
+<p>Each security session is one <strong>analysis run</strong>: the session keeps the run’s research beside
+its journal, so a review today can be followed by environment preparation, empirical
+validation, and reporting later, in the same session, without repeating discovery.</p>
+<pre><code class="language-sh">skyhook-security --prompt "Focus on request routing and access control"
+skyhook-security runs            # list security sessions; -w DIR selects another workspace
+skyhook-security runs SESSION    # the run as the Research tab shows it, every section open in full
+
+# Continue a run: resume its session.
+skyhook-security --resume SESSION --prompt "Extend the analysis to the admin interface"
+</code></pre>
+<p>The orchestrator runs the stages your instructions call for: a new session analyzes the
+workspace from target selection onward, and a resumed one continues from its records, whether
+the instructions extend the analysis, prepare an environment,
+validate, test or rewrite reports. Fresh work is always owed; settled or exhausted work is owed
+again only once something it rests on changed. A resumed run keeps its shortlist threshold,
+live policy and workers; a <code>--workers</code> flag resizes it once its work resumes, and <code>--live</code>
+applies only to a new session, so it is refused with <code>--resume</code>. A headless resume is refused
+only when the run’s own policy is <code>ask</code>, whatever the configuration says. Only the root agent knows the
+live policy, and under <code>no</code> every agent’s instructions leave out live work. The shortlist
+threshold is applied by the store alone; no agent is told it.</p>
+<p>In the terminal, a new session opens with a <strong>scope panel</strong> at the top of the
+root agent’s conversation: the shortlist threshold, the live policy, and the workers, prefilled from
+<code>security.yaml</code>, flags, then the defaults. Edit it while writing the
+instructions in the composer: <code>Shift+Tab</code> moves between the fields and the composer, <code>←</code>/<code>→</code>
+change a choice, digits edit the workers. The first message sends the panel’s values with it; with
+no instructions the session starts with “Analyze the workspace.” Once the run has started the
+panel stays in view, frozen; a session that fails to start leaves it editable for the next try.</p>
+<p>The Research tab (<code>]</code> from Jobs, or click its header) takes the whole screen below the tab
+strip. It opens on a dashboard of the run: its threshold, live policy and workers, the synthesis,
+a pipeline showing where each phase stands (what it owes, has running and has exhausted), and
+panels for coverage (sources, paths swept and unswept, uncovered interfaces, components reached
+or mapped only,
+premises undecided, asked and disputed, flaws by status), candidates by status, and the tasks
+running and exhausted in each phase. Below it, sections list the candidates, findings, paths,
+tasks, flaws, premises, components and sources as the session records them; unswept paths come
+first, and each path, premise, flaw and candidate shows what it owes and its last task, and
+opens to its latest tasks. Tasks are listed newest first with their phase, subjects, state (as
+their agent’s job stands), and when they began and ended; a task opens to its brief, its agent’s
+reply and the records the agent wrote. Click a section’s header, or choose it with <code>↑</code>/<code>↓</code> and
+press <code>Enter</code>, to open it; a record opens the same way to its detail, a candidate to its whole
+scenario: actions, chain, premises, assessment, verdict, tests and evidence, with an assessment
+or verdict that no longer stands marked stale. A candidate whose demonstration is under way
+shows as proving, and as test abandoned once the agent running it ended without recording an
+outcome. An open section lists its first 50 records, most relevant first; its last row loads 50
+more. The page scrolls as one, updates while agents work, and keeps what you opened. While
+agents run, they stay in view beside the page on a wide terminal, or below it on a narrow one;
+click one to open its conversation.</p>
+<p>The orchestrator receives the run’s state with each request: run, live policy, workers, the
+plan’s line (such as “owed: 4 sweep, 2 settle; 3 running; exhausted: 1 chain; asked: 1;
+uncovered: 1”), and the
+artifacts directory. The agents it starts receive no run state; their briefs name the IDs of
+their work, and each agent that runs or builds anything gets a working directory of its own
+under <code>artifacts/</code>, so parallel work never collides. A new
+session (<code>Ctrl+X N</code>) starts as the command line would, on the model selected
+where it was opened when the command line’s configuration offers it, and otherwise on its default.</p>
+<p>For automation, <code>batch</code> takes the same choices as flags over the <code>security.yaml</code> defaults:</p>
+<pre><code class="language-sh">skyhook-security batch --prompt "Review the HTTP header parser" --live no --shortlist medium
+skyhook-security batch --resume SESSION --prompt "Review the upload paths" --workers 2
+</code></pre>
+<p>The run’s files live in its session’s directory under <code>.skyhook/sessions/</code>: test artifacts belong
+under <code>artifacts/</code>, and the current reports are written under <code>reports/</code>. Sessions share <code>.skyhook/sessions</code> with <code>skyhook</code>, so <code>skyhook stats</code>
+covers them; a session created by the other application opens view-only (see
+<a href="sessions-and-context.html">sessions</a>).</p>
+<h2 id="live-work-and-reporting"><a class="header" href="#live-work-and-reporting">Live work and reporting</a></h2>
+<p>Live work is any interaction with a running target: probing it, settling or reviewing what only
+observation decides, and demonstrating findings. It happens only in an <strong>environment</strong>, a
+running instance an agent prepared (a container started from a binary or image) or a deployment
+you authorised, which records the interfaces it serves and their addresses. A prepared
+environment is a template: each agent copies it into its own working directory and runs its own
+instance there. A deployment cannot be copied, so its instructions say how agents share it, and
+are the rules of engagement: addresses, identities by reference, rate, what live work may change and
+must leave alone, and the window. Under <code>ask</code> the orchestrator records an environment for a
+deployment only once you approve its scope; under <code>yes</code> it takes the scope from your request,
+never broader. The store schedules around environments and enforces nothing: Skyhook’s
+approvals do, <code>fetch</code> per origin and <code>exec</code> per invocation. <code>exec</code> is not a sandbox, and batch
+live work needs <code>approve_all</code>; with <code>live: yes</code> against production, that is your choice.</p>
+<p>Under <code>live: no</code> no live work is owed: interfaces are never probed, and paths on them are
+listed as uncovered, while a binary is still analysed by reading its disassembly. Under <code>yes</code> or
+<code>ask</code> a path without source code is probed once an environment serves its interfaces; a probe
+that needs what its environment lacks, such as an identity, leaves the path unswept for a later
+environment.</p>
+<p>Under <code>live: no</code> no demonstration is owed. Under <code>yes</code> or <code>ask</code> each validated scenario that is
+not noted owes one until a test settles it, its root group’s most severe first; with <code>ask</code>, an
+interactive run asks after analytical review which findings to demonstrate, and each one
+declined is recorded as such. Declining does <strong>not</strong> reject a finding: its report remains
+confirmed and empirically untested, with the reason. A PoC agent makes an environment change the
+scenario’s premises admit itself, through an environment agent when the change is reusable; an
+environment recorded within its work is prepared for its candidate, without making its test owed
+again. A test waiting on you is recorded as pending and stays owed until you resolve what it
+waits for, which lets it resume; one the environment cannot run is recorded as unavailable and
+reported as untested with its reason. An inconclusive run is not a result: the PoC agent refines
+its approach, delegating helpers as it needs, until it confirms or disproves the scenario. A
+test is recorded as failed only with evidence that the scenario does not work as formulated,
+which goes on the chain flaw or premise it bears on: that evidence sends the candidate back to
+review, and the scenario is reported, or withdrawn, by the verdict review then records. A test
+other than a declined one stands only while the verdict it tested, the latest when its work
+began, is its candidate’s latest: a new verdict, such as a re-validation after its actions or
+chain changed, owes a test of its own, even one recorded while the test ran. An unavailable or
+failed test is owed again once a later environment is recorded for its candidate or for none in
+particular; a declined one stands, across new verdicts too, until you ask for it. A confirmed
+test stands while its chain is uncontradicted. A race, a check apart from its use or a measured
+difference such as timing is demonstrated over a fixed number of trials with a control run as
+often, both success rates in the test’s note, a measured difference confirmed only beyond a
+threshold stated before the runs; a win that needed the window widened counts only when the
+window exists in the unmodified build, with the rate without widening reported. A confirmed test
+is expected to record an attack artifact and a control run on the same build, each a distinct
+regular file under the run’s <code>artifacts/</code> directory reached without a symbolic link; the report
+shows a confirmation that lacks one. Execution uses ordinary approvals and capabilities: prefer
+a disposable container or a deliberately configured target, and keep live validation within the
+authorized environment.</p>
+<p>A root flaw is reported once its group owes no assessment, review or test, by a <code>report</code> agent
+who writes one markdown report: summary, analysis, impact, remediation, reproduction citing
+test ids and artifacts, and a section per other scenario. The report is owed again whenever
+what its scenarios rest on changes after it was written. <code>reports/</code> holds only the current
+reports, rendered from the run’s store; each root flaw with one has a folder,
+<code>reports/&lt;root&gt;/</code>:</p>
+<ul>
+<li><code>README.md</code>: front matter, the title, a generated table of the scenarios (candidate, paths,
+chain, vector, score, severity, status, confidence and test), then the reporter’s report;</li>
+<li><code>finding.json</code>, the machine-readable record the Markdown is rendered from;</li>
+<li><code>test-&lt;id&gt;/</code> for each scenario’s settling test: its artifacts under <code>attack/</code>,
+<code>control/</code>, <code>observation/</code>, <code>harness/</code> and <code>notes/</code> by their own names (numbered <code>-2</code>, <code>-3</code>
+when two share one), with <code>test.md</code>, <code>test.json</code> and <code>SHA256SUMS</code>.</li>
+</ul>
+<p><code>reports/index.md</code> and <code>index.json</code> list every current report with its severity (the most severe
+of its scenarios) and its headline scenario’s own severity, score, vector and confidence,
+labelled apart since a demonstrated headline may be less severe than an untested variant.
+<code>reports/hardening.md</code>, linked from the index while it has entries, lists the confirmed flaws no
+report covers, with each one’s title, location and CWE, in two groups: those no validated
+candidate holds, with why no chain was found, which are not scored or tested; and those whose
+most severe validated candidate is assessed below the run’s threshold, with that candidate and
+its severity. None are reported, and <code>index.json</code> lists them under <code>hardening</code>, each with its
+reason. Every page
+opens with a small front matter its text repeats, and links only by relative path. The
+orchestrator writes <code>reports/</code> out with <code>research</code> <code>generate</code> once it closes the run: a root’s folder is replaced in
+one step when what renders has changed, a stale root’s folder and anything else placed there is
+removed, and a generation with nothing changed changes nothing. An artifact is copied only while
+it matches the digest its test recorded; one that changed keeps the root out of <code>reports/</code> and
+is reported.</p>
+<h2 id="native-research-tools"><a class="header" href="#native-research-tools">Native research tools</a></h2>
+<p>Research tools are bound to the session’s run. Each call names an <code>action</code> and passes that
+action’s arguments beside it; the schema’s description of <code>action</code> lists each action’s
+arguments, marking optional ones with <code>?</code>:</p>
+<pre><code class="language-js">await tool.research({action: "upsert", kind: "premise", title: "32-bit builds",
+  body: "the library is built for 32-bit platforms", scope: "deployment"});
+await tool.research({action: "begin", phase: "sweep", subjects: [3]});
+await tool.research_query({action: "list", kind: "candidate", state: "validated", page: {after: 0, limit: 50}});
+await tool.research_query({action: "node", id: 7});
+await tool.research_query({action: "synthesis"});
+</code></pre>
+<p>A tool offers only the actions the agent’s capabilities allow. Lists are cursor pages: follow
+<code>next_after</code> until it is absent. CVSS input is a complete 4.0 base vector; the native scorer
+computes the CVSS-B score and severity.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Actions</th><th>Capabilities</th></tr>
+</thead>
+<tbody>
+<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind, <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate node, <code>set_status</code> of a premise, flaw, path, source or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
+<tr><td><code>research_query</code></td><td>Read a <code>node</code> with its neighbourhood and latest tasks, a <code>task</code> with its child’s brief, reply and records, <code>list</code> nodes of a kind (or environments and tasks), the event <code>history</code> of the run or a node, and the <code>synthesis</code> of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is <code>startable</code> next.</td><td><code>read</code>; <code>security.coordinate</code> for what can start next</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="building"><a class="header" href="#building">Building</a></h2>
+<p>The companion is the <code>skyhook-security</code> crate of the workspace:</p>
+<pre><code class="language-sh">cargo run -p skyhook-security -- --help
+</code></pre>
+<p>The release build includes both applications; stage shims first when SSH execution is needed
+(see <a href="../getting-started/installation.html">installation</a>).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../guide/instructions-and-skills.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../configuration/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../guide/instructions-and-skills.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../configuration/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

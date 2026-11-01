@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -197,6 +197,17 @@ outside-workspace reads. Outside-workspace writes require confirmation, and remo
 its own approval requirements. Permissions name paths as text, so an operation whose permission
 names a path or workspace that is not valid Unicode is refused rather than approved under an
 approximate name.</p>
+<p>A path counts as outside the workspace when resolving it leaves the workspace: it ends outside, or
+passes through an outside directory or symbolic link on the way, even if it ends back inside. Whether such a path exists is revealed only once its operation is approved. When it
+does not exist, the operation is refused without a prompt, exactly as if the user had denied it,
+unless the approval policy would allow the operation without asking; then it fails as not found.
+A missing path inside the workspace fails before approval. On the session host, a child agent’s
+<code>workspace</code> is checked like a path when the child starts: outside the workspace, it follows the
+rules above; inside, it need not exist yet, and a write that creates parent directories can create
+it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
+<code>workspace</code> resolves to, and its relative paths resolve from there. On the session host, its job
+shows the <code>workspace</code> joined to the agent’s workspace, with any <code>..</code> kept. <code>remove</code> refuses the root workspace, the agent’s workspace, and any directory
+containing either.</p>
 <p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
 scope</strong> saves the displayed grant for later operations while the session stays open; reopening
 the session asks again. Inspect <strong>Details</strong> before granting it. Path grants apply only to the
@@ -232,7 +243,12 @@ handling, see the <a href="../reference/javascript.html#responseunwrap-and-nativ
 </tbody>
 </table>
 </div>
-<p>A capability list is exact; <code>[]</code> grants no policy capabilities. Unknown names and <code>interactive</code>
+<p>Applications embedding Skyhook may declare additional namespaced capabilities, such as
+<code>security.verdict</code>. They follow the same mode, ceiling, and child-delegation restrictions as the
+built-ins. Only names declared by the application may be granted; ordinary Skyhook declares
+none. A host capability name is <code>&lt;namespace&gt;.&lt;name&gt;</code> (lowercase ASCII letters, digits and
+underscores, each component starting with a letter; at most 128 bytes in total).</p>
+<p>A capability list is exact; <code>[]</code> grants no policy capabilities. Undeclared names and <code>interactive</code>
 are errors in a mode and in <code>--capabilities</code>. The host supplies <code>interactive</code> independently of the
 list: the terminal always has it and <code>skyhook batch</code> never does, so an empty list does not disable
 the terminal interface or root questions. Per-agent depth restrictions narrow the result. Enable
@@ -291,6 +307,10 @@ connections. Per-server MCP requirements are additional gates, not grants.</p>
 <p>See <a href="headless.html">headless execution</a> for noninteractive commands and authentication,
 <a href="execution-targets.html">execution targets</a> for route approvals, and
 <a href="../configuration/mcp.html">MCP</a> for trusted server startup and per-server gates.</p>
+<p>Sessions retain the application that created them, separately from their title and mode. Other
+applications can inspect them and read their statistics from the shared session directory, but
+cannot activate, rename, or otherwise change them. Reopening a session in its creating application
+is required to resume work.</p>
 
                     </main>
 

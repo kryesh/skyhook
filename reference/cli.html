@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -200,7 +200,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><td><code>-c, --config PATH</code></td><td>Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging.</td></tr>
 <tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
-<tr><td><code>-m, --model PROVIDER/MODEL</code></td><td>Choose a configured model for a new session, named by its provider and model keys. Resumed sessions retain their recorded model.</td></tr>
+<tr><td><code>-m, --model PROVIDER/MODEL</code></td><td>Choose a configured model for a new session, named by its provider and model keys. With <code>--resume</code>, the session switches to it before anything runs, including a <code>--prompt</code> or <code>--script</code>. Otherwise a resumed session keeps its recorded model.</td></tr>
 <tr><td><code>-p, --prompt TEXT</code></td><td>Submit an initial user message.</td></tr>
 <tr><td><code>-s, --script PATH</code></td><td>Run a JavaScript workflow. Mutually exclusive with <code>--prompt</code>.</td></tr>
 <tr><td><code>--image PATH</code></td><td>Attach an image to the initial prompt; repeat for multiple images. Requires <code>--prompt</code>, conflicts with <code>--script</code>.</td></tr>
@@ -211,13 +211,16 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 </tbody>
 </table>
 </div>
-<p>An initial prompt or script runs in the terminal interface, which remains open afterward.
+<p>An initial prompt or script runs in the terminal interface, which remains open afterward. If
+the session cannot start, the prompt stays queued for <code>/resume</code>, but the script is not run; run
+the command again to retry it.
 Startup without initial input opens an empty draft; no session is created until a message or
 script is submitted. These options belong to session execution only: a subcommand accepts
 just its own options, after its name.</p>
 <h2 id="batch"><a class="header" href="#batch">Batch</a></h2>
 <p><code>skyhook batch</code> runs exactly one prompt or script without a terminal, then exits. It takes the
-session options above except that <code>--prompt</code> or <code>--script</code> is required, plus:</p>
+session options above except that <code>--prompt</code> or <code>--script</code> is required. A resumed session whose
+recorded model is no longer configured needs <code>--model</code> to run either. Batch also takes:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -286,7 +289,8 @@ search locations: <code>~/.agents/skills</code> plus <code>.agents/skills</code>
 how its model requests ended, what each agent delegated, and which tools it called. Like
 <code>--resume</code>, it finds the session in the selected workspace’s history
 (<code>&lt;workspace&gt;/.skyhook/sessions</code>). It needs no configuration, credentials, or terminal, and it
-can read a session another process still has open.</p>
+can read a session another process still has open. Sessions from other Skyhook products share
+this history; all report formats identify the creating host, and <code>--list</code> includes a Host column.</p>
 <div class="table-wrapper">
 <table>
 <thead>

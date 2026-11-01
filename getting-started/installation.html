@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,20 +181,26 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
-<p>Skyhook is built from a source checkout with <a href="https://github.com/casey/just">just</a>. Rust 1.89 or
-newer is required. SSH support needs static Linux shims, which are cross-compiled with
+<p>Skyhook runs on Unix and is built from a source checkout with <a href="https://github.com/casey/just">just</a>.
+Rust 1.89 or newer is required. SSH support needs static Linux shims, which are cross-compiled with
 <a href="https://ziglang.org/download/">Zig</a>; install Zig yourself and make <code>zig</code> available on <code>PATH</code> (or
 set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the remaining Rust-side tooling
 (<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, mdBook) and both musl targets.</p>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
 just setup
-just install   # release shims, release CLI embedding them, installed as ~/.local/bin/skyhook
+just install   # release shims and both applications, installed into ~/.local/bin
 </code></pre>
-<p>The executable supports both the terminal interface and headless execution; make sure
-<code>~/.local/bin</code> is on <code>PATH</code>. For a local-only build without Zig, run <code>just build-release</code> instead
-and use <code>target/release/skyhook</code>. SSH use without an included shim
-returns an explicit missing-shim error.</p>
+<p>This installs <code>skyhook</code>, the general-purpose coding agent, and <code>skyhook-security</code>, the
+<a href="../guide/security.html">security research companion</a>. Both support the terminal interface and
+headless execution and embed the same SSH shims. Make sure <code>~/.local/bin</code> is on <code>PATH</code>.</p>
+<p>For a local-only build without Zig, run <code>just build-release</code> instead and use
+<code>target/release/skyhook</code> or <code>target/release/skyhook-security</code>. <code>just build</code> builds both applications
+in <code>target/debug</code>. SSH use without an included shim returns an explicit missing-shim error.</p>
+<p>Both applications use the ordinary Skyhook provider configuration and credentials. The companion
+also reads <code>security.yaml</code>; use <code>security.example.yaml</code> as a starting point and adjust its model
+assignments to match your <code>config.yaml</code>. See <a href="../guide/security.html#configuration">security configuration</a>
+for discovery rules and research settings.</p>
 <p>See <a href="../development/setup.html">development setup</a> for contributor commands and
 <a href="../development/remote-transport-and-shims.html#building-and-packaging-artifacts">shim builds</a>
 for the build matrix, artifact layout, and native shim-only builds.</p>

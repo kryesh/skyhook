@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-389413f3.js";
+            window.path_to_searchindex_js = "../searchindex-4550e578.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-8b14bb79.js"></script>
+        <script src="../toc-26aae551.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,23 +193,21 @@ ordinary response.</p>
 <p>Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
 Nulls in tool payloads are preserved; fields a tool has no value for are absent.
 Process results contain <code>exit_code</code>, or <code>signal</code> when a signal killed the process, and the
-<code>stdout</code> and <code>stderr</code> streams that produced output; scripts read an absent stream as <code>""</code>.
+<code>stdout</code> and <code>stderr</code> streams that produced output; scripts read an absent stream as <code>null</code>.
 A <code>stdout</code> holding JSON is read as that JSON; see <a href="#json-output">JSON output</a>.
 Completed agent calls return their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
 <p>Directory reads return grouped entries with file sizes, for example:
 <code>{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}</code>.
 Groups are <code>files</code>, <code>directories</code>, <code>symlinks</code>, and <code>other</code>, with sorted names; empty <code>symlinks</code> and
-<code>other</code> groups are absent, and scripts read them as <code>[]</code>.
-<code>read({path:"src",details:true})</code> returns flat <code>{name,kind,bytes?}</code> entries; regular files include sizes in both forms.
-Missing paths and operating-system access denials from <code>read</code> are successful tool results with
-<code>{kind:"error", error:{code:"not_found"|"permission_denied", message}}</code>, so workflows can inspect the
-error without catching an exception. Tool-policy permission denials remain tool errors.
+<code>other</code> groups are absent, and scripts read them as <code>null</code>.
 Search returns <code>{matches:{"src/main.rs":["12: matching text"]}}</code>, preserving source whitespace.
-<code>search({pattern:"...",details:true})</code> returns structured <code>{path,line,column,text}</code> matches instead.
-An empty search result has <code>matches: {}</code>.
-<code>targets({details:true})</code> returns full target metadata; fields a target does not set are absent.
+An empty search result has <code>matches: {}</code>. A matched line longer than 1 KiB comes back as the text
+around its match, ending <code>(line truncated, N bytes)</code>. A file or directory the search cannot read
+is skipped and listed, as <code>skipped: [{path, reason}]</code> with reason <code>unlisted</code>, <code>unopened</code> or
+<code>unread</code>; the other files’ matches stay, and <code>matches</code> is then incomplete.
+<code>targets</code> returns each target’s routing and authentication metadata; fields a target does not set are absent.
 <code>target_add</code> completes without a result.
-All defaulted input fields, including <code>details: false</code>, are optional in tool schemas.</p>
+All defaulted input fields are optional in tool schemas.</p>
 <p>By default, hidden entries (including <code>.git</code>) and ignored files are excluded. <code>hidden: true</code>
 includes hidden entries, while <code>no_ignore: true</code> independently disables ignore files. Searches
 rooted in subdirectories inherit ancestor ignore rules; explicitly requested paths remain accessible.</p>
@@ -220,9 +218,8 @@ host/session failures are not attributed to the caller’s remote target. “On 
 shown when the viewing agent is on a different target and omitted for an agent on the host.
 Inspecting a remote job’s saved output does not connect to that machine: a retrieval failure concerns saved output,
 while a retrieved execution error retains the original operation’s context.</p>
-<p>Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
-viewing agent, exposing target aliases only when that viewer’s capabilities permit them. This is
-not a general redaction guarantee for saved output. A <code>jobs</code> output read made with broader
+<p>Structured job diagnostics are rendered for the viewing agent, exposing target aliases only when
+that viewer’s capabilities permit them. This is not a general redaction guarantee for saved output. A <code>jobs</code> output read made with broader
 capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
 with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
 copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
@@ -233,8 +230,10 @@ check failed, and a recursive removal may have deleted some entries. Messages di
 pre-execution failures from known or uncertain later effects. Do not automatically retry a
 mutation merely because its result is a failed job.</p>
 <p>Outcome distinctions still matter: a nonzero process exit is a completed command result, an
-HTTP error status is a normal HTTP result, and a <code>wait</code> timeout ends only that wait. Expected
-missing/unreadable-file results from <code>read</code> remain completed diagnostic payloads. Policy denials,
+HTTP error status is a normal HTTP result, and a <code>wait</code> timeout ends only that wait. A <code>read</code> of a
+missing or inaccessible path is a failed job like any other tool failure, except that a missing
+path outside the workspace is refused like a denial unless the approval policy allows the
+operation without asking (<a href="../guide/permissions.html#approval-policy">permissions</a>). Policy denials,
 operating-system access failures, cancellation, and interrupted execution remain distinct.</p>
 <h2 id="json-output"><a class="header" href="#json-output">JSON output</a></h2>
 <p>Process <code>stdout</code> and MCP <code>text</code> content blocks are checked once when the job finishes, and a
@@ -295,7 +294,7 @@ lines <code>next_start</code> up to, but not including, <code>tail_start</code> 
 <p><code>kept</code> lists the index ranges shown, as <code>[[first, last], ...]</code>, when a complete field inside an
 array or object keeps an element beyond the leading ones; such records are always listed. Reading
 a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
-include an <code>Output incomplete.</code> notice. These rules also apply after session resume and to
+include an <code>Output incomplete; captured fields remain readable with jobs({job, field}).</code> notice. These rules also apply after session resume and to
 completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
 <p>The enclosing script’s <code>.result</code> is <code>{value, console?, failure?}</code>; silent scripts have no
@@ -350,8 +349,8 @@ and a trailing newline does not add an empty line.</p>
 fewer lines than <code>limit</code>: use the returned position rather than computing <code>start + limit</code>. Offsets
 beyond a line or inside a UTF-8 character are rejected. A start past the available lines returns an
 empty page with the total. Regex matching is case-sensitive unless inline flags override it.
-Matching supports lines up to 4 MiB and reports an explicit resource error for larger lines; ordinary
-paging can still read those lines.</p>
+Matching supports lines up to 64 MiB and reports an explicit resource error for larger lines;
+ordinary paging can still read those lines.</p>
 <p>For closed fields, a missing <code>next_start</code> means no selected content remains. For running fields,
 <code>total_lines</code> describes currently captured output, and the numeric next position can be retried
 after yielding with <code>wait</code>, even when no content is currently available. Unavailable output omits
@@ -380,7 +379,7 @@ starts, a query runs to completion, and queries that repeat selectors can produc
 matches.</p>
 <h2 id="persistence-and-live-output"><a class="header" href="#persistence-and-live-output">Persistence and live output</a></h2>
 <p>Reads are repeatable and survive session resume. Finished jobs with retained partial output have
-an <code>Output incomplete.</code> notice, including when viewing the final captured page.</p>
+an <code>Output incomplete; captured fields remain readable with jobs({job, field}).</code> notice, including when viewing the final captured page.</p>
 <p>The view’s <code>presentation.captures</code> lists captures that are not a finished part of the result: live,
 unfinished, or abandoned output, even without a structured result:</p>
 <pre><code class="language-json">[{"field":"/result/console","complete":false}]
