@@ -216,6 +216,9 @@ pub(super) struct Child {
     pub(super) progress: AgentProgress,
     /// Live only: how far the current invocation got toward its child's turn.
     pub(super) start: Start,
+    /// Live only, as the holds are: the delivery each outstanding hold of the job
+    /// captured, once per hold.
+    pub(super) held: Vec<u64>,
 }
 
 /// Whether an invocation's child has taken the work that begins it. Until then
@@ -236,6 +239,11 @@ pub(super) struct Queued {
     pub(super) reply: AgentMessage,
     /// When its turn committed, in epoch milliseconds.
     pub(super) at: i64,
+    /// Live only, as the holds are: the pending delivery that presented it as its
+    /// invocation's result before a restart superseded that result. A read that
+    /// captured that delivery has it already, so it is held from its owner while
+    /// such a hold is outstanding.
+    pub(super) superseded: Option<u64>,
 }
 
 impl Queued {
@@ -249,11 +257,12 @@ impl Queued {
 }
 
 named_enum! {
-    /// Whether a child's answer is held or released.
+    /// Whether a child's answer is held, released, or the result.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) parsed enum AnswerKind {
         Held = "held",
         Released = "released",
+        Result = "result",
     }
 }
 
@@ -265,19 +274,36 @@ pub(super) enum Answer {
     /// Released to the owner early, and still queued: completion withdraws it, as
     /// the result delivers it.
     Released(MessageSeq),
+    /// The result completion made it, which its owner has yet to see: a restart
+    /// before then supersedes that result, and releases the answer as a reply.
+    Result { reply: AgentMessage, at: i64 },
 }
 
 impl Child {
     /// Queue a reply for delivery.
     pub(super) fn queue(&mut self, reply: AgentMessage, at: i64, stamps: &Stamps) {
         let stamp = stamps.now();
-        self.messages.push(Queued { stamp, reply, at });
+        self.messages.push(Queued {
+            stamp,
+            reply,
+            at,
+            superseded: None,
+        });
     }
 
-    /// When the newest queued reply was queued; replies are delivered oldest
+    /// The queued replies its owner may be shown, oldest first: all but a
+    /// superseded result an outstanding hold captured.
+    pub(super) fn deliverable(&self) -> impl Iterator<Item = &Queued> {
+        let held = |queued: &&Queued| {
+            (queued.superseded).is_some_and(|delivery| self.held.contains(&delivery))
+        };
+        self.messages.iter().filter(move |queued| !held(queued))
+    }
+
+    /// When the newest deliverable reply was queued; replies are delivered oldest
     /// first, so it stays queued while any older one does.
     pub(super) fn queued(&self) -> Option<u64> {
-        self.messages.last().map(|queued| queued.stamp)
+        self.deliverable().last().map(|queued| queued.stamp)
     }
 
     /// Queue the held answer, if any. An answer already released stays marked,
@@ -289,6 +315,49 @@ impl Child {
         if let Some(Answer::Held { reply, at }) = held {
             self.answer = Some(Answer::Released(reply.message));
             self.queue(reply, at, stamps);
+        }
+    }
+
+    /// Make the answer the result its completion delivers: withdrawn from the
+    /// queued replies if it was released early.
+    fn complete(&mut self) {
+        self.answer = match self.answer.take() {
+            Some(Answer::Held { reply, at }) => Some(Answer::Result { reply, at }),
+            Some(Answer::Released(answer)) => (self.messages.iter())
+                .position(|queued| queued.reply.message == answer)
+                .map(|index| {
+                    let Queued { reply, at, .. } = self.messages.remove(index);
+                    Answer::Result { reply, at }
+                }),
+            Some(Answer::Result { .. }) | None => None,
+        };
+    }
+
+    /// Queue the result a restart supersedes before its owner saw it as a reply,
+    /// marked with `presented`, the delivery that presented it.
+    fn supersede(&mut self, presented: Option<u64>, stamps: &Stamps) {
+        if let Some(Answer::Result { reply, at }) = self.answer.take() {
+            self.messages.push(Queued {
+                stamp: stamps.now(),
+                reply,
+                at,
+                superseded: presented,
+            });
+        }
+    }
+
+    /// The reply queued for the result that the delivery pending since
+    /// `delivery` presented, before a restart superseded it.
+    pub(super) fn superseded(&self, delivery: u64) -> Option<MessageSeq> {
+        (self.messages.iter())
+            .find(|queued| queued.superseded == Some(delivery))
+            .map(|queued| queued.reply.message)
+    }
+
+    /// A hold that captured `delivery` ended.
+    pub(super) fn unhold(&mut self, delivery: u64) {
+        if let Some(index) = self.held.iter().position(|held| *held == delivery) {
+            self.held.swap_remove(index);
         }
     }
 }
@@ -357,6 +426,9 @@ pub(super) struct JobFacts {
     /// Live only: the pending deliveries its runs read, which its finish
     /// acknowledges, however it ends.
     pub(super) reads: Vec<Delivery>,
+    /// Live only: the deliveries its runs captured to present, each held for it
+    /// from the capture until it ends, whether or not the read succeeds.
+    pub(super) holds: Vec<Delivery>,
     pub(super) invocation: Invocation,
     pub(super) timing: RunTiming,
     /// Live only.
@@ -515,9 +587,14 @@ impl JobFacts {
                         if previous != JobEnd::Interrupted {
                             self.background = true;
                         }
+                        let presented = match self.delivery {
+                            DeliveryState::Pending { stamp } => Some(stamp),
+                            DeliveryState::Acknowledged => None,
+                        };
                         self.invocation.0 += 1;
                         self.pend_delivery(stamps);
                         if let Some(child) = self.child_mut() {
+                            child.supersede(presented, stamps);
                             child.start = Start::Pending;
                         }
                     }
@@ -551,17 +628,16 @@ impl JobFacts {
                 }
                 let call = !self.background;
                 if let Some(child) = self.child_mut() {
-                    if end != JobEnd::Completed {
+                    if end == JobEnd::Completed {
+                        child.complete();
+                        if call {
+                            // Its result saved them, as `saved_replies` read them.
+                            child.messages.clear();
+                        }
+                    } else {
                         child.release(stamps);
-                    } else if call {
-                        // Its result saved them, as `saved_replies` read them.
-                        child.messages.clear();
-                    } else if let Some(Answer::Released(answer)) = child.answer {
-                        child
-                            .messages
-                            .retain(|queued| queued.reply.message != answer);
+                        child.answer = None;
                     }
-                    child.answer = None;
                 }
             }
         }
@@ -659,6 +735,9 @@ impl JobFacts {
     /// The owner has seen the pending delivery, through a claim or a notification.
     pub(super) fn acknowledge(&mut self) {
         self.delivery = DeliveryState::Acknowledged;
+        if let Some(child) = self.child_mut() {
+            (child.answer).take_if(|answer| matches!(answer, Answer::Result { .. }));
+        }
     }
 
     /// The owner has claimed the pending delivery. Claiming a foreground job's

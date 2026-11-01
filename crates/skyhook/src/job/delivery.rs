@@ -23,26 +23,66 @@ pub(crate) struct Delivery {
 }
 
 impl Delivery {
-    /// The claim acknowledging this delivery, unless its job has a newer one since.
+    /// The claim acknowledging this delivery while it is pending; once a restart
+    /// superseded the result it presented, the acknowledgement of that result,
+    /// queued as a reply, and never of the restarted invocation's delivery.
     pub(crate) fn claim(self, state: &CoreState) -> Option<(AgentId, SessionEvent)> {
         let Self { job, stamp } = self;
         // A pending delivery keeps its job resident: one no longer held was claimed.
         let entry = state.jobs.get(job)?;
-        let current = entry
-            .delivery(job)
-            .is_some_and(|delivery| delivery.stamp == stamp);
-        current.then(|| (entry.agent.clone(), SessionEvent::JobClaimed { job }))
+        let event = match entry.delivery(job) {
+            Some(delivery) if delivery.stamp == stamp => SessionEvent::JobClaimed { job },
+            _ => SessionEvent::JobMessageDelivered {
+                job,
+                source: entry.child()?.superseded(stamp)?,
+                notification: None,
+            },
+        };
+        Some((entry.agent.clone(), event))
     }
 
-    /// The claims acknowledging `reads` that are still current: each job's
-    /// newest, once.
+    /// The claims acknowledging `reads` that still acknowledge something, each
+    /// once.
     pub(crate) fn claims(
         mut reads: Vec<Self>,
         state: &CoreState,
     ) -> impl Iterator<Item = (AgentId, SessionEvent)> {
-        reads.sort_by_key(|read| (read.job, std::cmp::Reverse(read.stamp)));
-        reads.dedup_by_key(|read| read.job);
+        reads.sort_by_key(|read| (read.job, read.stamp));
+        reads.dedup_by_key(|read| (read.job, read.stamp));
         (reads.into_iter()).filter_map(|read| read.claim(state))
+    }
+}
+
+impl Jobs {
+    /// Hold for job `reader` the delivery it captured to present, in the change
+    /// that captures it: a result it presents that a restart supersedes is held
+    /// from its owner until the reader ends. A reader that ended, or is gone,
+    /// holds nothing, as its finish already released what it held.
+    fn reserve(&mut self, reader: JobId, captured: Delivery) {
+        if self.get(reader).is_none_or(|entry| entry.end().is_some()) {
+            return;
+        }
+        self.modify(reader, |entry, _| entry.holds.push(captured));
+        self.modify(captured.job, |entry, _| {
+            entry
+                .child_mut()
+                .map(|child| child.held.push(captured.stamp))
+        });
+    }
+
+    /// End job `reader`'s reads and holds, once its finish acknowledged what they
+    /// presented: a superseded result one held and did not acknowledge is its
+    /// owner's again.
+    pub(super) fn unread(&mut self, reader: JobId) {
+        let holds = self.modify(reader, |entry, _| {
+            entry.reads.clear();
+            std::mem::take(&mut entry.holds)
+        });
+        for Delivery { job, stamp } in holds.into_iter().flatten() {
+            self.modify(job, |entry, _| {
+                entry.child_mut().map(|child| child.unhold(stamp))
+            });
+        }
     }
 }
 
@@ -108,10 +148,11 @@ impl Notification {
                     entry.agent == owner && entry.lifecycle_pending() == Some(*stamp)
                 })
             });
+            // A hold registered since the batch was read keeps its reply back.
             let queued = messages.iter().all(|reply| {
                 let child = jobs.get(reply.id).and_then(JobFacts::child);
                 child.is_some_and(|child| {
-                    (child.messages.iter()).any(|m| m.reply.message == reply.message)
+                    (child.deliverable()).any(|m| m.reply.message == reply.message)
                 })
             });
             let unmoved = host
@@ -130,7 +171,7 @@ impl Notification {
                 .map(|reply| SessionEvent::JobMessageDelivered {
                     job: reply.id,
                     source: reply.message,
-                    notification,
+                    notification: Some(notification),
                 });
             let events = (preceding.into_iter())
                 .chain([SessionEvent::MessageCommitted { message }])
@@ -147,30 +188,36 @@ impl Notification {
 
 impl JobManager {
     /// The foreground result, with the delivery it presents for the caller to
-    /// acknowledge once it has read it; or the job as its call let go of it,
-    /// unfinished, which then reports through delivery, a question included. A
-    /// question alone, which its owner reads, leaves the call waiting.
+    /// acknowledge once it has read it, held for job `reader` when one reads it;
+    /// or the job as its call let go of it, unfinished, which then reports
+    /// through delivery, a question included. A question alone, which its owner
+    /// reads, leaves the call waiting.
     pub(crate) async fn wait_foreground(
         &self,
         id: JobId,
+        reader: Option<JobId>,
     ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
         // A released job whose finish is claimed returns with that outcome.
         let ready = |entry: &JobFacts| entry.concluded() || (entry.background && !entry.finishing);
-        let (envelope, presented) = self.until_job(id, ready).await?;
+        let (envelope, presented) = self.until_job(id, ready, reader).await?;
         let presented = presented.filter(|_| envelope.state.is_terminal());
         Ok((envelope, presented))
     }
 
     /// Block until `id` is no longer live, without claiming or hydrating output.
     pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
-        self.until_job(id, |entry| !entry.live()).await.map(drop)
+        self.until_job(id, |entry| !entry.live(), None)
+            .await
+            .map(drop)
     }
 
-    /// Job `id`'s envelope and the delivery it presents, once `ready`.
+    /// Job `id`'s envelope and the delivery it presents, once `ready`; a result
+    /// is held for `reader` in the change that decides it.
     pub(super) async fn until_job(
         &self,
         id: JobId,
         ready: fn(&JobFacts) -> bool,
+        reader: Option<JobId>,
     ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
         let resolve = move |state: &CoreState| match state.jobs.lookup(id) {
             Lookup::Held(entry) => {
@@ -180,10 +227,47 @@ impl JobManager {
             Lookup::Unheld(()) => None,
             Lookup::Unknown => Some(Err(JobError::Unknown(id))),
         };
-        self.inner
-            .store
-            .until(Wait::on([Key::Job(id)], resolve))
-            .await?
+        let hold =
+            move |state: &mut CoreState,
+                  decided: Result<(JobEnvelope, Option<Delivery>), JobError>| {
+                if let (Some(reader), Ok((envelope, Some(presented)))) = (reader, &decided)
+                    && envelope.state.is_terminal()
+                {
+                    state.jobs.reserve(reader, *presented);
+                }
+                decided
+            };
+        let wait = Wait::taking([Key::Job(id)], resolve, hold);
+        self.inner.store.until(wait).await?
+    }
+
+    /// What `read` reads of job `id`, with the delivery it presents, held for
+    /// `reader` in the change that reads it.
+    pub(super) async fn presenting<T: Send + 'static>(
+        &self,
+        id: JobId,
+        reader: Option<JobId>,
+        read: impl FnOnce(&JobFacts) -> T + Send + 'static,
+    ) -> Result<(T, Option<Delivery>), JobError> {
+        let presents = move |entry: &JobFacts| (read(entry), entry.delivery(id));
+        let Some(reader) = reader else {
+            return self.entry(id, presents).await;
+        };
+        let hold = move |state: &mut CoreState| {
+            let Some(entry) = state.jobs.get(id) else {
+                return Err(presents);
+            };
+            let presented = presents(entry);
+            if let Some(delivery) = presented.1 {
+                state.jobs.reserve(reader, delivery);
+            }
+            Ok(presented)
+        };
+        match self.inner.store.live(hold).await {
+            Ok(presented) => Ok(presented),
+            // A pending delivery keeps its job resident, so there is none to hold.
+            Err(presents) => self.entry(id, presents).await,
+        }
     }
 
     /// Acknowledge what a read presented, unless the job has a newer delivery since.
@@ -275,10 +359,7 @@ impl JobManager {
             // the lifecycle budget of an unrelated completion.
             .filter(|(_, entry)| {
                 entry.child().is_none_or(|child| {
-                    child
-                        .messages
-                        .iter()
-                        .all(|queued| queued.reply.message <= messages_through)
+                    (child.deliverable()).all(|queued| queued.reply.message <= messages_through)
                 })
             })
             .filter_map(|(id, entry)| {
@@ -485,6 +566,104 @@ mod tests {
             .unwrap();
         manager.acknowledge(first).await.unwrap();
         assert_pending(&manager, &owner, true, "after a stale completion");
+    }
+
+    /// A finished child whose answer is its pending result, and a job to read it.
+    async fn answered_child(manager: &JobManager, owner: &AgentId) -> (JobId, JobId) {
+        let job =
+            (manager.test_resumable(owner.clone(), "agent", serde_json::json!("again"))).await;
+        let child = manager.facts(|jobs| jobs.get(job)?.child()?.agent.clone());
+        let answer = Message::Assistant(vec![crate::provider::protocol::AssistantItem::text(
+            "text", 0, "first",
+        )]);
+        (manager
+            .commit_child_message(&child.unwrap(), job, answer, "first".into(), |_| Vec::new()))
+        .await
+        .unwrap();
+        manager.test_reply(job, "first").await;
+        let reader = manager
+            .test_create(JobSpec::test(owner.clone(), "script"))
+            .await;
+        (job, reader)
+    }
+
+    /// Restart finished job `job` with input, superseding its result.
+    async fn restart(manager: &JobManager, job: JobId) {
+        manager.send(job, serde_json::json!("more")).await.unwrap();
+        crate::tests::bounded(manager.wait(job, false))
+            .await
+            .unwrap();
+    }
+
+    /// A reader's capture of a result holds it from its owner before the reader
+    /// records its read, so a restart in between leaves the superseded answer to
+    /// the reader alone, whether a call's wait or a presentation captured it.
+    #[tokio::test]
+    async fn a_captured_result_is_held_before_its_read_is_recorded() {
+        for present in [false, true] {
+            let (_root, manager, owner) = crate::job::tests::runtime().await;
+            let (job, reader) = answered_child(&manager, &owner).await;
+            let read = if present {
+                let options = output::OutputOptions::Model {
+                    kind: ViewKind::Inspection,
+                    reader: Some(reader),
+                };
+                let args = output::OutputArgs::new(job);
+                let capabilities = CapabilitySet::default();
+                let presented = manager.present_output_with(
+                    args,
+                    CancellationToken::new(),
+                    &capabilities,
+                    options,
+                );
+                presented.await.unwrap().acknowledges
+            } else {
+                manager.wait_foreground(job, Some(reader)).await.unwrap().1
+            };
+            restart(&manager, job).await;
+            let pending = manager.pending_delivery(&owner).await.unwrap();
+            assert!(pending.messages().is_empty(), "{:?}", pending.messages());
+            manager.read(reader, read).await;
+            manager.test_finish(reader, serde_json::Value::Null).await;
+            for jobs in [manager.clone(), manager.test_replay()] {
+                let pending = jobs.pending_delivery(&owner).await.unwrap();
+                assert!(pending.messages().is_empty(), "{:?}", pending.messages());
+            }
+        }
+    }
+
+    /// A reader whose finish landed before its capture holds nothing: the
+    /// superseded answer stays its owner's.
+    #[tokio::test]
+    async fn a_finished_reader_holds_nothing() {
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
+        let (job, reader) = answered_child(&manager, &owner).await;
+        manager.test_finish(reader, serde_json::Value::Null).await;
+        manager.presenting(job, Some(reader), |_| ()).await.unwrap();
+        restart(&manager, job).await;
+        let pending = manager.pending_delivery(&owner).await.unwrap();
+        assert_eq!(pending.messages().len(), 1);
+    }
+
+    /// A notification read before a hold landed on a reply it presents commits
+    /// nothing.
+    #[tokio::test]
+    async fn a_hold_landing_after_a_notification_was_read_makes_it_stale() {
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
+        let (job, reader) = answered_child(&manager, &owner).await;
+        let (_, first) = manager.presenting(job, None, |_| ()).await.unwrap();
+        restart(&manager, job).await;
+        let read = manager.pending_delivery(&owner).await.unwrap();
+        assert_eq!(read.messages().len(), 1);
+        let first = first.unwrap();
+        manager
+            .store()
+            .live(move |state| state.jobs.reserve(reader, first))
+            .await;
+        let stale = read
+            .commit(Vec::new(), notification(job, JobState::Completed))
+            .await;
+        assert!(matches!(stale, Err(JobError::Stale)), "{stale:?}");
     }
 
     #[tokio::test]

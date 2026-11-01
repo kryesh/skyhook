@@ -18,7 +18,7 @@ use crate::{
         CoreState, Dirty, EventRecord, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq,
         RequestPhase, SessionEvent, agent_state::Last,
     },
-    tool::policy::{Mode, ModeName},
+    tool::policy::{Edition, ModeName},
 };
 
 /// The agents whose loops run, and whether they take deliveries. Every change
@@ -33,7 +33,7 @@ pub(crate) struct Agents {
     /// runs: only those facts' changes.
     journaled: HashMap<AgentId, Journaled>,
     /// Each mode's latest journaled edition.
-    editions: HashMap<ModeName, std::sync::Arc<Mode>>,
+    editions: HashMap<ModeName, std::sync::Arc<Edition>>,
     /// How many loops of each child have ended.
     ended: HashMap<AgentId, u64>,
     dirty: Dirty,
@@ -66,31 +66,23 @@ pub(super) struct RecordedContract {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AppliedMode {
     pub(super) name: ModeName,
-    pub(super) definition: std::sync::Arc<Mode>,
+    pub(super) definition: std::sync::Arc<Edition>,
 }
 
 impl AppliedMode {
-    /// The configured `definition` of `name`, as an agent entering it now runs it.
-    pub(super) fn configured(name: &ModeName, definition: &Mode) -> Self {
-        Self {
-            name: name.clone(),
-            definition: definition.clone().into(),
-        }
-    }
-
     /// The journal form of applying it, which records its definition only when
     /// that is a new edition.
     pub(super) fn selection(&self) -> crate::session::ModeSelection {
         crate::session::ModeSelection {
             name: self.name.clone(),
-            definition: Some(Mode::clone(&self.definition)),
+            definition: Some(Edition::clone(&self.definition)),
         }
     }
 }
 
 /// The edition `selection` applies: the one it records, or its name's latest.
 fn applied(
-    editions: &mut HashMap<ModeName, std::sync::Arc<Mode>>,
+    editions: &mut HashMap<ModeName, std::sync::Arc<Edition>>,
     selection: &crate::session::ModeSelection,
 ) -> Option<AppliedMode> {
     if let Some(definition) = &selection.definition {
@@ -106,7 +98,7 @@ fn applied(
 /// where it `begins`, and a child's start counts in its parent's children. Every
 /// record keeps the mode editions it records.
 fn fold(
-    editions: &mut HashMap<ModeName, std::sync::Arc<Mode>>,
+    editions: &mut HashMap<ModeName, std::sync::Arc<Edition>>,
     journaled: &mut HashMap<AgentId, Journaled>,
     begins: bool,
     record: &EventRecord,
@@ -625,7 +617,7 @@ impl Agents {
     }
 
     /// The latest journaled edition of mode `name`.
-    pub(crate) fn edition(&self, name: &ModeName) -> Option<&Mode> {
+    pub(crate) fn edition(&self, name: &ModeName) -> Option<&Edition> {
         self.editions.get(name).map(|mode| &**mode)
     }
 
@@ -673,6 +665,13 @@ impl Agents {
         true
     }
 
+    /// Begin `agent`'s invocation, opened in this change with its prompt
+    /// committed, answering `done`.
+    pub(super) fn begin(&mut self, agent: &AgentId, done: super::ChildCompletion) {
+        let facts = self.get_mut(agent).expect("the change runs its loop");
+        facts.inbox.push_back(AgentCommand::Begin(done));
+    }
+
     /// Take `agent`'s queued inputs, leaving every other command in order.
     pub(super) fn take_queued(&mut self, agent: &AgentId) -> Vec<QueuedInput> {
         let Some(facts) = self.get_mut(agent) else {
@@ -685,6 +684,7 @@ impl Agents {
         let inputs = queued.into_iter().flat_map(|command| match command {
             AgentCommand::QueuedInputs(inputs) => inputs,
             AgentCommand::Input { .. }
+            | AgentCommand::Begin(_)
             | AgentCommand::Select { .. }
             | AgentCommand::Continue { .. } => {
                 unreachable!("partitioned out")
@@ -732,14 +732,14 @@ impl Agents {
     }
 
     /// Hand back the input `agent` has yet to take, as interrupted, apart from
-    /// the input that begins its invocation yet to begin: that runs as the
+    /// the work that begins its invocation yet to begin: that runs as the
     /// invocation's first turn. Whether it handed any back.
     pub(crate) fn hand_back(&mut self, agent: &AgentId, jobs: &crate::job::Jobs) -> bool {
         let Some(facts) = self.get_mut(agent) else {
             return false;
         };
         let begins = jobs.unbegun(agent).is_some()
-            && matches!(facts.inbox.front(), Some(AgentCommand::Input { .. }));
+            && matches!(facts.inbox.front(), Some(AgentCommand::Begin(_)));
         let handed: Vec<_> = facts.inbox.drain(usize::from(begins)..).collect();
         let untaken = !handed.is_empty();
         for command in handed {

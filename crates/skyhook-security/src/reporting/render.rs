@@ -1,15 +1,16 @@
-//! The Markdown of `reports/`: each root's README, each test's page and the index. Every
-//! page opens with flat front matter its body repeats, uses fixed headings, links only to
-//! files by relative path within its root's folder (or between a root's README and the
-//! index), and sets authored text below its own headings with raw HTML neutralised.
+//! The Markdown of `reports/`: each root's README, each test's page, the hardening list and
+//! the index. Every page opens with flat front matter its body repeats, uses fixed headings,
+//! links only to files by relative path within its root's folder (or between the index and a
+//! root's README or the hardening list), and sets authored text below its own headings with
+//! raw HTML neutralised.
 
 use std::fmt::Write as _;
 
 use super::{
     Document, IndexEntry, TestFolder,
-    prose::{block as authored, label, line},
+    prose::{block as authored, flat, label, line},
 };
-use crate::store::{ArtifactRole, ReportedTest, TestResult};
+use crate::store::{ArtifactRole, Hardening, HardeningReason, ReportedTest, TestResult};
 
 /// Flat YAML front matter of scalar `fields`, never read back by tooling.
 fn front_matter(fields: &[(&str, String)]) -> String {
@@ -34,8 +35,9 @@ fn scalar(value: &str) -> String {
     }
 }
 
-/// `text` as an inline code span, fenced by more backticks than any run inside it.
+/// `text` as an inline code span on one line, fenced by more backticks than any run inside it.
 fn code(text: &str) -> String {
+    let text = &flat(text);
     let longest = (text.split(|c| c != '`').map(str::len).max()).unwrap_or(0);
     let fence = "`".repeat(longest + 1);
     let pad = if text.starts_with('`') || text.ends_with('`') {
@@ -98,7 +100,7 @@ pub(super) fn readme(document: &Document) -> String {
     );
     let header = &[
         "Candidate",
-        "Path",
+        "Paths",
         "Chain",
         "Vector",
         "Score",
@@ -110,6 +112,9 @@ pub(super) fn readme(document: &Document) -> String {
     let rows = (document.scenarios.iter())
         .map(|scenario| {
             let chain: Vec<_> = scenario.chain.iter().map(ToString::to_string).collect();
+            let actions: Vec<_> = (scenario.actions.iter())
+                .map(|action| format!("{} {}", action.path, line(&action.title)))
+                .collect();
             let test = match &scenario.test {
                 Some(test) => format!(
                     "[test {}](test-{}/test.md) {}",
@@ -121,7 +126,7 @@ pub(super) fn readme(document: &Document) -> String {
             };
             vec![
                 format!("{} {}", scenario.candidate, line(&scenario.title)),
-                format!("{} {}", scenario.path, line(&scenario.path_title)),
+                actions.join(" → "),
                 chain.join(" → "),
                 code(&scenario.vector.to_string()),
                 format!("{:.1}", scenario.vector.score()),
@@ -202,10 +207,11 @@ pub(super) fn test(document: &Document, folder: &TestFolder) -> String {
     text
 }
 
-pub(super) fn index(entries: &[IndexEntry]) -> String {
+pub(super) fn index(entries: &[IndexEntry], hardening: usize) -> String {
     let mut text = front_matter(&[
         ("type", "index".to_owned()),
         ("reports", entries.len().to_string()),
+        ("hardening", hardening.to_string()),
     ]);
     let _ = write!(
         text,
@@ -213,6 +219,13 @@ pub(super) fn index(entries: &[IndexEntry]) -> String {
          [index.json](index.json).\n\n",
         entries.len()
     );
+    if hardening > 0 {
+        let _ = write!(
+            text,
+            "[Hardening](hardening.md): {hardening} confirmed flaws no report covers, with no \
+             chain found or chains validated below the reporting threshold.\n\n"
+        );
+    }
     if entries.is_empty() {
         return text;
     }
@@ -248,6 +261,69 @@ pub(super) fn index(entries: &[IndexEntry]) -> String {
     text
 }
 
+pub(super) fn hardening(flaws: &[Hardening]) -> String {
+    let mut text = front_matter(&[
+        ("type", "hardening".to_owned()),
+        ("flaws", flaws.len().to_string()),
+    ]);
+    let _ = write!(
+        text,
+        "# Hardening\n\n{} confirmed flaws no report covers: verified defects that are not \
+         reported. All reports: [index](index.md).\n",
+        flaws.len()
+    );
+    let (unchained, below): (Vec<_>, Vec<_>) =
+        (flaws.iter()).partition(|flaw| matches!(flaw.reason, HardeningReason::NoChain { .. }));
+    let group = |text: &mut String, heading, about, header: &[&str], flaws: &[&Hardening]| {
+        if flaws.is_empty() {
+            return;
+        }
+        let _ = write!(text, "\n## {heading}\n\n{} {about}\n\n", flaws.len());
+        let rows = (flaws.iter())
+            .map(|flaw| {
+                let mut row = vec![
+                    flaw.flaw.to_string(),
+                    line(&flaw.title),
+                    code(&flaw.location.to_string()),
+                    flaw.cwe
+                        .map_or_else(String::new, |cwe| format!("CWE-{cwe}")),
+                ];
+                match &flaw.reason {
+                    HardeningReason::NoChain { note } => row.push(line(note)),
+                    HardeningReason::BelowThreshold {
+                        candidate,
+                        severity,
+                    } => row.extend([candidate.to_string(), severity.to_string()]),
+                }
+                row
+            })
+            .collect();
+        skyhook_cli::Table {
+            header,
+            numeric_from: header.len(),
+            rows,
+        }
+        .markdown(text);
+    };
+    group(
+        &mut text,
+        "No chain found",
+        "confirmed flaws no validated candidate holds: no chain to an observable consequence \
+         was found, so they are not scored or tested.",
+        &["Flaw", "Title", "Location", "CWE", "Why no chain"],
+        &unchained,
+    );
+    group(
+        &mut text,
+        "Below the reporting threshold",
+        "confirmed flaws whose most severe validated candidate is assessed below the run's \
+         threshold.",
+        &["Flaw", "Title", "Location", "CWE", "Candidate", "Severity"],
+        &below,
+    );
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +331,28 @@ mod tests {
     #[test]
     fn code_spans_outrun_the_backticks_they_hold() {
         assert_eq!(code("a `b`"), "`` a `b` ``");
+    }
+
+    /// A location written over several lines keeps its hardening row on one line.
+    #[test]
+    fn a_multiline_location_stays_in_its_row() {
+        use crate::store::{CodeSite, FlawId, Location, tests::text};
+        let flaw = Hardening {
+            flaw: FlawId::try_from(7).unwrap(),
+            title: "copy".to_owned(),
+            location: Location::Code(CodeSite {
+                file: text("src/a.rs"),
+                start_line: 1,
+                end_line: 2,
+                function: Some(text("parse\r\n\nheader")),
+            }),
+            cwe: None,
+            reason: HardeningReason::NoChain {
+                note: "no path".to_owned(),
+            },
+        };
+        let page = hardening(&[flaw]);
+        let row = "| 7 | copy | `src/a.rs:1-2 in parse header` |  | no path |\n";
+        assert!(page.contains(row), "{page}");
     }
 }

@@ -18,7 +18,7 @@ use skyhook::{
 use crate::{
     cvss::Severity,
     presets,
-    store::{PocPolicy, RunOptions},
+    store::{LivePolicy, RunOptions},
 };
 
 skyhook::named_enum! {
@@ -41,7 +41,7 @@ pub struct ModelAssignment {
     pub hint: Option<Prose>,
 }
 
-impl clap::ValueEnum for PocPolicy {
+impl clap::ValueEnum for LivePolicy {
     fn value_variants<'a>() -> &'a [Self] {
         &Self::ALL
     }
@@ -50,8 +50,6 @@ impl clap::ValueEnum for PocPolicy {
     }
 }
 
-// Defaults are per field, so the embedded modes are built once: as the default, or as
-// the base the configured modes replace entries of.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -60,7 +58,7 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Named entries replace the embedded mode of the same name whole.
-    #[serde(default = "presets::modes", deserialize_with = "over_presets")]
+    #[serde(default)]
     pub modes: IndexMap<ModeName, Mode>,
     /// How many agents a new run's scheduler runs at once; the run persists what it starts
     /// with.
@@ -70,17 +68,9 @@ pub struct SecurityConfig {
     pub shortlist: Option<Severity>,
     /// Absence is distinct from an explicit ask: headless defaults to no.
     #[serde(default)]
-    pub poc: Option<PocPolicy>,
+    pub live: Option<LivePolicy>,
     #[serde(skip)]
     sources: LayerSources,
-}
-
-fn over_presets<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<IndexMap<ModeName, Mode>, D::Error> {
-    let mut modes = presets::modes();
-    modes.extend(IndexMap::<ModeName, Mode>::deserialize(deserializer)?);
-    Ok(modes)
 }
 
 impl Default for SecurityConfig {
@@ -88,10 +78,10 @@ impl Default for SecurityConfig {
         Self {
             models: IndexMap::new(),
             mcp: BTreeMap::new(),
-            modes: presets::modes(),
+            modes: IndexMap::new(),
             workers: None,
             shortlist: None,
-            poc: None,
+            live: None,
             sources: LayerSources::default(),
         }
     }
@@ -112,8 +102,12 @@ pub enum Error {
         #[source]
         error: McpConfigError,
     },
-    #[error("poc: ask requires an interactive session; use --poc yes or --poc no in headless mode")]
+    #[error(
+        "live: ask requires an interactive session; use --live yes or --live no in headless mode"
+    )]
     HeadlessAsk,
+    #[error("--live sets a new session's policy; a resumed run keeps the one it started with")]
+    LiveOnResume,
     #[error(transparent)]
     Shared(#[from] ConfigError),
 }
@@ -163,20 +157,18 @@ impl SecurityConfig {
         }
     }
 
-    pub fn poc_policy(&self, cli: Option<PocPolicy>, headless: bool) -> Result<PocPolicy, Error> {
-        let policy = cli.or(self.poc).unwrap_or(if headless {
-            PocPolicy::No
+    /// A new run's policy: the flag's, the configuration's, or the default (interactive: ask;
+    /// headless: no).
+    pub fn live_policy(&self, cli: Option<LivePolicy>, headless: bool) -> LivePolicy {
+        cli.or(self.live).unwrap_or(if headless {
+            LivePolicy::No
         } else {
-            PocPolicy::Ask
-        });
-        if headless && policy == PocPolicy::Ask {
-            return Err(Error::HeadlessAsk);
-        }
-        Ok(policy)
+            LivePolicy::Ask
+        })
     }
 
-    /// Replace ordinary modes with the security modes, merge MCP servers, and rewrite
-    /// model offers. Nothing changes when an assigned model is not configured.
+    /// Replace ordinary modes with the security modes, merge MCP servers, and rewrite model
+    /// offers. Nothing changes when an assigned model is not configured.
     pub fn apply(&self, config: &mut Config) -> Result<(), Error> {
         for model in self.models.keys() {
             config
@@ -198,7 +190,7 @@ impl SecurityConfig {
         {
             config.default_model = Some(model.clone());
         }
-        config.modes = self.modes.clone();
+        config.modes = presets::configured(&self.modes);
         config.default_mode = presets::root();
         config.mcp.extend(self.mcp.clone());
         let hints: Vec<(ModelRef, Option<Prose>)> = config
@@ -353,7 +345,7 @@ modes:
                 skyhook::tool::policy::Capability::Targets
             ]
         );
-        assert!(security.modes.contains_key("orchestrate"));
+        assert!(presets::configured(&security.modes).contains_key("orchestrate"));
         let mut config = shared();
         let before = serde_json::to_value(&config).unwrap();
         let error = security.apply(&mut config).unwrap_err();
@@ -362,27 +354,20 @@ modes:
     }
 
     #[test]
-    fn policy_defaults_cli_precedence_and_headless_ask_rejection() {
+    fn policy_defaults_and_cli_precedence() {
         let mut config = SecurityConfig::default();
-        assert_eq!(config.poc_policy(None, false).unwrap(), PocPolicy::Ask);
-        assert_eq!(config.poc_policy(None, true).unwrap(), PocPolicy::No);
-        config.poc = Some(PocPolicy::Ask);
-        assert!(matches!(
-            config.poc_policy(None, true),
-            Err(Error::HeadlessAsk)
-        ));
+        assert_eq!(config.live_policy(None, false), LivePolicy::Ask);
+        assert_eq!(config.live_policy(None, true), LivePolicy::No);
+        config.live = Some(LivePolicy::Ask);
+        assert_eq!(config.live_policy(None, true), LivePolicy::Ask);
         assert_eq!(
-            config.poc_policy(Some(PocPolicy::Yes), true).unwrap(),
-            PocPolicy::Yes
+            config.live_policy(Some(LivePolicy::Yes), true),
+            LivePolicy::Yes
         );
-        config.poc = Some(PocPolicy::Yes);
+        config.live = Some(LivePolicy::Yes);
         assert_eq!(
-            config.poc_policy(Some(PocPolicy::No), false).unwrap(),
-            PocPolicy::No
+            config.live_policy(Some(LivePolicy::No), false),
+            LivePolicy::No
         );
-        assert!(matches!(
-            config.poc_policy(Some(PocPolicy::Ask), true),
-            Err(Error::HeadlessAsk)
-        ));
     }
 }

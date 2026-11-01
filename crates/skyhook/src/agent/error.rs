@@ -41,6 +41,8 @@ pub enum HarnessError {
     NoRecordedModel(crate::identity::AgentId),
     #[error("unknown mode `{0}`")]
     UnknownMode(crate::tool::policy::ModeName),
+    #[error(transparent)]
+    Prompt(#[from] crate::prompts::TemplateError),
     #[error("mode `{0}` cannot be applied: only the root agent changes mode")]
     ModeChangeUnsupported(crate::tool::policy::ModeName),
     #[error("invalid model `{model}`: {error}")]

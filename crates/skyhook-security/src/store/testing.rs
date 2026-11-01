@@ -1,7 +1,9 @@
 //! Tests of candidates and the environments they run in. A test's artifacts are files below
 //! the run's artifacts directory, admitted and digested before the test is recorded.
 
-use skyhook::db::params;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use skyhook::db::{Db, params};
 
 use super::*;
 
@@ -16,11 +18,55 @@ pub struct NewTest {
     pub artifacts: Vec<TestArtifact>,
 }
 
-/// Instructions for running tests, for one candidate or for any.
+/// A running instance: its instructions, for one candidate or for any, and the interfaces it
+/// serves.
 #[derive(Clone, Debug)]
 pub struct NewEnvironment {
     pub instructions: Text,
     pub candidate: Option<CandidateId>,
+    pub serves: Serves,
+}
+
+/// The interfaces an environment serves, each at one address: a request naming more than a
+/// call's records, or one interface twice, is no such set.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(try_from = "Vec<Served>")]
+pub struct Serves(std::collections::BTreeMap<InterfaceName, ServiceAddress>);
+
+impl TryFrom<Vec<Served>> for Serves {
+    type Error = Error;
+    fn try_from(list: Vec<Served>) -> Result<Self> {
+        if list.len() > MAX_ATTACHMENTS {
+            return Err(Error::Limit(Bound::Attachments));
+        }
+        let mut serves = std::collections::BTreeMap::new();
+        for Served { interface, address } in list {
+            if serves.contains_key(&interface) {
+                return Err(Error::ServedTwice(interface));
+            }
+            serves.insert(interface, address);
+        }
+        Ok(Self(serves))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(inline)]
+pub struct Served {
+    pub interface: InterfaceName,
+    pub address: ServiceAddress,
+}
+
+/// Environment `id` is recorded.
+pub(super) fn known_environment(db: &Db, id: EnvironmentId) -> Result<()> {
+    match exists(db, "SELECT 1 FROM environment WHERE id=?1", params![id])? {
+        true => Ok(()),
+        false => Err(Error::NotFound {
+            record: Record::Environment,
+            id: Some(id.0),
+        }),
+    }
 }
 
 impl Store {
@@ -35,22 +81,17 @@ impl Store {
         self.write(|db| {
             let candidate = live(db, test.candidate)?;
             if let Some(environment) = test.environment {
-                let known = "SELECT 1 FROM environment WHERE id=?1";
-                if !exists(db, known, params![environment])? {
-                    return Err(Error::NotFound {
-                        record: Record::Environment,
-                        id: Some(environment.0),
-                    });
-                }
+                known_environment(db, environment)?;
             }
             audit(db, actor, EventKind::Tested, Some(&test.note), |event| {
                 let id = TestId(db.insert(
                     concat!(
                         "INSERT INTO test(candidate,environment,result,verdict,event) VALUES \
-                         (?1,?2,?3,(SELECT max(en.event) FROM event_node en JOIN event e ON \
-                         e.id=en.event WHERE en.node=?1 AND e.kind='verdict' AND en.event<=",
+                         (?1,?2,?3,(SELECT en.event FROM event_node en WHERE en.node=?1 AND \
+                         en.kind!='tested' AND en.effect='standing' AND en.kind='verdict' AND \
+                         en.event<=",
                         crate::store::bearing::stamp!("test", "?4", "?1"),
-                        "),?4)"
+                        " ORDER BY en.event DESC LIMIT 1),?4)"
                     ),
                     params![candidate, test.environment, test.result, event],
                 )?);
@@ -74,7 +115,7 @@ impl Store {
         })
     }
 
-    /// Record an environment. One recorded within a test's work, by its agent or one beneath
+    /// Record an environment and the interfaces it serves. One recorded within a test's work, by its agent or one beneath
     /// it, is for that test's candidate unless it names another, and never offers that test
     /// again.
     pub fn environment(&self, actor: &AgentId, input: &NewEnvironment) -> Result<EnvironmentId> {
@@ -97,6 +138,14 @@ impl Store {
                     "INSERT INTO environment(instructions,candidate,event) VALUES (?1,?2,?3)",
                     params![&input.instructions, candidate, event],
                 )?);
+                for (interface, address) in &input.serves.0 {
+                    known_interface(db, interface)?;
+                    db.execute(
+                        "INSERT INTO environment_interface(environment,interface,address) VALUES \
+                         (?1,?2,?3)",
+                        params![id, interface.as_str(), address.as_str()],
+                    )?;
+                }
                 let mut marks = Marks::default();
                 if let Some(candidate) = candidate {
                     marks.mark(candidate, EventEffect::Concerns);
@@ -112,7 +161,9 @@ mod tests {
     use skyhook::job::JobState;
 
     use super::{
-        super::tests::{artifact, begun, child_of, fixture, scenario, text, validated},
+        super::tests::{
+            artifact, begun, child_of, fixture, operation, scenario, serve, text, validated,
+        },
         *,
     };
 
@@ -187,6 +238,7 @@ mod tests {
             let input = NewEnvironment {
                 instructions: text("start the container"),
                 candidate,
+                serves: Serves::default(),
             };
             store.environment(actor, &input).unwrap()
         };
@@ -206,5 +258,48 @@ mod tests {
         let other = validated(&store, &actor, "c").candidate;
         assert_eq!(prepared(environment(&preparer, Some(other))), Some(other.0));
         assert_eq!(prepared(environment(&actor, None)), None);
+    }
+
+    /// An environment serves recorded interfaces at absolute addresses, each once, and evidence
+    /// names the environment it was observed in.
+    #[test]
+    fn an_environment_serves_recorded_interfaces_and_evidence_names_it() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "gateway");
+        for address in ["tcp://10.0.0.5:7000", "https://staging.example.test/v1"] {
+            assert!(address.parse::<ServiceAddress>().is_ok(), "{address}");
+        }
+        for address in ["staging.example.test", "/v1/files", "https://"] {
+            assert!(address.parse::<ServiceAddress>().is_err(), "{address}");
+        }
+        let unknown = serve(&store, &actor, &["admin-api"]);
+        assert!(matches!(unknown, Err(Error::UnknownInterface(_))));
+        let served = Served {
+            interface: "gateway-api".parse().unwrap(),
+            address: "https://staging.example.test".parse().unwrap(),
+        };
+        let twice = Serves::try_from(vec![served.clone(), served]);
+        assert!(matches!(twice, Err(Error::ServedTwice(_))));
+        let environment = serve(&store, &actor, &["gateway-api"]).unwrap();
+        let listed = store.environments(Page::default()).unwrap();
+        assert_eq!(
+            listed[0]
+                .serves
+                .iter()
+                .map(|served| served.interface.as_str())
+                .collect::<Vec<_>>(),
+            ["gateway-api"]
+        );
+        let seen = NewEvidence {
+            location: Some(operation("gateway-api")),
+            environment: Some(environment),
+            stance: Stance::Supports,
+            note: text("the control was refused, the probe accepted"),
+        };
+        store
+            .evidence(&actor, scenario.flaw.into(), &[seen])
+            .unwrap();
+        let view = store.node(scenario.flaw.into()).unwrap();
+        assert_eq!(view.head().evidence[0].environment, Some(environment));
     }
 }

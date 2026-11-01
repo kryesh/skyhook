@@ -794,6 +794,162 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// Input that reaches a child as its final answer completes the job, before
+    /// its owner saw that completion, resumes the child. The answer it superseded
+    /// reaches the owner whole, as a reply, ahead of the resumed invocation's
+    /// result, and the child sees the input once.
+    #[tokio::test]
+    async fn input_racing_a_childs_final_answer_leaves_the_answer_for_its_owner() {
+        const INPUT: &str = "parent-input-racing-the-answer";
+        // Both longer than a text field shows, and than a saved string keeps inline.
+        let first = "child-first-answer line\n".repeat(2048);
+        let second = "child-answer-to-input line\n".repeat(2048);
+        let launch =
+            json!({"prompt":"report", "model":"wait-test/child", "name":"racer", "bg":true});
+        let tracking = tracking(vec![
+            ("root", call("launch", "agent", launch)),
+            ("child", AssistantItem::text("first", 0, first.clone())),
+            ("root", call("waiting", "wait", json!({}))),
+            ("child", AssistantItem::text("second", 0, second.clone())),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let runtime = &session.runtime;
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        let job = running_job(&session, &session.root, "agent").await;
+        // The owner's request is in flight, so nothing delivers the completion.
+        tracking.request(2).await;
+        tracking.pass(1).await;
+        child_completed(&session, job).await;
+        let send = format!("return (await tool.job({job}).send({{value:{INPUT:?}}})).unwrap();");
+        bounded(session.run_script(send)).await.unwrap();
+        let resumed = tracking.pass(3).await;
+        assert_eq!(rendered(&resumed).matches(INPUT).count(), 1);
+        let resumed_run = crate::job::Invocation::nth(1);
+        until(&session, job, move |job| {
+            job.invocation == resumed_run && job.state == JobState::Completed
+        })
+        .await;
+        tracking.release(2);
+        let woken = tracking.pass(4).await;
+        assert_reason(&woken, "waiting", "event");
+        let replies = agent_messages(&woken);
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0]["text"], first);
+        let completions = events(&woken);
+        assert_eq!(completions.len(), 1);
+        assert_child_completion(&completions[0], job, &second);
+        bounded(turn).await.unwrap().unwrap();
+        for jobs in [runtime.jobs.clone(), runtime.jobs.test_replay()] {
+            assert!(!jobs.has_pending(&session.root));
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    /// A script that read a child's answer and then sent the child input returns
+    /// the answer as its result: the restart supersedes the answer the script
+    /// already read, which its owner then sees once, never again as a reply.
+    #[tokio::test]
+    async fn a_scripts_read_answer_superseded_by_its_input_reaches_the_owner_once() {
+        const FIRST: &str = "child-first-answer";
+        const SECOND: &str = "child-answer-to-input";
+        let source = "const child = await tool.agent({prompt:'report', model:'wait-test/child', name:'racer'}); \
+            (await tool.job(child.id).send({value:'more'})).unwrap(); \
+            return child.result.reply;";
+        let tracking = tracking(vec![
+            ("root", call("run", "script", json!({"source": source}))),
+            ("child", AssistantItem::text("first", 0, FIRST.to_owned())),
+            ("child", AssistantItem::text("second", 0, SECOND.to_owned())),
+            ("root", call("waiting", "wait", json!({}))),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        let job = running_job(&session, &session.root, "agent").await;
+        tracking.pass(1).await;
+        tracking.request(3).await;
+        tracking.pass(2).await;
+        let resumed = crate::job::Invocation::nth(1);
+        until(&session, job, move |job| {
+            job.invocation == resumed && job.state == JobState::Completed
+        })
+        .await;
+        tracking.release(3);
+        let woken = tracking.pass(4).await;
+        assert_eq!(
+            rendered(&woken).matches(FIRST).count(),
+            1,
+            "{}",
+            rendered(&woken)
+        );
+        assert!(
+            agent_messages(&woken).is_empty(),
+            "{:?}",
+            agent_messages(&woken)
+        );
+        let completions = events(&woken);
+        assert_eq!(completions.len(), 1);
+        assert_child_completion(&completions[0], job, SECOND);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// A background script still running after it read a child's answer and sent
+    /// the child input holds that superseded answer: its owner, notified meanwhile,
+    /// sees the resumed invocation's result alone, and the answer once, as the
+    /// script's result.
+    #[tokio::test]
+    async fn a_running_scripts_superseded_answer_is_not_notified() {
+        const FIRST: &str = "child-first-answer";
+        const SECOND: &str = "child-answer-to-input";
+        let source = "const child = await tool.agent({prompt:'report', model:'wait-test/child', name:'racer'}); \
+            (await tool.job(child.id).send({value:'more'})).unwrap(); \
+            await receive(); \
+            return child.result.reply;";
+        let run = json!({"source": source, "bg": true});
+        let tracking = tracking_all(vec![
+            (
+                "root",
+                vec![
+                    call("run", "script", run),
+                    call_at(1, "waiting", "wait", json!({"timeout": 300})),
+                ],
+            ),
+            ("child", vec![AssistantItem::text("first", 0, FIRST)]),
+            ("child", vec![AssistantItem::text("second", 0, SECOND)]),
+            ("root", vec![call("again", "wait", json!({"timeout": 300}))]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let jobs = &session.runtime.jobs;
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        let script = running_job(&session, &session.root, "script").await;
+        tracking.pass(1).await;
+        let job = job_found(&session, &session.root, |job| job.tool == "agent").await;
+        tracking.pass(2).await;
+        let woken = tracking.pass(3).await;
+        assert_reason(&woken, "waiting", "event");
+        assert_eq!(delivered(&woken, job), ["completed"]);
+        assert_eq!(rendered(&woken).matches(FIRST).count(), 0);
+        jobs.send(script, json!("go")).await.unwrap();
+        let finished = tracking.pass(4).await;
+        let returned = events(&finished)
+            .into_iter()
+            .find(|event| event["id"] == script.get())
+            .unwrap();
+        assert_eq!(returned["result"]["value"], FIRST, "{returned}");
+        assert_eq!(delivered(&finished, job), ["completed"]);
+        once(&finished, &[FIRST, SECOND]);
+        bounded(turn).await.unwrap().unwrap();
+        for jobs in [jobs.clone(), jobs.test_replay()] {
+            assert!(!jobs.has_pending(&session.root));
+        }
+        session.shutdown().await.unwrap();
+    }
+
     /// A reasoning model's working turn is `reasoning` + a blank text separator +
     /// its calls. The blank block stays in the child's history for replay, but the
     /// turn answered nothing, so it must publish no reply, wake nobody and leave no

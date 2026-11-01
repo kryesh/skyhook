@@ -241,10 +241,10 @@ impl SessionRuntime {
                 }
             };
             let facts = facts(&mut state.agents, &id);
-            // Input that begins an invocation an interrupt stopped first runs as a
-            // turn interrupted on taking it: its input commits, and nothing requests.
-            // The token is cancelled before anyone holds it.
-            let begins = matches!(work, Work::Command(AgentCommand::Input { .. }));
+            // The work that begins an invocation an interrupt stopped first runs as a
+            // turn interrupted on taking it: its prompt stays committed, and nothing
+            // requests. The token is cancelled before anyone holds it.
+            let begins = matches!(work, Work::Command(AgentCommand::Begin(_)));
             let token = supervisor.token();
             facts.turn_token = token.clone();
             let resting = match work {
@@ -534,6 +534,9 @@ impl SessionRuntime {
                     done,
                     options,
                 }) => Some(Begins::Input(content, done, options)),
+                Work::Command(AgentCommand::Begin(done)) => {
+                    Some(Begins::Taken(Ok(()), Some(RequestCompletion::Child(done))))
+                }
                 Work::Command(AgentCommand::Select { options, done }) => {
                     let selected = self.select(&mut turn, &mut context, options, false);
                     let adopted = match selected.await {
@@ -1492,7 +1495,7 @@ mod tests {
         let (_, child, work) = retained_child(&session, false).await;
         let (done, received) = oneshot::channel();
         let mut events = session.runtime.store.observe().updates;
-        child_input(&session, &child, Some(done)).await;
+        begin(&session, &child, done).await;
         wait_for_child_answer(&mut events, &child).await;
         mailbox_barrier(&session, &child).await;
         assert_eq!(completion_count(&session, &child), 0);

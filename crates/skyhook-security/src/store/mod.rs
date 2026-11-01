@@ -23,6 +23,7 @@ mod events;
 mod evidence;
 mod findings;
 mod links;
+mod locations;
 mod nodes;
 mod queues;
 mod reads;
@@ -40,6 +41,7 @@ pub use events::*;
 pub use evidence::*;
 pub use findings::*;
 pub use links::*;
+pub use locations::*;
 pub use nodes::*;
 pub use queues::{QueueEntry, SpentWork};
 pub use reads::*;
@@ -113,8 +115,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("ids must be positive")]
     NonPositiveId,
-    #[error("span requires 1 <= start_line <= end_line")]
+    #[error("a span needs 1 <= start <= end")]
     Span,
+    #[error("{0}")]
+    InterfaceName(#[from] InvalidInterfaceName),
+    #[error("{0}")]
+    ServiceAddress(#[from] InvalidServiceAddress),
+    #[error("interface {0} is served twice")]
+    ServedTwice(InterfaceName),
+    #[error("no interface named {0}: record it on its component first")]
+    UnknownInterface(InterfaceName),
     #[error("{0}")]
     ArtifactReference(#[from] InvalidArtifactReference),
     #[error("{0}")]
@@ -133,10 +143,12 @@ pub enum Error {
     },
     #[error("a new {kind} needs {fields}")]
     Missing { kind: NodeKind, fields: Fields },
-    #[error("a candidate chains at least one flaw")]
-    EmptyChain,
+    #[error("a candidate lists at least one {0}")]
+    Empty(NodeKind),
     #[error("a node is not merged into itself")]
     SelfMerge,
+    #[error("source {0} is at that location: merge into it")]
+    SourceAt(SourceId),
     #[error("work is begun by the agent job that does it")]
     TaskNeedsJob,
     #[error("a task begins with at least one subject")]
@@ -350,15 +362,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn location(file: &str, line: u32) -> Location {
-        Location {
+        Location::Code(CodeSite {
             file: text(file),
             start_line: line,
             end_line: line,
             function: None,
-        }
+        })
     }
 
-    /// A security session held open for store tests, its run started under PoC policy `yes`.
+    /// A security session held open for store tests, its run started under live policy `yes`.
     pub(crate) struct Session {
         handle: SessionHandle,
         runtime: tokio::runtime::Runtime,
@@ -372,6 +384,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fixture() -> (Session, Store, AgentId) {
+        fixture_under(LivePolicy::Yes)
+    }
+
+    /// A new run under `live`.
+    pub(crate) fn fixture_under(live: LivePolicy) -> (Session, Store, AgentId) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -382,9 +399,7 @@ pub(crate) mod tests {
             harness.new_session().await.unwrap()
         });
         let store = Store::of(handle.store().extension().unwrap());
-        store
-            .start_run(RunOptions::default(), PocPolicy::Yes)
-            .unwrap();
+        store.start_run(RunOptions::default(), live).unwrap();
         let actor = handle.root_agent().clone();
         let session = Session {
             handle,
@@ -406,9 +421,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// A component owning `<name>/lib.c` and the interface `<name>-api`.
     pub(crate) fn component(store: &Store, actor: &AgentId, name: &str) -> ComponentId {
-        let files = vec![text(&format!("{name}/lib.c"))];
-        let new = new(name, NewComponent { files });
+        let new = new(
+            name,
+            NewComponent {
+                files: vec![text(&format!("{name}/lib.c"))],
+                interfaces: vec![format!("{name}-api").parse().unwrap()],
+            },
+        );
         created(
             store
                 .upsert(actor, &Upsert::Component(Change::Create(new)))
@@ -416,33 +437,46 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn source(store: &Store, actor: &AgentId, name: &str) -> SourceId {
-        let detail = NewSource {
-            location: location(&format!("{name}/net.c"), 1),
-            trust: Trust::Untrusted,
-        };
-        created(
-            store
-                .upsert(actor, &Upsert::Source(Change::Create(new(name, detail))))
-                .unwrap(),
-        )
-    }
-
-    /// A path entered by a source of its own, stepping through `through` in order.
+    /// A path entered by a source of its own in code, stepping through `through` in order.
     pub(crate) fn path(
         store: &Store,
         actor: &AgentId,
         name: &str,
         through: &[ComponentId],
     ) -> PathId {
+        path_from(
+            store,
+            actor,
+            name,
+            through,
+            location(&format!("{name}/net.c"), 1),
+        )
+    }
+
+    /// A path entered by a source of its own at `at`, stepping through `through` in order.
+    pub(crate) fn path_from(
+        store: &Store,
+        actor: &AgentId,
+        name: &str,
+        through: &[ComponentId],
+        at: Location,
+    ) -> PathId {
         let path = created(
             store
                 .upsert(actor, &Upsert::Path(Change::Create(new(name, ()))))
                 .unwrap(),
         );
+        let detail = NewSource {
+            location: at,
+            trust: Trust::Untrusted,
+        };
         let source = Link::PathSource {
             path,
-            source: source(store, actor, name),
+            source: created(
+                store
+                    .upsert(actor, &Upsert::Source(Change::Create(new(name, detail))))
+                    .unwrap(),
+            ),
         };
         let steps = (through.iter()).map(|component| Link::PathStep {
             path,
@@ -454,6 +488,46 @@ pub(crate) mod tests {
         let links: Vec<Link> = std::iter::once(source).chain(steps).collect();
         store.link(actor, &links).unwrap();
         path
+    }
+
+    /// A binary image's code at `start`, entering a path.
+    pub(crate) fn daemon(start: u64) -> Location {
+        Location::Binary(BinarySite {
+            image: text("bin/daemon"),
+            start: Address(start),
+            end: Address(start + 0x58),
+            symbol: None,
+        })
+    }
+
+    /// An operation of `interface`.
+    pub(crate) fn operation(interface: &str) -> Location {
+        Location::Interface(InterfaceSite {
+            interface: interface.parse().unwrap(),
+            operation: text("POST /files"),
+            field: None,
+        })
+    }
+
+    /// An environment for any candidate serving `interfaces`, recorded by `actor`.
+    pub(crate) fn serve(
+        store: &Store,
+        actor: &AgentId,
+        interfaces: &[&str],
+    ) -> Result<EnvironmentId> {
+        let environment = NewEnvironment {
+            instructions: text("the staging deployment"),
+            candidate: None,
+            serves: (interfaces.iter())
+                .map(|interface| Served {
+                    interface: interface.parse().unwrap(),
+                    address: "https://staging.example.test".parse().unwrap(),
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        };
+        store.environment(actor, &environment)
     }
 
     pub(crate) fn premise(store: &Store, actor: &AgentId, scope: PremiseScope) -> PremiseId {
@@ -482,7 +556,7 @@ pub(crate) mod tests {
         flaws: &[FlawId],
     ) -> CandidateId {
         let detail = NewCandidate {
-            path,
+            actions: vec![path].try_into().unwrap(),
             chain: flaws.to_vec().try_into().unwrap(),
         };
         let change = Change::Create(new("overflow", detail));
@@ -613,9 +687,9 @@ pub(crate) mod tests {
                     params![parent, index, job],
                 )?;
                 db.execute(
-                    "INSERT INTO job_status(job,state,invocation,background,cancel_recorded,resident) \
-                     VALUES (?1,?2,0,0,0,0)",
-                    params![job, state.as_str()],
+                    "INSERT INTO job_status(job,state,terminal,invocation,background,\
+                     cancel_recorded,resident) VALUES (?1,?2,?3,0,0,0,0)",
+                    params![job, state.as_str(), state.is_terminal()],
                 )?;
                 Ok((index, job))
             })
@@ -629,9 +703,9 @@ pub(crate) mod tests {
         store
             .write(|db| {
                 db.execute(
-                    "UPDATE job_status SET state=?2,first_run_millis=0,ended_millis=?3 WHERE \
-                     job=?1",
-                    params![job, state.as_str(), ended],
+                    "UPDATE job_status SET state=?2,terminal=?3,first_run_millis=0,ended_millis=?4 \
+                     WHERE job=?1",
+                    params![job, state.as_str(), state.is_terminal(), ended],
                 )?;
                 Ok(())
             })
@@ -661,6 +735,39 @@ pub(crate) mod tests {
                 )
             })
             .unwrap()
+    }
+
+    /// A step of a query plan, and the subquery it runs in, if any.
+    pub(crate) struct Step {
+        pub(crate) detail: String,
+        pub(crate) within: Option<String>,
+    }
+
+    /// The steps of `sql`'s query plan.
+    pub(crate) fn plan(store: &Store, sql: &str) -> Vec<Step> {
+        let steps: Vec<(i64, i64, String)> = store
+            .read(|db| {
+                rows(db, format!("EXPLAIN QUERY PLAN {sql}"), Vec::new(), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(3)?))
+                })
+            })
+            .unwrap();
+        let parents: std::collections::HashMap<i64, (i64, &str)> = (steps.iter())
+            .map(|(id, parent, detail)| (*id, (*parent, detail.as_str())))
+            .collect();
+        let within = |mut parent: i64| loop {
+            let (above, detail) = parents.get(&parent)?;
+            if detail.contains("SUBQUERY") {
+                return Some(detail.to_string());
+            }
+            parent = *above;
+        };
+        (steps.iter())
+            .map(|(_, parent, detail)| Step {
+                detail: detail.clone(),
+                within: within(*parent),
+            })
+            .collect()
     }
 
     /// The latest event.

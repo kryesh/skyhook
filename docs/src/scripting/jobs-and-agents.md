@@ -12,7 +12,10 @@ A retained child whose job is `completed`, `failed`, or `interrupted` resumes un
 job and agent identity, including after a session restart. New instructions are appended to its
 existing conversation. Explicitly `cancelled` children and non-agent jobs cannot be resumed.
 `jobs({job})` then exposes the latest run's saved result, not an archive of earlier results;
-the child conversation and messages already delivered to the parent remain intact.
+the child conversation and messages already delivered to the parent remain intact. A final reply
+whose completion the parent had yet to receive when the child resumed, as when input races that
+reply, arrives as a message event instead, unless a script already received it as the call's
+result.
 
 After a session interruption, retry resumes every retained failed/interrupted child without
 selecting them individually. A child-only retry leaves a parent waiting on work untouched and

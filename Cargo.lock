@@ -3568,6 +3568,7 @@ dependencies = [
  "sse-stream",
  "struson",
  "tempfile",
+ "tera",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -3864,6 +3865,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08"
 dependencies = [
  "new_debug_unreachable",
+]
+
+[[package]]
+name = "tera"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61e0cadeeb54426080b4c5395d59769ce8293f542cc25511c167c742b2175809"
+dependencies = [
+ "indexmap",
+ "serde",
 ]
 
 [[package]]

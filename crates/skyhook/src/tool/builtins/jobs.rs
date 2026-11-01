@@ -41,6 +41,7 @@ pub(crate) fn register(
                         context.diagnostic_viewer(),
                         OutputOptions::Model {
                             kind: ViewKind::Inspection,
+                            reader: Some(context.job()),
                         },
                     );
                     let presented = presented.await.map_err(|error| error.or(read))?;

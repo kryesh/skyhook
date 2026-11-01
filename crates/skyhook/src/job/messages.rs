@@ -59,8 +59,11 @@ impl JobFacts {
         };
         // A later turn means the answer did not resolve its invocation; replies
         // deliver oldest first. `notify_owner` has usually released it already.
-        child.release(stamps);
-        child.answer = None;
+        // A finished job's answer is its result.
+        if !finished {
+            child.release(stamps);
+            child.answer = None;
+        }
         let Reply { text, progress } = reply;
         if text.is_empty() || returned {
             return;
@@ -194,7 +197,7 @@ pub(super) fn pending_messages(jobs: &Jobs, owner: &AgentId) -> Vec<AgentMessage
     let mut messages: Vec<_> = jobs
         .pending(owner)
         .filter_map(|(_, entry)| entry.child())
-        .flat_map(|child| child.messages.iter().map(|queued| &queued.reply))
+        .flat_map(|child| child.deliverable().map(|queued| &queued.reply))
         .collect();
     messages.sort_by_key(|message| message.message);
     let mut budget: usize = 0;

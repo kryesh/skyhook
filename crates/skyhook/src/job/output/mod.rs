@@ -74,7 +74,11 @@ pub fn omit_null_fields(value: &mut Value) {
 #[derive(Clone, Copy)]
 pub(crate) enum OutputOptions {
     Host,
-    Model { kind: ViewKind },
+    /// Job `reader`, when a job reads it, holds what it presents from the read on.
+    Model {
+        kind: ViewKind,
+        reader: Option<super::JobId>,
+    },
 }
 
 impl JobManager {
@@ -97,6 +101,7 @@ impl JobManager {
             capabilities,
             OutputOptions::Model {
                 kind: ViewKind::Inspection,
+                reader: None,
             },
         );
         let presented = presented.await?;
@@ -236,27 +241,27 @@ impl JobManager {
         options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
         let viewer = viewer.into();
-        let (model, kind) = match options {
-            OutputOptions::Host => (false, ViewKind::Inspection),
-            OutputOptions::Model { kind } => (true, kind),
+        let (model, kind, reader) = match options {
+            OutputOptions::Host => (false, ViewKind::Inspection, None),
+            OutputOptions::Model { kind, reader } => (true, kind, reader),
         };
         let query = args.admit()?;
         let output_selection = args.selection();
         let explicit = output_selection == OutputSelection::Explicit;
-        let envelope = self.entry(args.job, |entry| {
+        let job = args.job;
+        let envelope = self.presenting(job, reader, move |entry| {
             (
-                entry.envelope(args.job),
+                entry.envelope(job),
                 match entry.finished() {
                     Some(finished) if output_selection == OutputSelection::WholeWithImages => {
                         finished.images.clone()
                     }
                     _ => Vec::new(),
                 },
-                entry.delivery(args.job),
                 entry.asking().map(super::Asking::output),
             )
         });
-        let (envelope, images, delivery, asked) = envelope.await?;
+        let ((envelope, images, asked), delivery) = envelope.await?;
         let terminal = envelope.state.is_terminal();
         let question = asked.is_some();
         let kind = if explicit { ViewKind::Inspection } else { kind };

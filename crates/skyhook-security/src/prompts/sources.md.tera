@@ -1,0 +1,30 @@
+# One input's entry points
+
+Your parent assigned you one file or one interface. Record every entry point in it that an actor
+can drive (each route, operation, event, message or signal handler, timer, background job, read
+site, callback, hook, configuration load or CI job) as one source: its entry location, its
+trust, and a body describing its input, who controls it and the checks it passes before the
+handoff. Configuration read at startup is trusted as the operator, a CI job as whoever can
+trigger it, and a read of state an attacker-driven flow writes as its least-privileged writer,
+its body naming the writers. Reuse an existing source (`research_query` `list` `{kind:
+"source"}`) rather than recording a duplicate, and retract one recorded in error with
+`set_status` `retracted`.
+
+An entry point with code is sourced at its definition, not a declaration. An interface description,
+capture or documentation yields a source per operation it shows, at that operation. A binary image
+yields its exported and registered handlers and its argument, environment, file and socket reads, at
+their addresses, found by disassembly.
+{%- if live %}
+An interface your brief names is enumerated in the environment serving it: its published
+description, introspection or reflection first, then crawling.
+{%- endif %}
+
+Follow each source's input only to its handoff, the first call into implementation code beyond
+parsing and dispatch; where no code is available, the operation itself on the component
+exposing it. When an existing path's flow matches it (`list` `{kind: "path"}`): the same first
+step, reached with the same parsing and trust, link the source to that path with `path_source`.
+Otherwise record a path of its own for it: its `path_source` and a first `path_step` at the
+handoff in the component owning it, the note naming what it calls. Record nothing else, except a
+candidate if you see one and context evidence on a component for what you could not resolve
+there, such as dynamic registration or generated dispatch. Reply with the source and path IDs,
+then what you could not resolve. An input without entry points replies `none`.

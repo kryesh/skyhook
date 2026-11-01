@@ -123,7 +123,7 @@ The extension points are:
   finish a setup an interruption left undone. A reopened session may only be viewed, so change
   nothing else. Failure shuts the session down.
 - What this launch changes about a reopened session's work (as the security product applies its
-  `--workers` and PoC policy) goes in a `skyhook::agent::ResumeHook` registered on the prepared
+  `--workers`) goes in a `skyhook::agent::ResumeHook` registered on the prepared
   builder with `HarnessBuilder::resume_hook`; the library runs it before that session's first
   work (see [Interruption, continuation, and shutdown](#interruption-continuation-and-shutdown)).
 
@@ -240,12 +240,34 @@ an override supplied by `Config::session_root`, is passed through unchanged: a r
 relative to the process working directory, not the workspace or configuration file. The CLI selects
 its own workspace-local session root.
 
-## Adding a persona
+## Persona and prompt templates
 
-`HarnessBuilder::persona(Prose)` adds host guidance to every agent's system prompt, after the
-built-in role text and before the runtime's workspace, tool, capability and mode instructions.
-The journal retains the exact prompt sent to the model: a resumed agent keeps its recorded
-prompt until a mode change rebuilds it, and newly started agents use the current persona.
+A host keeps its persona and mode instructions as embedded Tera templates, which the library
+renders for each agent. `skyhook::templates!` embeds each named file from the invoking crate's
+`src/prompts`, as a `Source::Template`, rendered by Tera, or a `Source::Verbatim`, such as a
+script shown to the model, included as written and never parsed. A file's final newline is not
+part of it, so an include can sit mid-line. `Templates::with(sources, &sample)` registers them
+beside the library's templates, which they can include by name, for a serializable section type
+`H`.
+
+`Prompts::host(&templates, &section, persona)` and `HarnessBuilder::prompts` give a session the
+host's section, fixed for the session, and its persona template, placed in every agent's system
+prompt after the built-in role text and before the runtime's workspace, tool, capability and
+mode instructions. Templates are named by a `TemplateName`, the name they are registered under.
+A mode whose `instructions` is `Instructions::Template(name)` is told that template; configuration spells only text, and `dump config` leaves a template out. Each template
+renders from the agent's context (`role`, `available_depth`, `capabilities`, `mode`,
+`location`, `job_view`) with the section's fields as top-level names, when the agent's contract
+is fixed: `Prompts::edition` renders a mode's instructions for an agent entering it.
+
+The journal keeps what rendered: a mode's edition records its instructions' text, and an
+agent's prompt as sent. A resumed agent keeps its recorded prompt until a mode change rebuilds
+it, and a reopened root whose mode now renders otherwise warns of a changed mode. One whose mode
+no longer renders for it opens all the same, warning with the error, which the work that next runs
+the root in that mode returns.
+
+Registration refuses a template that reads a top-level name its context does not define,
+counting the names its includes read, so a misspelled setting fails at registration rather than
+rendering as false. Names nested in a value (`capabilities.agents`) are not checked.
 
 ## Host state
 

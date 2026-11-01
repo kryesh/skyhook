@@ -1,0 +1,5 @@
+Tools default to the target and workspace in skyhook_context. A tool's target selects the execution machine; write commands as if already on that machine. If the task's machine is unclear, use targets to discover available machines. Findings apply only to the target inspected.
+
+"root" selects the session host running Skyhook and its configured workspace. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
+
+Remote commands receive the SSH agent their target's connection forwards in SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts.

@@ -13,12 +13,11 @@ macro_rules! finding_pending {
             pending!("review", $c, review_owed!($c)),
             " OR ",
             pending!("test", $c, test_owed!($c)),
-            " OR EXISTS (SELECT 1 FROM task_node ot JOIN task_state os ON os.task=ot.task WHERE \
-             ot.phase='test' AND ",
-            works!("ot.node", $c),
-            " AND os.live AND NOT EXISTS (SELECT 1 FROM test ox WHERE ox.candidate=",
+            " OR EXISTS (SELECT 1 FROM live ot WHERE ot.phase='test' AND ot.node=",
             $c,
-            " AND ox.event>os.began)))"
+            " AND ",
+            $crate::store::bearing::untested_since!($c, "ot.began"),
+            "))"
         )
     };
 }
@@ -105,7 +104,7 @@ mod tests {
         let (id, root) = (scenario.candidate, scenario.flaw);
         let owed = || queued(&store, Phase::Report) == [NodeId::from(root)];
         assert!(!owed(), "the test comes first");
-        assert_eq!(store.synthesis(&[]).unwrap().owed(Phase::Report), 1);
+        assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Report), 1);
         test(&store, &actor, id, TestResult::Confirmed);
         assert!(owed());
         let finding = store
@@ -129,6 +128,7 @@ mod tests {
         test(&store, &actor, id, TestResult::Confirmed);
         let disputed = NewEvidence {
             location: None,
+            environment: None,
             stance: Stance::Contradicts,
             note: text("the report misreads the bound"),
         };
@@ -181,7 +181,7 @@ mod tests {
                 title: None,
                 body: None,
                 detail: CandidateEdit {
-                    path: None,
+                    actions: None,
                     chain: Some(flaws.try_into().unwrap()),
                 },
             };

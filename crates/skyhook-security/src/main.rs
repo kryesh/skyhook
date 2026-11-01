@@ -3,6 +3,7 @@ mod config;
 pub mod cvss;
 mod presets;
 mod product;
+mod prompts;
 mod reporting;
 mod research_view;
 mod session;

@@ -11,9 +11,12 @@ use super::{Action, Placement, holds, options, output};
 use crate::capabilities::SecurityCapability;
 use crate::store::{
     ComponentId, Cursor, EnvironmentView, Event, FlawId, FlawStatus, Keyed, ListQuery, Listing,
-    NodeId, NodeSummary, NodeView, Page, PremiseScope, PremiseStatus, SpentWork, Startables,
-    Status, Store, Synthesis, Task, Tests,
+    Live, NodeId, NodeSummary, NodeView, Page, PremiseScope, PremiseStatus, SpentWork, Startables,
+    Status, Store, Synthesis, Task, TaskDetail, TaskId,
 };
+
+/// The events a task read shows of its child's, `more` flagging the rest.
+const TASK_EVENTS: usize = 100;
 
 /// What a listing reads: live nodes of one kind, filtered, or the environments or tasks.
 #[derive(Deserialize, JsonSchema)]
@@ -129,19 +132,22 @@ actions! {
             #[serde(default)]
             spent: Vec<SpentWork>,
             #[serde(default)]
-            tests: Tests,
+            live: Live,
             after: Option<Cursor>,
             limit: Bounded<1, 1000>,
         } -> Startables,
-        /// What each phase owes, what runs, what two tasks tried without settling (with the
-        /// last child's reply), counting `spent` as `startable` does, the deployment premises
-        /// the user is asked, and the components no path reaches.
+        /// What each phase owes, what runs, what two tasks tried without settling (with their
+        /// ids and the last child's reply), counting `spent` as `startable` does, the deployment
+        /// premises the user is asked, the unproven candidates, the components no path reaches,
+        /// and the interfaces whose paths wait on an environment.
         synthesis => Synthesis {
             #[serde(default)]
             spent: Vec<SpentWork>,
         } -> Synthesis,
-        /// A node, merged or not, with its neighbourhood.
+        /// A node, merged or not, with its neighbourhood and latest tasks.
         node => Node { id: NodeId } -> NodeView,
+        /// A task with its child's brief, reply and first events.
+        task => Task { id: TaskId } -> TaskDetail,
         list => List(ListInput) -> Listing<Listed>,
         /// Every event, or the events naming one node, with the nodes each bears on.
         history => History {
@@ -170,10 +176,11 @@ impl Query {
     fn execute(self, store: &Store, _: &AgentId) -> Result<Value, ToolError> {
         match self {
             Self::Startable(a) => output::<result::Startable>(
-                store.startable(&a.running, &a.spent, &a.tests, a.after, a.limit),
+                store.startable(&a.running, &a.spent, &a.live, a.after, a.limit),
             ),
             Self::Synthesis(a) => output::<result::Synthesis>(store.synthesis(&a.spent)),
             Self::Node(a) => output::<result::Node>(store.node(a.id)),
+            Self::Task(a) => output::<result::Task>(store.task(a.id, TASK_EVENTS)),
             Self::List(list) => output::<result::List>(list.read(store)),
             Self::History(a) => output::<result::History>(store.history(a.node, a.page)),
         }
@@ -184,7 +191,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     super::register(
         builder,
         "research_query",
-        "Read the run's research graph and the work it owes. Every list is a keyset page {items: T[], next_after?: integer}: continue with page.after = next_after until it is absent, even when a page is empty. Result: JobView<T>: startable → {items: [{phase, node, title, basis, about?, pending?, bundle?}], next?, held}; synthesis → {owed, running, exhausted: [{phase, node, title, reply?}], asked: [{premise, title}], unreached: component ids}; node → the node of its kind with its neighbours, evidence and, for a candidate, its chain, assessment, verdict, status, confidence and tests; list → page of {id, title, status?} (an environment or task listing: its records); history → page of {id, kind, agent, at, note?, nodes: [{node, effect}]}.",
+        "Read the run's research graph and the work it owes. Every list is a keyset page {items: T[], next_after?: integer}: continue with page.after = next_after until it is absent, even when a page is empty. Result: JobView<T>: startable → {items: [{phase, node, title, basis, about?, pending?, bundle?}], next?, held}; synthesis → {owed, running, exhausted: [{phase, node, title, tasks?, reply?}], asked: [{premise, title}], unproven: [{candidate, title, premises}], unreached: component ids, uncovered: [{interface, paths}]}; node → the node of its kind with its neighbours, evidence, latest task ids and, for a candidate, its actions, chain, assessment, verdict, status, confidence and tests; task → the task with its child's brief, reply and first events; list → page of {id, title, status?} (an environment or task listing: its records); history → page of {id, kind, agent, at, note?, nodes: [{node, effect}]}.",
         options::<Query>(),
         |store, actor, _, query| query.execute(store, actor),
     )

@@ -9,9 +9,7 @@ use skyhook_cli::{
     },
 };
 
-use crate::store::{
-    FlawStatus, Phase, PremiseStatus, RunFacts, RunState, Status, Store, Synthesis,
-};
+use crate::store::{FlawStatus, Phase, PremiseStatus, RunFacts, RunState, Status, Store, Summary};
 
 mod sections;
 use sections::sections;
@@ -27,11 +25,11 @@ impl RunFacts {
     /// The orchestrator's section of its runtime state.
     pub fn state(&self) -> String {
         format!(
-            "run: {}\npoc: {}\nworkers: {}\nplan: {}\nartifacts: {}\n",
+            "run: {}\nlive: {}\nworkers: {}\nplan: {}\nartifacts: {}\n",
             self.run.id,
-            self.run.poc,
+            self.run.live,
             self.run.options.workers,
-            self.synthesis.line(),
+            self.summary.line(),
             self.artifacts.display(),
         )
     }
@@ -42,34 +40,35 @@ impl RunState {
     /// counts that use the width, then the record sections with what `disclosed` shows.
     pub fn page(&self, store: &Store, disclosed: &Disclosed) -> Result<Page, crate::store::Error> {
         let facts = &self.facts;
-        let synthesis = &facts.synthesis;
+        let summary = &facts.summary;
         let coverage = &self.coverage;
         let header = vec![
             fact("run", facts.run.id.to_string()),
             fact("threshold", facts.run.options.threshold.to_string()),
-            fact("poc", facts.run.poc.to_string()),
+            fact("live", facts.run.live.to_string()),
             fact("workers", facts.run.options.workers.to_string()),
         ];
         let plan = Fact {
             label: "plan".to_owned(),
             value: Cell::new(
-                synthesis.line(),
-                if synthesis.complete() {
+                summary.line(),
+                if summary.complete() {
                     Tone::Success
-                } else if Work::of(synthesis, &Phase::ALL).active {
+                } else if Work::of(summary, &Phase::ALL).active {
                     Tone::Accent
                 } else {
                     Tone::Warning
                 },
             ),
         };
-        let work = |phases: &[Phase]| Work::of(synthesis, phases);
+        let work = |phases: &[Phase]| Work::of(summary, phases);
         let began = |phases: &[Phase]| {
             (phases.iter()).any(|phase| coverage.tasks.get(phase).is_some_and(|count| *count > 0))
         };
         let questions = [Phase::Settle, Phase::Chain];
+        let structure = [Phase::Sweep, Phase::Probe];
         let owed =
-            |phases: &[Phase]| -> u64 { phases.iter().map(|phase| synthesis.owed(*phase)).sum() };
+            |phases: &[Phase]| -> u64 { phases.iter().map(|phase| summary.owed(*phase)).sum() };
         let mut test = work(&[Phase::Test]);
         test.exhausted |= self.open_tests.iter().any(|open| !open.live);
         let pipeline = vec![
@@ -91,7 +90,7 @@ impl RunState {
             stage(
                 "sweep",
                 format!("{}/{}", coverage.swept, coverage.paths),
-                work(&[Phase::Sweep]),
+                work(&structure),
                 coverage.swept > 0,
             ),
             stage(
@@ -102,19 +101,19 @@ impl RunState {
             ),
             stage(
                 "assess",
-                synthesis.owed(Phase::Assess),
+                summary.owed(Phase::Assess),
                 work(&[Phase::Assess]),
                 began(&[Phase::Assess]),
             ),
             stage(
                 "review",
-                synthesis.owed(Phase::Review),
+                summary.owed(Phase::Review),
                 work(&[Phase::Review]),
                 began(&[Phase::Review]),
             ),
             stage(
                 "test",
-                synthesis.owed(Phase::Test),
+                summary.owed(Phase::Test),
                 test,
                 began(&[Phase::Test]),
             ),
@@ -139,7 +138,6 @@ impl RunState {
         let premises =
             |status: PremiseStatus| coverage.premises.get(&status).copied().unwrap_or_default();
         let flaws = |status: FlawStatus| coverage.flaws.get(&status).copied().unwrap_or_default();
-        let unreached = synthesis.unreached.len() as u64;
         let coverage_panel = Panel {
             title: "Coverage".to_owned(),
             columns: Vec::new(),
@@ -157,21 +155,31 @@ impl RunState {
                 row("  unswept", flagged(coverage.paths - coverage.swept), None),
                 row(
                     "  exhausted",
-                    flagged(synthesis.exhausted(Phase::Sweep)),
+                    flagged(
+                        structure
+                            .iter()
+                            .map(|phase| summary.exhausted(*phase))
+                            .sum(),
+                    ),
                     None,
                 ),
+                row("  uncovered interfaces", flagged(summary.uncovered), None),
                 row("components", count(coverage.components), None),
-                row("  reached", count(coverage.components - unreached), None),
-                row("  mapped only", flagged(unreached), None),
+                row(
+                    "  reached",
+                    count(coverage.components - coverage.unreached),
+                    None,
+                ),
+                row("  mapped only", flagged(coverage.unreached), None),
                 row(
                     "premises undecided",
                     count(premises(PremiseStatus::Undecided)),
                     None,
                 ),
-                row("  asked", flagged(synthesis.asked.len() as u64), None),
+                row("  asked", flagged(summary.asked), None),
                 row("  disputed", flagged(coverage.disputed), None),
                 row("flaws suspected", count(flaws(FlawStatus::Suspected)), None),
-                row("  contained", count(flaws(FlawStatus::Contained)), None),
+                row("  confirmed", count(flaws(FlawStatus::Confirmed)), None),
                 row("  refuted", count(flaws(FlawStatus::Refuted)), None),
             ],
         };
@@ -216,7 +224,7 @@ impl RunState {
             Block::Facts(header),
             Block::Facts(vec![plan]),
             Block::Pipeline(pipeline),
-            Block::Panels(vec![coverage_panel, funnel, tasks_panel(synthesis)]),
+            Block::Panels(vec![coverage_panel, funnel, tasks_panel(summary)]),
         ];
         blocks.extend(sections(store, self, disclosed)?);
         Ok(Page { blocks })
@@ -224,7 +232,7 @@ impl RunState {
 }
 
 /// Each task phase's running tasks and exhausted subjects.
-fn tasks_panel(synthesis: &Synthesis) -> Panel {
+fn tasks_panel(summary: &Summary) -> Panel {
     Panel {
         title: "Tasks".to_owned(),
         columns: vec!["running".to_owned(), "exhausted".to_owned()],
@@ -237,8 +245,8 @@ fn tasks_panel(synthesis: &Synthesis) -> Panel {
                 PanelRow {
                     label: words(phase),
                     values: vec![
-                        cell(synthesis.running(phase), Tone::Accent),
-                        cell(synthesis.exhausted(phase), Tone::Warning),
+                        cell(summary.running(phase), Tone::Accent),
+                        cell(summary.exhausted(phase), Tone::Warning),
                     ],
                     meter: None,
                 }
@@ -275,11 +283,10 @@ struct Work {
 }
 
 impl Work {
-    fn of(synthesis: &Synthesis, phases: &[Phase]) -> Self {
+    fn of(summary: &Summary, phases: &[Phase]) -> Self {
         Self {
-            active: (phases.iter())
-                .any(|phase| synthesis.owed(*phase) + synthesis.running(*phase) > 0),
-            exhausted: (phases.iter()).any(|phase| synthesis.exhausted(*phase) > 0),
+            active: (phases.iter()).any(|phase| summary.owed(*phase) + summary.running(*phase) > 0),
+            exhausted: (phases.iter()).any(|phase| summary.exhausted(*phase) > 0),
         }
     }
 

@@ -106,17 +106,13 @@ impl PreparedAgentLaunch {
         // the provider that serves it.
         let system = match system {
             Some(system) => system,
-            None => {
-                runtime
-                    .system_prompt(
-                        &id,
-                        &location,
-                        available_depth,
-                        mode.as_ref(),
-                        &capabilities,
-                    )
-                    .await?
-            }
+            None => runtime.system_prompt(
+                &id,
+                &location,
+                available_depth,
+                mode.as_ref(),
+                &capabilities,
+            )?,
         };
         let context =
             (runtime.open_agent_context(&id, profile, system, &capabilities, tools)).await?;
@@ -245,15 +241,9 @@ impl PreparedAgentLaunch {
             held: None,
         };
         state.agents.insert(id.clone(), facts, read);
-        // The prompt is committed: the input that begins the turn carries none.
         let answer = call.map(|_| {
             let (done, answer) = oneshot::channel();
-            let input = AgentCommand::Input {
-                options: Selection::default(),
-                content: Vec::new(),
-                done: Some(RequestCompletion::Child(done)),
-            };
-            state.agents.send(&id, input);
+            state.agents.begin(&id, done);
             answer
         });
         if let Some(job) = agent_loop.owner_job {
@@ -386,7 +376,7 @@ impl CreatedCall {
                     created,
                 } => (executor, call, created),
             };
-            let reported = executor.run_reported(*created).await;
+            let reported = executor.run_reported(*created, None).await;
             let result = match reported.outcome {
                 Ok(result) => ToolResult {
                     call_id: call.id().to_owned(),
@@ -486,14 +476,54 @@ impl SessionRuntime {
         committed.expect("the root's journal is held from its start")
     }
 
-    /// The edition of `name` the configuration defines now.
-    pub(super) fn applied(&self, name: &ModeName) -> Result<AppliedMode, HarnessError> {
+    /// The edition of `name` the configuration defines now, as an agent at `depth` and
+    /// `location`, delegating `available_depth` deep under `ceiling`, enters it, with what
+    /// it grants that agent.
+    pub(super) fn applied(
+        &self,
+        name: &ModeName,
+        depth: usize,
+        location: &crate::execution::ExecutionLocation,
+        available_depth: usize,
+        ceiling: &CapabilitySet,
+    ) -> Result<(AppliedMode, CapabilitySet), HarnessError> {
         let definition = self.harness.modes.get(name);
         let definition = definition.ok_or_else(|| HarnessError::UnknownMode(name.clone()))?;
-        Ok(AppliedMode::configured(name, definition))
+        let capabilities = definition.granted(ceiling).for_agent(available_depth);
+        let grants = (available_depth, &capabilities);
+        let agent = self.prompt_agent(depth, location, grants, Some(name))?;
+        let definition = self.harness.prompts.edition(definition, &agent)?.into();
+        let name = name.clone();
+        Ok((AppliedMode { name, definition }, capabilities))
     }
 
-    pub(super) async fn system_prompt(
+    /// The contract of an agent at `depth` and `location` holding `grants` in `mode`, as
+    /// its prompt describes it.
+    fn prompt_agent<'a>(
+        &self,
+        depth: usize,
+        location: &'a crate::execution::ExecutionLocation,
+        (available_depth, capabilities): (usize, &'a CapabilitySet),
+        mode: Option<&'a ModeName>,
+    ) -> Result<crate::prompts::Agent<'a>, HarnessError> {
+        let definition = match &location.target {
+            crate::target::TargetRef::Root => None,
+            crate::target::TargetRef::Named(name) => {
+                Some(self.router.targets(|targets| targets.get(name))?)
+            }
+        };
+        Ok(crate::prompts::Agent {
+            depth,
+            available_depth,
+            capabilities,
+            mode,
+            workspace: &location.workspace,
+            target: &location.target,
+            definition,
+        })
+    }
+
+    pub(super) fn system_prompt(
         &self,
         agent: &AgentId,
         location: &crate::execution::ExecutionLocation,
@@ -501,23 +531,13 @@ impl SessionRuntime {
         mode: Option<&AppliedMode>,
         capabilities: &CapabilitySet,
     ) -> Result<Vec<SystemSegment>, HarnessError> {
-        let target = match &location.target {
-            crate::target::TargetRef::Root => None,
-            crate::target::TargetRef::Named(name) => {
-                Some(self.router.targets(|targets| targets.get(name))?)
-            }
-        };
-        let system = vec![prompt::system_segment(&prompt::PromptInputs {
-            persona: self.harness.persona.as_ref(),
-            instructions: &self.harness.instructions,
-            agent,
-            location,
-            target: target.as_ref(),
-            available_depth,
-            mode: mode.map(|mode| (mode.name.as_str(), &*mode.definition)),
-            capabilities,
-        })];
-        Ok(system)
+        let grants = (available_depth, capabilities);
+        let name = mode.map(|mode| &mode.name);
+        let agent = self.prompt_agent(agent.depth(), location, grants, name)?;
+        let instructions = mode.and_then(|mode| mode.definition.instructions.as_ref());
+        let prompts = &self.harness.prompts;
+        let text = prompts.system(&agent, instructions, &self.harness.instructions)?;
+        Ok(vec![SystemSegment { text, cache: true }])
     }
 
     /// Open a context for `profile` on the live provider of its model, offering the
@@ -778,6 +798,75 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
 
+    struct DepthState;
+    impl crate::agent::HostState for DepthState {
+        fn state<'a>(
+            &'a self,
+            _: &'a crate::session::ExtensionDb,
+            agent: &'a crate::identity::AgentId,
+        ) -> crate::agent::HostStateFuture<'a> {
+            let depth = agent.depth();
+            Box::pin(async move { Some(format!("depth: {depth}").parse().unwrap()) })
+        }
+    }
+
+    /// The host's persona renders for every agent from its context and the host's
+    /// section, and the host's state section reaches every agent's request.
+    #[tokio::test]
+    async fn persona_and_host_state_reach_root_and_child_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let provider = scripted_provider(
+            &requests,
+            [
+                response(vec![tool_call(
+                    0,
+                    "delegate",
+                    "agent",
+                    json!({"prompt": "work"}),
+                )]),
+                answer("child done"),
+                answer("root done"),
+            ],
+        );
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .prompts(persona_prompts())
+            .session_extension(Some(crate::session::tests::TABLES))
+            .host_state(Arc::new(DepthState))
+            .build()
+            .await
+            .unwrap();
+        let session = ephemeral_session(&harness).await;
+        assert_eq!(
+            bounded(session.prompt("delegate")).await.unwrap(),
+            "root done"
+        );
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+        for (request, (role, depth)) in
+            (captured.iter()).zip([("root", 0), ("child", 1), ("root", 0)])
+        {
+            let persona = format!("Persona of a {role}, custom.");
+            assert!(request.system[0].text.contains(&persona), "{persona}");
+            assert!(request_runtime_state(request).ends_with(&format!("\nhost:\ndepth: {depth}")));
+        }
+        shutdown_session(session).await;
+    }
+
+    /// A host persona reading the agent's role and the host's `tag`.
+    fn persona_prompts() -> crate::prompts::Prompts {
+        #[derive(serde::Serialize)]
+        struct Host {
+            tag: &'static str,
+        }
+        let persona = "Persona of a {{ role }}, {{ tag }}.";
+        let sources = [("host/persona.md", crate::prompts::Source::Template(persona))];
+        let host = Host { tag: "custom" };
+        let templates = crate::prompts::Templates::with(sources, &host).unwrap();
+        let persona = "host/persona.md".parse().unwrap();
+        crate::prompts::Prompts::host(&templates, &host, persona).unwrap()
+    }
+
     fn last_tool_results(request: &ModelRequest) -> &[ToolResult] {
         let Some(Sent::Tool(results)) = request.messages().last() else {
             panic!("expected tool results at the end of the history");
@@ -869,6 +958,44 @@ mod tests {
             last_tool_results(&requests.lock().unwrap()[1]),
             [results[0].clone()]
         );
+    }
+
+    /// A launch, and a restart, begin the child's request with its prompt committed:
+    /// no input schedules the child's coalescing window for the request to wait out.
+    #[tokio::test]
+    async fn a_launch_and_a_restart_schedule_no_window() {
+        let arguments = json!({"prompt": "work"});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "delegate", "agent", arguments)])),
+            Step::new(answer("child done")).gated(),
+            Step::new(answer("root done")),
+            Step::new(answer("child again")).gated(),
+        ];
+        let provider = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = ephemeral_session(&harness).await;
+        let child = session.root.child(1);
+        let scheduled =
+            || (session.runtime).agents(|agents| agents.get(&child).unwrap().window.scheduled);
+        let prompt = spawn_prompt(&session, "delegate");
+        provider.request(1).await;
+        assert_eq!(scheduled(), 0);
+        provider.release(1);
+        assert_eq!(bounded(prompt).await.unwrap().unwrap(), "root done");
+        let records = session.runtime.store.records();
+        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
+            [0];
+        session.runtime.jobs.send(job, json!("more")).await.unwrap();
+        provider.request(3).await;
+        assert_eq!(scheduled(), 0);
+        provider.release(3);
+        assert_eq!(
+            terminal(&session, job).await.state,
+            crate::job::JobState::Completed
+        );
+        shutdown_session(session).await;
     }
 
     /// A call's launch is one commit: a fault refusing it leaves no child, seed or

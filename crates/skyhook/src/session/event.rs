@@ -332,7 +332,7 @@ impl ModelContext {
 pub struct ModeSelection {
     pub name: crate::tool::policy::ModeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definition: Option<crate::tool::policy::Mode>,
+    pub definition: Option<crate::tool::policy::Edition>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -475,11 +475,12 @@ pub enum SessionEvent {
     JobInjected {
         job: JobId,
     },
-    /// The child reply committed at `source` reached the owner in `notification`.
+    /// The child reply committed at `source` reached the owner in `notification`,
+    /// or, with none, as the result a call read before a restart superseded it.
     JobMessageDelivered {
         job: JobId,
         source: MessageSeq,
-        notification: MessageSeq,
+        notification: Option<MessageSeq>,
     },
     AgentCompleted,
     AgentInterrupted,

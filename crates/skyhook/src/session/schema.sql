@@ -606,7 +606,8 @@ CREATE TABLE job_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_state (
   name TEXT PRIMARY KEY,
-  terminal INTEGER NOT NULL CHECK (terminal IN (0,1))
+  terminal INTEGER NOT NULL CHECK (terminal IN (0,1)),
+  UNIQUE (name, terminal)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job (
@@ -636,7 +637,9 @@ CREATE TABLE job_answer (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- change it. While its state is a finish's, the job's latest finish holds the outcome.
 CREATE TABLE job_status (
   job INTEGER PRIMARY KEY REFERENCES job(id),
-  state TEXT NOT NULL REFERENCES job_state(name),
+  state TEXT NOT NULL,
+  -- Its state's, so that the live jobs are indexed.
+  terminal INTEGER NOT NULL,
   invocation INTEGER NOT NULL CHECK (invocation >= 0),
   background INTEGER NOT NULL CHECK (background IN (0,1)),
   cancel_recorded INTEGER NOT NULL CHECK (cancel_recorded IN (0,1)),
@@ -644,7 +647,7 @@ CREATE TABLE job_status (
   pending INTEGER REFERENCES entry(seq),
   first_run_millis INTEGER,
   ended_millis INTEGER,
-  -- A background child's text-only answer, held or released.
+  -- A child's text-only answer: held, released, or the result its owner has yet to see.
   answer INTEGER REFERENCES message_commit(entry),
   answer_kind TEXT REFERENCES job_answer(name),
   -- An agent job's child progress, committed turns and jobs it created, set for agent jobs
@@ -656,9 +659,11 @@ CREATE TABLE job_status (
   CHECK (ended_millis IS NULL OR first_run_millis IS NOT NULL),
   CHECK ((answer IS NULL) = (answer_kind IS NULL)),
   CHECK ((turns IS NULL) = (tool_calls IS NULL)),
-  CHECK (answer IS NULL OR turns IS NOT NULL)
+  CHECK (answer IS NULL OR turns IS NOT NULL),
+  FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
 ) STRICT;
 CREATE INDEX job_status_resident ON job_status(job) WHERE resident;
+CREATE INDEX job_status_live ON job_status(job) WHERE NOT terminal;
 
 -- A child's replies queued for its owner, each with the record that queued it.
 CREATE TABLE job_reply (
@@ -817,10 +822,11 @@ CREATE TABLE job_finish_image (
 CREATE TABLE job_delivery (
   entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   job INTEGER NOT NULL REFERENCES job(id),
-  -- A delivered child reply and the runtime message that carried it.
+  -- A delivered child reply and the runtime message that carried it, if one did: a
+  -- result a call read before a restart superseded it has none.
   source INTEGER REFERENCES message_commit(entry),
   notification INTEGER REFERENCES message_commit(entry),
-  CHECK ((source IS NULL) = (notification IS NULL))
+  CHECK (source IS NOT NULL OR notification IS NULL)
 ) STRICT;
 
 -- A cancellation requested of a finished job that could still restart.

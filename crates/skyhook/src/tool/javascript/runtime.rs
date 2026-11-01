@@ -182,7 +182,7 @@ async fn evaluate_inner(
                             let output = match created {
                                 Ok(created) => {
                                     (policy, job) = (created.result_policy(), Some(created.job()));
-                                    let reported = host_executor.run_reported(created).await;
+                                    let reported = host_executor.run_reported(created, parent).await;
                                     host_context.read(reported.acknowledges).await;
                                     match reported.outcome {
                                         Ok(result) => result.output,

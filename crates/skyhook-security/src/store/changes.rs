@@ -17,13 +17,14 @@ use crate::store::bearing::bearing;
 const RECENT: usize = 5;
 const NODES: usize = 8;
 
-/// Events of `$phase`'s bearing on node `?1` after `?2` and from `?3` on, with their kinds.
+/// Events of `$phase`'s bearing on node `?1` after `?2`, with their kinds. The one bound reaches
+/// every arm's index range.
 macro_rules! notices {
     ($phase:tt) => {
         concat!(
             "SELECT DISTINCT b.event,e.kind FROM (",
             bearing!($phase, "?1"),
-            ") b JOIN event e ON e.id=b.event WHERE b.event>?2 AND b.event>=?3 ORDER BY b.event"
+            ") b JOIN event e ON e.id=b.event WHERE b.event>?2 ORDER BY b.event"
         )
     };
 }
@@ -31,6 +32,7 @@ macro_rules! notices {
 const fn notices(phase: Phase) -> &'static str {
     match phase {
         Phase::Sweep => notices!("sweep"),
+        Phase::Probe => notices!("probe"),
         Phase::Settle => notices!("settle"),
         Phase::Chain => notices!("chain"),
         Phase::Assess => notices!("assess"),
@@ -77,8 +79,8 @@ fn changes(
     let subjects = rows(
         db,
         "SELECT tn.phase,coalesce(n.merged_into,n.id),t.began,CASE WHEN n.merged_into IS NOT NULL \
-         THEN (SELECT max(en.event) FROM event_node en JOIN event e ON e.id=en.event WHERE \
-         en.node=n.id AND en.effect='changed' AND e.kind='merged') ELSE 0 END FROM agent a JOIN \
+         THEN (SELECT max(en.event) FROM event_node en WHERE en.node=n.id AND en.kind!='tested' \
+         AND en.effect='changed' AND en.kind='merged') ELSE 0 END FROM agent a JOIN \
          task t ON t.job=a.owner_job JOIN task_node tn ON tn.task=t.id JOIN node n ON \
          n.id=tn.node WHERE a.id=?1 ORDER BY t.id,tn.node",
         params![agent],
@@ -96,8 +98,8 @@ fn changes(
     }
     let mut found = BTreeMap::<(Phase, NodeId), BTreeMap<EventId, EventKind>>::new();
     for (phase, node, began, merged) in subjects {
-        let after = since.map_or(began, |since| since.max(began));
-        let events = rows(db, notices(phase), params![node, after, merged], |row| {
+        let after = (since.map_or(began, |since| since.max(began)).0).max(merged - 1);
+        let events = rows(db, notices(phase), params![node, after], |row| {
             Ok((EventId(row.get(0)?), enum_column::<EventKind>(row, 1)?))
         })?;
         if !events.is_empty() {
@@ -170,6 +172,7 @@ mod tests {
     fn evidence(store: &Store, actor: &AgentId, node: impl Into<NodeId>, stance: Stance) {
         let item = NewEvidence {
             location: None,
+            environment: None,
             stance,
             note: text("seen"),
         };
@@ -291,6 +294,7 @@ mod tests {
         let environment = NewEnvironment {
             instructions: text("start the container"),
             candidate: None,
+            serves: Serves::default(),
         };
         store.environment(&root, &environment).unwrap();
         let told = store.changes(&tester, None).unwrap().unwrap().1;

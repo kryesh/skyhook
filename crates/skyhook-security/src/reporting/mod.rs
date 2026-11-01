@@ -1,7 +1,8 @@
 //! The session's `reports/` as a projection of the store: [`generate`] renders a folder per
 //! root flaw whose finding reports its scenarios as they stand, holding its report and a
-//! folder per test it states with that test's artifacts, and an index of them, with every
-//! other entry removed. Call it on a blocking worker.
+//! folder per test it states with that test's artifacts, a hardening list of the confirmed
+//! flaws no validated candidate holds, and an index of them, with every other entry removed.
+//! Call it on a blocking worker.
 
 mod document;
 mod folder;
@@ -29,8 +30,8 @@ use crate::{
     cvss::{Cvss40, Severity},
     store::{
         self, ArtifactFault, ArtifactReference, ArtifactRole, CandidateId, ConfidenceTier,
-        CurrentReport, Digesting, FindingId, FlawId, RecordedArtifact, ReportedScenario,
-        ReportedTest, Stopped, Store, TestArtifact,
+        CurrentReport, Digesting, FindingId, FlawId, Hardening, RecordedArtifact, ReportedScenario,
+        ReportedTest, Reporting, Stopped, Store, TestArtifact,
     },
 };
 
@@ -85,6 +86,7 @@ pub struct Generated {
 
 const INDEX_MD: &str = "index.md";
 const INDEX_JSON: &str = "index.json";
+const HARDENING_MD: &str = "hardening.md";
 
 /// The report roots a generation renders now: generations of one root take turns, so one
 /// never removes another's staging folder.
@@ -139,7 +141,8 @@ fn stopped(error: Error) -> Error {
 
 /// Renders `reports/` from the findings the store holds: a folder per current one, replaced in
 /// one step when it does not already hold exactly what renders, then `index.md` and
-/// `index.json` listing them, each rewritten only when it changes. Every other entry goes:
+/// `index.json` listing them and, while any confirmed flaw is reported by no finding,
+/// `hardening.md` listing those, each rewritten only when it changes. Every other entry goes:
 /// stale roots, roots with nothing to report, folders left by interrupted work, an index name
 /// held by anything but a file, and anything else placed there. A root whose folder cannot be
 /// written, such as one whose artifact changed since its test was recorded, is left out and
@@ -148,10 +151,13 @@ fn stopped(error: Error) -> Error {
 pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated> {
     let path = store.report_root();
     let _turn = Turn::take(path.clone(), cancelled)?;
-    let current = store.current_reports()?;
+    let Reporting {
+        reports: current,
+        hardening,
+    } = store.reporting()?;
     let absent = std::fs::symlink_metadata(&path)
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
-    if current.is_empty() && absent {
+    if current.is_empty() && hardening.is_empty() && absent {
         return Ok(Generated::default());
     }
     wanted(cancelled)?;
@@ -162,6 +168,7 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
     for entry in reports.entries()? {
         let keep = match entry.to_str() {
             Some(INDEX_MD | INDEX_JSON) => reports.open_file(&entry).is_ok(),
+            Some(HARDENING_MD) => !hardening.is_empty() && reports.open_file(&entry).is_ok(),
             Some(name) => roots.contains(name),
             None => false,
         };
@@ -205,17 +212,22 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
         }
     }
     let mut json = serde_json::to_vec_pretty(&Index {
-        format_version: 3,
+        format_version: 5,
         reports: &entries,
+        hardening: &hardening,
     })?;
     json.push(b'\n');
     replace_changed(&reports, INDEX_JSON, &json, cancelled)?;
     replace_changed(
         &reports,
         INDEX_MD,
-        render::index(&entries).as_bytes(),
+        render::index(&entries, hardening.len()).as_bytes(),
         cancelled,
     )?;
+    if !hardening.is_empty() {
+        let page = render::hardening(&hardening);
+        replace_changed(&reports, HARDENING_MD, page.as_bytes(), cancelled)?;
+    }
     reports.sync()?;
     Ok(generated)
 }
@@ -227,9 +239,15 @@ mod tests {
     use skyhook::identity::AgentId;
 
     use super::*;
+    /// Assessed below the fixture run's threshold.
+    const MEDIUM: &str = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:A/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N";
+
     use crate::store::{
-        NewTest, TestId, TestResult, Verdict,
-        tests::{Scenario, Session, artifact, fixture, text, validated, verdict},
+        FlawStatus, NewTest, StatusChange, TestId, TestResult, Verdict,
+        tests::{
+            HIGH, Scenario, Session, artifact, assess, candidate, fixture, flaw, text, validated,
+            verdict,
+        },
     };
 
     struct Fixture {
@@ -376,6 +394,47 @@ mod tests {
             )),
             "{index}"
         );
+    }
+
+    /// A confirmed flaw no finding reports is listed in `hardening.md`, which the index links:
+    /// with why no chain was found while no validated candidate holds it, then with the
+    /// candidate and its severity once one validated below the threshold does; the list goes
+    /// once a reported scenario holds it.
+    #[test]
+    fn unreported_confirmed_flaws_are_listed_as_hardening() {
+        let fixture = Fixture::new();
+        let (store, actor, scenario) = (&fixture.store, &fixture.actor, &fixture.scenario);
+        let apart = flaw(store, actor, scenario.component);
+        let confirmed = StatusChange::Flaw(apart, FlawStatus::Confirmed);
+        store
+            .set_status(actor, confirmed, &text("no leak path"))
+            .unwrap();
+        fixture.generate();
+        let read = |name| fs::read_to_string(store.report_root().join(name)).unwrap();
+        assert!(read(INDEX_MD).contains("[Hardening](hardening.md)"));
+        let page = read(HARDENING_MD);
+        assert!(
+            page.contains(&format!("| {apart} | unbounded copy |")),
+            "{page}"
+        );
+        assert!(page.contains("no leak path"), "{page}");
+        assert!(!page.contains(&format!("| {} |", scenario.flaw)), "{page}");
+
+        let holder = candidate(store, actor, scenario.path, &[apart]);
+        for (vector, below) in [(MEDIUM, true), (HIGH, false)] {
+            assess(store, actor, holder, vector);
+            verdict(store, actor, holder, Verdict::Validated);
+            fixture.generate();
+            if below {
+                let page = read(HARDENING_MD);
+                let row =
+                    format!("| {apart} | unbounded copy | `lib.c:7-7` |  | {holder} | medium |");
+                assert!(page.contains(&row), "{page}");
+                assert!(!page.contains("no leak path"), "{page}");
+            }
+        }
+        assert!(!store.report_root().join(HARDENING_MD).exists());
+        assert!(!read(INDEX_MD).contains(HARDENING_MD));
     }
 
     #[test]

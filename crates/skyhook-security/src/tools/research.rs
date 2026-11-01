@@ -14,18 +14,20 @@ use crate::{
     reporting::{self, Generated},
     store::{
         Assessment, CandidateId, EnvironmentId, EvidenceId, FindingId, FlawId, NewEnvironment,
-        NewEvidence, NewTest, NodeId, StatusInput, Store, TaskId, TestArtifact, TestId, TestResult,
-        Text, Upsert, UpsertInput,
+        NewEvidence, NewTest, NodeId, Served, Serves, StatusInput, Store, TaskId, TestArtifact,
+        TestId, TestResult, Text, Upsert, UpsertInput,
     },
 };
 
 actions! {
     enum Research {
-        /// Begin your assigned work, before anything else: one phase and its subjects.
+        /// When your brief assigns you scheduled work, begin it before anything else: one phase
+        /// and its subjects.
         /// Afterwards, job events list changes other agents make to what it rests on; re-read
         /// those records before you decide on them.
         begin => Begin(crate::store::Begin) -> TaskId,
         /// Create a node of `kind` (no `id`: its fields), or edit node `id` (the fields given).
+        /// A source at a location already recorded returns the source there.
         upsert => Upsert(UpsertInput) -> NodeId,
         /// Add edges; an ordered one at `position`, or last.
         link => Link { links: Vec<crate::store::Link> } -> (),
@@ -33,10 +35,15 @@ actions! {
         unlink => Unlink { links: Vec<crate::store::Unlink> } -> (),
         /// Observations about one node; contradicting evidence disputes it.
         evidence => Evidence { node: NodeId, items: Vec<NewEvidence> } -> Vec<EvidenceId>,
-        /// Fold a duplicate premise, flaw or candidate into `into`, one of its kind.
+        /// Fold a duplicate node of any kind but a finding into `into`, one of its kind: its
+        /// edges move to `into`.
         merge => Merge(crate::store::Merge) -> (),
-        /// Decide a premise, judge a flaw, or mark a path swept or unswept.
+        /// Decide a premise, judge a flaw, mark a path swept or unswept, or retract a source,
+        /// path or component recorded in error: it then stands in no work or count until marked
+        /// `recorded` (a path `unswept`) again.
         set_status => SetStatus(StatusInput) -> (),
+        /// The store scores `vector` and returns its severity and score: record the vector,
+        /// never compute a score.
         assess => Assess {
             candidate: CandidateId,
             /// `CVSS:4.0/AV:_/AC:_/AT:_/PR:_/UI:_/VC:_/VI:_/VA:_/SC:_/SI:_/SA:_`, every base
@@ -45,7 +52,7 @@ actions! {
             note: Text,
         } -> Assessment,
         verdict => Verdict { candidate: CandidateId, verdict: crate::store::Verdict, note: Text } -> (),
-        /// `failed`: any run that did not demonstrate it; `pending`: waits on the user (say
+        /// `failed`: evidence shows the scenario does not work as formulated; `pending`: waits on the user (say
         /// for what); `unavailable`: no real demonstration can run here; `declined`: the user
         /// turned it down.
         test => Test {
@@ -57,10 +64,14 @@ actions! {
             #[serde(default)]
             artifacts: Vec<TestArtifact>,
         } -> TestId,
-        /// How to run tests, for one candidate or any.
+        /// A running instance, for one candidate or any: how to work in it, and the interfaces
+        /// it serves.
         environment => Environment {
             instructions: Text,
             candidate: Option<CandidateId>,
+            #[serde(default)]
+            #[schemars(with = "Vec<Served>")]
+            serves: Serves,
         } -> EnvironmentId,
         /// The root flaw's report: markdown citing node and test ids.
         report => Report { root: FlawId, title: Text, body: Text } -> FindingId,
@@ -73,13 +84,10 @@ actions! {
 
 impl Action for Research {
     fn permitted(action: Name, capabilities: &CapabilitySet) -> bool {
-        let [research, verdict, test, coordinate] =
+        let [research, verdict, test, scheduled, coordinate] =
             SecurityCapability::ALL.map(SecurityCapability::capability);
         match action {
-            // Every scheduled mode begins its work, whichever authority it holds.
-            Name::begin => [research, verdict, test]
-                .into_iter()
-                .any(|capability| holds(capabilities, [capability])),
+            Name::begin => holds(capabilities, [scheduled]),
             // A verdict judges research, so it needs both authorities; a test needs its own,
             // so an agent that tests and records what it observes never decides verdicts.
             Name::verdict => holds(capabilities, [research, verdict]),
@@ -142,6 +150,7 @@ impl Research {
                 let environment = NewEnvironment {
                     instructions: a.instructions,
                     candidate: a.candidate,
+                    serves: a.serves,
                 };
                 output::<result::Environment>(store.environment(actor, &environment))
             }

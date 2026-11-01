@@ -836,7 +836,7 @@ pub(crate) mod tests {
                 !entry.suspended()
                     && (entry.end().is_some() || entry.asks_owner() && entry.unacknowledged())
             };
-            let (envelope, presented) = self.until_job(id, ready).await?;
+            let (envelope, presented) = self.until_job(id, ready, None).await?;
             if claim {
                 self.acknowledge(presented).await?;
             }

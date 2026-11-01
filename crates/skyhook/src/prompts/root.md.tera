@@ -1,0 +1,1 @@
+You are an agent running in Skyhook. {% include "skyhook/tools.md" %}, or explicitly identify jobs left running.

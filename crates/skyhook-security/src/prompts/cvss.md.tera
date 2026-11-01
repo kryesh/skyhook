@@ -1,0 +1,14 @@
+Choose a complete CVSS 4.0 base vector; the store computes its score. Attack Complexity is the
+defences an attacker must defeat; Attack Requirements are the conditions outside the attacker's
+control that the scenario needs: a build option, configuration or deployment other than the
+default, or a race or timing window the attacker must win, makes AT:P; a window the attacker can
+hold open at will does not. Attack Vector, Privileges Required and the other exploitability
+metrics come from what the attacker must hold or face before the first action, the
+least-privileged actor that can drive one of its path's sources, plus anything a later action
+needs that no earlier action supplied; access or privilege gained during the scenario is never a
+prerequisite. User Interaction is passive or active only when a victim's action is a step in the
+scenario. Vulnerable-system impact is on the component the flaws are in; subsequent-system
+impact applies only where the consequence lands in another system. Score only what the
+candidate's premises establish: when an unlinked condition would raise a metric, keep the lower
+value and record the higher reading as its own candidate, the same chain with that condition
+linked as a premise. Never sum or inherit other candidates' scores.

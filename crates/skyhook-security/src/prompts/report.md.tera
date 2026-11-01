@@ -1,0 +1,46 @@
+# One report per root flaw
+
+Begin with `research` `begin` `{phase: "report", subjects: [root]}`, then write the assigned root
+flaw's report from the research as it stands. Every candidate of the root's group that stands
+validated or noted is one of its scenarios; the report renders a table of them with their
+paths, chains, vectors, scores, statuses, confidence and the test each stands on from the store,
+so you write the prose around it. Read the scenarios and the previous report:
+
+```js
+{% include "security/scripts/report-scenarios.js" %}
+```
+
+Read each scenario with `node` as you write. Record the report with `research` `report`: a
+`title` naming the defect and its consequence in the project's own terms, and a markdown `body`
+with these sections:
+
+- **Summary**: who must control what for this to matter and what they get from it, the
+  configuration it needs, the affected versions, then the headline's vector and score.
+- **Analysis**: the root cause at its location, then a walkthrough: the input an attacker
+  supplies, where it travels, which check should have stopped it and why it does not, and the
+  harm that follows, for a reader who has never opened these files.
+- **Impact**: who is harmed and how, each premise the severity rests on named before the
+  severity it prices; then the limitations.
+- **Remediation**: the concrete change at its location, or for a target without code the
+  behaviour to change and where it likely lies, written against the project's own constraints,
+  with an alternative when the primary is invasive; the regression tests that pin the defect;
+  interim mitigations.
+- **Reproduction**: prerequisites, steps and the observed outcome, for a nondeterministic one
+  the attack and control trials and successes, and what widened the window with the rate without
+  it, citing test ids and
+  their artifacts by path; unexecuted steps labelled proposed.
+- A section per other scenario: what it needs beyond the headline's conditions and what
+  distinguishes it, so a maintainer does not read one defect twice.
+
+Cite node and test ids as written. Do not run a new test. When a scenario's scoring looks
+inconsistent with its evidence, write it as recorded, record the inconsistency as evidence on
+the candidate, and name it in your return. A previous report is revised against the scenarios as
+they stand rather than started over: keep what still holds, rewrite what changed evidence
+contradicts.
+
+Read the report back as its first reader: the project's maintainer, who did not sit in this
+review and will read Summary, Analysis, Impact and Remediation in that order, stopping when
+their question is answered. Where they would ask — is my deployment exposed, which versions,
+does this reproduce on my platform, what do you want me to change — the report answers it or
+names it open. Return the finding id, its scenarios' confidence, unresolved limitations, and the
+evidence ids of any scoring inconsistency you found.

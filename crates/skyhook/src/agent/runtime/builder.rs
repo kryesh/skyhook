@@ -14,7 +14,7 @@ pub struct HarnessBuilder {
     resume_hook: Option<Arc<dyn ResumeHook>>,
     session_extension: Option<crate::session::Extension>,
     extra_tools: ToolRegistry,
-    persona: Option<crate::Prose>,
+    prompts: crate::prompts::Prompts,
     skills: HostSkills,
     mcp: BTreeMap<String, McpServerConfig>,
     max_child_depth: usize,
@@ -102,7 +102,7 @@ impl HarnessBuilder {
             resume_hook: None,
             session_extension: None,
             extra_tools: ToolRegistry::default(),
-            persona: None,
+            prompts: Default::default(),
             skills: HostSkills::default(),
             mcp: BTreeMap::new(),
             max_child_depth: crate::config::DEFAULT_MAX_CHILD_DEPTH,
@@ -236,12 +236,13 @@ impl HarnessBuilder {
         self
     }
 
-    /// Host guidance placed after the agent's role, before runtime instructions.
+    /// The host's prompts: its templates, which render its persona and its modes'
+    /// instructions for each agent, with its section of that agent's context.
     ///
     /// Resumed agents retain their recorded prompt until a mode change rebuilds it.
     #[must_use]
-    pub fn persona(mut self, persona: crate::Prose) -> Self {
-        self.persona = Some(persona);
+    pub fn prompts(mut self, prompts: crate::prompts::Prompts) -> Self {
+        self.prompts = prompts;
         self
     }
 
@@ -395,7 +396,7 @@ impl HarnessBuilder {
                 extra_tools: self.extra_tools,
                 mcp: self.mcp,
                 instructions,
-                persona: self.persona,
+                prompts: self.prompts,
                 skills: self.skills,
                 warnings,
                 max_child_depth: self.max_child_depth,

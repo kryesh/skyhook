@@ -346,17 +346,19 @@ impl ToolExecutor {
         let Reported {
             outcome,
             acknowledges,
-        } = self.run_reported(created).await;
+        } = self.run_reported(created, None).await;
         let acknowledged = self.shared.jobs.acknowledge(acknowledges);
         acknowledged.await.map_err(job_error)?;
         outcome
     }
 
     /// Authorize, launch and collect a created invocation, with the delivery
-    /// its result reports for the caller to acknowledge with its record.
+    /// its result reports for the caller to acknowledge with its record, held
+    /// for job `reader` as it is collected when a job reads it.
     pub(crate) fn run_reported(
         &self,
         created: CreatedInvocation,
+        reader: Option<JobId>,
     ) -> futures_util::future::BoxFuture<'_, Reported> {
         Box::pin(async move {
             let CreatedInvocation { kind, plan, lease } = created;
@@ -375,7 +377,7 @@ impl ToolExecutor {
                 }
                 InvocationKind::Host => results::CollectionPurpose::Native,
             };
-            self.collect_result(started, purpose).await
+            self.collect_result(started, purpose, reader).await
         })
     }
 }

@@ -11,7 +11,7 @@ use crate::{
     },
     session::{ModeSelection, ModelContext, ProfileSnapshot, SessionEvent},
     target::{SshAuth, SshOptions, TargetAuth, TargetDefinition, TargetName},
-    tool::policy::{CapabilitySet, InteractiveListed, Mode},
+    tool::policy::{CapabilitySet, Edition, InteractiveListed},
 };
 
 fn digest(value: &impl serde::Serialize) -> DbResult<Vec<u8>> {
@@ -20,13 +20,16 @@ fn digest(value: &impl serde::Serialize) -> DbResult<Vec<u8>> {
     Ok(sha2::Sha256::digest(bytes).to_vec())
 }
 
-fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
+fn known(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<Option<i64>> {
     db.query_row(
         format!("SELECT id FROM {table} WHERE digest = ?1"),
         params![digest],
         |row| Ok(row.get::<i64>(0)?),
-    )?
-    .ok_or_else(|| corrupt(format!("{table} row is missing")))
+    )
+}
+
+fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
+    known(db, table, digest)?.ok_or_else(|| corrupt(format!("{table} row is missing")))
 }
 
 impl Encoder {
@@ -216,17 +219,20 @@ fn context(db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
     )?;
     for (position, tool) in context.tools.iter().enumerate() {
         let digest = digest(tool)?;
-        db.execute(
-            "INSERT INTO tool_definition (name, description, input_schema, digest) \
-             VALUES (?1, ?2, ?3, ?4) ON CONFLICT (digest) DO NOTHING",
-            params![
-                &tool.name,
-                &tool.description,
-                json(&tool.input_schema)?,
-                digest.clone()
-            ],
-        )?;
-        let tool = by_digest(db, "tool_definition", digest)?;
+        // Most contexts repeat known tools: only a new one's schema is serialized.
+        let tool = match known(db, "tool_definition", digest.clone())? {
+            Some(tool) => tool,
+            None => db.insert(
+                "INSERT INTO tool_definition (name, description, input_schema, digest) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &tool.name,
+                    &tool.description,
+                    json(&tool.input_schema)?,
+                    digest
+                ],
+            )?,
+        };
         db.execute(
             "INSERT INTO model_context_tool (context, position, tool) VALUES (?1, ?2, ?3)",
             params![seq, position, tool],
@@ -356,7 +362,7 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
     )?;
     let mut editions = keyed(db, editions, |row| {
         let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
-        Ok(Mode {
+        Ok(Edition {
             capabilities: (capabilities.into_iter().flatten().cloned())
                 .collect::<CapabilitySet>()
                 .try_into()

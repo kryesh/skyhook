@@ -38,17 +38,14 @@ pub struct Startables {
     pub items: Vec<Startable>,
     /// Where the next page continues; none at the end.
     pub next: Option<Cursor>,
-    /// A test the page passed over waits for an approval, an unblock or a slot.
+    /// A test the page passed over waits for an approval or an unblock.
     pub held: bool,
 }
 
-/// The tests the scheduler may start now; the rest wait.
+/// The tests the launch's live policy leaves to the user that may start now; the rest wait.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Tests {
-    /// How many may start; none when omitted.
-    #[serde(default)]
-    pub slots: u16,
+pub struct Live {
     /// Candidates the user approved a test of, under the launch's `ask` policy.
     #[serde(default)]
     pub approved: Vec<CandidateId>,
@@ -58,13 +55,14 @@ pub struct Tests {
     pub unblocked: Vec<TestId>,
 }
 
-impl Tests {
-    /// Whether `entry`'s test may start under `policy`, slots aside; none for other work.
-    fn admits(&self, policy: PocPolicy, phase: Phase, entry: &QueueEntry) -> Option<bool> {
-        (phase == Phase::Test).then(|| match entry.pending {
+impl Live {
+    /// Whether test `entry` may start under `policy`: it needs the user's approval under `ask`,
+    /// and a pending one its blocker resolved.
+    fn admits(&self, policy: LivePolicy, entry: &QueueEntry) -> bool {
+        match entry.pending {
             Some(pending) => self.unblocked.contains(&pending),
-            None => policy == PocPolicy::Yes || self.approved.contains(&CandidateId(entry.node.0)),
-        })
+            None => policy == LivePolicy::Yes || self.approved.contains(&CandidateId(entry.node.0)),
+        }
     }
 }
 
@@ -136,14 +134,14 @@ impl Store {
     /// queues offer (no live task, not exhausted, counting `spent` work exhausted while owed at
     /// its basis), none of `running` (launched, perhaps not yet begun) or held back by it or by
     /// live tasks, nothing a ready earlier-stage bundled entry touches, and no test beyond what
-    /// `tests` admits. A premise or flaw carries every other such entry of its phase sharing a
+    /// `live` admits. A premise or flaw carries every other such entry of its phase sharing a
     /// node with it, and what one page starts holds back the rest of it as running work would.
     /// Reading reserves nothing.
     pub fn startable(
         &self,
         running: &[NodeId],
         spent: &[SpentWork],
-        tests: &Tests,
+        live: &Live,
         after: Option<Cursor>,
         limit: Bounded<1, 1000>,
     ) -> Result<Startables> {
@@ -156,30 +154,25 @@ impl Store {
         let wanted = u64::from(limit) as usize;
         let spent = &queues::Spent::of(spent)?;
         self.read(|db| {
-            let policy = runs::run(db)?.poc;
+            let policy = runs::run(db)?.live;
             let mut busy = Work::running(db, &queues::live_subjects(db)?, running)?;
-            let (mut items, mut slots, mut held) = (Vec::new(), tests.slots, false);
+            let (mut items, mut held) = (Vec::new(), false);
             for &phase in phases.iter().skip(first.unwrap_or(phases.len())) {
-                let tested = phase == Phase::Test;
-                // With no slot left, the first test passed over shows that tests wait.
-                if tested && slots == 0 && held {
-                    continue;
-                }
                 let earlier: Vec<Phase> = (phases.iter().copied())
                     .filter(|earlier| earlier.bundled() && earlier.stage() < phase.stage())
                     .collect();
-                // Tests are paged whole: the ones `tests` admits may lie far behind the rest.
+                // Tests are paged whole: the ones `live` admits may lie far behind the rest.
                 let mut page = Page::new(
                     after
                         .filter(|cursor| cursor.phase == phase)
                         .map_or(0, |cursor| cursor.after),
-                    if tested {
+                    if phase == Phase::Test {
                         Bounded::new::<1000>()
                     } else {
                         limit
                     },
                 );
-                'phase: loop {
+                loop {
                     let listing = queues::page(db, phase, page, spent)?;
                     let touched = touched(db, &listing, &earlier, spent)?;
                     for entry in listing.items {
@@ -189,15 +182,9 @@ impl Store {
                         {
                             continue;
                         }
-                        if let Some(admitted) = tests.admits(policy, phase, &entry) {
-                            if !admitted || slots == 0 {
-                                held = true;
-                                if slots == 0 {
-                                    break 'phase;
-                                }
-                                continue;
-                            }
-                            slots -= 1;
+                        if phase == Phase::Test && !live.admits(policy, &entry) {
+                            held = true;
+                            continue;
                         }
                         let bundle = match phase.bundled() {
                             true => partners(db, phase, &entry, &busy, spent)?,
@@ -284,8 +271,8 @@ mod tests {
         super::{
             queues::tests::queued,
             tests::{
-                HIGH, assess, begun, fixture, premise, scenario, sweep, test, text, validated,
-                verdict,
+                HIGH, assess, begun, component, fixture, operation, path_from, premise, scenario,
+                serve, sweep, test, text, validated, verdict,
             },
         },
         *,
@@ -309,7 +296,7 @@ mod tests {
         let [first, second] = premises.map(NodeId::from);
         let started = |running: &[NodeId]| {
             let page = store
-                .startable(running, &[], &Tests::default(), None, Bounded::new::<10>())
+                .startable(running, &[], &Live::default(), None, Bounded::new::<10>())
                 .unwrap();
             (page.items.into_iter())
                 .map(|item| {
@@ -351,7 +338,7 @@ mod tests {
         store.merge(&actor, &merge).unwrap();
         assert!(queued(&store, Phase::Assess).is_empty());
         let page =
-            (store.startable(&[], &[], &Tests::default(), None, Bounded::new::<10>())).unwrap();
+            (store.startable(&[], &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
         assert_eq!(
             (page.items.iter())
                 .map(|item| (item.phase, item.entry.node))
@@ -377,8 +364,8 @@ mod tests {
         };
         store.merge(&actor, &merge).unwrap();
         let running = [merged.candidate.into()];
-        let page = (store.startable(&running, &[], &Tests::default(), None, Bounded::new::<10>()))
-            .unwrap();
+        let page =
+            (store.startable(&running, &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
         assert!(
             !(page.items.iter()).any(|item| item.entry.node == kept.candidate.into()),
             "{:?}",
@@ -397,8 +384,7 @@ mod tests {
         let id = scenario.candidate;
         let first = test(&store, &actor, id, TestResult::Pending);
         let started = |unblocked: &[TestId]| {
-            let tests = Tests {
-                slots: 1,
+            let tests = Live {
                 approved: Vec::new(),
                 unblocked: unblocked.to_vec(),
             };
@@ -419,5 +405,31 @@ mod tests {
         );
         verdict(&store, &actor, id, Verdict::Validated);
         assert_eq!(started(&[]), (vec![(id.into(), None)], false));
+    }
+
+    /// A probe and a test the launch's policy admits start together, with nothing held.
+    #[test]
+    fn probes_and_admitted_tests_start_without_waiting() {
+        let (_session, store, actor) = fixture();
+        let scenario = validated(&store, &actor, "decoder");
+        sweep(&store, scenario.path);
+        let gateway = component(&store, &actor, "gateway");
+        let probe = path_from(&store, &actor, "api", &[gateway], operation("gateway-api"));
+        serve(&store, &actor, &["gateway-api"]).unwrap();
+        let page =
+            (store.startable(&[], &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
+        let items: Vec<_> = (page.items.iter())
+            .map(|item| (item.phase, item.entry.node))
+            .collect();
+        assert_eq!(
+            (items, page.held),
+            (
+                vec![
+                    (Phase::Probe, probe.into()),
+                    (Phase::Test, scenario.candidate.into())
+                ],
+                false
+            )
+        );
     }
 }

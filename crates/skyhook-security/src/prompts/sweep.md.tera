@@ -1,0 +1,29 @@
+{% include "security/sweep-rules.md" %}
+
+# One path
+
+Your parent assigned you one path. Begin with `research` `begin` `{phase: "sweep", subjects:
+[path]}`, read it with `research_query` `node`, and sweep it once, whatever else reaches its
+components. Measure the files its steps enter first:
+
+```js
+{% include "security/scripts/sweep-measure.js" %}
+```
+
+Sweep it yourself when you can read and reason over all of it in one context. Otherwise split
+it into stretches of consecutive steps, each a coherent piece one agent can hold, and sweep
+them with `sweep-part` children:
+
+```js
+{% include "security/scripts/sweep-stretches.js" %}
+```
+
+With every stretch's outcome in hand, read the path again and reconcile across stretches: check
+whether other stretches' flaws meet each stretch's premises, follow each stretch's misreported
+value into the next one's consumers, and record the flaws, premises and candidates that only
+show across stretches. A stretch whose child failed is swept again, never dropped.
+
+Once the whole path is swept, mark it with `research` `set_status` `{path, status: "swept",
+note}`; a sweep you cannot finish leaves it unswept, the reason recorded as context evidence on
+it and in your reply. Do not wait for further instructions. Return the IDs you and your
+stretches recorded and anything left open, each also recorded.

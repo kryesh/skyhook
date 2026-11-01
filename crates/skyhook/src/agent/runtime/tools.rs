@@ -10,7 +10,7 @@ use crate::{
     agent::{ModelEntry, Question, ReplaceError, TodoItem},
     identity::{AgentId, JobId},
     provider::profile::ModelRef,
-    session::{CoreState, Plan, UserPart},
+    session::{CoreState, Message, Plan, SessionEvent, UserPart},
     tool::{
         AdmissionError, RegistryError, TARGET, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::{Effects, FailureSite, Operation, Subject},
@@ -251,7 +251,7 @@ fn register_child_agent(
                     .operation(Operation::Lookup, Subject::Label(format!("parent agent {owner}"))).effects(Effects::NotStarted);
                 let delegation = runtime.held(owner, |contract, depth, _| (contract.profile.name.clone(), depth));
                 let (model, depth) = delegation.ok_or_else(unstarted)?;
-                let caller = (context.capabilities(), model, depth);
+                let caller = (owner.depth(), context.capabilities(), model, depth);
                 let location = context.job_location().clone();
                 let (launch, prompt) = child_launch(&runtime, input, caller, location)?;
                 let child = runtime.next_child(owner).await.ok_or_else(unstarted)?;
@@ -286,12 +286,12 @@ fn launch_error(error: HarnessError, child: &crate::identity::AgentId) -> ToolEr
 }
 
 /// Check `input` as the launch its call makes, with the prompt that begins it,
-/// against what its caller now holds, which model it runs and how deep it may
-/// delegate.
+/// against its caller's depth, what it now holds, which model it runs and how deep
+/// it may delegate.
 fn child_launch(
     runtime: &SessionRuntime,
     input: AgentArgs,
-    (caller, model, available_depth): (&CapabilitySet, ModelRef, usize),
+    (depth, caller, model, available_depth): (usize, &CapabilitySet, ModelRef, usize),
     location: crate::execution::ExecutionLocation,
 ) -> Result<(AgentLaunch, String), ToolError> {
     let todos = input.todos.map(|items| admit_todos("todos", items));
@@ -312,7 +312,7 @@ fn child_launch(
         None => (None, caller.clone()),
         Some(name) => {
             let offered = |(_, mode): &(&ModeName, &Mode)| offers_mode(mode, caller);
-            let Some((name, mode)) = runtime
+            let Some((name, _)) = runtime
                 .harness
                 .modes
                 .get_key_value(name.as_str())
@@ -321,8 +321,10 @@ fn child_launch(
                 return Err(invalid_argument(["mode"], format!("unknown mode `{name}`")));
             };
             // Interaction follows the caller, as the root's follows the host.
-            let applied = super::AppliedMode::configured(name, mode);
-            (Some(applied), &mode.granted(&runtime.capabilities) & caller)
+            let ceiling = &runtime.capabilities & caller;
+            let applied = runtime.applied(name, depth + 1, &location, input.depth, &ceiling);
+            let (applied, granted) = applied.map_err(harness_error)?;
+            (Some(applied), granted)
         }
     };
     if input.depth >= available_depth {
@@ -459,18 +461,18 @@ fn restart<T: Send + 'static>(
     content: Vec<UserPart>,
     into: fn(ChildAnswer) -> T,
 ) -> Result<Plan<T>, HarnessError> {
-    let released = crate::job::Jobs::release_answer(state, job)?;
-    Ok(Plan::new(released, move |state, _| {
+    let mut events = crate::job::Jobs::release_answer(state, job)?;
+    // The owner input commits as the invocation opens, as a launch's prompt does.
+    let message = (!content.is_empty()).then(|| SessionEvent::MessageCommitted {
+        message: Message::User(content),
+    });
+    events.extend(message.map(|message| (child.clone(), message)));
+    Ok(Plan::new(events, move |state, _| {
         crate::job::woken(state, job);
         let (done, received) = oneshot::channel();
-        let input = AgentCommand::Input {
-            options: Default::default(),
-            content,
-            done: Some(super::RequestCompletion::Child(done)),
-        };
         let facts = (state.agents.get_mut(&child)).expect("the change runs its loop");
         facts.invocation = Invocation::Open;
-        state.agents.send(&child, input);
+        state.agents.begin(&child, done);
         into(received)
     }))
 }
@@ -1075,7 +1077,10 @@ for line in sys.stdin:
         let opened = crate::session::SessionStore::open(&sessions, id, None).await;
         let records = opened.unwrap().records();
         let recorded = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "scout" => mode.definition.clone());
-        assert_eq!(recorded, [Some(scout), None, Some(widened)]);
+        assert_eq!(
+            recorded,
+            [Some(edition(&scout)), None, Some(edition(&widened))]
+        );
     }
 
     /// Children starting at once in a mode the session has not used record its

@@ -10,6 +10,7 @@ use super::*;
 #[serde(deny_unknown_fields)]
 pub struct NewEvidence {
     pub location: Option<Location>,
+    pub environment: Option<EnvironmentId>,
     pub stance: Stance,
     pub note: Text,
 }
@@ -34,10 +35,20 @@ impl Store {
                     let location = (item.location.as_ref())
                         .map(|at| location_id(db, at))
                         .transpose()?;
+                    if let Some(environment) = item.environment {
+                        known_environment(db, environment)?;
+                    }
                     ids.push(EvidenceId(db.insert(
-                        "INSERT INTO evidence(node,location,stance,note,event) VALUES \
-                         (?1,?2,?3,?4,?5)",
-                        params![node, location, item.stance, &item.note, event],
+                        "INSERT INTO evidence(node,location,environment,stance,note,event) VALUES \
+                         (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            node,
+                            location,
+                            item.environment,
+                            item.stance,
+                            &item.note,
+                            event
+                        ],
                     )?));
                     if item.stance == Stance::Contradicts {
                         effect = EventEffect::Changed;

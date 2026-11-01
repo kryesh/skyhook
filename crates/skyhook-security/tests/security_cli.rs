@@ -118,6 +118,18 @@ impl Fixture {
         })
     }
 
+    /// Run `sql` against `run`'s session database, as a session left by another launch.
+    fn execute(&self, run: &str, sql: &str) {
+        block_on(async {
+            let database =
+                libsql::Builder::new_local(self.session_directory(run).join("session.db"))
+                    .build()
+                    .await
+                    .unwrap();
+            database.connect().unwrap().execute(sql, ()).await.unwrap();
+        });
+    }
+
     fn stats(&self, session: SessionId) -> Value {
         let result = output(self.command(SECURITY).args([
             "stats",
@@ -304,9 +316,9 @@ fn admission_fails_before_any_history_exists() {
     assert_admission_failure(&output(f.command(SECURITY).args(["dump", "config"])));
     assert_admission_failure(&f.script(&[]));
     fs::remove_file(f.path(".skyhook/security.yaml")).unwrap();
-    f.write("config/skyhook/security.yaml", "poc: ask\n");
+    f.write("config/skyhook/security.yaml", "live: ask\n");
     assert_admission_failure(&f.script(&[]));
-    for arguments in [vec!["--poc", "ask"], vec!["--mode", "orchestrate"]] {
+    for arguments in [vec!["--live", "ask"], vec!["--mode", "orchestrate"]] {
         assert_admission_failure(&output(f.batch().args(["-p", "x"]).args(arguments)));
     }
     f.no_history();
@@ -341,7 +353,7 @@ fn each_session_is_its_own_run_and_a_resume_continues_it() {
 }
 
 #[test]
-fn a_resumed_run_keeps_its_threshold_and_workers_unless_a_flag_changes_them() {
+fn a_resumed_run_keeps_its_settings_unless_a_flag_resizes_its_workers() {
     let f = Fixture::new();
     f.write(
         "config/skyhook/security.yaml",
@@ -353,14 +365,29 @@ fn a_resumed_run_keeps_its_threshold_and_workers_unless_a_flag_changes_them() {
     let workers_sql = "SELECT CAST(workers AS TEXT) FROM run";
     assert_eq!(f.column(&run, workers_sql), ["2"]);
 
-    // Later configuration does not resize the run; a flag on a later launch does.
+    // Later configuration changes nothing of the run; a worker flag on a later launch resizes
+    // it, and a live policy flag is no resumed run's.
     f.write(
         "config/skyhook/security.yaml",
-        "shortlist: critical\nworkers: 9\n",
+        "shortlist: critical\nworkers: 9\nlive: yes\n",
     );
     assert_eq!(session_id(&f.script(&["--resume", &run])), first);
     assert_eq!(f.column(&run, "SELECT threshold FROM run"), ["medium"]);
+    assert_eq!(f.column(&run, "SELECT live FROM run"), ["no"]);
+    assert_admission_failure(&f.script(&["--resume", &run, "--live", "yes"]));
     assert_eq!(f.runs(), std::slice::from_ref(&run));
+    // A headless resume is checked against the run's own policy, not the configuration's.
+    f.write("config/skyhook/security.yaml", "live: ask\n");
+    assert_eq!(session_id(&f.script(&["--resume", &run])), first);
+    f.write("config/skyhook/security.yaml", "live: no\n");
+    f.execute(&run, "UPDATE run SET live = 'ask'");
+    let asking = f.script(&["--resume", &run]);
+    assert_admission_failure(&asking);
+    assert!(
+        String::from_utf8_lossy(&asking.stderr).contains("live: ask"),
+        "{asking:?}"
+    );
+    f.execute(&run, "UPDATE run SET live = 'no'");
     assert_eq!(f.column(&run, workers_sql), ["2"]);
     session_id(&f.script(&["--resume", &run, "--workers", "4"]));
     assert_eq!(f.column(&run, workers_sql), ["4"]);
@@ -381,14 +408,14 @@ fn a_run_sends_host_state_with_layered_roles() {
         ".skyhook/security.yaml",
         "models:\n  test/reasoner:\n    roles: [orchestrator, validator]\n    hint: WORKSPACE_ROLE_HINT\nshortlist: high\n",
     );
-    let result = output(f.batch().args(["--prompt", "Start.", "--poc", "yes"]));
+    let result = output(f.batch().args(["--prompt", "Start.", "--live", "yes"]));
     let request = provider.join().unwrap();
     let session = session_id(&result);
     let run = session.to_string();
     assert_eq!(request["model"], "fixture-reasoner");
     let state = host_state(&request);
     assert!(state.contains(&format!("run: {run}\n")));
-    assert!(state.contains("poc: yes\n"));
+    assert!(state.contains("live: yes\n"));
     assert_eq!(f.column(&run, "SELECT threshold FROM run"), ["high"]);
     let encoded = request.to_string();
     assert!(encoded.contains("WORKSPACE_ROLE_HINT"));
@@ -407,7 +434,7 @@ fn dump_config_layers_security_files() {
     );
     f.write(
         ".skyhook/security.yaml",
-        "models:\n  test/reasoner:\n    roles: [orchestrator, validator]\n    hint: WORKSPACE_ROLE_HINT\npoc: ask\nmodes:\n  report:\n    capabilities: [read, write, security.verdict]\n    instructions: WORKSPACE_REPORT_INSTRUCTIONS\nmcp:\n  security:\n    transport: stdio\n    start_command: [/bin/true]\n",
+        "models:\n  test/reasoner:\n    roles: [orchestrator, validator]\n    hint: WORKSPACE_ROLE_HINT\nlive: ask\nmodes:\n  report:\n    capabilities: [read, write, security.verdict]\n    instructions: WORKSPACE_REPORT_INSTRUCTIONS\nmcp:\n  security:\n    transport: stdio\n    start_command: [/bin/true]\n",
     );
     let config = dumped_config(&output(f.command(SECURITY).args(["dump", "config"])));
     // Both security layers apply, the workspace's replacing whole entries.
@@ -441,7 +468,7 @@ fn dump_config_layers_security_files() {
     );
     f.write(
         "selected-security.yaml",
-        "models:\n  test/explorer:\n    roles: [orchestrator]\n    hint: EXPLICIT_ROLE_HINT\npoc: no\n",
+        "models:\n  test/explorer:\n    roles: [orchestrator]\n    hint: EXPLICIT_ROLE_HINT\nlive: no\n",
     );
     let config = dumped_config(&output(
         f.command(SECURITY)
@@ -467,13 +494,13 @@ const CANDIDATE_SOURCE: &str = "int parse(unsigned len) {\n  char buffer[4] = {0
 const VALIDATED_CANDIDATE: &str = r#"
 const research = async action => (await tool.research(action)).unwrap();
 await research({action:'upsert',kind:'premise',title:'first-run-premise',body:'the parser is enabled',scope:'deployment'});
-const at = line => ({file:'fixture.c',start_line:line,end_line:line});
+const at = line => ({code:{file:'fixture.c',start_line:line,end_line:line}});
 const component = await research({action:'upsert',kind:'component',title:'parser',body:'fixture parser',files:['fixture.c']});
 const source = await research({action:'upsert',kind:'source',title:'request',body:'Untrusted request length in the assumed deployment',location:at(1),trust:'untrusted'});
 const path = await research({action:'upsert',kind:'path',title:'request length parsing',body:'the length reaches parse'});
 await research({action:'link',links:[{path_source:{path,source}},{path_step:{path,component,location:at(3),note:'the length check admits it'}}]});
 const flaw = await research({action:'upsert',kind:'flaw',title:'Out-of-bounds read',body:'An oversized length indexes past the buffer',component,location:at(4),cwe:125});
-const candidate = await research({action:'upsert',kind:'candidate',title:'Out-of-bounds read',body:'Oversized length reaches an unsafe read',path,flaws:[flaw]});
+const candidate = await research({action:'upsert',kind:'candidate',title:'Out-of-bounds read',body:'Oversized length reaches an unsafe read',paths:[path],flaws:[flaw]});
 await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:H/SC:N/SI:N/SA:N',note:'Remote unauthenticated disclosure and process failure in the assumed deployment'});
 await research({action:'verdict',candidate,verdict:'validated',note:'Reviewed the guard, the path and the read'});
 "#;

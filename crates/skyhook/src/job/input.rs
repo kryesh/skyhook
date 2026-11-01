@@ -122,7 +122,7 @@ impl JobManager {
     /// than once their turns unwind: resumable where the child is installed, as
     /// a crash would leave them. Each finish is claimed here, so nothing its
     /// worker reports meanwhile ends it otherwise; one already finishing keeps
-    /// its own outcome. An invocation yet to begin gives up the input that would
+    /// its own outcome. An invocation yet to begin gives up the work that would
     /// begin it. What a script launched ends with the script instead.
     /// A call that installed no child is stopped as a crash stops it, so input
     /// asks for it again.

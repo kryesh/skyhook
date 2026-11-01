@@ -453,7 +453,12 @@ mod tests {
         one!(SessionEvent::JobMessageDelivered {
             job,
             source: assistant.message(),
-            notification: prompt.message(),
+            notification: Some(prompt.message()),
+        });
+        one!(SessionEvent::JobMessageDelivered {
+            job,
+            source: assistant.message(),
+            notification: None,
         });
         one!(SessionEvent::TodosReplaced {
             items: vec![crate::agent::TodoItem {

@@ -50,7 +50,6 @@ mod compact;
 mod context;
 mod modes;
 use context::AgentContext;
-mod prompt;
 mod questions;
 mod queue;
 pub use queue::{
@@ -94,7 +93,7 @@ struct HarnessInner {
     extra_tools: ToolRegistry,
     mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
-    persona: Option<crate::Prose>,
+    prompts: crate::prompts::Prompts,
     skills: HostSkills,
     /// Model configuration, instruction, and skill diagnostics.
     warnings: Vec<String>,
@@ -249,6 +248,10 @@ enum AgentCommand {
         content: Vec<UserPart>,
         done: Option<RequestCompletion>,
     },
+    /// Begin the child's invocation whose prompt the change that opened it
+    /// committed: its first request, whose answer `done` hears. Not input, so it
+    /// opens no coalescing window.
+    Begin(ChildCompletion),
     /// Adopt `options` without input or a turn, as work that runs the root but
     /// commits no message, such as a host script, must before it starts.
     Select {
@@ -278,6 +281,7 @@ impl AgentCommand {
                 done: Some(done), ..
             } => done.settle(Err(error())),
             Self::Input { done: None, .. } => {}
+            Self::Begin(done) => RequestCompletion::Child(done).settle(Err(error())),
             Self::Select { done, .. } => {
                 let _ = done.send(Err(error()));
             }
@@ -895,6 +899,13 @@ mod tests {
         assert!(session.runtime.store.live(send).await, "the agent runs");
     }
 
+    /// Begin child `agent`'s invocation, as a launch whose prompt is committed does.
+    pub(super) async fn begin(session: &SessionHandle, agent: &AgentId, done: ChildCompletion) {
+        let agent = agent.clone();
+        let begin = move |state: &mut CoreState| state.agents.begin(&agent, done);
+        session.runtime.store.live(begin).await;
+    }
+
     /// Queue `command` for child `agent` in the change that starts its parked loop.
     pub(super) async fn unpark(session: &SessionHandle, agent: &AgentId, command: AgentCommand) {
         let target = agent.clone();
@@ -1279,6 +1290,16 @@ mod tests {
 
     pub(super) fn mode_name(name: &str) -> ModeName {
         name.parse().unwrap()
+    }
+
+    /// The edition of `mode`, whose instructions are text.
+    pub(super) fn edition(mode: &crate::tool::policy::Mode) -> crate::tool::policy::Edition {
+        use crate::tool::policy::Written;
+        crate::tool::policy::Edition {
+            capabilities: mode.capabilities.clone(),
+            instructions: (mode.instructions.as_ref()).map(|text| text.written().unwrap().clone()),
+            hint: mode.hint.clone(),
+        }
     }
 
     pub(super) fn listed(capabilities: &[Capability]) -> crate::tool::policy::ModeCapabilities {

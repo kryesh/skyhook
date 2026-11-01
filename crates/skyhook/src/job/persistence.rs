@@ -247,6 +247,7 @@ impl JobStatus {
             answer: child.answer.as_ref().map(|answer| match answer {
                 Answer::Held { reply, .. } => (reply.message, AnswerKind::Held),
                 Answer::Released(message) => (*message, AnswerKind::Released),
+                Answer::Result { reply, .. } => (reply.message, AnswerKind::Result),
             }),
             replies: (child.messages.iter())
                 .map(|queued| (queued.reply.message, queued.stamp))
@@ -307,6 +308,7 @@ impl JobFacts {
             handles: None,
             finishing: false,
             reads: Vec::new(),
+            holds: Vec::new(),
             invocation: Invocation::default(),
             timing: RunTiming::Unstarted,
             cancel: CancelState::Open,
@@ -358,7 +360,12 @@ impl JobFacts {
                 messages: (stored.replies.iter())
                     .map(|&(message, stamp)| {
                         let (reply, at) = reply(message)?;
-                        Some(Queued { stamp, reply, at })
+                        Some(Queued {
+                            stamp,
+                            reply,
+                            at,
+                            superseded: None,
+                        })
                     })
                     .collect::<Option<_>>()?,
                 answer: match stored.answer {
@@ -367,10 +374,15 @@ impl JobFacts {
                         Some(Answer::Held { reply, at })
                     }
                     Some((message, AnswerKind::Released)) => Some(Answer::Released(message)),
+                    Some((message, AnswerKind::Result)) => {
+                        let (reply, at) = reply(message)?;
+                        Some(Answer::Result { reply, at })
+                    }
                     None => None,
                 },
                 progress: stored.progress,
                 start: Start::Pending,
+                held: Vec::new(),
             }),
             None => None,
         };
@@ -395,7 +407,7 @@ impl JobFacts {
     pub(super) fn journaled(&self, id: JobId) -> String {
         let child = self.child().map(|child| {
             let answer = child.answer.as_ref().map(|answer| match answer {
-                Answer::Held { reply, .. } => reply.message,
+                Answer::Held { reply, .. } | Answer::Result { reply, .. } => reply.message,
                 Answer::Released(message) => *message,
             });
             let messages = (child.messages.iter())
@@ -1022,7 +1034,7 @@ mod tests {
                 assert_eq!(pending_for(&jobs, &owner, job).await, expected);
             }
             if !scripted {
-                let (returned, presented) = crate::tests::bounded(jobs.wait_foreground(job))
+                let (returned, presented) = crate::tests::bounded(jobs.wait_foreground(job, None))
                     .await
                     .unwrap();
                 assert_eq!(returned.state, JobState::WaitingInput);

@@ -11,9 +11,9 @@ use skyhook_cli::page::{
 
 use super::words;
 use crate::store::{
-    CandidateView, EvidenceView, FlawStatus, LastTask, NodeId, NodeKind, NodeStatus, NodeView,
-    OpenTest, Owing, PathStatus, PremiseRef, PremiseStatus, RunState, ShelfRow, Status, Store,
-    TaskDetail, TaskId,
+    CandidateView, EvidenceView, FlawStatus, InventoryStatus, LastTask, NodeId, NodeKind,
+    NodeStatus, NodeView, OpenTest, Owing, PathStatus, PremiseRef, PremiseStatus, RunState,
+    ShelfRow, Status, Store, Task, TaskDetail, TaskId,
 };
 
 type Result<T> = std::result::Result<T, crate::store::Error>;
@@ -63,34 +63,69 @@ impl Shelf {
         }
     }
 
-    fn columns(self) -> &'static [(&'static str, u8)] {
+    fn columns(self) -> Vec<Column> {
         match self {
-            Self::Tasks => &[
-                ("id", 0),
-                ("phase", 0),
-                ("subjects", 2),
-                ("state", 0),
-                ("began", 1),
-                ("ended", 3),
-            ],
-            Self::Nodes(NodeKind::Component | NodeKind::Source | NodeKind::Finding) => {
-                &[("id", 0), ("title", 0)]
-            }
-            Self::Nodes(_) => &[
-                ("id", 0),
-                ("status", 0),
-                ("owes", 1),
-                ("last task", 2),
-                ("title", 0),
-            ],
+            Self::Tasks => headings(&TASK_FIELDS),
+            Self::Nodes(kind) => headings(node_fields(kind)),
         }
+    }
+}
+
+/// A section's column: its heading, its [`Column::priority`] and the cell it shows of each of
+/// its rows, so a section's columns and its records' cells come from one list.
+type Field<R> = (&'static str, u8, fn(&R) -> Cell);
+
+fn headings<R>(fields: &[Field<R>]) -> Vec<Column> {
+    (fields.iter())
+        .map(|(title, priority, _)| Column {
+            title: (*title).to_owned(),
+            priority: *priority,
+        })
+        .collect()
+}
+
+fn cells<R>(fields: &[Field<R>], row: &R) -> Vec<Cell> {
+    fields.iter().map(|(_, _, cell)| cell(row)).collect()
+}
+
+const TASK_FIELDS: [Field<Task>; 6] = [
+    ("id", 0, |task| id(task.id)),
+    ("phase", 0, |task| words(task.phase).into()),
+    ("subjects", 2, |task| ids(task.subjects.iter()).into()),
+    ("state", 0, |task| job_state(task.state)),
+    ("began", 1, |task| at(task.began)),
+    ("ended", 3, |task| task.ended.map_or_else(dash, at)),
+];
+
+/// A node's row, with the open test of a candidate.
+struct NodeRow {
+    row: ShelfRow,
+    test: Option<OpenTest>,
+}
+
+const NODE_ID: Field<NodeRow> = ("id", 0, |node| id(node.row.node.id));
+const NODE_TITLE: Field<NodeRow> = ("title", 0, |node| node.row.node.title.clone().into());
+
+/// The columns of a section of `kind`'s nodes; a finding has no standing or work of its own.
+fn node_fields(kind: NodeKind) -> &'static [Field<NodeRow>] {
+    match kind {
+        NodeKind::Finding => &[NODE_ID, NODE_TITLE],
+        _ => &[
+            NODE_ID,
+            ("status", 0, |node| {
+                (node.row.node.status).map_or_else(dash, |status| standing(status, node.test))
+            }),
+            ("owes", 1, |node| owing(&node.row.owing)),
+            ("last task", 2, |node| last_task(node.row.last)),
+            NODE_TITLE,
+        ],
     }
 }
 
 /// Every section in reading order, with records and detail for what `open` shows; a
 /// candidate with an open test shows it as proving, or abandoned once its job ended.
 pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec<Block>> {
-    let synthesis = &state.facts.synthesis;
+    let summary = &state.facts.summary;
     let coverage = &state.coverage;
     let candidates: u64 = coverage.candidates.values().sum();
     let mut blocks = Vec::with_capacity(SHELVES.len());
@@ -108,8 +143,8 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
             )),
             Shelf::Tasks => Some(format!(
                 "{} running · {} exhausted",
-                synthesis.running.values().sum::<u64>(),
-                synthesis.exhausted.len()
+                summary.running.values().sum::<u64>(),
+                summary.exhausted.values().sum::<u64>()
             )),
             _ => None,
         };
@@ -123,7 +158,7 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
             (Shelf::Nodes(kind), Some(limit)) => {
                 let read = store.shelf(kind, limit)?;
                 let records = (read.rows.into_iter())
-                    .map(|row| node_record(store, key, row, open, &state.open_tests))
+                    .map(|row| node_record(store, (key, kind), row, open, &state.open_tests))
                     .collect::<Result<_>>()?;
                 (read.total, Some(records))
             }
@@ -134,12 +169,7 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
             title: shelf.title().to_owned(),
             summary,
             total,
-            columns: (shelf.columns().iter())
-                .map(|(title, priority)| Column {
-                    title: (*title).to_owned(),
-                    priority: *priority,
-                })
-                .collect(),
+            columns: shelf.columns(),
             records: records.unwrap_or_default(),
         }));
     }
@@ -161,29 +191,18 @@ fn record(
 
 fn node_record(
     store: &Store,
-    section: SectionKey,
+    (section, kind): (SectionKey, NodeKind),
     row: ShelfRow,
     open: &Disclosed,
     tests: &[OpenTest],
 ) -> Result<Record> {
-    let node = row.node;
-    let cells = match node.status {
-        None => vec![id(node.id), node.title.into()],
-        Some(status) => {
-            let test = tests
-                .iter()
-                .find(|test| NodeId::from(test.candidate) == node.id);
-            vec![
-                id(node.id),
-                standing(status, test),
-                owing(&row.owing),
-                last_task(row.last),
-                node.title.into(),
-            ]
-        }
-    };
-    record(section, node.id, cells, open, |_| {
-        Ok(node_detail(&store.node(node.id)?).into())
+    let node = row.node.id;
+    let test = (tests.iter())
+        .find(|test| NodeId::from(test.candidate) == node)
+        .copied();
+    let cells = cells(node_fields(kind), &NodeRow { row, test });
+    record(section, node, cells, open, |_| {
+        Ok(node_detail(&store.node(node)?).into())
     })
 }
 
@@ -195,18 +214,13 @@ fn tasks(
 ) -> Result<Vec<Record>> {
     (store.tasks(limit)?.into_iter())
         .map(|task| {
-            let subjects = ids(task.subjects.iter());
-            let cells = vec![
-                id(task.id),
-                words(task.phase).into(),
-                subjects.into(),
-                job_state(task.state),
-                at(task.began),
-                task.ended.map_or_else(dash, at),
-            ];
-            record(section, task.id, cells, open, |events| {
-                task_detail(store, task.id, events)
-            })
+            record(
+                section,
+                task.id,
+                cells(&TASK_FIELDS, &task),
+                open,
+                |events| task_detail(store, task.id, events),
+            )
         })
         .collect()
 }
@@ -252,6 +266,7 @@ fn node_detail(view: &NodeView) -> Vec<Detail> {
     }
     match view {
         NodeView::Component(component) => {
+            lines.push(line("status", vec![inventory_status(component.status)]));
             lines.push(line("files", vec![component.files.join(" ").into()]));
             lines.push(line(
                 "paths",
@@ -263,13 +278,7 @@ fn node_detail(view: &NodeView) -> Vec<Detail> {
             ));
         }
         NodeView::Path(path) => {
-            lines.push(line(
-                "swept",
-                vec![
-                    path.swept
-                        .map_or_else(dash, |event| format!("event #{event}").into()),
-                ],
-            ));
+            lines.push(line("status", vec![path_status(path.status)]));
             lines.extend(listed(
                 "steps",
                 (path.steps.iter()).map(|step| {
@@ -294,12 +303,15 @@ fn node_detail(view: &NodeView) -> Vec<Detail> {
             ));
         }
         NodeView::Source(source) => {
-            lines.push(line("entry", vec![source.location.to_string().into()]));
-            lines.push(line("trust", vec![words(source.trust).into()]));
-            lines.push(line(
-                "paths",
-                vec![ids(source.paths.iter().map(|p| p.id)).into()],
-            ));
+            if let Some(source) = &source.live {
+                lines.push(line("status", vec![inventory_status(source.status)]));
+                lines.push(line("entry", vec![source.location.to_string().into()]));
+                lines.push(line("trust", vec![words(source.trust).into()]));
+                lines.push(line(
+                    "paths",
+                    vec![ids(source.paths.iter().map(|p| p.id)).into()],
+                ));
+            }
         }
         NodeView::Premise(premise) => {
             lines.push(line(
@@ -373,6 +385,9 @@ fn node_detail(view: &NodeView) -> Vec<Detail> {
         }
     }
     lines.extend(evidence(&head.evidence));
+    if !head.tasks.is_empty() {
+        lines.push(line("tasks", vec![ids(head.tasks.iter()).into()]));
+    }
     lines
 }
 
@@ -386,10 +401,17 @@ fn candidate_detail(candidate: &CandidateView) -> Vec<Detail> {
                 .map_or_else(dash, |tier| words(tier).into()),
         ],
     )];
-    lines.push(line(
-        "path",
-        vec![id(candidate.path.id), candidate.path.title.clone().into()],
-    ));
+    for (position, action) in candidate.actions.iter().enumerate() {
+        lines.push(Detail {
+            label: (position == 0).then(|| "actions".to_owned()),
+            cells: vec![
+                Cell::new(format!("{}.", position + 1), Tone::Muted),
+                id(action.path.id),
+                action.path.title.clone().into(),
+            ],
+        });
+        lines.extend(premises("", &action.premises));
+    }
     for (position, link) in candidate.chain.iter().enumerate() {
         lines.push(Detail {
             label: (position == 0).then(|| "chain".to_owned()),
@@ -402,7 +424,6 @@ fn candidate_detail(candidate: &CandidateView) -> Vec<Detail> {
         });
         lines.extend(premises("", &link.premises));
     }
-    lines.extend(premises("path premises", &candidate.path_premises));
     let stale = |current: bool| (!current).then(|| Cell::new("stale", Tone::Warning));
     if let Some(assessment) = &candidate.assessment {
         let mut cells = vec![
@@ -547,7 +568,7 @@ fn last_task(task: Option<LastTask>) -> Cell {
 
 /// A node's own status; a candidate with an open test shows it as proving, or abandoned
 /// once its job ended.
-fn standing(status: NodeStatus, test: Option<&OpenTest>) -> Cell {
+fn standing(status: NodeStatus, test: Option<OpenTest>) -> Cell {
     match (status, test) {
         (NodeStatus::Candidate(status), Some(test)) => {
             let (note, tone) = match test.live {
@@ -557,10 +578,8 @@ fn standing(status: NodeStatus, test: Option<&OpenTest>) -> Cell {
             Cell::new(format!("{} ({note})", words(status)), tone)
         }
         (NodeStatus::Candidate(candidate), None) => self::status(candidate),
-        (NodeStatus::Path(path), _) => match path {
-            PathStatus::Swept => Cell::new("swept", Tone::Success),
-            PathStatus::Unswept => Cell::new("unswept", Tone::Accent),
-        },
+        (NodeStatus::Inventory(inventory), _) => inventory_status(inventory),
+        (NodeStatus::Path(path), _) => path_status(path),
         (NodeStatus::Premise(premise), _) => premise_status(premise),
         (NodeStatus::Flaw(flaw), _) => flaw_status(flaw),
     }
@@ -580,6 +599,23 @@ fn status(status: Status) -> Cell {
     Cell::new(words(status), tone)
 }
 
+fn inventory_status(status: InventoryStatus) -> Cell {
+    let tone = match status {
+        InventoryStatus::Recorded => Tone::Normal,
+        InventoryStatus::Retracted => Tone::Muted,
+    };
+    Cell::new(words(status), tone)
+}
+
+fn path_status(status: PathStatus) -> Cell {
+    let tone = match status {
+        PathStatus::Swept => Tone::Success,
+        PathStatus::Unswept => Tone::Accent,
+        PathStatus::Retracted => Tone::Muted,
+    };
+    Cell::new(words(status), tone)
+}
+
 fn premise_status(status: PremiseStatus) -> Cell {
     let tone = match status {
         PremiseStatus::Holds => Tone::Success,
@@ -592,7 +628,7 @@ fn premise_status(status: PremiseStatus) -> Cell {
 fn flaw_status(status: FlawStatus) -> Cell {
     let tone = match status {
         FlawStatus::Suspected => Tone::Accent,
-        FlawStatus::Contained | FlawStatus::Refuted => Tone::Muted,
+        FlawStatus::Confirmed | FlawStatus::Refuted => Tone::Muted,
     };
     Cell::new(words(status), tone)
 }
@@ -606,7 +642,7 @@ mod tests {
         Begin, Link, PremiseScope, Verdict,
         tests::{
             HIGH, assess, begun, component, fixture, job_state as set_job, path, premise, scenario,
-            sweep, verdict,
+            sweep, text, verdict,
         },
     };
 
@@ -677,6 +713,36 @@ mod tests {
         );
         let flaws = section(&blocks, Shelf::Nodes(NodeKind::Flaw));
         assert_eq!(flaws.total, 2);
+    }
+
+    /// Every section's records show one cell per column, a component's and a source's title
+    /// under its title.
+    #[test]
+    fn records_fill_their_sections_columns() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        (store.report(&actor, scenario.flaw, &text("overflow"), &text("report"))).unwrap();
+        begun(&store, &Begin::Sweep(vec![scenario.path]));
+        premise(&store, &actor, PremiseScope::Code);
+        let mut open = Disclosed::default();
+        for shelf in SHELVES {
+            open.apply(&Toggle::Section(shelf.key()));
+        }
+        let blocks = opened(&store, &open);
+        for shelf in SHELVES {
+            let section = section(&blocks, shelf);
+            let widths: Vec<usize> = (section.records.iter())
+                .map(|record| record.cells.len())
+                .collect();
+            assert_eq!(widths, [section.columns.len()], "{}", shelf.title());
+        }
+        for kind in [NodeKind::Component, NodeKind::Source] {
+            let section = section(&blocks, Shelf::Nodes(kind));
+            let title = (section.columns.iter())
+                .position(|column| column.title == "title")
+                .unwrap();
+            assert_eq!(section.records[0].cells[title].text, "decoder");
+        }
     }
 
     /// Paths list unswept first, each with the work it owes and its latest task.

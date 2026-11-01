@@ -1,0 +1,34 @@
+{#- An agent's whole system prompt: its parts are separated by blank lines. -#}
+{% if role == "root" %}{% include "skyhook/root.md" %}{% else %}{% include "skyhook/child.md" %}{% endif %}
+{%- if persona %}
+
+{{ persona }}
+{%- endif %}
+
+{% include "skyhook/workspace.md" %}
+
+{% include "skyhook/todo.md" %}
+
+{% include "skyhook/lifecycle.md" %}
+{%- if capabilities.targets %}
+
+{% include "skyhook/targets.md" %}
+{%- endif %}
+{%- if capabilities.agents %}
+
+{% include "skyhook/agents.md" %}
+{%- endif %}
+{%- if mode_instructions %}
+
+<mode name={{ mode | json }}>
+{{ mode_instructions }}
+</mode>
+{%- endif %}
+{%- for text in instructions %}
+
+{{ text }}
+{%- endfor %}
+
+<skyhook_context>
+{{ location | json }}
+</skyhook_context>

@@ -46,8 +46,8 @@ impl ModeChange {
 
 impl SessionRuntime {
     /// What sending `agent`, which runs `current` with `capabilities`, into the
-    /// configured `name` changes; `None` when it already runs that edition with
-    /// what it grants now.
+    /// configured `name` changes; `None` when it already runs the edition it renders
+    /// now with what it grants now.
     pub(super) fn mode_change(
         &self,
         agent: &AgentId,
@@ -55,9 +55,12 @@ impl SessionRuntime {
         capabilities: &CapabilitySet,
         name: &ModeName,
     ) -> Result<Option<ModeChange>, HarnessError> {
-        let mode = self.applied(name)?;
-        let depth = self.held(agent, |_, depth, _| depth).unwrap_or(0);
-        let granted = mode.definition.granted(&self.capabilities).for_agent(depth);
+        let held = self.held(agent, |contract, depth, _| {
+            (contract.location.clone(), depth)
+        });
+        let (location, depth) = held.ok_or_else(|| HarnessError::NoRecordedModel(agent.clone()))?;
+        let (mode, granted) =
+            self.applied(name, agent.depth(), &location, depth, &self.capabilities)?;
         let unchanged = current == Some(&mode) && *capabilities == granted;
         Ok((!unchanged).then_some(ModeChange {
             mode,
@@ -99,39 +102,58 @@ impl SessionRuntime {
             !matches!(change, Ok(None))
         })
     }
-}
 
-/// Warnings that the configuration has moved on from the selection a reopened
-/// root last ran under, `running`: it no longer has the model, which another must
-/// replace before the root runs again, or it redefined or
-/// removed the mode, which the next work that runs the root adopts. A selection
-/// the root has replaced warns no more.
-pub(super) fn drift_warnings(harness: &HarnessInner, running: &RecordedContract) -> Vec<String> {
-    let model = &running.profile.name;
-    let model = (!harness.models.contains_key(model)).then(|| {
-        format!(
-            "The configuration no longer has model `{model}`, which this session last ran on; \
-             the root agent runs only once another is chosen."
-        )
-    });
-    let mode = running.mode.as_ref().and_then(|running| {
+    /// Warnings that the configuration has moved on from the selection the reopened
+    /// `root` last ran under: it no longer has the model, which another must replace
+    /// before the root runs again; its mode renders for it otherwise or is gone, which
+    /// the next work that runs the root adopts; or its mode no longer renders for it,
+    /// which fails that work. A selection the root has replaced warns no more.
+    pub(super) fn drift_warnings(&self, root: &AgentId) -> Vec<String> {
+        let held = self.held(root, |contract, _, granted| {
+            (
+                contract.profile.name.clone(),
+                contract.mode.clone(),
+                granted,
+            )
+        });
+        let Some((model, running, capabilities)) = held else {
+            return Vec::new();
+        };
+        let model = (!self.harness.models.contains_key(&model)).then(|| {
+            format!(
+                "The configuration no longer has model `{model}`, which this session last ran \
+                 on; the root agent runs only once another is chosen."
+            )
+        });
+        let Some(running) = running else {
+            return model.into_iter().collect();
+        };
         let name = &running.name;
-        match (harness.modes.get(name), &harness.mode) {
-            (Some(configured), _) if *configured == *running.definition => None,
-            (Some(_), _) => Some(format!(
-                "The configuration has changed mode `{name}` since this session last ran; the \
-                 root agent adopts it when it next runs."
-            )),
-            (None, Some(default)) => Some(format!(
+        let mode = match (self.harness.modes.contains_key(name), &self.harness.mode) {
+            (true, _) => match self.mode_change(root, Some(&running), &capabilities, name) {
+                Ok(change) => change
+                    .is_some_and(|change| change.mode != running)
+                    .then(|| {
+                        format!(
+                            "The configuration has changed mode `{name}` since this session last \
+                         ran; the root agent adopts it when it next runs."
+                        )
+                    }),
+                Err(error) => Some(format!(
+                    "Mode `{name}`, which this session last ran in, no longer renders for the \
+                     root agent: {error}. Running the root agent in it fails until it does."
+                )),
+            },
+            (false, Some(default)) => Some(format!(
                 "The configuration no longer has mode `{name}`, which this session last ran \
                  in; the root agent moves to the default mode `{default}` when it next runs."
             )),
-            (None, None) => Some(format!(
+            (false, None) => Some(format!(
                 "The configuration no longer has mode `{name}`, which this session last ran \
                  in; without a default mode, the root agent keeps running it within the \
                  current capabilities."
             )),
-        }
-    });
-    model.into_iter().chain(mode).collect()
+        };
+        model.into_iter().chain(mode).collect()
+    }
 }

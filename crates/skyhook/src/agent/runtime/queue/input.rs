@@ -72,9 +72,8 @@ impl SessionRuntime {
             };
             let replacement = if let Some(change) = &mode {
                 let (mode, capabilities) = (Some(&change.mode), &change.capabilities);
-                let prompt =
-                    self.system_prompt(agent, turn.location, change.depth, mode, capabilities);
-                let system = prompt.await?;
+                let system =
+                    self.system_prompt(agent, turn.location, change.depth, mode, capabilities)?;
                 let context = self
                     .open_agent_context(agent, snapshot.clone(), system, capabilities, None)
                     .await?;

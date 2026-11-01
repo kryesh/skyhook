@@ -60,41 +60,57 @@ macro_rules! settled {
 }
 pub(super) use settled;
 
+/// The facts selecting tests, read once per statement for the root groups `$roots` selects,
+/// every group without it: their [`demonstrations`], the candidates standing validated, which no
+/// demonstration of their group notes, and of those the contenders, with no pending or settling
+/// test and a test not exhausted, placed in their group by severity, then age.
+macro_rules! tested {
+    ($($roots:expr)?) => {
+        concat!(
+            $crate::store::bearing::demonstrations!($($roots)?),
+            ",validated AS MATERIALIZED (SELECT upheld.candidate,upheld.root,upheld.rank FROM \
+             upheld LEFT JOIN demonstration d ON d.root=upheld.root WHERE upheld.shortlisted AND \
+             (upheld.demonstrated OR ifnull(d.rank<upheld.rank,1))),\
+             contender AS MATERIALIZED (SELECT validated.*,row_number() OVER (PARTITION BY root \
+             ORDER BY rank DESC,candidate) AS place FROM validated WHERE NOT ",
+            pending_test!("validated.candidate"),
+            " AND NOT ",
+            settled!("validated.candidate"),
+            " AND (",
+            task_live!("test", "validated.candidate"),
+            " OR ",
+            retryable!("test", "validated.candidate"),
+            "))"
+        )
+    };
+}
+pub(super) use tested;
+
 /// Candidate `$c` stands validated and the launch tests validated candidates.
 macro_rules! testable {
     ($c:expr) => {
         concat!(
-            "((SELECT poc FROM run)!='no' AND ifnull((SELECT ts.state='validated' FROM \
-             candidate_state ts WHERE ts.candidate=",
+            "((SELECT live FROM run)!='no' AND EXISTS (SELECT 1 FROM validated tv WHERE \
+             tv.candidate=",
             $c,
-            "),0))"
+            "))"
         )
     };
 }
 pub(super) use testable;
 
-/// No candidate of `$c`'s root group comes before it for a test: a validated one with no
-/// pending or settling test, more severe, or as severe and older, whose test is not exhausted.
-/// A group's first demonstration goes to its most severe scenario, and what it confirms notes
-/// the rest; a failed or exhausted one holds nothing back.
+/// No candidate of `$c`'s root group comes before it for a test: its group's first contender is
+/// none, `$c` itself, or less severe, or as severe and younger. A group's first demonstration goes to
+/// its most severe scenario, and what it confirms notes the rest; a failed or exhausted one
+/// holds nothing back.
 macro_rules! leads {
     ($c:expr) => {
         concat!(
-            "NOT EXISTS (SELECT 1 FROM candidate_root lg JOIN candidate_root lo ON lo.root=lg.root \
-             AND lo.candidate!=lg.candidate JOIN candidate_state ld ON ld.candidate=lo.candidate \
-             WHERE lg.candidate=",
+            "NOT EXISTS (SELECT 1 FROM validated lv JOIN contender ll ON ll.root=lv.root AND \
+             ll.place=1 WHERE lv.candidate=",
             $c,
-            " AND ld.state='validated' AND (ld.rank>(SELECT rank FROM candidate_core WHERE \
-             candidate=lg.candidate) OR (ld.rank=(SELECT rank FROM candidate_core WHERE \
-             candidate=lg.candidate) AND ld.candidate<lg.candidate)) AND NOT ",
-            pending_test!("ld.candidate"),
-            " AND NOT ",
-            settled!("ld.candidate"),
-            " AND (",
-            task_live!("test", "ld.candidate"),
-            " OR ",
-            retryable!("test", "ld.candidate"),
-            "))"
+            " AND ll.candidate!=lv.candidate AND (ll.rank>lv.rank OR (ll.rank=lv.rank AND \
+             ll.candidate<lv.candidate)))"
         )
     };
 }
@@ -119,14 +135,14 @@ macro_rules! test_owed {
 }
 pub(super) use test_owed;
 
-/// The sweep of candidate `$c`'s path is not pending.
+/// The sweep or probe of no path candidate `$c` performs is pending.
 macro_rules! structure_settled {
     ($c:expr) => {
         concat!(
-            "NOT EXISTS (SELECT 1 FROM candidate rc WHERE rc.node=",
+            "NOT EXISTS (SELECT 1 FROM candidate_action ra WHERE ra.candidate=",
             $c,
             " AND ",
-            sweep_pending!("rc.path"),
+            structure_pending!("ra.path"),
             ")"
         )
     };
@@ -223,7 +239,7 @@ mod tests {
         };
         store.link(&actor, &[rests(code)]).unwrap();
         assert!(!owed(Phase::Review), "the settling look comes first");
-        assert_eq!(store.synthesis(&[]).unwrap().owed(Phase::Review), 1);
+        assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 1);
         exhaust(&store, &Begin::Settle(vec![code]));
         assert!(owed(Phase::Review), "an exhausted look holds nothing");
         verdict(&store, &actor, id, Verdict::Validated);
@@ -296,6 +312,33 @@ mod tests {
         assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
     }
 
+    /// An unproven verdict stands only while a premise of its chain is undecided: one its own
+    /// review decides leaves the review owed again.
+    #[test]
+    fn an_unproven_verdict_stands_while_a_premise_is_undecided() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let id = scenario.candidate;
+        sweep(&store, scenario.path);
+        assess(&store, &actor, id, HIGH);
+        let code = premise(&store, &actor, PremiseScope::Code);
+        let rests = Link::FlawPremise {
+            flaw: scenario.flaw,
+            premise: code,
+        };
+        store.link(&actor, &[rests]).unwrap();
+        exhaust(&store, &Begin::Settle(vec![code]));
+        let (reviewer, job, _) = begun(&store, &Begin::Review(vec![id]));
+        verdict(&store, &reviewer, id, Verdict::Unproven);
+        assert_eq!(status(&store, id), Status::Unproven);
+        let decided = StatusChange::Premise(code, PremiseStatus::Holds);
+        store
+            .set_status(&reviewer, decided, &text("measured"))
+            .unwrap();
+        end_job(&store, job);
+        assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
+    }
+
     /// A root group is tested from its most severe scenario; once its test is exhausted the
     /// next one leads, and a demonstration notes the scenarios no more severe than it while
     /// it is its candidate's settling test and the positive verdict it tested stands.
@@ -318,6 +361,7 @@ mod tests {
         test(&store, &actor, severe, TestResult::Confirmed);
         assert!(queued(&store, Phase::Test).is_empty());
         assert_eq!(status(&store, lesser), Status::Noted);
+        assert_eq!(store.coverage().unwrap().candidates[&Status::Noted], 1);
         test(&store, &actor, severe, TestResult::Failed);
         assert_eq!(
             status(&store, lesser),
@@ -353,6 +397,7 @@ mod tests {
             let input = NewEnvironment {
                 instructions: text("start the container"),
                 candidate: None,
+                serves: Serves::default(),
             };
             store.environment(actor, &input).unwrap();
         };

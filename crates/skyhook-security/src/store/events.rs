@@ -3,9 +3,10 @@
 //! along the graph: a premise moves the standing of the flaws and paths relying on it, a source
 //! passes its effect to the paths it enters, and a flaw or path passes its effect to the live
 //! candidates holding it. Some marks move their node's own work alone: a candidate taking or
-//! losing a flaw as its root leaves the flaw's other candidates unmoved, and a path marked swept
-//! or unswept leaves its candidates unmoved. A flaw joining or leaving a chain at another place
-//! is only concerned.
+//! losing a flaw as its root leaves the flaw's other candidates unmoved, and a status set on a
+//! path, source or component moves that node, and a source's paths, but no candidate, unless it
+//! retracts or restores a path. A flaw joining or leaving a chain at another place is only
+//! concerned.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -91,8 +92,8 @@ impl Marks {
             db,
             "SELECT cf.candidate,j.value->>1 FROM json_each(?1) j JOIN candidate_flaw cf ON \
              cf.flaw=j.value->>0 JOIN node n ON n.id=cf.candidate WHERE n.merged_into IS NULL \
-             UNION ALL SELECT c.node,j.value->>1 FROM json_each(?1) j JOIN candidate c ON \
-             c.path=j.value->>0 JOIN node n ON n.id=c.node WHERE n.merged_into IS NULL",
+             UNION ALL SELECT ca.candidate,j.value->>1 FROM json_each(?1) j JOIN candidate_action \
+             ca ON ca.path=j.value->>0 JOIN node n ON n.id=ca.candidate WHERE n.merged_into IS NULL",
         )?;
         for (node, effect) in self.alone {
             strongest(&mut self.carried, node, effect);
@@ -126,8 +127,8 @@ pub(super) fn audit<T>(
     let (written, marks) = write(event)?;
     for (node, effect) in marks.propagated(db)? {
         db.execute(
-            "INSERT INTO event_node(event,node,effect) VALUES (?1,?2,?3)",
-            params![event, node, effect],
+            "INSERT INTO event_node(event,node,kind,effect) VALUES (?1,?2,?3,?4)",
+            params![event, node, kind, effect],
         )?;
     }
     Ok(written)
@@ -283,8 +284,8 @@ impl Store {
 mod tests {
     use super::{
         super::tests::{
-            HIGH, assess, child_agent, fixture, last_event, marks, premise, scenario, test, text,
-            validated,
+            HIGH, assess, child_agent, fixture, last_event, marks, path, premise, scenario, test,
+            text, validated, verdict,
         },
         *,
     };
@@ -420,7 +421,7 @@ mod tests {
             title: None,
             body: None,
             detail: CandidateEdit {
-                path: None,
+                actions: None,
                 chain: Some(vec![ahead].try_into().unwrap()),
             },
         };
@@ -431,6 +432,100 @@ mod tests {
             marks(&store, last_event(&store)),
             [concerns(flaw.into()), changed(sibling.into())]
         );
+    }
+
+    /// A candidate rests on every action it performs, not only the first: a premise of a later
+    /// action's path is one its chain rests on, and correcting the source entering that path
+    /// or its steps re-owes the candidate's assessment and verdict and stales its root's
+    /// report.
+    #[test]
+    fn a_later_actions_correction_reowes_its_candidate() {
+        let (_session, store, actor) = fixture();
+        let first = scenario(&store, &actor, "setter");
+        let later = path(&store, &actor, "consumer", &[first.component]);
+        let actions = CandidateEdit {
+            actions: Some(vec![first.path, later].try_into().unwrap()),
+            chain: None,
+        };
+        let edit = Edit {
+            title: None,
+            body: None,
+            detail: actions,
+        };
+        let change = Upsert::Candidate(Change::Edit(first.candidate, edit));
+        store.upsert(&actor, &change).unwrap();
+        let view = || {
+            let NodeView::Candidate(view) = store.node(first.candidate.into()).unwrap() else {
+                panic!("a candidate")
+            };
+            view
+        };
+        let NodeView::Path(consumer) = store.node(later.into()).unwrap() else {
+            panic!("a path")
+        };
+        let held = premise(&store, &actor, PremiseScope::Code);
+        let on_later = Link::PathPremise {
+            path: later,
+            premise: held,
+        };
+        store.link(&actor, &[on_later]).unwrap();
+        assess(&store, &actor, first.candidate, HIGH);
+        assert_eq!(
+            view().confidence,
+            Some(ConfidenceTier::Conjectured),
+            "a later action's undecided premise is one its chain rests on"
+        );
+        let decided = StatusChange::Premise(held, PremiseStatus::Holds);
+        store.set_status(&actor, decided, &text("traced")).unwrap();
+        let settle = || {
+            assess(&store, &actor, first.candidate, HIGH);
+            verdict(&store, &actor, first.candidate, Verdict::Validated);
+            store
+                .report(&actor, first.flaw, &text("overflow"), &text("report"))
+                .unwrap()
+        };
+        let standing = |finding: FindingId| {
+            let view = view();
+            let NodeView::Finding(report) = store.node(finding.into()).unwrap() else {
+                panic!("a finding")
+            };
+            (
+                view.assessment.unwrap().current,
+                view.verdict.unwrap().current,
+                report.current,
+            )
+        };
+
+        let source = Upsert::Source(Change::Edit(
+            consumer.sources[0].id,
+            Edit {
+                title: None,
+                body: None,
+                detail: SourceEdit {
+                    location: None,
+                    trust: Some(Trust::Authenticated),
+                },
+            },
+        ));
+        let step = Link::PathStep {
+            path: later,
+            component: first.component,
+            location: None,
+            note: text("reads it back"),
+            position: None,
+        };
+        let corrections: [Box<dyn Fn()>; 2] = [
+            Box::new(|| {
+                store.upsert(&actor, &source).unwrap();
+            }),
+            Box::new(|| store.link(&actor, std::slice::from_ref(&step)).unwrap()),
+        ];
+        for correct in corrections {
+            let finding = settle();
+            assert_eq!(standing(finding), (true, true, true));
+            correct();
+            assert_eq!(standing(finding), (false, false, false));
+        }
     }
 
     /// History pages through the events naming a node, oldest first, each with the nodes it

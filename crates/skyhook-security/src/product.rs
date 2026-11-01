@@ -12,15 +12,15 @@ use skyhook::{
     tool::diagnostic::escape_controls,
 };
 use skyhook_cli::{
-    Color, Configured, Error, Identity, Palette, Product, RootMode, SessionContext, SyntaxPalette,
-    Table, Theme, page::Disclosed,
+    Color, Configured, Error, Identity, Opening, Palette, Product, RootMode, SessionContext,
+    SyntaxPalette, Table, Theme, page::Disclosed,
 };
 
 use crate::{
     config::SecurityConfig,
     cvss::Severity,
-    session::{ResearchFactory, Scope},
-    store::{PocPolicy, Run, Store},
+    session::{ResearchFactory, Scope, resumed_policy},
+    store::{LivePolicy, Run, Store},
 };
 
 /// Red emphasis in place of Skyhook's blue; code keeps the shared syntax palette.
@@ -40,9 +40,10 @@ pub struct Security;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Live proof-of-concept policy (interactive: ask; batch: no).
+    /// Whether a new run's agents work against a running target: probing it and demonstrating
+    /// findings (interactive: ask; batch: no). A resumed run keeps its own.
     #[arg(long, value_enum)]
-    pub poc: Option<PocPolicy>,
+    pub live: Option<LivePolicy>,
     /// Shortlist threshold for a new run: the lowest severity sent to review.
     #[arg(long, value_enum)]
     pub shortlist: Option<Severity>,
@@ -102,11 +103,26 @@ impl Product for Security {
         let resolved =
             SecurityConfig::resolve(context.workspace, args.security_config.as_deref()).await?;
         let security = resolved.config;
-        // The policy is checked once, on what the flag and configuration resolve to.
+        if let (Opening::Resume(_), Some(_)) = (context.opening, args.live) {
+            return Err(crate::config::Error::LiveOnResume.into());
+        }
         let scope = Scope {
             options: security.run_options(args.shortlist, args.workers),
-            poc: security.poc_policy(args.poc, context.headless)?,
+            live: security.live_policy(args.live, context.headless),
         };
+        let factory = ResearchFactory::new(scope, args.workers);
+        // The policy is checked once, on what the opened session runs under; another host's
+        // session opens without this product's resources.
+        let (live, factory) = match context.opening {
+            Opening::Resume(id) if self.owns(context.workspace, id).await? => {
+                let live = resumed_policy(context.workspace, id, scope.live).await?;
+                (live, factory.resuming(id, live))
+            }
+            Opening::New(_) | Opening::Resume(_) => (scope.live, factory),
+        };
+        if context.headless && live == LivePolicy::Ask {
+            return Err(crate::config::Error::HeadlessAsk.into());
+        }
         security.apply(config)?;
         let mut report = resolved.report;
         if security
@@ -123,7 +139,6 @@ impl Product for Security {
                 message: "no model role hints configured; every agent runs on the default model (see security.example.yaml)".to_owned(),
             });
         }
-        let factory = ResearchFactory::new(scope, args.workers, security.modes.clone());
         Ok(Configured {
             report,
             factory: Arc::new(factory),
@@ -179,6 +194,16 @@ impl Product for Security {
                 Ok(())
             }
         }
+    }
+}
+
+impl Security {
+    /// Whether session `id` of `workspace` is one of this product's own.
+    async fn owns(&self, workspace: &Path, id: SessionId) -> Result<bool, Error> {
+        let identity = self.identity();
+        let root = workspace_session_root(workspace);
+        let summary = SessionStore::summary(&root, id, identity.owner()).await?;
+        Ok(summary.host == identity.host)
     }
 }
 

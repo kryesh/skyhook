@@ -1197,7 +1197,7 @@ mod tests {
 
         let named = |name: &str, definition: Option<&Mode>| crate::session::ModeSelection {
             name: mode_name(name),
-            definition: definition.cloned(),
+            definition: definition.map(edition),
         };
         let held = |session: &SessionHandle| session.agent_capabilities(session.root_agent());
         let in_mode = |session: &SessionHandle, mode: &str| {
@@ -1371,7 +1371,7 @@ mod tests {
         let SessionEvent::ModeChanged { mode, .. } = &change.event else {
             unreachable!()
         };
-        assert_eq!(mode.definition, Some(look("Changed.")));
+        assert_eq!(mode.definition, Some(edition(&look("Changed."))));
         let SessionEvent::MessageCommitted {
             message: Message::User(parts),
         } = &delivery.event
@@ -1543,6 +1543,67 @@ mod tests {
         let resumed = harness.resume_session(id).await.unwrap();
         resumed.running().await.unwrap();
         stopped(&resumed.runtime.jobs).await;
+        shutdown_session(resumed).await;
+    }
+
+    /// A host template's edition is the text it rendered for the root: reopened where it
+    /// renders otherwise, the mode has changed; where it renders the same, nothing has.
+    /// Where it no longer renders, the session opens warning of it, and running the root in
+    /// it fails.
+    #[tokio::test]
+    async fn a_template_mode_drifts_when_it_renders_otherwise() {
+        use crate::{
+            prompts::{Prompts, Source, Templates},
+            tool::policy::{Capability, Instructions, Mode},
+        };
+        #[derive(serde::Serialize)]
+        struct Host {
+            look: &'static str,
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let build = |look| {
+            let sources = [
+                ("host/persona.md", Source::Template("Persona.")),
+                ("host/look.md", Source::Template("{{ look }}")),
+            ];
+            let templates = Templates::with(sources, &Host { look }).unwrap();
+            let persona = "host/persona.md".parse().unwrap();
+            let prompts = Prompts::host(&templates, &Host { look }, persona);
+            let look = Mode {
+                capabilities: listed(&[Capability::Read]),
+                instructions: Some(Instructions::Template("host/look.md".parse().unwrap())),
+                hint: None,
+            };
+            let provider = scripted_provider(&Requests::default(), [answer("done")]);
+            test_builder(root.path(), &sessions, provider, false)
+                .modes([(mode_name("look"), look)].into_iter().collect())
+                .prompts(prompts.unwrap())
+                .build()
+        };
+        let session = build("Live.").await.unwrap().new_session().await.unwrap();
+        session.prompt("start").await.unwrap();
+        let id = session.id();
+        shutdown_session(session).await;
+        for (look, changed) in [("Live.", false), ("Quiet.", true)] {
+            let resumed = build(look).await.unwrap().resume_session(id).await.unwrap();
+            let warnings = resumed.warnings().join("\n");
+            assert_eq!(
+                warnings.contains("changed mode `look`"),
+                changed,
+                "{warnings}"
+            );
+            assert_eq!(resumed.changes_mode(&mode_name("look")), changed);
+            shutdown_session(resumed).await;
+        }
+        let resumed = build("").await.unwrap().resume_session(id).await.unwrap();
+        let warnings = resumed.warnings().join("\n");
+        assert!(
+            warnings.contains("Mode `look`") && warnings.contains("renders blank"),
+            "{warnings}"
+        );
+        let run = resumed.prompt("again").await;
+        assert!(matches!(run, Err(HarnessError::Prompt(_))), "{run:?}");
         shutdown_session(resumed).await;
     }
 

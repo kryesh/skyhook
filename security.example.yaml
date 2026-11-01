@@ -21,9 +21,10 @@ models:
 # limited impact scores below high; use medium for web and other logic-heavy targets.
 shortlist: high
 
-# Omit poc to ask interactively and default to no in batch mode. An explicit ask
-# requires an interactive session; use --poc yes/no when automating this example.
-# poc: ask
+# Live work against a running target: probing it and demonstrating findings. Omit live
+# to ask interactively and default to no in batch mode. An explicit ask requires an
+# interactive session; use --live yes/no when automating this example.
+# live: ask
 
 # How many agents the orchestrator's scheduler runs at once. The default for a new
 # run; the run persists it, and a later launch's --workers can change it. It is not a

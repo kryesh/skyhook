@@ -1,0 +1,70 @@
+# Optional empirical demonstration
+
+Work on one analytically validated candidate: open the test with `research` `begin` `{phase:
+"test", subjects: [candidate]}` and settle it at the end with `research` `test`. The candidate
+is the most severe untested scenario of its root flaw's group: demonstrate it end to end at its
+assessed severity, since a confirmation also covers the group's scenarios that are no more
+severe. Read it with `research_query` `node`, including any test the analysis wrote into the
+evidence as the one that would settle a question.
+
+Define a minimal demonstration with explicit preconditions and observable success criteria that
+distinguish the violation under test from an unrelated error, and a control run on the same
+build showing the guard holds without the trigger (the benign input handled, the unauthorized
+request refused), recorded as a `control` artifact beside the `attack` artifact. For a
+multi-flaw chain, exercise how the flaws combine and the final consequence, not just isolated
+flaws; for a chain across actions, perform each action as its own actor, in order, from the
+state the last left. Use synthetic inputs and non-sensitive markers; do not expose real secrets
+to demonstrate access.
+
+Repeat the demonstration from a clean state and record the success rate. For a race, a check
+apart from its use or a measured difference such as timing, fix the number of trials first and
+run the control as often (the same harness without the competing flow, or with it serialised;
+the same measurement on a value that should not differ), stating both counts in the note, with
+the driver and any delay shim as `harness` and per-trial logs beside `attack` and `control`. It
+is confirmed when the attack succeeds and its control never does, or a measured difference
+separates from its control beyond a threshold stated before the runs, and an `observation` shows
+the mechanism: a race detector's report, a replayable recording of the failing schedule or the
+raw measurements, described with its location when too large to copy. Widening the window (a
+delay at the check, CPU pinning, a stalled file system) counts only for a window present in the
+unmodified build, disclosed, with the success rate of a run without it. Show that the fault
+originates from the candidate's trigger, not from the harness. Flags or settings that disable
+the target's own protections invalidate the demonstration unless the class is about those
+protections. Use an ephemeral port per harness, never a fixed default.
+
+Check revision, configuration, endpoint ownership, shared state and privileges before
+execution. Selection for a test is not blanket approval; do not broaden the target to obtain a
+result. Make an environment change the candidate's premises admit (a service, a build or a
+non-default option) yourself: one only this test needs in your own instance, recorded as
+provenance; a reusable one through an `environment` child briefed with this candidate.
+
+Delegate work that stands apart: independent approaches in parallel, building or instrumenting a
+harness or build, long trial runs, environment changes, and side questions that need deep code
+reading. Brief each child with the candidate and its exact sub-task;
+children keep their files in their working directories and their evidence in the store: work
+from those records, not their replies.
+
+Save the smallest reproducible payload, sanitized commands and configuration, expected versus
+actual observations, and relevant logs or traces in your working directory.
+Re-run after every reduction; keep the smallest payload that still demonstrates the impact and
+write human-followable ordered steps into the test's note. Before recording, enumerate the
+artifacts the demonstration needs — one `attack`, one `control`, an `observation` per step that
+produces evidence — and check that each exists:
+
+```js
+{% include "security/scripts/poc-artifacts.js" %}
+```
+
+Keep going until the demonstration confirms the scenario or disproves it. An inconclusive run is
+not a result: refine the approach, harness, instrumentation, environment or trial counts, and
+run again. Record the result with `research` `test`, with its artifacts and the environment it
+ran in. Confirm only when the demonstration meets its success criteria. Record `failed` only
+with evidence that the scenario does not work as formulated, recorded as contradicting evidence
+on the chain flaw or premise it bears on, which sends the candidate back to review. A demonstration
+waiting on the user (an approval, credentials, a destination or privilege, an option outside the
+premises) is `pending`, stating exactly what it waits for. Failure to demonstrate is not proof
+that no vulnerability exists.
+
+Settle this test on this candidate's scenario alone: another input along the same path to the
+same consequence is this scenario, to try in this test; anything else the run shows is recorded
+apart, citing its artifacts, when you find it. Return the authoritative result and
+evidence references, and the IDs you recorded.

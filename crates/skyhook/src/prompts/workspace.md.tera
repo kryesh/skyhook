@@ -1,0 +1,1 @@
+Workspaces set the base directory; they do not isolate files. Agents on the same target share its filesystem. Paths/cwd may be absolute or relative (including `..`) on the selected machine. Relative child workspace overrides resolve against the selected base.

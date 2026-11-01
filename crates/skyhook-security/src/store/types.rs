@@ -87,11 +87,11 @@ named_enum! {
 }
 
 named_enum! {
-    /// Work the scheduler derives: paths owing a sweep, premises a settling look, flaws a
-    /// chain, candidates an assessment, a review or a test, and root flaws a report.
+    /// Work the scheduler derives: paths owing a sweep or a probe, premises a settling look,
+    /// flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum Phase {
-        Sweep = "sweep", Settle = "settle", Chain = "chain", Assess = "assess",
+        Sweep = "sweep", Probe = "probe", Settle = "settle", Chain = "chain", Assess = "assess",
         Review = "review", Test = "test", Report = "report",
     }
 }
@@ -99,7 +99,7 @@ impl Phase {
     /// The kind of node its work is about.
     pub const fn subject(self) -> NodeKind {
         match self {
-            Self::Sweep => NodeKind::Path,
+            Self::Sweep | Self::Probe => NodeKind::Path,
             Self::Settle => NodeKind::Premise,
             Self::Chain | Self::Report => NodeKind::Flaw,
             Self::Assess | Self::Review | Self::Test => NodeKind::Candidate,
@@ -110,7 +110,7 @@ impl Phase {
     /// stage goes first and holds back the later work it touches.
     pub const fn stage(self) -> u8 {
         match self {
-            Self::Sweep => 0,
+            Self::Sweep | Self::Probe => 0,
             Self::Settle | Self::Chain => 1,
             Self::Assess => 2,
             Self::Review => 3,
@@ -141,18 +141,24 @@ named_enum! {
     #[schemars(inline)]
     pub enum PremiseStatus { Holds = "holds", Fails = "fails", Undecided = "undecided" }
 }
-// A flaw is suspected until it is refuted, or contained: real, with no observable consequence
-// found.
+// A flaw is suspected until it is refuted, or confirmed: a verified defect with no chain to an
+// observable consequence found so far.
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     #[schemars(inline)]
-    pub enum FlawStatus { Suspected = "suspected", Contained = "contained", Refuted = "refuted" }
+    pub enum FlawStatus { Suspected = "suspected", Confirmed = "confirmed", Refuted = "refuted" }
 }
-// Whether a path's sweep is done. Any agent marks it.
+// Whether a path's sweep is done, or the path was recorded in error. Any agent marks it.
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     #[schemars(inline)]
-    pub enum PathStatus { Swept = "swept", Unswept = "unswept" }
+    pub enum PathStatus { Swept = "swept", Unswept = "unswept", Retracted = "retracted" }
+}
+// Whether a source or component stands as recorded, or was recorded in error.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum InventoryStatus { Recorded = "recorded", Retracted = "retracted" }
 }
 named_enum! {
     /// A review's conclusion; its rationale is the verdict event's note.
@@ -209,7 +215,7 @@ string_newtype! {
         } else {
             Ok(())
         }
-    }, schema = schemars::json_schema!({"type": "string", "pattern": "\\S", "maxLength": 1_000_000});
+    }, schema = schemars::json_schema!({"type": "string", "pattern": "\\S"});
 }
 
 named_enum! {
@@ -221,8 +227,8 @@ named_enum! {
 
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    /// A test's outcome. Confirmed and failed (a run that did not demonstrate the scenario,
-    /// inconclusive ones included) are demonstrations; pending waits on the user or the
+    /// A test's outcome. Confirmed and failed (evidence that the scenario does not work as
+    /// formulated) are demonstrations; pending waits on the user or the
     /// environment and settles nothing; unavailable (the environment cannot run a real
     /// demonstration) and declined (the user turned this one down) settle the test as
     /// untested.
@@ -361,9 +367,11 @@ pub trait Keyed {
 }
 
 named_enum! {
-    /// Whether a launch demonstrates validated candidates against an authorized environment.
+    /// Whether a launch works against a running target: probing it in an environment serving its
+    /// interfaces and demonstrating validated candidates. Static analysis of binaries is reading,
+    /// allowed under any.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    pub enum PocPolicy { Ask = "ask", Yes = "yes", No = "no" }
+    pub enum LivePolicy { Ask = "ask", Yes = "yes", No = "no" }
 }
 
 /// Per-run limits, persisted with the run; a later launch may change its workers. A report
@@ -385,67 +393,39 @@ impl Default for RunOptions {
     }
 }
 
-/// A file region: inclusive, one-based lines, in the function containing it when it lies in
-/// one. Paths are stored verbatim.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
-#[serde(try_from = "LocationInput<Option<Text>>")]
-pub struct Location {
-    pub file: Text,
-    pub start_line: u32,
-    pub end_line: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<Text>,
-}
-/// A location's input; its function is `Text` where the location must name one.
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct LocationInput<F> {
-    file: Text,
-    #[schemars(range(min = 1))]
-    start_line: u32,
-    #[schemars(range(min = 1))]
-    end_line: u32,
-    function: F,
-}
-impl Location {
-    pub fn new(
-        file: Text,
-        start_line: u32,
-        end_line: u32,
-        function: Option<Text>,
-    ) -> Result<Self, Error> {
-        if start_line == 0 || start_line > end_line {
-            return Err(Error::Span);
-        }
-        Ok(Self {
-            file,
-            start_line,
-            end_line,
-            function,
-        })
-    }
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum LocationKind { Code = "code", Binary = "binary", Interface = "interface" }
 }
 
-impl<F: Into<Option<Text>>> TryFrom<LocationInput<F>> for Location {
-    type Error = Error;
-    fn try_from(value: LocationInput<F>) -> Result<Self, Error> {
-        Self::new(
-            value.file,
-            value.start_line,
-            value.end_line,
-            value.function.into(),
-        )
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("an interface name is 1 to 128 bytes without whitespace")]
+pub struct InvalidInterfaceName;
+
+string_newtype! {
+    /// A component's interface, by the short name it was recorded under.
+    #[derive(PartialOrd, Ord)]
+    pub struct InterfaceName(InvalidInterfaceName) = |name| {
+        if name.is_empty() || name.len() > 128 || name.chars().any(char::is_whitespace) {
+            Err(InvalidInterfaceName)
+        } else {
+            Ok(())
+        }
+    }, schema = schemars::json_schema!({"type": "string", "pattern": "^\\S+$"});
 }
 
-impl fmt::Display for Location {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}-{}", self.file, self.start_line, self.end_line)?;
-        match &self.function {
-            Some(function) => write!(f, " in {function}"),
-            None => Ok(()),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("an address is an absolute URL with a host, such as tcp://10.0.0.5:7000")]
+pub struct InvalidServiceAddress;
+
+string_newtype! {
+    /// Where an environment serves an interface: an absolute URL with a host.
+    pub struct ServiceAddress(InvalidServiceAddress) = |address| {
+        match address.parse::<http::Uri>() {
+            Ok(uri) if uri.scheme().is_some() && uri.host().is_some_and(|host| !host.is_empty()) => Ok(()),
+            _ => Err(InvalidServiceAddress),
         }
-    }
+    }, schema = schemars::json_schema!({"type": "string", "format": "uri"});
 }
 
 impl Sql for &Text {

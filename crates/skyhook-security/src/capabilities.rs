@@ -6,18 +6,27 @@ pub enum SecurityCapability {
     Research,
     Verdict,
     Test,
+    /// Begin the work the scheduler assigns: the modes it launches.
+    Scheduled,
     /// Schedule the run and write its reports out: the root's alone.
     Coordinate,
 }
 
 impl SecurityCapability {
-    pub const ALL: [Self; 4] = [Self::Research, Self::Verdict, Self::Test, Self::Coordinate];
+    pub const ALL: [Self; 5] = [
+        Self::Research,
+        Self::Verdict,
+        Self::Test,
+        Self::Scheduled,
+        Self::Coordinate,
+    ];
 
     pub fn host(self) -> HostCapability {
         match self {
             Self::Research => "security.research",
             Self::Verdict => "security.verdict",
             Self::Test => "security.test",
+            Self::Scheduled => "security.scheduled",
             Self::Coordinate => "security.coordinate",
         }
         .parse()
@@ -34,6 +43,7 @@ impl SecurityCapability {
             Self::Research => "Record research",
             Self::Verdict => "Decide verdicts",
             Self::Test => "Record tests",
+            Self::Scheduled => "Begin scheduled work",
             Self::Coordinate => "Coordinate the run",
         }
     }

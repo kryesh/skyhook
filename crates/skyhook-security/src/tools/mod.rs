@@ -258,7 +258,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         capabilities::SecurityCapability,
-        store::{NodeId, NodeView, PathId, PocPolicy, RunOptions},
+        store::{LivePolicy, NodeId, NodeView, PathId, RunOptions},
     };
 
     pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -271,13 +271,13 @@ pub(crate) mod tests {
     /// candidate of it along the path, assessed critical; binds their ids.
     const DISCOVER: &str = r#"
         const research = async action => (await tool.research(action)).unwrap();
-        const at = (file, line) => ({file, start_line: line, end_line: line});
+        const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
         const component = await research({action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']});
         const source = await research({action:'upsert',kind:'source',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'});
         const path = await research({action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'});
         await research({action:'link',links:[{path_source:{path,source}},{path_step:{path,component,note:'parse is called on every request'}}]});
         const flaw = await research({action:'upsert',kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120});
-        const candidate = await research({action:'upsert',kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',path,flaws:[flaw]});
+        const candidate = await research({action:'upsert',kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]});
         await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',note:'unauthenticated request controls memory corruption'});
     "#;
 
@@ -288,12 +288,15 @@ pub(crate) mod tests {
     }
     impl Fixture {
         async fn new(capabilities: CapabilitySet) -> Self {
-            Self::built(capabilities, crate::store::tests::harness).await
+            Self::built(capabilities, crate::store::tests::harness, LivePolicy::Yes).await
         }
 
-        /// A session whose children are [`Children`] deciding by brief with `then`, with
-        /// every mode and the capabilities they need.
-        async fn with_children(then: impl Fn(&str) -> Then + Send + Sync + 'static) -> Self {
+        /// A run under `live` whose children are [`Children`] deciding by brief with `then`,
+        /// with every mode and the capabilities they need.
+        async fn with_children(
+            live: LivePolicy,
+            then: impl Fn(&str) -> Then + Send + Sync + 'static,
+        ) -> Self {
             let children = Arc::new(Children(Arc::new(then)));
             let capabilities = capabilities(
                 [
@@ -307,14 +310,17 @@ pub(crate) mod tests {
                 .chain(SecurityCapability::ALL.map(SecurityCapability::capability)),
             );
             let harness = move |root: &std::path::Path| {
-                crate::store::tests::harness_on(root, children).modes(crate::presets::modes())
+                (crate::store::tests::harness_on(root, children))
+                    .modes(crate::presets::modes())
+                    .prompts(crate::prompts::prompts(live))
             };
-            Self::built(capabilities, harness).await
+            Self::built(capabilities, harness, live).await
         }
 
         async fn built(
             capabilities: CapabilitySet,
             harness: impl FnOnce(&std::path::Path) -> skyhook::agent::HarnessBuilder,
+            live: LivePolicy,
         ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let registry = registry().unwrap();
@@ -327,12 +333,10 @@ pub(crate) mod tests {
                 .unwrap();
             let session = harness.new_session().await.unwrap();
             let store = Store::of(session.store().extension().unwrap());
-            tokio::task::spawn_blocking(move || {
-                store.start_run(RunOptions::default(), PocPolicy::Yes)
-            })
-            .await
-            .unwrap()
-            .unwrap();
+            tokio::task::spawn_blocking(move || store.start_run(RunOptions::default(), live))
+                .await
+                .unwrap()
+                .unwrap();
             Self {
                 _root: root,
                 registry,
@@ -405,22 +409,16 @@ pub(crate) mod tests {
         )
     }
 
-    /// A prompt's first JS template.
-    fn template(prompt: &str) -> &str {
-        let script = prompt.split("```js\n").nth(1).unwrap();
-        script.split("```").next().unwrap()
-    }
-
-    /// A prompt's first JS template without its first line, which declares its inputs.
-    fn template_body(prompt: &str) -> &str {
-        template(prompt).split_once('\n').unwrap().1
+    /// A script template without its first line, which declares its inputs.
+    fn template_body(script: &str) -> &str {
+        script.split_once('\n').unwrap().1
     }
 
     /// Each capability admits its action group at the surface, and the executor refuses an
     /// action outside the surfaced schema before it reaches the store.
     #[tokio::test]
     async fn actions_follow_capabilities_at_the_surface_and_the_executor() {
-        let [research, verdict, test, coordinate] =
+        let [research, verdict, test, scheduled, coordinate] =
             SecurityCapability::ALL.map(SecurityCapability::capability);
         let fixture = Fixture::new(all_capabilities()).await;
         let read = capabilities([]);
@@ -431,23 +429,16 @@ pub(crate) mod tests {
             (
                 &read,
                 "research_query",
-                owned(&["history", "list", "node", "synthesis"]),
+                owned(&["history", "list", "node", "synthesis", "task"]),
             ),
-            (
-                &capabilities([verdict.clone()]),
-                "research",
-                owned(&["begin"]),
-            ),
+            (&capabilities([verdict.clone()]), "research", None),
             (
                 &capabilities([verdict.clone(), Capability::Write]),
                 "research",
-                owned(&["begin", "report"]),
+                owned(&["report"]),
             ),
-            (
-                &capabilities([test.clone()]),
-                "research",
-                owned(&["begin", "test"]),
-            ),
+            (&capabilities([test.clone()]), "research", owned(&["test"])),
+            (&capabilities([scheduled]), "research", owned(&["begin"])),
             (
                 &capabilities([coordinate]),
                 "research",
@@ -456,15 +447,18 @@ pub(crate) mod tests {
         ] {
             assert_eq!(fixture.actions(granted, tool), actions, "{tool}");
         }
-        // Only the root mode schedules the run and writes its reports out.
-        for (mode, granted) in crate::presets::modes() {
-            let granted: CapabilitySet = granted.capabilities.into();
+        // Only the root mode schedules the run and writes its reports out, and only a mode
+        // the scheduler launches, whose instructions begin its work, can begin work.
+        for (mode, preset) in crate::presets::tests::editions(LivePolicy::Yes) {
+            let granted: CapabilitySet = preset.capabilities.into();
             let offers = |tool, action| {
                 (fixture.actions(&granted, tool).unwrap_or_default().iter()).any(|a| a == action)
             };
             let root = mode == crate::presets::root();
             assert_eq!(offers("research_query", "startable"), root, "{mode}");
             assert_eq!(offers("research", "generate"), root, "{mode}");
+            let begins = (preset.instructions.unwrap().as_str()).contains("`research` `begin`");
+            assert_eq!(offers("research", "begin"), root || begins, "{mode}");
         }
         // A validator decides verdicts; a tester records what it observes, but never decides
         // verdicts.
@@ -481,8 +475,8 @@ pub(crate) mod tests {
             ),
             (
                 &capabilities([research, test]),
-                &["evidence", "begin", "test"],
-                &["verdict"],
+                &["evidence", "test"],
+                &["verdict", "begin"],
             ),
         ] {
             let actions = fixture.actions(granted, "research").unwrap();
@@ -614,8 +608,8 @@ pub(crate) mod tests {
     async fn every_template_call_names_an_action_its_mode_surfaces() {
         let fixture = Fixture::new(all_capabilities()).await;
         let mut checked = 0;
-        for poc in [PocPolicy::Yes, PocPolicy::No] {
-            for (mode, granted) in crate::presets::for_policy(crate::presets::modes(), poc) {
+        for live in [LivePolicy::Yes, LivePolicy::No] {
+            for (mode, granted) in crate::presets::tests::editions(live) {
                 let instructions = granted.instructions.unwrap();
                 let granted: CapabilitySet = granted.capabilities.into();
                 for (at, _) in instructions.as_str().match_indices("tool.") {
@@ -689,7 +683,7 @@ pub(crate) mod tests {
         fixture.success("research", verdict).await;
         let settling = fixture.success("research", test).await;
         fixture.success("research", json!({"action":"test","candidate":candidate,"result":"pending","note":"needs a board"})).await;
-        let body = template_body(include_str!("../prompts/report.md"));
+        let body = template_body(include_str!("../prompts/scripts/report-scenarios.js"));
         let script = format!("const root = {};\n{body}", ids["flaw"]);
         let first = fixture.script(script.clone()).await;
         assert_eq!(first["scenarios"][0]["id"], candidate, "{first}");
@@ -710,9 +704,10 @@ pub(crate) mod tests {
     }
 
     /// The validation script lists what the candidate's verdict still rests on: here an
-    /// undecided premise of its flaw.
+    /// undecided premise of its flaw, a flaw off every action's steps until an action reaches
+    /// its component, and the premises of a path performed twice once.
     #[tokio::test]
-    async fn the_validation_script_lists_an_undecided_premise() {
+    async fn the_validation_script_lists_an_undecided_premise_and_a_flaw_off_its_actions() {
         let fixture = Fixture::new(all_capabilities()).await;
         let ids = fixture.discover().await;
         let premise = fixture
@@ -720,18 +715,46 @@ pub(crate) mod tests {
             .await;
         let link = json!({"action":"link","links":[{"flaw_premise":{"flaw":ids["flaw"],"premise":premise}}]});
         fixture.success("research", link).await;
-        let body = template_body(include_str!("../prompts/validate.md"));
-        let result = fixture
-            .script(format!("const candidate = {};\n{body}", ids["candidate"]))
-            .await;
-        assert_eq!(
-            result["gaps"],
-            json!([format!(
-                "code premise {premise} of flaw {} is undecided: the listener is enabled",
-                ids["flaw"]
-            )]),
-            "{result}"
+        let body = template_body(include_str!("../prompts/scripts/validate-gaps.js"));
+        let gaps = async || {
+            let result = fixture
+                .script(format!("const candidate = {};\n{body}", ids["candidate"]))
+                .await;
+            result["gaps"].clone()
+        };
+        let undecided = format!(
+            "code premise {premise} of flaw {} is undecided: the listener is enabled",
+            ids["flaw"]
         );
+        assert_eq!(gaps().await, json!([undecided]));
+        let later = fixture.script(format!(r#"
+            const research = async action => (await tool.research(action)).unwrap();
+            const at = (file, line) => ({{code: {{file, start_line: line, end_line: line}}}});
+            const component = await research({{action:'upsert',kind:'component',title:'store',body:'session store',files:['store.c']}});
+            const source = await research({{action:'upsert',kind:'source',title:'login',body:'login form',location:at('store.c',1),trust:'untrusted'}});
+            const path = await research({{action:'upsert',kind:'path',title:'login',body:'login writes the session'}});
+            await research({{action:'link',links:[{{path_source:{{path,source}}}},{{path_step:{{path,component,note:'writes'}}}}]}});
+            const flaw = await research({{action:'upsert',kind:'flaw',title:'Stale session',body:'kept after logout',component,location:at('store.c',4)}});
+            await research({{action:'upsert',kind:'candidate',id:{candidate},flaws:[{root},flaw]}});
+            return {{path, flaw}};
+        "#, candidate = ids["candidate"], root = ids["flaw"])).await;
+        let off = format!(
+            "flaw {} lies off every action's steps: a missing step or action?",
+            later["flaw"]
+        );
+        assert_eq!(gaps().await, json!([undecided, off]));
+        let actions = json!({"action":"upsert","kind":"candidate","id":ids["candidate"],"paths":[ids["path"],later["path"]]});
+        fixture.success("research", actions).await;
+        assert_eq!(gaps().await, json!([undecided]));
+        let link = json!({"action":"link","links":[{"path_premise":{"path":later["path"],"premise":premise}}]});
+        fixture.success("research", link).await;
+        let repeated = json!({"action":"upsert","kind":"candidate","id":ids["candidate"],"paths":[later["path"],ids["path"],later["path"]]});
+        fixture.success("research", repeated).await;
+        let on_path = format!(
+            "code premise {premise} of path {} is undecided: the listener is enabled",
+            later["path"]
+        );
+        assert_eq!(gaps().await, json!([undecided, on_path]), "once per path");
         fixture.close().await;
     }
 
@@ -745,8 +768,7 @@ pub(crate) mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "int x;\n").unwrap();
         }
-        let target = include_str!("../prompts/target.md");
-        let body = template_body(target.split_once("```\n").unwrap().1);
+        let body = template_body(include_str!("../prompts/scripts/target-map.js"));
         let map = r#"[{title: "net", body: "network input", patterns: ["src/net/**"]}, {title: "core", body: "the rest", patterns: ["src/**"]}]"#;
         let result = fixture.script(format!("const map = {map};\n{body}")).await;
         let mut files = Vec::new();
@@ -772,7 +794,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
         let result = fixture.script(r#"
             const research = async action => (await tool.research(action)).unwrap();
-            const at = (file, line) => ({file, start_line: line, end_line: line});
+            const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
             const parser = await research({action:'upsert',kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']});
             const decoder = await research({action:'upsert',kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']});
             const paths = [];
@@ -783,11 +805,11 @@ pub(crate) mod tests {
             }
             return {parser, decoder, paths};
         "#).await;
-        let body = template_body(include_str!("../prompts/paths.md"));
+        let paths = template_body(include_str!("../prompts/scripts/paths.live.js"));
         let grouped = fixture
-            .script(format!("const workers = 1, inputs = [];\n{body}"))
+            .script(format!("const workers = 1, inputs = [];\n{paths}"))
             .await;
-        let at = |file: &str, line: u32| json!({"file": file, "start_line": line, "end_line": line, "function": null});
+        let at = |file: &str, line: u32| json!({"code": {"file": file, "start_line": line, "end_line": line, "function": null}});
         let paths = &result["paths"];
         assert_eq!(
             grouped["handoffs"],
@@ -838,7 +860,7 @@ pub(crate) mod tests {
             await research({action:'link',links:[{path_step:{path,component:main,note:'reads'}},{path_step:{path,component:parser,note:'parses'}}]});
             return path;
         "#).await;
-        let body = template_body(include_str!("../prompts/path-sweep.md"));
+        let body = template_body(include_str!("../prompts/scripts/sweep-measure.js"));
         let result = fixture
             .script(format!("const path = {path};\n{body}"))
             .await;
@@ -851,10 +873,15 @@ pub(crate) mod tests {
         fixture.close().await;
     }
 
-    /// The scheduler template rendered under `poc`, without its inputs line.
-    fn scheduler(poc: PocPolicy) -> String {
-        let orchestrate = crate::presets::rendered(include_str!("../prompts/orchestrate.md"), poc);
-        template_body(&orchestrate).to_owned()
+    /// The scheduler template a run under `live` is shown, without its inputs line.
+    fn scheduler(live: LivePolicy) -> String {
+        template_body(match live {
+            LivePolicy::No => include_str!("../prompts/scripts/scheduler.no-live.js"),
+            LivePolicy::Ask | LivePolicy::Yes => {
+                include_str!("../prompts/scripts/scheduler.live.js")
+            }
+        })
+        .to_owned()
     }
 
     /// Runs `body` after `stubs`, which declare the `tool` and `receive` it uses and its
@@ -1030,13 +1057,16 @@ pub(crate) mod tests {
     /// The scheduler's launch briefs, each cut to its phase and first node.
     const BRIEFS: &str = "started.map(p => p.match(/^\\D+\\d+/)[0])";
 
+    /// The scheduler's launch briefs, each cut to its first sentence: its work and subjects.
+    const HEADS: &str = "started.map(p => p.split('. ')[0])";
+
     /// The orchestrator's scheduler reads only what it starts: with one worker and a long
     /// queue, the rows it reads grow with the work, not with its square. Every child fails,
     /// so each sweep is tried twice before it is exhausted.
     #[tokio::test]
     async fn the_scheduler_reads_a_bounded_page_per_launch() {
-        const SWEEPS: usize = 30;
-        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        const SWEEPS: usize = 10;
+        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
         sweeps(&fixture, SWEEPS).await;
         let stubs = "let rows = 0;
             const real = globalThis.tool;
@@ -1045,9 +1075,9 @@ pub(crate) mod tests {
                 research_query: async action => { const result = await real.research_query(action); if (action.action === 'startable') rows += result.unwrap().items.length; return result; },
             };
             const receive = () => new Promise(() => {});
-            const workers = 1;";
+            const workers = 1, artifacts = 'artifacts';";
         let returned = "{rows, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, stubs, &scheduler(PocPolicy::No), returned).await;
+        let result = run_template(&fixture, stubs, &scheduler(LivePolicy::No), returned).await;
         assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
         let rows = result["rows"].as_u64().unwrap() as usize;
         assert!(rows <= 2 * SWEEPS, "{rows} rows for {SWEEPS} sweeps");
@@ -1057,11 +1087,11 @@ pub(crate) mod tests {
     /// A pool wider than the largest page still reads its work a page at a time.
     #[tokio::test]
     async fn the_scheduler_pages_a_pool_wider_than_a_page() {
-        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
         sweeps(&fixture, 2).await;
-        let stubs = format!("{RECORDING}\nconst workers = 1001;");
+        let stubs = format!("{RECORDING}\nconst workers = 1001, artifacts = 'artifacts';");
         let returned = "{launched: started.length, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
+        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), returned).await;
         assert_eq!(result, json!({"launched": 4, "exhausted": 2}));
         fixture.close().await;
     }
@@ -1072,7 +1102,7 @@ pub(crate) mod tests {
     async fn the_scheduler_holds_a_launched_subject_until_its_child_begins() {
         const SWEEPS: usize = 6;
         const LAUNCHES: usize = 2 * SWEEPS;
-        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
         sweeps(&fixture, SWEEPS).await;
         // The first launch begins once every other sweep is exhausted.
         let stubs = format!(
@@ -1095,10 +1125,10 @@ pub(crate) mod tests {
                 }},
             }};
             const receive = () => new Promise(() => {{}});
-            const workers = 2;"
+            const workers = 2, artifacts = 'artifacts';"
         );
         let returned = "{launched, held, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
+        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), returned).await;
         assert_eq!(result["launched"], json!(LAUNCHES), "{result}");
         assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
         let held = result["held"].as_array().unwrap();
@@ -1115,7 +1145,7 @@ pub(crate) mod tests {
     async fn candidates(fixture: &Fixture, count: usize, shared: bool, validated: bool) -> Value {
         fixture.script(format!(r#"
             const research = async action => (await tool.research(action)).unwrap();
-            const at = (file, line) => ({{file, start_line: line, end_line: line}});
+            const at = (file, line) => ({{code: {{file, start_line: line, end_line: line}}}});
             const component = await research({{action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']}});
             const path = await research({{action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'}});
             const source = await research({{action:'upsert',kind:'source',title:'request',body:'the raw request',location:at('input.c',1),trust:'untrusted'}});
@@ -1124,7 +1154,7 @@ pub(crate) mod tests {
             let flaw;
             for (let i = 0; i < {count}; i++) {{
                 if (i === 0 || !{shared}) flaw = await research({{action:'upsert',kind:'flaw',title:`Unchecked copy ${{i}}`,body:'the request length is copied into a fixed buffer',component,location:at('input.c',8 + i)}});
-                const candidate = await research({{action:'upsert',kind:'candidate',title:`Unchecked copy ${{i}}`,body:'request length overflows a fixed buffer',path,flaws:[flaw]}});
+                const candidate = await research({{action:'upsert',kind:'candidate',title:`Unchecked copy ${{i}}`,body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]}});
                 if ({validated}) {{
                     await research({{...{assess},candidate}});
                     await research({{action:'verdict',candidate,verdict:'validated',note:'reviewed the path'}});
@@ -1162,27 +1192,45 @@ pub(crate) mod tests {
         }
     }
 
-    async fn set_policy(fixture: &Fixture, poc: PocPolicy) {
-        let store = Store::of(fixture.session.store().extension().unwrap());
-        tokio::task::spawn_blocking(move || store.set_poc_policy(poc))
-            .await
-            .unwrap()
-            .unwrap();
+    /// A task's read returns its finished child's reply after its job ended, by the id the
+    /// synthesis names for the subject its tasks left exhausted.
+    #[tokio::test]
+    async fn a_finished_tasks_reply_is_read_by_the_id_its_exhaustion_names() {
+        let fixture = Fixture::with_children(LivePolicy::No, |_| {
+            Then::Record(|path| {
+                json!({"action": "evidence", "node": path, "items": [{"stance": "context", "note": "looked"}]})
+            })
+        })
+        .await;
+        let path = sweeps(&fixture, 1).await[0];
+        let result = fixture.script(format!(r#"
+            for (let i = 0; i < 2; i++) await tool.agent({{mode: "sweep", depth: 1, name: `sweep-${{i}}`, prompt: "Sweep path {path} (part0)."}});
+            const [exhausted] = (await tool.research_query({{action: "synthesis"}})).unwrap().exhausted;
+            const task = (await tool.research_query({{action: "task", id: exhausted.tasks.at(-1)}})).unwrap();
+            return {{tasks: exhausted.tasks.length, subjects: task.subjects, state: task.state, reply: task.reply}};
+        "#)).await;
+        assert_eq!(
+            result,
+            json!({"tasks": 2, "subjects": [path], "state": "completed", "reply": "done"})
+        );
+        fixture.close().await;
     }
 
     /// A child that fails before it begins its task counts toward its node's two tries in the
     /// run: the node is launched twice, then listed exhausted with its last child's reply,
-    /// though the store holds no task of it. Running no more, it takes no test slot: with one,
-    /// the next test runs and none is held.
+    /// though the store holds no task of it. Running no more, it holds back nothing: the next
+    /// test runs and none is held.
     #[tokio::test]
     async fn the_scheduler_returns_a_subject_whose_children_never_began() {
-        let fixture =
-            Fixture::with_children(unbegun_first("Demonstrate candidate ", sweeps_then_fail)).await;
+        let fixture = Fixture::with_children(
+            LivePolicy::Yes,
+            unbegun_first("Demonstrate candidate ", sweeps_then_fail),
+        )
+        .await;
         let made = candidates(&fixture, 2, false, true).await;
         let [first, second] = [0, 1].map(|i| made["candidates"][i].clone());
-        set_policy(&fixture, PocPolicy::Yes).await;
         let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let body = scheduler(PocPolicy::Yes).replace("const pocSlots = 0;", "const pocSlots = 1;");
+        let body = scheduler(LivePolicy::Yes);
         let returned = "{tests: started.filter(p => p.startsWith('Demonstrate')).map(p => Number(p.match(/\\d+/)[0])), held: outcome.held, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node]), reply: outcome.synthesis.exhausted[0].reply}";
         let mut result = run_template(&fixture, &stubs, &body, returned).await;
         let reply = result["reply"].take();
@@ -1206,12 +1254,14 @@ pub(crate) mod tests {
     /// root's report.
     #[tokio::test]
     async fn a_spent_test_releases_its_root_group_in_the_same_run() {
-        let fixture =
-            Fixture::with_children(unbegun_first("Demonstrate candidate ", sweeps_then_fail)).await;
+        let fixture = Fixture::with_children(
+            LivePolicy::Yes,
+            unbegun_first("Demonstrate candidate ", sweeps_then_fail),
+        )
+        .await;
         let made = candidates(&fixture, 2, true, true).await;
-        set_policy(&fixture, PocPolicy::Yes).await;
         let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let body = scheduler(PocPolicy::Yes).replace("const pocSlots = 0;", "const pocSlots = 1;");
+        let body = scheduler(LivePolicy::Yes);
         let returned = format!(
             "{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
         );
@@ -1234,11 +1284,11 @@ pub(crate) mod tests {
 
     /// A second launch that settles the work it was spent on suppresses nothing: the
     /// assessment's first child never begins and its second records it, so the candidate's
-    /// review starts in the same run and nothing is exhausted.
+    /// review starts in the same run, then its root's report, and only the report is exhausted.
     #[tokio::test]
     async fn a_launch_that_settles_spent_work_releases_its_next_phase() {
         let assessments = std::sync::atomic::AtomicBool::new(false);
-        let fixture = Fixture::with_children(move |brief| {
+        let fixture = Fixture::with_children(LivePolicy::No, move |brief| {
             if brief.starts_with("Sweep") {
                 SWEEP
             } else if brief.starts_with("Assess") {
@@ -1254,31 +1304,36 @@ pub(crate) mod tests {
         })
         .await;
         let made = candidates(&fixture, 1, false, false).await;
-        let stubs = format!("{RECORDING}\nconst workers = 1;");
-        let returned = format!("{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted}}");
-        let candidate = &made["candidates"][0]["candidate"];
+        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
+        let returned = format!(
+            "{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
+        );
+        let (candidate, root) = (
+            &made["candidates"][0]["candidate"],
+            &made["candidates"][0]["root"],
+        );
+        let report = format!("Report root flaw {root}");
         assert_eq!(
-            run_template(&fixture, &stubs, &scheduler(PocPolicy::No), &returned).await,
+            run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await,
             json!({
                 "started": [format!("Sweep path {}", made["path"]), format!("Assess candidate {candidate}"),
-                    format!("Assess candidate {candidate}"), format!("Review candidate {candidate}")],
-                "exhausted": [],
+                    format!("Assess candidate {candidate}"), format!("Review candidate {candidate}"), &report, &report],
+                "exhausted": [["report", root]],
             })
         );
         fixture.close().await;
     }
 
     /// The scheduler returns with held tests and nothing else to start; run again with an
-    /// approval and a slot, the store passes over the tests it may still not start to reach
+    /// approval, the store passes over the tests it may still not start to reach
     /// the approved one, a page per launch. Two children leaving that test owed exhaust it,
     /// which releases its root's report.
     #[tokio::test]
     async fn the_scheduler_returns_held_tests_and_reaches_the_approved_one_when_rerun() {
         const CANDIDATES: usize = 31;
-        let fixture = Fixture::with_children(sweeps_then_fail).await;
+        let fixture = Fixture::with_children(LivePolicy::Ask, sweeps_then_fail).await;
         let made = candidates(&fixture, CANDIDATES, false, true).await;
         let approved = made["candidates"][CANDIDATES - 1].clone();
-        set_policy(&fixture, PocPolicy::Ask).await;
         let stubs = "let reads = 0;
             const started = [], real = globalThis.tool;
             const tool = {
@@ -1292,7 +1347,7 @@ pub(crate) mod tests {
         let run = async |inputs: Vec<(&'static str, String)>| {
             let body = inputs
                 .iter()
-                .fold(scheduler(PocPolicy::Ask), |body, (input, value)| {
+                .fold(scheduler(LivePolicy::Ask), |body, (input, value)| {
                     assert!(body.contains(input), "{input}");
                     body.replace(input, value)
                 });
@@ -1304,13 +1359,10 @@ pub(crate) mod tests {
         );
         let test = format!("Demonstrate candidate {}", approved["candidate"]);
         let report = format!("Report root flaw {}", approved["root"]);
-        let rerun = run(vec![
-            (
-                "[/* under ask: candidates the user approved */]",
-                format!("[{}]", approved["candidate"]),
-            ),
-            ("const pocSlots = 0;", "const pocSlots = 1;".to_owned()),
-        ]);
+        let rerun = run(vec![(
+            "[/* under ask: candidates the user approved */]",
+            format!("[{}]", approved["candidate"]),
+        )]);
         assert_eq!(
             rerun.await,
             json!({"reads": 5, "started": [&test, &test, &report, &report], "held": true})
@@ -1323,7 +1375,7 @@ pub(crate) mod tests {
     /// back.
     #[tokio::test]
     async fn the_scheduler_briefs_sweeps_and_chains_and_exhausts_what_children_leave_owed() {
-        let fixture = Fixture::with_children(|_| Then::Fail).await;
+        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
         let path = sweeps(&fixture, 1).await[0];
         let store = Store::of(fixture.session.store().extension().unwrap());
         let agent = fixture.session.root_agent().clone();
@@ -1336,13 +1388,14 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
-        let stubs = format!("{RECORDING}\nconst workers = 1;");
-        let returned =
-            "{started, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}";
-        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
+        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
+        let returned = format!(
+            "{{started: {HEADS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
+        );
+        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await;
         let (sweep, chain) = (
-            format!("Sweep path {path} (part0)."),
-            format!("Chain flaw {flaw} (unbounded copy)."),
+            format!("Sweep path {path} (part0)"),
+            format!("Chain flaw {flaw} (unbounded copy)"),
         );
         assert_eq!(
             result,
@@ -1363,7 +1416,7 @@ pub(crate) mod tests {
         // The parser's children run until the first scheduler is killed; every other fails.
         let killing = Arc::new(AtomicBool::new(true));
         let hangs = killing.clone();
-        let fixture = Fixture::with_children(move |brief| {
+        let fixture = Fixture::with_children(LivePolicy::No, move |brief| {
             match brief.contains("(part1)") && hangs.load(SeqCst) {
                 true => Then::Hang,
                 false => Then::Fail,
@@ -1376,7 +1429,7 @@ pub(crate) mod tests {
         let killed = format!(
             "{RECORDING}
             tool.agent = args => (started.push(args.prompt), started.filter(p => p === args.prompt).length > 1 && args.prompt.includes('(part0)') ? new Promise(() => {{}}) : real.agent(args));
-            const workers = 2;"
+            const workers = 2, artifacts = 'artifacts';"
         );
         let store = Store::of(fixture.session.store().extension().unwrap());
         let mut updates = fixture.session.store().observe().updates;
@@ -1412,19 +1465,20 @@ pub(crate) mod tests {
         // Killed, the script fails; what it left is the store's.
         let run = fixture
             .session
-            .run_script(format!("{killed}\n{}", scheduler(PocPolicy::No)));
+            .run_script(format!("{killed}\n{}", scheduler(LivePolicy::No)));
         let _ = bounded(async { tokio::join!(run, tried) }).await;
 
-        let stubs = format!("{RECORDING}\nconst workers = 2;");
-        let returned =
-            "{started, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}";
-        let result = run_template(&fixture, &stubs, &scheduler(PocPolicy::No), returned).await;
+        let stubs = format!("{RECORDING}\nconst workers = 2, artifacts = 'artifacts';");
+        let returned = format!(
+            "{{started: {HEADS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
+        );
+        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await;
         assert_eq!(
             result,
             json!({
                 "started": [
-                    format!("Sweep path {decoder} (part0)."),
-                    format!("Sweep path {parser} (part1)."),
+                    format!("Sweep path {decoder} (part0)"),
+                    format!("Sweep path {parser} (part1)"),
                 ],
                 "exhausted": [["sweep", decoder], ["sweep", parser]],
             })

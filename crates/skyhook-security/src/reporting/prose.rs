@@ -201,13 +201,18 @@ pub(super) fn label(text: &str) -> String {
     inline(text, Setting::Label)
 }
 
+/// `text` on one line: each run of line breaks becomes a space.
+pub(super) fn flat(text: &str) -> String {
+    let lines: Vec<&str> = (text.split(['\r', '\n']))
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.join(" ")
+}
+
 fn inline(text: &str, setting: Setting) -> String {
     // A leading word keeps the text inline, as it is within the page's line.
     const LEAD: &str = "x ";
-    let flat: Vec<&str> = (text.split(['\r', '\n']))
-        .filter(|line| !line.is_empty())
-        .collect();
-    let mut text = escape(format!("{LEAD}{}", flat.join(" ")), LEAD.len(), setting);
+    let mut text = escape(format!("{LEAD}{}", flat(text)), LEAD.len(), setting);
     if escaped(&text, text.len()) {
         text.push('\\');
     }

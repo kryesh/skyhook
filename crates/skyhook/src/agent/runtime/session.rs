@@ -763,11 +763,11 @@ mod tests {
         };
         let prompt = |request: &ModelRequest| request.system[0].text.clone();
         let (looking, child, working) = (&captured[0], &captured[1], &captured[3]);
-        assert!(prompt(looking).contains("<mode name=\"look\">\nOnly look.\n</mode>"));
+        assert!(prompt(looking).contains("Only look."));
         assert!(offers(looking, "read") && !offers(looking, "write"));
         // The child inherits the narrowed set, but a mode's instructions are the root's.
-        assert!(!prompt(child).contains("<mode") && !offers(child, "write"));
-        assert!(!prompt(working).contains("<mode") && offers(working, "write"));
+        assert!(!prompt(child).contains("Only look.") && !offers(child, "write"));
+        assert!(!prompt(working).contains("Only look.") && offers(working, "write"));
         assert_eq!(captured[4].system, working.system);
         // The switch replaced the conversation its signed reasoning was bound to.
         let replays = |request: &ModelRequest| {
@@ -791,7 +791,7 @@ mod tests {
         // A mode's first use records its first edition.
         let first_edition = |name: &str| crate::session::ModeSelection {
             name: mode_name(name),
-            definition: Some(modes[name].clone()),
+            definition: Some(edition(&modes[name])),
         };
         assert_eq!(
             changes,

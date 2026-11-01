@@ -27,6 +27,7 @@ use super::*;
 )]
 pub enum Begin {
     Sweep(Vec<PathId>),
+    Probe(Vec<PathId>),
     Settle(Vec<PremiseId>),
     Chain(Vec<FlawId>),
     Assess(Vec<CandidateId>),
@@ -40,6 +41,7 @@ impl Begin {
     pub fn phase(&self) -> Phase {
         match self {
             Self::Sweep(_) => Phase::Sweep,
+            Self::Probe(_) => Phase::Probe,
             Self::Settle(_) => Phase::Settle,
             Self::Chain(_) => Phase::Chain,
             Self::Assess(_) => Phase::Assess,
@@ -54,7 +56,7 @@ impl Begin {
             ids.iter().map(|id| (*id).into()).collect()
         }
         match self {
-            Self::Sweep(ids) => nodes(ids),
+            Self::Sweep(ids) | Self::Probe(ids) => nodes(ids),
             Self::Settle(ids) => nodes(ids),
             Self::Chain(ids) | Self::Report(ids) => nodes(ids),
             Self::Assess(ids) | Self::Review(ids) | Self::Test(ids) => nodes(ids),
@@ -104,9 +106,11 @@ impl Keyed for Task {
 }
 
 /// A task with its brief, its child's reply, and what its child recorded.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct TaskDetail {
+    #[serde(flatten)]
     pub task: Task,
+    pub job: JobId,
     /// The prompt the task's job was launched with.
     pub brief: Option<String>,
     /// Its child's latest reply; none until it replies.
@@ -134,6 +138,54 @@ fn task_row(row: &Row) -> Result<Task> {
         state: enum_column(row, 1)?,
         began: time(row.get(2)?)?,
         ended: row.get::<Option<i64>>(3)?.map(time).transpose()?,
+    })
+}
+
+/// Each subject of a live task, a merged one as the node it was merged into, as `task`, `phase`,
+/// `node` and `began` rows: driven by the journal's live jobs, read down their index, never by the
+/// task log's history, whatever statistics the planner lacks. The node keeps an integer's
+/// affinity, so that a relation of these rows is sought by phase and node.
+macro_rules! live {
+    () => {
+        "SELECT t.id AS task,tn.phase,CAST(coalesce(n.merged_into,n.id) AS INTEGER) AS node,\
+         t.began FROM job_status j CROSS JOIN task t ON t.job=j.job JOIN task_node tn ON \
+         tn.task=t.id JOIN node n ON n.id=tn.node WHERE NOT j.terminal"
+    };
+}
+pub(super) use live;
+
+/// How many of its latest tasks a node view names.
+const NODE_TASKS: u32 = 5;
+
+/// The latest `$limit` tasks of node `$n`, or of a node merged into it, newest first, as `task`
+/// rows: the newest of its own and of those merged into it, each read down its index, a task
+/// on several merged nodes counted once.
+macro_rules! newest_tasks {
+    ($n:expr, $limit:expr) => {
+        concat!(
+            "SELECT task FROM (SELECT task FROM task_node WHERE node=",
+            $n,
+            " ORDER BY task DESC LIMIT ",
+            $limit,
+            ") UNION SELECT task FROM (SELECT DISTINCT tn.task FROM node m JOIN task_node tn ON \
+             tn.node=m.id WHERE m.merged_into=",
+            $n,
+            " ORDER BY tn.task DESC LIMIT ",
+            $limit,
+            ") ORDER BY task DESC LIMIT ",
+            $limit
+        )
+    };
+}
+pub(super) use newest_tasks;
+
+/// The latest tasks of node `?1`, or of a node merged into it, newest first, `?2` of them.
+pub(super) const OF_NODE: &str = newest_tasks!("?1", "?2");
+
+/// The latest tasks of node `node`, or of a node merged into it, newest first.
+pub(super) fn of_node(db: &Db, node: NodeId) -> Result<Vec<TaskId>> {
+    rows(db, OF_NODE, params![node, NODE_TASKS], |row| {
+        Ok(TaskId(row.get(0)?))
     })
 }
 
@@ -256,9 +308,11 @@ impl Store {
         })?;
         let more = events.len() > limit;
         events.truncate(limit);
-        let texts = self.0.agent_job_texts(journal_job(job)?)?;
+        let job = journal_job(job)?;
+        let texts = self.0.agent_job_texts(job)?;
         Ok(TaskDetail {
             task,
+            job,
             brief: texts.as_ref().map(|texts| texts.prompt.clone()),
             reply: texts.and_then(|texts| texts.reply),
             events,
@@ -266,17 +320,15 @@ impl Store {
         })
     }
 
-    /// The journal's latest agent job transition, a finish included: job state the research
+    /// The journal's latest job transition, a finish included: job state the research
     /// generation does not follow moves it, so a cache of what reads task liveness keys on it.
+    /// Any job's transition moves it, read at the end of each table's key.
     pub fn journal_mark(&self) -> Result<Option<i64>> {
-        // Each side walks its table back from the newest entry to the first agent job's.
         self.read(|db| {
             stored(
                 db,
-                "SELECT max(entry) FROM (SELECT * FROM (SELECT t.entry FROM job_transition t JOIN \
-                 job j ON j.id=t.job WHERE j.role='agent' ORDER BY t.entry DESC LIMIT 1) UNION \
-                 ALL SELECT * FROM (SELECT f.entry FROM job_finish f JOIN job j ON j.id=f.job \
-                 WHERE j.role='agent' ORDER BY f.entry DESC LIMIT 1))",
+                "SELECT max(entry) FROM (SELECT max(entry) AS entry FROM job_transition UNION ALL \
+                 SELECT max(entry) FROM job_finish)",
                 Vec::new(),
                 |row| Ok(row.get::<Option<i64>>(0)?),
             )
@@ -289,7 +341,9 @@ mod tests {
     use skyhook::job::JobState;
 
     use super::{
-        super::tests::{HIGH, assess, begun, child_agent, fixture, last_event, scenario, text},
+        super::tests::{
+            HIGH, assess, begun, child_agent, fixture, last_event, premise, scenario, text,
+        },
         *,
     };
 
@@ -364,5 +418,27 @@ mod tests {
             [EventKind::Began]
         );
         assert!(!detail.more && store.task(task, 0).unwrap().more);
+    }
+
+    /// A node's latest tasks count a task once however many of the nodes merged into it it
+    /// began on.
+    #[test]
+    fn a_nodes_latest_tasks_count_each_task_once() {
+        let (_session, store, actor) = fixture();
+        let [a, b, c] = [(); 3].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let mut tasks: Vec<TaskId> = (0..4)
+            .map(|_| begun(&store, &Begin::Settle(vec![a])).2)
+            .collect();
+        tasks.push(begun(&store, &Begin::Settle(vec![a, b])).2);
+        for premise in [a, b] {
+            let merge = Merge::Premise {
+                premise,
+                into: c,
+                note: text("same"),
+            };
+            store.merge(&actor, &merge).unwrap();
+        }
+        tasks.reverse();
+        assert_eq!(store.read(|db| of_node(db, c.into())).unwrap(), tasks);
     }
 }

@@ -13,7 +13,7 @@ use super::*;
 /// The research tables every security session keeps beside its journal.
 pub const EXTENSION: Extension = Extension {
     sql: concat!(include_str!("schema.sql"), bearing::derived_views!()),
-    format: 12,
+    format: 13,
     seed,
 };
 
@@ -26,10 +26,13 @@ fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
             libsql::Value::Integer(phase.stage().into()),
         ]
     })?;
+    dictionaries.names("location_kind", &LocationKind::ALL)?;
     dictionaries.names("trust_kind", &Trust::ALL)?;
     dictionaries.names("premise_scope", &PremiseScope::ALL)?;
     dictionaries.names("premise_status", &PremiseStatus::ALL)?;
     dictionaries.names("flaw_status", &FlawStatus::ALL)?;
+    dictionaries.names("path_status", &PathStatus::ALL)?;
+    dictionaries.names("inventory_status", &InventoryStatus::ALL)?;
     dictionaries.ranked("severity_kind", &Severity::ALL)?;
     dictionaries.names("verdict_kind", &Verdict::ALL)?;
     dictionaries.names("stance_kind", &Stance::ALL)?;
@@ -37,11 +40,11 @@ fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     dictionaries.names("artifact_role", &ArtifactRole::ALL)?;
     dictionaries.names("event_kind", &EventKind::ALL)?;
     dictionaries.ranked("event_effect", &EventEffect::ALL)?;
-    dictionaries.names("poc_policy_kind", &PocPolicy::ALL)
+    dictionaries.names("live_policy_kind", &LivePolicy::ALL)
 }
 
-/// The run: its session, when it began, its options, and the PoC policy of the launch
-/// working it.
+/// The run: its session, when it began, its options, and the live policy it started under,
+/// which it keeps.
 #[derive(Clone, Debug, Serialize)]
 pub struct Run {
     pub id: SessionId,
@@ -49,13 +52,13 @@ pub struct Run {
     #[serde(flatten)]
     pub options: RunOptions,
     #[serde(skip)]
-    pub poc: PocPolicy,
+    pub live: LivePolicy,
 }
 
 pub(super) fn run(db: &Db) -> Result<Run> {
     optional(
         db,
-        "SELECT s.public_id,r.created,r.threshold,r.workers,r.poc FROM run r JOIN session s",
+        "SELECT s.public_id,r.created,r.threshold,r.workers,r.live FROM run r JOIN session s",
         Vec::new(),
         |row| {
             Ok(Run {
@@ -68,7 +71,7 @@ pub(super) fn run(db: &Db) -> Result<Run> {
                         .and_then(std::num::NonZeroU16::new)
                         .ok_or_else(|| corrupt("invalid stored worker count"))?,
                 },
-                poc: enum_column(row, 4)?,
+                live: enum_column(row, 4)?,
             })
         },
     )?
@@ -122,21 +125,13 @@ impl Store {
         self.read(|db| exists(db, "SELECT 1 FROM run", Vec::new()))
     }
 
-    /// Record the run as its session opens, under the launch's PoC policy.
-    pub fn start_run(&self, options: RunOptions, poc: PocPolicy) -> Result<()> {
+    /// Record the run as its session opens, under the live policy it keeps.
+    pub fn start_run(&self, options: RunOptions, live: LivePolicy) -> Result<()> {
         self.write(|db| {
             db.execute(
-                "INSERT INTO run(id,created,threshold,workers,poc) VALUES (1,?1,?2,?3,?4)",
-                params![now(), options.threshold, options.workers.get(), poc],
+                "INSERT INTO run(id,created,threshold,workers,live) VALUES (1,?1,?2,?3,?4)",
+                params![now(), options.threshold, options.workers.get(), live],
             )?;
-            Ok(())
-        })
-    }
-
-    /// A later launch works the run under its own PoC policy.
-    pub fn set_poc_policy(&self, poc: PocPolicy) -> Result<()> {
-        self.write(|db| {
-            db.execute("UPDATE run SET poc=?1", params![poc])?;
             Ok(())
         })
     }

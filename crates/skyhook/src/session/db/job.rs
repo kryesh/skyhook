@@ -46,15 +46,17 @@ pub(in crate::session) fn write_status(db: &Db, jobs: &[(JobId, JobStatus)]) -> 
         let progress = child.map(|child| (child.progress.turns, child.progress.tool_calls));
         let (turns, tool_calls) = progress.unzip();
         db.execute(
-            "INSERT INTO job_status (job, state, invocation, background, cancel_recorded, \
-               pending, first_run_millis, ended_millis, answer, answer_kind, turns, tool_calls, \
-               resident) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT (job) DO UPDATE SET state = ?2, invocation = ?3, background = ?4, \
-               cancel_recorded = ?5, pending = ?6, first_run_millis = ?7, ended_millis = ?8, \
-               answer = ?9, answer_kind = ?10, turns = ?11, tool_calls = ?12",
+            "INSERT INTO job_status (job, state, terminal, invocation, background, \
+               cancel_recorded, pending, first_run_millis, ended_millis, answer, answer_kind, \
+               turns, tool_calls, resident) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             ON CONFLICT (job) DO UPDATE SET invocation = ?4, background = ?5, \
+               cancel_recorded = ?6, pending = ?7, first_run_millis = ?8, ended_millis = ?9, \
+               answer = ?10, answer_kind = ?11, turns = ?12, tool_calls = ?13",
             params![
                 *job,
                 status.state,
+                status.state.is_terminal(),
                 status.invocation.number(),
                 status.background,
                 status.cancel_recorded,
@@ -68,10 +70,16 @@ pub(in crate::session) fn write_status(db: &Db, jobs: &[(JobId, JobStatus)]) -> 
                 status.resident,
             ],
         )?;
-        // Apart, as setting the partial index's column rewrites its entry even unchanged.
+        // Apart, as setting a partial index's column rewrites its entry even unchanged.
         db.execute(
-            "UPDATE job_status SET resident = ?2 WHERE job = ?1 AND resident <> ?2",
-            params![*job, status.resident],
+            "UPDATE job_status SET state = ?2, terminal = ?3, resident = ?4 \
+             WHERE job = ?1 AND (state <> ?2 OR resident <> ?4)",
+            params![
+                *job,
+                status.state,
+                status.state.is_terminal(),
+                status.resident
+            ],
         )?;
         let Some(child) = child else {
             continue;
@@ -304,7 +312,7 @@ impl Encoder {
                 job,
                 source,
                 notification,
-            } => delivery(db, seq, job.get(), Some(*notification), Some(*source)),
+            } => delivery(db, seq, job.get(), *notification, Some(*source)),
             _ => unreachable!("{} is not a job event", event.kind()),
         }
     }
@@ -493,9 +501,10 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         |row| {
             let job = job(row.get(2)?)?;
             let message = |at: i32| {
-                row.get::<Option<i64>>(at)?
-                    .map(|entry| sequence(entry).message())
-                    .ok_or_else(|| corrupt("message delivery has no notification or source"))
+                Ok::<_, DbError>(
+                    row.get::<Option<i64>>(at)?
+                        .map(|entry| sequence(entry).message()),
+                )
             };
             Ok(match enum_column(row, 1)? {
                 EntryKind::JobClaimed => SessionEvent::JobClaimed { job },
@@ -504,7 +513,7 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
                 EntryKind::JobInjected => SessionEvent::JobInjected { job },
                 EntryKind::JobMessageDelivered => SessionEvent::JobMessageDelivered {
                     job,
-                    source: message(4)?,
+                    source: message(4)?.ok_or_else(|| corrupt("message delivery has no source"))?,
                     notification: message(3)?,
                 },
                 kind => return Err(corrupt(format!("{kind} entry has a delivery row"))),

@@ -46,15 +46,8 @@ impl SessionRuntime {
         builder.extend(&harness.extra_tools)?;
         let (mcp, connection) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
-        let root = AgentId::root(store.id());
         let mut warnings = harness.warnings.clone();
         warnings.extend(connection);
-        warnings.extend(store.read(|state| {
-            let running = state.agents.journaled(&root);
-            running.map_or_else(Vec::new, |held| {
-                modes::drift_warnings(&harness, &held.contract)
-            })
-        }));
         let executor = ToolExecutor::with_authorization(
             builder.build(),
             authorization,
@@ -68,7 +61,7 @@ impl SessionRuntime {
             jobs.clone(),
             harness.questions.clone(),
         ));
-        let runtime = Arc::new(Self {
+        let mut runtime = Self {
             instance: RuntimeInstance::next(),
             harness,
             capabilities,
@@ -81,7 +74,13 @@ impl SessionRuntime {
             router,
             questions,
             resume,
-        });
+        };
+        // A session another host views runs nothing here, so nothing drifts.
+        if runtime.harness.owns(&runtime.store) {
+            let drift = runtime.drift_warnings(&AgentId::root(runtime.store.id()));
+            runtime.warnings.extend(drift);
+        }
+        let runtime = Arc::new(runtime);
         let _ = runtime_slot.set(Arc::downgrade(&runtime));
         let restarter: Arc<dyn crate::job::Restarter> = runtime.clone();
         runtime.jobs.restart_with(Arc::downgrade(&restarter));
@@ -145,18 +144,21 @@ impl SessionRuntime {
 
     /// A new session's root: the default model, in the configured mode.
     pub(super) fn new_root(&self) -> Result<AgentLaunch, HarnessError> {
-        let mode = (self.harness.mode.as_ref())
-            .map(|name| self.applied(name))
-            .transpose()?;
-        let capabilities = match &mode {
-            Some(mode) => mode.definition.granted(&self.capabilities),
-            None => self.capabilities.clone(),
+        let location = crate::execution::ExecutionLocation::root(self.harness.workspace.clone());
+        let available_depth = self.harness.max_child_depth;
+        let (mode, capabilities) = match &self.harness.mode {
+            Some(name) => {
+                let ceiling = &self.capabilities;
+                let (mode, granted) = self.applied(name, 0, &location, available_depth, ceiling)?;
+                (Some(mode), granted)
+            }
+            None => (None, self.capabilities.clone()),
         };
         Ok(AgentLaunch::New {
             model: self.harness.default_model.clone(),
             todos: None,
-            available_depth: self.harness.max_child_depth,
-            location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
+            available_depth,
+            location,
             mode,
             capabilities,
         })
@@ -183,7 +185,7 @@ impl SessionRuntime {
     /// only on its own turn and work. A busy turn holding foreground child
     /// invocations is held on them, and any other is stopped. A child invocation
     /// yet to begin is stopped before it does, whether or not its owner's loop
-    /// runs: the input that begins it runs as an interrupted turn. An agent between turns gives up the input it had yet
+    /// runs: the work that begins it runs as an interrupted turn. An agent between turns gives up the input it had yet
     /// to take, as a stopped turn gives up what was queued for it, and leaves its
     /// deliveries pending. Each of those counts once.
     ///
@@ -802,7 +804,7 @@ mod tests {
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, provider.clone()).await;
             let session = harness.new_session().await.unwrap();
-            // Owner input behind the launch is handed back; the input that begins
+            // Owner input behind the launch is handed back; the work that begins
             // the child is not.
             let (committed, owner_input) = oneshot::channel();
             let input = queue::QueuedInput {

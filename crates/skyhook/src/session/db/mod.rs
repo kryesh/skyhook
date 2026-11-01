@@ -53,7 +53,7 @@ pub(super) use wal::{Checkpointer, Log};
 pub(super) const SCHEMA: Schema = Schema {
     sql: include_str!("../schema.sql"),
     application_id: 0x534B_5948,
-    user_version: 28,
+    user_version: 29,
 };
 /// Store `bytes` under `digest`, their digest, once.
 pub(super) fn insert_blob(db: &Db, digest: BlobDigest, bytes: &[u8]) -> DbResult<()> {

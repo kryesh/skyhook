@@ -67,6 +67,7 @@ pub(super) struct IndexEntry<'a> {
 pub(super) struct Index<'a> {
     pub(super) format_version: u32,
     pub(super) reports: &'a [IndexEntry<'a>],
+    pub(super) hardening: &'a [Hardening],
 }
 
 pub(super) fn document<'a>(
@@ -85,7 +86,7 @@ pub(super) fn document<'a>(
             .filter(|scenario| scenario.candidate != headline.candidate),
     );
     Document {
-        format_version: 7,
+        format_version: 8,
         run,
         finding: report.finding,
         root: report.root,

@@ -15,10 +15,10 @@ impl ToolExecutor {
     pub(super) async fn collect_model_started(&self, started: StartedExecution) -> Reported {
         let StartedExecution::Foreground(job) = started else {
             let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
-            return self.collect_result(started, purpose).await;
+            return self.collect_result(started, purpose, None).await;
         };
         let jobs = &self.shared.jobs;
-        let waited = match jobs.wait_foreground(job).await {
+        let waited = match jobs.wait_foreground(job, None).await {
             Ok((waited, _)) => waited,
             Err(error) => return Err(job_error(error)).into(),
         };
@@ -35,6 +35,7 @@ impl ToolExecutor {
             self.diagnostic_viewer(),
             crate::job::output::OutputOptions::Model {
                 kind: crate::job::ViewKind::Response,
+                reader: None,
             },
         );
         let presented = match presented.await {
@@ -58,10 +59,13 @@ impl ToolExecutor {
         }
     }
 
+    /// Collect `started`'s outcome; the result it reports is held for job
+    /// `reader` as the wait for it decides, when a job reads it.
     pub(super) async fn collect_result(
         &self,
         started: StartedExecution,
         purpose: CollectionPurpose,
+        reader: Option<JobId>,
     ) -> Reported {
         let job = match started {
             StartedExecution::Foreground(job) => job,
@@ -79,7 +83,7 @@ impl ToolExecutor {
             }
         };
         let jobs = &self.shared.jobs;
-        let (envelope, delivery) = match jobs.wait_foreground(job).await {
+        let (envelope, delivery) = match jobs.wait_foreground(job, reader).await {
             Ok(waited) => waited,
             Err(error) => return Err(job_error(error)).into(),
         };
@@ -357,7 +361,7 @@ mod tests {
         let started = || StartedExecution::Background(launched.clone());
         let model = executor.collect_model_started(started()).await;
         let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
-        let script = executor.collect_result(started(), purpose).await;
+        let script = executor.collect_result(started(), purpose, None).await;
         let (model, script) = (model.outcome.unwrap(), script.outcome.unwrap());
         assert_eq!(model.output.value, script.output.value);
         assert!(model.background && script.background);

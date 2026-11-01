@@ -1,4 +1,4 @@
-//! Work each phase owes, derived from the graph: paths owing a sweep, premises a settling
+//! Work each phase owes, derived from the graph: paths owing a sweep or a probe, premises a settling
 //! look, flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
 //! A subject is offered while it owes the phase, no task of it is live, and fewer than two of
 //! its tasks began at its current basis, the latest event of the phase's `bearing` on it; once
@@ -15,49 +15,35 @@ use skyhook::db::{Db, enum_column, params};
 
 use super::*;
 
-use crate::store::bearing::{basis, bearing, chain_premises};
+use crate::store::bearing::{action_premises, basis, bearing, chain_premises};
 
-/// Task subject `$subject` is node `$id`, or a node merged into it since its task began.
-macro_rules! works {
-    ($subject:expr, $id:expr) => {
-        concat!(
-            $subject,
-            " IN (SELECT ",
-            $id,
-            " UNION ALL SELECT id FROM node WHERE merged_into=",
-            $id,
-            ")"
-        )
-    };
-}
-pub(in crate::store) use works;
-
-/// A task of `$phase` on node `$id` is live.
+/// A task of `$phase` on node `$id`, or on a node merged into it since the task began, is live:
+/// `$id` is in the list of the phase's live subjects, which a statement reads once.
 macro_rules! task_live {
     ($phase:tt, $id:expr) => {
         concat!(
-            "EXISTS (SELECT 1 FROM task_node lt JOIN task_state ls ON ls.task=lt.task WHERE \
-             lt.phase='",
+            "(",
+            $id,
+            " IN (SELECT lt.node FROM live lt WHERE lt.phase='",
             $phase,
-            "' AND ",
-            works!("lt.node", $id),
-            " AND ls.live)"
+            "'))"
         )
     };
 }
 
 /// `$phase`'s work on node `$id` is not exhausted at its current basis: fewer than two of its
-/// tasks began there, and the scheduler has not [`Spent`] it there this run.
+/// tasks began there, and the scheduler has not [`Spent`] it there this run. The phase's spent
+/// work is read once, as a list each subject's basis is looked up in.
 macro_rules! retryable {
     ($phase:tt, $id:expr) => {
         concat!(
-            "(NOT EXISTS (SELECT 1 FROM json_each(?99) sw WHERE sw.value->>0='",
-            $phase,
-            "' AND sw.value->>1=",
+            "((",
             $id,
-            " AND sw.value->>2=",
+            ",",
             basis!($phase, $id),
-            ") AND (SELECT count(*) FROM task_node rt WHERE rt.phase='",
+            ") NOT IN (SELECT sw.node,sw.basis FROM spent sw WHERE sw.phase='",
+            $phase,
+            "') AND (SELECT count(*) FROM task_node rt WHERE rt.phase='",
             $phase,
             "' AND rt.node=",
             $id,
@@ -87,13 +73,16 @@ macro_rules! pending {
 }
 
 /// A phase's statements over its live subjects `n`, each row the key, title, basis and the
-/// pending test it resumes: the page of offered entries that are `$ready`, past `?1`, limit
-/// `?2`; every `$owed` subject without a live task, flagged when exhausted; and, for a bundled
-/// phase, the offered and ready entries `$naming` selects from the nodes bound as `?1`.
+/// pending test it resumes: the page of offered entries that are `$ready`, past `?1` up to `?3`,
+/// limit `?2`; every `$owed` subject without a live task, flagged when exhausted, and those of
+/// them bound as `?1`; and, for a bundled phase, the offered and ready entries `$naming` selects
+/// from the nodes bound as `?1`. Each statement but the whole listing reads the facts of only
+/// the root groups of the subjects it may list.
 macro_rules! phase_sql {
     ($phase:tt, $kind:literal, $owed:expr, $ready:expr, $pending:expr, $naming:expr) => {
         phase_sql!(
-            @ concat!(
+            @ $kind,
+            concat!(
                 "SELECT n.id,n.title,",
                 basis!($phase, "n.id"),
                 ",",
@@ -117,14 +106,40 @@ macro_rules! phase_sql {
             $naming
         )
     };
-    (@ $select:expr, $flagged:expr, $unstarted:expr, $retryable:expr, $ready:expr, $naming:expr) => {
+    (@ $kind:literal, $select:expr, $flagged:expr, $unstarted:expr, $retryable:expr, $ready:expr,
+        $naming:expr) => {
         Sql {
-            page: concat!($select, "n.id>?1 AND ", $unstarted, " AND ", $retryable, " AND ",
-                $ready, " ORDER BY n.id LIMIT ?2"),
-            owed: concat!($flagged, $unstarted, " ORDER BY n.id"),
-            naming: concat!($select, "n.id IN (", $naming, ") AND ", $unstarted, " AND ",
-                $retryable, " AND ", $ready, " ORDER BY n.id"),
+            page: concat!(
+                relations!(concat!("SELECT id FROM node WHERE kind='", $kind,
+                    "' AND merged_into IS NULL AND id>?1 AND id<=?3")),
+                $select, "n.id>?1 AND n.id<=?3 AND ", $unstarted, " AND ",
+                $retryable, " AND ", $ready, " ORDER BY n.id LIMIT ?2"),
+            owed: concat!(relations!(), $flagged, $unstarted, " ORDER BY n.id"),
+            owing: concat!(relations!("SELECT value FROM json_each(?1)"), $flagged,
+                "n.id IN (SELECT value FROM json_each(?1)) AND ", $unstarted, " ORDER BY n.id"),
+            naming: concat!(relations!($naming), $select, "n.id IN (", $naming, ") AND ", $unstarted,
+                " AND ", $retryable, " AND ", $ready, " ORDER BY n.id"),
         }
+    };
+}
+
+/// The relations a phase statement reads once, each when it first reads it: the [`Spent`] work
+/// bound as `?99`, which [`retryable`] lists by phase, the subjects of live
+/// tasks, which [`task_live`] lists by phase, and the facts selecting tests, of the
+/// root groups of the candidates and the root flaws among `$subjects`, or of every group.
+macro_rules! relations {
+    ($($subjects:expr)?) => {
+        concat!(
+            "WITH spent(phase,node,basis) AS MATERIALIZED (SELECT value->>0,value->>1,value->>2 \
+             FROM json_each(?99)),live AS MATERIALIZED (",
+            $crate::store::tasks::live!(),
+            "),",
+            tested!($(concat!(
+                "SELECT root FROM candidate_root WHERE candidate IN (", $subjects,
+                ") UNION SELECT node FROM flaw WHERE node IN (", $subjects, ")"
+            ))?),
+            " "
+        )
     };
 }
 
@@ -132,6 +147,7 @@ macro_rules! phase_sql {
 struct Sql {
     page: &'static str,
     owed: &'static str,
+    owing: &'static str,
     naming: &'static str,
 }
 
@@ -142,12 +158,14 @@ mod structure;
 pub(super) use self::{
     candidates::review_owed,
     reports::{current_finding, reported},
+    structure::{probed, served},
 };
 use self::{candidates::*, reports::*, structure::*};
 
 const fn sql(phase: Phase) -> Sql {
     match phase {
         Phase::Sweep => SWEEP,
+        Phase::Probe => PROBE,
         Phase::Settle => SETTLE,
         Phase::Chain => CHAIN,
         Phase::Assess => ASSESS,
@@ -165,7 +183,7 @@ pub struct QueueEntry {
     pub title: String,
     pub basis: EventId,
     /// What the work is about: a premise and the flaws depending on it, a flaw, or a
-    /// candidate, its chain's flaws and the premises they and its path rely on.
+    /// candidate, its chain's flaws and the premises they and its paths rely on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub about: Vec<NodeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,8 +206,8 @@ pub struct SpentWork {
     pub basis: EventId,
 }
 
-/// The work the scheduler spent this run, as `[phase, node, basis]` rows. [`retryable`] reads
-/// them from the parameter numbered past every statement's own, `?99`; a statement leaving it
+/// The work the scheduler spent this run, as `[phase, node, basis]` rows bound to the parameter
+/// numbered past every statement's own, `?99`, which [`relations`] decodes; a statement leaving it
 /// unbound, or the default, reads none spent.
 pub(super) struct Spent(libsql::Value);
 
@@ -249,32 +267,53 @@ pub(super) struct Owed {
     pub(super) exhausted: bool,
 }
 
-/// Every subject `phase` owes with no task of it live, offered or exhausted, ready or not.
-pub(super) fn owed(db: &Db, phase: Phase, spent: &Spent) -> Result<Vec<Owed>> {
-    rows(db, sql(phase).owed, spent.bound(Vec::new()), |row: &Row| {
-        Ok(Owed {
-            node: NodeId(row.get(0)?),
-            title: row.get(1)?,
-            basis: EventId(row.get(2)?),
-            exhausted: row.get(3)?,
-        })
+fn owed_row(row: &Row) -> Result<Owed> {
+    Ok(Owed {
+        node: NodeId(row.get(0)?),
+        title: row.get(1)?,
+        basis: EventId(row.get(2)?),
+        exhausted: row.get(3)?,
     })
 }
 
+/// Every subject `phase` owes with no task of it live, offered or exhausted, ready or not.
+pub(super) fn owed(db: &Db, phase: Phase, spent: &Spent) -> Result<Vec<Owed>> {
+    rows(db, sql(phase).owed, spent.bound(Vec::new()), owed_row)
+}
+
+/// Those of `nodes` that `phase` owes with no task of it live, as [`owed`] lists them with none
+/// spent.
+pub(super) fn owing(db: &Db, phase: Phase, nodes: &[NodeId]) -> Result<Vec<Owed>> {
+    rows(db, sql(phase).owing, params![json_list(nodes)?], owed_row)
+}
+
 /// The next page of `phase` work that can start now: a subject whose prerequisites are still
-/// open waits off the page while it stays owed.
+/// open waits off the page while it stays owed. The subjects past the cursor are read in
+/// windows, the first as wide as the page and each next twice the last, so a page reads the
+/// facts of the groups it reaches alone.
 pub(super) fn page(
     db: &Db,
     phase: Phase,
     page: Page,
     spent: &Spent,
 ) -> Result<Listing<QueueEntry>> {
-    let listed = listed(
-        db,
-        sql(phase).page,
-        spent.bound(params![page.after, page.limit()]),
-    )?;
-    Ok(Listing::keyset(listed, page))
+    let (mut after, mut width, mut items) = (page.after, page.limit(), Vec::new());
+    loop {
+        let end: Option<i64> = optional(
+            db,
+            "SELECT id FROM node WHERE kind=?1 AND merged_into IS NULL AND id>?2 ORDER BY id \
+             LIMIT 1 OFFSET ?3",
+            params![phase.subject(), after, width - 1],
+            |row| Ok(row.get(0)?),
+        )?;
+        let wanted = page.limit() - items.len() as i64;
+        let window = params![after, wanted, end.unwrap_or(i64::MAX)];
+        items.extend(listed(db, sql(phase).page, spent.bound(window))?);
+        match end {
+            Some(end) if (items.len() as i64) < page.limit() => (after, width) = (end, width * 2),
+            _ => return Ok(Listing::keyset(items, page)),
+        }
+    }
 }
 
 /// The offered and ready entries of bundled `phase` about one of `nodes`, in key order.
@@ -314,12 +353,15 @@ pub(super) fn about(
     .collect();
     for (node, record) in rows(
         db,
-        "SELECT fp.premise,fp.flaw FROM json_each(?1) j JOIN flaw_premise fp ON \
-         fp.premise=j.value UNION ALL SELECT cf.candidate,cf.flaw FROM json_each(?1) j JOIN \
-         candidate_flaw cf ON cf.candidate=j.value UNION ALL SELECT cf.candidate,fp.premise FROM \
-         json_each(?1) j JOIN candidate_flaw cf ON cf.candidate=j.value JOIN flaw_premise fp ON \
-         fp.flaw=cf.flaw UNION ALL SELECT c.node,pp.premise FROM json_each(?1) j JOIN candidate c \
-         ON c.node=j.value JOIN path_premise pp ON pp.path=c.path",
+        concat!(
+            "SELECT fp.premise,fp.flaw FROM json_each(?1) j JOIN flaw_premise fp ON \
+             fp.premise=j.value UNION ALL SELECT cf.candidate,cf.flaw FROM json_each(?1) j JOIN \
+             candidate_flaw cf ON cf.candidate=j.value UNION ALL SELECT cf.candidate,fp.premise \
+             FROM json_each(?1) j JOIN candidate_flaw cf ON cf.candidate=j.value JOIN \
+             flaw_premise fp ON fp.flaw=cf.flaw UNION ALL SELECT DISTINCT pa.candidate,pp.premise \
+             FROM json_each(?1) j JOIN ",
+            action_premises!("pa.candidate=j.value")
+        ),
         params![json_list(nodes)?],
         |row| Ok((NodeId(row.get(0)?), NodeId(row.get(1)?))),
     )? {
@@ -334,8 +376,11 @@ pub(super) fn about(
 pub(super) fn live_subjects(db: &Db) -> Result<Vec<(Phase, NodeId)>> {
     rows(
         db,
-        "SELECT tn.phase,coalesce(n.merged_into,n.id) FROM task_node tn JOIN task_state s ON \
-         s.task=tn.task JOIN node n ON n.id=tn.node WHERE s.live ORDER BY tn.task,tn.node",
+        concat!(
+            "SELECT phase,node FROM (",
+            tasks::live!(),
+            ") ORDER BY task,node"
+        ),
         Vec::new(),
         |row| Ok((enum_column(row, 0)?, NodeId(row.get(1)?))),
     )
@@ -347,8 +392,8 @@ pub(super) mod tests {
 
     use super::{
         super::tests::{
-            HIGH, assess, begun, child_of, end_job, fixture, premise, scenario, sweep, test, text,
-            verdict,
+            HIGH, Step, assess, begun, child_of, end_job, fixture, plan, premise, scenario, sweep,
+            test, text, verdict,
         },
         *,
     };
@@ -378,18 +423,21 @@ pub(super) mod tests {
             Some(first) => *first,
             None => panic!("{phase} offers nothing to exhaust"),
         };
-        for _ in 0..2 {
-            let (_, job, _) = begun(store, work);
-            end_job(store, job);
-        }
+        let tasks: Vec<TaskId> = (0..2)
+            .map(|_| {
+                let (_, job, task) = begun(store, work);
+                end_job(store, job);
+                task
+            })
+            .collect();
         assert!(
             !queued(store, phase).contains(&subject),
             "{phase} still offers {subject}"
         );
         assert!(
             (store.synthesis(&[]).unwrap().exhausted.iter())
-                .any(|entry| entry.phase == phase && entry.node == subject),
-            "{phase} lists {subject} exhausted"
+                .any(|entry| entry.phase == phase && entry.node == subject && entry.tasks == tasks),
+            "{phase} lists {subject} exhausted with the tasks that tried it"
         );
     }
 
@@ -402,7 +450,7 @@ pub(super) mod tests {
         let scenario = scenario(&store, &actor, "decoder");
         let started = |spent: &[SpentWork]| {
             let page = store
-                .startable(&[], spent, &Tests::default(), None, Bounded::new::<10>())
+                .startable(&[], spent, &Live::default(), None, Bounded::new::<10>())
                 .unwrap();
             (page.items.into_iter())
                 .map(|item| SpentWork {
@@ -477,7 +525,10 @@ pub(super) mod tests {
             end_job(&store, job);
         }
         assert!(queued(&store, Phase::Review).is_empty());
-        assert_eq!(store.synthesis(&[]).unwrap().exhausted(Phase::Review), 1);
+        assert_eq!(
+            store.run_facts().unwrap().summary.exhausted(Phase::Review),
+            1
+        );
         rely(&actor);
         assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
 
@@ -490,51 +541,88 @@ pub(super) mod tests {
         assert_eq!(queued(&store, Phase::Test), [NodeId::from(id)]);
     }
 
-    /// Every phase's statements and the views deriving standing seek the log, the task log and
-    /// the graph by node: the only scans are of a per-subject result, the bound lists, the run's
-    /// one row, and the environments prepared for any candidate.
+    /// Every phase's statements, the views deriving standing and the open tests seek the log,
+    /// the task log and the graph by node: the only scans are of a per-subject result, the bound
+    /// lists, the run's one row, the environments prepared for any candidate, the paths for any
+    /// sweep a chain waits on, the facts selecting tests, the root groups they are read for and
+    /// the live jobs, uncorrelated and so read once per statement. Only a phase's whole listing
+    /// reads every group's facts, a page seeks the range of subjects between its cursor and its
+    /// window's end, and the subjects of live tasks and the spent work are read once, as lists
+    /// each subject is looked up in. No task is sought by its phase alone, which would visit the phase's whole
+    /// task log, and a node's events are walked only down its effects, which hold none of its
+    /// test records.
     #[test]
     fn phase_statements_seek_by_node() {
         let (_session, store, _) = fixture();
         let mut statements = vec![
             "SELECT * FROM candidate_state WHERE candidate=?1",
             "SELECT * FROM finding_scenario WHERE root=?1",
+            crate::store::tasks::OF_NODE,
+            crate::store::synthesis::OPEN_TESTS,
         ];
+        let (mut whole, mut pages) = (Vec::new(), Vec::new());
         for phase in Phase::ALL {
             let sql = sql(phase);
-            statements.extend([sql.page, sql.owed, crate::store::bearing::lookup(phase)]);
+            whole.push(sql.owed);
+            pages.push(sql.page);
+            statements.extend([sql.page, sql.owing, crate::store::bearing::lookup(phase)]);
             if phase.bundled() {
                 statements.push(sql.naming);
             }
         }
+        let every_group = "SCAN c USING INDEX candidate_validated";
         let allowed = [
             "SCAN ob",
             "SCAN cp",
             "SCAN vp",
             "SCAN tp",
-            "SCAN sw VIRTUAL TABLE",
             "SCAN json_each VIRTUAL TABLE",
             "SCAN run",
+            "SCAN rp",
             "SCAN CONSTANT ROW",
-            "SCAN environment USING INDEX environment_unscoped",
+            "SCAN ev USING INDEX environment_unscoped",
+            "SCAN tl",
+            "SCAN upheld",
+            "SCAN validated",
+            "SCAN ur",
+            "SCAN (subquery-",
+            "SCAN j USING INDEX job_status_live",
         ];
-        let scans = store
-            .read(|db| {
-                let mut scans = Vec::new();
-                for sql in &statements {
-                    let plan = rows(db, format!("EXPLAIN QUERY PLAN {sql}"), Vec::new(), |row| {
-                        Ok(row.get::<String>(3)?)
-                    })?;
-                    scans.extend(
-                        (plan.into_iter())
-                            .filter(|step| step.starts_with("SCAN "))
-                            .filter(|step| !allowed.iter().any(|scan| step.starts_with(scan)))
-                            .map(|step| format!("{step} in {sql}")),
-                    );
-                }
-                Ok(scans)
+        let statements =
+            (statements.iter().map(|sql| (sql, false))).chain(whole.iter().map(|sql| (sql, true)));
+        let mut scans: Vec<String> = statements
+            .flat_map(|(sql, whole)| {
+                (plan(&store, sql).into_iter())
+                    .filter(move |Step { detail, within }| {
+                        let listed = [
+                            "SCAN lt",
+                            "SEARCH lt ",
+                            "SCAN sw",
+                            "SEARCH sw ",
+                            "BLOOM FILTER ON sw ",
+                        ];
+                        if listed.iter().any(|list| detail.starts_with(list)) {
+                            return !within
+                                .as_ref()
+                                .is_some_and(|within| within.starts_with("LIST SUBQUERY"));
+                        }
+                        (detail.starts_with("SCAN ")
+                            && !(whole && detail.starts_with(every_group))
+                            && !allowed.iter().any(|scan| detail.starts_with(scan)))
+                            || detail.ends_with("(phase=?)")
+                            || (["SEARCH en ", "SEARCH ed "].iter())
+                                .any(|walk| detail.starts_with(walk))
+                                && !detail.contains("event_node_effect")
+                    })
+                    .map(move |step| format!("{} in {sql}", step.detail))
             })
-            .unwrap();
+            .collect();
+        let range = "SEARCH n USING INDEX node_live (kind=? AND id>? AND id<?)";
+        scans.extend(
+            (pages.iter())
+                .filter(|sql| !plan(&store, sql).iter().any(|step| step.detail == range))
+                .map(|sql| format!("no range seek in {sql}")),
+        );
         assert!(scans.is_empty(), "{scans:#?}");
     }
 }

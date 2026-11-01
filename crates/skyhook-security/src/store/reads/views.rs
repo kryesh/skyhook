@@ -14,6 +14,9 @@ pub struct Head {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_into: Option<NodeId>,
     pub evidence: Vec<EvidenceView>,
+    /// The latest tasks on it or on a node merged into it, newest first: `task` reads each.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskId>,
 }
 
 /// A neighbouring node.
@@ -50,6 +53,9 @@ pub struct EvidenceView {
     pub id: EvidenceId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+    /// Where it was observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentId>,
     pub stance: Stance,
     pub note: String,
     pub event: EventId,
@@ -70,14 +76,17 @@ pub struct SourceRef {
     pub title: String,
     pub location: Location,
     pub trust: Trust,
+    pub status: InventoryStatus,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ComponentView {
     #[serde(flatten)]
     pub head: Head,
+    pub status: InventoryStatus,
     pub files: Vec<String>,
-    /// The paths stepping through it.
+    pub interfaces: Vec<InterfaceName>,
+    /// The live paths stepping through it.
     pub paths: Vec<Ref>,
     pub flaws: Vec<FlawRef>,
 }
@@ -90,17 +99,25 @@ pub struct PathView {
     pub sources: Vec<SourceRef>,
     pub premises: Vec<PremiseRef>,
     pub candidates: Vec<CandidateRef>,
-    /// The event that marked it swept; while a source enters it, it owes a sweep without one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub swept: Option<EventId>,
+    /// While unswept and a recorded source enters it, it owes a sweep.
+    pub status: PathStatus,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct SourceView {
     #[serde(flatten)]
     pub head: Head,
+    /// Absent once merged: its location is free for another source.
+    #[serde(flatten)]
+    pub live: Option<LiveSource>,
+}
+
+/// What a live source holds.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct LiveSource {
     pub location: Location,
     pub trust: Trust,
+    pub status: InventoryStatus,
     pub paths: Vec<Ref>,
 }
 
@@ -183,15 +200,22 @@ pub struct TestView {
     pub artifacts: Vec<ArtifactView>,
 }
 
+/// A path a candidate's scenario performs.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct CandidateView {
-    #[serde(flatten)]
-    pub head: Head,
+pub struct ActionView {
     pub path: Ref,
     pub steps: Vec<Step>,
     pub sources: Vec<SourceRef>,
     /// The premises its path relies on.
-    pub path_premises: Vec<PremiseRef>,
+    pub premises: Vec<PremiseRef>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CandidateView {
+    #[serde(flatten)]
+    pub head: Head,
+    /// The paths its scenario performs, in order: the first is where the attacker starts.
+    pub actions: Vec<ActionView>,
     /// Its flaws from the root.
     pub chain: Vec<ChainLink>,
     pub status: Status,
@@ -261,6 +285,7 @@ pub struct EnvironmentView {
     pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate: Option<CandidateId>,
+    pub serves: Vec<Served>,
     pub event: EventId,
 }
 

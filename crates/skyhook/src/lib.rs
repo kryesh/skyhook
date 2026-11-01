@@ -15,6 +15,7 @@ pub mod media;
 pub mod named_enum;
 mod newtype;
 mod process_group;
+pub mod prompts;
 pub mod provider;
 pub mod remote;
 pub mod session;

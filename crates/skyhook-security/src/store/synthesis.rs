@@ -1,8 +1,8 @@
 //! The synthesis of the run's work: what every phase owes, what runs, what two tasks tried
-//! without settling, what the user is asked, and what no path reaches; and the counts the
-//! Research page draws.
+//! without settling, what the user is asked, what stands unproven, what no path reaches and
+//! which interfaces wait on an environment; and the counts the Research page draws.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -21,6 +21,9 @@ pub struct Exhausted {
     pub phase: Phase,
     pub node: NodeId,
     pub title: String,
+    /// The tasks that tried it at its current basis, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskId>,
     /// The last task's child's reply, when a task of it began.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
@@ -33,6 +36,23 @@ pub struct Asked {
     pub title: String,
 }
 
+/// A candidate whose unproven verdict stands, with the undecided premises of its chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Unproven {
+    pub candidate: CandidateId,
+    pub title: String,
+    pub premises: Vec<PremiseRef>,
+}
+
+/// An interface that unswept paths with no source in code wait on: no environment for any
+/// candidate serves it, or the launch does no live work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Uncovered {
+    pub interface: InterfaceName,
+    /// How many paths wait on it.
+    pub paths: u64,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Synthesis {
     /// Per phase, the subjects owing it that may still start: no task live, not exhausted.
@@ -41,11 +61,29 @@ pub struct Synthesis {
     pub running: BTreeMap<Phase, u64>,
     pub exhausted: Vec<Exhausted>,
     pub asked: Vec<Asked>,
+    pub unproven: Vec<Unproven>,
     /// Components no path steps through.
     pub unreached: Vec<ComponentId>,
+    pub uncovered: Vec<Uncovered>,
 }
 
-impl Synthesis {
+/// The run's work in counts, read without the details the synthesis gives: what the
+/// orchestrator steers by and the Research page draws.
+#[derive(Clone, Debug)]
+pub struct Summary {
+    /// Per phase, the subjects owing it that may still start.
+    pub owed: BTreeMap<Phase, u64>,
+    /// Per phase, the subjects of live tasks.
+    pub running: BTreeMap<Phase, u64>,
+    /// Per phase, the subjects exhausted while they owe it.
+    pub exhausted: BTreeMap<Phase, u64>,
+    /// Undecided deployment premises a review waits on.
+    pub asked: u64,
+    /// Interfaces unswept paths wait on.
+    pub uncovered: u64,
+}
+
+impl Summary {
     pub fn owed(&self, phase: Phase) -> u64 {
         self.owed.get(&phase).copied().unwrap_or_default()
     }
@@ -55,35 +93,30 @@ impl Synthesis {
     }
 
     pub fn exhausted(&self, phase: Phase) -> u64 {
-        (self.exhausted.iter())
-            .filter(|exhausted| exhausted.phase == phase)
-            .count() as u64
+        self.exhausted.get(&phase).copied().unwrap_or_default()
     }
 
-    /// Whether the run's work is done: nothing owed, running, exhausted or asked.
+    /// Whether the run's work is done: nothing owed, running, exhausted, asked or uncovered.
     pub fn complete(&self) -> bool {
-        self.owed.values().all(|count| *count == 0)
-            && self.running.values().all(|count| *count == 0)
-            && self.exhausted.is_empty()
-            && self.asked.is_empty()
+        (self.owed.values().chain(self.running.values()))
+            .chain(self.exhausted.values())
+            .all(|count| *count == 0)
+            && self.asked == 0
+            && self.uncovered == 0
     }
 
-    /// The synthesis in one line, e.g. `owed: 3 sweep, 2 settle; 4 running; exhausted: 1
-    /// chain; asked: 2`.
+    /// The summary in one line, e.g. `owed: 3 sweep, 2 settle; 4 running; exhausted: 1 chain;
+    /// asked: 2; uncovered: 1`.
     pub fn line(&self) -> String {
-        let counts = |counts: Vec<(Phase, u64)>| -> Vec<String> {
-            (counts.into_iter())
-                .filter(|(_, count)| *count > 0)
+        let counts = |counts: &BTreeMap<Phase, u64>| -> Vec<String> {
+            (counts.iter())
+                .filter(|(_, count)| **count > 0)
                 .map(|(phase, count)| format!("{count} {phase}"))
                 .collect()
         };
-        let owed = counts(self.owed.iter().map(|(phase, n)| (*phase, *n)).collect());
+        let owed = counts(&self.owed);
         let running: u64 = self.running.values().sum();
-        let exhausted = counts(
-            (Phase::ALL.iter())
-                .map(|phase| (*phase, self.exhausted(*phase)))
-                .collect(),
-        );
+        let exhausted = counts(&self.exhausted);
         let mut parts = vec![match owed.is_empty() {
             true => "nothing owed".to_owned(),
             false => format!("owed: {}", owed.join(", ")),
@@ -94,62 +127,168 @@ impl Synthesis {
         if !exhausted.is_empty() {
             parts.push(format!("exhausted: {}", exhausted.join(", ")));
         }
-        if !self.asked.is_empty() {
-            parts.push(format!("asked: {}", self.asked.len()));
+        if self.asked > 0 {
+            parts.push(format!("asked: {}", self.asked));
+        }
+        if self.uncovered > 0 {
+            parts.push(format!("uncovered: {}", self.uncovered));
         }
         parts.join("; ")
     }
 }
 
-/// A synthesis as one snapshot finds it, each exhausted subject with its last task's job if one
-/// began: [`Store::replied`] reads the replies outside the snapshot.
-struct Found {
-    owed: BTreeMap<Phase, u64>,
-    running: BTreeMap<Phase, u64>,
-    exhausted: Vec<(Phase, queues::Owed, Option<JobId>)>,
-    asked: Vec<Asked>,
-    unreached: Vec<ComponentId>,
+/// What each phase owes: how many subjects may still start, and the exhausted ones.
+struct OwedWork {
+    offered: BTreeMap<Phase, u64>,
+    exhausted: Vec<(Phase, queues::Owed)>,
 }
 
-fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
-    let (mut owed, mut exhausted) = (BTreeMap::new(), Vec::new());
+fn owed_work(db: &Db, spent: &queues::Spent) -> Result<OwedWork> {
+    let mut work = OwedWork {
+        offered: BTreeMap::new(),
+        exhausted: Vec::new(),
+    };
     for phase in Phase::ALL {
         let mut offered = 0;
         for entry in queues::owed(db, phase, spent)? {
-            if !entry.exhausted {
-                offered += 1;
-                continue;
+            match entry.exhausted {
+                true => work.exhausted.push((phase, entry)),
+                false => offered += 1,
             }
-            let job = optional(
-                db,
-                "SELECT t.job FROM task_node tn JOIN task t ON t.id=tn.task WHERE tn.phase=?1 AND \
-                 tn.node=?2 AND tn.basis=?3 ORDER BY tn.task DESC LIMIT 1",
-                params![phase, entry.node, entry.basis],
-                |row| tasks::journal_job(row.get(0)?),
-            )?;
-            exhausted.push((phase, entry, job));
         }
-        owed.insert(phase, offered);
+        work.offered.insert(phase, offered);
     }
-    Ok(Found {
-        owed,
-        running: counts(
+    Ok(work)
+}
+
+fn running(db: &Db) -> Result<BTreeMap<Phase, u64>> {
+    counts(
+        db,
+        concat!(
+            "SELECT phase,count(*) FROM (",
+            tasks::live!(),
+            ") GROUP BY phase"
+        ),
+    )
+}
+
+/// The undecided deployment premises a review waits on, as `p.node` and `n.title`.
+macro_rules! asked {
+    () => {
+        concat!(
+            "SELECT p.node,n.title FROM premise_state p JOIN node n ON n.id=p.node WHERE \
+             p.scope='deployment' AND p.status='undecided' AND n.merged_into IS NULL AND EXISTS \
+             (SELECT 1 FROM (",
+            bearing::premise_candidates!("p.node"),
+            ") ap JOIN node an ON an.id=ap.candidate WHERE an.merged_into IS NULL AND ",
+            queues::review_owed!("ap.candidate"),
+            ")"
+        )
+    };
+}
+
+/// The live recorded components no live path steps through but a retracted one, as `c.node`.
+macro_rules! unreached {
+    () => {
+        "SELECT c.node FROM component c JOIN node n ON n.id=c.node WHERE n.merged_into IS NULL AND \
+         c.status='recorded' AND NOT EXISTS (SELECT 1 FROM path_step s JOIN node sn ON \
+         sn.id=s.path JOIN path sp ON sp.node=s.path WHERE s.component=c.node AND \
+         sn.merged_into IS NULL AND sp.status!='retracted')"
+    };
+}
+
+/// The interfaces recorded sources of unswept probed paths sit on and wait for, as
+/// `xi.interface`, with how many paths wait.
+macro_rules! uncovered_interfaces {
+    () => {
+        concat!(
+            "SELECT xi.interface,count(DISTINCT p.node) FROM path p JOIN node pn ON pn.id=p.node \
+             JOIN path_source xs ON xs.path=p.node JOIN source xo ON xo.node=xs.source JOIN \
+             interface_location xi ON xi.location=xo.location WHERE pn.merged_into IS NULL AND \
+             p.status='unswept' AND xo.status='recorded' AND ",
+            queues::probed!("p.node"),
+            " AND NOT ",
+            queues::served!("xi.interface"),
+            " GROUP BY xi.interface"
+        )
+    };
+}
+
+fn summary(db: &Db) -> Result<Summary> {
+    let work = owed_work(db, &queues::Spent::default())?;
+    let mut exhausted = BTreeMap::new();
+    for (phase, _) in work.exhausted {
+        *exhausted.entry(phase).or_default() += 1;
+    }
+    Ok(Summary {
+        owed: work.offered,
+        running: running(db)?,
+        exhausted,
+        asked: count(
             db,
-            "SELECT tn.phase,count(*) FROM task_node tn JOIN task_state s ON s.task=tn.task WHERE \
-             s.live GROUP BY tn.phase",
+            concat!("SELECT count(*) FROM (", asked!(), ")"),
+            Vec::new(),
         )?,
+        uncovered: count(
+            db,
+            concat!("SELECT count(*) FROM (", uncovered_interfaces!(), ")"),
+            Vec::new(),
+        )?,
+    })
+}
+
+/// A synthesis as one snapshot finds it, each exhausted subject with the tasks that tried it at
+/// its basis and the last one's job: [`Store::synthesis`] reads the replies outside the snapshot.
+struct Found {
+    owed: BTreeMap<Phase, u64>,
+    running: BTreeMap<Phase, u64>,
+    exhausted: Vec<(Phase, queues::Owed, Vec<TaskId>, Option<JobId>)>,
+    asked: Vec<Asked>,
+    unproven: Vec<Unproven>,
+    unreached: Vec<ComponentId>,
+    uncovered: Vec<Uncovered>,
+}
+
+fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
+    let work = owed_work(db, spent)?;
+    let mut exhausted = Vec::with_capacity(work.exhausted.len());
+    for (phase, entry) in work.exhausted {
+        let tried = rows(
+            db,
+            "SELECT t.id,t.job FROM task_node tn JOIN task t ON t.id=tn.task WHERE tn.phase=?1 AND \
+             tn.node=?2 AND tn.basis=?3 ORDER BY tn.task",
+            params![phase, entry.node, entry.basis],
+            |row| Ok((TaskId(row.get(0)?), tasks::journal_job(row.get(1)?)?)),
+        )?;
+        let job = tried.last().map(|(_, job)| *job);
+        let tasks = tried.into_iter().map(|(task, _)| task).collect();
+        exhausted.push((phase, entry, tasks, job));
+    }
+    let unproven = rows(
+        db,
+        "SELECT c.node,n.title FROM candidate c JOIN node n ON n.id=c.node WHERE \
+         c.verdict='unproven' AND (SELECT state FROM candidate_state WHERE candidate=c.node)=\
+         'unproven' ORDER BY c.node",
+        Vec::new(),
+        |row| Ok((CandidateId(row.get(0)?), row.get::<String>(1)?)),
+    )?
+    .into_iter()
+    .map(|(candidate, title)| {
+        Ok(Unproven {
+            premises: reads::undecided_premises(db, candidate.into())?,
+            candidate,
+            title,
+        })
+    })
+    .collect::<Result<_>>()?;
+    Ok(Found {
+        owed: work.offered,
+        unproven,
+        running: running(db)?,
         exhausted,
         asked: rows(
             db,
-            concat!(
-                "SELECT p.node,n.title FROM premise_state p JOIN node n ON n.id=p.node WHERE \
-                 p.scope='deployment' AND p.status='undecided' AND n.merged_into IS NULL AND \
-                 EXISTS (SELECT 1 FROM (",
-                bearing::premise_candidates!("p.node"),
-                ") ap JOIN node an ON an.id=ap.candidate WHERE an.merged_into IS NULL AND ",
-                queues::review_owed!("ap.candidate"),
-                ") ORDER BY p.node"
-            ),
+            concat!(asked!(), " ORDER BY p.node"),
             Vec::new(),
             |row| {
                 Ok(Asked {
@@ -160,10 +299,20 @@ fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
         )?,
         unreached: rows(
             db,
-            "SELECT c.node FROM component c WHERE NOT EXISTS (SELECT 1 FROM path_step s WHERE \
-             s.component=c.node) ORDER BY c.node",
+            concat!(unreached!(), " ORDER BY c.node"),
             Vec::new(),
             |row| Ok(ComponentId(row.get(0)?)),
+        )?,
+        uncovered: rows(
+            db,
+            concat!(uncovered_interfaces!(), " ORDER BY xi.interface"),
+            Vec::new(),
+            |row| {
+                Ok(Uncovered {
+                    interface: row.get::<String>(0)?.parse()?,
+                    paths: row.get(1)?,
+                })
+            },
         )?,
     })
 }
@@ -176,13 +325,15 @@ fn counts<T: NamedEnum + Ord>(db: &Db, sql: &'static str) -> Result<BTreeMap<T, 
     Ok(pairs.into_iter().collect())
 }
 
-/// What the run holds, by kind and standing.
+/// What the run holds, by kind and standing, merged and retracted nodes aside.
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct Coverage {
     pub sources: u64,
     pub paths: u64,
     pub swept: u64,
     pub components: u64,
+    /// Components no path steps through.
+    pub unreached: u64,
     /// Live premises by status.
     pub premises: BTreeMap<PremiseStatus, u64>,
     /// Live premises with contradicting evidence since their latest status.
@@ -196,17 +347,37 @@ pub struct Coverage {
     pub tasks: BTreeMap<Phase, u64>,
 }
 
+/// The live candidates by status, their root groups' facts read once.
+const CANDIDATE_STATES: &str = concat!(
+    "WITH ",
+    bearing::demonstrations!(),
+    " SELECT ",
+    bearing::state!("ifnull(d.rank>=s.rank,0)"),
+    ",count(*) FROM candidate_core s LEFT JOIN demonstration d ON d.root=s.root WHERE \
+     s.merged_into IS NULL GROUP BY 1"
+);
+
 fn coverage(db: &Db) -> Result<Coverage> {
-    let all = |kind: NodeKind| count(db, "SELECT count(*) FROM node WHERE kind=?1", params![kind]);
+    let (sources, paths, swept, components) = stored(
+        db,
+        "SELECT (SELECT count(*) FROM source WHERE status='recorded'),(SELECT count(*) FROM path \
+         p JOIN node n ON n.id=p.node WHERE n.merged_into IS NULL AND p.status!='retracted'),\
+         (SELECT count(*) FROM path p JOIN node n ON n.id=p.node WHERE n.merged_into IS NULL AND \
+         p.status='swept'),(SELECT count(*) FROM component c JOIN node n ON n.id=c.node WHERE \
+         n.merged_into IS NULL AND c.status='recorded')",
+        Vec::new(),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     Ok(Coverage {
-        sources: all(NodeKind::Source)?,
-        paths: all(NodeKind::Path)?,
-        swept: count(
+        sources,
+        paths,
+        swept,
+        components,
+        unreached: count(
             db,
-            "SELECT count(*) FROM path WHERE swept IS NOT NULL",
+            concat!("SELECT count(*) FROM (", unreached!(), ")"),
             Vec::new(),
         )?,
-        components: all(NodeKind::Component)?,
         premises: counts(
             db,
             "SELECT p.status,count(*) FROM premise_state p JOIN node n ON n.id=p.node WHERE \
@@ -226,10 +397,7 @@ fn coverage(db: &Db) -> Result<Coverage> {
             "SELECT f.status,count(*) FROM flaw_state f JOIN node n ON n.id=f.node WHERE \
              n.merged_into IS NULL GROUP BY f.status",
         )?,
-        candidates: counts(
-            db,
-            "SELECT state,count(*) FROM candidate_state WHERE merged_into IS NULL GROUP BY state",
-        )?,
+        candidates: counts(db, CANDIDATE_STATES)?,
         findings: count(
             db,
             concat!(
@@ -242,12 +410,12 @@ fn coverage(db: &Db) -> Result<Coverage> {
     })
 }
 
-/// What the orchestrator steers the run by, read at once: the run and the synthesis of its
+/// What the orchestrator steers the run by, read at once: the run and the summary of its
 /// work.
 #[derive(Clone)]
 pub struct RunFacts {
     pub run: Run,
-    pub synthesis: Synthesis,
+    pub summary: Summary,
     pub artifacts: std::path::PathBuf,
 }
 
@@ -260,51 +428,49 @@ pub struct OpenTest {
     pub live: bool,
 }
 
+/// Each live candidate's latest test task, read down its own and each merged candidate's tasks
+/// newest first, while it recorded no test since; its job's state says whether it is live.
+pub(super) const OPEN_TESTS: &str = concat!(
+    "SELECT o.candidate,o.task,NOT j.terminal FROM (SELECT n.id AS candidate,(SELECT \
+     max((SELECT tn.task FROM task_node tn WHERE tn.node=m.id AND +tn.phase='test' ORDER BY \
+     tn.task DESC LIMIT 1)) FROM node m WHERE m.id=n.id OR m.merged_into=n.id) AS task FROM node \
+     n WHERE n.kind='candidate' AND n.merged_into IS NULL) o JOIN task t ON t.id=o.task JOIN \
+     job_status j ON j.job=t.job WHERE ",
+    bearing::untested_since!("o.candidate", "t.began"),
+    " ORDER BY o.candidate"
+);
+
 fn open_tests(db: &Db) -> Result<Vec<OpenTest>> {
-    rows(
-        db,
-        "SELECT o.candidate,o.task,s.live FROM (SELECT coalesce(n.merged_into,n.id) AS \
-         candidate,max(tn.task) AS task FROM task_node tn JOIN node n ON n.id=tn.node WHERE \
-         tn.phase='test' GROUP BY 1) o JOIN task_state s ON s.task=o.task WHERE NOT EXISTS \
-         (SELECT 1 FROM test x WHERE x.candidate=o.candidate AND x.event>s.began) ORDER BY \
-         o.candidate",
-        Vec::new(),
-        |row| {
-            Ok(OpenTest {
-                candidate: CandidateId(row.get(0)?),
-                task: TaskId(row.get(1)?),
-                live: row.get(2)?,
-            })
-        },
-    )
+    rows(db, OPEN_TESTS, Vec::new(), |row| {
+        Ok(OpenTest {
+            candidate: CandidateId(row.get(0)?),
+            task: TaskId(row.get(1)?),
+            live: row.get(2)?,
+        })
+    })
 }
 
-/// The run as the Research page shows it: its facts, what it holds and its open tests, read
-/// at once.
+/// The run as the Research page shows it: its facts, what it holds and its open tests.
 #[derive(Clone)]
 pub struct RunState {
-    pub facts: RunFacts,
-    pub coverage: Coverage,
+    pub facts: Arc<RunFacts>,
+    pub coverage: Arc<Coverage>,
     pub open_tests: Vec<OpenTest>,
 }
 
 impl Store {
     /// What every phase owes, what runs, what is exhausted with its last child's reply, the
-    /// scheduler's `spent` work included, what the user is asked and what no path reaches.
+    /// scheduler's `spent` work included, what the user is asked, what stands unproven and
+    /// what no path reaches.
     pub fn synthesis(&self, spent: &[SpentWork]) -> Result<Synthesis> {
         let spent = &queues::Spent::of(spent)?;
         let found = self.read(|db| synthesis(db, spent))?;
-        self.replied(found)
-    }
-
-    /// The synthesis `found`, each exhausted subject with its last child's reply, read after
-    /// the snapshot that found it.
-    fn replied(&self, found: Found) -> Result<Synthesis> {
         let exhausted = (found.exhausted.into_iter())
-            .map(|(phase, owed, job)| {
+            .map(|(phase, owed, tasks, job)| {
                 let texts = job.map(|job| self.0.agent_job_texts(job)).transpose()?;
                 Ok(Exhausted {
                     reply: texts.flatten().and_then(|texts| texts.reply),
+                    tasks,
                     phase,
                     node: owed.node,
                     title: owed.title,
@@ -316,7 +482,9 @@ impl Store {
             running: found.running,
             exhausted,
             asked: found.asked,
+            unproven: found.unproven,
             unreached: found.unreached,
+            uncovered: found.uncovered,
         })
     }
 
@@ -325,32 +493,29 @@ impl Store {
     }
 
     pub fn run_facts(&self) -> Result<RunFacts> {
-        let (run, found) =
-            self.read(|db| Ok((runs::run(db)?, synthesis(db, &queues::Spent::default())?)))?;
+        let (run, summary) = self.read(|db| Ok((runs::run(db)?, summary(db)?)))?;
         Ok(RunFacts {
             run,
-            synthesis: self.replied(found)?,
+            summary,
             artifacts: self.artifact_root(),
         })
     }
 
+    pub fn open_tests(&self) -> Result<Vec<OpenTest>> {
+        self.read(open_tests)
+    }
+
+    /// The run as the Research page shows it, read at once.
     pub fn run_state(&self) -> Result<RunState> {
-        let (run, found, coverage, open_tests) = self.read(|db| {
-            Ok((
-                runs::run(db)?,
-                synthesis(db, &queues::Spent::default())?,
-                coverage(db)?,
-                open_tests(db)?,
-            ))
-        })?;
-        let facts = RunFacts {
-            run,
-            synthesis: self.replied(found)?,
-            artifacts: self.artifact_root(),
-        };
+        let (run, summary, coverage, open_tests) =
+            self.read(|db| Ok((runs::run(db)?, summary(db)?, coverage(db)?, open_tests(db)?)))?;
         Ok(RunState {
-            facts,
-            coverage,
+            facts: Arc::new(RunFacts {
+                run,
+                summary,
+                artifacts: self.artifact_root(),
+            }),
+            coverage: Arc::new(coverage),
             open_tests,
         })
     }
@@ -359,9 +524,58 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::tests::{begun, fixture, text, validated},
+        super::{
+            queues::tests::queued,
+            tests::{
+                HIGH, assess, begun, component, fixture, operation, path_from, plan, premise,
+                scenario, sweep, text, validated, verdict,
+            },
+        },
         *,
     };
+
+    /// Coverage reads its root groups' facts once: no candidate's standing seeks its group's
+    /// members.
+    #[test]
+    fn coverage_reads_group_facts_once() {
+        let (_session, store, _) = fixture();
+        let seeks: Vec<String> = (plan(&store, CANDIDATE_STATES).into_iter())
+            .map(|step| step.detail)
+            .filter(|step| step.contains("candidate_flaw_flaw"))
+            .collect();
+        assert!(seeks.is_empty(), "{seeks:#?}");
+    }
+
+    /// A candidate left unproven is listed with the undecided premises of its chain alone.
+    #[test]
+    fn an_unproven_candidate_is_listed_with_its_undecided_premises() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        sweep(&store, scenario.path);
+        assess(&store, &actor, scenario.candidate, HIGH);
+        let [open, decided] = [PremiseScope::Code, PremiseScope::Deployment]
+            .map(|scope| premise(&store, &actor, scope));
+        let rests = [open, decided].map(|premise| Link::FlawPremise {
+            flaw: scenario.flaw,
+            premise,
+        });
+        store.link(&actor, &rests).unwrap();
+        let holds = StatusChange::Premise(decided, PremiseStatus::Holds);
+        store
+            .set_status(&actor, holds, &text("the user runs it"))
+            .unwrap();
+        verdict(&store, &actor, scenario.candidate, Verdict::Unproven);
+        let unproven = store.synthesis(&[]).unwrap().unproven;
+        assert_eq!(
+            (unproven.iter())
+                .map(|entry| (
+                    entry.candidate,
+                    entry.premises.iter().map(|p| p.id).collect()
+                ))
+                .collect::<Vec<(CandidateId, Vec<PremiseId>)>>(),
+            [(scenario.candidate, vec![open])]
+        );
+    }
 
     /// A test task on a candidate merged away is its survivor's open test.
     #[test]
@@ -386,5 +600,39 @@ mod tests {
                 live: true
             }]
         );
+    }
+
+    /// A retracted source enters no path's work and counts nowhere: a path only it enters owes
+    /// no sweep or probe, and an interface only it sits on waits on nothing. A retracted component is
+    /// neither counted nor unreached. Restored, a source enters its paths again.
+    #[test]
+    fn retracted_sources_and_components_count_nowhere() {
+        let (_session, store, actor) = fixture();
+        let decoder = scenario(&store, &actor, "decoder");
+        let idle = component(&store, &actor, "idle");
+        let gateway = component(&store, &actor, "gateway");
+        let api = path_from(&store, &actor, "api", &[gateway], operation("gateway-api"));
+        let [code, interface] = [decoder.path, api].map(|path| {
+            let NodeView::Path(view) = store.node(path.into()).unwrap() else {
+                panic!("a path")
+            };
+            view.sources[0].id
+        });
+        let read = || {
+            let (coverage, synthesis) = (store.coverage().unwrap(), store.synthesis(&[]).unwrap());
+            let counts = (coverage.sources, coverage.components, coverage.unreached);
+            let uncovered = synthesis.uncovered.len();
+            let structure = [Phase::Sweep, Phase::Probe].map(|phase| queued(&store, phase));
+            (counts, synthesis.unreached, uncovered, structure.concat())
+        };
+        let swept = vec![NodeId::from(decoder.path)];
+        assert_eq!(read(), ((2, 3, 1), vec![idle], 1, swept.clone()));
+        let mark = |change| store.set_status(&actor, change, &text("in error")).unwrap();
+        mark(StatusChange::Source(code, InventoryStatus::Retracted));
+        mark(StatusChange::Source(interface, InventoryStatus::Retracted));
+        mark(StatusChange::Component(idle, InventoryStatus::Retracted));
+        assert_eq!(read(), ((0, 2, 0), vec![], 0, vec![]));
+        mark(StatusChange::Source(code, InventoryStatus::Recorded));
+        assert_eq!(read(), ((1, 2, 0), vec![], 0, swept));
     }
 }

@@ -1,7 +1,9 @@
-//! Edges linked and unlinked, and merges of duplicate premises, flaws and candidates, which
-//! move every edge of the merged node to the node it is merged into. Ordered edges, a path's
-//! steps and a candidate's chain, keep positions 0..n-1 through every write; a chain is edited
-//! whole, by its candidate's upsert.
+//! Edges linked and unlinked, and merges of duplicate nodes, which move every edge of the merged
+//! node to the node it is merged into. A path's steps keep
+//! positions 0..n-1 through every write; a candidate's chain and actions are set by its upsert
+//! or a merge, rewritten past the prefix they keep, or one flaw replaced in place.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -44,58 +46,27 @@ pub enum Unlink {
     FlawPremise { flaw: FlawId, premise: PremiseId },
 }
 
-/// The statements keeping one ordered edge table's positions contiguous for an owner `?1`:
-/// how many it has, and the two-step shifts opening a gap at `?2` or closing the one at
-/// `?2`. Each shift first lifts the moving rows past every position in use, so no step
-/// collides with a row not yet moved.
+/// The statements keeping path `?1`'s step positions contiguous: how many it has, read off
+/// its last position, and the two-step shifts opening a gap at `?2` or closing the one at `?2`.
+/// Each shift first lifts the moving rows past every position in use, so no step collides with
+/// a row not yet moved.
 struct Ordered {
     count: &'static str,
     open: [&'static str; 2],
     close: [&'static str; 2],
 }
 
-macro_rules! ordered {
-    ($table:literal, $owner:literal) => {
-        Ordered {
-            count: concat!("SELECT count(*) FROM ", $table, " WHERE ", $owner, "=?1"),
-            open: [
-                concat!(
-                    "UPDATE ",
-                    $table,
-                    " SET position=position+4294967296 WHERE ",
-                    $owner,
-                    "=?1 AND position>=?2"
-                ),
-                concat!(
-                    "UPDATE ",
-                    $table,
-                    " SET position=position-4294967295 WHERE ",
-                    $owner,
-                    "=?1 AND position>=4294967296"
-                ),
-            ],
-            close: [
-                concat!(
-                    "UPDATE ",
-                    $table,
-                    " SET position=position+4294967296 WHERE ",
-                    $owner,
-                    "=?1 AND position>?2"
-                ),
-                concat!(
-                    "UPDATE ",
-                    $table,
-                    " SET position=position-4294967297 WHERE ",
-                    $owner,
-                    "=?1 AND position>=4294967296"
-                ),
-            ],
-        }
-    };
-}
-
-const PATH_STEPS: Ordered = ordered!("path_step", "path");
-const CHAIN: Ordered = ordered!("candidate_flaw", "candidate");
+const PATH_STEPS: Ordered = Ordered {
+    count: "SELECT coalesce(max(position)+1,0) FROM path_step WHERE path=?1",
+    open: [
+        "UPDATE path_step SET position=position+4294967296 WHERE path=?1 AND position>=?2",
+        "UPDATE path_step SET position=position-4294967295 WHERE path=?1 AND position>=4294967296",
+    ],
+    close: [
+        "UPDATE path_step SET position=position+4294967296 WHERE path=?1 AND position>?2",
+        "UPDATE path_step SET position=position-4294967297 WHERE path=?1 AND position>=4294967296",
+    ],
+};
 
 impl Ordered {
     /// Open a gap for a new edge of `owner` at `position`, or last: where it goes.
@@ -235,6 +206,21 @@ fn unlink(db: &Db, unlink: &Unlink, marks: &mut Marks) -> Result<()> {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Merge {
+    Component {
+        component: ComponentId,
+        into: ComponentId,
+        note: Text,
+    },
+    Source {
+        source: SourceId,
+        into: SourceId,
+        note: Text,
+    },
+    Path {
+        path: PathId,
+        into: PathId,
+        note: Text,
+    },
     Premise {
         premise: PremiseId,
         into: PremiseId,
@@ -321,31 +307,29 @@ fn absorb(db: &Db, from: NodeId, into: NodeId) -> Result<()> {
 fn rechain(db: &Db, from: FlawId, into: FlawId, marks: &mut Marks) -> Result<()> {
     let held = rows(
         db,
-        "SELECT candidate FROM candidate_flaw WHERE flaw=?1",
-        params![from],
-        |row| Ok(NodeId(row.get(0)?)),
+        "SELECT candidate,EXISTS (SELECT 1 FROM candidate_flaw WHERE candidate=f.candidate AND \
+         flaw=?2) FROM candidate_flaw f WHERE flaw=?1",
+        params![from, into],
+        |row| Ok((NodeId(row.get(0)?), row.get::<bool>(1)?)),
     )?;
-    for candidate in held {
+    for (candidate, collides) in held {
         marks.mark(candidate, EventEffect::Standing);
+        if !collides {
+            db.execute(
+                "UPDATE candidate_flaw SET flaw=?3 WHERE candidate=?1 AND flaw=?2",
+                params![candidate, from, into],
+            )?;
+            marks.mark(from, EventEffect::Concerns);
+            marks.mark(into, EventEffect::Concerns);
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let chain: Vec<FlawId> = (FLAWS.held::<FlawId>(db, candidate)?.into_iter())
+            .map(|flaw| if flaw == from { into } else { flaw })
+            .filter(|flaw| seen.insert(NodeId::from(*flaw)))
+            .collect();
+        FLAWS.set(db, candidate, &chain, marks)?;
     }
-    let later = rows(
-        db,
-        "SELECT a.candidate,max(a.position,b.position) FROM candidate_flaw a JOIN candidate_flaw \
-         b ON b.candidate=a.candidate AND b.flaw=?2 WHERE a.flaw=?1",
-        params![from, into],
-        |row| Ok((NodeId(row.get(0)?), row.get::<i64>(1)?)),
-    )?;
-    for (candidate, position) in later {
-        db.execute(
-            "DELETE FROM candidate_flaw WHERE candidate=?1 AND position=?2",
-            params![candidate, position],
-        )?;
-        CHAIN.close(db, candidate, position)?;
-    }
-    db.execute(
-        "UPDATE candidate_flaw SET flaw=?2 WHERE flaw=?1",
-        params![from, into],
-    )?;
     let finding = |root: FlawId| {
         optional(
             db,
@@ -382,10 +366,44 @@ fn pair<I: KindId>(db: &Db, from: I, into: I) -> Result<(I, I)> {
 }
 
 /// Fold `merge`'s duplicate into its survivor: every edge naming it names the survivor,
-/// marking the nodes at their other ends. A merged candidate keeps its chain, tests and
-/// verdict as history, and leaves its root's group as a candidate losing its root does.
+/// marking the nodes at their other ends. A merged source gives up its row, so its location
+/// is free for a live source. A merged path keeps its steps as history, the
+/// survivor's standing for the flow. A merged candidate keeps its chain, actions, tests
+/// and verdict as history, and leaves its root's group as a candidate losing its root does;
+/// the survivor performs, after its own actions, each of the duplicate's it has no
+/// counterpart for: as many of a path as the duplicate performs beyond its own.
 fn fold(db: &Db, merge: &Merge, marks: &mut Marks) -> Result<(NodeId, NodeId)> {
     Ok(match merge {
+        Merge::Component {
+            component, into, ..
+        } => {
+            let (from, into) = pair(db, *component, *into)?;
+            let edges = [
+                repoint!("component_file", "component", "NULL"),
+                repoint!("component_interface", "component", "NULL"),
+                repoint!("path_step", "component", "path"),
+                repoint!("flaw", "component", "node"),
+            ];
+            repoint(db, &edges, from.into(), into.into(), marks)?;
+            (from.into(), into.into())
+        }
+        Merge::Source { source, into, .. } => {
+            let (from, into) = pair(db, *source, *into)?;
+            let edges = [repoint!("path_source", "source", "path", duplicates)];
+            repoint(db, &edges, from.into(), into.into(), marks)?;
+            db.execute("DELETE FROM source WHERE node=?1", params![from])?;
+            (from.into(), into.into())
+        }
+        Merge::Path { path, into, .. } => {
+            let (from, into) = pair(db, *path, *into)?;
+            let edges = [
+                repoint!("path_source", "path", "source", duplicates),
+                repoint!("path_premise", "path", "premise", duplicates),
+                repoint!("candidate_action", "path", "candidate"),
+            ];
+            repoint(db, &edges, from.into(), into.into(), marks)?;
+            (from.into(), into.into())
+        }
         Merge::Premise { premise, into, .. } => {
             let (from, into) = pair(db, *premise, *into)?;
             let edges = [
@@ -408,6 +426,18 @@ fn fold(db: &Db, merge: &Merge, marks: &mut Marks) -> Result<(NodeId, NodeId)> {
             let (from, into) = pair(db, *candidate, *into)?;
             let edges = [repoint!("environment", "candidate", "NULL")];
             repoint(db, &edges, from.into(), into.into(), marks)?;
+            let mut actions: Vec<PathId> = ACTIONS.held(db, into)?;
+            let mut unmatched = BTreeMap::<NodeId, usize>::new();
+            for path in &actions {
+                *unmatched.entry((*path).into()).or_default() += 1;
+            }
+            for path in ACTIONS.held::<PathId>(db, from)? {
+                match unmatched.get_mut(&path.into()) {
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => actions.push(path),
+                }
+            }
+            ACTIONS.set(db, into, &actions, marks)?;
             let root = optional(
                 db,
                 "SELECT root FROM candidate_root WHERE candidate=?1",
@@ -453,10 +483,13 @@ impl Store {
         })
     }
 
-    /// Merge a duplicate premise, flaw or candidate into a live node of its kind, with the
-    /// actor's reason; ids of merged nodes name the node they were merged into.
+    /// Merge a duplicate node into a live node of its kind, with the actor's reason; ids of
+    /// merged nodes name the node they were merged into.
     pub fn merge(&self, actor: &AgentId, merge: &Merge) -> Result<()> {
-        let (Merge::Premise { note, .. }
+        let (Merge::Component { note, .. }
+        | Merge::Source { note, .. }
+        | Merge::Path { note, .. }
+        | Merge::Premise { note, .. }
         | Merge::Flaw { note, .. }
         | Merge::Candidate { note, .. }) = merge;
         self.write(|db| {
@@ -475,8 +508,12 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::tests::{
-            candidate, component, fixture, flaw, last_event, marks, path, premise, scenario, text,
+        super::{
+            queues::tests::queued,
+            tests::{
+                candidate, component, daemon, fixture, flaw, last_event, marks, path, path_from,
+                premise, scenario, text,
+            },
         },
         *,
     };
@@ -495,6 +532,13 @@ mod tests {
             panic!("a candidate")
         };
         view.chain.iter().map(|link| link.flaw.id).collect()
+    }
+
+    fn actions(store: &Store, candidate: CandidateId) -> Vec<NodeId> {
+        let NodeView::Candidate(view) = store.node(candidate.into()).unwrap() else {
+            panic!("a candidate")
+        };
+        view.actions.iter().map(|action| action.path.id).collect()
     }
 
     /// Steps go where they are put, or last, and removing one closes its gap: positions stay
@@ -550,7 +594,7 @@ mod tests {
             title: None,
             body: None,
             detail: CandidateEdit {
-                path: None,
+                actions: None,
                 chain: Some(vec![first].try_into().unwrap()),
             },
         };
@@ -563,8 +607,10 @@ mod tests {
 
     /// A merge moves every edge of the merged node to the survivor, dropping duplicates; a
     /// chain holding both flaws keeps the earlier place, so its root stays the flaw that place
-    /// became, with the root's finding re-keyed or absorbed; and `merged_into` stays one hop:
-    /// writes naming a merged node land on the survivor.
+    /// became, with the root's finding re-keyed or absorbed; a merged candidate's actions
+    /// follow the survivor's, each path as often as the merged one performs it beyond the
+    /// survivor; and `merged_into` stays one hop: writes naming a merged node land on the
+    /// survivor.
     #[test]
     fn a_merge_moves_every_edge_to_the_survivor() {
         let (_session, store, actor) = fixture();
@@ -601,6 +647,7 @@ mod tests {
         let environment = NewEnvironment {
             instructions: text("start it"),
             candidate: Some(one.candidate),
+            serves: Serves::default(),
         };
         store.environment(&actor, &environment).unwrap();
         let note = text("duplicate");
@@ -622,6 +669,30 @@ mod tests {
             into: both,
             note: note.clone(),
         });
+        assert_eq!(actions(&store, both), [two.path.into(), one.path.into()]);
+        assert_eq!(actions(&store, one.candidate), [one.path.into()]);
+        let twice = New {
+            title: text("raced"),
+            body: text("the request races itself"),
+            detail: NewCandidate {
+                actions: vec![one.path, one.path].try_into().unwrap(),
+                chain: vec![between].try_into().unwrap(),
+            },
+        };
+        let twice: CandidateId = (store.upsert(&actor, &Upsert::Candidate(Change::Create(twice))))
+            .unwrap()
+            .get()
+            .try_into()
+            .unwrap();
+        merge(Merge::Candidate {
+            candidate: twice,
+            into: both,
+            note: note.clone(),
+        });
+        assert_eq!(
+            actions(&store, both),
+            [two.path.into(), one.path.into(), one.path.into()]
+        );
         let third = flaw(&store, &actor, two.component);
         let kept = store
             .report(&actor, third, &text("finding"), &text("report"))
@@ -650,6 +721,7 @@ mod tests {
                 one.flaw.into(),
                 &[NewEvidence {
                     location: None,
+                    environment: None,
                     stance: Stance::Supports,
                     note: text("seen"),
                 }],
@@ -707,5 +779,117 @@ mod tests {
                 .collect::<Vec<_>>(),
             [NodeId::from(kept)]
         );
+    }
+
+    /// A merged path moves its sources, premises and places in candidates' actions to the
+    /// survivor, keeping its steps; a merged source the paths it enters, freeing its location
+    /// for the survivor; and a merged component its files, interfaces, steps and flaws. Each
+    /// leaves the sweep and probe queues and every coverage count, a merged path reaching no
+    /// component and listed by none.
+    #[test]
+    fn a_merged_inventory_node_leaves_its_queues_and_counts() {
+        let (_session, store, actor) = fixture();
+        let (one, two) = (
+            scenario(&store, &actor, "one"),
+            scenario(&store, &actor, "two"),
+        );
+        let probes = [0x10, 0x100]
+            .map(|at| path_from(&store, &actor, "daemon", &[two.component], daemon(at)));
+        let relied = premise(&store, &actor, PremiseScope::Code);
+        let link = Link::PathPremise {
+            path: one.path,
+            premise: relied,
+        };
+        store.link(&actor, &[link]).unwrap();
+        let counts = || {
+            let coverage = store.coverage().unwrap();
+            let unreached = store.synthesis(&[]).unwrap().unreached;
+            let counts = (coverage.sources, coverage.paths, coverage.components);
+            (counts, coverage.unreached, unreached)
+        };
+        assert_eq!(counts(), ((4, 4, 2), 0, vec![]));
+        let note = text("duplicate");
+        let merge = |merge: Merge| store.merge(&actor, &merge).unwrap();
+        merge(Merge::Path {
+            path: one.path,
+            into: two.path,
+            note: note.clone(),
+        });
+        merge(Merge::Path {
+            path: probes[1],
+            into: probes[0],
+            note: note.clone(),
+        });
+        assert_eq!(queued(&store, Phase::Sweep), [NodeId::from(two.path)]);
+        assert_eq!(queued(&store, Phase::Probe), [NodeId::from(probes[0])]);
+        assert_eq!(counts(), ((4, 2, 2), 1, vec![one.component]));
+        assert_eq!(actions(&store, one.candidate), [two.path.into()]);
+        assert_eq!(steps(&store, one.path), [(0, one.component)]);
+        let NodeView::Path(survivor) = store.node(two.path.into()).unwrap() else {
+            panic!("a path")
+        };
+        assert_eq!(
+            survivor.premises.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [relied]
+        );
+        let (merged_source, kept_source) = (survivor.sources[0].id, survivor.sources[1].id);
+        assert_eq!(survivor.sources.len(), 2);
+
+        merge(Merge::Source {
+            source: merged_source,
+            into: kept_source,
+            note: note.clone(),
+        });
+        let NodeView::Source(merged) = store.node(merged_source.into()).unwrap() else {
+            panic!("a source")
+        };
+        assert_eq!(
+            (merged.head.merged_into, merged.live.is_none()),
+            (Some(kept_source.into()), true)
+        );
+        let adopt = Edit {
+            title: None,
+            body: None,
+            detail: SourceEdit {
+                location: Some(survivor.sources[0].location.clone()),
+                trust: None,
+            },
+        };
+        let adopt = Upsert::Source(Change::Edit(kept_source, adopt));
+        store.upsert(&actor, &adopt).unwrap();
+        merge(Merge::Component {
+            component: one.component,
+            into: two.component,
+            note,
+        });
+        assert_eq!(counts(), ((3, 2, 1), 0, vec![]));
+        let NodeView::Source(source) = store.node(kept_source.into()).unwrap() else {
+            panic!("a source")
+        };
+        let source = source.live.unwrap();
+        assert_eq!(
+            (source.paths.iter().map(|path| path.id)).collect::<Vec<_>>(),
+            [NodeId::from(two.path)]
+        );
+        assert_eq!(source.location, survivor.sources[0].location);
+        let NodeView::Component(component) = store.node(two.component.into()).unwrap() else {
+            panic!("a component")
+        };
+        assert_eq!(component.files, ["one/lib.c", "two/lib.c"]);
+        assert_eq!(component.interfaces.len(), 2);
+        assert_eq!(
+            (component.paths.iter().map(|path| path.id)).collect::<Vec<_>>(),
+            [NodeId::from(two.path), probes[0].into()],
+            "a merged path's steps are history"
+        );
+        assert_eq!(
+            component
+                .flaws
+                .iter()
+                .map(|flaw| flaw.id)
+                .collect::<Vec<_>>(),
+            [one.flaw, two.flaw]
+        );
+        assert_eq!(steps(&store, one.path), [(0, two.component)]);
     }
 }

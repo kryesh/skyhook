@@ -11,7 +11,7 @@
 
 mod lookup;
 
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -427,14 +427,14 @@ impl FromStr for Cvss40 {
         let body = vector
             .strip_prefix("CVSS:4.0/")
             .ok_or(ParseError::InvalidPrefix)?;
-        let mut metrics = HashMap::new();
+        let mut metrics = [None; BaseMetric::ALL.len()];
         // The specification makes every ordering but Table 23's invalid, and the enum
         // declares the metrics in that order.
         let mut last = None;
         for token in body.split('/') {
             let (name, value) = token.split_once(':').ok_or(ParseError::MalformedMetric)?;
             let metric = (name.parse::<BaseMetric>()).map_err(|_| ParseError::UnknownMetric)?;
-            if metrics.insert(metric, value).is_some() {
+            if metrics[metric as usize].replace(value).is_some() {
                 return Err(ParseError::DuplicateMetric(metric));
             }
             if last.is_some_and(|last| last > metric as u8) {
@@ -463,12 +463,10 @@ impl FromStr for Cvss40 {
 }
 
 fn parse_value<T: NamedEnum>(
-    metrics: &HashMap<BaseMetric, &str>,
+    metrics: &[Option<&str>; BaseMetric::ALL.len()],
     metric: BaseMetric,
 ) -> Result<T, ParseError> {
-    let value = metrics
-        .get(&metric)
-        .ok_or(ParseError::MissingMetric(metric))?;
+    let value = metrics[metric as usize].ok_or(ParseError::MissingMetric(metric))?;
     T::parse(value).ok_or(ParseError::InvalidValue(metric))
 }
 

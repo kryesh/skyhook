@@ -807,9 +807,13 @@ mod tests {
         builder
     }
 
+    /// The fixture is found through the manifest directory the test runner sets, not the
+    /// one compiled in: cargo keys artifacts by workspace-relative paths, so a binary built
+    /// from another copy of the workspace into the same target directory stays fresh while
+    /// naming that copy's sources.
     async fn fixture_skills() -> HostSkills {
-        let workspace =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skill-workspace");
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("run by cargo or nextest");
+        let workspace = Path::new(&manifest).join("tests/fixtures/skill-workspace");
         HostSkills::discover_from(&workspace, None).await
     }
 

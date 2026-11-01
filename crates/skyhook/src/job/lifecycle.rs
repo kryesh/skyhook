@@ -184,7 +184,7 @@ impl JobManager {
                 }
                 journaled.extend(Delivery::claims(entry.reads.clone(), state));
                 let acknowledged = Plan::new(journaled, move |state, _| {
-                    state.jobs.modify(id, |entry, _| entry.reads.clear());
+                    state.jobs.unread(id);
                     if let Some((asking, _, change)) = unasked {
                         asked(state, asking, change);
                     }

@@ -13,7 +13,7 @@ mod shelf;
 mod views;
 
 pub use list::*;
-pub(super) use neighbours::disputed;
+pub(super) use neighbours::{disputed, undecided_premises};
 pub use shelf::*;
 pub use views::*;
 
@@ -34,6 +34,7 @@ impl Store {
                             body: row.get(2)?,
                             merged_into: row.get::<Option<i64>>(3)?.map(NodeId),
                             evidence: evidence(db, id)?,
+                            tasks: tasks::of_node(db, id)?,
                         },
                     ))
                 },
@@ -71,9 +72,31 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::tests::{fixture, premise, scenario, text},
+        super::tests::{begun, fixture, premise, scenario, text},
         *,
     };
+
+    /// A node's view lists its tasks newest first, and a merge's survivor lists the merged
+    /// node's too.
+    #[test]
+    fn a_node_lists_its_tasks_through_a_merge() {
+        let (_session, store, actor) = fixture();
+        let (merged, kept) = (
+            scenario(&store, &actor, "one"),
+            scenario(&store, &actor, "two"),
+        );
+        let (_, _, first) = begun(&store, &Begin::Assess(vec![merged.candidate]));
+        let (_, _, second) = begun(&store, &Begin::Assess(vec![kept.candidate]));
+        let merge = Merge::Candidate {
+            candidate: merged.candidate,
+            into: kept.candidate,
+            note: text("same"),
+        };
+        store.merge(&actor, &merge).unwrap();
+        let tasks = |id: CandidateId| store.node(id.into()).unwrap().head().tasks.clone();
+        assert_eq!(tasks(kept.candidate), [second, first]);
+        assert_eq!(tasks(merged.candidate), [first]);
+    }
 
     /// Evidence recorded on a node of any kind shows in its view.
     #[test]
@@ -98,6 +121,7 @@ mod tests {
         for node in nodes {
             let item = NewEvidence {
                 location: None,
+                environment: None,
                 stance: Stance::Context,
                 note: text("seen"),
             };
