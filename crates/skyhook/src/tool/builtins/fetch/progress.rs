@@ -6,7 +6,7 @@ use crate::tool::diagnostic::{
     Cause, Effects, IoKind, Operation, PartialContext, RequestEffects, Subject,
 };
 
-use super::super::workspace::Parents;
+use super::super::workspace::Directories;
 use super::LocalError;
 
 pub(super) struct FetchProgress {
@@ -15,7 +15,7 @@ pub(super) struct FetchProgress {
     /// Once a request is sent, a failure no longer proves the server did nothing.
     request: RequestEffects,
     /// The directories a download created to hold its destination remain after a failure.
-    pub parents: Parents,
+    pub parents: Directories,
 }
 
 impl FetchProgress {
@@ -24,7 +24,7 @@ impl FetchProgress {
             started: Instant::now(),
             context: PartialContext::default(),
             request: RequestEffects::Unknown,
-            parents: Parents::Existed,
+            parents: Directories::Existed,
         }
     }
 
@@ -119,9 +119,11 @@ pub(super) fn transport_error(error: reqwest::Error) -> LocalError {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::super::tests::{executor, fetch};
     use super::*;
-    use crate::provider::http::transport::tests::{Plan, Server};
+    use crate::tests::{Plan, Server};
     use crate::tool::diagnostic::FailureSite;
     use serde_json::json;
     use std::time::Duration;
@@ -164,14 +166,14 @@ mod tests {
         assert!(!error.to_string().contains("secret"));
         let (diagnostic, output) = error.into_parts();
         assert!(output.is_none());
-        assert!(matches!(
+        assert_matches!(
             diagnostic.cause,
             Cause::Io {
                 kind: IoKind::ConnectionRefused,
                 code: Some(_),
                 ..
             }
-        ));
+        );
         assert_eq!(
             diagnostic.context.subject,
             Subject::Label("HTTP GET http://127.0.0.1:1".into())

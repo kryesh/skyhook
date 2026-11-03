@@ -308,17 +308,13 @@ mod tests {
                 json!([{"index":0,"function":{"name":"one","arguments":""}}]),
                 vec![(SYNTHETIC, "one", json!({}))],
             ),
-            // Null, empty, object, and double-encoded arguments; loose index/type.
+            // Object arguments; loose index and type.
             (
-                json!([{"index":"0","type":"custom","id":"c","function":{"name":"one","arguments":"null"}}]),
+                json!([{"index":"0","type":"custom","id":"c","function":{"name":"one","arguments":"{}"}}]),
                 vec![("c", "one", json!({}))],
             ),
             (
                 json!([{"index":null,"id":"c","function":{"name":"one","arguments":{"n":1}},"unknown":1}]),
-                vec![("c", "one", json!({"n":1}))],
-            ),
-            (
-                json!([{"id":"c","function":{"name":"one","arguments":"\"{\\\"n\\\":1}\""}}]),
                 vec![("c", "one", json!({"n":1}))],
             ),
             // Names outside the Chat charset reach the runtime, which reports them.

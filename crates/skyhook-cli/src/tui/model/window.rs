@@ -15,15 +15,39 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-/// Records a transcript page reads.
-pub const PAGE: usize = 64;
-/// Requests or jobs a list page reads.
-pub const LIST_PAGE: usize = 128;
 /// Children a card reads at a time.
 pub const CHILD_PAGE: usize = 16;
-/// Records, requests or jobs kept loaded besides those in view, half on each side;
-/// beyond them, those farthest from the view are let go.
-pub const KEPT: usize = 8 * PAGE;
+
+/// How much a window reads at a time and keeps loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Records a transcript page reads.
+    pub page: usize,
+    /// Requests or jobs a list page reads.
+    pub list_page: usize,
+    /// Records, requests or jobs kept loaded besides those in view, half on each side;
+    /// beyond them, those farthest from the view are let go.
+    pub kept: usize,
+}
+
+impl Budget {
+    /// What the terminal reads and keeps.
+    pub const DEFAULT: Self = Self {
+        page: 64,
+        list_page: 128,
+        kept: 8 * 64,
+    };
+}
+
+#[cfg(test)]
+impl Budget {
+    /// A budget small enough that tests reach past what it keeps with short histories.
+    pub const SMALL: Self = Self {
+        page: 16,
+        list_page: 64,
+        kept: 128,
+    };
+}
 
 /// Which side of the view a load fills. Each side has at most one load in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,13 +230,13 @@ impl<K: Ord + Copy> List<K> {
         (!self.earlier || run.first <= key) && (!self.later || key <= run.last)
     }
 
-    /// Let go of the keys beyond what is kept around the view's `shown` ones.
-    pub(super) fn trim(&mut self, shown: Range<usize>) -> bool {
+    /// Let go of the keys beyond the `kept` around the view's `shown` ones.
+    pub(super) fn trim(&mut self, shown: Range<usize>, kept: usize) -> bool {
         let Some(run) = &mut self.run else {
             return false;
         };
-        let before = shown.start.saturating_sub(KEPT / 2);
-        let after = (run.kept.len() - shown.end).saturating_sub(KEPT / 2);
+        let before = shown.start.saturating_sub(kept / 2);
+        let after = (run.kept.len() - shown.end).saturating_sub(kept / 2);
         if before + after == 0 {
             return false;
         }
@@ -233,9 +257,10 @@ impl<K: Ord + Copy> List<K> {
     }
 
     /// The page of up to `page` keys beyond the end `gap` stands for, while more lie
-    /// there and trimming around the view's `shown` ones would keep what it reads.
-    fn want(&self, gap: Gap, shown: Range<usize>, page: usize) -> Option<Page<K>> {
-        let kept = |beyond: usize| beyond + page <= KEPT / 2;
+    /// there and trimming to the `kept` around the view's `shown` ones would keep what
+    /// it reads.
+    fn want(&self, gap: Gap, shown: Range<usize>, page: usize, kept: usize) -> Option<Page<K>> {
+        let kept = |beyond: usize| beyond + page <= kept / 2;
         let run = self.run.as_ref()?;
         match gap {
             Gap::Earlier if self.earlier && kept(shown.start) => Some(Page::Before(run.first)),
@@ -328,6 +353,7 @@ pub struct Window {
     /// Tells this window's loads from those of one it replaced.
     pub id: u64,
     pub content: Content,
+    pub budget: Budget,
     /// The jobs it shows, as their pages read them.
     jobs: HashMap<JobId, JobEnvelope>,
     /// The requests it shows, as their pages read them or as a newer request of the
@@ -349,13 +375,14 @@ pub struct Window {
 }
 
 impl Window {
-    /// `agent`'s `tab`, its first load read around `focus`.
-    pub fn new(agent: AgentId, tab: Tab, id: u64, focus: Edge) -> Self {
+    /// `agent`'s `tab`, its first load read around `focus`, within `budget`.
+    pub fn new(agent: AgentId, tab: Tab, id: u64, focus: Edge, budget: Budget) -> Self {
         Self {
             agent,
             tab,
             id,
             content: Content::of(tab),
+            budget,
             jobs: HashMap::new(),
             requests: HashMap::new(),
             children: HashMap::new(),
@@ -369,8 +396,8 @@ impl Window {
     }
 
     /// A window with nothing to read: a draft's.
-    pub fn empty(agent: AgentId, tab: Tab, id: u64) -> Self {
-        let mut window = Self::new(agent, tab, id, Edge::End);
+    pub fn empty(agent: AgentId, tab: Tab, id: u64, budget: Budget) -> Self {
+        let mut window = Self::new(agent, tab, id, Edge::End, budget);
         window.phase = Phase::Open;
         match &mut window.content {
             Content::Conversation(transcript) => transcript.run = List::complete(),
@@ -380,9 +407,9 @@ impl Window {
         window
     }
 
-    /// `agent`'s whole transcript as `pages` read it in order, for an export.
-    pub fn whole(agent: AgentId, id: u64, pages: Vec<Loaded>) -> Self {
-        let mut window = Self::empty(agent, Tab::Conversation, id);
+    /// `agent`'s whole transcript as `pages` of `budget` read it in order, for an export.
+    pub fn whole(agent: AgentId, id: u64, pages: Vec<Loaded>, budget: Budget) -> Self {
+        let mut window = Self::empty(agent, Tab::Conversation, id, budget);
         for loaded in pages {
             window.add(loaded);
         }
@@ -517,14 +544,21 @@ impl Window {
     }
 
     fn want(&self, gap: Gap) -> Option<Want> {
-        let at = self.in_view();
+        let (
+            at,
+            Budget {
+                page,
+                list_page,
+                kept,
+            },
+        ) = (self.in_view(), self.budget);
         Some(match (gap, &self.content) {
             (Gap::More(parent), _) => Want::Children(vec![(parent, self.children_after(parent)?)]),
             (gap, Content::Conversation(transcript)) => {
-                Want::Transcript(transcript.run.want(gap, at, PAGE)?)
+                Want::Transcript(transcript.run.want(gap, at, page, kept)?)
             }
-            (gap, Content::Requests(list)) => Want::Requests(list.want(gap, at, LIST_PAGE)?),
-            (gap, Content::Jobs(list)) => Want::Roots(list.want(gap, at, LIST_PAGE)?),
+            (gap, Content::Requests(list)) => Want::Requests(list.want(gap, at, list_page, kept)?),
+            (gap, Content::Jobs(list)) => Want::Roots(list.want(gap, at, list_page, kept)?),
         })
     }
 
@@ -638,19 +672,19 @@ impl Window {
         };
         match (&mut self.content, read) {
             (Content::Conversation(transcript), Read::Transcript(page, read)) => {
-                for (request, record) in transcript.place(page, *read) {
+                for (request, record) in transcript.place(page, *read, self.budget.page) {
                     self.requests.entry(request).or_insert(record);
                 }
             }
             (Content::Requests(list), Read::Requests(page, read)) => {
-                let full = read.len() == LIST_PAGE;
+                let full = read.len() == self.budget.list_page;
                 list.insert(page, read.iter().map(|(request, _)| (*request, true)), full);
                 for (request, record) in read {
                     self.requests.entry(request).or_insert(record);
                 }
             }
             (Content::Jobs(list), Read::Roots(page)) => {
-                let full = jobs.len() == LIST_PAGE;
+                let full = jobs.len() == self.budget.list_page;
                 list.insert(page, jobs.iter().map(|job| (job.id, true)), full);
             }
             _ => {}
@@ -675,11 +709,11 @@ impl Window {
 
     /// Let go of what lies farthest from the view beyond what is kept.
     fn trim(&mut self) {
-        let at = self.in_view();
+        let (at, kept) = (self.in_view(), self.budget.kept);
         let trimmed = match &mut self.content {
-            Content::Conversation(transcript) => transcript.trim(at),
-            Content::Requests(list) => list.trim(at),
-            Content::Jobs(list) => list.trim(at),
+            Content::Conversation(transcript) => transcript.trim(at, kept),
+            Content::Requests(list) => list.trim(at, kept),
+            Content::Jobs(list) => list.trim(at, kept),
         };
         self.unpruned |= trimmed;
     }
@@ -802,7 +836,8 @@ mod tests {
 
     /// What the root's transcript `page` reads.
     async fn read(session: &SessionHandle, page: Page<u64>) -> Loaded {
-        let transcript = session.store().transcript(session.root_agent(), page, PAGE);
+        let size = Budget::SMALL.page;
+        let transcript = session.store().transcript(session.root_agent(), page, size);
         Loaded {
             read: Read::Transcript(page, Box::new(bounded(transcript).await.unwrap())),
             jobs: Vec::new(),
@@ -827,7 +862,7 @@ mod tests {
     /// The ordinals loaded, and whether they follow one another.
     fn run(window: &Window) -> (&[u64], bool) {
         let keys = window.transcript().unwrap().run.kept();
-        (keys, keys.windows(2).all(|pair| pair[1] == pair[0] + 1))
+        (keys, keys.array_windows().all(|&[a, b]| b == a + 1))
     }
 
     /// A page read while the first of a parent's children is made leaves them to read,
@@ -856,19 +891,22 @@ mod tests {
             let last = bounded(last).await.unwrap();
             (last.first, last.records[0].clone())
         };
-        let statuses = (0..KEPT + 3 * PAGE)
+        let Budget {
+            page: size, kept, ..
+        } = Budget::SMALL;
+        let statuses = (0..kept + 3 * size)
             .map(|status| session.record_status(agent.clone(), format!("status {status}")));
         bounded(futures_util::future::try_join_all(statuses))
             .await
             .unwrap();
-        let mut focus = Edge::At(Focus::Ordinal(PAGE as u64));
-        let mut window = Window::new(agent.clone(), Tab::Conversation, 1, focus);
+        let mut focus = Edge::At(Focus::Ordinal(size as u64));
+        let mut window = Window::new(agent.clone(), Tab::Conversation, 1, focus, Budget::SMALL);
         let (direction, first) = want(&mut window, None, focus);
         window.loaded(direction, read(&session, first).await);
         let (up, earlier) = want(&mut window, Some(Gap::Earlier), focus);
         let stale = read(&session, earlier).await;
         // The view moves down until the run's start is let go, then back up to it.
-        while run(&window).0[0] == PAGE as u64 {
+        while run(&window).0[0] == size as u64 {
             focus = Edge::At(Focus::Ordinal(run(&window).0.last().unwrap() - 10));
             let (down, later) = want(&mut window, Some(Gap::Later), focus);
             window.loaded(down, read(&session, later).await);
@@ -883,7 +921,7 @@ mod tests {
             let (down, later) = want(&mut window, Some(Gap::Later), focus);
             let page = read(&session, later).await;
             match &page.read {
-                Read::Transcript(_, read) if read.records.len() < PAGE => break (down, page),
+                Read::Transcript(_, read) if read.records.len() < size => break (down, page),
                 _ => window.loaded(down, page),
             }
         };

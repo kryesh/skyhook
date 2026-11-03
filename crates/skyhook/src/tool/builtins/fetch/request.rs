@@ -310,9 +310,11 @@ pub(super) async fn execute(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::super::tests::{executor, fetch, server};
     use super::*;
-    use crate::provider::http::transport::tests::reply;
+    use crate::tests::reply;
     use crate::tool::diagnostic::{Cause, Effects, IoKind};
     use serde_json::json;
 
@@ -425,13 +427,13 @@ mod tests {
         assert_eq!(diagnostic.context.operation, Operation::Read);
         assert_eq!(diagnostic.context.subject, Subject::path(&source));
         assert_eq!(diagnostic.context.effects, Effects::Unknown);
-        assert!(matches!(
+        assert_matches!(
             diagnostic.cause,
             Cause::Io {
                 kind: IoKind::NotFound,
                 ..
             }
-        ));
+        );
 
         // A snapshot read failing while the request streams keeps its I/O cause.
         let (url, _server) = server(vec![reply("200 OK", OK, "")]).await;
@@ -443,13 +445,13 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let request = apply_body(client.put(url), Some(&upload), &HeaderMap::new());
         let error = transport_error(request.send().await.unwrap_err());
-        assert!(matches!(
+        assert_matches!(
             error.diagnostic().cause,
             Cause::Io {
                 code: Some(libc::EBADF),
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test]

@@ -201,7 +201,7 @@ mod tests {
             interrupting: StdMutex::default(),
         });
         let harness = test_builder(root.path(), &sessions, script.clone(), false)
-            .session_extension(Some(crate::session::tests::TABLES))
+            .session_schema(crate::session::tests::TABLES)
             .resume_hook(hook.clone())
             .build()
             .await

@@ -523,7 +523,8 @@ mod tests {
 
     /// The table keeps only the rows a base score reads: every base vector scores as it
     /// did against the reference's full table, whose scores' tenths fold, in this order, to
-    /// the digest.
+    /// the digest. Each code is parsed once, in a vector taking every metric's code at one
+    /// place in its list, and the vectors are composed of the parsed values.
     #[test]
     fn every_base_vector_scores_as_against_the_full_table() {
         const IMPACT: &[&str] = &["H", "L", "N"];
@@ -540,18 +541,41 @@ mod tests {
             IMPACT,
             IMPACT,
         ];
+        let parsed: Vec<Cvss40> = (0..4)
+            .map(|place| {
+                let vector: String = (BaseMetric::ALL.iter().zip(&codes))
+                    .map(|(metric, values)| format!("/{metric}:{}", values[place % values.len()]))
+                    .collect();
+                format!("CVSS:4.0{vector}").parse().unwrap()
+            })
+            .collect();
         let vectors: usize = codes.iter().map(|values| values.len()).product();
         let mut digest = 0u64;
         for mut index in 0..vectors {
-            let mut picked = [""; 11];
-            for (slot, values) in picked.iter_mut().zip(&codes).rev() {
-                *slot = values[index % values.len()];
+            let mut places = [0; 11];
+            for (place, values) in places.iter_mut().zip(&codes).rev() {
+                *place = index % values.len();
                 index /= values.len();
             }
-            let vector: String = (BaseMetric::ALL.iter().zip(picked))
-                .map(|(metric, code)| format!("/{metric}:{code}"))
-                .collect();
-            let cvss: Cvss40 = format!("CVSS:4.0{vector}").parse().unwrap();
+            let at = |metric: BaseMetric| &parsed[places[metric as usize]];
+            use BaseMetric::*;
+            let cvss = Cvss40 {
+                attack_vector: at(AttackVector).attack_vector,
+                attack_complexity: at(AttackComplexity).attack_complexity,
+                attack_requirements: at(AttackRequirements).attack_requirements,
+                privileges_required: at(PrivilegesRequired).privileges_required,
+                user_interaction: at(UserInteraction).user_interaction,
+                vulnerable: Impacts {
+                    confidentiality: at(VulnerableConfidentiality).vulnerable.confidentiality,
+                    integrity: at(VulnerableIntegrity).vulnerable.integrity,
+                    availability: at(VulnerableAvailability).vulnerable.availability,
+                },
+                subsequent: Impacts {
+                    confidentiality: at(SubsequentConfidentiality).subsequent.confidentiality,
+                    integrity: at(SubsequentIntegrity).subsequent.integrity,
+                    availability: at(SubsequentAvailability).subsequent.availability,
+                },
+            };
             digest = digest
                 .wrapping_mul(31)
                 .wrapping_add((cvss.score() * 10.0).round() as u64);

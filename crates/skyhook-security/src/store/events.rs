@@ -1,11 +1,12 @@
 //! The audit log: every write is one event naming the nodes it bears on, each with the
 //! strongest effect it has on it. A write names its direct marks; one rule carries them
-//! along the graph: a premise moves the standing of the flaws and paths relying on it, a source
-//! passes its effect to the paths it enters, and a flaw or path passes its effect to the live
+//! along the graph: a premise moves the standing of the flaws and paths relying on it, a state
+//! passes its effect to the paths accessing it, and a flaw or path passes its effect to the live
 //! candidates holding it. Some marks move their node's own work alone: a candidate taking or
-//! losing a flaw as its root leaves the flaw's other candidates unmoved, and a status set on a
-//! path, source or component moves that node, and a source's paths, but no candidate, unless it
-//! retracts or restores a path. A flaw joining or leaving a chain at another place is only
+//! losing a flaw as its root leaves the flaw's other candidates unmoved, an access recorded on a
+//! state, or its path retracted, restored or merged away, moves its check alone, and a status set
+//! on a path, state or component moves that node, and a state's paths, but no candidate, unless
+//! it retracts or restores a path. A flaw joining or leaving a chain at another place is only
 //! concerned.
 
 use std::collections::{BTreeMap, HashMap};
@@ -14,7 +15,7 @@ use libsql::Row;
 use schemars::JsonSchema;
 use serde::Serialize;
 use skyhook::{
-    db::{Db, enum_column, params},
+    db::{Db, Sql, enum_column, params},
     identity::SessionId,
 };
 
@@ -47,6 +48,16 @@ impl Marks {
     /// Mark `node` standing for its own work alone, carried nowhere.
     pub(super) fn alone(&mut self, node: impl Into<NodeId>) {
         strongest(&mut self.alone, node.into(), EventEffect::Standing);
+    }
+
+    /// Mark alone the check of each state `path` accesses, as recording or removing those
+    /// accesses would: a path retracted, restored or merged away changes them.
+    pub(super) fn accesses(&mut self, db: &Db, path: PathId) -> Result<()> {
+        let sql = "SELECT DISTINCT state FROM path_state WHERE path=?1";
+        for state in rows(db, sql, params![path], |row| Ok(NodeId(row.get(0)?)))? {
+            self.alone(state);
+        }
+        Ok(())
     }
 
     /// Mark alone the flaws leaving and taking a chain's root role, when it moved.
@@ -86,7 +97,7 @@ impl Marks {
             "SELECT fp.flaw,'standing' FROM json_each(?1) j JOIN flaw_premise fp ON \
              fp.premise=j.value->>0 UNION SELECT pp.path,'standing' FROM json_each(?1) j JOIN \
              path_premise pp ON pp.premise=j.value->>0 UNION SELECT ps.path,j.value->>1 FROM \
-             json_each(?1) j JOIN path_source ps ON ps.source=j.value->>0",
+             json_each(?1) j JOIN path_state ps ON ps.state=j.value->>0",
         )?;
         self.carry(
             db,
@@ -102,9 +113,86 @@ impl Marks {
     }
 }
 
-/// Record one event of `kind` by `actor`, part of the tasks it and the agents above it hold:
-/// `write` makes its changes knowing the event, and names the nodes it bears on directly; the
-/// event then names them and what they carry.
+/// A phase's results on a node: a premise's status, a flaw's judgement, a candidate's assessment
+/// or verdict, each recorded with whether the work owning it recorded it.
+pub(super) struct Standing {
+    /// Whether event `?2` was recorded by the work owning node `?1`'s results.
+    pub(super) owns: &'static str,
+    /// Whether node `?1`'s standing result is `?2`.
+    pub(super) held: &'static str,
+    /// Whether node `?1`'s proposal is event `?2`.
+    pub(super) proposal: &'static str,
+    /// The effect of a result its owning work records that replaces the standing one.
+    pub(super) replaced: EventEffect,
+}
+
+/// The [`Standing`] of the results in `$view`, keyed by `$node`, whose value is `$value` and
+/// whose proposal is `$proposed`, owned by the work `$owns` holds for.
+macro_rules! standing_of {
+    ($view:literal, $node:literal, $value:literal, $proposed:literal, $owns:expr,
+        $replaced:ident) => {
+        Standing {
+            owns: concat!("SELECT ", $owns),
+            held: concat!(
+                "SELECT ",
+                $value,
+                " IS ?2 FROM ",
+                $view,
+                " WHERE ",
+                $node,
+                "=?1"
+            ),
+            proposal: concat!(
+                "SELECT ",
+                $proposed,
+                " IS ?2 FROM ",
+                $view,
+                " WHERE ",
+                $node,
+                "=?1"
+            ),
+            replaced: EventEffect::$replaced,
+        }
+    };
+}
+pub(super) use standing_of;
+
+impl Standing {
+    /// The effect on `node` of its result `value`, which `insert` records at `event` from `row`
+    /// and whether its owning work recorded it, bound last. Recorded by the work owning it, it
+    /// replaces the standing one, or only concerns it when it restates it, current or not: its
+    /// currency comes from that work's basis, and nothing resting on it moves. Recorded
+    /// elsewhere, it disputes the standing one when it reads as its proposal, moving that work
+    /// alone, and only concerns it when it agrees or repeats a proposal that work answered.
+    pub(super) fn record(
+        &self,
+        db: &Db,
+        node: impl Into<NodeId>,
+        event: EventId,
+        value: impl Sql,
+        insert: &'static str,
+        mut row: Vec<libsql::Value>,
+    ) -> Result<EventEffect> {
+        let node = node.into();
+        let flag =
+            |sql, value| stored(db, sql, params![node, value], |row| Ok(row.get::<bool>(0)?));
+        let owned = flag(self.owns, event.sql())?;
+        let replaces = owned && !flag(self.held, value.sql())?;
+        row.push(owned.sql());
+        db.execute(insert, row)?;
+        Ok(if replaces {
+            self.replaced
+        } else if !owned && flag(self.proposal, event.sql())? {
+            EventEffect::Disputes
+        } else {
+            EventEffect::Concerns
+        })
+    }
+}
+
+/// Record one event of `kind` by `actor`, part of the tasks of the outermost agent holding any,
+/// `actor` or one above it: `write` makes its changes knowing the event, and names the nodes it
+/// bears on directly; the event then names them and what they carry, and the bearing they decide.
 pub(super) fn audit<T>(
     db: &Db,
     actor: &AgentId,
@@ -118,19 +206,23 @@ pub(super) fn audit<T>(
         params![agent, now(), kind, note],
     )?);
     db.execute(
-        "WITH RECURSIVE line(agent) AS (SELECT ?2 UNION ALL SELECT g.parent FROM line l JOIN \
-         agent g ON g.id=l.agent WHERE g.parent IS NOT NULL) INSERT INTO event_task(event,task) \
-         SELECT DISTINCT ?1,t.id FROM line l JOIN agent a ON a.id=l.agent JOIN task t ON \
-         t.job=a.owner_job",
+        "WITH RECURSIVE line(agent,depth) AS (SELECT ?2,0 UNION ALL SELECT g.parent,l.depth+1 \
+         FROM line l JOIN agent g ON g.id=l.agent WHERE g.parent IS NOT NULL),held AS (SELECT \
+         t.id,l.depth FROM line l JOIN agent a ON a.id=l.agent JOIN task t ON \
+         t.job=a.owner_job) INSERT INTO event_task(event,task) SELECT ?1,id FROM held WHERE \
+         depth=(SELECT max(depth) FROM held)",
         params![event, agent],
     )?;
+    bearing::record_work(db, event, kind)?;
     let (written, marks) = write(event)?;
-    for (node, effect) in marks.propagated(db)? {
+    let marks = marks.propagated(db)?;
+    for (node, effect) in &marks {
         db.execute(
             "INSERT INTO event_node(event,node,kind,effect) VALUES (?1,?2,?3,?4)",
-            params![event, node, kind, effect],
+            params![event, *node, kind, *effect],
         )?;
     }
+    bearing::record(db, event, kind, &marks)?;
     Ok(written)
 }
 
@@ -228,7 +320,7 @@ fn completed(db: &Db, session: SessionId, events: Vec<Logged>) -> Result<Vec<Eve
 }
 
 /// The agent of journal row `row`, by its path of child indexes from the root.
-fn agent_id(db: &Db, session: SessionId, row: i64) -> Result<AgentId> {
+pub(super) fn agent_id(db: &Db, session: SessionId, row: i64) -> Result<AgentId> {
     let path = rows(
         db,
         "WITH RECURSIVE up(id,child,depth) AS (SELECT id,child_index,0 FROM agent WHERE id=?1 \
@@ -243,13 +335,14 @@ fn agent_id(db: &Db, session: SessionId, row: i64) -> Result<AgentId> {
 
 /// The first `limit` events the agent of journal job `job` recorded, oldest first.
 pub(super) fn of_job(db: &Db, session: SessionId, job: i64, limit: usize) -> Result<Vec<Event>> {
-    let events = rows(
+    let events = first_rows(
         db,
         concat!(
             event_select!(),
-            "e.agent=(SELECT id FROM agent WHERE owner_job=?2) ORDER BY e.id LIMIT ?1"
+            "e.agent=(SELECT id FROM agent WHERE owner_job=?1) ORDER BY e.id"
         ),
-        params![limit, job],
+        params![job],
+        limit,
         event_row,
     )?;
     completed(db, session, events)
@@ -261,17 +354,19 @@ impl Store {
         let session = self.id();
         self.read(|db| {
             let events = match node {
-                None => rows(
+                None => first_rows(
                     db,
-                    concat!(event_select!(), "e.id>?1 ORDER BY e.id LIMIT ?2"),
-                    params![page.after, page.limit()],
+                    concat!(event_select!(), "e.id>?1 ORDER BY e.id"),
+                    params![page.after],
+                    page.limit(),
                     event_row,
                 )?,
-                Some(node) => rows(
+                Some(node) => first_rows(
                     db,
                     "SELECT e.id,e.kind,e.agent,e.at,e.note FROM event_node en JOIN event e ON \
-                     e.id=en.event WHERE en.node=?3 AND en.event>?1 ORDER BY en.event LIMIT ?2",
-                    params![page.after, page.limit(), node],
+                     e.id=en.event WHERE en.node=?2 AND en.event>?1 ORDER BY en.event",
+                    params![page.after, node],
+                    page.limit(),
                     event_row,
                 )?,
             };
@@ -284,18 +379,20 @@ impl Store {
 mod tests {
     use super::{
         super::tests::{
-            HIGH, assess, child_agent, fixture, last_event, marks, path, premise, scenario, test,
-            text, validated, verdict,
+            HIGH, access, assess, begun, check, child_agent, component, decide, fixture,
+            last_event, location, marks, path, premise, scenario, state, sweep, test, text,
+            validated, verdict,
         },
         *,
     };
 
-    /// A write's effects flow premise → flaw/path and source → path → candidate: a flaw edit
+    /// A write's effects flow premise → flaw/path and state → path → candidate: a flaw edit
     /// makes its candidates `changed`, a premise decision makes its flaws, paths and their
-    /// candidates `standing`, a path step or a source edit makes the candidates along the path
-    /// `changed`, and a test record moves only its own candidate. A candidate taking a flaw as
-    /// its root moves that flaw, not its other candidates; a flaw joining or leaving a chain at
-    /// another place is only concerned.
+    /// candidates `standing`, a path step or an input state's edit makes the candidates along
+    /// the path `changed`, and a test record moves only its own candidate. A candidate taking a
+    /// flaw as its root moves that flaw, not its other candidates; a flaw joining or leaving a
+    /// chain at another place is only concerned. An access recorded moves its path's standing
+    /// and its state's check alone.
     #[test]
     fn effects_propagate_along_the_graph() {
         let (_session, store, actor) = fixture();
@@ -342,8 +439,7 @@ mod tests {
         );
 
         for premise in [on_flaw, on_path] {
-            let decided = StatusChange::Premise(premise, PremiseStatus::Holds);
-            store.set_status(&actor, decided, &text("traced")).unwrap();
+            decide(&store, premise, PremiseStatus::Holds);
         }
         assert_eq!(
             marks(&store, last_event(&store)),
@@ -375,24 +471,35 @@ mod tests {
         let NodeView::Path(view) = store.node(path.into()).unwrap() else {
             panic!("a path")
         };
-        let source = view.sources[0].id;
+        let input = view.states[0].id;
         let edit = Edit {
             title: None,
             body: None,
-            detail: SourceEdit {
+            detail: StateEdit {
                 location: None,
                 trust: Some(Trust::Authenticated),
             },
         };
         store
-            .upsert(&actor, &Upsert::Source(Change::Edit(source, edit)))
+            .upsert(&actor, &Upsert::State(Change::Edit(input, edit)))
             .unwrap();
         assert_eq!(
             marks(&store, last_event(&store)),
             [
                 changed(path.into()),
-                changed(source.into()),
+                changed(input.into()),
                 changed(candidate.into())
+            ]
+        );
+        let kept = state(&store, &actor, NewState::Instance);
+        let write = access(path, kept, Access::Write, location("decoder/lib.c", 3));
+        store.link(&actor, &[write]).unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [
+                standing(path.into()),
+                standing(candidate.into()),
+                standing(kept.into())
             ]
         );
 
@@ -402,7 +509,7 @@ mod tests {
             marks(&store, last_event(&store)),
             [standing(candidate.into())]
         );
-        assess(&store, &actor, other, HIGH);
+        assess(&store, other, HIGH);
         assert_eq!(marks(&store, last_event(&store)), [standing(other.into())]);
 
         let ahead = super::super::tests::flaw(&store, &actor, decoder.component);
@@ -434,8 +541,50 @@ mod tests {
         );
     }
 
+    /// A path retracted, restored or merged away moves the checks of the states it accesses,
+    /// which gain or lose its accesses; marked swept again, it moves none.
+    #[test]
+    fn a_paths_retraction_restoration_and_merge_move_its_states_checks() {
+        let (_session, store, actor) = fixture();
+        let decoder = component(&store, &actor, "decoder");
+        let [kept, other] = ["kept", "other"].map(|name| path(&store, &actor, name, &[decoder]));
+        let window = state(&store, &actor, NewState::Instance);
+        let at = location("decoder/lib.c", 3);
+        let accesses = [
+            access(kept, window, Access::Write, at.clone()),
+            access(other, window, Access::Read, at),
+        ];
+        store.link(&actor, &accesses).unwrap();
+        for path in [kept, other] {
+            sweep(&store, path);
+        }
+        let owed = || store.run_facts().unwrap().summary.owed(Phase::Check);
+        let check = || {
+            check(&store, window);
+            assert_eq!(owed(), 0);
+        };
+        let mark = |status| {
+            let change = StatusChange::Path(other, status);
+            store.set_status(&actor, change, &text("marked")).unwrap();
+            owed()
+        };
+        check();
+        assert_eq!(mark(PathStatus::Swept), 0, "a restated sweep");
+        assert_eq!(mark(PathStatus::Retracted), 1, "retracted");
+        check();
+        assert_eq!(mark(PathStatus::Swept), 1, "restored");
+        check();
+        let merge = Merge {
+            node: other.into(),
+            into: kept.into(),
+            note: text("same"),
+        };
+        store.merge(&actor, &merge).unwrap();
+        assert_eq!(owed(), 1, "merged");
+    }
+
     /// A candidate rests on every action it performs, not only the first: a premise of a later
-    /// action's path is one its chain rests on, and correcting the source entering that path
+    /// action's path is one its chain rests on, and correcting the input state that path reads
     /// or its steps re-owes the candidate's assessment and verdict and stales its root's
     /// report.
     #[test]
@@ -469,17 +618,16 @@ mod tests {
             premise: held,
         };
         store.link(&actor, &[on_later]).unwrap();
-        assess(&store, &actor, first.candidate, HIGH);
+        assess(&store, first.candidate, HIGH);
         assert_eq!(
             view().confidence,
             Some(ConfidenceTier::Conjectured),
             "a later action's undecided premise is one its chain rests on"
         );
-        let decided = StatusChange::Premise(held, PremiseStatus::Holds);
-        store.set_status(&actor, decided, &text("traced")).unwrap();
+        decide(&store, held, PremiseStatus::Holds);
         let settle = || {
-            assess(&store, &actor, first.candidate, HIGH);
-            verdict(&store, &actor, first.candidate, Verdict::Validated);
+            assess(&store, first.candidate, HIGH);
+            verdict(&store, first.candidate, Verdict::Validated);
             store
                 .report(&actor, first.flaw, &text("overflow"), &text("report"))
                 .unwrap()
@@ -496,12 +644,12 @@ mod tests {
             )
         };
 
-        let source = Upsert::Source(Change::Edit(
-            consumer.sources[0].id,
+        let input = Upsert::State(Change::Edit(
+            consumer.states[0].id,
             Edit {
                 title: None,
                 body: None,
-                detail: SourceEdit {
+                detail: StateEdit {
                     location: None,
                     trust: Some(Trust::Authenticated),
                 },
@@ -516,7 +664,7 @@ mod tests {
         };
         let corrections: [Box<dyn Fn()>; 2] = [
             Box::new(|| {
-                store.upsert(&actor, &source).unwrap();
+                store.upsert(&actor, &input).unwrap();
             }),
             Box::new(|| store.link(&actor, std::slice::from_ref(&step)).unwrap()),
         ];
@@ -535,8 +683,11 @@ mod tests {
         let (_session, store, actor) = fixture();
         let decoder = scenario(&store, &actor, "decoder");
         let (candidate, flaw) = (decoder.candidate, decoder.flaw);
-        let (child, _) = child_agent(&store, skyhook::job::JobState::Running);
-        assess(&store, &child, candidate, HIGH);
+        let (child, _, _) = begun(&store, &Begin::Assess(vec![candidate]));
+        let vector = HIGH.parse().unwrap();
+        store
+            .assess(&child, candidate, vector, &text("scored"))
+            .unwrap();
         let page = Page::new(0, skyhook::Bounded::new::<1>());
         let first = store.history(Some(candidate.into()), page).unwrap();
         assert_eq!(first.items[0].kind, EventKind::Created);
@@ -546,9 +697,13 @@ mod tests {
         }));
         let after = first.next_after.expect("a full page continues");
         let rest = store
-            .history(Some(candidate.into()), Page::new(after, page.limit))
+            .history(
+                Some(candidate.into()),
+                Page::new(after, skyhook::Bounded::new::<2>()),
+            )
             .unwrap();
-        let assessed = &rest.items[0];
+        assert_eq!(rest.items[0].kind, EventKind::Began);
+        let assessed = &rest.items[1];
         assert_eq!(
             (assessed.kind, &assessed.agent, assessed.note.as_deref()),
             (EventKind::Assessed, &child, Some("scored"))

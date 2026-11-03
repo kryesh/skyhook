@@ -95,21 +95,18 @@ impl Scope {
     fn answered(mut self, fields: &[ScopeField], reply: &ScopeReply) -> Self {
         for (field, value) in fields.iter().zip(reply) {
             match field {
-                ScopeField::Shortlist => {
-                    if let Some(index) = value.choice() {
-                        self.options.threshold = Severity::ALL[index];
-                    }
+                ScopeField::Shortlist if let Some(index) = value.choice() => {
+                    self.options.threshold = Severity::ALL[index];
                 }
-                ScopeField::Live => {
-                    if let Some(index) = value.choice() {
-                        self.live = LivePolicy::ALL[index];
-                    }
+                ScopeField::Live if let Some(index) = value.choice() => {
+                    self.live = LivePolicy::ALL[index];
                 }
-                ScopeField::Workers => {
-                    if let Some(workers) = value.integer().and_then(std::num::NonZeroU16::new) {
-                        self.options.workers = workers;
-                    }
+                ScopeField::Workers
+                    if let Some(workers) = value.integer().and_then(std::num::NonZeroU16::new) =>
+                {
+                    self.options.workers = workers;
                 }
+                ScopeField::Shortlist | ScopeField::Live | ScopeField::Workers => {}
             }
         }
         self
@@ -621,67 +618,6 @@ mod tests {
         }
     }
 
-    /// The Research page draws related counts from one snapshot: coverage still cached from
-    /// before components were mapped draws them as it read them, whatever the newer facts hold.
-    #[tokio::test]
-    async fn the_research_page_draws_related_counts_from_one_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let (session, _) = open(
-            &factory(LivePolicy::No, None),
-            directory.path(),
-            Opening::New(None),
-        )
-        .await;
-        let store = research(session.store()).unwrap();
-        let (worker, root) = (store.clone(), session.root_agent().clone());
-        let earlier = tokio::task::spawn_blocking(move || {
-            let earlier = worker.coverage().unwrap();
-            for name in ["decoder", "encoder"] {
-                crate::store::tests::component(&worker, &root, name);
-            }
-            earlier
-        })
-        .await
-        .unwrap();
-        let host = host();
-        let generation = Generation {
-            session: store.id(),
-            generation: store.generation(),
-        };
-        let cached = host.coverage.get(generation, async { Ok(earlier) });
-        cached.await.unwrap();
-        bounded(host.refresh(0, session.clone(), Disclosed::default()))
-            .await
-            .unwrap();
-        session.shutdown().await.unwrap();
-        session.close().await.unwrap();
-    }
-
-    /// Only the root's state carries the run; a child's is a plain agent's.
-    #[tokio::test]
-    async fn only_the_root_gets_the_research_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path();
-        let (session, _) = open(
-            &factory(LivePolicy::No, None),
-            workspace,
-            Opening::New(None),
-        )
-        .await;
-        let host = host();
-        let root = session.root_agent();
-        let extension = session.store().extension().unwrap();
-        let state = host.state(extension, root).await.unwrap();
-        assert!(
-            state
-                .as_str()
-                .starts_with(&format!("run: {}\n", session.id()))
-        );
-        assert!(host.state(extension, &root.child(1)).await.is_none());
-        session.shutdown().await.unwrap();
-        session.close().await.unwrap();
-    }
-
     /// A child is told, as a host event, of the root's change to the work its job began, past
     /// its cursor once; the root, which has no task, is told nothing.
     #[tokio::test]
@@ -719,10 +655,10 @@ mod tests {
         let told = host.events(research, &child, None).await.unwrap().unwrap();
         assert_eq!(
             serde_json::Value::Object(told.view.fields().clone()),
-            serde_json::json!({"research_changes": [{"phase": "sweep", "node": path, "count": 1,
-                "latest": told.through.get(), "kinds": ["edited"], "recent": [
-                {"id": told.through.get(), "kind": "edited", "nodes": [{"node": path, "effect": "changed"}]},
-            ]}]})
+            serde_json::json!({"research_changes": [{"phase": "sweep", "node": path,
+                "title": "stream", "count": 1, "latest": told.through.get(), "kinds": ["edited"],
+                "recent": [{"id": told.through.get(), "kind": "edited",
+                    "nodes": [{"node": path, "title": "stream", "effect": "changed"}]}]}]})
         );
         assert!(
             host.events(research, &child, Some(told.through))
@@ -830,8 +766,9 @@ mod tests {
         }
     }
 
-    /// The root's plan line and the Research page follow a task's job ending, which the
-    /// journal records with no research write.
+    /// Only the root's state carries the run, a child's is a plain agent's, and its plan line and
+    /// the Research page follow a task's job ending, which the journal records with no research
+    /// write.
     #[tokio::test]
     async fn a_job_ending_moves_the_cached_state_and_page() {
         use skyhook_cli::page::Block;
@@ -854,6 +791,13 @@ mod tests {
         let decoder = crate::store::tests::component(&store, &root, "decoder");
         let stream = crate::store::tests::path(&store, &root, "stream", &[decoder]);
         let extension = session.store().extension().unwrap();
+        let state = host.state(extension, &root).await.unwrap();
+        assert!(
+            state
+                .as_str()
+                .starts_with(&format!("run: {}\n", session.id()))
+        );
+        assert!(host.state(extension, &root.child(1)).await.is_none());
         let plan = async || {
             let state = host.state(extension, &root).await.unwrap();
             let line = state

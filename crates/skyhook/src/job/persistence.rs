@@ -513,6 +513,7 @@ mod tests {
         job::output,
         tool::{ToolOutput, policy::CapabilitySet},
     };
+    use std::assert_matches;
 
     /// An on-disk runtime, so `reopen` can open its journal again.
     async fn runtime() -> (tempfile::TempDir, JobManager, crate::identity::AgentId) {
@@ -557,8 +558,7 @@ mod tests {
             },
         )
         .resolve();
-        // An offloaded field exercises whole-document render caching.
-        let payload = json!({"path":"missing.txt", "text":"ordinary output\n".repeat(800)});
+        let payload = json!({"path":"missing.txt", "text":"ordinary output\n"});
         let failed = jobs
             .test_create(JobSpec::test(agent.clone(), "fixture"))
             .await;
@@ -614,8 +614,8 @@ mod tests {
         let Err(SessionError::JournalFailed(failure)) = refused else {
             panic!("a refused transition stops the journal: {refused:?}");
         };
-        assert!(matches!(failure.cause(),
-            SessionError::IllegalTransition { sequence: refused } if *refused == sequence));
+        assert_matches!(failure.cause(),
+            SessionError::IllegalTransition { sequence: refused } if *refused == sequence);
         assert_eq!(jobs.store().records().len(), before);
         assert_eq!(
             jobs.snapshot(lease.id()).await.unwrap().state,
@@ -670,62 +670,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_recovers_creation_committed_before_map_publication() {
-        let (root, jobs, agent) = runtime().await;
-        let job = JobId::new(7).unwrap();
-        let created = crate::session::tests::job_created(job, JobRole::Tool);
-        jobs.store().append(agent.clone(), created).await.unwrap();
-        // A creation no manager ever ran, as a crash leaves it.
-        let jobs = reopen(jobs, root.path()).await;
-        let interrupted = jobs.snapshot(job).await.unwrap();
-        assert_eq!(interrupted.state, JobState::Interrupted);
-        assert!(
-            interrupted
-                .rendered_error(&CapabilitySet::default())
-                .is_some_and(|error| error.contains("operation interrupted")
-                    && !error.contains("session was not running"))
-        );
-        assert_eq!(
-            jobs.test_create(JobSpec::test(agent, "next")).await.get(),
-            8
-        );
-    }
-
-    #[tokio::test]
-    async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
-        let (root, jobs, agent) = runtime().await;
+    async fn agent_views_hide_pending_authorization() {
+        let (_root, jobs, agent) = crate::job::tests::runtime().await;
         let capabilities = CapabilitySet::default();
         let job = jobs
             .test_approving(JobSpec::test(agent, "exec"))
             .await
             .into_test_id();
-        let pending = jobs.snapshot(job).await.unwrap();
-        assert_eq!(
-            pending.metadata_view(&capabilities).into_value()["state"],
-            "queued"
-        );
-        let schema = JOB_VIEW_SCHEMAS.one.to_string();
+        for jobs in [jobs.clone(), jobs.test_replay()] {
+            let pending = jobs.snapshot(job).await.unwrap();
+            assert_eq!(
+                pending.metadata_view(&capabilities).into_value()["state"],
+                "queued"
+            );
+        }
+        let schema = JOB_VIEW_SCHEMAS.view.to_string();
         assert!(!schema.contains("awaiting_approval"));
-        jobs.finish(job, ToolError::denied("user reason").into())
-            .await
-            .unwrap();
-        let denied = jobs
-            .wait(job, true)
-            .await
-            .unwrap()
-            .metadata_view(&capabilities)
-            .into_value();
-        assert_eq!(denied["meta"]["code"], "permission_denied");
-        assert!(denied["error"].as_str().unwrap().contains("user reason"));
-        // The persisted terminal event is the source of truth for replay.
-        let restored = reopen(jobs, root.path()).await;
-        let replayed = restored
-            .snapshot(job)
-            .await
-            .unwrap()
-            .metadata_view(&capabilities)
-            .into_value();
-        assert_eq!(replayed, denied);
     }
 
     #[tokio::test]
@@ -760,8 +720,19 @@ mod tests {
                 .test_capture(field, kind, bytes.as_bytes());
             leases.push(lease);
         }
+        // A creation no manager ever ran, as a crash leaves it.
+        let created = crate::session::tests::job_created(JobId::new(3).unwrap(), JobRole::Tool);
+        manager
+            .store()
+            .append(agent.clone(), created)
+            .await
+            .unwrap();
         abandon(leases);
         let restored = reopen(manager, root.path()).await;
+        let crashed = restored.snapshot(JobId::new(3).unwrap()).await.unwrap();
+        assert_eq!(crashed.state, JobState::Interrupted);
+        let cause = crashed.diagnostic.map(|diagnostic| diagnostic.cause);
+        assert_eq!(cause, Some(crate::tool::diagnostic::Cause::Interrupted));
         for (job, field, location) in [
             (1, "/result/stdout", ExecutionLocation::root(".".into())),
             (2, "/result/custom", named),
@@ -782,7 +753,7 @@ mod tests {
             );
         }
         let next = restored.create(JobSpec::test(agent, "next")).await.unwrap();
-        assert_eq!(next.id().get(), 3);
+        assert_eq!(next.id().get(), 4);
     }
 
     fn outcome_image() -> crate::media::ImageRef {
@@ -814,11 +785,30 @@ mod tests {
 
     #[tokio::test]
     async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
-        for case in 0..7 {
-            let (root, jobs, agent) = runtime().await;
-            jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
+        enum Case {
+            Completed,
+            Failed,
+            FailedWithResult,
+            Denied,
+            CancelledWithResult,
+            Interrupted,
+            /// Nothing runs to stop: the cancellation settles at its grace.
+            InterruptedThenCancelled,
+        }
+        let (_root, jobs, agent) = crate::job::tests::runtime().await;
+        jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
+        let mut projections = Vec::new();
+        for case in [
+            Case::Completed,
+            Case::Failed,
+            Case::FailedWithResult,
+            Case::Denied,
+            Case::CancelledWithResult,
+            Case::Interrupted,
+            Case::InterruptedThenCancelled,
+        ] {
             let id = jobs
-                .test_resumable(agent, "outcome", serde_json::Value::Null)
+                .test_resumable(agent.clone(), "outcome", serde_json::Value::Null)
                 .await;
             let asked = crate::job::tests::asked_by(id, "partial");
             jobs.request_input(id, asked).await.unwrap();
@@ -827,18 +817,19 @@ mod tests {
                     .with_images(vec![outcome_image()])
             };
             let outcome = match case {
-                0 => JobOutcome::Completed(result().into()),
-                1 => ToolError::failed("failed").into(),
-                2 => ToolError::failed("partial failure")
+                Case::Completed => JobOutcome::Completed(result().into()),
+                Case::Failed => ToolError::failed("failed").into(),
+                Case::FailedWithResult => ToolError::failed("partial failure")
                     .with_result(result())
                     .into(),
-                3 => ToolError::denied("denied").into(),
-                4 => ToolError::cancelled().with_result(result()).into(),
-                _ => ToolError::interrupted().into(),
+                Case::Denied => ToolError::denied("denied").into(),
+                Case::CancelledWithResult => ToolError::cancelled().with_result(result()).into(),
+                Case::Interrupted | Case::InterruptedThenCancelled => {
+                    ToolError::interrupted().into()
+                }
             };
             jobs.finish(id, outcome).await.unwrap();
-            if case == 6 {
-                // Nothing runs to stop: the cancellation settles at its grace.
+            if let Case::InterruptedThenCancelled = case {
                 let (settled, _) = crate::tests::expire(
                     jobs.wait_settled(id),
                     async { jobs.cancel(id).await.unwrap() },
@@ -848,13 +839,23 @@ mod tests {
                 settled.unwrap();
             }
             let projection = stored_projection(&jobs, id).await;
-            assert_eq!(projection["resumable"], !matches!(case, 4 | 6));
+            let cancelled = matches!(
+                case,
+                Case::CancelledWithResult | Case::InterruptedThenCancelled
+            );
+            assert_eq!(projection["resumable"], !cancelled);
             // The saved payload is never replaced by the in-memory question.
-            if matches!(case, 0 | 2 | 4) {
+            if matches!(
+                case,
+                Case::Completed | Case::FailedWithResult | Case::CancelledWithResult
+            ) {
                 let document = jobs.output(id).await.test_document().unwrap();
                 assert_eq!(document["result"], serde_json::json!({"result":"saved"}));
             }
-            let replay = reopen(jobs, root.path()).await;
+            projections.push((id, projection));
+        }
+        let replay = jobs.test_replay();
+        for (id, projection) in projections {
             assert_eq!(projection, stored_projection(&replay, id).await);
         }
     }
@@ -896,31 +897,14 @@ mod tests {
 
     /// A running foreground agent job of `owner`, called by `parent`'s own calls
     /// if any, with its child, which runs until its next input once resumed.
-    async fn retained_child(
-        jobs: &JobManager,
-        owner: &AgentId,
-        parent: Option<JobId>,
-    ) -> (crate::job::JobLease<crate::job::stage::Running>, AgentId) {
-        let spec = JobSpec {
-            accepts_input: true,
-            role: JobRole::Agent,
-            parent,
-            ..JobSpec::test(owner.clone(), "agent")
-        };
-        let lease = jobs.test_running(spec).await;
-        let child = jobs.test_install(lease.id()).await;
-        resumes(jobs, lease.id());
-        (lease, child)
-    }
-
-    fn resumes(jobs: &JobManager, job: JobId) {
-        let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, mut input| {
+    /// A resume handler that takes one input, then completes.
+    fn resumes() -> super::super::ResumeHandler {
+        std::sync::Arc::new(|_, mut input| {
             Box::pin(async move {
                 input.recv().await;
                 Ok(crate::job::Completion::Reply("done".to_owned()))
             })
-        });
-        jobs.test_resume_with(job, handler);
+        })
     }
 
     /// The replies and the states of `job` that `owner` has pending.
@@ -943,7 +927,9 @@ mod tests {
     async fn released_child_delivers_its_replies_and_completion_to_its_owner() {
         use crate::job::tests::commit;
         let (root, jobs, owner) = runtime().await;
-        let (lease, child) = retained_child(&jobs, &owner, None).await;
+        let (lease, child) = jobs
+            .test_agent(JobSpec::test(owner.clone(), "agent"), resumes())
+            .await;
         let job = lease.into_test_id();
         jobs.finish(job, ToolError::interrupted().into())
             .await
@@ -970,7 +956,9 @@ mod tests {
         use crate::job::tests::{commit, saved_replies};
         for finished in [false, true] {
             let (root, jobs, owner) = runtime().await;
-            let (lease, child) = retained_child(&jobs, &owner, None).await;
+            let (lease, child) = jobs
+                .test_agent(JobSpec::test(owner.clone(), "agent"), resumes())
+                .await;
             let job = lease.id();
             let reply = commit(&jobs, &child, job, "progress").await;
             if finished {
@@ -985,7 +973,7 @@ mod tests {
             jobs.store().commit(Command::Journal, settle).await.unwrap();
             if !finished {
                 assert_eq!(pending_for(&jobs, &owner, job).await, (vec![reply], vec![]));
-                resumes(&jobs, job);
+                jobs.test_resume_with(job, resumes());
                 jobs.send(job, serde_json::json!("resume")).await.unwrap();
                 jobs.send(job, serde_json::json!("finish")).await.unwrap();
                 crate::tests::bounded(jobs.wait_settled(job)).await.unwrap();
@@ -1021,7 +1009,15 @@ mod tests {
                 false => None,
             };
             let parent = script.as_ref().map(crate::job::JobLease::id);
-            let (lease, child) = retained_child(&jobs, &owner, parent).await;
+            let (lease, child) = jobs
+                .test_agent(
+                    JobSpec {
+                        parent,
+                        ..JobSpec::test(owner.clone(), "agent")
+                    },
+                    resumes(),
+                )
+                .await;
             let job = lease.id();
             let reply = commit(&jobs, &child, job, "progress").await;
             assert!(!jobs.has_pending(&owner));

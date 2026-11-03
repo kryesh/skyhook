@@ -247,6 +247,7 @@ pub(crate) async fn read_to_limit(file: OpenFile, limit: u64) -> Result<Vec<u8>,
 mod tests {
     use super::*;
     use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile};
+    use std::assert_matches;
     use std::io::Write as _;
 
     /// A live database's file is neither read nor replaced by the in-process openers.
@@ -257,10 +258,10 @@ mod tests {
         let path = root.path().join("live.db");
         let db = Db::connect(&path, OpenMode::Create).unwrap();
         db.batch("CREATE TABLE t(x)").unwrap();
-        assert!(matches!(
+        assert_matches!(
             read_regular(&path, u64::MAX).await,
             Err(RegularFileError::Live(_))
-        ));
+        );
         let staged = StagedFile::create(&path, PermissionPolicy::Inherit);
         assert!(staged.is_err_and(|error| error.stage == AtomicWriteStage::InspectDestination));
         // A destination that became live while staged is refused at commit.
@@ -275,10 +276,10 @@ mod tests {
         fs::create_dir_all(tree.join("session")).unwrap();
         fs::write(tree.join("notes"), b"").unwrap();
         let nested = Db::connect(&tree.join("session/session.db"), OpenMode::Create).unwrap();
-        assert!(matches!(
+        assert_matches!(
             remove_tree_unless_live(&tree),
             Err(RegularFileError::Live(_))
-        ));
+        );
         assert!(tree.join("notes").exists() && tree.join("session/session.db").exists());
         drop((db, opened, nested));
         remove_tree_unless_live(&tree).unwrap();
@@ -291,23 +292,19 @@ mod tests {
         let path = root.path().join("file");
         fs::write(&path, b"abc").unwrap();
         assert_eq!(read_regular(&path, 3).await.unwrap(), b"abc");
-        assert!(matches!(
+        assert_matches!(
             read_regular(&path, 2).await,
             Err(RegularFileError::TooLarge { limit: 2 })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             read_regular(root.path(), u64::MAX).await,
             Err(RegularFileError::NotRegular)
-        ));
+        );
         let fifo = root.path().join("fifo");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        crate::tests::fifo(&fifo);
         // Opening a FIFO without a writer would block without O_NONBLOCK.
         let read = crate::tests::bounded(read_regular(&fifo, u64::MAX));
-        assert!(matches!(read.await, Err(RegularFileError::NotRegular)));
+        assert_matches!(read.await, Err(RegularFileError::NotRegular));
     }
 
     /// A read still running as its async handle drops keeps the file registered until
@@ -317,11 +314,7 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
         let root = tempfile::tempdir().unwrap();
         let fifo = root.path().join("fifo");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        crate::tests::fifo(&fifo);
         // Holding both ends, a read waits for data and never sees the end.
         let both = || {
             let opened = fs::OpenOptions::new().read(true).write(true).open(&fifo);

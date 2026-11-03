@@ -30,7 +30,7 @@ pub(super) fn transcript_length(db: &Db, agent: i64) -> DbResult<u64> {
 
 /// The queries of a page read, by [`Page`] variant in declaration order: `select`'s
 /// rows that match `filter`, in `key` order, from either end or past `bound`, which
-/// reads the page's key as `?1`. The limit is `?2`; `filter`'s parameters start at `?3`.
+/// reads the page's key as `?1`; `filter`'s parameters start at `?2`.
 macro_rules! paged_sql {
     ($select:expr, $filter:literal, $key:literal, $bound:literal) => {
         [
@@ -41,13 +41,13 @@ macro_rules! paged_sql {
         ]
     };
     (@ $select:expr, $filter:literal, $key:literal, $order:literal $(, $clause:expr)*) => {
-        concat!($select, " WHERE ", $filter, $($clause,)* " ORDER BY ", $key, $order, " LIMIT ?2")
+        concat!($select, " WHERE ", $filter, $($clause,)* " ORDER BY ", $key, $order)
     };
 }
 pub(super) use paged_sql;
 
-/// The rows `page` reads, in ascending order, by whichever [`paged_sql!`] query reads its
-/// way: each binds the page's bound, the limit, then `params`.
+/// Up to `limit` rows `page` reads, in ascending order, by whichever [`paged_sql!`] query
+/// reads its way: each binds the page's bound, then `params`.
 pub(super) fn paged<K: Sql, T>(
     db: &Db,
     page: Page<K>,
@@ -62,9 +62,9 @@ pub(super) fn paged<K: Sql, T>(
         Page::Before(key) => (before, Some(key), true),
         Page::Last => (last, None, true),
     };
-    let mut bound = params![bound, limit];
+    let mut bound = params![bound];
     bound.extend(params);
-    let mut rows = db.query(sql, bound, map)?;
+    let mut rows = db.query_up_to(sql, bound, limit, map)?;
     if descending {
         rows.reverse();
     }
@@ -92,7 +92,7 @@ pub(in crate::session) fn transcript(
         page,
         paged_sql!(
             "SELECT seq, agent_ordinal FROM entry",
-            "agent = ?3",
+            "agent = ?2",
             "agent_ordinal",
             "?1"
         ),
@@ -257,7 +257,7 @@ pub(in crate::session) fn root_jobs(
         page,
         paged_sql!(
             "SELECT j.id FROM entry e JOIN job j ON j.created = e.seq",
-            "e.agent = ?3 AND e.kind = ?4 AND (j.parent IS NULL OR j.origin_call IS NOT NULL)",
+            "e.agent = ?2 AND e.kind = ?3 AND (j.parent IS NULL OR j.origin_call IS NOT NULL)",
             "e.seq",
             "coalesce((SELECT created FROM job WHERE id = ?1), 9223372036854775807)"
         ),
@@ -277,7 +277,7 @@ pub(in crate::session) fn child_jobs(
     paged(
         db,
         page,
-        paged_sql!("SELECT id FROM job", "parent = ?3", "id", "?1"),
+        paged_sql!("SELECT id FROM job", "parent = ?2", "id", "?1"),
         params![parent],
         limit,
         |row| job(row.get(0)?),
@@ -296,12 +296,13 @@ pub(in crate::session) fn newest_jobs(
         return Ok((Vec::new(), 0));
     };
     let except: Vec<_> = except.iter().map(|job| job.get()).collect();
-    let rows = db.query(
+    let rows = db.query_up_to(
         "SELECT j.id, count(*) OVER () FROM entry e JOIN job j ON j.created = e.seq \
          WHERE e.agent = ?1 AND e.kind = ?2 AND j.id NOT IN (SELECT value FROM json_each(?3)) \
-         ORDER BY j.id DESC LIMIT ?4",
-        params![row, EntryKind::JobCreated, json(&except)?, limit],
-        |row| {
+         ORDER BY j.id DESC",
+        params![row, EntryKind::JobCreated, json(&except)?],
+        limit,
+        |row| -> DbResult<_> {
             Ok((
                 job(row.get(0)?)?,
                 usize::try_from(row.get::<i64>(1)?).unwrap_or_default(),

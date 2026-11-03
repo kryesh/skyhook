@@ -4,7 +4,9 @@ control that the scenario needs: a build option, configuration or deployment oth
 default, or a race or timing window the attacker must win, makes AT:P; a window the attacker can
 hold open at will does not. Attack Vector, Privileges Required and the other exploitability
 metrics come from what the attacker must hold or face before the first action, the
-least-privileged actor that can drive one of its path's sources, plus anything a later action
+least-privileged actor that can drive every input state the chain needs, at the trust its path
+reads it with (past the checks earlier stages make), a read of a stored state trusted as the
+input of its least-privileged writer path, plus anything a later action
 needs that no earlier action supplied; access or privilege gained during the scenario is never a
 prerequisite. User Interaction is passive or active only when a victim's action is a step in the
 scenario. Vulnerable-system impact is on the component the flaws are in; subsequent-system

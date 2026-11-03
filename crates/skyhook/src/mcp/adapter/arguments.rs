@@ -158,22 +158,49 @@ mod tests {
         arguments.admit(&admitted)
     }
 
+    /// Reserved and open-ended inputs are wrapped without losing an upstream `bg`;
+    /// object-wide constraints never interpret the job's own `bg`.
     #[test]
     fn reserved_and_open_ended_inputs_are_wrapped_without_losing_bg() {
-        for schema in [
-            json!({"type":"object"}),
-            json!({"type":"object","additionalProperties":true}),
-            json!({"type":"object","additionalProperties":{"type":"string"}}),
-            json!({"type":"object","properties":{"bg":{"type":"string"}},"additionalProperties":false}),
-            json!({"type":"object","patternProperties":{"^b":{"type":"string"}},"additionalProperties":false}),
+        let wrapped = |schema| {
+            let value = json!({"arguments":{"bg":"upstream"}, "bg":true});
+            (schema, value, json!({"bg":"upstream"}))
+        };
+        let constrained = |constraint: Value| {
+            let mut schema = json!({
+                "type":"object", "properties":{"count":{"type":"integer"}},
+                "required":["count"], "additionalProperties":false
+            });
+            let constraint = constraint.as_object().unwrap().clone();
+            schema.as_object_mut().unwrap().extend(constraint);
+            let value = json!({"arguments":{"count":1},"bg":true});
+            (schema, value, json!({"count":1}))
+        };
+        for (schema, value, expected) in [
+            wrapped(json!({"type":"object"})),
+            wrapped(json!({"type":"object","additionalProperties":true})),
+            wrapped(json!({"type":"object","additionalProperties":{"type":"string"}})),
+            wrapped(
+                json!({"type":"object","properties":{"bg":{"type":"string"}},"additionalProperties":false}),
+            ),
+            wrapped(
+                json!({"type":"object","patternProperties":{"^b":{"type":"string"}},"additionalProperties":false}),
+            ),
             // Reference siblings cannot hide an upstream bg either.
-            json!({"$schema":"http://json-schema.org/draft-07/schema#", "type":"object",
+            wrapped(
+                json!({"$schema":"http://json-schema.org/draft-07/schema#", "type":"object",
                 "additionalProperties":false, "definitions":{"open":{"type":"object"}},
                 "$ref":"#/definitions/open"}),
+            ),
+            constrained(json!({"maxProperties":1})),
+            constrained(json!({"propertyNames":{"enum":["count"]}})),
+            constrained(
+                json!({"allOf":[{"properties":{"count":{"minimum":1}},"additionalProperties":false}]}),
+            ),
+            constrained(json!({"const":{"count":1}})),
         ] {
             let tool = registered(schema).unwrap();
-            let value = json!({"arguments":{"bg":"upstream"}, "bg":true});
-            assert_eq!(upstream(&tool, value).unwrap()["bg"], "upstream");
+            assert_eq!(Value::Object(upstream(&tool, value).unwrap()), expected);
         }
         let tool = registered(json!({"type":"object"})).unwrap();
         for invalid in [
@@ -182,29 +209,6 @@ mod tests {
             json!({"arguments":{},"other":1}),
         ] {
             assert!(upstream(&tool, invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn object_wide_constraints_do_not_interpret_the_job_bg_property() {
-        for constraint in [
-            json!({"maxProperties":1}),
-            json!({"propertyNames":{"enum":["count"]}}),
-            json!({"allOf":[{"properties":{"count":{"minimum":1}},"additionalProperties":false}]}),
-            json!({"const":{"count":1}}),
-        ] {
-            let mut original = json!({
-                "type":"object", "properties":{"count":{"type":"integer"}},
-                "required":["count"], "additionalProperties":false
-            });
-            let constraint = constraint.as_object().unwrap().clone();
-            original.as_object_mut().unwrap().extend(constraint);
-            let tool = registered(original).unwrap();
-            let value = json!({"arguments":{"count":1},"bg":true});
-            assert_eq!(
-                upstream(&tool, value).unwrap(),
-                json!({"count":1}).as_object().cloned().unwrap()
-            );
         }
     }
 
@@ -296,17 +300,18 @@ mod tests {
                 "/",
                 vec!["expected an integer"],
             ),
+            // A field name is no value: the closed object names the one it does not take.
             (
                 json!({"type":"object"}),
-                json!({"arguments":{}, (secret):secret}),
+                json!({"arguments":{}, "extra":secret}),
                 "",
-                vec!["not allowed"],
+                vec!["property `extra` is not allowed"],
             ),
             (
                 json!({"type":"object", "additionalProperties":false}),
-                json!({(secret):secret}),
+                json!({"extra":secret}),
                 "",
-                vec!["not allowed"],
+                vec!["property `extra` is not allowed"],
             ),
             (
                 json!({"type":"object", "additionalProperties":false,

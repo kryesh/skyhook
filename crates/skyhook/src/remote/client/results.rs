@@ -420,7 +420,7 @@ impl Ingestion {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        fixture_context, route_fixture, sink, wired_connection, write_result,
+        fixture_context, fixture_context_with, route_fixture, sink, wired_connection, write_result,
     };
     use super::*;
     use crate::{
@@ -428,9 +428,10 @@ mod tests {
         media::BlobRef,
         remote::protocol::RemoteToolError,
         tests::bounded,
-        tool::{StreamEnd, output::CaptureId},
+        tool::{StreamEnd, output::CaptureId, policy::Capability},
     };
     use serde_json::json;
+    use std::assert_matches;
 
     fn open(id: u64, field: &str) -> PayloadEvent {
         PayloadEvent::Capture(CaptureEvent::Open {
@@ -483,7 +484,7 @@ mod tests {
             });
             let received = ingest.finish(context.execution_location());
             if failed {
-                assert!(matches!(received, Ok(Err(_))));
+                assert_matches!(received, Ok(Err(_)));
             } else {
                 assert!(
                     received.is_err(),
@@ -552,6 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_payloads_preserve_cut_errors_and_only_host_finished_receipts() {
+        let runtime = crate::tests::TestRuntime::new().await;
         for (failed, selected) in [
             (false, &[1, 2, 4][..]),
             (true, &[1, 2, 4][..]),
@@ -561,12 +563,11 @@ mod tests {
             (false, &[1, 1][..]),
         ] {
             let valid_selection = selected == [1, 2, 4];
-            let runtime = crate::tests::TestRuntime::new().await;
-            runtime
-                .jobs
+            let job = (runtime.jobs)
                 .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                 .await;
-            let context = fixture_context(&runtime);
+            let context =
+                fixture_context_with(&runtime, job, [Capability::Read].into_iter().collect());
             let saved = runtime.jobs.output(context.job()).await;
             let mut ingest = Ingestion::new(&context).await;
             for event in [
@@ -733,13 +734,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_call_keeps_late_payloads_until_terminal_and_disconnect_keeps_prefixes() {
+        let runtime = crate::tests::TestRuntime::new().await;
         for terminal in [false, true] {
-            let runtime = crate::tests::TestRuntime::new().await;
-            runtime
-                .jobs
+            let job = (runtime.jobs)
                 .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                 .await;
-            let context = fixture_context(&runtime);
+            let context =
+                fixture_context_with(&runtime, job, [Capability::Read].into_iter().collect());
             let saved = runtime.jobs.output(context.job()).await;
             let (connection, mut requests) = wired_connection(4096).await;
             let call_connection = connection.clone();
@@ -747,19 +748,19 @@ mod tests {
             let call = tokio::spawn(async move {
                 (call_connection.execute("read".into(), json!({}), &call_context)).await
             });
-            assert!(matches!(
+            assert_matches!(
                 bounded(read_frame::<_, Request>(&mut requests))
                     .await
                     .unwrap(),
                 Some(Request::Tool { .. })
-            ));
+            );
             context.cancellation_token().cancel();
-            assert!(matches!(
+            assert_matches!(
                 bounded(read_frame::<_, Request>(&mut requests))
                     .await
                     .unwrap(),
                 Some(Request::Cancel { .. })
-            ));
+            );
             // The worker had the request: cancelling it does not prove it did nothing.
             let Err(error) = bounded(call).await.unwrap() else {
                 panic!("a cancelled call returned a result");

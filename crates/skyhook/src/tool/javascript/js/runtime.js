@@ -19,6 +19,13 @@ export function install({builders, terminal, source}, hostCall, hostSleep, log) 
     });
   };
   Object.assign(globalThis, {tool, receive, sleep, console: createConsole(log), WorkPool});
+  // Results hold JSON a tool already decoded (a command's JSON stdout, say) as the value
+  // itself, so parsing one returns a copy of it rather than failing on "[object Object]".
+  const parse = JSON.parse;
+  JSON.parse = function (text, reviver) {
+    if (text !== null && typeof text === "object") text = JSON.stringify(text);
+    return parse(text, reviver);
+  };
 }
 
 // An error's text is its message and stack; its other properties are details.

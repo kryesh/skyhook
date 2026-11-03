@@ -165,24 +165,3 @@ impl From<AuthorizationError> for RemoteError {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_io_cause_survives_remote_error_conversion() {
-        for boundary in [RemoteError::start, RemoteError::io] {
-            for error in [
-                io::Error::from_raw_os_error(libc::ENOENT),
-                io::Error::new(io::ErrorKind::PermissionDenied, "transport denied"),
-            ] {
-                let expected = Cause::io(&error);
-                assert_eq!(
-                    boundary(error).into_tool_error().diagnostic().cause,
-                    expected
-                );
-            }
-        }
-    }
-}

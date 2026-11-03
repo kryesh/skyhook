@@ -428,6 +428,7 @@ pub(in crate::remote) mod tests {
         authorization::{AuthorizationArguments, AuthorizationCoordinator, AuthorizationError},
         policy::{AllowAll, Capability},
     };
+    use std::assert_matches;
 
     pub(super) fn sink() -> Arc<Mutex<Writer>> {
         Arc::new(Mutex::new(Box::new(tokio::io::sink())))
@@ -471,60 +472,6 @@ pub(in crate::remote) mod tests {
         assert_eq!(connection.ids.next(), Some(RequestId::new(1)));
     }
 
-    /// A call dropped before its terminal result, without cancelling its
-    /// context, still tells the worker to release it.
-    #[tokio::test]
-    async fn dropped_calls_send_cancel() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let context = fixture_context(&runtime);
-        let (connection, mut peer) = wired_connection(4096).await;
-        let call = {
-            let (connection, context) = (connection.clone(), context.clone());
-            tokio::spawn(async move {
-                connection
-                    .execute("read".into(), serde_json::json!({}), &context)
-                    .await
-            })
-        };
-        let Some(Request::Tool { request_id, .. }) =
-            read_frame::<_, Request>(&mut peer).await.unwrap()
-        else {
-            panic!("expected the tool request");
-        };
-        call.abort();
-        assert!(call.await.unwrap_err().is_cancelled());
-        assert!(!context.is_cancelled());
-        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
-        assert!(matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id));
-    }
-
-    /// A cancelled call dropped while another frame holds the writer still
-    /// sends its Cancel once the writer is free.
-    #[tokio::test]
-    async fn cancellation_waiting_for_the_writer_survives_the_call() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let context = fixture_context(&runtime);
-        let (connection, mut peer) = wired_connection(4096).await;
-        let request_id = {
-            let mut call =
-                std::pin::pin!(connection.execute("read".into(), serde_json::json!({}), &context));
-            assert!(futures_util::poll!(&mut call).is_pending());
-            let Some(Request::Tool { request_id, .. }) = read_frame(&mut peer).await.unwrap()
-            else {
-                panic!("expected the tool request");
-            };
-            let held = connection.writer.clone().lock_owned().await;
-            assert!(futures_util::poll!(&mut call).is_pending());
-            context.cancellation_token().cancel();
-            let _ = futures_util::poll!(&mut call);
-            drop(held);
-            request_id
-        };
-        drop(connection);
-        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
-        assert!(matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id));
-    }
-
     /// Drop `submission` once its frame has started on a one-byte pipe,
     /// returning that frame and the next.
     async fn drop_mid_write(
@@ -546,6 +493,9 @@ pub(in crate::remote) mod tests {
         (next().await, next().await)
     }
 
+    /// An abandoned submission releases its id: a call dropped mid-write, aborted
+    /// after its request without cancelling its context, or cancelled while another
+    /// frame holds the writer sends its Cancel; a stream dropped mid-write closes.
     #[tokio::test]
     async fn submissions_dropped_mid_write_are_released() {
         let runtime = crate::tests::TestRuntime::new().await;
@@ -574,34 +524,60 @@ pub(in crate::remote) mod tests {
         };
         assert_eq!(closed, channel);
         assert!(connection.state.lock().await.streams.is_empty());
-    }
 
-    #[tokio::test]
-    async fn channels_share_request_ids() {
         let (connection, mut peer) = wired_connection(4096).await;
-        let _stream = connection.open_ssh(route(), String::new()).await.unwrap();
-        let (request_id, ()) = connection
-            .submit(|request_id, _| (Request::Cancel { request_id }, ()))
-            .await
-            .unwrap();
-        assert_eq!(request_id, RequestId::new(2));
-        assert!(matches!(
-            read_frame::<_, Request>(&mut peer).await.unwrap(),
-            Some(Request::Control(ControlRequest::OpenSsh { channel, .. })) if channel == RequestId::new(1)
-        ));
-        assert!(matches!(read_frame::<_, Request>(&mut peer).await.unwrap(),
-            Some(Request::Cancel { request_id: id }) if id == request_id));
+        let call = {
+            let (connection, context) = (connection.clone(), context.clone());
+            tokio::spawn(async move {
+                connection
+                    .execute("read".into(), serde_json::json!({}), &context)
+                    .await
+            })
+        };
+        let Some(Request::Tool { request_id, .. }) =
+            read_frame::<_, Request>(&mut peer).await.unwrap()
+        else {
+            panic!("expected the tool request");
+        };
+        call.abort();
+        let _ = call.await;
+        assert!(!context.is_cancelled());
+        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
+        assert_matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id);
+
+        let context = fixture_context(&runtime);
+        let (connection, mut peer) = wired_connection(4096).await;
+        let request_id = {
+            let mut call =
+                std::pin::pin!(connection.execute("read".into(), serde_json::json!({}), &context));
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let Some(Request::Tool { request_id, .. }) = read_frame(&mut peer).await.unwrap()
+            else {
+                panic!("expected the tool request");
+            };
+            let held = connection.writer.clone().lock_owned().await;
+            assert!(futures_util::poll!(&mut call).is_pending());
+            context.cancellation_token().cancel();
+            let _ = futures_util::poll!(&mut call);
+            drop(held);
+            request_id
+        };
+        drop(connection);
+        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
+        assert_matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id);
     }
 
     pub(in crate::remote) fn fixture_context(runtime: &crate::tests::TestRuntime) -> ToolContext {
-        fixture_context_with_capabilities(runtime, [Capability::Read].into_iter().collect())
+        let job = crate::identity::JobId::new(1).unwrap();
+        fixture_context_with(runtime, job, [Capability::Read].into_iter().collect())
     }
 
-    pub(in crate::remote) fn fixture_context_with_capabilities(
+    /// The context of `job` calling with `capabilities`.
+    pub(in crate::remote) fn fixture_context_with(
         runtime: &crate::tests::TestRuntime,
+        job: crate::identity::JobId,
         capabilities: crate::tool::policy::CapabilitySet,
     ) -> ToolContext {
-        let job = crate::identity::JobId::new(1).unwrap();
         let subject = crate::tool::authorization::AuthorizationSubject {
             capabilities,
             ..runtime.subject(job, CancellationToken::new())
@@ -691,7 +667,8 @@ pub(in crate::remote) mod tests {
         let capabilities = [Capability::Exec, Capability::Targets]
             .into_iter()
             .collect();
-        let context = fixture_context_with_capabilities(&runtime, capabilities);
+        let job = crate::identity::JobId::new(1).unwrap();
+        let context = fixture_context_with(&runtime, job, capabilities);
         let (connection, mut peer) = wired_connection(4096).await;
         let arguments = serde_json::json!({"command":["true"]});
         let call = connection.execute("exec".into(), arguments, &context);
@@ -723,7 +700,7 @@ pub(in crate::remote) mod tests {
                 )));
             };
         let (result, ()) = tokio::join!(call, inspect);
-        assert!(matches!(result, Err(RemoteError::Authorization(_))));
+        assert_matches!(result, Err(RemoteError::Authorization(_)));
     }
 
     /// An upload sends one credit window ahead of the worker's acknowledgements,
@@ -752,7 +729,7 @@ pub(in crate::remote) mod tests {
             };
             let mut next_chunk = async || {
                 let frame = read_frame::<_, Request>(&mut peer).await.unwrap();
-                assert!(matches!(frame, Some(Request::SourceData { .. })));
+                assert_matches!(frame, Some(Request::SourceData { .. }));
             };
             for _ in 0..WINDOW {
                 next_chunk().await;
@@ -793,10 +770,7 @@ pub(in crate::remote) mod tests {
         assert_eq!(error.context.operation, Operation::Send);
         assert_eq!(error.context.site, FailureSite::Host);
         assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
-        assert!(matches!(
-            error.cause,
-            crate::tool::diagnostic::Cause::Io { .. }
-        ));
+        assert_matches!(error.cause, crate::tool::diagnostic::Cause::Io { .. });
         // A writable pipe must not allow registration once the dispatcher has failed.
         *connection.writer.lock().await = Box::new(tokio::io::sink());
         let retry = bounded(connection.open_ssh(route(), "true".into())).await;
@@ -815,9 +789,9 @@ pub(in crate::remote) mod tests {
         let failure = ProtocolError::Violation("connection failed").into();
         fail_connection(&connection.state, failure).await;
         let error = bounded(stream.output.read_to_end(&mut Vec::new())).await;
-        assert!(matches!(
+        assert_matches!(
             RemoteError::from(error.unwrap_err()),
             RemoteError::Protocol(ProtocolError::Violation("connection failed"))
-        ));
+        );
     }
 }

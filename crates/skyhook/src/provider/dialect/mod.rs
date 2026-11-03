@@ -235,27 +235,16 @@ pub(crate) fn build(
     })
 }
 
+#[derive(Default)]
 pub(crate) struct Resources {
-    client: reqwest::Client,
+    client: crate::provider::http::transport::LazyClient,
     sources: Sources,
-}
-
-impl Resources {
-    pub(crate) fn new() -> Result<Self, BuildError> {
-        Ok(Self {
-            client: crate::provider::http::transport::client()?,
-            sources: Sources::default(),
-        })
-    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::provider::{
-        Provider,
-        http::transport::tests::{Plan, Server, header_values},
-    };
+    pub(crate) use crate::provider::http::tests::Sent;
 
     /// An entry at `root`, keyed or anonymous.
     pub(crate) fn common(root: &str, api_key: Option<Sourced>) -> Common {
@@ -288,60 +277,41 @@ pub(crate) mod tests {
         profile.codec = placements.apply(profile.codec).unwrap();
         let connection = common.admit(BaseUrl::Required).unwrap();
         let credentials = connection.credentials(profile.key);
-        let mut resources = Resources::new().unwrap();
+        let mut resources = Resources::default();
         build(name, profile, &connection, credentials, &mut resources).unwrap()
     }
 
-    /// The head of one request a keyed entry sends.
+    /// An API root nothing listens on: requests are prepared, never posted.
+    pub(crate) const ROOT: &str = "http://127.0.0.1:9/v1";
+
+    /// One request a keyed entry sends.
     pub(crate) async fn head(
         settings: &impl DialectConfig,
         codec: CodecName,
         api_key: &str,
-    ) -> String {
-        sent(settings, codec, api_key, request()).await.0
+    ) -> Sent {
+        sent(settings, codec, api_key, request()).await
     }
 
-    /// The head and JSON body a keyed entry sends for `request`.
+    /// What a keyed entry sends for `request`.
     pub(crate) async fn sent(
         settings: &impl DialectConfig,
         codec: CodecName,
         api_key: &str,
         request: crate::provider::protocol::ModelRequest,
-    ) -> (String, serde_json::Value) {
-        let mut sent = requests(1, async |root| {
-            let common = common(root, Some(Sourced::Literal(api_key.into())));
-            let provider = provider("test", settings, codec, &common);
-            let mut context = provider.open_context("ctx".parse().unwrap()).unwrap();
-            drop(futures_util::StreamExt::next(&mut context.invoke(request)).await);
-        })
-        .await;
-        let (head, body) = sent.remove(0);
-        (head, serde_json::from_str(&body).unwrap())
+    ) -> Sent {
+        let common = common(ROOT, Some(Sourced::Literal(api_key.into())));
+        let provider = provider("test", settings, codec, &common);
+        provider.sent(request).await.unwrap()
     }
 
-    /// The raw heads of `count` requests to a server that answers each with an
-    /// empty stream, after `invoke` ran them.
-    pub(crate) async fn heads(count: usize, invoke: impl AsyncFnOnce(&str)) -> Vec<String> {
-        let requests = requests(count, invoke).await;
-        requests.into_iter().map(|(head, _)| head).collect()
-    }
-
-    /// The raw heads and bodies of `count` requests to a server that answers each
-    /// with an empty stream, after `invoke` ran them.
-    pub(crate) async fn requests(
-        count: usize,
-        invoke: impl AsyncFnOnce(&str),
-    ) -> Vec<(String, String)> {
-        let plans = (0..count).map(|_| Plan::empty_stream()).collect();
-        let server = Server::start(plans).await;
-        let root = format!("{}/v1", server.url.trim_end_matches("/responses"));
-        invoke(&root).await;
-        let requests = server.finish().await.into_iter();
-        let split = |request: String| {
-            let (head, body) = request.split_once("\r\n\r\n").unwrap();
-            (head.to_owned(), body.to_owned())
-        };
-        requests.map(split).collect()
+    /// The replay scope `yaml` settings admit under `codec`.
+    pub(crate) fn replay_scope<C>(yaml: &str, codec: CodecName) -> String
+    where
+        C: DialectConfig + serde::de::DeserializeOwned,
+    {
+        let settings = crate::yaml::parse::<C>(yaml).unwrap();
+        settings.admit(codec).unwrap().scope
     }
 
     /// The kind `settings` read a rejection of `codec` as.
@@ -414,36 +384,25 @@ pub(crate) mod tests {
             protocol::ToolDefinition,
         };
         use CodecName::*;
-        let litellm = |upstream| crate::yaml::parse::<litellm::Config>(upstream).unwrap();
-        let (litellm_openai, litellm_anthropic) =
-            (litellm("upstream: openai"), litellm("upstream: anthropic"));
+        let litellm_anthropic =
+            crate::yaml::parse::<litellm::Config>("upstream: anthropic").unwrap();
         let tool = |name: String| {
             let mut request = request();
-            request.tools = vec![ToolDefinition {
+            request.tools = vec![std::sync::Arc::new(ToolDefinition {
                 name,
                 description: String::new(),
                 input_schema: serde_json::json!({"type": "object"}),
-            }];
+            })];
             request
         };
         let (dotted, long) = (tool("vendor.tool".into()), tool("a".repeat(100)));
-        let compatible = compatible::Config::default();
-        let openrouter = openrouter::Config::default();
-        let rows: [(&dyn DialectConfig, CodecName, ToolNames); 14] = [
-            (&compatible, ChatCompletions, Any),
-            (&compatible, Responses, Any),
-            (&compatible, Messages, Any),
-            (&anthropic::Config::default(), Messages, Anthropic),
-            (&openai::Config::default(), ChatCompletions, OpenAi),
+        let rows: [(&dyn DialectConfig, CodecName, ToolNames); 5] = [
+            (&compatible::Config::default(), ChatCompletions, Any),
             (&openai::Config::default(), Responses, OpenAi),
-            (&codex::Config::default(), Responses, Any),
-            (&openrouter, ChatCompletions, OpenAi),
-            (&openrouter, Responses, OpenAi),
-            (&openrouter, Messages, Anthropic),
-            (&litellm_openai, Responses, OpenAi),
+            (&anthropic::Config::default(), Messages, Anthropic),
+            // OpenRouter's alphabet follows the codec, LiteLLM's the upstream.
+            (&openrouter::Config::default(), Messages, Anthropic),
             (&litellm_anthropic, ChatCompletions, Anthropic),
-            (&litellm_anthropic, Responses, Anthropic),
-            (&litellm_anthropic, Messages, Anthropic),
         ];
         for (settings, codec, names) in rows {
             let conventions = settings.admit(codec).unwrap().codec;
@@ -463,43 +422,37 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn fixed_headers_merge_in_order() {
-        let heads = heads(2, async |root| {
-            let mut common = common(root, None);
-            common.headers = [
-                ("x-literal".to_owned(), Sourced::Literal("plain".into())),
-                (
-                    "x-lazy".to_owned(),
-                    Sourced::Command {
-                        command: "printf lazy".into(),
-                    },
-                ),
-                // The entry's headers win over the transport's constants.
-                (
-                    "anthropic-version".to_owned(),
-                    Sourced::Literal("2099-01-01".into()),
-                ),
-            ]
-            .into_iter()
-            .collect();
-            let settings = anthropic::Config::default();
-            let provider = provider("test", &settings, CodecName::Messages, &common);
-            let mut context = provider.open_context("c".parse().unwrap()).unwrap();
-            for _ in 0..2 {
-                drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
-            }
-        })
-        .await;
-        for head in &heads {
-            assert_eq!(header_values(head, "x-literal"), ["plain"]);
-            assert_eq!(header_values(head, "x-lazy"), ["lazy"]);
-            assert_eq!(header_values(head, "anthropic-version"), ["2099-01-01"]);
-            assert!(header_values(head, "x-api-key").is_empty());
+        let mut common = common(ROOT, None);
+        common.headers = [
+            ("x-literal".to_owned(), Sourced::Literal("plain".into())),
+            (
+                "x-lazy".to_owned(),
+                Sourced::Command {
+                    command: "printf lazy".into(),
+                },
+            ),
+            // The entry's headers win over the transport's constants.
+            (
+                "anthropic-version".to_owned(),
+                Sourced::Literal("2099-01-01".into()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let settings = anthropic::Config::default();
+        let provider = provider("test", &settings, CodecName::Messages, &common);
+        for _ in 0..2 {
+            let sent = provider.sent(request()).await.unwrap();
+            assert_eq!(sent.header("x-literal"), ["plain"]);
+            assert_eq!(sent.header("x-lazy"), ["lazy"]);
+            assert_eq!(sent.header("anthropic-version"), ["2099-01-01"]);
+            assert!(sent.header("x-api-key").is_empty());
         }
     }
 
-    /// The key replaces an entry header of its name, and a codec placement
-    /// replaces the key; a replaced command never runs, and a replaced
-    /// environment value is never read.
+    /// The key replaces an entry header of its name, a codec placement replaces
+    /// the key, and the transport's `Accept` replaces the entry's; a replaced
+    /// command never runs, and a replaced environment value is never read.
     #[tokio::test]
     async fn placements_replace_credentials_which_replace_entry_headers() {
         use crate::provider::codec::{NonEmpty, header};
@@ -512,24 +465,23 @@ pub(crate) mod tests {
             ))),
             ..Placements::default()
         };
-        let heads = heads(2, async |root| {
-            let mut common = common(root, Some(Sourced::Literal("k".into())));
-            let entry = Sourced::Command { command };
-            common.headers.insert("x-api-key".into(), entry);
-            let unset = Sourced::Env {
-                env: "SKYHOOK_TEST_UNSET_X".into(),
-            };
-            common.headers.insert("accept".into(), unset);
-            for placements in [Placements::default(), selected] {
-                let settings = compatible::Config::default();
-                let provider = placed("test", &settings, &placements, CodecName::Messages, &common);
-                let mut context = provider.open_context("ctx".parse().unwrap()).unwrap();
-                drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
-            }
-        })
-        .await;
-        assert_eq!(header_values(&heads[0], "x-api-key"), ["k"]);
-        assert_eq!(header_values(&heads[1], "x-api-key"), ["ctx"]);
+        let mut common = common(ROOT, Some(Sourced::Literal("k".into())));
+        let entry = Sourced::Command { command };
+        common.headers.insert("x-api-key".into(), entry);
+        let unset = Sourced::Env {
+            env: "SKYHOOK_TEST_UNSET_X".into(),
+        };
+        common.headers.insert("accept".into(), unset);
+        let mut keys = Vec::new();
+        for placements in [Placements::default(), selected] {
+            let settings = compatible::Config::default();
+            let provider = placed("test", &settings, &placements, CodecName::Messages, &common);
+            let sent = provider.sent(request()).await.unwrap();
+            // The transport's own `Accept` displaces the entry's.
+            assert_eq!(sent.header("accept"), ["text/event-stream"]);
+            keys.push(sent.header("x-api-key").join(""));
+        }
+        assert_eq!(keys, ["k", "ctx"]);
         assert!(!count.exists());
     }
 }

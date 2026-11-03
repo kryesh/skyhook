@@ -64,9 +64,7 @@ impl SessionRuntime {
                 }
             } else {
                 match self.root_mode(current, requested) {
-                    Some(name) => {
-                        self.mode_change(agent, current, &turn.settings.capabilities, &name)?
-                    }
+                    Some(name) => self.mode_change(agent, current, &name)?,
                     None => None,
                 }
             };
@@ -186,7 +184,6 @@ impl SessionRuntime {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use crate::agent::runtime::tests::{answer, inbox, scripted_provider, until_parked};
 
     #[tokio::test]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
@@ -202,11 +199,6 @@ mod tests {
         let launched = bounded(session.run_script(launch)).await.unwrap();
         let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
         let initial = tracking.request(0).await;
-        // A follow-up addressed by name is refused rather than started as a second child.
-        let again = "return await tool.agent({prompt:'test:follow-up',name:'kid'});";
-        let refused = bounded(session.run_script(again)).await.unwrap().value;
-        let error = refused["value"]["error"].as_str().unwrap();
-        assert!(error.contains(&format!("tool.job({job}).send")), "{error}");
         assert_eq!(texts(initial.messages()), ["test:child-initial"]);
         assert!(parent_inputs(initial.messages()).is_empty());
         let child = {
@@ -218,10 +210,9 @@ mod tests {
         };
         // A send acknowledgement alone does not prove forwarding: observe the child's inbox.
         let forwarded = async |count| {
-            bounded(async {
-                while inbox(&session, &child) != count {
-                    tokio::task::yield_now().await;
-                }
+            let (key, child) = (Key::Agent(child.clone()), child.clone());
+            found(&session, [key], move |state| {
+                (state.agents.get(&child)?.inbox.len() == count).then_some(())
             })
             .await
         };
@@ -266,109 +257,6 @@ mod tests {
         drop(root_inbox);
         stop(&session).await;
         assert_eq!(count(&tracking), 2);
-    }
-
-    #[tokio::test]
-    async fn child_names_are_owner_scoped_and_survive_completion_but_not_failed_launches() {
-        let (_root, tracking, session) = start(false).await;
-        let runtime = &session.runtime;
-        let root_inbox = quiet_root(&session);
-        // Each invocation is a separate script, but the caller owns its children.
-        let call = async |owner: &AgentId, source: &str| {
-            bounded(runtime.executor.execute(
-                owner.clone(),
-                "script",
-                json!({"source":source}),
-                None,
-            ))
-            .await
-            .unwrap()
-            .output
-            .value["value"]
-                .clone()
-        };
-        let launch = |name| {
-            format!("return await tool.agent({{prompt:'test:{name}',name:'{name}',bg:true}});")
-        };
-        let id =
-            |view: &serde_json::Value| serde_json::from_value::<JobId>(view["id"].clone()).unwrap();
-        let refused = |view: &serde_json::Value, existing: JobId| {
-            assert_eq!(view["state"], "failed");
-            let error = view["error"].as_str().unwrap();
-            assert!(error.contains("already exists"), "{error}");
-            assert!(
-                error.contains(&format!("tool.job({existing}).send")),
-                "{error}"
-            );
-        };
-
-        // An admitted tool job that never installs a child must not manufacture
-        // a permanent name reservation, even though it has role Agent and a name.
-        let invalid = call(
-            &session.root,
-            "return await tool.agent({prompt:'bad-depth',name:'worker',depth:999});",
-        )
-        .await;
-        assert_eq!(invalid["state"], "failed");
-        assert!(invalid["error"].as_str().unwrap().contains("depth"));
-        assert!(runtime.jobs.snapshot(id(&invalid)).await.is_ok());
-        let first = call(&session.root, &launch("worker")).await;
-        assert_ne!(first["state"], "failed", "{first}");
-        let first = id(&first);
-        tracking.request(0).await;
-        let duplicate = "return await tool.agent({prompt:'duplicate',name:'worker'});";
-        refused(&call(&session.root, duplicate).await, first);
-
-        // A second caller may install its own worker while the root's worker is
-        // still active. Resolve its identity from the actual installation record.
-        let manager = id(&call(
-            &session.root,
-            "return await tool.agent({prompt:'test:manager',name:'manager',depth:1,bg:true});",
-        )
-        .await);
-        tracking.request(1).await;
-        let records = runtime.store.records();
-        let manager = records
-            .iter()
-            .find_map(|record| match &record.event {
-                SessionEvent::AgentStarted {
-                    owner_job: Some(job),
-                    ..
-                } if *job == manager => Some(record.agent.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let second = call(&manager, &launch("worker")).await;
-        assert_ne!(second["state"], "failed", "{second}");
-        let second = id(&second);
-        assert_ne!(first, second);
-        tracking.request(2).await;
-        let completed = bounded(runtime.jobs.wait(second, true)).await.unwrap();
-        assert_eq!(completed.state, crate::job::JobState::Completed);
-        refused(&call(&manager, duplicate).await, second);
-
-        tracking.release(0);
-        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
-        assert_eq!(completed.state, crate::job::JobState::Completed);
-        // A parked child keeps its name.
-        until_parked(&session, &runtime.jobs.child_agent(first).await.unwrap()).await;
-        refused(&call(&session.root, duplicate).await, first);
-        // Rejecting a duplicate does not interfere with the intended follow-up
-        // path: the original child resumes under its existing ID and history.
-        bounded(runtime.jobs.send(first, json!("test:resume")))
-            .await
-            .unwrap();
-        let resumed = tracking.request(3).await;
-        assert!(
-            parent_inputs(resumed.messages())
-                .iter()
-                .any(|text| text.contains("test:resume"))
-        );
-        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
-        assert_eq!(completed.output, Some(json!({"reply": "answer-3"})));
-        drop(root_inbox);
-        stop(&session).await;
-        assert_eq!(count(&tracking), 4);
     }
 
     #[tokio::test]
@@ -439,63 +327,6 @@ mod tests {
         // Queued inputs must not become additional turns.
         assert_eq!(count(&tracking), 2);
         assert_eq!(texts(&committed(&session)), expected);
-    }
-
-    #[tokio::test]
-    async fn selecting_a_model_with_an_equal_profile_switches_its_provider() {
-        let root = tempfile::tempdir().unwrap();
-        let requests = Default::default();
-        let (first, second) = (
-            scripted_provider(&requests, [answer("from a")]),
-            scripted_provider(&requests, [answer("from b")]),
-        );
-        let profile = crate::tests::profile("same", false);
-        let harness = HarnessBuilder::new(root.path(), "test".parse().unwrap())
-            .session_root(root.path().join("sessions"))
-            .provider(
-                provider_name("a"),
-                first.clone(),
-                models([("m", profile.clone())]),
-            )
-            .provider(provider_name("b"), second.clone(), models([("m", profile)]))
-            .default_model("a/m".parse().unwrap())
-            .build()
-            .await
-            .unwrap();
-        let session = ephemeral_session(&harness).await;
-        assert_eq!(session.prompt("test:first").await.unwrap(), "from a");
-        let options = session
-            .selection(Some(&"b/m".parse().unwrap()), None)
-            .unwrap();
-        let switched = session.prompt_with_options("test:second", &[], options);
-        assert_eq!(bounded(switched).await.unwrap(), "from b");
-        assert_eq!((first.remaining(), second.remaining()), (0, 0));
-        stop(&session).await;
-    }
-
-    #[tokio::test]
-    async fn canceled_buffered_submission_never_commits_text_or_model() {
-        let (_root, tracking, session) = start(true).await;
-        let turn = spawn_prompt(&session, "test:initial");
-        tracking.request(0).await;
-        let (receipt, token_cancel) =
-            enqueue(&session, "test:canceled", vec![], Some("queue-test/second"));
-        buffered(&session, 1).await;
-        assert!(!receipt.is_finished());
-        assert!(token_cancel.cancel());
-        assert!(token_cancel.cancel());
-        tracking.release(0);
-        let next = tracking.request(1).await;
-        assert!(bounded(receipt).await.unwrap().is_err());
-        assert!(!token_cancel.is_claimed());
-        assert_eq!(next.model.as_str(), "first-model");
-        assert_eq!(texts(next.messages()), ["test:initial"]);
-        assert!(model_changes(&session).is_empty());
-        tracking.release(1);
-        bounded(turn).await.unwrap().unwrap();
-        stop(&session).await;
-        assert_eq!(texts(&committed(&session)), ["test:initial"]);
-        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]

@@ -505,6 +505,9 @@ mod tests {
         assert!(descendants.covers(&Capability::Read, &child));
         assert!(!descendants.covers(&Capability::Write, &child));
         assert!(!descendants.covers(&Capability::Read, &path("/ab")));
+        assert!(exact.permits(&exact));
+        assert!(descendants.permits(&exact));
+        assert!(!exact.permits(&descendants));
         let name = |name: &str| name.parse::<TargetName>().unwrap();
         let hops = vec![(name("jump"), 1), (name("build"), 2)];
         let route = ResourceId::route(name("build"), hops.clone());

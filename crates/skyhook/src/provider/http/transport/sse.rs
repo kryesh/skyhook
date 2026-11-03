@@ -183,11 +183,12 @@ impl Batches for SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Plan, Server, stalled_response};
+    use super::super::tests::stalled_response;
     use super::super::{client, post_sse};
     use super::*;
     use crate::provider::{ProviderErrorKind, http::Timeouts};
     use crate::tests::bounded;
+    use crate::tests::{Plan, Server};
     use futures_util::StreamExt;
     use reqwest::header::HeaderMap;
 

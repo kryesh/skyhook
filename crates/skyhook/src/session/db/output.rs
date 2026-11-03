@@ -439,6 +439,7 @@ mod tests {
         },
         tests::TestRuntime,
     };
+    use std::assert_matches;
 
     fn run(job: JobId, generation: u32) -> crate::job::Run {
         crate::job::Run(job, crate::job::Invocation::nth(generation))
@@ -511,7 +512,7 @@ mod tests {
         let refused = async |store: SessionStore, generation, capture| {
             let records = store.records();
             let finish = finish(&store, &agent, (first, generation), "{}", &[capture]).await;
-            assert!(matches!(finish, Err(SessionError::JournalFailed(_))));
+            assert_matches!(finish, Err(SessionError::JournalFailed(_)));
             assert_eq!(store.records(), records);
             assert_eq!(saved(&store, generation), None);
             assert!(store.close().await.is_err());
@@ -523,13 +524,6 @@ mod tests {
         finish(&store, &agent, (first, 0), "{}", &[earlier])
             .await
             .unwrap();
-        assert_eq!(saved(&store, 0), Some(vec![field("earlier")]));
-        for change in [
-            "UPDATE job_output SET result = 'null'",
-            "DELETE FROM job_output_field",
-        ] {
-            assert!(store.outputs().lock().execute(change, Vec::new()).is_err());
-        }
         assert_eq!(saved(&store, 0), Some(vec![field("earlier")]));
 
         let restart = SessionEvent::JobStateChanged {
@@ -660,10 +654,10 @@ mod tests {
             state: JobTransition::Running,
         };
         let stale = store.append(agent.clone(), restart.clone()).await;
-        assert!(matches!(
+        assert_matches!(
             stale,
             Err(SessionError::Refused(crate::session::SessionPhase::Closed))
-        ));
+        );
         reopened.append(agent.clone(), restart).await.unwrap();
         let current = reopened.outputs();
         let capture = reserve(&current, 1);

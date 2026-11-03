@@ -8,10 +8,10 @@ use std::{
     },
 };
 
-use super::{DATABASE_FILE, Reads, SessionError, SharedDb, db};
+use super::{DATABASE_FILE, Reads, Schema, SessionError, SharedDb, db};
 use crate::{
     blocking,
-    db::{Db, DbError, DbResult, Own, Seeding, Turn, params},
+    db::{Db, DbError, Own, Turn},
     identity::{JobId, SessionId},
     job::{ChildResult, output::Saved},
 };
@@ -24,53 +24,6 @@ pub struct AgentJobTexts {
     /// The reply its latest saved result carries; none until the child replied, or when its
     /// run saved no reply.
     pub reply: Option<String>,
-}
-
-/// Tables a product keeps in every session it creates, under a format of their own.
-/// They are mutable, unlike the journal's, and only the product's harness opens them:
-/// another host's harness opens the session without them.
-#[derive(Clone, Copy, Debug)]
-pub struct Extension {
-    pub sql: &'static str,
-    /// Checked on every open by the product; any change to the tables is a new one.
-    pub format: i64,
-    /// Fills the tables' dictionaries in a new session, and checks them on an open.
-    pub seed: fn(&Db, Seeding) -> DbResult<()>,
-}
-
-impl Extension {
-    pub(super) fn install(&self, db: &Db) -> DbResult<()> {
-        db.atomic(|| {
-            db.batch("CREATE TABLE extension(format INTEGER NOT NULL) STRICT;")?;
-            db.execute(
-                "INSERT INTO extension(format) VALUES (?1)",
-                params![self.format],
-            )?;
-            db.batch(self.sql)?;
-            (self.seed)(db, Seeding::Fill)
-        })
-    }
-
-    pub(super) fn check(&self, db: &Db) -> DbResult<()> {
-        // A session created without the tables has no `extension` table to read.
-        let installed = db
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='extension'",
-                Vec::new(),
-                |_| Ok(()),
-            )?
-            .is_some();
-        let format = match installed {
-            true => db.query_row("SELECT format FROM extension", Vec::new(), |row| {
-                Ok(row.get::<i64>(0)?)
-            })?,
-            false => None,
-        };
-        match format {
-            Some(format) if format == self.format => (self.seed)(db, Seeding::Check),
-            found => Err(DbError::Extension(found.unwrap_or_default())),
-        }
-    }
 }
 
 /// Whether an extension writes through its open session, or only reads a session
@@ -129,12 +82,8 @@ impl ExtensionDb {
         }
     }
 
-    /// The extension tables of a session that may be open elsewhere, read-only.
-    pub async fn inspect(
-        root: &Path,
-        id: SessionId,
-        extension: Extension,
-    ) -> Result<Self, SessionError> {
+    /// The product tables of `schema` in a session that may be open elsewhere, read-only.
+    pub async fn inspect(root: &Path, id: SessionId, schema: Schema) -> Result<Self, SessionError> {
         let directory = root.join(id.to_string());
         blocking(move || {
             let path = directory.join(DATABASE_FILE);
@@ -142,7 +91,7 @@ impl ExtensionDb {
                 return Err(SessionError::NotFound(id));
             }
             let own = Own::new(path, db::opener(db::OpenMode::ReadOnly));
-            own.read(|db| extension.check(db))?;
+            own.read(|db| schema.check(db))?;
             Ok(Self {
                 session: id,
                 directory,
@@ -287,21 +236,24 @@ impl ExtensionDb {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{db::Dictionaries, session::SessionStore};
+    use crate::{
+        db::{DbResult, Dictionaries, Seeding},
+        session::SessionStore,
+    };
+    use std::assert_matches;
 
     pub(crate) fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
         Dictionaries(db, seeding).names("fixture_kind", &crate::job::JobState::ALL)
     }
 
-    /// An agent job yields its brief and its child's reply whole, one the saved document
-    /// holds as a capture included, whether read beside a held reader or not; another job
-    /// yields none.
+    /// An agent job yields its child's reply whole, one the saved document holds as a
+    /// capture included, whether read beside a held reader or not.
     #[tokio::test]
     async fn an_agent_jobs_texts_read_its_reply_whole() {
         use crate::job::{JobManager, JobRole, JobSpec};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
-        let store = SessionStore::create(&sessions, "test".parse().unwrap(), Some(TABLES))
+        let store = SessionStore::create_ephemeral(&sessions, TABLES)
             .await
             .unwrap();
         let agent = crate::session::tests::started(&store, root.path()).await;
@@ -312,7 +264,6 @@ pub(crate) mod tests {
             ..JobSpec::test(agent.clone(), "agent")
         };
         let child = jobs.test_running(spec).await.into_test_id();
-        let tool = (jobs.test_running(JobSpec::test(agent, "exec")).await).into_test_id();
         // Longer than a saved document keeps a string inline.
         let reply = "r".repeat(5000);
         jobs.test_reply(child, &reply).await;
@@ -325,16 +276,16 @@ pub(crate) mod tests {
         let held = tables.clone();
         let read = move || Ok::<_, SessionError>(held.agent_job_texts(child)?);
         assert_eq!(tables.reading(read).await.unwrap(), expected);
-        assert_eq!(tables.agent_job_texts(tool).unwrap(), None);
-        store.close().await.unwrap();
     }
 
-    pub(crate) const TABLES: Extension = Extension {
-        sql: "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT; \
-              CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;",
-        format: 1,
+    pub(crate) const TABLES: Schema = Schema::extended(
+        skyhook_schema::image!(
+            format = 1,
+            sql = "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT;",
+            sql = "CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;"
+        ),
         seed,
-    };
+    );
 
     /// A product's tables open, and their sessions list for the product, only with their
     /// own format, beside a journal that opens without them; an inspection reads them
@@ -345,7 +296,7 @@ pub(crate) mod tests {
         let sessions = root.path();
         // The host the fixture's journal records.
         let host: crate::identity::HostName = "test".parse().unwrap();
-        let store = SessionStore::create(sessions, host.clone(), Some(TABLES))
+        let store = SessionStore::create(sessions, host.clone(), TABLES)
             .await
             .unwrap();
         let id = store.id();
@@ -385,19 +336,24 @@ pub(crate) mod tests {
         store.close().await.unwrap();
         drop(store);
 
-        let changed = Extension {
-            format: 2,
-            ..TABLES
-        };
+        // The same tables, created as each session is, at another format.
+        let changed = Schema::extended(
+            crate::session::ProductImage::layered(
+                "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT; \
+                 CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;",
+                2,
+            ),
+            seed,
+        );
         assert!(matches!(
             SessionStore::open(sessions, id, Some((&host, changed))).await,
             Err(SessionError::Database(DbError::Extension(1)))
         ));
         let summary = |host, tables| SessionStore::summary(sessions, id, Some((host, tables)));
-        assert!(matches!(
+        assert_matches!(
             summary(&host, changed).await,
             Err(SessionError::Database(DbError::Extension(1)))
-        ));
+        );
         assert!(summary(&host, TABLES).await.is_ok());
         // Another host lists the session and its harness opens it without the tables.
         let other = "other".parse().unwrap();
@@ -417,7 +373,7 @@ pub(crate) mod tests {
         assert_eq!(kept.as_deref(), Some("kept"));
         reopened.close().await.unwrap();
 
-        let journal = SessionStore::create(sessions, host.clone(), None)
+        let journal = SessionStore::create(sessions, host.clone(), Schema::JOURNAL)
             .await
             .unwrap();
         let bare = journal.id();
@@ -440,7 +396,7 @@ pub(crate) mod tests {
     async fn extension_only_writes_are_synced_by_drain_and_close() {
         let root = tempfile::tempdir().unwrap();
         let host = "test".parse().unwrap();
-        let store = SessionStore::create(root.path(), host, Some(TABLES))
+        let store = SessionStore::create(root.path(), host, TABLES)
             .await
             .unwrap();
         let root_agent = crate::identity::AgentId::root(store.id());

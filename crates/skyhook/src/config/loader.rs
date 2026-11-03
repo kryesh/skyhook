@@ -383,6 +383,7 @@ pub(super) mod tests {
     use super::*;
     use indexmap::IndexMap;
     use serde::Deserialize;
+    use std::assert_matches;
 
     #[derive(Debug, Deserialize)]
     #[serde(default, deny_unknown_fields)]
@@ -612,24 +613,24 @@ providers:
         let missing = resolve_paths::<Config>(&f.workspace, None, Vec::new())
             .await
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             missing,
             LayerResolutionError::Missing {
                 file_name: "config.yaml",
                 ..
             }
-        ));
+        );
         let error = resolve_paths::<LimitedDefaults>(&f.workspace, None, Vec::new())
             .await
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             LayerResolutionError::Resolution {
                 file_name: "defaults.yaml",
                 stage: ResolutionStage::Effective,
                 ..
             }
-        ));
+        );
         assert_eq!(
             error.report().diagnostics[0].path,
             f.local.with_file_name("defaults.yaml")
@@ -640,13 +641,72 @@ providers:
         let error = resolve_layers::<ExampleConfig>(&f.workspace, Some(&explicit))
             .await
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             LayerResolutionError::Resolution {
                 stage: ResolutionStage::Explicit,
                 ..
             }
-        ));
+        );
         assert_eq!(error.report().diagnostics[0].path, explicit);
+    }
+
+    /// Discovery takes the first usable candidate: an absent one is silent, a
+    /// refused one is reported once and leaks nothing, and with none usable the
+    /// workspace file alone configures.
+    #[tokio::test]
+    async fn candidates_fall_back_past_refusals_once_each() {
+        let f = Fixture::<ExampleConfig>::new();
+        write(&f.home, "models:\n  kept: {value: 1}\n");
+        let candidates = vec![f.xdg.clone(), f.xdg.clone(), f.home.clone()];
+        let resolve = || resolve_paths::<ExampleConfig>(&f.workspace, None, candidates.clone());
+        let refusals: [Option<&[u8]>; 8] = [
+            None,
+            Some(b"DIRECTORY"), // read failure, works even when tests run as root
+            Some(b"\xff\xfe"),  // invalid UTF-8
+            Some(b""),          // not a mapping
+            Some(b"limit: 9\nmalformed: ["), // YAML
+            Some(b"limit: bad"), // serde type
+            Some(b"limit: 9\nunrecognized: 1"), // serde unknown field
+            Some(b"limit: 0\nmodels:\n  a: {value: 1}"), // admission
+        ];
+        for refused in refusals {
+            if f.xdg.is_dir() {
+                std::fs::remove_dir(&f.xdg).unwrap();
+            }
+            match refused {
+                Some(b"DIRECTORY") => std::fs::create_dir(&f.xdg).unwrap(),
+                Some(bytes) => write(&f.xdg, bytes),
+                None => {}
+            }
+            let resolved = resolve()
+                .await
+                .unwrap_or_else(|error| panic!("{refused:?}: {error}"));
+            assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
+            let diagnostics = &resolved.report.diagnostics;
+            assert_eq!(
+                diagnostics.len(),
+                usize::from(refused.is_some()),
+                "{refused:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.path == f.xdg)
+            );
+            let config = resolved.config;
+            assert_eq!(config.limit, 1, "refused candidate leaked: {refused:?}");
+            assert_eq!(config.models.keys().collect::<Vec<_>>(), ["kept"]);
+        }
+        std::fs::remove_file(&f.home).unwrap();
+        write(&f.local, "models:\n  local: {value: 2}\n");
+        for (candidates, diagnostics) in [(candidates.clone(), 1), (Vec::new(), 0)] {
+            let resolved = resolve_paths::<ExampleConfig>(&f.workspace, None, candidates)
+                .await
+                .unwrap();
+            assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));
+            assert_eq!(resolved.report.diagnostics.len(), diagnostics);
+            assert_eq!(resolved.config.models["local"].value, 2);
+        }
     }
 }

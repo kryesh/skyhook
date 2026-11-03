@@ -152,7 +152,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         record(method)
         if method != 'initialize' and os.environ.get('MCP_TEST_HTTP_HANG'):
             threading.Event().wait()
-        if method == 'tools/call' and os.environ.get('MCP_TEST_HTTP_EXPIRED'):
+        # The session expires under a call to the `expired` tool.
+        if method == 'tools/call' and request['params']['name'] == 'expired':
             self.send_error(404)
             return
         if method == 'initialize':
@@ -160,7 +161,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       'capabilities': {'tools': {}},
                       'serverInfo': {'name': 'http-fixture', 'version': '1'}}
         elif method == 'tools/list':
-            result = {'tools': [{'name': 'echo', 'inputSchema': {'type': 'object'}}]}
+            result = {'tools': [{'name': name, 'inputSchema': {'type': 'object'}}
+                                for name in ['echo', 'expired']]}
         elif method == 'tools/call':
             result = {'content': [{'type': 'text', 'text': 'http fixture response'}]}
         else:
@@ -225,7 +227,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn reachable_http_errors_never_launch_a_configured_command() {
-        use crate::provider::http::transport::tests::{read_request, reply};
+        use crate::tests::{read_request, reply};
         use tokio::io::AsyncWriteExt;
 
         let fixture = Fixture::new();
@@ -266,21 +268,28 @@ server.serve_forever()
         }
     }
 
+    /// An expired session never reinitializes or replays a tool call.
     #[tokio::test]
     async fn refused_http_port_launches_command_waits_for_readiness_and_reaps_child() {
         let fixture = Fixture::new();
         // No request can succeed until the manager launches the HTTP subprocess.
         let port = crate::tests::RefusedPort::new();
-        let manager = connect(http_fixture_config(&fixture, port.address().port())).await;
+        let config = http_fixture_config(&fixture, port.address().port());
+        let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
+        let manager = connect(config).await;
         assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-        assert_eq!(manager.catalog().len(), 1);
-        assert_eq!(manager.catalog()[0].tool.name, "echo");
+        let names = manager.catalog().iter().map(|entry| &*entry.tool.name);
+        assert_eq!(names.collect::<Vec<_>>(), ["echo", "expired"]);
         assert!(fixture.directory.path().join("ready").exists());
         let result = fixture_call(&manager, "echo").await.unwrap();
         assert_eq!(
             serde_json::to_value(result).unwrap()["content"][0]["text"],
             "http fixture response"
         );
+        assert!(fixture_call(&manager, "expired").await.is_err());
+        let counts = std::fs::read_to_string(fixture.path("http-counts")).unwrap();
+        let count = |name| counts.lines().filter(|method| *method == name).count();
+        assert_eq!((count("initialize"), count("tools/call")), (1, 2));
         let pid = fixture.pid();
         shutdown(&manager).await;
         assert_process_reaped(pid).await;
@@ -337,7 +346,7 @@ server.serve_forever()
         config.start_command = Some(vec![fixture.path("must-not-be-executed")]);
         let manager = connect(config).await;
         assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-        assert_eq!(manager.catalog().len(), 1);
+        assert_eq!(manager.catalog().len(), 2);
         shutdown(&manager).await;
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -349,7 +358,7 @@ server.serve_forever()
         config.cwd = None;
         config.env.clear();
         let second = connect(config).await;
-        assert_eq!(second.catalog().len(), 1, "{:?}", second.warnings());
+        assert_eq!(second.catalog().len(), 2, "{:?}", second.warnings());
         shutdown(&second).await;
         child.kill().await.unwrap();
         child.wait().await.unwrap();
@@ -396,39 +405,16 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn cancelled_shutdown_waiter_does_not_discard_cleanup_task() {
-        let fixture = Fixture::new();
-        let manager = connect(fixture.config()).await;
-        let pid = fixture.pid();
-        // One poll stores the cleanup task; dropping the waiter then cancels it.
-        let mut waiter = Box::pin(manager.shutdown());
-        assert!(futures_util::poll!(&mut waiter).is_pending());
-        drop(waiter);
-        shutdown(&manager).await;
-        assert_process_reaped(pid).await;
-    }
-
-    #[tokio::test]
-    async fn expired_http_session_never_reinitializes_or_replays_tool_call() {
-        let fixture = Fixture::new();
-        let port = crate::tests::RefusedPort::new();
-        let config = http_fixture_config(&fixture, port.address().port());
-        let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
-        let manager = connect(with_env(config, "MCP_TEST_HTTP_EXPIRED", "1".into())).await;
-        assert_eq!(manager.catalog().len(), 1, "{:?}", manager.warnings());
-        assert!(fixture_call(&manager, "echo").await.is_err());
-        let counts = std::fs::read_to_string(fixture.path("http-counts")).unwrap();
-        let count = |name| counts.lines().filter(|method| *method == name).count();
-        assert_eq!((count("initialize"), count("tools/call")), (1, 1));
-        shutdown(&manager).await;
-    }
-
-    #[tokio::test]
     async fn shutdown_kills_entire_owned_process_group_not_unrelated_processes() {
         use std::os::unix::process::ExitStatusExt;
         let fixture = Fixture::new();
         let manager = connect(fixture.config()).await;
         let pid = fixture.pid();
+        // A cancelled shutdown waiter does not discard the cleanup task: one poll
+        // stores it, and dropping the waiter then cancels only the wait.
+        let mut waiter = Box::pin(manager.shutdown());
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        drop(waiter);
         // Join a test-owned child to the server group. Retaining its Child handle
         // lets the test reap it (real grandchildren are reaped by their new parent).
         let sleeper = |group| {

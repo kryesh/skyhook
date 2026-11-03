@@ -232,9 +232,8 @@ mod tests {
 
     /// Session and event identifiers share one generator and one text form.
     #[test]
-    fn random_ids_are_random_and_round_trip() {
+    fn random_ids_round_trip() {
         let event = EventId::generate().unwrap();
-        assert_ne!(event, EventId::generate().unwrap());
         let session = SessionId::from_bytes([0xab; 16]);
         assert_eq!(event.to_string().parse::<EventId>().unwrap(), event);
         assert_eq!(

@@ -2,7 +2,7 @@
 use super::{Item, MenuKind, MenuLoaded};
 use crate::tui::app::{App, Work};
 use skyhook::identity::JobId;
-use skyhook::job::{Continuation, FieldPointer, JobOutputQuery, OutputFields};
+use skyhook::job::{FieldPointer, JobOutputQuery, NextChild, OutputFields};
 
 const OUTPUT_SEARCH_CONTEXT: usize = 2;
 
@@ -10,10 +10,10 @@ const OUTPUT_SEARCH_CONTEXT: usize = 2;
 pub enum OutputAction {
     Automatic,
     Field(FieldPointer),
-    /// Show `field` from its child at `index`, which lists the fields from there.
+    /// Show `field` from its child `next`, which lists the fields from there.
     MoreFields {
         field: FieldPointer,
-        index: usize,
+        next: NextChild,
     },
     Search,
     Next,
@@ -24,12 +24,16 @@ fn output_items(parent: &FieldPointer, listed: OutputFields) -> Vec<Item<OutputA
     let mut items: Vec<_> = (listed.fields.into_iter())
         .map(|field| Item::new(OutputAction::Field(field.clone()), field.to_string(), ""))
         .collect();
-    if let Some(index) = listed.next_index {
+    if let Some(next) = listed.next {
         let more = OutputAction::MoreFields {
             field: parent.clone(),
-            index,
+            next,
         };
-        items.push(Item::new(more, "more fields", format!("from {index}")));
+        items.push(Item::new(
+            more,
+            "more fields",
+            format!("from {}", next.index),
+        ));
     }
     if let Some(up) = parent
         .parent()
@@ -62,17 +66,17 @@ impl App {
             return;
         };
         // Fields are listed a level at a time, below the one shown and from the
-        // page of its members or elements shown; a query's index counts matches.
+        // page of its members or elements shown; a query's start counts matches.
         let query = self.outputs.query(job);
         let index = (query.filter(|query| query.query.is_none()))
-            .and_then(|query| query.index)
-            .unwrap_or(0);
+            .and_then(|query| query.start)
+            .map_or(0, |start| start - 1);
         let parent = (query.and_then(|query| query.field.clone()))
             .filter(|field| !field.is_root())
             .unwrap_or_else(FieldPointer::result);
         let none = OutputFields {
             fields: Vec::new(),
-            next_index: None,
+            next: None,
         };
         self.open(
             "Saved output",
@@ -107,13 +111,11 @@ impl App {
                 };
                 let mut query =
                     (self.outputs.query(job).cloned()).unwrap_or_else(|| JobOutputQuery::new(job));
-                if let Some(field) = next.field() {
+                if let Some(field) = next.field {
                     query.field = Some(field.clone());
                 }
-                (query.start, query.offset, query.index) = match next {
-                    Continuation::Lines { start, offset, .. } => (Some(start), offset, None),
-                    Continuation::Index { index, .. } => (None, None, Some(index)),
-                };
+                (query.start, query.unit, query.offset) =
+                    (Some(next.start), Some(next.unit), next.offset);
                 self.outputs.set_query(query);
             }
             OutputAction::Field(field) => {
@@ -121,9 +123,10 @@ impl App {
                 query.field = Some(field.clone());
                 self.outputs.set_query(query);
             }
-            OutputAction::MoreFields { field, index } => {
+            OutputAction::MoreFields { field, next } => {
                 let mut query = JobOutputQuery::new(job);
-                (query.field, query.index) = (Some(field.clone()), Some(*index));
+                (query.field, query.start) = (Some(field.clone()), Some(next.index + 1));
+                query.unit = Some(next.unit);
                 self.outputs.set_query(query);
             }
         }
@@ -143,7 +146,7 @@ mod tests {
     use super::super::super::tests::*;
     use super::*;
     use crate::tui::keys::Command;
-    use skyhook::job::OutputPreview;
+    use skyhook::job::{OutputPreview, PageUnit};
 
     fn offered(app: &mut App, field: &str) -> Option<usize> {
         let MenuKind::Output(_, items) = &app.menu.as_mut().unwrap().kind else {
@@ -245,7 +248,10 @@ mod tests {
         };
         let more = OutputAction::MoreFields {
             field: value.clone(),
-            index: 100,
+            next: NextChild {
+                index: 100,
+                unit: PageUnit::Members,
+            },
         };
         let chosen = items.iter().position(|item| item.value == more).unwrap();
         app.menu.as_mut().unwrap().select(chosen);

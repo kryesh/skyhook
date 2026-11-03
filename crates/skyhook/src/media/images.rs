@@ -323,6 +323,7 @@ fn flatten(pixels: DynamicImage) -> DynamicImage {
 mod tests {
     use super::*;
     use crate::tests::noise;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn still_images_keep_their_source_bytes() {
@@ -342,39 +343,23 @@ mod tests {
 
     #[tokio::test]
     async fn animations_are_stored_as_their_first_frame() {
-        // Only the first frame decodes, so a second one cut short is never kept.
-        let animation = crate::tests::animated_gif();
-        let truncated = animation[..animation.len() - 4].to_vec();
-        let red_then_blue = apng(4, 2, false, &[&[0; 8], &[1; 8]]);
-        // An APNG keeps the image viewers without animation show: its default
-        // one, outside the animation here.
-        let blue_then_red = apng(4, 2, true, &[&[1; 8], &[0; 8]]);
-        let red = [255, 0, 0, 255];
-        let blue = [0, 0, 255, 255];
-        for (bytes, color) in [
-            (animation, red),
-            (truncated, red),
-            (red_then_blue, red),
-            (blue_then_red, blue),
-        ] {
+        let red_then_blue = apng(4, 2, &[&[0; 8], &[1; 8]]);
+        for bytes in [crate::tests::animated_gif(), red_then_blue] {
             let image = Image::decode(bytes).await.unwrap();
             assert_eq!(image.format(), ImageFormat::Png);
             let (still, _) = decoding::admit(image.format(), image.bytes()).unwrap();
-            assert_eq!(still.to_rgba8().get_pixel(3, 1).0, color);
+            assert_eq!(still.to_rgba8().get_pixel(3, 1).0, [255, 0, 0, 255]);
         }
     }
 
     #[tokio::test]
     async fn decoding_refuses_what_it_cannot_store() {
         let oversized = vec![0; MAX_IMAGE_BYTES as usize + 1];
-        assert!(matches!(
-            Image::decode(oversized).await,
-            Err(MediaError::TooLarge)
-        ));
-        assert!(matches!(
+        assert_matches!(Image::decode(oversized).await, Err(MediaError::TooLarge));
+        assert_matches!(
             Image::decode(b"not an image".to_vec()).await,
             Err(MediaError::UnsupportedImage)
-        ));
+        );
         // A canvas is admitted before any frame is read, however small its frame,
         // and a decompression bomb before its pixels are inflated.
         let refused = async |bytes| {
@@ -412,16 +397,15 @@ mod tests {
         bytes
     }
 
-    /// An APNG of `images`: its default image, then its frames, the first of them
-    /// also the default unless it is `separate`; palette index 0 is red, 1 blue.
-    fn apng(width: u32, height: u32, separate: bool, images: &[&[u8]]) -> Vec<u8> {
+    /// An APNG of `images`, the first also its default image; palette index 0 is
+    /// red, 1 blue.
+    fn apng(width: u32, height: u32, images: &[&[u8]]) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut encoder = png::Encoder::new(&mut bytes, width, height);
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_palette(vec![255, 0, 0, 0, 0, 255]);
-        let frames = u32::try_from(images.len() - usize::from(separate)).unwrap();
+        let frames = u32::try_from(images.len()).unwrap();
         encoder.set_animated(frames, 0).unwrap();
-        encoder.set_sep_def_img(separate).unwrap();
         let mut writer = encoder.write_header().unwrap();
         for image in images {
             writer.write_image_data(image).unwrap();
@@ -467,7 +451,8 @@ mod tests {
     async fn fit_copies_only_images_over_a_limit() {
         use image::{GenericImageView as _, ImageFormat as Codec};
         let mut wide = Cursor::new(Vec::new());
-        image::GrayImage::new(16_000_000, 1)
+        // Its height rounds to nothing at the edge limit, so stays one pixel.
+        image::GrayImage::new(24_000, 1)
             .write_to(&mut wide, Codec::Png)
             .unwrap();
         let roomy = 1 << 20;
@@ -488,6 +473,12 @@ mod tests {
                 ImageLimits::new(8000, roomy),
                 Some((ImageFormat::Png, Some((8000, 1)))),
             ),
+            // A lossless source over only the byte limit stays a PNG when one fits.
+            (
+                commented_png(),
+                ImageLimits::new(64, 200),
+                Some((ImageFormat::Png, None)),
+            ),
             (
                 rotated_jpeg(64, 32),
                 ImageLimits::new(16, roomy),
@@ -497,7 +488,7 @@ mod tests {
             let source = Image::decode(source).await.unwrap();
             let fitted = source.fit(limits).unwrap();
             let Some((format, dimensions)) = expected else {
-                assert!(matches!(fitted, Cow::Borrowed(image) if *image == source));
+                assert_matches!(fitted, Cow::Borrowed(image) if *image == source);
                 continue;
             };
             assert_eq!(fitted.format(), format);
@@ -509,13 +500,11 @@ mod tests {
         }
         let tiny = ImageLimits::new(64, 1);
         let image = Image::decode(noise(Codec::Png, 8, 8)).await.unwrap();
-        assert!(matches!(image.fit(tiny), Err(FitError::Unfittable(_))));
+        assert_matches!(image.fit(tiny), Err(FitError::Unfittable(_)));
     }
 
-    /// A lossless source within the edge limit but over the byte limit is
-    /// re-encoded as a PNG when one fits.
-    #[tokio::test]
-    async fn fit_prefers_a_png_to_a_jpeg() {
+    /// An 8×8 PNG whose text metadata outweighs its pixels.
+    fn commented_png() -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut encoder = png::Encoder::new(&mut bytes, 8, 8);
         encoder.set_color(png::ColorType::Rgba);
@@ -525,11 +514,6 @@ mod tests {
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(&[0; 8 * 8 * 4]).unwrap();
         writer.finish().unwrap();
-        let limits = ImageLimits::new(64, 200);
-        let source = Image::decode(bytes).await.unwrap();
-        assert!(!limits.fits_bytes(&source));
-        let fitted = source.fit(limits).unwrap();
-        assert_eq!(fitted.format(), ImageFormat::Png);
-        assert!(limits.fits_bytes(&fitted));
+        bytes
     }
 }

@@ -1,11 +1,12 @@
 # Optional empirical demonstration
 
-Work on one analytically validated candidate: open the test with `research` `begin` `{phase:
-"test", subjects: [candidate]}` and settle it at the end with `research` `test`. The candidate
-is the most severe untested scenario of its root flaw's group: demonstrate it end to end at its
-assessed severity, since a confirmation also covers the group's scenarios that are no more
-severe. Read it with `research_query` `node`, including any test the analysis wrote into the
-evidence as the one that would settle a question.
+Work on one candidate: open the test with `research` `begin` `{phase: "test", subjects:
+[candidate]}` and settle it at the end with `research` `test`. Read it with `research_query`
+`node`, including any test the analysis wrote into the evidence as the one that would settle a
+question. An analytically validated candidate is the most severe untested scenario of its root
+flaw's group: demonstrate it end to end at its assessed severity, since a confirmation also
+covers the group's scenarios that are no more severe. An unproven one is tested for its
+premises, as the last section says.
 
 Define a minimal demonstration with explicit preconditions and observable success criteria that
 distinguish the violation under test from an unrelated error, and a control run on the same
@@ -68,3 +69,14 @@ Settle this test on this candidate's scenario alone: another input along the sam
 same consequence is this scenario, to try in this test; anything else the run shows is recorded
 apart, citing its artifacts, when you find it. Return the authoritative result and
 evidence references, and the IDs you recorded.
+
+## An unproven candidate
+
+Its review left code premises of its chain undecided that reading could not settle: observe
+them rather than demonstrate the scenario. Run the demonstration plan its review recorded as
+context evidence on it, or a bounded plan of your own, against those premises, with the care
+above. Propose each premise you observe with `research` `set_status`: `holds`, or `fails` on an
+observed counterexample, citing the run's artifacts, for its settle to decide; record the test
+`confirmed`, or `failed` when one fails. A plan that shows nothing ends the test: record what
+was tried as context evidence on each premise and the test as `unavailable`. That is no proof either way, so it
+contradicts nothing.

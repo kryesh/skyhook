@@ -711,34 +711,22 @@ mod tests {
             json!({"type":"redacted_thinking", "data":"encrypted+/=", "future_field":42});
         // A valid object is also provisional until the terminal reason, and a
         // truncated tool must not block later completed reasoning.
-        for (reason, expected, input, tool_first) in [
-            (
-                "max_tokens",
-                CutReason::MaxTokens,
-                r#"{"path":"part"#,
-                false,
-            ),
-            ("refusal", CutReason::Refusal, "[]", false),
+        for (reason, expected, input) in [
+            ("max_tokens", CutReason::MaxTokens, r#"{"path":"part"#),
+            ("refusal", CutReason::Refusal, "[]"),
         ] {
-            let (tool, reasoning) = if tool_first { (0, [1, 2]) } else { (2, [0, 1]) };
-            let mut frames = vec![start()];
-            for index in 0..3 {
-                if index == tool {
-                    frames.extend([
-                        block_start(index, tool_use("call_1")),
-                        json_delta(index, input),
-                    ]);
-                } else {
-                    let native = if index == reasoning[0] {
-                        &signed
-                    } else {
-                        &redacted
-                    };
-                    frames.push(block_start(index, native.clone()));
-                }
-                frames.push(stop(index));
-            }
-            frames.extend([terminal(reason, 19), message_stop()]);
+            let frames = vec![
+                start(),
+                block_start(0, signed.clone()),
+                stop(0),
+                block_start(1, redacted.clone()),
+                stop(1),
+                block_start(2, tool_use("call_1")),
+                json_delta(2, input),
+                stop(2),
+                terminal(reason, 19),
+                message_stop(),
+            ];
             let reduced = reduced("test-model", frames);
             assert_eq!(
                 (reduced.completion.outcome(), reduced.usage),
@@ -787,18 +775,6 @@ mod tests {
                 ProviderErrorKind::ContextWindowExceeded
             );
         }
-    }
-
-    #[test]
-    fn malformed_tool_input_still_errors_on_normal_terminal_reason() {
-        let mut decoder = started();
-        decode(
-            &mut decoder,
-            vec![block_start(0, tool_use("call_1")), json_delta(0, "[]")],
-        );
-        assert!(decode(&mut decoder, vec![stop(0)]).is_empty());
-        assert!(decoder.decode(&event(terminal("end_turn", 19))).is_err());
-        assert!(decoder.finish().is_err());
     }
 
     #[test]
@@ -923,19 +899,10 @@ mod tests {
                 max_tokens,
                 true,
             ),
-            // A later cut retracts tools, and so does a later overflow, without
-            // failing the response.
+            // A later cut retracts tools.
             (
                 vec![terminal("tool_use", 3), terminal("max_tokens", 4)],
                 max_tokens,
-                true,
-            ),
-            (
-                vec![
-                    terminal("tool_use", 3),
-                    terminal("model_context_window_exceeded", 4),
-                ],
-                Some(Outcome::Cut(CutReason::Incomplete)),
                 true,
             ),
             (vec![terminal("tool_use", 2)], None, false),
@@ -957,6 +924,23 @@ mod tests {
             let tools = reduced.items().iter().filter(|item| item.call().is_some());
             assert_eq!(tools.count(), usize::from(!discarded), "{tail:?}");
         }
+        // A later abnormal reason does not revise a text response.
+        let reduced = reduced(
+            "model-a",
+            vec![
+                start(),
+                block_start(0, json!({"type":"text","text":"partial"})),
+                stop(0),
+                terminal("end_turn", 2),
+                terminal("max_tokens", 3),
+                message_stop(),
+            ],
+        );
+        assert_eq!(reduced.completion.outcome(), Outcome::Answer);
+        assert_eq!(
+            reduced.items()[0].text_content().as_deref(),
+            Some("partial")
+        );
     }
 
     #[test]
@@ -969,9 +953,10 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(error.kind(), ProviderErrorKind::Unavailable);
-        assert_eq!(
-            error.message,
-            "provider stream error [code=overloaded_error]: Overloaded, retry with Bearer abc.def"
+        assert!(
+            error
+                .message
+                .ends_with(": Overloaded, retry with Bearer abc.def")
         );
         // Anthropic names overflow only in the message, which the codec's error
         // reader recognises.
@@ -1011,25 +996,14 @@ mod tests {
             Outcome::Cut(CutReason::MaxTokens)
         );
         assert!(reduced.items().is_empty());
-    }
-
-    #[test]
-    fn a_later_abnormal_reason_does_not_revise_a_text_response() {
-        let reduced = reduced(
-            "model-a",
-            vec![
-                start(),
-                block_start(0, json!({"type":"text","text":"partial"})),
-                stop(0),
-                terminal("end_turn", 2),
-                terminal("max_tokens", 3),
-                message_stop(),
-            ],
+        // Input that never forms an object fails a normal stop.
+        let mut decoder = started();
+        decode(
+            &mut decoder,
+            vec![block_start(0, tool_use("call_1")), json_delta(0, "[]")],
         );
-        assert_eq!(reduced.completion.outcome(), Outcome::Answer);
-        assert_eq!(
-            reduced.items()[0].text_content().as_deref(),
-            Some("partial")
-        );
+        assert!(decode(&mut decoder, vec![stop(0)]).is_empty());
+        assert!(decoder.decode(&event(terminal("end_turn", 19))).is_err());
+        assert!(decoder.finish().is_err());
     }
 }

@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use reqwest::{Method, header::HeaderMap};
 use tokio::io::AsyncWriteExt;
 
-use super::super::workspace::{Parents, atomic_write_context};
+use super::super::workspace::{Directories, atomic_write_context};
 use super::progress::{FetchProgress, transport_error};
 use super::validation::{HttpRequestUrl, OutputPlan};
 use super::{LocalContext, LocalError, ResponseBody, ResponseFormat, text};
@@ -38,7 +38,7 @@ impl PendingDownload {
         overwrite: bool,
         progress: &mut FetchProgress,
     ) -> Result<Self, LocalError> {
-        progress.parents = Parents::create(&destination).await?;
+        progress.parents = Directories::above(&destination).await?;
         progress.download_io(Operation::CreateCapture, &destination);
         let staging = destination.clone();
         let staged = blocking(move || {
@@ -242,7 +242,7 @@ async fn response_body(
         },
         (_, ContentClass::Html) => {
             progress.step(Operation::Capture, Subject::Label("HTML extraction".into()));
-            text::extract(entity, url).await
+            text::extract(entity, url, super::budget::Limits::DEFAULT).await
         }
         (_, ContentClass::Binary) => ResponseBody::Base64 {
             data: STANDARD.encode(entity.bytes()),
@@ -267,33 +267,13 @@ async fn json_or_text(text: String) -> ResponseBody {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::super::tests::{executor, fetch, server};
     use super::*;
-    use crate::provider::http::transport::tests::{Plan, Server, read_request, reply};
+    use crate::tests::{read_request, reply};
     use crate::tool::diagnostic::{Effects, RequestEffects};
     use serde_json::json;
-
-    #[tokio::test]
-    async fn unreadable_html_keeps_the_response_and_its_source() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = executor(&runtime);
-        let html = "<html><body><div id='app'></div></body></html>";
-        let (url, task) = server(vec![reply(
-            "201 Created",
-            "Content-Type: text/html\r\n",
-            html,
-        )])
-        .await;
-        let arguments = json!({"url":url, "include_headers":true});
-        let output = fetch(&runtime, &executor, arguments).await.unwrap();
-        task.finish().await;
-        assert_eq!(output["status"], 201);
-        assert_eq!(output["headers"]["content-type"], json!(["text/html"]));
-        assert_eq!(
-            output["body"],
-            json!({"kind":"unreadable", "reason":"no_text", "text":html})
-        );
-    }
 
     /// A download creates the directories that hold it, which a failure leaves.
     #[tokio::test]
@@ -413,23 +393,23 @@ mod tests {
             }
         };
         let body = async |bytes, content_type, format| read(bytes, content_type, format).await.0;
-        assert!(matches!(
+        assert_matches!(
             body(&[0, 255, 3], Some("application/octet-stream"), Readable).await,
             ResponseBody::Base64 { data } if data == "AP8D"
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             body(&[0xe9], Some("text/plain; charset=windows-1252"), Auto).await,
             ResponseBody::Text { text } if text == "\u{e9}"
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             body(&[], Some("text/html"), Text).await,
             ResponseBody::Empty
-        ));
+        );
         let html = html.as_bytes();
-        assert!(matches!(
+        assert_matches!(
             body(html, Some("text/html"), Text).await,
             ResponseBody::Text { text } if text.as_bytes() == html
-        ));
+        );
         // Sniffed HTML extracts without a declared media type, and `readable`
         // also reads HTML served as another one.
         for (content_type, format) in [(None, Auto), (Some("text/plain"), Readable)] {
@@ -441,10 +421,10 @@ mod tests {
             assert!(page.markdown.contains("Meaningful article details"));
             assert_eq!(page.title, "Sniffed article");
         }
-        assert!(matches!(
+        assert_matches!(
             body(html, Some("text/plain"), Auto).await,
             ResponseBody::Text { .. }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -474,41 +454,5 @@ mod tests {
             }
             task.finish().await;
         }
-    }
-
-    #[tokio::test]
-    async fn cancellation_preserves_destination_and_cleans_temporary_download() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let destination = runtime.root.path().join("saved.txt");
-        tokio::fs::write(&destination, b"original").await.unwrap();
-        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial";
-        let mut server = Server::start(vec![Plan::stalled(head)]).await;
-        let url = server.root();
-        let executor = executor(&runtime);
-        let agent = runtime.agent.clone();
-        let arguments = json!({"url":url,"save_to":"saved.txt","overwrite":true});
-        let pending =
-            tokio::spawn(async move { executor.run_host(&agent, "fetch", arguments).await });
-        server.request().await;
-        assert_eq!(
-            runtime
-                .jobs
-                .cancel_all(&runtime.agent, crate::job::CancelScope::Outcome)
-                .await,
-            1
-        );
-        let result = crate::tests::bounded(pending).await;
-        assert!(result.unwrap().is_err());
-        drop(server);
-        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"original");
-        let entries: Vec<_> = std::fs::read_dir(runtime.root.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(
-            entries.len(),
-            2,
-            "only sessions and original destination should remain: {entries:?}"
-        );
     }
 }

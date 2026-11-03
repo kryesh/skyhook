@@ -109,10 +109,7 @@ fn reported_start(requests: &[CompletedRequest], visible: &[&Projected], budget:
         return visible.len();
     };
     let mut total = 0u64;
-    for pair in boundaries.windows(2).rev() {
-        let [(earlier, before, smaller), (_, after, larger)] = pair else {
-            unreachable!("windows of two")
-        };
+    for [(earlier, before, smaller), (_, after, larger)] in boundaries.array_windows().rev() {
         if before != after || larger <= smaller {
             break;
         }

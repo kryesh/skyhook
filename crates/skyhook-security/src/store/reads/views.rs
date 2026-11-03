@@ -5,6 +5,36 @@ use serde::Serialize;
 
 use super::super::*;
 
+/// A result recorded outside the work owning it that differs from the standing one, which that
+/// work decides: the latest, with the task and agent that recorded it.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct Proposal<T> {
+    pub value: T,
+    pub event: EventId,
+    /// The work it was recorded within; none outside every task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    pub agent: AgentId,
+}
+
+/// A proposed assessment.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct Scored {
+    pub vector: String,
+    pub severity: Severity,
+    pub score: f64,
+}
+
+/// A proposal of the result a phase records on its subject.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Proposed {
+    Premise(PremiseStatus),
+    Flaw(FlawStatus),
+    Assessment(Scored),
+    Verdict(Verdict),
+}
+
 /// What every node view leads with.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Head {
@@ -32,6 +62,20 @@ pub struct PremiseRef {
     pub title: String,
     pub scope: PremiseScope,
     pub status: PremiseStatus,
+}
+
+/// A decided premise of a flaw leaving a state wrong, which the state's check may contradict:
+/// the decision its standing rests on, the task that decision was recorded within, and how much
+/// evidence it carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DecidedPremise {
+    #[serde(flatten)]
+    pub premise: PremiseRef,
+    pub decided: EventId,
+    /// None when decided outside every task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    pub evidence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
@@ -70,13 +114,26 @@ pub struct Step {
     pub note: String,
 }
 
+/// A state's scope, with an input state's trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum Scoped {
+    Input { trust: Trust },
+    Handed,
+    Instance,
+    Stored,
+}
+
+/// A state a path reads or writes, at the location it does.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct SourceRef {
-    pub id: SourceId,
+pub struct AccessRef {
+    pub id: StateId,
     pub title: String,
-    pub location: Location,
-    pub trust: Trust,
+    #[serde(flatten)]
+    pub scope: Scoped,
     pub status: InventoryStatus,
+    pub access: Access,
+    pub location: Location,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -96,29 +153,56 @@ pub struct PathView {
     #[serde(flatten)]
     pub head: Head,
     pub steps: Vec<Step>,
-    pub sources: Vec<SourceRef>,
+    /// The states its flow reads or writes.
+    pub states: Vec<AccessRef>,
     pub premises: Vec<PremiseRef>,
     pub candidates: Vec<CandidateRef>,
-    /// While unswept and a recorded source enters it, it owes a sweep.
+    /// While unswept and it reads a recorded input or handed state, it owes a sweep.
     pub status: PathStatus,
 }
 
+/// A path's read or write of a state, at the location it does.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct SourceView {
-    #[serde(flatten)]
-    pub head: Head,
-    /// Absent once merged: its location is free for another source.
-    #[serde(flatten)]
-    pub live: Option<LiveSource>,
+pub struct AccessView {
+    pub path: Ref,
+    pub access: Access,
+    pub location: Location,
 }
 
-/// What a live source holds.
+/// An input state's trust and the read defining it.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct LiveSource {
+pub struct InputView {
     pub location: Location,
     pub trust: Trust,
+}
+
+/// The event that last recorded a state's check across calls, and whether it stands: no access,
+/// edit or merge came since.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CheckView {
+    pub event: EventId,
+    pub note: Option<String>,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StateView {
+    #[serde(flatten)]
+    pub head: Head,
+    pub scope: StateScope,
     pub status: InventoryStatus,
-    pub paths: Vec<Ref>,
+    /// A live input state's trust and defining read; a merged one's location is free for another.
+    #[serde(flatten)]
+    pub input: Option<InputView>,
+    /// Each path's reads and writes of it, by path.
+    pub accesses: Vec<AccessView>,
+    /// The flaws leaving it wrong.
+    pub flaws: Vec<FlawRef>,
+    /// The decided premises of those flaws.
+    pub premises: Vec<DecidedPremise>,
+    /// Its latest check across calls; none until one is recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckView>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -129,10 +213,17 @@ pub struct PremiseView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
     pub status: PremiseStatus,
-    /// Contradicting evidence came after its latest status.
+    /// A status its settle, or for a deployment premise the user, has yet to decide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<Proposal<PremiseStatus>>,
+    /// A proposal or contradicting evidence came after its status.
     pub disputed: bool,
     pub flaws: Vec<Ref>,
     pub paths: Vec<Ref>,
+    /// The premises it holds only if they do.
+    pub rests_on: Vec<PremiseRef>,
+    /// The premises holding only if it does.
+    pub rested_on_by: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -151,7 +242,12 @@ pub struct FlawView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwe: Option<u32>,
     pub status: FlawStatus,
+    /// A status its chain has yet to decide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<Proposal<FlawStatus>>,
     pub premises: Vec<PremiseRef>,
+    /// The states it leaves wrong.
+    pub states: Vec<Ref>,
     pub candidates: Vec<Chained>,
     /// Its report, as its group's root.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,7 +301,7 @@ pub struct TestView {
 pub struct ActionView {
     pub path: Ref,
     pub steps: Vec<Step>,
-    pub sources: Vec<SourceRef>,
+    pub states: Vec<AccessRef>,
     /// The premises its path relies on.
     pub premises: Vec<PremiseRef>,
 }
@@ -225,8 +321,14 @@ pub struct CandidateView {
     pub assessment: Option<AssessmentView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<VerdictView>,
+    /// An assessment its assess has yet to decide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_assessment: Option<Proposal<Scored>>,
+    /// A verdict its review has yet to decide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_verdict: Option<Proposal<Verdict>>,
     pub tests: Vec<TestView>,
-    /// The test its testing stands on: its latest that is not pending, recorded at its latest
+    /// The test its testing stands on: its latest that is not pending, recorded at its standing
     /// verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settling_test: Option<TestId>,
@@ -258,7 +360,7 @@ pub struct FindingView {
 pub enum NodeView {
     Component(ComponentView),
     Path(PathView),
-    Source(SourceView),
+    State(StateView),
     Premise(PremiseView),
     Flaw(FlawView),
     Candidate(CandidateView),
@@ -270,7 +372,7 @@ impl NodeView {
         match self {
             Self::Component(view) => &view.head,
             Self::Path(view) => &view.head,
-            Self::Source(view) => &view.head,
+            Self::State(view) => &view.head,
             Self::Premise(view) => &view.head,
             Self::Flaw(view) => &view.head,
             Self::Candidate(view) => &view.head,

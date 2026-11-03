@@ -379,6 +379,7 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     async fn completed_job() -> (tempfile::TempDir, JobManager, AgentId, JobId) {
         let (root, manager, owner) = crate::job::tests::runtime().await;
@@ -443,7 +444,7 @@ mod tests {
             if claim_first {
                 manager.test_claim(job).await.unwrap();
                 let stale = read.commit(Vec::new(), message).await;
-                assert!(matches!(stale, Err(JobError::Stale)), "{stale:?}");
+                assert_matches!(stale, Err(JobError::Stale));
             } else {
                 read.commit(Vec::new(), message).await.unwrap();
                 manager.test_claim(job).await.unwrap();
@@ -598,15 +599,17 @@ mod tests {
     /// A reader's capture of a result holds it from its owner before the reader
     /// records its read, so a restart in between leaves the superseded answer to
     /// the reader alone, whether a call's wait or a presentation captured it.
+    /// A reader whose finish landed before its capture holds nothing.
     #[tokio::test]
     async fn a_captured_result_is_held_before_its_read_is_recorded() {
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
         for present in [false, true] {
-            let (_root, manager, owner) = crate::job::tests::runtime().await;
             let (job, reader) = answered_child(&manager, &owner).await;
             let read = if present {
                 let options = output::OutputOptions::Model {
                     kind: ViewKind::Inspection,
                     reader: Some(reader),
+                    fit: output::Fit::Preview,
                 };
                 let args = output::OutputArgs::new(job);
                 let capabilities = CapabilitySet::default();
@@ -630,13 +633,6 @@ mod tests {
                 assert!(pending.messages().is_empty(), "{:?}", pending.messages());
             }
         }
-    }
-
-    /// A reader whose finish landed before its capture holds nothing: the
-    /// superseded answer stays its owner's.
-    #[tokio::test]
-    async fn a_finished_reader_holds_nothing() {
-        let (_root, manager, owner) = crate::job::tests::runtime().await;
         let (job, reader) = answered_child(&manager, &owner).await;
         manager.test_finish(reader, serde_json::Value::Null).await;
         manager.presenting(job, Some(reader), |_| ()).await.unwrap();
@@ -663,7 +659,7 @@ mod tests {
         let stale = read
             .commit(Vec::new(), notification(job, JobState::Completed))
             .await;
-        assert!(matches!(stale, Err(JobError::Stale)), "{stale:?}");
+        assert_matches!(stale, Err(JobError::Stale));
     }
 
     #[tokio::test]
@@ -694,5 +690,95 @@ mod tests {
         let message = notification(lease.id(), JobState::WaitingInput);
         receipt.commit(Vec::new(), message).await.unwrap();
         assert!(!manager.has_pending(&agent));
+    }
+
+    /// A read of a released answer that its job's completion withdraws before
+    /// the read commits is stale: the answer drops out, and the completion is
+    /// pending in its place.
+    #[tokio::test]
+    async fn a_completion_withdrawing_a_read_answer_stales_the_read() {
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
+        let (job, child) = running_child(&manager, &owner).await;
+        let text = "released-answer";
+        let answer = crate::provider::protocol::AssistantItem::text("answer", 0, text);
+        let answer = Message::Assistant(vec![answer]);
+        let commit = manager.commit_child_message(&child, job, answer, text.into(), |_| Vec::new());
+        commit.await.unwrap();
+        manager.notify_owner(job).await.unwrap();
+        let read = manager.pending_delivery(&owner).await.unwrap();
+        assert_eq!(read.messages().len(), 1);
+        manager.test_finish(job, serde_json::json!("result")).await;
+        let stale = read
+            .commit(Vec::new(), notification(job, JobState::Running))
+            .await;
+        assert_matches!(stale, Err(JobError::Stale));
+        let pending = manager.pending_delivery(&owner).await.unwrap();
+        assert!(pending.messages().is_empty(), "{:?}", pending.messages());
+        let delivered: Vec<_> = (pending.envelopes().iter())
+            .map(|envelope| (envelope.id, envelope.state))
+            .collect();
+        assert_eq!(delivered, [(job, JobState::Completed)]);
+    }
+
+    /// A running background agent job of `owner`, and its child.
+    async fn running_child(manager: &JobManager, owner: &AgentId) -> (JobId, AgentId) {
+        let spec = JobSpec {
+            background: true,
+            role: JobRole::Agent,
+            ..JobSpec::test(owner.clone(), "agent")
+        };
+        let job = manager.test_running(spec).await.into_test_id();
+        (job, manager.test_install(job).await)
+    }
+
+    /// Abandoning a read keeps its source message pending. Cancelling a started
+    /// commit still finishes it, stales a competing read of the same events, and a
+    /// later message with equal text is a new event.
+    #[tokio::test]
+    async fn cancelling_a_started_commit_finishes_acknowledgments_and_stales_a_competing_read() {
+        for with_completion in [true, false] {
+            let (_root, manager, owner) = crate::job::tests::runtime().await;
+            if with_completion {
+                let spec = JobSpec {
+                    background: true,
+                    ..JobSpec::test(owner.clone(), "test")
+                };
+                let completed = manager.test_create(spec).await;
+                manager
+                    .test_finish(completed, serde_json::json!("done"))
+                    .await;
+            }
+            let (job, child) = running_child(&manager, &owner).await;
+            let first = crate::job::tests::commit(&manager, &child, job, "progress").await;
+            drop(manager.pending_delivery(&owner).await.unwrap());
+            assert!(manager.has_pending(&owner));
+            let batch = manager.pending_delivery(&owner).await.unwrap();
+            let competing = manager.pending_delivery(&owner).await.unwrap();
+            let message = notification(job, JobState::Running);
+            {
+                let commit = batch.commit(Vec::new(), message.clone());
+                tokio::pin!(commit);
+                // Dropping the caller once its commit is queued models an interrupt just
+                // after this transaction's ownership boundary.
+                let _ = futures_util::poll!(commit.as_mut());
+            }
+            // A read of the same events, even without any terminal job, delivers
+            // nothing the interrupted caller's transaction delivered.
+            let stale = competing.commit(Vec::new(), message.clone()).await;
+            assert_matches!(stale, Err(JobError::Stale));
+            let records = manager.store().records();
+            let saved = records.iter().filter(|record| {
+                record.agent == owner
+                    && matches!(&record.event, SessionEvent::MessageCommitted { message: saved } if *saved == message)
+            });
+            assert_eq!(saved.count(), 1);
+            assert!(!manager.has_pending(&owner));
+            // Equal text is a new independent event when its source sequence differs.
+            let second = crate::job::tests::commit(&manager, &child, job, "progress").await;
+            assert_ne!(first, second);
+            let pending = manager.pending_delivery(&owner).await.unwrap();
+            assert_eq!(pending.messages().len(), 1);
+            assert!(pending.envelopes().is_empty());
+        }
     }
 }

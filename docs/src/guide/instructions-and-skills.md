@@ -106,6 +106,6 @@ await tool.write({
 
 An agent on the session host can omit `target`.
 
-A [mixed-file test workspace](https://github.com/kryesh/skyhook/tree/main/tests/fixtures/skill-workspace) includes its hidden
+A [mixed-file test workspace](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/tool/builtins/testdata/skill-workspace) includes its hidden
 `.agents/skills/mixed-assets/` directory. Its tests exercise native calls, explicit nulls,
 asset discovery, UTF-8 and binary files, image attachments, and path containment.

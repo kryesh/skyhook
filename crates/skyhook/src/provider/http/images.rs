@@ -59,7 +59,10 @@ mod tests {
     use crate::{
         media::FitError,
         provider::{
-            codec::common::tests::{LIMITS, image, request, tool_result},
+            codec::{
+                Codec, chat_completions,
+                common::tests::{LIMITS, image, request, tool_result},
+            },
             protocol::entries,
         },
     };
@@ -78,6 +81,13 @@ mod tests {
         request.context = entries(vec![result]);
         request.blobs.insert(png.blob, crate::tests::png_bytes(b""));
         let mut images = FittedImages::default();
+        // An image whose blob the request does not carry fails the request.
+        let unloaded = ModelRequest {
+            blobs: Default::default(),
+            ..request.clone()
+        };
+        let missing = images.refresh(&unloaded, LIMITS).await.unwrap_err();
+        assert_eq!(missing.kind(), ProviderErrorKind::InvalidRequest);
         // Whether the image is omitted as undecodable, once prepared.
         let omitted = |images: &FittedImages| {
             images.prepared().get(&png).map(|prepared| match prepared {
@@ -101,5 +111,11 @@ mod tests {
         request.context = referenced;
         images.refresh(&request, LIMITS).await.unwrap();
         assert_eq!(omitted(&images), Ok(true));
+        // An omitted image is sent as a note in its place rather than failing
+        // the request.
+        let chat = Codec::ChatCompletions(chat_completions::Dialect::compatible());
+        let encoded = chat.encode(&request, images.prepared(), &"c".parse().unwrap());
+        let body = serde_json::Value::Object(encoded.unwrap().body).to_string();
+        assert!(body.contains("not sent: image data is invalid"), "{body}");
     }
 }

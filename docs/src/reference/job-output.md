@@ -105,10 +105,16 @@ preview:
   when that does not fit, none. When even a single sample does not fit, strings get shorter, then
   deeper levels are left empty. Values holding complete fields keep the path to them.
 
-Fields a tool declares complete are never shortened and are not counted: skill instructions,
-child agent answers, and the job views `jobs` reads return. Errors and child questions sit
-outside `result` and are also complete, including those of tool responses a script returns. A
-response can therefore exceed the budget; it does not limit response size.
+Fields a tool declares complete are never shortened and are not counted: skill instructions and
+child agent answers. Errors and child questions sit outside `result` and are also complete,
+including those of tool responses a script returns. A response can therefore exceed the budget;
+it does not limit response size.
+
+A presentation is never shortened again: a `jobs` listing, or a `jobs` read's preview or page,
+reads the same however it is presented later. A script's `jobs` read holds the whole result
+instead, so wherever that view is presented again, returned from the script or read as the
+`jobs` call's own saved output, its result is previewed as a direct read of it would be, while
+the view's own fields stay whole.
 
 `presentation` precedes `result`. When arrays or objects were cut, `presentation.shape` describes
 the whole result: objects list each member's shape under its own name, and a member only some
@@ -129,7 +135,8 @@ its deepest levels to `"{…}"` and `[count, "…"]`.
 
 `kept` lists the index ranges shown, as `[[first, last], ...]`, when a complete field inside an
 array or object keeps an element beyond the leading ones; such records are always listed. Reading
-a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
+a cut array or object continues at its first value not shown: `start` is one-based, so without
+`kept` that is `shown + 1`, with `unit` `elements` or `members`. Finished jobs with incomplete captures
 include an `Output incomplete; captured fields remain readable with jobs({job, field}).` notice. These rules also apply after session resume and to
 completed remote jobs.
 
@@ -151,12 +158,18 @@ selected field, in that field's own unit:
 | Field | Selectors | Page |
 | --- | --- | --- |
 | Text: a string, a number, boolean or null, or a capture that is live or unfinished | `start`, `offset`, `limit`, `pattern`, `context` | `lines`, `total_lines`, `next_start`, `next_offset` |
-| A JSON object or array | `index`, `limit` | `elements` or `members`, `total_elements` or `total_members`, `next_index` |
-| A JSON object or array, queried | `query`, `index`, `limit` | `matches`, `total_matches`, `next_index` |
+| A JSON object or array | `start`, `unit`, `limit` | `elements` or `members`, `total_elements` or `total_members`, `next_start` |
+| A JSON object or array, filtered by `pattern` or `query` | `start`, `unit`, `limit`, and `pattern` or `query` | `matches`, `total_matches`, `next_start` |
 
-Using another unit's selectors is rejected with an error naming the field's kind; selectors that
-only restate their defaults (`start: 1`, `offset: 0`, `context: 0`, and `index: 0` without
-`query`) select nothing, so they are accepted with either kind of field. Job metadata is never truncated.
+`start` and `limit` page lines of text or values of JSON, and `pattern` filters either. `unit`
+names what `start` counts, as the page it continues names its values: `lines`, `elements`,
+`members` or `matches`. A `start` past 1 on JSON requires it, and any `unit` must match the field's
+pages: a capture read as lines while its job ran can be JSON once it finished, and a line position
+does not apply to it, so such a read is rejected and the field is read again from `start: 1`.
+`offset` and `context` apply only to text, and `query` only to JSON; using them with the other kind
+of field is rejected with an error naming the field's kind. Selectors that only restate their defaults
+(`start: 1`, `offset: 0`, `context: 0`) select nothing, so they are accepted with either kind of
+field. Job metadata is never truncated.
 
 ```js
 // Read part of a text field, search it, and continue a long line.
@@ -164,7 +177,9 @@ jobs({job:42, field:"/result/stdout", start:300, limit:80})
 jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 // Page a JSON array, then continue at the returned position.
-jobs({job:42, field:"/result/stdout/items", index:200, limit:50})
+jobs({job:42, field:"/result/stdout/items", start:201, unit:"elements", limit:50})
+// Keep the elements whose JSON mentions a name.
+jobs({job:42, field:"/result/stdout/items", pattern:"\"api-[0-9]+\""})
 // Select within JSON.
 jobs({job:42, field:"/result/stdout", query:"$.items[?@.status.phase == 'Failed'].metadata.name"})
 ```
@@ -204,22 +219,31 @@ the original job.
 
 ### JSON pages
 
-`index` is the zero-based first element or member (default 0). A page holds whole consecutive
-values in source order within 32 KiB, member names and text included, so it may return fewer than
-`limit`: continue at `next_index`, which is absent at the end. A first value that is not whole
-within the page is sampled as a preview is, within the page budget, with the page's `shape` and
-`truncated` records at that value's own pointers, for scripts and the model alike; select those
-pointers to read further into it. A member name longer than the page budget is still shown whole.
+`start` is the one-based first element or member (default 1), so element `/items/0` is `start: 1`;
+past 1, `unit` is `elements` or `members`, or `matches` on a page filtered by `pattern`.
+A page holds whole consecutive values in source order within 32 KiB, member names and text
+included, so it may return fewer than `limit`: continue at `next_start`, which is absent at the
+end. A first value that is not whole within the page is sampled as a preview is, within the page
+budget, with the page's `shape` and `truncated` records at that value's own pointers, for scripts
+and the model alike; select those pointers to read further into it. A member name longer than the page budget is still shown whole.
+
+`pattern` keeps the elements or members whose compact JSON text matches, with text's regex rules:
+a member's text is its name, a colon and its value, and strings appear JSON-escaped. The kept
+values are `{at, value}` matches like a query's, with `total_matches` counting all of them in the
+field; `start` and `next_start` are positions among the field's elements or members, so a search
+continues as a text search does. Like a query, a pattern reads the field into memory, up to 64 MiB
+of JSON text.
 
 ### Queries
 
 `query` is a JSONPath (RFC 9535) query over the selected JSON field: `$` is that field. Filters can
 use `length()`, `count()`, `value()`, and regular expressions with `match()` (the whole string) and
-`search()` (any part). Matches are `{at, value}` in document order, duplicates included, where `at`
-is the match's pointer in the saved output, ready to use as `field`. They page by `index` like
-elements, with `total_matches` counting all of them. Numeric comparisons use double precision.
-When nothing matches, the page carries the queried field's `shape`, which shows the member names
-a query can use.
+`search()` (any part), as in `$[?search(@.title, '[Ee]ncoder')]`. A query that does not parse is rejected with this filter form. Matches
+are `{at, value}` in document order, duplicates included, where `at` is the match's pointer in the
+saved output, ready to use as `field`. They page by `start` with `unit: "matches"`, counting matches from 1,
+with `total_matches` counting all of them. Numeric comparisons use double precision. When nothing
+matches, the page carries the filtered field's `shape`, which shows the member names a query or
+pattern can use.
 
 A query reads the selected field's JSON into memory, up to 64 MiB of JSON text; a larger field is
 rejected, so query a field within it. This limits a query's input, not its evaluation: once it

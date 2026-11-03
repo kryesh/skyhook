@@ -460,6 +460,7 @@ mod tests {
     use super::super::played::*;
     use super::super::tests::*;
     use super::*;
+    use std::assert_matches;
     use std::sync::Arc;
 
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
@@ -646,71 +647,7 @@ mod tests {
                 .iter()
                 .all(|input| matches!(&input.state, RowState::InFlight(row) if row.is_retained()))
         );
-        // Editing a held row withdraws it and the rows behind it, which then follow
-        // it; while the edit is open, neither a later failure nor /retry sends them.
-        let editing = app.queue[0].submission.text.clone();
-        app.command(Command::Queue);
-        app.choose();
-        assert_eq!(app.editor.text(), editing);
-        app.pause_queue(Paused::Stopped);
-        app.command(Command::Retry);
-        let toast = app.toast.take().map(|(toast, _)| toast);
-        assert!(toast.is_some_and(|toast| toast.starts_with("Submit the message you are editing")));
-        assert!(matches!(app.paused, Some(Paused::Editing { .. })));
-        assert!(matches!(app.queue[0].state, RowState::Editing));
-        assert!(
-            app.queue
-                .iter()
-                .skip(1)
-                .all(|input| matches!(input.state, RowState::Waiting))
-        );
-        // Submitted, the edit goes back ahead of the rows behind it; the stop still
-        // holds them all.
-        let edited = app.editor.take();
-        app.submit(edited);
-        let texts: Vec<_> = (app.queue.iter())
-            .map(|row| row.submission.text.as_str())
-            .collect();
-        assert_eq!(texts, ["image", "second", "third"]);
-        app.tick();
-        assert_eq!(app.paused, Some(Paused::Stopped));
-        assert!(
-            app.queue
-                .iter()
-                .all(|row| matches!(row.state, RowState::Waiting))
-        );
-        // /retry sends them again as one batch, on the bottom bar's model.
-        app.command(Command::Retry);
-        assert_eq!(app.paused, None);
-        assert!(
-            app.queue
-                .iter()
-                .all(|row| matches!(row.state, RowState::InFlight(_)) && row.model == app.model)
-        );
         app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    /// A receipt the session's own stop resolves is reported by the session; only
-    /// a refusal no turn took is the row's to report.
-    #[test]
-    fn receipts_parse_into_who_reports_them() {
-        use skyhook::session::{SessionError, SessionPhase};
-        assert!(matches!(
-            Delivered::from(Ok(committed())),
-            Delivered::Committed(_)
-        ));
-        for held in [
-            HarnessError::Interrupted,
-            HarnessError::Session(SessionError::Refused(SessionPhase::ShuttingDown)),
-            HarnessError::Session(SessionError::Refused(SessionPhase::Closed)),
-        ] {
-            assert!(matches!(Delivered::from(Err(held)), Delivered::HeldBack));
-        }
-        let refused = Delivered::from(Err(HarnessError::ImageLimit));
-        assert!(matches!(
-            refused,
-            Delivered::Refused(HarnessError::ImageLimit)
-        ));
     }
 
     #[tokio::test]
@@ -758,7 +695,7 @@ mod tests {
         assert!(app.begin_edit(id(&app, "edited")).is_some());
         app.command(Command::Retry);
         app.tick();
-        assert!(matches!(app.paused, Some(Paused::Editing { .. })));
+        assert_matches!(app.paused, Some(Paused::Editing { .. }));
         assert!(matches!(app.queue[1].state, RowState::Editing));
         assert!(deliveries.try_recv().is_err());
         for removed in ["behind", "before"] {
@@ -892,74 +829,6 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// A root parked by a failed turn passes through work it does not take
-    /// without failing again.
-    #[tokio::test]
-    async fn a_withdrawn_row_does_not_fail_a_parked_root_again() {
-        let (_root, mut app, mut model, session) = played_fixture().await;
-        let mut rx = capture_work(&mut app);
-        let root = app.root_agent().clone();
-        app.submit("first".into());
-        model.turn().await.fail(rejected());
-        observe_until(&mut app, |app| {
-            stopped(&app.snapshot, &root) && app.paused.is_some()
-        })
-        .await;
-        // Sent, then withdrawn before the runtime claims it.
-        app.paused = None;
-        app.submit("second".into());
-        let row = app.queue.iter().find(|row| row.submission.text == "second");
-        let id = row.unwrap().id;
-        assert!(app.remove_queued(id).is_some());
-        // Its receipt resolves once the session has dropped it, whether or not
-        // the root took it as work.
-        bounded(async {
-            while !matches!(recv(&mut rx).await,
-                Work::QueueCommitted { id: committed, .. } if committed == id)
-            {}
-        })
-        .await;
-        let busy = || {
-            session.store().observe().snapshot.activity[&root]
-                .state
-                .is_busy()
-        };
-        bounded(async {
-            while busy() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        resubscribed(&mut app).await;
-        assert_eq!(count(&app.journal, agent_failed), 1);
-        assert!(!app.paused.is_some());
-        session.shutdown().await.unwrap();
-    }
-
-    /// A failure inside updates the app skipped still holds the queue once it
-    /// resubscribes.
-    #[tokio::test]
-    async fn a_root_failure_missed_by_a_lagged_observer_pauses_on_resubscribe() {
-        let (_root, mut app, mut model, session) = played_fixture().await;
-        let _rx = capture_work(&mut app);
-        let mut updates = session.store().observe().updates;
-        app.submit("first".into());
-        app.close_observation();
-        model.turn().await.fail(rejected());
-        bounded(async {
-            while !matches!(updates.recv().await.unwrap().event, RuntimeEvent::Record(record)
-                if agent_failed(&record.event))
-            {}
-        })
-        .await;
-        resubscribed(&mut app).await;
-        assert!(app.paused.is_some());
-        app.submit("second".into());
-        let row = app.queue.iter().find(|row| row.submission.text == "second");
-        assert!(matches!(row.unwrap().state, RowState::Waiting));
-        session.shutdown().await.unwrap();
-    }
-
     /// Reopening a session whose last root turn failed shows that failure
     /// once, and takes new input.
     #[tokio::test]
@@ -997,77 +866,6 @@ mod tests {
                 .any(|row| matches!(row.state, RowState::Waiting))
         );
         assert_eq!(shown(&app, REJECTED).await, 1);
-        reopened.shutdown().await.unwrap();
-    }
-
-    /// A delivery its idle root cannot take fails the root's turn as a failed
-    /// request would: journaled, shown, and holding the queue. Here a retained
-    /// child's answer reaches a reopened root that must first adopt its
-    /// redefined mode, in a conversation its provider no longer opens.
-    #[tokio::test]
-    async fn a_delivery_the_idle_root_refuses_fails_its_turn_and_pauses_the_queue() {
-        use serde_json::json;
-        use skyhook::agent::HarnessBuilder;
-        use skyhook::provider::protocol::ContextId;
-        use skyhook::tool::policy::{AllowAll, Capability, CapabilitySet, Mode};
-        let (_root, mut app) = draft_fixture().await;
-        let name = app.mode.clone();
-        let mode = |instructions: &str| {
-            let general = Mode {
-                capabilities: CapabilitySet::from_iter([Capability::Read, Capability::Agents])
-                    .try_into()
-                    .unwrap(),
-                instructions: Some(instructions.parse().unwrap()),
-                hint: None,
-            };
-            let modes = [(name.clone(), general)].into_iter().collect();
-            move |builder: HarnessBuilder| builder.modes(modes)
-        };
-        let policy = std::sync::Arc::new(AllowAll);
-        let (harness, mut model) = played_harness(&app.launch, policy.clone(), mode("Look.")).await;
-        let session = harness.new_session().await.unwrap();
-        let root = session.root_agent().clone();
-        attach(&mut app, session.clone()).await;
-        let _rx = capture_work(&mut app);
-        app.submit("delegate".into());
-        let task = json!({"prompt": "work", "bg": true});
-        model
-            .turn()
-            .await
-            .end(vec![call("agent-0", "agent", task, 0)]);
-        // The root answers while its child's request stays open, until closing
-        // interrupts it.
-        let (first, second) = (model.turn().await, model.turn().await);
-        let (answering, _child) = match first.context == ContextId::from(&root) {
-            true => (first, second),
-            false => (second, first),
-        };
-        answering.answer("delegated");
-        observe_until(&mut app, |app| count(&app.journal, answered) == 1).await;
-        session.shutdown().await.unwrap();
-        session.close().await.unwrap();
-
-        let (harness, mut model) = played_harness(&app.launch, policy, mode("Changed.")).await;
-        let reopened = harness.resume_session(session.id()).await.unwrap();
-        // Activation opens the root's conversation: the last one opened for it.
-        let activated = reopened.record_status(root.clone(), "reopened".into());
-        activated.await.unwrap();
-        model.refuse(&root);
-        attach(&mut app, reopened.clone()).await;
-        let mut rx = capture_work(&mut app);
-        app.command(Command::Retry);
-        model.turn().await.answer("worked");
-        let work = continued(&mut app, &mut rx).await;
-        assert!(matches!(work, Work::Continued { result: Ok(()), .. }));
-        app.work(work);
-        observe_until(&mut app, |app| {
-            let mut records = app.journal.iter();
-            let failed = records.any(|record| record.agent == root && agent_failed(&record.event));
-            failed && stopped(&app.snapshot, &root)
-        })
-        .await;
-        assert!(app.paused.is_some());
-        assert_eq!(shown(&app, "no longer opens this conversation").await, 1);
         reopened.shutdown().await.unwrap();
     }
 

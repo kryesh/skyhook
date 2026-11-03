@@ -11,25 +11,25 @@ use serde_json::Value;
 use crate::json_schema::{Node, Resolver};
 use crate::provider::protocol::ToolDefinition as ProviderToolDefinition;
 
-use super::{JobViewResult, ResultSchema, ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
+use super::{ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
 
 static JOB_VIEW_TYPE: LazyLock<String> = LazyLock::new(|| {
-    let schema = &crate::job::JOB_VIEW_SCHEMAS.one;
+    let schema = &crate::job::JOB_VIEW_SCHEMAS.view;
     schema_type(schema, schema)
 });
 
+/// The schema keyword marking a type the prompt spells out in full, holding the name a result
+/// type gives it instead of expanding it. A mark, not a title, so that a host type sharing the
+/// name keeps its fields.
+pub(crate) const DOCUMENTED: &str = "x-skyhook-documented";
+
 /// Append the response type to `description` after `lead`, a JobView of the
 /// result type, unless the result is plain JSON.
-fn describe(description: &str, lead: &str, result: Option<&ResultSchema>) -> String {
-    let (rendered, definitions) = match result {
-        None => return description.to_owned(),
-        Some(ResultSchema::Json(schema)) => result_type(schema),
-        Some(ResultSchema::JobViews(JobViewResult::One)) => ("JobView".to_owned(), String::new()),
-        Some(ResultSchema::JobViews(JobViewResult::Listing)) => (
-            "{jobs: JobView[], older?: number}".to_owned(),
-            String::new(),
-        ),
+fn describe(description: &str, lead: &str, result: Option<&Value>) -> String {
+    let Some(schema) = result else {
+        return description.to_owned();
     };
+    let (rendered, definitions) = result_type(schema);
     if rendered == "JSON" {
         return description.to_owned();
     }
@@ -37,7 +37,14 @@ fn describe(description: &str, lead: &str, result: Option<&ResultSchema>) -> Str
 }
 
 impl ToolSurface {
-    pub fn definitions(&self) -> Vec<ProviderToolDefinition> {
+    /// The definitions a model sees, generated once per surface and shared.
+    pub fn definitions(&self) -> Vec<std::sync::Arc<ProviderToolDefinition>> {
+        (self.definitions)
+            .get_or_init(|| self.generate_definitions())
+            .clone()
+    }
+
+    fn generate_definitions(&self) -> Vec<std::sync::Arc<ProviderToolDefinition>> {
         self.tools
             .values()
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
@@ -50,11 +57,11 @@ impl ToolSurface {
                 } else {
                     description
                 };
-                ProviderToolDefinition {
+                std::sync::Arc::new(ProviderToolDefinition {
                     name: tool.name.clone(),
                     description,
                     input_schema: tool.input_schema.clone(),
-                }
+                })
             })
             .collect()
     }
@@ -165,7 +172,7 @@ impl ScriptManifest {
 }
 
 fn schema_type<'a>(field: &'a Value, root: &'a Value) -> String {
-    let renderer = Renderer::new(root, BTreeSet::new());
+    let renderer = Renderer::new(root, BTreeSet::new(), Documented::Expanded);
     let node = Node::root(root).child(field);
     let mut active = if std::ptr::eq(field, root) {
         vec![node]
@@ -180,7 +187,7 @@ fn schema_type<'a>(field: &'a Value, root: &'a Value) -> String {
 /// and those definitions' suffix.
 fn result_type(schema: &Value) -> (String, String) {
     let mut counts = BTreeMap::<&str, usize>::new();
-    count_references(schema, &mut counts);
+    count_references(schema, schema, &mut counts);
     let shared = counts
         .into_iter()
         .filter(|(reference, count)| {
@@ -192,7 +199,7 @@ fn result_type(schema: &Value) -> (String, String) {
         })
         .map(|(reference, _)| reference)
         .collect::<BTreeSet<_>>();
-    let renderer = Renderer::new(schema, shared);
+    let renderer = Renderer::new(schema, shared, Documented::Named);
     let root = Node::root(schema);
     let rendered = renderer.render(root, false, &mut vec![root]);
     let definitions = (renderer.shared.iter())
@@ -212,23 +219,41 @@ fn result_type(schema: &Value) -> (String, String) {
     }
 }
 
-fn count_references<'a>(value: &'a Value, counts: &mut BTreeMap<&'a str, usize>) {
+/// Count the references `value` renders, walking each definition it reaches once: a documented
+/// type renders by name, so what it references is left out.
+fn count_references<'a>(root: &'a Value, value: &'a Value, counts: &mut BTreeMap<&'a str, usize>) {
     match value {
-        Value::Object(object) => {
+        Value::Object(object) if documented(value).is_none() => {
             for (key, value) in object {
                 match (key.as_str(), value) {
+                    ("$defs", _) => {}
                     ("$ref", Value::String(reference)) => {
-                        *counts.entry(reference.as_str()).or_default() += 1;
+                        let target =
+                            (reference.strip_prefix('#')).and_then(|pointer| root.pointer(pointer));
+                        let Some(target) = target else { continue };
+                        if documented(target).is_some() {
+                            continue;
+                        }
+                        let count = counts.entry(reference.as_str()).or_default();
+                        *count += 1;
+                        if *count == 1 && reference != "#" {
+                            count_references(root, target, counts);
+                        }
                     }
-                    _ => count_references(value, counts),
+                    _ => count_references(root, value, counts),
                 }
             }
         }
         Value::Array(values) => values
             .iter()
-            .for_each(|value| count_references(value, counts)),
+            .for_each(|value| count_references(root, value, counts)),
         _ => {}
     }
+}
+
+/// The name `schema` is documented under, when it is marked [`DOCUMENTED`].
+fn documented(schema: &Value) -> Option<&str> {
+    schema.get(DOCUMENTED)?.as_str()
 }
 
 fn definition_name(definition: &Value, reference: &str) -> String {
@@ -246,23 +271,40 @@ struct Renderer<'a> {
     root: &'a Value,
     /// Root-resource references rendered by name and defined once after the type.
     shared: BTreeSet<&'a str>,
+    documented: Documented,
+}
+
+/// How a renderer shows a type marked [`DOCUMENTED`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Documented {
+    /// By its name, wherever it occurs: the prompt spells it out.
+    Named,
+    /// In full, as any other type.
+    Expanded,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(root: &'a Value, shared: BTreeSet<&'a str>) -> Self {
+    fn new(root: &'a Value, shared: BTreeSet<&'a str>, documented: Documented) -> Self {
         Self {
             resolver: Resolver::new(root),
             root,
             shared,
+            documented,
         }
     }
 
     /// `active` holds the referenced schemas being expanded, outermost first.
     fn render(&self, node: Node<'a>, array_item: bool, active: &mut Vec<Node<'a>>) -> String {
         let field = node.schema;
+        if let Some(name) = self.named(field) {
+            return name.to_owned();
+        }
         if let Some(reference) = field.get("$ref").and_then(Value::as_str)
             && let Some(target) = self.resolver.target(node)
         {
+            if let Some(name) = self.named(target.schema) {
+                return name.to_owned();
+            }
             // Recursive schemas (including capture pages containing JobView) need
             // a named back-reference, not unbounded expansion in the tool prompt.
             if (self.shared.contains(reference) && node.in_root_resource(self.root))
@@ -311,6 +353,13 @@ impl<'a> Renderer<'a> {
                 .join(" | ");
         }
         self.typed(node, field.get("type").and_then(Value::as_str), active)
+    }
+
+    /// The name `schema` renders by, when it is documented and named here.
+    fn named(&self, schema: &'a Value) -> Option<&'a str> {
+        (self.documented == Documented::Named)
+            .then(|| documented(schema))
+            .flatten()
     }
 
     /// Render `node` as one of its declared types.
@@ -403,10 +452,26 @@ mod tests {
             ],
             "$defs":{"Body":body, "Once":{"type":"integer"}}
         });
-        let result = ResultSchema::Json(schema);
+        let result = schema;
         assert_eq!(
             describe("Send.", " Returns", Some(&result)),
             "Send. Returns `JobView<{body:Body} | {body?:Body, once?:integer}>` where `Body = {text:string}`."
+        );
+        let listing = &crate::job::JOB_VIEW_SCHEMAS.listing;
+        assert_eq!(
+            describe("List.", " Returns", Some(listing)),
+            "List. Returns `JobView<{jobs:JobView[], older?:integer}>`.",
+            "a documented type renders by name, without what it references"
+        );
+        let host = json!({
+            "title":"JobView","type":"object",
+            "properties":{"job":{"$ref":"#/$defs/JobView"}},"required":["job"],
+            "$defs":{"JobView":{"type":"object","properties":{"rows":{"type":"integer"}}}}
+        });
+        assert_eq!(
+            describe("Count.", " Returns", Some(&host)),
+            "Count. Returns `JobView<{job:{rows?:integer}}>`.",
+            "a host type sharing the name keeps its fields"
         );
     }
 }

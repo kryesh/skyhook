@@ -38,10 +38,12 @@ pub enum Failure {
     Shutdown(Box<Self>, HarnessError),
 }
 
+/// Run the batch job, announcing its session id on `announce` before any input is read.
 pub async fn run(
     request: BatchRequest,
     input: InitialInput,
     host: ConfiguredHost,
+    announce: &mut impl Write,
 ) -> Result<(), BatchError> {
     let BatchRequest {
         execution: request,
@@ -71,10 +73,7 @@ pub async fn run(
 
     // This must be the first action after open, before reading a workflow/image or
     // contacting a provider. Flush explicitly so pipe consumers can follow events.
-    let announced = {
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{}", session.id()).and_then(|()| stdout.flush())
-    };
+    let announced = writeln!(announce, "{}", session.id()).and_then(|()| announce.flush());
     let outcome = if let Err(error) = announced {
         Err(OperationError::from(error).into())
     } else {
@@ -169,4 +168,168 @@ async fn run_input(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{
+        args::{Invocation, tests::parse_from},
+        interaction::tests::{test_config, two_models},
+    };
+    use skyhook::{config::Config, identity::SessionId, session::SessionStore};
+    use std::assert_matches;
+    use std::path::PathBuf;
+
+    /// A workspace whose `config.yaml` its batch jobs run with.
+    pub(crate) struct Workspace(tempfile::TempDir);
+
+    impl Workspace {
+        pub(crate) fn new(config: Config) -> Self {
+            let workspace = Self(tempfile::tempdir().unwrap());
+            workspace.configure(config);
+            workspace
+        }
+
+        pub(crate) fn path(&self, name: &str) -> PathBuf {
+            self.0.path().join(name)
+        }
+
+        fn configure(&self, config: Config) {
+            self.write("config.yaml", &config.to_yaml().unwrap());
+        }
+
+        pub(crate) fn write(&self, name: &str, text: &str) -> String {
+            let path = self.path(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path.to_str().unwrap().to_owned()
+        }
+
+        /// Run `batch` with `args`: its outcome and the session it announced.
+        pub(crate) async fn batch(
+            &self,
+            args: &[&str],
+        ) -> (Result<(), BatchError>, Option<SessionId>) {
+            let (root, config) = (self.path(""), self.path("config.yaml"));
+            let common = ["skyhook", "batch", "--workspace", root.to_str().unwrap()];
+            let config = ["--config", config.to_str().unwrap()];
+            let Ok(Invocation::Headless(request, input, args)) =
+                parse_from([&common[..], &config, args].concat())
+            else {
+                panic!("batch invocation");
+            };
+            let mut announced = Vec::new();
+            let result = async {
+                let host =
+                    launch::configure(&crate::Skyhook, args, &request.execution, true).await?;
+                run(request, input, host, &mut announced).await
+            }
+            .await;
+            let announced = String::from_utf8(announced).unwrap();
+            let id = (!announced.is_empty()).then(|| {
+                let id = announced.strip_suffix('\n').expect("the id ends its line");
+                id.parse().expect("only the session id is announced")
+            });
+            (result, id)
+        }
+
+        /// The session's journal, as JSON.
+        async fn journal(&self, id: SessionId) -> String {
+            let sessions = self.path(".skyhook/sessions");
+            let records = SessionStore::read_records(&sessions, id).await.unwrap();
+            serde_json::to_string(&records).unwrap()
+        }
+    }
+
+    /// A job journals its startup warnings, its model, its tools' work under `--approve-all`
+    /// and its status; an explicit model is remembered for the workspace, and a resume
+    /// appends to the same session.
+    #[tokio::test]
+    async fn a_batch_job_journals_its_run_and_a_resume_appends() {
+        let workspace = Workspace::new(two_models());
+        workspace.write(".skyhook/state.json", "invalid JSON");
+        let script = workspace.write(
+            "run.js",
+            "return (await tool.exec({command:['sh','-c','echo approved-output']})).unwrap();",
+        );
+        let args = [
+            "-m",
+            "test/second",
+            "--capabilities",
+            "exec",
+            "--approve-all",
+        ];
+        let (result, id) = workspace
+            .batch(&[&args[..], &["-s", &script]].concat())
+            .await;
+        result.unwrap();
+        let id = id.unwrap();
+        let journal = workspace.journal(id).await;
+        for expected in [
+            "Startup warning: Could not read UI state",
+            r#""profile":{"name":"test/second""#,
+            "approved-output",
+            "Completed",
+        ] {
+            assert!(journal.contains(expected), "{expected}: {journal}");
+        }
+        let (saved, _) = crate::state::load(&workspace.path(".skyhook/state.json"));
+        assert_eq!(saved.model, Some("test/second".parse().unwrap()));
+
+        let resumed = workspace.write("resumed.js", "return 'resumed-result';");
+        let (result, again) = workspace
+            .batch(&["--resume", &id.to_string(), "-s", &resumed])
+            .await;
+        result.unwrap();
+        assert_eq!(again, Some(id));
+        let appended = workspace.journal(id).await;
+        let before = journal.strip_suffix(']').unwrap();
+        assert!(appended.starts_with(before) && appended.contains("resumed-result"));
+    }
+
+    /// A job that cannot open announces nothing; one that fails, its input included, is
+    /// journaled as failed; a resumed session that never ran journals nothing; and a resumed
+    /// session whose model the configuration dropped points to `--model`.
+    #[tokio::test]
+    async fn failures_are_journaled_once_a_job_runs() {
+        let workspace = Workspace::new(two_models());
+        let missing = "00000000000000000000000000000001";
+        for args in [
+            &["-p", "x", "--mode", "missing"][..],
+            &["-p", "x", "--resume", missing],
+        ] {
+            let (result, id) = workspace.batch(args).await;
+            assert!(result.is_err() && id.is_none(), "{args:?}");
+        }
+        assert!(!workspace.path(".skyhook/sessions").exists());
+
+        let thrown = workspace.write("throw.js", "throw new Error('deliberate-failure');");
+        let (result, id) = workspace.batch(&["-m", "test/second", "-s", &thrown]).await;
+        assert_matches!(result, Err(BatchError::Failed(_)));
+        let id = id.unwrap();
+        let journal = workspace.journal(id).await;
+        assert!(journal.contains("Failed:") && journal.contains("deliberate-failure"));
+        let (result, image) = workspace
+            .batch(&["-p", "x", "--image", "missing.png"])
+            .await;
+        assert_matches!(result, Err(BatchError::Failed(_)));
+        assert!(workspace.journal(image.unwrap()).await.contains("Failed:"));
+
+        let (absent, id) = (workspace.path("absent.js"), id.to_string());
+        let (result, again) = workspace
+            .batch(&["--resume", &id, "-s", absent.to_str().unwrap()])
+            .await;
+        assert_eq!(again.map(|again| again.to_string()), Some(id.clone()));
+        assert!(result.unwrap_err().to_string().contains("No such file"));
+        assert_eq!(workspace.journal(id.parse().unwrap()).await, journal);
+
+        workspace.configure(test_config());
+        let (result, _) = workspace.batch(&["--resume", &id, "-s", &thrown]).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("unknown model `test/second`; resume with --model"),
+            "{error}"
+        );
+    }
 }

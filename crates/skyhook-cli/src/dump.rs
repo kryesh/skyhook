@@ -82,21 +82,21 @@ mod tests {
         tests::Configuring,
     };
 
-    /// The dump shows the configuration after the product's edit, through the shared
-    /// renderer, without a resolvable workspace, a session, or a provider.
+    /// The dump shows the configuration after the product's edit and the command line's
+    /// policy, through the shared renderer, without a resolvable workspace, a session, a
+    /// provider, a credential, an MCP server or a target's connection.
     #[tokio::test]
     async fn dump_config_applies_product_edits_without_starting_anything() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config.yaml");
-        let credential = format!(
-            "touch {}; printf key",
-            root.path().join("CREDENTIAL_RAN").display()
-        );
+        let ran = |name: &str| format!("touch {}", root.path().join(name).display());
+        let quoted = |command: String| serde_json::to_string(&command).unwrap();
         std::fs::write(
             &config,
             format!(
-                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n",
-                serde_json::to_string(&credential).unwrap()
+                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, {}]\ntargets:\n  remote:\n    type: ssh\n    host: remote.test\n    via: defined-later\n",
+                quoted(format!("{}; printf key", ran("CREDENTIAL_RAN"))),
+                quoted(ran("MCP_RAN")),
             ),
         )
         .unwrap();
@@ -108,6 +108,7 @@ mod tests {
             workspace.to_str().unwrap(),
             "--config",
             config.to_str().unwrap(),
+            "--approve-all",
         ])
         .unwrap() else {
             panic!("inspection")
@@ -125,14 +126,38 @@ mod tests {
         let dumped =
             skyhook::yaml::parse::<super::super::HostConfig>(std::str::from_utf8(&output).unwrap())
                 .unwrap();
-        assert!(!dumped.approve_all);
+        assert!(dumped.approve_all);
         assert_eq!(dumped.config.default_mode.as_str(), "inspect");
+        assert!(
+            std::str::from_utf8(&output)
+                .unwrap()
+                .contains("via: defined-later")
+        );
         assert!(!workspace.exists());
-        for path in ["CREDENTIAL_RAN", ".skyhook"] {
+        for path in ["CREDENTIAL_RAN", "MCP_RAN", ".skyhook"] {
             assert!(
                 !root.path().join(path).exists(),
                 "inspection created {path}"
             );
         }
+    }
+
+    /// A skill that cannot be read fails the dump, which still lists the others.
+    #[tokio::test]
+    async fn dump_skills_lists_the_readable_skills_and_fails_on_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join(".agents/skills");
+        for (name, text) in [
+            ("release", "---\ndescription: Release helper\n---\n"),
+            ("broken", "---\ndescription: [unterminated\n---\n"),
+        ] {
+            std::fs::create_dir_all(skills.join(name)).unwrap();
+            std::fs::write(skills.join(name).join("SKILL.md"), text).unwrap();
+        }
+        let request = Inspection::Skills(root.path().to_owned());
+        let mut output = Vec::new();
+        assert!(run(&crate::Skyhook, request, &mut output).await.is_err());
+        let listed = String::from_utf8(output).unwrap();
+        assert!(listed.contains("Release helper") && !listed.contains("broken"));
     }
 }

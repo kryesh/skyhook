@@ -495,43 +495,45 @@ mod tests {
         }
     }
 
+    /// At every width the columns fill it exactly, keep the identity's minimum beside
+    /// anything else, and only grow with it: a band gives statistics up before the
+    /// status, and a column, which has no status label, gives statistics up leftmost
+    /// first, so the time stays longest.
     #[test]
     fn agent_columns_hide_optional_fields_at_width_boundaries() {
-        for (width, identity, stats, status) in [
-            (0, 0, 0, 0),
-            (45, 45, 0, 0),
-            (46, 16, 0, 28),
-            (51, 21, 0, 28),
-            (52, 22, 0, 28),
-            (81, 51, 0, 28),
-            (91, 61, 0, 28),
-            (92, 16, 44, 28),
-        ] {
-            // The time column keeps room for an hour's counter.
-            let values = ["x".repeat(10), "x".repeat(10), "x".repeat(8), "4.2s".into()];
-            let columns = AgentColumns::fit(width, 16, AgentStatsColumns::new([&values]));
-            let actual = (
-                columns.identity_width,
-                columns.stats_width,
-                columns.status_width,
-            );
-            assert_eq!(actual, (identity, stats, status), "width {width}");
+        // The time column keeps room for an hour's counter.
+        let values = ["x".repeat(10), "x".repeat(10), "x".repeat(8), "4.2s".into()];
+        let stats = || AgentStatsColumns::new([&values]);
+        let reserved = |width: u16| if width > 0 { width + 2 } else { 0 };
+        let full = stats().width();
+        for plane in [TreePlane::Band, TreePlane::Column] {
+            let mut last = (0, 0);
+            for width in 0..=120 {
+                let columns = match plane {
+                    TreePlane::Band => AgentColumns::fit(width, 16, stats()),
+                    TreePlane::Column => AgentColumns::narrow(width, 16, stats()),
+                };
+                let (identity, stats, status) = (
+                    columns.identity_width,
+                    columns.stats_width,
+                    columns.status_width,
+                );
+                assert_eq!(identity + reserved(stats) + reserved(status), width);
+                if stats > 0 || status > 0 {
+                    assert!(identity >= 16, "width {width}");
+                }
+                match plane {
+                    TreePlane::Band => assert!(stats == 0 || status > 0, "width {width}"),
+                    TreePlane::Column => assert_eq!(status, 0),
+                }
+                assert!(stats >= last.0 && status >= last.1, "width {width}");
+                last = (stats, status);
+            }
+            assert_eq!(last.0, full, "the widest shows every statistic");
         }
-        // A column has no status label and gives statistics up leftmost first.
-        for (width, identity, stats) in [
-            (24, 24, 0),
-            (25, 16, 7),
-            (35, 26, 7),
-            (36, 16, 18),
-            (49, 16, 31),
-            (62, 16, 44),
-        ] {
-            let values = ["x".repeat(10), "x".repeat(10), "x".repeat(8), "4.2s".into()];
-            let columns = AgentColumns::narrow(width, 16, AgentStatsColumns::new([&values]));
-            let actual = (columns.identity_width, columns.stats_width);
-            assert_eq!(actual, (identity, stats), "column width {width}");
-            assert_eq!(columns.status_width, 0);
-        }
+        let narrow = AgentColumns::narrow(25, 16, stats());
+        assert!(narrow.stats_width > 0 && narrow.stats_width < full);
+        assert_eq!(narrow.stats.first, 3, "the time stays longest");
     }
 
     #[test]
@@ -607,19 +609,10 @@ mod tests {
                 shown.push((width, text.contains(&row.sent)));
             }
         }
-        // The bare request number leaves room for a header from 81 columns and for
-        // the sent time from 99.
-        assert_eq!(
-            shown,
-            [
-                (81, false),
-                (82, false),
-                (86, false),
-                (87, false),
-                (99, true),
-                (120, true)
-            ]
-        );
+        // A header fits on a wide enough row, and the sent time, giving way first, only
+        // on a wider one.
+        let sent = shown.iter().position(|(_, sent)| *sent).unwrap();
+        assert!(sent > 0 && shown[sent..].iter().all(|(_, sent)| *sent));
     }
 
     #[test]

@@ -143,9 +143,7 @@ mod tests {
             }
         }
         // A status in the body stands in for the missing HTTP one.
-        assert_eq!(
-            error(None, &json!({"error": {"code":429, "message":"slow down"}})).message,
-            "provider HTTP 429 error: slow down"
-        );
+        let error = error(None, &json!({"error": {"code":429, "message":"slow down"}}));
+        assert_eq!(error.kind(), RateLimited);
     }
 }

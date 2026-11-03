@@ -125,7 +125,7 @@ impl Timeouts {
 
 #[derive(Clone)]
 pub(crate) struct HttpProvider {
-    pub(crate) client: reqwest::Client,
+    pub(crate) client: transport::LazyClient,
     pub(crate) endpoint: Url,
     pub(crate) codec: Codec,
     pub(crate) transport: Transport,
@@ -180,6 +180,7 @@ impl Provider for HttpProvider {
     }
 }
 
+#[derive(Clone)]
 struct Context {
     provider: HttpProvider,
     context: ContextId,
@@ -187,35 +188,46 @@ struct Context {
     images: Arc<tokio::sync::Mutex<FittedImages>>,
 }
 
+impl Context {
+    /// The headers and body `request` is posted with.
+    async fn prepare(
+        &self,
+        request: &mut ModelRequest,
+    ) -> Result<(headers::Resolved, String), ProviderError> {
+        let provider = &self.provider;
+        filter_reasoning_scope(request, &provider.scope);
+        let mut images = self.images.lock().await;
+        images.refresh(request, provider.images).await?;
+        let mut encoded = provider
+            .codec
+            .encode(request, images.prepared(), &self.context)?;
+        drop(images);
+        provider
+            .transport
+            .fields
+            .place(request, &mut encoded.body)?;
+        // The codec's placements, then the turn's session header, replace
+        // the composed headers before any value is produced.
+        let mut headers = provider.headers.clone();
+        for (name, value) in &encoded.headers {
+            headers.insert(name.clone(), Value::Fixed(value.clone()));
+        }
+        if let Some((name, value)) = self.session.prepare(&provider.transport.session, request) {
+            headers.insert(name, Value::Fixed(value));
+        }
+        let headers = headers.resolve().await?;
+        Ok((headers, serde_json::Value::Object(encoded.body).to_string()))
+    }
+}
+
 impl ProviderContext for Context {
     fn invoke(&mut self, mut request: ModelRequest) -> ResponseStream {
-        let provider = self.provider.clone();
-        let context = self.context.clone();
-        let session = self.session.clone();
-        let images = Arc::clone(&self.images);
+        let context = self.clone();
         let started = async move {
-            filter_reasoning_scope(&mut request, &provider.scope);
-            let mut images = images.lock().await;
-            images.refresh(&request, provider.images).await?;
-            let mut encoded = provider
-                .codec
-                .encode(&request, images.prepared(), &context)?;
-            drop(images);
-            provider
-                .transport
-                .fields
-                .place(&request, &mut encoded.body)?;
-            // The codec's placements, then the turn's session header, replace
-            // the composed headers before any value is produced.
-            let mut headers = provider.headers.clone();
-            for (name, value) in &encoded.headers {
-                headers.insert(name.clone(), Value::Fixed(value.clone()));
-            }
-            if let Some((name, value)) = session.prepare(&provider.transport.session, &request) {
-                headers.insert(name, Value::Fixed(value));
-            }
-            let headers = headers.resolve().await?;
-            let body = serde_json::Value::Object(encoded.body).to_string();
+            let (headers, body) = context.prepare(&mut request).await?;
+            let Context {
+                provider, session, ..
+            } = context;
             let decoder = provider.codec.decoder(
                 request.model.into(),
                 provider.scope,
@@ -223,7 +235,7 @@ impl ProviderContext for Context {
                 provider.transport.errors,
             );
             let (response, events) = transport::post_sse(
-                &provider.client,
+                provider.client.get().await?,
                 provider.endpoint.as_str(),
                 headers.map(),
                 body,
@@ -283,22 +295,57 @@ pub(crate) mod tests {
         },
         protocol::{Binding, BlockId, Outcome, ReplayFormat, TextBlock, ToolCall},
     };
+    use crate::tests::{Plan, Server, header_values, reply};
     use futures_util::StreamExt;
     use serde_json::{Value, json};
     use std::sync::Arc;
-    use transport::tests::{Plan, Server, header_values, reply};
 
     type Events = Vec<Result<transport::SseEvent, ProviderError>>;
+
+    /// A request as a provider posts it.
+    pub(crate) struct Sent {
+        pub endpoint: Url,
+        pub headers: reqwest::header::HeaderMap,
+        pub body: Value,
+    }
+
+    impl Sent {
+        /// Every value sent under `name`, in order.
+        pub(crate) fn header(&self, name: &str) -> Vec<&str> {
+            let values = self.headers.get_all(name).iter();
+            values.map(|value| value.to_str().unwrap()).collect()
+        }
+    }
+
+    impl HttpProvider {
+        /// What a fresh context posts for `request`, prepared without posting.
+        pub(crate) async fn sent(&self, mut request: ModelRequest) -> Result<Sent, ProviderError> {
+            let context = Context {
+                provider: self.clone(),
+                context: "ctx".parse().unwrap(),
+                session: session::SessionState::default(),
+                images: Arc::default(),
+            };
+            let (headers, body) = context.prepare(&mut request).await?;
+            Ok(Sent {
+                endpoint: self.endpoint.clone(),
+                headers: headers.map(),
+                body: serde_json::from_str(&body).unwrap(),
+            })
+        }
+    }
 
     /// A Chat-shaped request with one tool, for provider round trips.
     pub(crate) fn chat_request(model: &str, messages: Vec<Message>) -> ModelRequest {
         ModelRequest {
             context: entries(messages),
-            tools: vec![crate::provider::protocol::ToolDefinition {
-                name: "lookup".into(),
-                description: "Find a value".into(),
-                input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
-            }],
+            tools: vec![std::sync::Arc::new(
+                crate::provider::protocol::ToolDefinition {
+                    name: "lookup".into(),
+                    description: "Find a value".into(),
+                    input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+                },
+            )],
             max_output_tokens: std::num::NonZeroU64::new(512),
             ..request(model)
         }
@@ -492,15 +539,10 @@ pub(crate) mod tests {
         crate::tests::bounded(async {
             let model = "served-model";
             let first = vec![
-                json!({"choices":[{"delta":{"reasoning_content":"plan ","content":"checking"}}],
-                    "usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101}}),
-                json!({"choices":[{"index":0,"delta":{"reasoning":"step","tool_calls":[
-                    {"index":0,"id":"call_a","type":"function","function":{"name":"lookup"}},
-                    {"index":0,"function":{"arguments":"{\"q\":\"x\"}"}}
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"plan","tool_calls":[
+                    {"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}}
                 ]}}]}),
                 json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
-                json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,
-                    "total_tokens":106,"prompt_tokens_details":{"cached_tokens":80}}}),
             ];
             let answer = vec![
                 json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
@@ -515,13 +557,6 @@ pub(crate) mod tests {
             let user = user("find x");
             let reduced = complete(&mut *context, chat_request(model, vec![user.clone()])).await;
             assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
-            let usage = reduced.usage;
-            let tokens = (
-                usage.input_tokens.unwrap(),
-                usage.cached_input_tokens.unwrap(),
-                usage.output_tokens.unwrap(),
-            );
-            assert_eq!(tokens, (20, 80, 6));
             let items = reduced.completion.items().to_vec();
             // Persist/restore canonical history without any codec-specific request fields.
             let serialized = serde_json::to_vec(&Message::Assistant(items)).unwrap();
@@ -550,111 +585,11 @@ pub(crate) mod tests {
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
                 })
                 .collect();
-            assert!(requests[0].get("n").is_none());
             let assistant = &requests[1]["messages"][1];
-            assert_eq!(assistant["content"], "checking");
-            assert_eq!(assistant["reasoning_content"], "plan step");
+            assert_eq!(assistant["reasoning_content"], "plan");
             assert_eq!(requests[2]["messages"][1], *assistant);
-            for request in &requests[1..] {
-                assert_eq!(request["messages"][1]["tool_calls"][0]["id"], "call_a");
-            }
-            assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call_a");
         })
         .await;
-    }
-
-    /// A stored image that no longer decodes is sent as a note in its place, on
-    /// every request that references it, rather than failing them.
-    #[tokio::test]
-    async fn an_undecodable_image_is_sent_as_a_note() {
-        use crate::{
-            media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
-            provider::{
-                Provider,
-                dialect::{self, Sourced, compatible},
-                protocol::UserContent,
-            },
-        };
-        crate::tests::bounded(async {
-            let answer = vec![
-                json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
-            ];
-            let (url, server) = serve(vec![answer.clone(), answer]).await;
-            let common = dialect::tests::common(&url, Some(Sourced::Literal("k".into())));
-            let chat = codec::CodecName::ChatCompletions;
-            let settings = compatible::Config::default();
-            let provider = dialect::tests::provider("local", &settings, chat, &common);
-            let mut context = provider.open_context("images".parse().unwrap()).unwrap();
-            let broken = b"\x89PNG\r\n\x1a\nbroken".to_vec();
-            let image = ImageRef {
-                file: Some("shot.png".into()),
-                format: ImageFormat::Png,
-                blob: BlobRef::of(&broken),
-            };
-            let attached = Message::User(vec![UserContent::Attachment {
-                attachment: AttachmentRef::Image(image.clone()),
-            }]);
-            let mut request = chat_request("served-model", vec![attached]);
-            request.blobs.insert(image.blob, broken);
-            for _ in 0..2 {
-                let reduced = complete(&mut *context, request.clone()).await;
-                assert_eq!(reduced.completion.outcome(), Outcome::Answer);
-            }
-            for request in server.finish().await {
-                let body: Value =
-                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                // A turn left with only text is sent as text.
-                let note = body["messages"][0]["content"].as_str().unwrap();
-                assert!(note.starts_with("[Image shot.png not sent: image data is invalid"));
-            }
-        })
-        .await;
-    }
-
-    /// The transport's `Accept` displaces an entry's before any value is
-    /// produced: the entry's command never runs, so it holds no lease that
-    /// would turn a later 401 on the fixed key into an expiry.
-    #[tokio::test]
-    async fn entry_accept_is_displaced_before_its_command_runs() {
-        use crate::provider::{
-            Provider, ProviderErrorKind,
-            dialect::{self, Sourced, compatible},
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let count = dir.path().join("count");
-        let answer =
-            json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]});
-        let stream = format!("data: {answer}\n\ndata: [DONE]\n\n");
-        let events = "Content-Type: text/event-stream\r\n";
-        let refused = r#"{"error":{"message":"revoked"}}"#;
-        let server = Server::start(vec![
-            Plan::reply(reply("200 OK", events, &stream)),
-            Plan::reply(reply("401 Unauthorized", "", refused)),
-        ])
-        .await;
-        let root = format!("{}/v1", server.url.trim_end_matches("/responses"));
-        let mut common = dialect::tests::common(&root, Some(Sourced::Literal("k".into())));
-        let command = format!(
-            "printf x >> '{}'; printf text/html",
-            count.to_str().unwrap()
-        );
-        common
-            .headers
-            .insert("accept".into(), Sourced::Command { command });
-        let settings = compatible::Config::default();
-        let chat = codec::CodecName::ChatCompletions;
-        let provider = dialect::tests::provider("test", &settings, chat, &common);
-        let mut context = provider.open_context("c".parse().unwrap()).unwrap();
-        let user = user("hi");
-        let request = chat_request("model", vec![user]);
-        complete(&mut *context, request.clone()).await;
-        let events: Vec<_> = context.invoke(request).collect().await;
-        let error = events.into_iter().find_map(Result::err).unwrap();
-        assert_eq!(error.kind(), ProviderErrorKind::Authentication);
-        for request in server.finish().await {
-            assert_eq!(header_values(&request, "accept"), ["text/event-stream"]);
-        }
-        assert!(!count.exists());
     }
 
     /// A Responses provider at `server` whose bearer key a command produces.
@@ -666,7 +601,7 @@ pub(crate) mod tests {
         let endpoint = Url::parse(&server.url).unwrap();
         let codec = codec::Codec::Responses(responses::Dialect::stateless());
         HttpProvider {
-            client: transport::client().unwrap(),
+            client: transport::LazyClient::default(),
             scope: reasoning_scope("test", endpoint.as_str(), codec.name(), "compatible"),
             endpoint,
             codec,

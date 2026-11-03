@@ -320,7 +320,9 @@ impl DialectConfig for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
+    use crate::provider::dialect::tests::head;
+    use crate::provider::dialect::tests::replay_scope;
+    use std::assert_matches;
 
     const CODECS: [CodecName; 3] = [
         CodecName::ChatCompletions,
@@ -331,13 +333,7 @@ mod tests {
     #[test]
     fn replay_identity_tracks_routing_not_cache_lifetime() {
         for codec in CODECS {
-            let scope = |yaml| {
-                crate::yaml::parse::<Config>(yaml)
-                    .unwrap()
-                    .admit(codec)
-                    .unwrap()
-                    .scope
-            };
+            let scope = |yaml| replay_scope::<Config>(yaml, codec);
             assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
             let routed = scope("routing: {order: [first], fallback_models: [backup]}");
             for other in [
@@ -389,69 +385,6 @@ mod tests {
         assert!(serde_json::from_value::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
     }
 
-    /// Chat marks the system prompt and each earlier request's prefix end within the
-    /// strictest upstream cap, so an upstream that reads only at marked boundaries
-    /// reuses the previous request's cache; the oldest seams give way first.
-    #[tokio::test]
-    async fn chat_keeps_earlier_prefix_ends_within_the_breakpoint_budget() {
-        use crate::provider::{
-            codec::{Cache, common, common::tests::user},
-            protocol::{AssistantItem, Message, SystemSegment, entries},
-        };
-        let mut codec = Config::default()
-            .admit(CodecName::ChatCompletions)
-            .unwrap()
-            .codec;
-        *codec.cache_mut().unwrap() = Cache::Explicit;
-        let mut request = super::super::tests::request();
-        request.system = vec![SystemSegment {
-            text: "stable".into(),
-            cache: true,
-        }];
-        let marked = |request: &crate::provider::protocol::ModelRequest| -> Vec<bool> {
-            let context = "session".parse().unwrap();
-            let body = codec
-                .encode(request, Default::default(), &context)
-                .unwrap()
-                .body;
-            let messages = body["messages"].as_array().unwrap();
-            messages
-                .iter()
-                .map(|message| message.to_string().contains("cache_control"))
-                .collect()
-        };
-        assert_eq!(marked(&request), [true, true]);
-        let exchange = |request: &mut crate::provider::protocol::ModelRequest, turn| {
-            let answer = AssistantItem::text("a", 0, "answer");
-            (request.context).extend(entries([Message::Assistant(vec![answer]), user(turn)]));
-        };
-        exchange(&mut request, "two");
-        assert_eq!(marked(&request), [true, true, false, true]);
-        exchange(&mut request, "three");
-        exchange(&mut request, "four");
-        // The system prompt and the three newest prefix ends fill the budget.
-        assert_eq!(
-            marked(&request),
-            [true, false, false, true, false, true, false, true]
-        );
-        // A history without text adds no breakpoint of its own, so a system prompt
-        // filling the budget still fits.
-        request.system = vec![request.system[0].clone(); 4];
-        request.context = entries([Message::User(vec![
-            crate::provider::protocol::UserContent::Attachment {
-                attachment: crate::media::AttachmentRef::Image(common::tests::image()),
-            },
-        ])]);
-        let images = common::tests::loaded(&mut request).await;
-        let context = "session".parse().unwrap();
-        let body = codec
-            .encode(&request, images.prepared(), &context)
-            .unwrap()
-            .body;
-        let markers = serde_json::Value::Object(body).to_string();
-        assert_eq!(markers.matches("cache_control").count(), 4);
-    }
-
     /// Every codec's body carries the preferences and fallbacks; a response
     /// schema forces parameter support, with or without routing.
     #[tokio::test]
@@ -480,39 +413,42 @@ mod tests {
         let placed: super::super::Placements =
             crate::yaml::parse("cache_key: {body: provider.sort}").unwrap();
         let codec = placed.apply(profile.codec).unwrap();
-        assert!(matches!(
+        assert_matches!(
             super::super::placements::check(&codec, &profile.transport.fields),
             Err(super::super::PlacementError::Reserved { .. })
-        ));
-        crate::tests::bounded(async {
-            for codec in CODECS {
-                let (_, body) = sent(&routed, codec, "k", request()).await;
-                assert_eq!(
-                    body["provider"],
-                    json!({"order":["a"], "only":["a","b/turbo"], "ignore":["c"], "allow_fallbacks":false}),
-                    "{codec}"
-                );
-                assert_eq!(body["models"], json!(["x/y"]), "{codec}");
-                let (_, body) = sent(&routed, codec, "k", constrained.clone()).await;
-                assert_eq!(body["provider"]["require_parameters"], true, "{codec}");
-                assert_eq!(body["provider"]["only"], json!(["a","b/turbo"]), "{codec}");
-                let (_, body) = sent(&Config::default(), codec, "k", constrained.clone()).await;
-                assert_eq!(body["provider"], json!({"require_parameters":true}), "{codec}");
-                assert!(body.get("models").is_none());
-                let (_, body) = sent(&Config::default(), codec, "k", request()).await;
-                assert!(body.get("provider").is_none());
-            }
-        })
-        .await;
+        );
+        for codec in CODECS {
+            let body = sent(&routed, codec, "k", request()).await.body;
+            assert_eq!(
+                body["provider"],
+                json!({"order":["a"], "only":["a","b/turbo"], "ignore":["c"], "allow_fallbacks":false}),
+                "{codec}"
+            );
+            assert_eq!(body["models"], json!(["x/y"]), "{codec}");
+            let body = sent(&routed, codec, "k", constrained.clone()).await.body;
+            assert_eq!(body["provider"]["require_parameters"], true, "{codec}");
+            assert_eq!(body["provider"]["only"], json!(["a", "b/turbo"]), "{codec}");
+            let body = sent(&Config::default(), codec, "k", constrained.clone())
+                .await
+                .body;
+            assert_eq!(
+                body["provider"],
+                json!({"require_parameters":true}),
+                "{codec}"
+            );
+            assert!(body.get("models").is_none());
+            let body = sent(&Config::default(), codec, "k", request()).await.body;
+            assert!(body.get("provider").is_none());
+        }
     }
 
     #[tokio::test]
     async fn key_session_and_attribution_ride_every_request() {
         let head = head(&Config::default(), CodecName::ChatCompletions, "sk-or").await;
-        assert_eq!(header_values(&head, "authorization"), ["Bearer sk-or"]);
-        assert_eq!(header_values(&head, "x-session-id"), ["ctx"]);
-        assert_eq!(header_values(&head, "x-openrouter-title"), ["Skyhook"]);
-        assert_eq!(header_values(&head, "http-referer").len(), 1);
+        assert_eq!(head.header("authorization"), ["Bearer sk-or"]);
+        assert_eq!(head.header("x-session-id"), ["ctx"]);
+        assert_eq!(head.header("x-openrouter-title"), ["Skyhook"]);
+        assert_eq!(head.header("http-referer").len(), 1);
     }
 
     /// Each codec carries the canonical type in its own place, over HTTP and

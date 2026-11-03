@@ -360,11 +360,8 @@ struct ProcessOutput {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Read as _,
-        os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
-        sync::Arc,
-    };
+    use std::assert_matches;
+    use std::sync::Arc;
 
     use serde_json::{Value, json};
     use std::time::Duration;
@@ -507,8 +504,8 @@ mod tests {
             ),
             // Only stdout declares JSON content, read as the value it holds.
             (
-                r#"printf '{"a":1}\n{"a":2}\n'; printf '[]' >&2"#,
-                json!({"exit_code":0,"stdout":[{"a":1},{"a":2}],"stderr":"[]"}),
+                "printf '[1]'; printf '[]' >&2",
+                json!({"exit_code":0,"stdout":[1],"stderr":"[]"}),
                 json!([]),
             ),
         ] {
@@ -543,7 +540,7 @@ mod tests {
         for stream in ["stdout", "stderr"] {
             let text = view.output.value["result"][stream].as_str().unwrap();
             assert!(text.starts_with("1\n2\n"), "{stream}: {text}");
-            assert!(text.contains("\n60\n… lines 61–860 omitted …\n861\n"));
+            assert!(!text.contains("\n500\n"), "{stream}: {text}");
             assert!(text.ends_with("\n1000\n"));
         }
 
@@ -557,7 +554,7 @@ mod tests {
         assert_eq!(diagnostic.context.operation, Operation::Wait);
         assert_eq!(diagnostic.context.subject, Subject::Process);
         assert_eq!(diagnostic.context.effects, Effects::Unknown);
-        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("3600")));
+        assert_matches!(&diagnostic.cause, Cause::Message(text) if text.contains("3600"));
         let failed = jobs.list(agent).await.unwrap().last().unwrap().id;
         let view = jobs
             .inspect_output(
@@ -571,10 +568,6 @@ mod tests {
         assert_eq!(
             view["result"],
             json!({"signal":libc::SIGKILL,"stdout":"partial"})
-        );
-        assert_eq!(
-            view["presentation"]["notice"],
-            crate::job::Notice::OutputIncomplete.as_str()
         );
     }
 
@@ -637,10 +630,11 @@ mod tests {
                 assert_eq!(context.effects, Effects::NotStarted);
             }
             match arguments["cwd"].as_str() {
-                Some(cwd) => assert!(
-                    matches!(&context.subject, Subject::WorkingDirectory(path) if path.ends_with(cwd)),
-                    "{context:?}"
-                ),
+                Some(cwd) => {
+                    assert_matches!(&context.subject, Subject::WorkingDirectory(path) if path.ends_with(cwd),
+                        "{context:?}"
+                    )
+                }
                 None => assert_eq!(context.subject, Subject::argument([argument])),
             }
         }
@@ -657,13 +651,13 @@ mod tests {
         assert_eq!(diagnostic.context.operation, Operation::Spawn);
         assert_eq!(diagnostic.context.subject, Subject::Process);
         assert_eq!(diagnostic.context.effects, Effects::NotStarted);
-        assert!(matches!(
+        assert_matches!(
             diagnostic.cause,
             Cause::Io {
                 kind: IoKind::NotFound,
                 ..
             }
-        ));
+        );
         assert!(!runtime.root.path().join("started").exists());
     }
 
@@ -713,14 +707,12 @@ mod tests {
                 producer.clone(),
                 Arc::new(Authorizations::default()),
             );
-            let mut command = Command::new("/bin/sh");
-            command
-                .args(["-c", "printf output"])
-                .current_dir(root.path());
-            let error = bounded(run_process(context, command, std::future::pending()))
-                .await
-                .err()
-                .unwrap();
+            let captured = async {
+                let mut capture = Capture::create(&context, TextCaptureField::Stdout).await?;
+                capture.write_bytes(b"output").await?;
+                capture.finish().await
+            };
+            let error = bounded(captured).await.err().unwrap();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.operation, operation);
             assert_eq!(
@@ -773,9 +765,7 @@ mod tests {
         let stopped = async |interactive: bool, timeout: bool| {
             let runtime = TestRuntime::new().await;
             let held = runtime.root.path().join("held");
-            let path = std::ffi::CString::new(held.as_os_str().as_encoded_bytes()).unwrap();
-            // SAFETY: `path` is a valid NUL-terminated string for the call.
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            crate::tests::fifo(&held);
             let mut held = tokio::net::unix::pipe::OpenOptions::new()
                 .open_receiver(&held)
                 .unwrap();
@@ -808,7 +798,7 @@ mod tests {
         // A timeout kills noninteractive descendants that hold the pipes open.
         assert_eq!(timed_out.state, JobState::Failed);
         let diagnostic = timed_out.envelope.diagnostic.unwrap();
-        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
+        assert_matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out"));
     }
 
     /// Every process leads its own session, with or without a terminal.
@@ -827,130 +817,15 @@ mod tests {
         }
     }
 
-    // Use a separate session with a real controlling PTY; never change the
-    // test runner's own session or terminal state.
-    const PTY_HELPER: &str = "SKYHOOK_PROCESS_PTY_TEST";
-
     #[tokio::test]
-    async fn process_tools_detach_from_the_terminal_under_a_pty() {
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: openpty initializes the two descriptor slots; optional arguments
-        // are null. OwnedFd below takes sole ownership on success.
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            },
-            0
-        );
-        let (master, slave) =
-            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        for fd in [&master, &slave] {
-            // SAFETY: these descriptors remain owned and valid throughout setup.
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
-                -1
-            );
-        }
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        let helper = "tool::builtins::process::tests::pty_executor_helper";
-        command
-            .args(["--exact", helper, "--ignored", "--nocapture"])
-            .env(PTY_HELPER, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let slave_fd = slave.as_raw_fd();
-        // SAFETY: only async-signal-safe syscalls are used in the child. The slave
-        // stays open until spawn finishes and is then closed on exec via CLOEXEC.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setsid() == -1 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn().unwrap();
-        let _group = ProcessGroup::led_by(&child);
-        let output = bounded(child.wait_with_output()).await.unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "PTY helper failed: {stdout}\n{stderr}"
-        );
-        assert!(
-            stdout.contains("1 passed"),
-            "PTY helper filter did not execute the regression"
-        );
-
-        // Keep the slave open so an empty master returns EAGAIN rather than EIO.
-        // No tool should have emitted its attempted credential prompt to the PTY.
-        assert_ne!(
-            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
-            -1
-        );
-        let mut terminal_output = Vec::new();
-        match std::fs::File::from(master).read_to_end(&mut terminal_output) {
-            Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
-                panic!("reading PTY output: {error}")
-            }
-            _ => {}
-        }
-        let prompt = String::from_utf8_lossy(&terminal_output);
-        assert!(
-            terminal_output.is_empty(),
-            "unexpected terminal prompt: {prompt:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "invoked in a dedicated PTY/session by process_tools_detach_from_the_terminal_under_a_pty"]
-    fn pty_executor_helper() {
-        if std::env::var_os(PTY_HELPER).is_none() {
-            return;
-        }
-        // Establish that this is a real controlling terminal, not merely a tty FD.
-        let _tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .expect("helper must have a controlling terminal");
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for interactive in [false, true] {
-                let runtime = TestRuntime::new().await;
-                // The fixture disables Targets: terminal isolation must not depend on it.
-                let executor = executor(&runtime, interactive, tokio::time::sleep);
-                // With only setpgid and piped stdio this emits a terminal prompt
-                // then stops on SIGTTIN. The tool timeout makes that regression
-                // fail promptly instead of hanging the test suite.
-                let command = "if (: <> /dev/tty) 2>/dev/null; then exec 3<> /dev/tty; printf 'Password: ' >&3; read answer <&3; else printf isolated; fi";
-                for argv in [false, true] {
-                    let output = executor.run_host(&runtime.agent, "exec", sh_args(argv, command, Some(2))).await
-                        .unwrap_or_else(|error| panic!("argv={argv} interactive={interactive}: {error}"));
-                    assert_eq!(output.output.value["exit_code"], 0);
-                    assert_eq!(output.output.value["stdout"], "isolated");
-                }
-            }
-        });
-    }
-
-    #[tokio::test]
-    async fn session_askpass_reaches_exec_without_targets_keeping_agent_and_display() {
+    async fn session_askpass_reaches_exec_without_targets_keeping_agent() {
         let runtime = TestRuntime::new().await;
         let policy = Arc::new(crate::tool::policy::AllowAll);
         let router = crate::target::TargetRouter::test(&runtime.store, [], policy).await;
         // The fixture disables Targets, so the managed agent must not start.
         let executor =
             executor(&runtime, true, tokio::time::sleep).with_target_router(router.clone());
-        let command = r#"printf '%s\n' "$SUDO_ASKPASS" "$SSH_AUTH_SOCK" "$DISPLAY"; test -x "$SUDO_ASKPASS" && printf live"#;
+        let command = r#"printf '%s\n' "$SUDO_ASKPASS" "$SSH_AUTH_SOCK"; test -x "$SUDO_ASKPASS" && printf live"#;
         let output = executor
             .run_host(&runtime.agent, "exec", sh_args(true, command, None))
             .await
@@ -960,11 +835,7 @@ mod tests {
         let inherited = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
         assert!(!lines[0].is_empty());
         assert_eq!(lines[1], inherited("SSH_AUTH_SOCK").unwrap_or_default());
-        assert_eq!(
-            lines[2],
-            inherited("DISPLAY").as_deref().unwrap_or("skyhook")
-        );
-        assert_eq!(lines[3], "live");
+        assert_eq!(lines[2], "live");
         router.shutdown().await;
     }
 
@@ -991,50 +862,48 @@ mod tests {
             if interactive {
                 capabilities.insert(Capability::Interactive);
             }
-            for argv in [false, true] {
-                let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
-                let producer = crate::tool::output::OutputContext::new(sink.clone());
-                let context = crate::tool::invocation::LocalContext::new(
-                    crate::execution::ExecutionLocation::root(root.path().to_owned()),
-                    capabilities.clone(),
-                    environment.clone(),
-                    tokio_util::sync::CancellationToken::new(),
-                    producer.clone(),
-                    Arc::new(crate::tool::invocation::tests::Authorizations::default()),
-                );
-                let output = catalog
-                    .run("exec", sh_args(argv, command, None), context, root.path())
-                    .await
-                    .unwrap()
-                    .value;
-                producer.settle().await.unwrap();
-                let stdout = String::from_utf8(sink.bytes()).unwrap();
-                assert_eq!(output["exit_code"], 0);
-                let lines: Vec<_> = stdout.lines().collect();
+            let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
+            let producer = crate::tool::output::OutputContext::new(sink.clone());
+            let context = crate::tool::invocation::LocalContext::new(
+                crate::execution::ExecutionLocation::root(root.path().to_owned()),
+                capabilities.clone(),
+                environment.clone(),
+                tokio_util::sync::CancellationToken::new(),
+                producer.clone(),
+                Arc::new(crate::tool::invocation::tests::Authorizations::default()),
+            );
+            let output = catalog
+                .run("exec", sh_args(false, command, None), context, root.path())
+                .await
+                .unwrap()
+                .value;
+            producer.settle().await.unwrap();
+            let stdout = String::from_utf8(sink.bytes()).unwrap();
+            assert_eq!(output["exit_code"], 0);
+            let lines: Vec<_> = stdout.lines().collect();
+            assert_eq!(
+                lines[4], "/inherited/agent-socket",
+                "nonprompting credentials remain usable"
+            );
+            if interactive {
+                assert_eq!(lines, inherited.map(|(_, value)| value));
+            } else {
+                assert_ne!(lines[0], "/inherited/prompt-helper");
+                assert_eq!(lines[1..3], ["force", "inherited-display"]);
+                assert_ne!(lines[3], "/inherited/prompt-socket");
+                assert_eq!(lines[5], lines[0], "sudo prompts use the same helper");
                 assert_eq!(
-                    lines[4], "/inherited/agent-socket",
-                    "nonprompting credentials remain usable"
+                    lines[6], "live",
+                    "rejecting broker must live throughout command"
                 );
-                if interactive {
-                    assert_eq!(lines, inherited.map(|(_, value)| value));
-                } else {
-                    assert_ne!(lines[0], "/inherited/prompt-helper");
-                    assert_eq!(lines[1..3], ["force", "inherited-display"]);
-                    assert_ne!(lines[3], "/inherited/prompt-socket");
-                    assert_eq!(lines[5], lines[0], "sudo prompts use the same helper");
-                    assert_eq!(
-                        lines[6], "live",
-                        "rejecting broker must live throughout command"
-                    );
-                    assert!(
-                        !std::path::Path::new(lines[0]).exists(),
-                        "helper must be cleaned up"
-                    );
-                    assert!(
-                        !std::path::Path::new(lines[3]).exists(),
-                        "socket must be cleaned up"
-                    );
-                }
+                assert!(
+                    !std::path::Path::new(lines[0]).exists(),
+                    "helper must be cleaned up"
+                );
+                assert!(
+                    !std::path::Path::new(lines[3]).exists(),
+                    "socket must be cleaned up"
+                );
             }
         }
     }

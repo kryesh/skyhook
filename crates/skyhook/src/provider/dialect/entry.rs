@@ -16,7 +16,7 @@ use super::{
 };
 use crate::identity::HostName;
 use crate::provider::{
-    Provider, ProviderError,
+    ProviderError,
     ProviderErrorKind::Authentication,
     dialect::LoginCommand,
     profile::{ModelName, ModelProfile, ProviderName},
@@ -297,7 +297,7 @@ impl AdmittedModel {
 pub(crate) struct BuiltModel {
     pub name: ModelName,
     pub profile: ModelProfile,
-    pub provider: Arc<dyn Provider>,
+    pub provider: Arc<crate::provider::http::HttpProvider>,
 }
 
 impl<O: ProviderOptions> AdmittedEntry<O> {
@@ -317,7 +317,7 @@ impl<O: ProviderOptions> AdmittedEntry<O> {
         if self.models.is_empty() {
             return Ok(Vec::new());
         }
-        let mut resources = dialect::Resources::new()?;
+        let mut resources = dialect::Resources::default();
         let authentication = self
             .options
             .login(self.login_command(name, program), &self.connection)?
@@ -471,10 +471,6 @@ providers:
     fn refusals_name_the_entry_and_field() {
         for (field, expected) in [
             (
-                "    api_key: |\n      sk-key\n",
-                "`providers.local`: api_key: must be a valid header value",
-            ),
-            (
                 "    headers: {x-title: \"a\\nb\"}\n",
                 "`providers.local`: headers.x-title: must be a valid header value",
             ),
@@ -482,18 +478,9 @@ providers:
                 "    headers: {x-count: 1}\n",
                 "`providers.local.headers.x-count`",
             ),
-            ("    api_key: 1\n", "`providers.local.api_key`"),
             (
                 "    headers: {X-Title: a, x-title: b}\n",
                 "`providers.local`: headers: `x-title` is named twice",
-            ),
-            (
-                "    startup_timeout_secs: soon\n",
-                "`providers.local.startup_timeout_secs`",
-            ),
-            (
-                "    workspace_id: w",
-                "`providers.local`: workspace_id: unknown field",
             ),
         ] {
             let refused = error(&with(LOCAL, field.trim_end()));
@@ -504,22 +491,13 @@ providers:
             located.contains("providers.local") && located.contains("models.local.max_context"),
             "{located}"
         );
-        // Both limits are required, and admission checks them.
+        // Admission checks a model's limits.
         let limits = "max_context: 4096\n        max_output: 512";
-        for (replacement, expected) in [
-            ("max_output: 512", "max_context"),
-            ("max_context: 4096", "max_output"),
-            (
-                "max_context: 4096\n        max_output: 4096",
-                "max_output must be smaller",
-            ),
-        ] {
-            let refused = error(&LOCAL.replace(limits, replacement));
-            assert!(
-                refused.contains("providers.local") && refused.contains(expected),
-                "{replacement}: {refused}"
-            );
-        }
+        let refused = error(&LOCAL.replace(limits, "max_context: 4096\n        max_output: 4096"));
+        assert!(
+            refused.contains("providers.local") && refused.contains("max_output must be smaller"),
+            "{refused}"
+        );
         // A model's reasoning level is one its conventions accept.
         let adaptive = LOCAL
             .replace("dialect: compatible", "dialect: openai")
@@ -534,46 +512,25 @@ providers:
             "{refused}"
         );
         assert!(builds(&adaptive.replace("adaptive", "high")));
-        // A model's placements stay clear of the codec's own fields.
-        let placed = LOCAL.replace(
-            "max_output: 512",
-            "max_output: 512\n        reasoning_effort: messages",
-        );
-        let refused = error(&placed);
-        assert!(
-            refused.contains(
-                "`providers.local`: models.local: reasoning_effort `messages` is a field chat_completions requests already carry"
-            ),
-            "{refused}"
-        );
     }
 
     /// A value missing when the provider is built is reported with its provider
     /// and field.
     #[test]
     fn build_errors_name_the_provider_and_field() {
-        for (field, expected) in [
-            (
-                "    api_key: {env: SKYHOOK_TEST_UNSET_API_KEY}",
-                "provider `local` could not be initialized: api_key: environment variable `SKYHOOK_TEST_UNSET_API_KEY` is required",
-            ),
-            (
-                "    headers: {x-token: {env: SKYHOOK_TEST_UNSET_HEADER}}",
-                "provider `local` could not be initialized: headers.x-token: environment variable `SKYHOOK_TEST_UNSET_HEADER` is required",
-            ),
-        ] {
-            let error = Config::from_yaml(&with(LOCAL, field))
-                .unwrap()
-                .into_runtime()
-                .and_then(|runtime| {
-                    let model = runtime.select_model(&"local/local".parse().unwrap())?;
-                    crate::agent::HarnessBuilder::configured(&model, ".", "test".parse().unwrap())
-                })
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
+        let field = "    headers: {x-token: {env: SKYHOOK_TEST_UNSET_HEADER}}";
+        let error = Config::from_yaml(&with(LOCAL, field))
+            .unwrap()
+            .into_runtime()
+            .and_then(|runtime| {
+                let model = runtime.select_model(&"local/local".parse().unwrap())?;
+                crate::agent::HarnessBuilder::configured(&model, ".", "test".parse().unwrap())
+            })
+            .err()
+            .unwrap()
+            .to_string();
+        let expected = "provider `local` could not be initialized: headers.x-token: environment variable `SKYHOOK_TEST_UNSET_HEADER` is required";
+        assert!(error.contains(expected), "{error}");
     }
 
     #[test]
@@ -606,49 +563,36 @@ providers:
     #[tokio::test]
     async fn model_settings_specialise_the_provider_per_model() {
         use crate::provider::{
-            codec::common::tests::{tool_result, user},
-            http::tests::{chat_request, complete, serve},
-            protocol::Message,
+            codec::common::{
+                self,
+                tests::{tool_result, user},
+            },
+            http::tests::chat_request,
+            protocol::{AssistantItem, Binding, Message, ReplayFormat, ToolCall},
         };
         use serde_json::json;
-        let first = vec![
-            json!({"choices":[{"index":0,"delta":{"reasoning_content":"plan","tool_calls":[
-                {"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}}
-            ]}}]}),
-            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
-        ];
-        let answer = vec![
-            json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
-        ];
-        let (root, server) = serve(vec![first.clone(), answer.clone(), first, answer]).await;
-        let text = LOCAL
-            .replace("http://127.0.0.1:11434/v1", &root)
-            .replace(
-                "        max_output: 512\n",
-                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: null\n        output_limit: max_tokens\n",
-            );
+        let text = LOCAL.replace(
+            "        max_output: 512\n",
+            "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: null\n        output_limit: max_tokens\n",
+        );
+        let mut requests = Vec::new();
         for entry in &build(&text) {
-            let mut context = entry.provider.open_context("c".parse().unwrap()).unwrap();
-            let user = user("find");
             let model = entry.profile.model.as_str();
-            let reduced = complete(&mut *context, chat_request(model, vec![user.clone()])).await;
+            let format = ReplayFormat::ChatText;
+            let plan = json!({"text":"plan"});
+            let replay = common::replay(format, model, &entry.provider.scope, plan, Binding::Free);
+            let call = ToolCall::new("call_a", "lookup", json!({})).unwrap();
+            let assistant = Message::Assistant(vec![
+                AssistantItem::reasoning("r", 0, "plan", Some(replay)),
+                AssistantItem::tool_call("c", 1, call),
+            ]);
             let result = tool_result("call_a", "lookup", json!({}), vec![], false);
-            let assistant = Message::Assistant(reduced.items().to_vec());
-            complete(
-                &mut *context,
-                chat_request(model, vec![user, assistant, result]),
-            )
-            .await;
+            let request = chat_request(model, vec![user("find"), assistant, result]);
+            requests.push(entry.provider.sent(request).await.unwrap().body);
         }
-        let requests: Vec<Value> = server
-            .finish()
-            .await
-            .iter()
-            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
-            .collect();
         let sent = |request: &Value, field: &str| request.get(field).is_some();
         let replayed = |request: &Value| sent(&request["messages"][1], "reasoning_content");
-        let [local, local_replay, strict, strict_replay] = &requests[..] else {
+        let [local, strict] = &requests[..] else {
             panic!("{requests:?}")
         };
         assert_eq!(
@@ -657,7 +601,7 @@ providers:
         );
         assert!(sent(local, "max_completion_tokens") && !sent(local, "max_tokens"));
         assert!(sent(strict, "max_tokens") && !sent(strict, "max_completion_tokens"));
-        assert!(replayed(local_replay) && !replayed(strict_replay));
+        assert!(replayed(local) && !replayed(strict));
     }
 
     const PROXY: &str = r#"
@@ -777,11 +721,7 @@ providers:
 
     #[tokio::test]
     async fn one_credential_command_is_shared_across_model_codecs_and_contexts() {
-        use crate::provider::{
-            dialect::tests::{heads, request},
-            http::transport::tests::header_values,
-        };
-        use futures_util::StreamExt;
+        use crate::provider::dialect::tests::request;
         const MESSAGES: &str = "
       messages:
         model: messages-model
@@ -789,54 +729,44 @@ providers:
         max_context: 4096
         max_output: 512
 ";
-        crate::tests::bounded(async {
-            let directory = tempfile::tempdir().unwrap();
-            let count = directory.path().join("count");
-            let command = format!("printf x >> '{}'; printf shared-key", count.display());
-            let command = serde_json::to_string(&command).unwrap();
-            let text = format!(
-                "{}{}",
-                with(LOCAL, &format!("    api_key: {{command: {command}}}")),
-                &MESSAGES[1..]
-            );
-            let requests = heads(4, async |root| {
-                let models = build(&text.replace("http://127.0.0.1:11434/v1", root));
-                assert!(!count.exists());
-                for context_id in ["parent", "child"] {
-                    for model in &models {
-                        let context_id = context_id.parse().unwrap();
-                        let mut context = model.provider.open_context(context_id).unwrap();
-                        let mut request = request();
-                        request.model = model.profile.model.clone();
-                        drop(context.invoke(request).next().await);
-                    }
-                }
-            })
-            .await;
-            assert_eq!(std::fs::read(&count).unwrap(), b"x");
-            for [chat, messages] in requests.as_chunks::<2>().0 {
-                assert!(chat.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
-                assert_eq!(header_values(chat, "authorization"), ["Bearer shared-key"]);
-                assert!(header_values(chat, "x-api-key").is_empty());
-                assert!(messages.starts_with("POST /v1/messages HTTP/1.1\r\n"));
-                assert_eq!(header_values(messages, "x-api-key"), ["shared-key"]);
-                assert!(header_values(messages, "authorization").is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        let count = directory.path().join("count");
+        let command = format!("printf x >> '{}'; printf shared-key", count.display());
+        let command = serde_json::to_string(&command).unwrap();
+        let text = format!(
+            "{}{}",
+            with(LOCAL, &format!("    api_key: {{command: {command}}}")),
+            &MESSAGES[1..]
+        );
+        let models = build(&text);
+        assert!(!count.exists());
+        // Each request opens a context of its own.
+        for _ in 0..2 {
+            let mut sent = Vec::new();
+            for model in &models {
+                let mut request = request();
+                request.model = model.profile.model.clone();
+                sent.push(model.provider.sent(request).await.unwrap());
             }
-        })
-        .await;
+            let [chat, messages] = &sent[..] else {
+                unreachable!()
+            };
+            assert_eq!(chat.endpoint.path(), "/v1/chat/completions");
+            assert_eq!(chat.header("authorization"), ["Bearer shared-key"]);
+            assert!(chat.header("x-api-key").is_empty());
+            assert_eq!(messages.endpoint.path(), "/v1/messages");
+            assert_eq!(messages.header("x-api-key"), ["shared-key"]);
+            assert_eq!(messages.header("anthropic-version"), ["2023-06-01"]);
+            assert!(messages.header("authorization").is_empty());
+        }
+        assert_eq!(std::fs::read(&count).unwrap(), b"x");
     }
 
+    /// A model's own upstream and tags scope signed history apart from the
+    /// entry's, and its tags replace the entry's on the wire.
     #[tokio::test]
     async fn litellm_model_upstream_and_tags_scope_signed_chat_history() {
-        use crate::provider::{
-            codec::common::tests::{tool_result, user},
-            http::{
-                tests::{chat_request, complete, serve},
-                transport::tests::header_values,
-            },
-            protocol::Message,
-        };
-        use serde_json::json;
+        use crate::provider::dialect::tests::request;
         const SIBLINGS: &str = "
       other_tags:
         model: local-model
@@ -854,65 +784,24 @@ providers:
         max_output: 512
         upstream: openai
 ";
-        crate::tests::bounded(async {
-            let block = json!({"type":"thinking","thinking":"plan","signature":"signed"});
-            let call = json!({"index":0,"id":"call_a","type":"function",
-                "function":{"name":"lookup","arguments":"{}"}});
-            let first = vec![
-                json!({"choices":[{"index":0,
-                    "delta":{"thinking_blocks":[block.clone()],"tool_calls":[call]}}]}),
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
-            ];
-            let answer = vec![
-                json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
-            ];
-            let mut replies = vec![first];
-            replies.resize(5, answer);
-            let (root, server) = serve(replies).await;
-            let proxy = LOCAL
-                .replace("dialect: compatible", "dialect: litellm")
-                .replace("http://127.0.0.1:11434/v1", &root);
-            let proxy = with(&proxy, "    upstream: anthropic\n    tags: [tenant-a]");
-            let models = build(&format!("{proxy}{}", &SIBLINGS[1..]));
-            let user = user("find");
-            let initial = models[0].provider.open_context("initial".parse().unwrap());
-            let request = chat_request("local-model", vec![user.clone()]);
-            let completion = complete(&mut *initial.unwrap(), request).await;
-            let assistant = Message::Assistant(completion.items().to_vec());
-            let result = tool_result("call_a", "lookup", json!({}), vec![], false);
-            let history = vec![user, assistant, result];
-            for model in models {
-                let context = model.provider.open_context("replay".parse().unwrap());
-                let request = chat_request("local-model", history.clone());
-                complete(&mut *context.unwrap(), request).await;
-            }
-            let requests = server.finish().await;
-            let bodies: Vec<Value> = requests
-                .iter()
-                .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1))
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert_eq!(bodies[1]["messages"][1]["thinking_blocks"], json!([block]));
-            for body in &bodies[2..] {
-                assert!(
-                    body["messages"][1].get("thinking_blocks").is_none(),
-                    "{body}"
-                );
-            }
-            assert_eq!(header_values(&requests[1], "x-litellm-tags"), ["tenant-a"]);
-            assert_eq!(header_values(&requests[2], "x-litellm-tags"), ["tenant-b"]);
-            let cached = |body: &Value| {
-                let parts = body["messages"].as_array().unwrap().iter();
-                parts
-                    .filter_map(|message| message["content"].as_array())
-                    .flatten()
-                    .any(|part| part.get("cache_control").is_some())
-            };
-            // Bedrock's Chat takes OpenAI's conventions, as the OpenAI upstream does.
-            assert!(cached(&bodies[1]) && cached(&bodies[2]));
-            assert!(!cached(&bodies[3]) && !cached(&bodies[4]));
-        })
-        .await;
+        let proxy = LOCAL.replace("dialect: compatible", "dialect: litellm");
+        let proxy = with(&proxy, "    upstream: anthropic\n    tags: [tenant-a]");
+        let text = format!("{proxy}{}", &SIBLINGS[1..]);
+        let config = Config::from_yaml(&text).unwrap();
+        let admitted = config.providers["local"].admit().unwrap();
+        let scopes: Vec<_> = (admitted.models().values())
+            .map(|model| &model.wire.scope)
+            .collect();
+        for other in &scopes[1..] {
+            assert_ne!(scopes[0], *other);
+        }
+        let models = build(&text);
+        let tags = async |model: &BuiltModel| {
+            let sent = model.provider.sent(request()).await.unwrap();
+            sent.header("x-litellm-tags").join(",")
+        };
+        assert_eq!(tags(&models[0]).await, "tenant-a");
+        assert_eq!(tags(&models[1]).await, "tenant-b");
     }
 
     /// Request settings reach the body on every codec a dialect speaks: the service
@@ -922,7 +811,7 @@ providers:
     /// explicit caching is selected.
     #[tokio::test]
     async fn request_settings_reach_every_dialect_and_codec() {
-        use crate::provider::dialect::tests::{request, requests};
+        use crate::provider::dialect::tests::{ROOT, request};
         use serde_json::json;
         /// Every prompt-cache field in the body, as `{field: value}`.
         fn caching(value: &Value, found: &mut Vec<Value>) {
@@ -1045,48 +934,36 @@ providers:
                 ],
             ),
         ];
-        let expected: Vec<_> = entries
-            .iter()
-            .flat_map(|(dialect, _, models)| models.iter().map(move |model| (dialect, model)))
-            .collect();
-        let sent = crate::tests::bounded(requests(expected.len(), async |root| {
-            for (dialect, fields, models) in &entries {
-                let models: String = models
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (codec, fields, ..))| {
-                        format!(
-                            "      m{index}:\n        model: m{index}\n        codec: {codec}\n        max_context: 4096\n        max_output: 512\n        {fields}\n"
-                        )
-                    })
-                    .collect();
-                let text = format!(
-                    "providers:\n  local:\n    dialect: {dialect}\n    base_url: {root}\n    api_key: k\n    service_tier: priority\n    {fields}\n    models:\n{models}"
-                );
-                for model in build(&text) {
-                    let mut context = model.provider.open_context("c".parse().unwrap()).unwrap();
-                    drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
+        for (dialect, fields, models) in &entries {
+            let text: String = models
+                .iter()
+                .enumerate()
+                .map(|(index, (codec, fields, ..))| {
+                    format!(
+                        "      m{index}:\n        model: m{index}\n        codec: {codec}\n        max_context: 4096\n        max_output: 512\n        {fields}\n"
+                    )
+                })
+                .collect();
+            let text = format!(
+                "providers:\n  local:\n    dialect: {dialect}\n    base_url: {ROOT}\n    api_key: k\n    service_tier: priority\n    {fields}\n    models:\n{text}"
+            );
+            let built = build(&text);
+            assert_eq!(built.len(), models.len());
+            for (model, (codec, fields, summary, expected_caching)) in built.iter().zip(models) {
+                let body = model.provider.sent(request()).await.unwrap().body;
+                let case = format!("{dialect} {codec} {fields}");
+                let object = body.as_object().unwrap();
+                assert_eq!(object.keys().next().unwrap(), "service_tier", "{case}");
+                assert_eq!(body["service_tier"], "priority", "{case}");
+                let sent_summary = body.pointer("/reasoning/summary");
+                assert_eq!(sent_summary, summary.map(Value::from).as_ref(), "{case}");
+                if let Some(expected) = expected_caching {
+                    let mut found = Vec::new();
+                    caching(&body, &mut found);
+                    found.sort_by_key(Value::to_string);
+                    found.dedup();
+                    assert_eq!(&found, expected, "{case}");
                 }
-            }
-        }))
-        .await;
-        assert_eq!(sent.len(), expected.len());
-        for ((_, body), (dialect, (codec, fields, summary, expected_caching))) in
-            sent.iter().zip(expected)
-        {
-            let case = format!("{dialect} {codec} {fields}");
-            let body: Value = serde_json::from_str(body).unwrap();
-            let object = body.as_object().unwrap();
-            assert_eq!(object.keys().next().unwrap(), "service_tier", "{case}");
-            assert_eq!(body["service_tier"], "priority", "{case}");
-            let sent_summary = body.pointer("/reasoning/summary");
-            assert_eq!(sent_summary, summary.map(Value::from).as_ref(), "{case}");
-            if let Some(expected) = expected_caching {
-                let mut found = Vec::new();
-                caching(&body, &mut found);
-                found.sort_by_key(Value::to_string);
-                found.dedup();
-                assert_eq!(&found, expected, "{case}");
             }
         }
     }

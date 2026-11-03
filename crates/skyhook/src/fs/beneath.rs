@@ -13,10 +13,10 @@ use super::{
 
 /// A directory handle usable only as a lookup base, so opening one needs search
 /// permission rather than read permission.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const SEARCH_ONLY: libc::c_int = libc::O_PATH;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-const SEARCH_ONLY: libc::c_int = 0;
+const SEARCH_ONLY: libc::c_int = cfg_select! {
+    any(target_os = "linux", target_os = "android") => libc::O_PATH,
+    _ => 0,
+};
 
 /// Why a file confined below a directory could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -408,38 +408,36 @@ fn rename_at(directory: &fs::File, from: &OsStr, to: &OsStr, mode: Rename) -> io
     let invalid = |_| io::Error::from(io::ErrorKind::InvalidInput);
     let (from, to) = (c_name(from).map_err(invalid)?, c_name(to).map_err(invalid)?);
     let at = directory.as_raw_fd();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: both names are NUL-terminated and the descriptor is open for the call.
-    let renamed = unsafe {
-        libc::renameat2(
-            at,
-            from.as_ptr(),
-            at,
-            to.as_ptr(),
-            match mode {
-                Rename::NoReplace => libc::RENAME_NOREPLACE,
-                Rename::Exchange => libc::RENAME_EXCHANGE,
-            },
-        )
-    };
-    #[cfg(target_vendor = "apple")]
-    // SAFETY: both names are NUL-terminated and the descriptor is open for the call.
-    let renamed = unsafe {
-        libc::renameatx_np(
-            at,
-            from.as_ptr(),
-            at,
-            to.as_ptr(),
-            match mode {
-                Rename::NoReplace => libc::RENAME_EXCL,
-                Rename::Exchange => libc::RENAME_SWAP,
-            },
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    let renamed = {
-        let _ = (at, &from, &to, mode);
-        return Err(io::ErrorKind::Unsupported.into());
+    let renamed = cfg_select! {
+        any(target_os = "linux", target_os = "android") => unsafe {
+            libc::renameat2(
+                at,
+                from.as_ptr(),
+                at,
+                to.as_ptr(),
+                match mode {
+                    Rename::NoReplace => libc::RENAME_NOREPLACE,
+                    Rename::Exchange => libc::RENAME_EXCHANGE,
+                },
+            )
+        },
+        target_vendor = "apple" => unsafe {
+            libc::renameatx_np(
+                at,
+                from.as_ptr(),
+                at,
+                to.as_ptr(),
+                match mode {
+                    Rename::NoReplace => libc::RENAME_EXCL,
+                    Rename::Exchange => libc::RENAME_SWAP,
+                },
+            )
+        },
+        _ => {{
+            let _ = (at, &from, &to, mode);
+            return Err(io::ErrorKind::Unsupported.into());
+        }}
     };
     match renamed {
         0 => Ok(()),

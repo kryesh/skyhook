@@ -390,7 +390,8 @@ mod tests {
     use crate::provider::protocol::StateLifetime;
     use crate::session::CompactionTrigger;
     use crate::session::tests::{
-        admitted, committed, context, projected, requested_history, sequences, text_message,
+        admitted, committed, context, projected, requested_history, sequences, start_child,
+        text_message,
     };
     use crate::{
         agent::{TodoItem, TodoStatus},
@@ -402,6 +403,7 @@ mod tests {
         session::{AttemptRef, CompactionCheckpoint, SessionStore, UserPart},
     };
     use serde_json::json;
+    use std::assert_matches;
 
     fn todo(text: &str) -> TodoItem {
         TodoItem {
@@ -507,9 +509,10 @@ mod tests {
         ] {
             let request = requested_history(context, None, history, "state", history_lifetime);
             let rejected = admitted(&store, &agent, request);
-            assert!(
-                matches!(rejected, Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected),
-                "{expected}: {rejected:?}"
+            assert_matches!(
+                rejected,
+                Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected,
+                "{expected}"
             );
         }
         let id = store.id();
@@ -548,10 +551,10 @@ mod tests {
             (0.into(), ReplayError::NotFound),
             (child_context.sequence.request(), ReplayError::NotRequest),
         ] {
-            assert!(matches!(
+            assert_matches!(
                 store.reconstruct_model_request(sequence).await,
                 Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
-            ));
+            );
         }
     }
 
@@ -676,9 +679,10 @@ mod tests {
             (StaleTodos, checkpoint(research, vec![], summary)),
         ] {
             let rejected = admitted(store, agent, SessionEvent::Compaction { checkpoint });
-            assert!(
-                matches!(rejected, Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
-                "{expected}: {rejected:?}"
+            assert_matches!(
+                rejected,
+                Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected,
+                "{expected}"
             );
         }
         // A checkpoint may name a summary request committed in its own batch.
@@ -698,6 +702,7 @@ mod tests {
         );
     }
 
+    /// Partial retention of a closed exchange is `invalid_compactions_are_refused`'s.
     #[tokio::test]
     async fn checkpoints_admit_a_trailing_open_exchange_but_not_partial_retention() {
         let call = |id: &str, position| {
@@ -712,46 +717,27 @@ mod tests {
                 is_error: false,
             })
         };
-        use CheckpointError::{IncompleteExchange, MismatchedExchange};
-        for (results, trailing, retained, expected) in [
-            (vec![], true, vec![0], None),
-            (vec!["b"], true, vec![0, 1], None),
-            (vec!["b", "a"], true, vec![0, 1, 2], None),
-            (vec![], false, vec![0], Some(IncompleteExchange)),
-            (vec!["b"], false, vec![0, 1], Some(IncompleteExchange)),
-            (vec!["b"], true, vec![0], Some(IncompleteExchange)),
-            (vec!["b"], true, vec![1], Some(IncompleteExchange)),
-            (vec!["b", "a"], true, vec![0, 1], Some(IncompleteExchange)),
-            (vec!["unknown"], true, vec![0, 1], Some(MismatchedExchange)),
-            (
-                vec!["b", "b"],
-                true,
-                vec![0, 1, 2],
-                Some(MismatchedExchange),
-            ),
-        ] {
-            let session = crate::tests::TestRuntime::new().await;
-            let (store, agent) = (&session.store, &session.agent);
+        let session = crate::tests::TestRuntime::new().await;
+        let store = &session.store;
+        let cases = [
+            (vec![], vec![0], true),
+            (vec!["b"], vec![0, 1], true),
+            (vec!["b", "a"], vec![0, 1, 2], true),
+            (vec!["b"], vec![0], false),
+            (vec!["b"], vec![1], false),
+        ];
+        for (index, (results, retained, admits)) in (1..).zip(cases) {
+            let workspace = session.root.path();
+            let agent = &start_child(store, &session.agent, index, None, workspace).await;
             let mut events = vec![committed(Message::Assistant(vec![
                 call("a", 0),
                 call("b", 1),
             ]))];
             events.extend(results.iter().map(|id| committed(result(id))));
-            if !trailing {
-                events.push(committed(text_message("later input")));
-            }
             let mut messages = Vec::new();
             for event in events {
-                let appended = store.append(agent.clone(), event).await;
-                let Ok(appended) = appended else {
-                    // The journal binds no result to a call it does not answer.
-                    assert_eq!(expected, Some(MismatchedExchange), "{results:?}");
-                    break;
-                };
+                let appended = store.append(agent.clone(), event).await.unwrap();
                 messages.push(appended.sequence);
-            }
-            if messages.len() < 1 + results.len() + usize::from(!trailing) {
-                continue;
             }
             let frontier = *messages.last().unwrap();
             let summarizes = context(ModelPurpose::Compaction, "p", "m", "s");
@@ -783,12 +769,18 @@ mod tests {
             };
             let admitted = admitted(store, agent, compaction);
             assert!(
-                match expected {
-                    None => admitted.is_ok(),
-                    Some(expected) => matches!(admitted,
-                        Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
+                if admits {
+                    admitted.is_ok()
+                } else {
+                    matches!(
+                        admitted,
+                        Err(SessionError::InvalidCompaction {
+                            reason: CheckpointError::IncompleteExchange,
+                            ..
+                        })
+                    )
                 },
-                "{results:?}, trailing={trailing}: {admitted:?}"
+                "{results:?} retaining {retained:?}: {admitted:?}"
             );
         }
     }

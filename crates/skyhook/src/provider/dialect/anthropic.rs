@@ -140,15 +140,12 @@ impl DialectConfig for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
-        Provider,
-        dialect::{
-            Sourced,
-            tests::{common, head, heads, provider, request},
-        },
-        http::transport::tests::header_values,
+    use crate::provider::dialect::tests::replay_scope;
+    use crate::provider::dialect::{
+        Sourced,
+        tests::{ROOT, common, head, provider, request},
     };
-    use futures_util::StreamExt;
+    use std::assert_matches;
 
     /// The service takes back only thinking it signed, so unsigned thinking stays
     /// local even while the context is unsigned; a server that accepts it gets it.
@@ -190,13 +187,7 @@ mod tests {
 
     #[test]
     fn replay_identity_tracks_workspace_not_cache_lifetime() {
-        let scope = |yaml| {
-            crate::yaml::parse::<Config>(yaml)
-                .unwrap()
-                .admit(CodecName::Messages)
-                .unwrap()
-                .scope
-        };
+        let scope = |yaml| replay_scope::<Config>(yaml, CodecName::Messages);
         assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
         // State in another role than the default changes the conversation replay saw.
         assert_eq!(scope("{}"), scope("state_role: system"));
@@ -217,46 +208,33 @@ mod tests {
             state_role: Some(StateRole::User),
             ..Config::default()
         };
-        let binding_only = header_values(
-            &head(&user, CodecName::Messages, "k").await,
-            "anthropic-beta",
+        let binding_only = head(&user, CodecName::Messages, "k").await;
+        assert_eq!(
+            binding_only.header("anthropic-beta"),
+            ["thinking-binding-controls-2026-08-01"]
         );
-        assert_eq!(binding_only, ["thinking-binding-controls-2026-08-01"]);
         let keyed = head(&Config::default(), CodecName::Messages, "k").await;
-        assert!(keyed.starts_with("POST /v1/messages HTTP/1.1"));
-        assert_eq!(header_values(&keyed, "x-api-key"), ["k"]);
-        assert!(header_values(&keyed, "authorization").is_empty());
-        assert_eq!(header_values(&keyed, "anthropic-version"), ["2023-06-01"]);
+        assert_eq!(keyed.endpoint.path(), "/v1/messages");
+        assert_eq!(keyed.header("x-api-key"), ["k"]);
+        assert!(keyed.header("authorization").is_empty());
+        assert_eq!(keyed.header("anthropic-version"), ["2023-06-01"]);
         let configured = Config {
             workspace_id: Some("wrkspc_1".parse().unwrap()),
             cache_ttl: Some(CacheTtl::OneHour),
             state_role: None,
         };
-        assert_eq!(
-            configured.admit(CodecName::Messages).unwrap().codec,
-            Codec::Messages(messages::Dialect {
-                cache_ttl: Some(CacheTtl::OneHour),
-                state_role: StateRole::System,
-                ..messages()
-            })
+        let mut common = common(ROOT, Some(Sourced::Literal("k".into())));
+        // A configured beta joins the dialect's rather than replacing them.
+        common.headers.insert(
+            "anthropic-beta".into(),
+            Sourced::Literal("context-1m-2025-08-07".into()),
         );
-        let mut heads = heads(1, async |root| {
-            let mut common = common(root, Some(Sourced::Literal("k".into())));
-            // A configured beta joins the dialect's rather than replacing them.
-            common.headers.insert(
-                "anthropic-beta".into(),
-                Sourced::Literal("context-1m-2025-08-07".into()),
-            );
-            let provider = provider("test", &configured, CodecName::Messages, &common);
-            let mut context = provider.open_context("c".parse().unwrap()).unwrap();
-            drop(context.invoke(request()).next().await);
-        })
-        .await;
-        let head = heads.remove(0);
-        assert_eq!(header_values(&head, "x-api-key"), ["k"]);
-        assert_eq!(header_values(&head, "anthropic-workspace-id"), ["wrkspc_1"]);
+        let provider = provider("test", &configured, CodecName::Messages, &common);
+        let sent = provider.sent(request()).await.unwrap();
+        assert_eq!(sent.header("x-api-key"), ["k"]);
+        assert_eq!(sent.header("anthropic-workspace-id"), ["wrkspc_1"]);
         assert_eq!(
-            header_values(&head, "anthropic-beta"),
+            sent.header("anthropic-beta"),
             [
                 "thinking-binding-controls-2026-08-01, mid-conversation-system-clear-at-2026-08-21, context-1m-2025-08-07"
             ]
@@ -271,6 +249,6 @@ mod tests {
             "details":{"error_code":"enforced_spend_limit_reached"}}});
         assert_eq!(kind(capped), ProviderErrorKind::Billing);
         let limited = serde_json::json!({"error":{"type":"rate_limit_error"}});
-        assert!(matches!(kind(limited), ProviderErrorKind::RateLimited));
+        assert_matches!(kind(limited), ProviderErrorKind::RateLimited);
     }
 }

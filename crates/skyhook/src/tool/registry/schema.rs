@@ -10,6 +10,7 @@ use super::{
     RegistryError,
     envelope::BACKGROUND,
     options::{ConditionalProperty, SchemaOrigin},
+    surface::Compiled,
 };
 
 /// The longest tool name every provider accepts.
@@ -113,7 +114,9 @@ fn add_nested_schema_property(schema: &mut Value, pointer: &str, name: &str, pro
     add_schema_property(object, name, property);
 }
 
-pub(super) fn validate_schema(schema: &Value) -> Result<(), RegistryError> {
+/// Check `schema` is an object schema without the reserved background property, and,
+/// unless `compiled` is [`Compiled::OnFirstUse`], that it compiles.
+pub(super) fn validate_schema(schema: &Value, compiled: Compiled) -> Result<(), RegistryError> {
     let object = schema
         .as_object()
         .ok_or_else(|| RegistryError::Schema("root must be an object".to_owned()))?;
@@ -123,10 +126,16 @@ pub(super) fn validate_schema(schema: &Value) -> Result<(), RegistryError> {
     if schema["properties"].get(BACKGROUND).is_some() {
         return Err(RegistryError::ReservedBackground);
     }
-    crate::tool::arguments::argument_validator(schema).map_err(|reason| {
-        RegistryError::Schema(format!("input schema does not compile: {reason}"))
-    })?;
+    if compiled == Compiled::AsOffered {
+        compile_schema(schema)?;
+    }
     Ok(())
+}
+
+pub(super) fn compile_schema(schema: &Value) -> Result<(), RegistryError> {
+    crate::tool::arguments::argument_validator(schema)
+        .map(drop)
+        .map_err(|reason| RegistryError::Schema(format!("input schema does not compile: {reason}")))
 }
 
 pub(super) fn validate_output_schema(schema: &Value) -> Result<(), RegistryError> {
@@ -220,23 +229,32 @@ pub(super) fn optional_defaults(schema: &mut Value) {
     });
 }
 
-pub(super) fn sanitize_schema(value: &mut Value) {
-    sanitize_schema_inner(value, SchemaOrigin::Native);
+/// Normalize a native result schema as [`sanitize_schema_inner`] does, keeping titles: results
+/// never reach providers, and a title names its type in tool descriptions.
+pub(super) fn normalize_result_schema(value: &mut Value) {
+    strip_annotations(value, &["$schema", "format"]);
 }
 
-/// Strip annotations providers reject. `true` becomes `{}` because some
-/// provider-side converters (including llama.cpp) only accept the object form;
-/// `false` stays, since internal validation relies on closed-object flags.
+/// Strip annotations providers reject.
 pub(super) fn sanitize_schema_inner(value: &mut Value, origin: SchemaOrigin) {
+    let annotations: &[&str] = match origin {
+        SchemaOrigin::Native => &["$schema", "title", "format"],
+        SchemaOrigin::External => &["title", "format"],
+    };
+    strip_annotations(value, annotations);
+}
+
+/// Remove `annotations` from every subschema. `true` becomes `{}` because some provider-side
+/// converters (including llama.cpp) only accept the object form; `false` stays, since internal
+/// validation relies on closed-object flags.
+fn strip_annotations(value: &mut Value, annotations: &[&str]) {
     for_each_subschema(value, &mut |schema| {
         if schema.as_bool() == Some(true) {
             *schema = Value::Object(Map::new());
         } else if let Some(object) = schema.as_object_mut() {
-            if origin == SchemaOrigin::Native {
-                object.remove("$schema");
+            for annotation in annotations {
+                object.remove(*annotation);
             }
-            object.remove("title");
-            object.remove("format");
         }
     });
 }
@@ -247,29 +265,6 @@ mod tests {
     use crate::tool::registry::AgentLevel;
     use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder, ToolSpec};
     use serde_json::json;
-
-    /// An internally tagged variant lists its tag last; a grammar built from that
-    /// order can never reach the variant once the tag is written first.
-    #[test]
-    fn tags_lead_their_objects_at_every_depth() {
-        let mut schema = json!({"type": "object", "properties": {"auth": {"oneOf": [
-            {"type": "object", "properties": {"kind": {"const": "agent"}}},
-            {"type": "object", "properties": {
-                "path": {"type": "string"}, "kind": {"type": "string", "const": "key"}}},
-            {"type": "object", "properties": {"path": {"type": "string"}, "mode": {"enum": ["x"]}}},
-        ]}}});
-        tags_first(&mut schema);
-        let keys = |variant: usize| -> Vec<&str> {
-            schema["properties"]["auth"]["oneOf"][variant]["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect()
-        };
-        assert_eq!(keys(1), ["kind", "path"]);
-        assert_eq!(keys(2), ["mode", "path"]);
-    }
 
     #[test]
     fn sanitization_preserves_property_names_and_literal_payloads() {
@@ -285,7 +280,7 @@ mod tests {
             "$defs": {"title": {"type": "string", "title": "definition annotation"}},
             "items": [{"type": "string", "format": "uri"}]
         });
-        sanitize_schema(&mut schema);
+        sanitize_schema_inner(&mut schema, SchemaOrigin::Native);
         assert!(schema.get("title").is_none());
         assert!(schema.get("$schema").is_none());
         assert_eq!(schema["properties"]["title"], json!({"type": "string"}));
@@ -315,7 +310,7 @@ mod tests {
             "required":["value"]
         });
         let mut normalized = original.clone();
-        sanitize_schema(&mut normalized);
+        sanitize_schema_inner(&mut normalized, SchemaOrigin::Native);
         for pointer in [
             "/properties/value",
             "/properties/list/items",
@@ -395,7 +390,7 @@ mod tests {
                 .background()
                 .output_schema(Value::Bool(true)),
         );
-        assert_eq!(tool.result_schema.unwrap().schema(), &json!({}));
+        assert_eq!(tool.result_schema.unwrap(), json!({}));
     }
 
     #[test]

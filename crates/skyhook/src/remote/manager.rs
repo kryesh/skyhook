@@ -322,6 +322,7 @@ pub(crate) mod tests {
         protocol::{Request, Response, read_frame, write_frame},
     };
     use crate::{target::TargetDefinition, tests::bounded};
+    use std::assert_matches;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
@@ -469,7 +470,7 @@ pub(crate) mod tests {
     async fn evicted_connections_drain_accepted_output_before_shutdown() {
         use crate::{
             remote::{
-                client::tests::{fixture_context, write_result},
+                client::tests::{fixture_context_with, write_result},
                 protocol::{PayloadEvent, RequestId},
             },
             session::SessionEvent,
@@ -488,13 +489,15 @@ pub(crate) mod tests {
         }
 
         bounded(async {
+            let runtime = crate::tests::TestRuntime::new().await;
             for successful in [true, false] {
-                let runtime = crate::tests::TestRuntime::new().await;
-                runtime
-                    .jobs
+                let job = (runtime.jobs)
                     .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
                     .await;
-                let context = fixture_context(&runtime);
+                let read = [crate::tool::policy::Capability::Read]
+                    .into_iter()
+                    .collect();
+                let context = fixture_context_with(&runtime, job, read);
                 let saved = runtime.jobs.output(context.job()).await;
                 let (client, mut shim) = tokio::io::duplex(4096);
                 let (output, input) = tokio::io::split(client);
@@ -514,10 +517,10 @@ pub(crate) mod tests {
                     &admitted,
                 );
                 let handshake = async {
-                    assert!(matches!(
+                    assert_matches!(
                         read_frame::<_, Request>(&mut shim).await.unwrap(),
                         Some(Request::Hello)
-                    ));
+                    );
                     write_frame(&mut shim, &Response::Ready).await.unwrap();
                 };
                 let (prepared, ()) = tokio::join!(connecting, handshake);
@@ -531,22 +534,25 @@ pub(crate) mod tests {
                             .await
                     }
                 });
-                assert!(matches!(
+                assert_matches!(
                     read_frame::<_, Request>(&mut shim).await.unwrap(),
                     Some(Request::Tool { .. })
-                ));
+                );
                 context.cancellation_token().cancel();
-                assert!(matches!(
+                assert_matches!(
                     read_frame::<_, Request>(&mut shim).await.unwrap(),
                     Some(Request::Cancel { .. })
-                ));
+                );
                 let Err(error) = abandoned.await.unwrap() else {
                     panic!("an abandoned call returned a result");
                 };
                 let cause = error.into_tool_error().diagnostic().cause;
                 assert_eq!(cause, crate::tool::diagnostic::Cause::Cancelled);
 
-                let caller = fixture_context(&runtime);
+                let read = [crate::tool::policy::Capability::Read]
+                    .into_iter()
+                    .collect();
+                let caller = fixture_context_with(&runtime, job, read);
                 let completing =
                     prepared
                         .clone()
@@ -558,7 +564,7 @@ pub(crate) mod tests {
                     tokio::select! {
                         result = &mut completing => panic!("unexpected completion: {result:?}"),
                         request = read_frame::<_, Request>(&mut shim) => {
-                            assert!(matches!(request.unwrap(), Some(Request::Tool { .. })));
+                            assert_matches!(request.unwrap(), Some(Request::Tool { .. }));
                         }
                     }
                 }
@@ -677,8 +683,9 @@ pub(crate) mod tests {
             error.context.effects,
             crate::tool::diagnostic::Effects::NotStarted
         );
-        assert!(
-            matches!(error.cause, crate::tool::diagnostic::Cause::Message(message) if message.contains("invalid shim handshake"))
+        assert_matches!(
+            error.cause,
+            crate::tool::diagnostic::Cause::Message(message) if message.contains("invalid shim handshake")
         );
         assert_eq!(factory.counts(), (1, 1));
         assert!(manager.pool().is_empty());

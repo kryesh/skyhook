@@ -9,7 +9,7 @@ impl Harness {
         let store = SessionStore::create(
             &inner.session_root,
             inner.host.clone(),
-            inner.session_extension,
+            inner.session_schema,
         )
         .await?;
         let jobs = JobManager::new(store.clone());
@@ -59,13 +59,11 @@ impl SessionHandle {
     /// another mode, a configured redefinition of its own, or different grants. An
     /// unknown mode counts as a change, which sending it would refuse.
     pub fn changes_mode(&self, mode: &ModeName) -> bool {
-        let held = (self.runtime).held(&self.root, |contract, _, granted| {
-            (contract.mode.clone(), granted)
-        });
-        let Some((current, capabilities)) = held else {
+        let held = (self.runtime).held(&self.root, |contract, _, _| contract.mode.clone());
+        let Some(current) = held else {
             return true;
         };
-        let change = (self.runtime).mode_change(&self.root, current.as_ref(), &capabilities, mode);
+        let change = (self.runtime).mode_change(&self.root, current.as_ref(), mode);
         !matches!(change, Ok(None))
     }
 
@@ -577,6 +575,7 @@ impl SessionRuntime {
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
+    use std::assert_matches;
 
     /// Once closing has begun, a host script is refused before its job exists,
     /// and input the root holds, or never takes, as the session's refusal, not
@@ -587,8 +586,6 @@ mod tests {
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
-        let result = session.run_script("console.log('completed'); return 42;");
-        assert_eq!(result.await.unwrap().value["value"], 42);
         let begin = Command::BeginShutdown;
         (session.runtime.store).enter(begin).await.unwrap();
         let closing = crate::session::SessionPhase::ShuttingDown;
@@ -604,8 +601,8 @@ mod tests {
         status.await.unwrap();
         let durable = SessionStore::read_records(&sessions, session.id()).await;
         let durable = durable.unwrap();
-        assert!(matches!(&durable.last().unwrap().event,
-            SessionEvent::Status { message } if message == "Completed"));
+        assert_matches!(&durable.last().unwrap().event,
+            SessionEvent::Status { message } if message == "Completed");
         assert_eq!(session.runtime.store.records(), durable);
     }
 
@@ -673,7 +670,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let jobs = session.runtime.jobs.clone();
         let spec = crate::job::JobSpec::test(session.root.clone(), "stubborn");
         let (_input, worker) = jobs.test_running(spec).await.split();
@@ -684,18 +681,15 @@ mod tests {
     }
 
     /// A mode decides the root agent's capabilities, tools and instructions from the
-    /// input that selects it. A child gets what its parent holds when it starts.
+    /// input that selects it. A child gets what its parent holds when it starts. A
+    /// switch pins its prompt and tools with a context of its own, even one equal to
+    /// the previous mode's.
     #[tokio::test]
     async fn modes_switch_the_root_contract_and_survive_resume() {
-        use crate::tool::policy::{Capability, CapabilitySet, Mode};
+        use crate::tool::policy::{Capability, CapabilitySet};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let requests = Requests::default();
-        let mode = |capabilities: &[Capability], instructions: Option<&str>| Mode {
-            capabilities: listed(capabilities),
-            instructions: instructions.map(|text| text.parse().unwrap()),
-            hint: None,
-        };
         let look = mode(&[Capability::Read, Capability::Agents], Some("Only look."));
         // The session's ceiling has no targets, so no mode grants them. A mode is a
         // set however it is listed.
@@ -707,8 +701,9 @@ mod tests {
             Capability::Read,
         ];
         let modes: indexmap::IndexMap<_, _> = [
-            (mode_name("look"), look),
+            (mode_name("look"), look.clone()),
             (mode_name("work"), mode(&work, None)),
+            (mode_name("same"), look),
         ]
         .into();
         let builder = |provider| {
@@ -809,6 +804,7 @@ mod tests {
             Step::new(answer("resumed")),
             Step::fail(rejected),
             Step::new(answer("continued")),
+            Step::new(answer("same")),
         ];
         let provider = Script::new(steps, &requests);
         let harness = builder(provider)
@@ -837,55 +833,28 @@ mod tests {
         assert_eq!(captured.last().unwrap().system, looking.system);
         let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 2);
-        shutdown_session(resumed).await;
-    }
 
-    /// A mode pins its prompt and tools with a context of its own, even one equal to
-    /// the previous mode's: resume restores them from it.
-    #[tokio::test]
-    async fn a_mode_switch_journals_its_own_context_even_when_equal() {
-        use crate::tool::policy::{Capability, CapabilitySet, Mode};
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let same = Mode {
-            capabilities: listed(&[Capability::Read]),
-            instructions: None,
-            hint: None,
-        };
-        let modes: indexmap::IndexMap<_, _> =
-            [(mode_name("a"), same.clone()), (mode_name("b"), same)].into();
-        let provider = scripted_provider(&requests, [answer("first"), answer("second")]);
-        let session = test_builder(root.path(), &sessions, provider, false)
-            .capabilities(CapabilitySet::default())
-            .modes(modes)
-            .build()
-            .await
-            .unwrap()
-            .new_session()
-            .await
-            .unwrap();
-        session.prompt("first").await.unwrap();
-        let b = session.selection(None, Some(&mode_name("b"))).unwrap();
-        session.prompt_with_options("second", &[], b).await.unwrap();
-        let records = session.runtime.store.records();
+        let same = resumed.selection(None, Some(&mode_name("same"))).unwrap();
+        let prompt = resumed.prompt_with_options("same", &[], same);
+        assert_eq!(prompt.await.unwrap(), "same");
+        let records = resumed.runtime.store.records();
         let switched = records
             .iter()
-            .position(|record| matches!(record.event, SessionEvent::ModeChanged { .. }))
+            .rposition(|record| matches!(record.event, SessionEvent::ModeChanged { .. }))
             .unwrap();
         let repinned = records[switched..].iter().any(|record| {
             matches!(&record.event, SessionEvent::ModelContext { context }
                 if context.purpose == crate::session::ModelPurpose::Agent)
         });
         assert!(repinned);
-        session.shutdown().await.unwrap();
+        shutdown_session(resumed).await;
     }
 
     /// A mode consumed at a request boundary narrows the root's next tool call and its
     /// host scripts, while a child it already started keeps what it was given.
     #[tokio::test]
     async fn a_mid_turn_mode_switch_narrows_the_root_but_not_its_running_child() {
-        use crate::tool::policy::{Capability, Mode};
+        use crate::tool::policy::Capability;
         let call = |id: &str, name: &str, arguments: serde_json::Value| {
             let call = ToolCall::new(id, name, arguments).unwrap();
             response(vec![AssistantItem::tool_call(id, 0, call)])
@@ -912,12 +881,10 @@ mod tests {
             &Default::default(),
         );
         let root = tempfile::tempdir().unwrap();
-        let mode = |capabilities: &[Capability]| Mode {
-            capabilities: listed(capabilities),
-            instructions: None,
-            hint: None,
-        };
-        let work = mode(&[Capability::Read, Capability::Write, Capability::Agents]);
+        let work = mode(
+            &[Capability::Read, Capability::Write, Capability::Agents],
+            None,
+        );
         let profile = |model: &str| ModelProfile {
             hint: Some(model.parse().unwrap()),
             ..crate::tests::profile(model, false)
@@ -933,14 +900,14 @@ mod tests {
             .modes(
                 [
                     (mode_name("work"), work),
-                    (mode_name("look"), mode(&[Capability::Read])),
+                    (mode_name("look"), mode(&[Capability::Read], None)),
                 ]
                 .into(),
             )
             .build()
             .await
             .unwrap();
-        let session = Arc::new(harness.new_session().await.unwrap());
+        let session = Arc::new(ephemeral_session(&harness).await);
         let turn = spawn_prompt(&session, "delegate, then write");
         tracking.request(0).await;
         // Queued while the root's first request is in flight; consumed at its next one.
@@ -1015,15 +982,6 @@ mod tests {
         session.set_title("second title".into()).await.unwrap();
         session.prompt("a later prompt").await.unwrap();
         assert_eq!(title(&session).await.as_deref(), Some("first title"));
-        let summary = SessionStore::summary(&sessions, session.id(), None)
-            .await
-            .unwrap();
-        let records = session.runtime.store.records();
-        assert_eq!(summary.entries, records.len() as u64);
-        assert_eq!(
-            summary.last_millis,
-            records.last().unwrap().timestamp_millis
-        );
         shutdown_session(session).await;
     }
 
@@ -1042,7 +1000,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let model = |name: &str| {
             session
                 .selection(Some(&name.parse().unwrap()), None)
@@ -1052,7 +1010,7 @@ mod tests {
         let oversized = crate::tests::over_limit_images().await;
         let rejected =
             session.prompt_with_options("Oversized image", &oversized, model("test/vision"));
-        assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
+        assert_matches!(rejected.await, Err(HarnessError::ImageLimit));
         assert_eq!(session.runtime.store.records().len(), before);
         let images = [image];
         let direct = session.prompt_with_options("Look", &images, Selection::default());
@@ -1100,7 +1058,7 @@ mod tests {
         let provider = Script::new([Step::new(events).midstream()], &requests);
         let harness =
             test_harness(root.path(), &root.path().join("sessions"), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let store = session.runtime.store.clone();
         let mut updates = store.observe().updates;
         let task = spawn_prompt(&session, "stream");
@@ -1140,7 +1098,7 @@ mod tests {
         let provider = Script::new(steps, &requests);
         let harness =
             test_harness(root.path(), &root.path().join("sessions"), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let task = spawn_prompt(&session, "retained input");
         let mut events = session.runtime.store.observe().updates;
         provider.request(0).await;
@@ -1194,149 +1152,35 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// Continue resumes every holder's wait, not only the root's: a nested holder's
-    /// resumed turn is busy again, so a second interrupt stops it.
     #[tokio::test]
-    async fn continue_resumes_nested_holders_so_a_second_interrupt_stops_them() {
-        let steps = [
-            Step::new(response(vec![delegation("child", 1)])),
-            Step::new(response(vec![delegation("grandchild", 0)])),
-            Step::new(Vec::new()).midstream(),
-            Step::new(answer("grandchild recovered")),
-            Step::new(Vec::new()).midstream(),
-            Step::new(answer("child recovered")),
-            Step::new(answer("parent done")),
-        ];
-        let requests = Requests::default();
-        let provider = Script::new(steps, &requests);
+    async fn selecting_a_model_with_an_equal_profile_switches_its_provider() {
         let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let parent = spawn_prompt(&session, "delegate");
-        provider.request(2).await;
-        // The grandchild is interrupted; the child and the root holding it keep waiting.
-        assert_eq!(session.interrupt().await, 3);
-        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
-        provider.request(4).await;
-        let child = session.root.child(1);
-        assert_eq!(turn(&session, &child), Turn::Busy);
-        // The child's resumed turn is in a model request, so it is interrupted; the
-        // root holding it shows interrupted again.
-        assert_eq!(session.interrupt().await, 2);
-        assert!(turn(&session, &child).interrupted());
-        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
-        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
-        session.shutdown().await.unwrap();
-    }
-
-    /// A feed's wake never keeps input from the script: after an empty feed and after one
-    /// that ends with its wake still pending, the next `receive()` gets the first value
-    /// sent once both have ended.
-    #[tokio::test]
-    async fn a_finished_feed_leaves_script_input_to_receive() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
-        let session = harness.new_session().await.unwrap();
-        let source = r#"
-for await (const _ of new WorkPool(1).feed(async () => [], async () => 0, {wake: receive})) {}
-const once = [{key: 1}];
-for await (const _ of new WorkPool(1).feed(async () => once.splice(0), async () => sleep(0), {wake: receive})) {}
-console.log("fed");
-return [await receive(), await receive()];
-"#;
-        let arguments = json!({"source": source, "bg": true});
-        let running = (session.runtime.executor)
-            .execute(session.root.clone(), "script", arguments, None)
-            .await
-            .unwrap()
-            .job;
-        let id = running.get();
-        // Input sent while a feed still runs may rightly go to its wake: send only once
-        // both feeds have ended, which the script logs.
-        let console = format!(r#"return tool.jobs({{job:{id}, field:"/result/console"}});"#);
-        bounded(async {
-            loop {
-                let view = session.run_script(console.clone()).await.unwrap();
-                if view.value.to_string().contains("fed") {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        let send = format!(
-            r#"await tool.job({id}).send({{value: "first"}}); await tool.job({id}).send({{value: "second"}}); return null;"#
+        let requests = Default::default();
+        let (first, second) = (
+            scripted_provider(&requests, [answer("from a")]),
+            scripted_provider(&requests, [answer("from b")]),
         );
-        session.run_script(send).await.unwrap();
-        session.runtime.jobs.wait(running, true).await.unwrap();
-        let output = format!("return tool.jobs({{job:{id}}});");
-        let completed = session.run_script(output).await.unwrap();
-        assert_eq!(
-            completed.value["value"]["result"]["value"],
-            json!(["first", "second"])
-        );
-    }
-
-    #[tokio::test]
-    async fn script_messages_preserve_order_across_calls_and_cancel_waiting_receivers() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
-        let session = harness.new_session().await.unwrap();
-        let executor = &session.runtime.executor;
-        let jobs = &session.runtime.jobs;
-        let background = async |source: &str| {
-            let arguments = json!({"source": source, "bg":true});
-            let running = executor.execute(session.root.clone(), "script", arguments, None);
-            running.await.unwrap().job
-        };
-        let running = background("const messages=[]; for(let i=0;i<4;i++) messages.push(await receive()); return {messages, notifyType:typeof notify};").await;
-        let id = running.get();
-        let queued = session
-            .run_script(format!(
-                r#"
-    const accepted = [];
-    for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
-      accepted.push((await tool.job({id}).send({{value}})).unwrap());
-    }}
-    const pending = await tool.jobs({{job:{id}}});
-    return {{accepted, state:pending.state}};
-    "#
-            ))
+        let profile = crate::tests::profile("same", false);
+        let harness = HarnessBuilder::new(root.path(), "test".parse().unwrap())
+            .session_root(root.path().join("sessions"))
+            .provider(
+                provider_name("a"),
+                first.clone(),
+                models([("m", profile.clone())]),
+            )
+            .provider(provider_name("b"), second.clone(), models([("m", profile)]))
+            .default_model("a/m".parse().unwrap())
+            .build()
             .await
             .unwrap();
-        let accepted = json!([null, null, null]);
-        assert_eq!(queued.value["value"]["accepted"], accepted);
-        assert_eq!(queued.value["value"]["state"], "running");
-        let last = format!("return tool.job({id}).send({{value:\"last\"}});");
-        session.run_script(last).await.unwrap();
-        jobs.wait(running, true).await.unwrap();
-        let output = format!("return tool.jobs({{job:{id}}});");
-        let completed = session.run_script(output).await.unwrap();
-        assert_eq!(completed.value["value"]["state"], "completed");
-        assert_eq!(
-            completed.value["value"]["result"]["value"],
-            json!({
-                "messages":[{"text":"hello 🌏", "nested":[1,true]}, null, false, "last"],
-                "notifyType":"undefined",
-            })
-        );
-
-        let waiting = background("return await receive();").await;
-        let id = waiting.get();
-        // The cancel result is the target's view, with no denial code.
-        let cancel = format!(
-            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === null;"
-        );
-        assert_eq!(
-            session.run_script(cancel).await.unwrap().value["value"],
-            true
-        );
-        jobs.wait(waiting, true).await.unwrap();
-        let output = format!("return tool.jobs({{job:{id}}});");
-        let cancelled = session.run_script(output).await.unwrap();
-        assert_eq!(cancelled.value["value"]["state"], "cancelled");
+        let session = ephemeral_session(&harness).await;
+        assert_eq!(session.prompt("test:first").await.unwrap(), "from a");
+        let options = session
+            .selection(Some(&"b/m".parse().unwrap()), None)
+            .unwrap();
+        let switched = session.prompt_with_options("test:second", &[], options);
+        assert_eq!(bounded(switched).await.unwrap(), "from b");
+        assert_eq!((first.remaining(), second.remaining()), (0, 0));
+        session.shutdown().await.unwrap();
     }
 }

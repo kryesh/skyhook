@@ -28,6 +28,7 @@ use super::*;
 pub enum Begin {
     Sweep(Vec<PathId>),
     Probe(Vec<PathId>),
+    Check(Vec<StateId>),
     Settle(Vec<PremiseId>),
     Chain(Vec<FlawId>),
     Assess(Vec<CandidateId>),
@@ -42,6 +43,7 @@ impl Begin {
         match self {
             Self::Sweep(_) => Phase::Sweep,
             Self::Probe(_) => Phase::Probe,
+            Self::Check(_) => Phase::Check,
             Self::Settle(_) => Phase::Settle,
             Self::Chain(_) => Phase::Chain,
             Self::Assess(_) => Phase::Assess,
@@ -57,6 +59,7 @@ impl Begin {
         }
         match self {
             Self::Sweep(ids) | Self::Probe(ids) => nodes(ids),
+            Self::Check(ids) => nodes(ids),
             Self::Settle(ids) => nodes(ids),
             Self::Chain(ids) | Self::Report(ids) => nodes(ids),
             Self::Assess(ids) | Self::Review(ids) | Self::Test(ids) => nodes(ids),
@@ -154,9 +157,6 @@ macro_rules! live {
 }
 pub(super) use live;
 
-/// How many of its latest tasks a node view names.
-const NODE_TASKS: u32 = 5;
-
 /// The latest `$limit` tasks of node `$n`, or of a node merged into it, newest first, as `task`
 /// rows: the newest of its own and of those merged into it, each read down its index, a task
 /// on several merged nodes counted once.
@@ -179,14 +179,13 @@ macro_rules! newest_tasks {
 }
 pub(super) use newest_tasks;
 
-/// The latest tasks of node `?1`, or of a node merged into it, newest first, `?2` of them.
-pub(super) const OF_NODE: &str = newest_tasks!("?1", "?2");
+/// The latest five tasks of node `?1`, or of a node merged into it, newest first: as many as a
+/// node view names.
+pub(super) const OF_NODE: &str = newest_tasks!("?1", "5");
 
 /// The latest tasks of node `node`, or of a node merged into it, newest first.
 pub(super) fn of_node(db: &Db, node: NodeId) -> Result<Vec<TaskId>> {
-    rows(db, OF_NODE, params![node, NODE_TASKS], |row| {
-        Ok(TaskId(row.get(0)?))
-    })
+    rows(db, OF_NODE, params![node], |row| Ok(TaskId(row.get(0)?)))
 }
 
 /// `tasks` with their subjects.
@@ -213,11 +212,44 @@ pub(super) fn journal_job(id: i64) -> Result<JobId> {
     JobId::new(id as u64).map_err(|_| corrupt("invalid job id").into())
 }
 
+/// A begun task, with what changed of its subjects' work since each was last worked in its
+/// phase, and the results proposed for it to decide.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct Begun {
+    pub task: TaskId,
+    /// For each subject a task of this phase worked before, the events bearing on its work
+    /// since that task's basis; nothing on a first visit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<SubjectChanges>,
+    /// Each subject's result recorded outside this phase's work that differs from its standing
+    /// one, which this work decides.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proposals: Vec<SubjectProposal>,
+    /// For each state a check begins on, the decided premises of the flaws leaving it wrong,
+    /// which what the check finds may contradict.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub premises: Vec<SubjectPremises>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct SubjectPremises {
+    pub node: NodeId,
+    pub premises: Vec<DecidedPremise>,
+}
+
+/// A subject's proposed result.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct SubjectProposal {
+    pub node: NodeId,
+    pub proposal: Proposal<Proposed>,
+}
+
 impl Store {
     /// Begin `work` as the task of `actor`'s job, each subject at the basis its phase's work
-    /// rests on now, whether or not it is owed. A merged subject is begun as the node it was
-    /// merged into.
-    pub fn begin(&self, actor: &AgentId, work: &Begin) -> Result<TaskId> {
+    /// rests on now, whether or not it is owed, with what changed for each since the basis of
+    /// its previous task in the phase, on it or on a node merged into it. A merged subject is
+    /// begun as the node it was merged into.
+    pub fn begin(&self, actor: &AgentId, work: &Begin) -> Result<Begun> {
         let subjects = work.subjects();
         if subjects.is_empty() {
             return Err(Error::NoSubjects);
@@ -226,6 +258,7 @@ impl Store {
             return Err(Error::Limit(Bound::Attachments));
         }
         let phase = work.phase();
+        let session = self.id();
         self.write(|db| {
             let mut bases: Vec<(NodeId, EventId)> = Vec::with_capacity(subjects.len());
             for id in subjects {
@@ -241,6 +274,36 @@ impl Store {
                 |row| Ok(row.get::<i64>(0)?),
             )?
             .ok_or(Error::TaskNeedsJob)?;
+            let (mut changed, mut proposals, mut premises) = (Vec::new(), Vec::new(), Vec::new());
+            for (node, _) in &bases {
+                if phase == Phase::Check {
+                    let decided = reads::decided_premises(db, *node)?;
+                    if !decided.is_empty() {
+                        premises.push(SubjectPremises {
+                            node: *node,
+                            premises: decided,
+                        });
+                    }
+                }
+                if let Some(proposal) = reads::proposed(db, session, phase, *node)? {
+                    proposals.push(SubjectProposal {
+                        node: *node,
+                        proposal,
+                    });
+                }
+                let previous = stored(
+                    db,
+                    "SELECT max((SELECT max(tn.basis) FROM task_node tn WHERE tn.phase=?1 AND \
+                     tn.node=m.id)) FROM node m WHERE m.id=?2 OR m.merged_into=?2",
+                    params![phase, *node],
+                    |row| Ok(row.get::<Option<i64>>(0)?.map(EventId)),
+                )?;
+                if let Some(previous) = previous {
+                    let events = changes::noticed(db, phase, *node, previous)?;
+                    let events = events.into_iter().collect();
+                    changed.extend(changes::digest(db, phase, *node, &events)?);
+                }
+            }
             audit(db, actor, EventKind::Began, None, |event| {
                 let task = TaskId(db.insert(
                     "INSERT INTO task(job,phase,began) VALUES (?1,?2,?3)",
@@ -252,20 +315,38 @@ impl Store {
                         "INSERT INTO task_node(task,phase,node,kind,basis) VALUES (?1,?2,?3,?4,?5)",
                         params![task, phase, node, phase.subject(), basis],
                     )?;
+                    if phase == Phase::Report {
+                        bearing::record_scenarios(db, event, node)?;
+                    }
                     marks.mark(node, EventEffect::Concerns);
                 }
-                Ok((task, marks))
+                Ok((
+                    Begun {
+                        task,
+                        changes: changed,
+                        proposals,
+                        premises,
+                    },
+                    marks,
+                ))
             })
         })
     }
 
-    /// The latest `limit` tasks, newest first.
+    /// The first `limit` tasks, live ones first, then queued, failed and cancelled ones, each
+    /// newest first.
     pub fn tasks(&self, limit: usize) -> Result<Vec<Task>> {
         self.read(|db| {
-            let tasks = rows(
+            let tasks = first_rows(
                 db,
-                concat!(task_select!(), "1 ORDER BY t.id DESC LIMIT ?1"),
-                params![limit],
+                concat!(
+                    task_select!(),
+                    "1 ORDER BY CASE j.state WHEN 'running' THEN 0 WHEN 'waiting_input' THEN 0 \
+                     WHEN 'queued' THEN 1 WHEN 'awaiting_approval' THEN 1 WHEN 'failed' THEN 2 \
+                     WHEN 'interrupted' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END,t.id DESC"
+                ),
+                Vec::new(),
+                limit,
                 task_row,
             )?;
             with_subjects(db, tasks)
@@ -275,10 +356,11 @@ impl Store {
     /// A page of tasks, oldest first.
     pub fn task_page(&self, page: Page) -> Result<Listing<Task>> {
         self.read(|db| {
-            let tasks = rows(
+            let tasks = first_rows(
                 db,
-                concat!(task_select!(), "t.id>?1 ORDER BY t.id LIMIT ?2"),
-                params![page.after, page.limit()],
+                concat!(task_select!(), "t.id>?1 ORDER BY t.id"),
+                params![page.after],
+                page.limit(),
                 task_row,
             )?;
             Ok(Listing::keyset(with_subjects(db, tasks)?, page))
@@ -338,11 +420,14 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use skyhook::job::JobState;
 
     use super::{
         super::tests::{
-            HIGH, assess, begun, child_agent, fixture, last_event, premise, scenario, text,
+            HIGH, assess, begun, child_agent, end_job, fixture, last_event, premise, scenario,
+            state, text, within,
         },
         *,
     };
@@ -355,28 +440,28 @@ mod tests {
         let (_session, store, actor) = fixture();
         let (first, second) = (scenario(&store, &actor, "a"), scenario(&store, &actor, "b"));
         let created = last_event(&store);
-        assess(&store, &actor, second.candidate, HIGH);
-        let merge = Merge::Candidate {
-            candidate: first.candidate,
-            into: second.candidate,
+        assess(&store, second.candidate, HIGH);
+        let merge = Merge {
+            node: first.candidate.into(),
+            into: second.candidate.into(),
             note: text("same"),
         };
         store.merge(&actor, &merge).unwrap();
         let merged = last_event(&store);
-        assert!(matches!(
+        assert_matches!(
             store.begin(&actor, &Begin::Assess(vec![second.candidate])),
             Err(Error::TaskNeedsJob)
-        ));
+        );
         let wrong = Begin::Assess(vec![CandidateId(second.flaw.0)]);
         let (child, _) = child_agent(&store, JobState::Running);
-        assert!(matches!(
+        assert_matches!(
             store.begin(&child, &wrong),
             Err(Error::WrongKind {
                 expected: NodeKind::Candidate,
                 found: NodeKind::Flaw,
                 ..
             })
-        ));
+        );
         let work = Begin::Review(vec![first.candidate, second.candidate]);
         let (_, _, task) = begun(&store, &work);
         let bases = store
@@ -420,8 +505,136 @@ mod tests {
         assert!(!detail.more && store.task(task, 0).unwrap().more);
     }
 
+    /// `begin` names, per subject, what bore on its work since its previous task's basis in the
+    /// phase, with each event's note, but nothing for a subject on its first visit: a reopened
+    /// settle learns what it rests on failed.
+    #[test]
+    fn begin_reports_what_changed_since_the_last_visit() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let [parent, sub] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let links = [
+            Link::FlawPremise {
+                flaw: scenario.flaw,
+                premise: parent,
+            },
+            Link::PremiseBasis {
+                premise: parent,
+                rests_on: sub,
+            },
+        ];
+        store.link(&actor, &links).unwrap();
+        let (settler, job) = child_agent(&store, JobState::Running);
+        let first = store.begin(&settler, &Begin::Settle(vec![parent])).unwrap();
+        assert!(first.changes.is_empty(), "a first visit");
+        let holds = StatusChange::Premise(parent, PremiseStatus::Holds);
+        store.set_status(&settler, holds, &text("drained")).unwrap();
+        end_job(&store, job);
+        within(&store, &Begin::Settle(vec![sub]), |settler| {
+            let fails = StatusChange::Premise(sub, PremiseStatus::Fails);
+            store
+                .set_status(settler, fails, &text("one exit keeps input"))
+                .unwrap();
+        });
+        let failed = last_event(&store);
+
+        let (settler, _) = child_agent(&store, JobState::Running);
+        let again = store
+            .begin(&settler, &Begin::Settle(vec![parent, sub]))
+            .unwrap();
+        assert_eq!(
+            (again.changes.iter())
+                .map(|subject| {
+                    let notes = (subject.recent.iter())
+                        .map(|notice| (notice.id, notice.note.as_deref()))
+                        .collect();
+                    (subject.node, notes)
+                })
+                .collect::<Vec<(NodeId, Vec<_>)>>(),
+            [(parent.into(), vec![(failed, Some("one exit keeps input"))])]
+        );
+    }
+
+    /// A check begins with the decided premises of the flaws leaving its state wrong, each with
+    /// the settle task deciding it and its evidence, as the state's view lists them; an
+    /// undecided one is not listed.
+    #[test]
+    fn a_check_begins_with_the_decided_premises_it_may_contradict() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let window = state(&store, &actor, NewState::Instance);
+        let [decided, open] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let mut links = vec![Link::FlawState {
+            flaw: scenario.flaw,
+            state: window,
+        }];
+        links.extend([decided, open].map(|premise| Link::FlawPremise {
+            flaw: scenario.flaw,
+            premise,
+        }));
+        store.link(&actor, &links).unwrap();
+        let settle = within(&store, &Begin::Settle(vec![decided]), |settler| {
+            let holds = StatusChange::Premise(decided, PremiseStatus::Holds);
+            store.set_status(settler, holds, &text("traced")).unwrap();
+            store.tasks(1).unwrap()[0].id
+        });
+        let support = NewEvidence {
+            location: None,
+            environment: None,
+            stance: Stance::Supports,
+            note: text("every caller checks it"),
+        };
+        store.evidence(&actor, decided.into(), &[support]).unwrap();
+        let (checker, _) = child_agent(&store, JobState::Running);
+        let begun = store.begin(&checker, &Begin::Check(vec![window])).unwrap();
+        let [listed] = &begun.premises[..] else {
+            panic!("one state's premises")
+        };
+        let [premise] = &listed.premises[..] else {
+            panic!("the decided premise alone")
+        };
+        assert_eq!(
+            (premise.premise.id, premise.premise.status, premise.task),
+            (decided, PremiseStatus::Holds, Some(settle))
+        );
+        assert_eq!(premise.evidence, 1);
+        let NodeView::State(view) = store.node(window.into()).unwrap() else {
+            panic!("a state")
+        };
+        assert_eq!(view.premises, listed.premises);
+    }
+
+    /// A subject's previous visit counts a task on a node merged into it: the survivor's first
+    /// task learns what changed since, its own creation and the merge.
+    #[test]
+    fn begin_reports_what_changed_since_a_merged_nodes_visit() {
+        let (_session, store, actor) = fixture();
+        let merged = premise(&store, &actor, PremiseScope::Code);
+        begun(&store, &Begin::Settle(vec![merged]));
+        let kept = premise(&store, &actor, PremiseScope::Code);
+        let created = last_event(&store);
+        let merge = Merge {
+            node: merged.into(),
+            into: kept.into(),
+            note: text("same"),
+        };
+        store.merge(&actor, &merge).unwrap();
+        let folded = last_event(&store);
+        let (settler, _) = child_agent(&store, JobState::Running);
+        let again = store.begin(&settler, &Begin::Settle(vec![kept])).unwrap();
+        assert_eq!(
+            (again.changes.iter())
+                .map(|subject| {
+                    let events = subject.recent.iter().map(|notice| notice.id).collect();
+                    (subject.node, events)
+                })
+                .collect::<Vec<(NodeId, Vec<EventId>)>>(),
+            [(kept.into(), vec![created, folded])]
+        );
+    }
+
     /// A node's latest tasks count a task once however many of the nodes merged into it it
-    /// began on.
+    /// began on. Its view lists them newest first, and a node merged into it lists only its own.
     #[test]
     fn a_nodes_latest_tasks_count_each_task_once() {
         let (_session, store, actor) = fixture();
@@ -431,14 +644,17 @@ mod tests {
             .collect();
         tasks.push(begun(&store, &Begin::Settle(vec![a, b])).2);
         for premise in [a, b] {
-            let merge = Merge::Premise {
-                premise,
-                into: c,
+            let merge = Merge {
+                node: premise.into(),
+                into: c.into(),
                 note: text("same"),
             };
             store.merge(&actor, &merge).unwrap();
         }
         tasks.reverse();
         assert_eq!(store.read(|db| of_node(db, c.into())).unwrap(), tasks);
+        let listed = |id: PremiseId| store.node(id.into()).unwrap().head().tasks.clone();
+        assert_eq!(listed(c), tasks);
+        assert_eq!(listed(b), [tasks[0]]);
     }
 }

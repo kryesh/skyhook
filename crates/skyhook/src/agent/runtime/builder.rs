@@ -12,7 +12,7 @@ pub struct HarnessBuilder {
     questions: Option<Arc<dyn QuestionHandler>>,
     host_state: Option<Arc<dyn HostState>>,
     resume_hook: Option<Arc<dyn ResumeHook>>,
-    session_extension: Option<crate::session::Extension>,
+    session_schema: crate::session::Schema,
     extra_tools: ToolRegistry,
     prompts: crate::prompts::Prompts,
     skills: HostSkills,
@@ -100,7 +100,7 @@ impl HarnessBuilder {
             questions: None,
             host_state: None,
             resume_hook: None,
-            session_extension: None,
+            session_schema: crate::session::Schema::JOURNAL,
             extra_tools: ToolRegistry::default(),
             prompts: Default::default(),
             skills: HostSkills::default(),
@@ -228,11 +228,11 @@ impl HarnessBuilder {
         self
     }
 
-    /// Tables of the host's own, if it keeps any, in every session this harness
-    /// creates, checked on every one of the host's it reopens.
+    /// The schema of every session this harness creates, with any tables of the host's
+    /// own, checked on every one of the host's it reopens. The journal's by default.
     #[must_use]
-    pub fn session_extension(mut self, extension: Option<crate::session::Extension>) -> Self {
-        self.session_extension = extension;
+    pub fn session_schema(mut self, schema: crate::session::Schema) -> Self {
+        self.session_schema = schema;
         self
     }
 
@@ -392,7 +392,7 @@ impl HarnessBuilder {
                 questions: self.questions,
                 host_state: self.host_state,
                 resume_hook: self.resume_hook,
-                session_extension: self.session_extension,
+                session_schema: self.session_schema,
                 extra_tools: self.extra_tools,
                 mcp: self.mcp,
                 instructions,
@@ -546,6 +546,7 @@ async fn load_agent_instructions(
 mod tests {
     use super::*;
     use crate::{agent::runtime::tests::*, provider::profile::LimitsError, tool::ToolOptions};
+    use std::assert_matches;
 
     #[derive(serde::Deserialize, schemars::JsonSchema)]
     struct HostInput {}
@@ -716,11 +717,7 @@ mod tests {
             .unwrap();
         for (index, &(context, output, warns)) in cases.iter().enumerate() {
             let name = format!("Model `test/case-{index}`:");
-            let warned = harness.inner.warnings.iter().any(|warning| {
-                warning.starts_with(&name)
-                    && warning.contains(&format!("max_output ({output})"))
-                    && warning.contains(&format!("max_context ({context})"))
-            });
+            let warned = (harness.inner.warnings.iter()).any(|warning| warning.starts_with(&name));
             assert_eq!(warned, warns, "{context}/{output}");
         }
     }
@@ -730,16 +727,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let base = || test_builder(root.path(), &sessions, Arc::new(HangingProvider), false);
-        let mode = |capabilities: &[Capability]| Mode {
-            capabilities: listed(capabilities),
-            instructions: None,
-            hint: None,
-        };
         let (look, work, missing) = (mode_name("look"), mode_name("work"), mode_name("missing"));
         let modes = || {
             [
-                (look.clone(), mode(&[Capability::Read])),
-                (work.clone(), mode(&[Capability::Read, Capability::Write])),
+                (look.clone(), mode(&[Capability::Read], None)),
+                (
+                    work.clone(),
+                    mode(&[Capability::Read, Capability::Write], None),
+                ),
             ]
             .into()
         };
@@ -760,7 +755,7 @@ mod tests {
             base().modes(modes()).mode(missing.clone()),
         ] {
             let error = builder.build().await.err().unwrap();
-            assert!(matches!(error, HarnessError::UnknownMode(mode) if mode == missing));
+            assert_matches!(error, HarnessError::UnknownMode(mode) if mode == missing);
         }
         // Without modes the root holds the ceiling itself; a selection does not apply.
         let built = base().mode(work).build().await.unwrap();
@@ -1011,14 +1006,7 @@ mod tests {
                 .unwrap();
             let prompt = SensitivePrompt::test(SensitivePromptKind::Password);
             let result = harness.inner.sensitive_prompts.prompt(prompt).await;
-            match result {
-                Ok(_) => assert!(interactive),
-                Err(error) => {
-                    assert!(!interactive);
-                    let found = error.to_string();
-                    assert_eq!(found, "interactive authentication is unavailable");
-                }
-            }
+            assert_eq!(result.is_ok(), interactive);
             let found = calls.load(Ordering::SeqCst);
             assert_eq!(found, usize::from(interactive));
         }

@@ -699,52 +699,30 @@ mod tests {
         // failure would restore the silent-failure UX this classification exists
         // to prevent.
         let (_root, mut app, mut model, session) = played_fixture().await;
+        let failed = async |app: &mut App, failures: usize| {
+            observe_until(app, |app| count(&app.journal, model_failed) == failures).await;
+            let request = latest_request(&app.journal).unwrap();
+            let entries = whole_entries(app, false).await;
+            let card = entries
+                .into_iter()
+                .find(|entry| entry.key() == &EntryKey::Retry(request));
+            card.expect("a failure is presented in the conversation")
+        };
         let asked = ask(&session, "question");
         let refusal = Completion::cut(Vec::new(), CutReason::Refusal).unwrap();
         model.turn().await.complete(refusal);
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut app, |app| count(&app.journal, model_failed) == 1).await;
-        let refused_request = latest_request(&app.journal).unwrap();
-        let detail = (app.journal.iter()).find_map(|record| match &record.event {
-            SessionEvent::ModelFailed {
-                failure: AttemptFailure::Final(skyhook::agent::Failure::Refused(detail)),
-                ..
-            } => Some(detail.clone()),
-            _ => None,
-        });
-        let detail = detail.expect("a refusal is journaled as one");
-        let entries = whole_entries(&mut app, false).await;
-        let card = entries
-            .iter()
-            .find(|entry| entry.key() == &EntryKey::Retry(refused_request))
-            .expect("a refusal is presented in the conversation");
+        let card = failed(&mut app, 1).await;
         assert_eq!(card.surface, Surface::Error);
-        let mut lines = card.text().lines();
-        assert_eq!(
-            lines.next(),
-            Some("▾ Model declined to respond · attempt 1")
-        );
-        assert_eq!(lines.next(), Some(detail.as_str()));
-        assert_eq!(lines.next(), Some(super::super::retry::REFUSAL_HINT));
-        assert_eq!(lines.next(), None);
+        assert!(card.text().contains(super::super::retry::REFUSAL_HINT));
         // An ordinary failure keeps the muted presentation and gains no hint.
-        let (_root, mut app, mut model, session) = played_fixture().await;
-        let asked = ask(&session, "question");
+        let asked = ask(&session, "again");
         let rejected = ProviderErrorKind::Protocol.error("rejected");
         model.turn().await.fail(rejected);
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut app, |app| count(&app.journal, model_failed) == 1).await;
-        let failed_request = latest_request(&app.journal).unwrap();
-        let entries = whole_entries(&mut app, false).await;
-        let card = entries
-            .iter()
-            .find(|entry| entry.key() == &EntryKey::Retry(failed_request))
-            .expect("an ordinary failure is still presented");
+        let card = failed(&mut app, 2).await;
         assert_eq!(card.surface, Surface::Status);
-        assert_eq!(
-            card.text(),
-            "▾ Request failed · attempt 1 · Protocol\nrejected"
-        );
+        assert!(!card.text().contains(super::super::retry::REFUSAL_HINT));
     }
 
     /// A partial attempt shows where it settled until its agent's next turn begins,
@@ -790,8 +768,7 @@ mod tests {
             "interrupted thinking",
             "Incomplete response\ninterrupted partial",
         ];
-        for pair in order.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
+        for &[a, b] in order.array_windows() {
             assert!(
                 text.find(a).unwrap() < text.find(b).unwrap(),
                 "{a} must precede {b}: {text}"

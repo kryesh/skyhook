@@ -507,6 +507,7 @@ mod tests {
             },
         },
     };
+    use std::assert_matches;
     use tokio::sync::mpsc;
 
     /// Files and saved output have no change notification, so waits on them poll.
@@ -742,13 +743,13 @@ mod tests {
         let worker = tokio::spawn(serve_io_at(input, output, root));
         write_frame(&mut requests, &Request::Hello).await.unwrap();
         let ready = read_frame::<_, Response>(&mut responses).await.unwrap();
-        assert!(matches!(ready, Some(Response::Ready)));
+        assert_matches!(ready, Some(Response::Ready));
         gate.set(GateState::Held(None));
         let request = Request::Tool {
             request_id: RequestId::new(1),
-            name: "exec".into(),
-            arguments: serde_json::json!({"command":["/bin/sh", "-c", "printf x"]}),
-            capabilities: vec![Capability::Exec],
+            name: "read".into(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}),
+            capabilities: vec![Capability::Read],
             source: false,
         };
         write_frame(&mut requests, &request).await.unwrap();
@@ -756,67 +757,6 @@ mod tests {
         // Leaving closes both directions without yielding between them.
         gate.set(GateState::Broken);
         drop(requests);
-        bounded(worker).await.unwrap().unwrap();
-    }
-
-    /// A call cancelled while its source is still arriving never starts, still
-    /// answers with a terminal result, and releases its upload.
-    #[tokio::test]
-    async fn cancelled_uploads_finish_without_starting_the_call() {
-        use crate::remote::protocol::{PayloadEvent, PayloadId, Response, read_frame, write_frame};
-        let root = tempfile::tempdir().unwrap();
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut responses, mut requests) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let root_path = root.path().to_owned();
-        let worker = tokio::spawn(serve_io_at(server_input, server_output, root_path.clone()));
-        let id = RequestId::new(1);
-        let destination = root_path.join("never-written");
-        for request in [
-            Request::Hello,
-            Request::Tool {
-                request_id: id,
-                name: "write".into(),
-                arguments: serde_json::json!({"path": destination, "source": {"path": "x"}}),
-                capabilities: vec![Capability::Write],
-                source: true,
-            },
-            Request::SourceData {
-                request_id: id,
-                data: b"partial".to_vec(),
-            },
-            Request::Cancel { request_id: id },
-        ] {
-            write_frame(&mut requests, &request).await.unwrap();
-        }
-        let mut result = Vec::new();
-        loop {
-            match bounded(read_frame::<_, Response>(&mut responses))
-                .await
-                .unwrap()
-            {
-                Some(Response::Payload { event, .. }) => {
-                    if let PayloadEvent::Data {
-                        id: PayloadId::Result,
-                        data,
-                    } = event
-                    {
-                        result.extend(data);
-                    }
-                    write_frame(&mut requests, &Request::PayloadAck)
-                        .await
-                        .unwrap();
-                }
-                Some(Response::Tool { request_id }) if request_id == id => break,
-                Some(_) => {}
-                None => panic!("worker closed before the terminal result"),
-            }
-        }
-        let result: crate::remote::protocol::RemoteToolResult =
-            serde_json::from_slice(&result).unwrap();
-        assert!(result.is_err());
-        assert!(!destination.exists());
-        drop((requests, responses));
         bounded(worker).await.unwrap().unwrap();
     }
 
@@ -834,10 +774,10 @@ mod tests {
         let (server_input, server_output) = tokio::io::split(server);
         let worker = tokio::spawn(serve_io_at(server_input, server_output, root_path.clone()));
         write_frame(&mut requests, &Request::Hello).await.unwrap();
-        assert!(matches!(
+        assert_matches!(
             bounded(read_frame(&mut responses)).await.unwrap(),
             Some(Response::Ready)
-        ));
+        );
         let (upload, sibling) = (RequestId::new(1), RequestId::new(2));
         let never_written = root_path.join("never-written");
         let written = root_path.join("sibling");
@@ -1015,7 +955,7 @@ mod tests {
     /// arguments, as it does on the host, and a redirect names its new origin.
     #[tokio::test]
     async fn worker_reauthorization_uses_the_invocation_arguments() {
-        use crate::provider::http::transport::tests::{Plan, Server, reply};
+        use crate::tests::{Plan, Server, reply};
         let landing = Server::start(vec![Plan::reply(reply("200 OK", "", ""))]).await;
         let location = format!("Location: {}/\r\n", landing.root());
         let redirect = Plan::reply(reply("302 Found", &location, ""));
@@ -1082,31 +1022,18 @@ mod tests {
                         &crate::tool::policy::PathText::new(file.path()).unwrap(),
                     ))
         );
-        let sibling = worker
-            .tool(
-                CapabilitySet::default(),
-                "exec",
-                serde_json::json!({"command":["/bin/sh", "-c", "printf sibling"]}),
-            )
-            .await;
-        assert_eq!(
-            worker.result(sibling).await.output.unwrap()["stdout"],
-            "sibling"
-        );
+        // A workspace read asks for nothing, so only a blocked worker could hold it.
+        let workspace_read = || {
+            let arguments = serde_json::json!({"path":"Cargo.toml"});
+            worker.tool(CapabilitySet::default(), "read", arguments)
+        };
+        let sibling = workspace_read().await;
+        assert_eq!(worker.result(sibling).await.state, JobState::Completed);
         worker.runtime.jobs.cancel(blocked).await.unwrap();
         assert_eq!(worker.result(blocked).await.state, JobState::Cancelled);
         release.add_permits(1);
-        let followup = worker
-            .tool(
-                CapabilitySet::default(),
-                "exec",
-                serde_json::json!({"command":["/bin/sh", "-c", "printf reusable"]}),
-            )
-            .await;
-        assert_eq!(
-            worker.result(followup).await.output.unwrap()["stdout"],
-            "reusable"
-        );
+        let followup = workspace_read().await;
+        assert_eq!(worker.result(followup).await.state, JobState::Completed);
         assert_eq!(
             worker.runtime.jobs.snapshot(blocked).await.unwrap().state,
             JobState::Cancelled

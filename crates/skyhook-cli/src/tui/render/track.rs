@@ -210,24 +210,25 @@ impl Records {
 mod tests {
     use super::super::super::app::{
         played::{ask, observe_until, played_fixture, streamed},
-        tests::{Screen, capture_work, draw, recv, viewing},
+        tests::{Screen, capture_work, draw, recv, viewing, viewing_within},
     };
     use super::super::cache::tests::{mixed_history, settle, statuses, top};
     use super::*;
     use crate::tests::bounded;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use skyhook::agent::SessionHandle;
 
-    /// Stepping through a history of entries of mixed heights and records that show
-    /// nothing, longer than a window keeps, on a screen `height` rows tall, moves the
+    /// Stepping through `session`'s history on a screen `height` rows tall moves the
     /// thumb only the way it steps, and pages landing not at all but to the start once
     /// found, from flush with the top to flush with the bottom, where the view follows
     /// the newest entries.
-    async fn step_through_mixed_history(
+    async fn step_through(
+        session: &SessionHandle,
+        budget: model::Budget,
         height: u16,
         step: fn(bool, ratatui::layout::Rect) -> Event,
     ) {
-        let (_root, _app, session) = mixed_history().await;
-        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
+        let (_viewer, mut app) = viewing_within(session, Tab::Conversation, budget).await;
         let mut work = capture_work(&mut app);
         let mut screen = Screen::new(80, height);
         screen.draw(&mut app);
@@ -258,14 +259,7 @@ mod tests {
         };
         // The first step that moved the thumb against the scroll.
         let against = |thumb: Vec<f64>, up: bool| {
-            let back = |step: &[f64]| {
-                if up {
-                    step[1] > step[0]
-                } else {
-                    step[1] < step[0]
-                }
-            };
-            thumb.windows(2).position(back)
+            (thumb.array_windows()).position(|&[a, b]| if up { b > a } else { b < a })
         };
         let up = scroll(&mut app, true).await;
         assert_eq!(against(up, true), None);
@@ -279,10 +273,18 @@ mod tests {
         assert!(app.entries().iter().all(|entry| *entry.key() != later));
     }
 
-    /// Wheeling, a few rows at a time.
+    /// Through a history of entries of mixed heights and records that show nothing,
+    /// longer than a window keeps, the thumb moves only one way to each end: wheeling a
+    /// few rows at a time, and paging a screen showing more records than a window keeps
+    /// beside it. Dragging the thumb down the track moves the view down with it, and the
+    /// pointer held at a row keeps the view where it is, whatever heights the entries it
+    /// passes.
     #[tokio::test]
-    async fn wheeling_through_the_history_moves_the_thumb_one_way_to_each_end() {
-        step_through_mixed_history(40, |up, rect| {
+    async fn scrolling_a_mixed_history_moves_the_thumb_one_way() {
+        use crossterm::event::MouseButton;
+        let budget = model::Budget::SMALL;
+        let (_root, _app, session) = mixed_history(budget).await;
+        step_through(&session, budget, 40, |up, rect| {
             Event::Mouse(MouseEvent {
                 kind: match up {
                     true => MouseEventKind::ScrollUp,
@@ -294,12 +296,7 @@ mod tests {
             })
         })
         .await;
-    }
-
-    /// Paging a screen showing more records than a window keeps beside it.
-    #[tokio::test]
-    async fn paging_a_screen_taller_than_the_window_moves_the_thumb_one_way_to_each_end() {
-        step_through_mixed_history(700, |up, _| {
+        step_through(&session, budget, 700, |up, _| {
             let code = if up {
                 KeyCode::PageUp
             } else {
@@ -308,15 +305,8 @@ mod tests {
             Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
         })
         .await;
-    }
 
-    /// Dragging the thumb down the track moves the view down with it, and the pointer
-    /// held at a row keeps the view where it is, whatever heights the entries it passes.
-    #[tokio::test]
-    async fn dragging_the_thumb_moves_the_view_with_the_pointer() {
-        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let (_root, _app, session) = mixed_history().await;
-        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
+        let (_viewer, mut app) = viewing_within(&session, Tab::Conversation, budget).await;
         let mut work = capture_work(&mut app);
         draw(&mut app);
         let track = app.render.content_rect;
@@ -350,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn a_view_on_a_notice_before_every_entry_stays_at_the_start() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-        let (_root, _app, session) = statuses(model::KEPT + 3 * model::PAGE).await;
+        let (_root, _app, session) = statuses(2 * model::Budget::DEFAULT.page).await;
         let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
         crate::tui::app::tests::unsaved_at(&mut app, None, "drafted");
         let mut work = capture_work(&mut app);

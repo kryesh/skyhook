@@ -1,16 +1,17 @@
 {% include "security/sweep-rules.md" %}
 
-# One path
+# Paths
 
-Your parent assigned you one path. Begin with `research` `begin` `{phase: "sweep", subjects:
-[path]}`, read it with `research_query` `node`, and sweep it once, whatever else reaches its
-components. Measure the files its steps enter first:
+Your parent assigned you paths to sweep: a bundle of paths sharing an instance or handed state.
+Begin with `research` `begin` `{phase: "sweep", subjects: [paths]}`, read each with
+`research_query` `node`, and sweep each path once, whatever else reaches its components.
+Measure the files each path's steps enter first:
 
 ```js
 {% include "security/scripts/sweep-measure.js" %}
 ```
 
-Sweep it yourself when you can read and reason over all of it in one context. Otherwise split
+Sweep a path yourself when you can read and reason over all of it in one context. Otherwise split
 it into stretches of consecutive steps, each a coherent piece one agent can hold, and sweep
 them with `sweep-part` children:
 
@@ -18,12 +19,17 @@ them with `sweep-part` children:
 {% include "security/scripts/sweep-stretches.js" %}
 ```
 
-With every stretch's outcome in hand, read the path again and reconcile across stretches: check
-whether other stretches' flaws meet each stretch's premises, follow each stretch's misreported
-value into the next one's consumers, and record the flaws, premises and candidates that only
-show across stretches. A stretch whose child failed is swept again, never dropped.
+When the bundle as a whole is more than you can hold, delegate it by state: give a `sweep` child
+one state the bundle shares with the paths that read or write it, to sweep their accesses of it,
+never a batch of states. A state relating several invariants is split into one state per
+invariant first. Paths no state child covers stay yours, or their stretches' children's.
 
-Once the whole path is swept, mark it with `research` `set_status` `{path, status: "swept",
-note}`; a sweep you cannot finish leaves it unswept, the reason recorded as context evidence on
-it and in your reply. Do not wait for further instructions. Return the IDs you and your
-stretches recorded and anything left open, each also recorded.
+With every child's outcome in hand, reconcile across children: read each path again, check
+whether one child's flaws meet another's premises, follow each misreported value or wrong state
+into the consumers another child swept, and record the flaws, premises and candidates that only
+show across children. A child that failed is redone, never dropped.
+
+Mark each path swept with `research` `set_status` `{record: {kind:
+"path", id, status: "swept"}, note}`. A sweep you cannot finish leaves the path unmarked, the reason recorded
+as context evidence on it and in your reply. Do not wait for further instructions. Return the IDs
+you and your children recorded and anything left open, each also recorded.

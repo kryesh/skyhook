@@ -2,30 +2,29 @@
 
 Your parent assigned you premises to settle or flaws to chain. Begin with `research` `begin`:
 the phase (`settle` or `chain`) and every id in your brief. A loose-end review begins no task, so
-what it records reopens work: settle each premise, or record what would settle it or the
-evidence or edit that reopens its settling. Read them together with
-`research_query` `node`, but answer each one. Read source code for the missing fact, not to
-sweep again.
+what it records reopens work: propose each premise's status, or record what would settle it or
+the evidence or edit that reopens its settling. Read them together with
+`research_query` `node`, but answer each one, and before deciding read what each bears on: a
+premise's flaws and the states they leave wrong, a flaw's premises and states, with their
+evidence and latest checks. Read source code for the missing fact, not to sweep again.
 
 **Settle** each premise from the code or a binary's disassembly: `set_status` `holds` or
-`fails`, with evidence at every site the answer rests on. A premise about a value's meaning, a
-bound or a check covers every site producing or enforcing it: `holds` names a site that meets
-it, and `fails` shows why each site cannot. A premise that another flow can change state between
-a check and its use, or while a flow relies on it, covers every writer: `holds` names one, the
-flow that runs it (a path, thread, task, signal or later action) and who drives it, citing by id
-a writer that is a recorded flaw; `fails` shows each writer kept out of the window (a lock, an
-ordering, a single thread, ownership or permission), or that the use acts on what was checked.
+`fails`, with evidence at every site the answer rests on.
 {%- if live %}
 A bounded experiment or measurement in a recorded environment may decide what the code alone
 cannot, such as a timing, a reuse or the logic behind an interface without code: run it
 yourself or through a child, and decide from what it observed against its control, cited as
 evidence.
 {%- endif %}
-"Looks bounded" settles nothing; leave a premise you cannot settle undecided, with
-evidence on the sites you checked and those you did not.
+Leave a premise you cannot settle undecided, with evidence on the sites you checked and those
+you did not.
 
 **Chain** each flaw: follow its effect to what an attacker observes, including through state it
-leaves for a later action or another flow.
+leaves for a later action or another flow. Read the readers of each state it leaves wrong (the
+state's `node` lists them; `begin`'s changes name those recorded since its last chain) and follow
+the ones that matter: where the wrong state continues, record the candidate that performs that
+path after the flaw's action; a reader you rule out may get `context` evidence on the flaw saying
+why, where worth noting.
 {%- if live %}
 Where no code is available, observe the effect in an environment serving it.
 {%- endif %}

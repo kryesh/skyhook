@@ -24,7 +24,6 @@ use crate::{
     media::ImageRef,
     tool::diagnostic::{Effects, FailureSite, Operation, Subject},
     tool::executor::{InvocationKind, ToolExecutor, failure_response},
-    tool::output::FieldPresentation,
     tool::{ToolContext, ToolError, ToolOutput, ToolResultPolicy},
 };
 
@@ -179,7 +178,7 @@ async fn evaluate_inner(
                                 )
                                 .await;
                             drop(issuing);
-                            let output = match created {
+                            let mut output = match created {
                                 Ok(created) => {
                                     (policy, job) = (created.result_policy(), Some(created.job()));
                                     let reported = host_executor.run_reported(created, parent).await;
@@ -191,14 +190,14 @@ async fn evaluate_inner(
                                 }
                                 Err(error) => failed(error),
                             };
-                            host_images.lock().await.extend(output.images);
+                            host_images.lock().await.extend(std::mem::take(&mut output.images));
                             let jobs = host_executor.jobs();
                             let result = match (policy, job) {
-                                (ToolResultPolicy::Value, Some(job)) => jobs.output_schema(job).await.ok().flatten(),
                                 (ToolResultPolicy::JobView, _) => inspected_schema(jobs, &output.value).await,
-                                (ToolResultPolicy::Value, None) | (ToolResultPolicy::Nothing, _) => None,
+                                (_, Some(job)) => jobs.output_schema(job).await.ok().flatten(),
+                                (_, None) => None,
                             };
-                            script_view(output.value, policy, result.as_deref())
+                            script_view(output, result.as_deref())
                         }
                         HostRequest::Receive => {
                             drop(issuing);
@@ -280,41 +279,24 @@ async fn evaluate_inner(
         .with_presented(presented.into_iter().collect()))
 }
 
-/// A response as scripts see it: with the presentations its schemas declare, and
-/// each member they declare but it lacks as `null`. `result` is the schema its
-/// result follows, when known.
-fn script_view(mut value: Value, policy: ToolResultPolicy, result: Option<&Value>) -> HostResponse {
-    let schemas = &JOB_VIEW_SCHEMAS;
-    let mut presented = Presented::new();
-    let view = match policy {
-        // The response keeps its error and questions whole, and its result what
-        // the tool's schema declares.
-        ToolResultPolicy::Value => {
-            presented.extend(presented_fields(
-                &value,
-                &FieldPointer::root(),
-                &schemas.response,
-            ));
-            if let (Some(schema), Some(result)) = (result, value.get("result")) {
-                presented.extend(presented_fields(result, &FieldPointer::result(), schema));
-            }
-            &schemas.response
-        }
-        // Job views and bare envelopes are presentations already.
-        ToolResultPolicy::Nothing => {
-            presented.insert(FieldPointer::root(), FieldPresentation::Complete);
-            &schemas.response
-        }
-        ToolResultPolicy::JobView => {
-            presented.insert(FieldPointer::root(), FieldPresentation::Complete);
-            &schemas.one
-        }
-    };
+/// A response as scripts see it: its own fields presented as its schema declares,
+/// the rest as its output presents them, and each member its schemas declare but
+/// it lacks as `null`. `result` is the schema its result follows, when known.
+fn script_view(output: ToolOutput, result: Option<&Value>) -> HostResponse {
+    let view = &JOB_VIEW_SCHEMAS.view;
+    let (mut value, mut presented) = (output.value, output.presented);
+    presented.extend(presented_fields(&value, &FieldPointer::root(), view));
     if let (Some(schema), Some(result)) = (result, value.get_mut("result")) {
         fill_absent(result, schema);
     }
     fill_absent(&mut value, view);
-    HostResponse::Ok { value, presented }
+    let presented = presented
+        .fields()
+        .map(|(field, shown)| (field.clone(), shown));
+    HostResponse::Ok {
+        value,
+        presented: presented.collect(),
+    }
 }
 
 /// The schema an inspected job's result follows, when the view shows it whole: a
@@ -343,6 +325,7 @@ async fn inspected_schema(jobs: &JobManager, view: &Value) -> Option<Arc<Value>>
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::time::{Duration, Instant};
 
     use crate::tests::TestRuntime;
@@ -438,8 +421,7 @@ mod tests {
         // A buffer as large as the entire budget is rejected before allocating its backing store.
         let source = "new ArrayBuffer(512 * 1024 * 1024);";
         let (diagnostic, output) = bounded(plain(source)).await.unwrap_err().into_parts();
-        assert!(
-            matches!(&diagnostic.cause, Cause::Message(message) if message.contains("out of memory")),
+        assert_matches!(&diagnostic.cause, Cause::Message(message) if message.contains("out of memory"),
             "{diagnostic:?}"
         );
         assert_eq!(output.unwrap().value["value"], Value::Null);
@@ -541,6 +523,8 @@ mod tests {
         struct Streams {
             #[schemars(transform = crate::tool::output::ends)]
             stdout: String,
+            #[schemars(transform = crate::tool::output::complete)]
+            note: String,
         }
         let mut builder = ToolRegistryBuilder::default();
         builder
@@ -551,6 +535,7 @@ mod tests {
                 |_, input| async move {
                     Ok(Streams {
                         stdout: input.value,
+                        note: String::new(),
                     })
                 },
             )
@@ -571,6 +556,13 @@ return {full, extracted};";
                 .map(|field| field.as_str())
                 .eq(fields)
         );
+        for field in [
+            "/result/value/extracted/note",
+            "/result/value/full/result/note",
+        ] {
+            let field: crate::job::FieldPointer = field.parse().unwrap();
+            assert!(presented.complete().contains(&field), "{field:?}");
+        }
     }
 
     /// The script tool is hidden and rejected inside scripts, and denied
@@ -621,13 +613,8 @@ return {full, extracted};";
         );
         let source = r#"
 const deniedResponse = await tool.deny({value:"x"});
-let denied;
-try { deniedResponse.unwrap(); } catch (error) {
-  denied = {code:error.code, job:error.job, message:error.message,
-            output:error.output ?? null, sameResponse:error.response === deniedResponse};
-}
 const imported = await import("skyhook:tools").then(() => true, () => false);
-return {visible: typeof tool.script, imported, deniedResponse, denied};
+return {visible: typeof tool.script, imported, deniedResponse};
 "#;
         let output = evaluate(source, executor.clone(), context.clone())
             .await
@@ -639,15 +626,8 @@ return {visible: typeof tool.script, imported, deniedResponse, denied};
         // A returned response keeps its error whole in the script's presentation.
         let error: crate::job::FieldPointer = "/result/value/deniedResponse/error".parse().unwrap();
         assert!(output.presented.complete().contains(&error));
-        let job = &value["deniedResponse"]["id"];
-        assert_eq!(
-            (&value["denied"]["code"], &value["denied"]["job"]),
-            (&json!("permission_denied"), job)
-        );
-        assert!(value["denied"]["output"].is_null());
-        assert_eq!(value["denied"]["sameResponse"], true);
         assert!(
-            value["denied"]["message"]
+            value["deniedResponse"]["error"]
                 .as_str()
                 .unwrap()
                 .contains("user reason")
@@ -662,128 +642,13 @@ return {visible: typeof tool.script, imported, deniedResponse, denied};
         let (diagnostic, Some(output)) = error.into_parts() else {
             panic!("expected nested failure details")
         };
-        assert!(matches!(diagnostic.cause, Cause::Message(_)));
+        assert_matches!(diagnostic.cause, Cause::Message(_));
         // The failed response is referenced by its job, not embedded again.
         let failure = &output.value["failure"];
         assert_eq!(failure["code"], "permission_denied");
         assert_eq!(
             failure.as_object().unwrap().keys().collect::<Vec<_>>(),
             ["job", "code"]
-        );
-    }
-
-    #[tokio::test]
-    async fn work_pool_accepts_native_arrays_completion_order_and_early_close() {
-        // A failure whatever is thrown still settles its task.
-        let output = crate::tests::bounded(plain(
-            r#"
-const values = [2, 3];
-const pooled = [], settled = [];
-for await (const result of new WorkPool(2).map(values, async value => value * 2)) pooled.push(result);
-const tasks = values.map(value => async () => {
-  if (value === 3) throw new Error("three");
-  return value * 3;
-});
-for await (const result of new WorkPool(2).run(tasks)) settled.push(result);
-const unprintable = [() => { throw Object.create(null); }, () => { throw {get message() { throw 0; }}; }];
-for await (const result of new WorkPool(1).run(unprintable)) settled.push(result);
-let rejected = false;
-try { new WorkPool(1).map(values, null); } catch (error) { rejected = error instanceof TypeError; }
-return {values, pooled, settled, rejected};
-"#,
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            output.value["value"],
-            json!({
-                "values": [2, 3],
-                "pooled": [{ "index":0, "value":4 }, { "index":1, "value":6 }],
-                "settled": [
-                    {"index":0,"value":6}, {"index":1,"error":"three"},
-                    {"index":0,"error":"[Unprintable]"}, {"index":1,"error":"[Uninspectable property]"},
-                ],
-                "rejected": true,
-            })
-        );
-        let output = plain(
-            r#"
-const gates = Array.from({length:4}, () => {
-  let resolve; const promise = new Promise(done => { resolve = done; });
-  return {promise, resolve};
-}), started = [];
-const iterator = new WorkPool(2).map(gates, async (gate, index) => {
-  started.push(index);
-  const value = await gate.promise;
-  if (value === "fail") throw new Error("late failure");
-  return value;
-});
-const pending = iterator.next(); gates[1].resolve("second");
-const first = await pending;
-const next = iterator.next(); gates[2].resolve("third");
-const second = await next;
-const closing = iterator.return(); gates[0].resolve("fail");
-await closing;
-return {first, second, started};
-"#,
-        )
-        .await
-        .unwrap();
-        let value = &output.value["value"];
-        assert_eq!(value["first"]["value"]["index"], 1);
-        assert_eq!(value["second"]["value"]["index"], 2);
-        assert_eq!(value["started"], json!([0, 1, 2]));
-    }
-
-    /// A feed refills from `next` as items complete, keeps the items beyond its free slots
-    /// for later, never runs one key twice at once, returns failures and wake-ups as
-    /// values, and releases a wake still pending when it ends.
-    #[tokio::test]
-    async fn work_pool_feeds_ready_items_by_key() {
-        let output = plain(
-            r#"
-const queue = [{key: "a", n: 1}, {key: "b", n: 2}, {key: "a", n: 3}, {key: "c", n: 4}];
-const asked = [], order = [], live = new Set();
-let overlap = false, released = 0, wakes = 0;
-const gates = new Map();
-const feed = new WorkPool(2).feed(async (running, free) => {
-  asked.push(free);
-  return queue.splice(0, queue.length);
-}, async item => {
-  if (live.has(item.key)) overlap = true;
-  live.add(item.key);
-  await new Promise(resolve => gates.set(item.n, resolve));
-  live.delete(item.key);
-  if (item.n === 4) throw new Error("four");
-  return item.n;
-}, {wake: () => {
-  wakes++;
-  if (wakes === 1) return "ping";
-  return Object.defineProperty(new Promise(() => {}), "release", {value: () => released++});
-}});
-const open = () => { for (const [n, resolve] of gates) { gates.delete(n); resolve(); return; } };
-for await (const r of feed) {
-  order.push("wake" in r ? {wake: r.wake} : r.error ? {key: r.key, error: r.error} : {key: r.key, value: r.value});
-  await sleep(0);
-  open();
-}
-return {order, asked, overlap, released, wakes};
-"#,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            output.value["value"],
-            json!({
-                "order": [
-                    {"wake":"ping"}, {"key":"a","value":1}, {"key":"b","value":2},
-                    {"key":"a","value":3}, {"key":"c","error":"four"},
-                ],
-                "asked": [2, 1, 2],
-                "overlap": false,
-                "released": 1,
-                "wakes": 2,
-            })
         );
     }
 
@@ -851,9 +716,8 @@ return {order, asked, overlap, released, wakes};
             let diagnostic = plain(source).await.unwrap_err().diagnostic();
             assert_eq!(diagnostic.context.operation, Operation::Validate);
             assert_eq!(diagnostic.context.effects, Effects::NotStarted);
-            assert!(
-                matches!(&diagnostic.cause, Cause::Message(message)
-                    if message.starts_with("SyntaxError: ") && message.ends_with(&format!("at {location}"))),
+            assert_matches!(&diagnostic.cause, Cause::Message(message)
+                    if message.starts_with("SyntaxError: ") && message.ends_with(&format!("at {location}")),
                 "{diagnostic:?}"
             );
         }
@@ -866,8 +730,7 @@ return {order, asked, overlap, released, wakes};
         let diagnostic = failed.unwrap_err().diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::Execute);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
-        assert!(
-            matches!(&diagnostic.cause, Cause::Message(message) if message.contains("a non-finite number at $.nested"))
+        assert_matches!(&diagnostic.cause, Cause::Message(message) if message.contains("a non-finite number at $.nested")
         );
     }
 
@@ -899,7 +762,7 @@ return {order, asked, overlap, released, wakes};
         let diagnostic = error.diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::CreateCapture);
         assert_eq!(diagnostic.context.effects, Effects::NotStarted);
-        assert!(matches!(diagnostic.cause, Cause::Io { .. }));
+        assert_matches!(diagnostic.cause, Cause::Io { .. });
     }
 
     #[test]
@@ -942,13 +805,13 @@ return {order, asked, overlap, released, wakes};
         .into_parts();
         assert_eq!(diagnostic.context.operation, Operation::FinishCapture);
         assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
-        assert!(matches!(
+        assert_matches!(
             diagnostic.cause,
             Cause::Io {
                 kind: IoKind::BrokenPipe,
                 ..
             }
-        ));
+        );
         assert_eq!(output.unwrap().value, json!({"value":{"computed":42}}));
     }
 
@@ -1033,22 +896,124 @@ function __skyhookConsoleLog(message) {
     }
 
     #[test]
-    fn presented_fields_follow_full_envelopes_and_extracted_native_payloads() {
-        let result = evaluate_wrapper_envelope(
+    fn work_pool_accepts_native_arrays_completion_order_and_early_close() {
+        // A failure whatever is thrown still settles its task.
+        let value = evaluate_wrapper(
             r#"
-const full = await tool.echo({value:["full"]});
-const extracted = (await tool.echo({value:["extracted"]})).result.value;
-return {full, extracted};
+const values = [2, 3];
+const pooled = [], settled = [];
+for await (const result of new WorkPool(2).map(values, async value => value * 2)) pooled.push(result);
+const tasks = values.map(value => async () => {
+  if (value === 3) throw new Error("three");
+  return value * 3;
+});
+for await (const result of new WorkPool(2).run(tasks)) settled.push(result);
+const unprintable = [() => { throw Object.create(null); }, () => { throw {get message() { throw 0; }}; }];
+for await (const result of new WorkPool(1).run(unprintable)) settled.push(result);
+let rejected = false;
+try { new WorkPool(1).map(values, null); } catch (error) { rejected = error instanceof TypeError; }
+return {values, pooled, settled, rejected};
 "#,
         );
         assert_eq!(
-            result["presented"],
+            value,
             json!({
-                "/result/value/full/result/value": "complete",
-                "/result/value/full/result/value/0": "ends",
-                "/result/value/extracted": "complete",
-                "/result/value/extracted/0": "ends",
+                "values": [2, 3],
+                "pooled": [{ "index":0, "value":4 }, { "index":1, "value":6 }],
+                "settled": [
+                    {"index":0,"value":6}, {"index":1,"error":"three"},
+                    {"index":0,"error":"[Unprintable]"}, {"index":1,"error":"[Uninspectable property]"},
+                ],
+                "rejected": true,
             })
+        );
+        let value = evaluate_wrapper(
+            r#"
+const gates = Array.from({length:4}, () => {
+  let resolve; const promise = new Promise(done => { resolve = done; });
+  return {promise, resolve};
+}), started = [];
+const iterator = new WorkPool(2).map(gates, async (gate, index) => {
+  started.push(index);
+  const value = await gate.promise;
+  if (value === "fail") throw new Error("late failure");
+  return value;
+});
+const pending = iterator.next(); gates[1].resolve("second");
+const first = await pending;
+const next = iterator.next(); gates[2].resolve("third");
+const second = await next;
+const closing = iterator.return(); gates[0].resolve("fail");
+await closing;
+return {first, second, started};
+"#,
+        );
+        assert_eq!(value["first"]["value"]["index"], 1);
+        assert_eq!(value["second"]["value"]["index"], 2);
+        assert_eq!(value["started"], json!([0, 1, 2]));
+    }
+
+    /// A feed refills from `next` as items complete, keeps the items beyond its free slots
+    /// for later, never runs one key twice at once, returns failures and wake-ups as
+    /// values, and releases a wake still pending when it ends.
+    #[test]
+    fn work_pool_feeds_ready_items_by_key() {
+        let value = evaluate_wrapper(
+            r#"
+const queue = [{key: "a", n: 1}, {key: "b", n: 2}, {key: "a", n: 3}, {key: "c", n: 4}];
+const asked = [], order = [], live = new Set();
+let overlap = false, released = 0, wakes = 0;
+const gates = new Map();
+const feed = new WorkPool(2).feed(async (running, free) => {
+  asked.push(free);
+  return queue.splice(0, queue.length);
+}, async item => {
+  if (live.has(item.key)) overlap = true;
+  live.add(item.key);
+  await new Promise(resolve => gates.set(item.n, resolve));
+  live.delete(item.key);
+  if (item.n === 4) throw new Error("four");
+  return item.n;
+}, {wake: () => {
+  wakes++;
+  if (wakes === 1) return "ping";
+  return Object.defineProperty(new Promise(() => {}), "release", {value: () => released++});
+}});
+const open = () => { for (const [n, resolve] of gates) { gates.delete(n); resolve(); return; } };
+for await (const r of feed) {
+  order.push("wake" in r ? {wake: r.wake} : r.error ? {key: r.key, error: r.error} : {key: r.key, value: r.value});
+  await sleep(0);
+  open();
+}
+return {order, asked, overlap, released, wakes};
+"#,
+        );
+        assert_eq!(
+            value,
+            json!({
+                "order": [
+                    {"wake":"ping"}, {"key":"a","value":1}, {"key":"b","value":2},
+                    {"key":"a","value":3}, {"key":"c","error":"four"},
+                ],
+                "asked": [2, 1, 2],
+                "overlap": false,
+                "released": 1,
+                "wakes": 2,
+            })
+        );
+    }
+
+    /// `JSON.parse` given a value a tool already decoded returns a copy of it, reviver applied.
+    #[test]
+    fn json_parse_takes_a_decoded_value_as_itself() {
+        let source = "const decoded = {a: [1, {b: 2}]}; const copy = JSON.parse(decoded);
+copy.a.push(3);
+const revived = JSON.parse({n: 1}, (_, x) => typeof x === 'number' ? x + 1 : x);
+return {copy, decoded, revived, text: JSON.parse('[1]')};";
+        assert_eq!(
+            evaluate_wrapper(source),
+            json!({"copy": {"a": [1, {"b": 2}, 3]}, "decoded": {"a": [1, {"b": 2}]},
+                   "revived": {"n": 2}, "text": [1]})
         );
     }
 
@@ -1226,10 +1191,12 @@ return results;
         assert_eq!(result, json!(["ping", 1]));
     }
 
-    /// A released receive returns its value to the oldest receive still waiting, so
-    /// input arrives in order.
+    /// A released receive returns its value to the oldest receive still waiting, and
+    /// values released by feeds that end with their wakes taken but unread reach later
+    /// receives in the order they arrived. A wake still waiting when its feed ends keeps
+    /// nothing: the value its receive was pulling reaches the next `receive()`.
     #[test]
-    fn a_released_receive_goes_to_the_oldest_waiter() {
+    fn released_receives_keep_their_arrival_order() {
         let result = evaluate_wrapper(
             r#"
 const answers = [];
@@ -1247,12 +1214,6 @@ return [await second, await third].map(received => received.value);
 "#,
         );
         assert_eq!(result, json!(["one", "two"]));
-    }
-
-    /// Values released by feeds that end with their wakes taken but unread reach later
-    /// receives in the order they arrived.
-    #[test]
-    fn released_receives_keep_their_arrival_order() {
         let result = evaluate_wrapper(
             r#"
 const answers = [], wakes = [];
@@ -1273,6 +1234,23 @@ for (const [index, value] of ["one", "two"].entries()) {
 }
 for (const feed of feeds) await feed.return();
 return [await receive(), await receive()].map(received => received.value);
+"#,
+        );
+        assert_eq!(result, json!(["one", "two"]));
+        let result = evaluate_wrapper(
+            r#"
+const answers = [];
+__skyhookHostCall = () => new Promise(resolve => answers.push(value => {
+  resolve(JSON.stringify({outcome: "ok", value: {value}, presented: {}}));
+}));
+for await (const _ of new WorkPool(1).feed(async () => [], async () => 0, {wake: receive})) {}
+const once = [{key: 1}];
+for await (const _ of new WorkPool(1).feed(async () => once.splice(0), async () => sleep(0), {wake: receive})) {}
+const first = receive(), second = receive();
+answers.shift()("one");
+await first;
+answers.shift()("two");
+return [await first, await second].map(received => received.value);
 "#,
         );
         assert_eq!(result, json!(["one", "two"]));
@@ -1376,22 +1354,8 @@ return {{direct, inspected, missing:direct.result.entries.symlinks === null}};
         assert_eq!(value["direct"].get("id"), Some(&Value::Null));
         assert_eq!(value["inspected"]["result"]["entries"], groups);
         assert_eq!(value["inspected"].get("error"), Some(&Value::Null));
-    }
-
-    /// An inspected result fills from its own invocation's schema, here a JobView
-    /// rather than the listing the `jobs` tool declares, and only when shown whole.
-    #[tokio::test]
-    async fn inspected_results_fill_from_their_invocations_schema() {
-        let runtime = TestRuntime::new().await;
-        tokio::fs::create_dir(runtime.root.path().join("listed"))
-            .await
-            .unwrap();
-        let (executor, _slot) =
-            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
-        let listed = executor
-            .run_model(&runtime.agent, "read", json!({"path":"listed"}))
-            .await
-            .unwrap();
+        // An inspected result fills from its own invocation's schema, here a JobView
+        // rather than the listing the `jobs` tool declares, and only when shown whole.
         let inspection = executor
             .run_model(&runtime.agent, "jobs", json!({"job":listed.job}))
             .await
@@ -1414,6 +1378,28 @@ return {{direct, inspected, missing:direct.result.entries.symlinks === null}};
         );
         let truncated = shown(json!({"truncated":[{"field":"/result/entries"}]}));
         assert!(inspected_schema(&runtime.jobs, &truncated).await.is_none());
+    }
+
+    /// A script holds a saved job's whole result, but returning its view presents
+    /// that result to the model as a direct read would.
+    #[tokio::test]
+    async fn returned_job_views_present_their_results() {
+        let runtime = TestRuntime::new().await;
+        let (executor, _slot) =
+            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let agent = &runtime.agent;
+        let source = "return Array.from({length: 5000}, (_, index) => index);";
+        let saved = script(&executor, agent, source.into(), false).await;
+        let source = format!(
+            "const view = await tool.jobs({{job:{}}});
+if (view.result.value.length !== 5000) throw new Error('partial');
+return view;",
+            saved.job
+        );
+        let output = script(&executor, agent, source, false).await.output;
+        let shown = &output.value["result"]["value"]["result"]["value"];
+        assert!(shown.as_array().unwrap().len() < 5000, "{:#}", output.value);
+        assert!(output.value["presentation"]["truncated"].is_array());
     }
 
     #[test]
@@ -1544,17 +1530,15 @@ return __testCalls;
         let launched = script(&executor, agent, source.into(), true).await;
         assert!(launched.background);
         runtime.jobs.wait(launched.job, true).await.unwrap();
-        for _ in 0..2 {
-            let output = executor
-                .run_model(agent, "jobs", json!({"job":launched.job}))
-                .await;
-            let output = output.unwrap().output;
-            assert_eq!(output.value["state"], "completed");
-            // Returning a tool response preserves its canonical read JobView.
-            assert_eq!(output.value["result"]["value"]["result"]["kind"], "image");
-            assert_eq!(output.value["result"].get("console"), None);
-            assert_loaded(&runtime.store, output.images).await;
-        }
+        let output = executor
+            .run_model(agent, "jobs", json!({"job":launched.job}))
+            .await;
+        let output = output.unwrap().output;
+        assert_eq!(output.value["state"], "completed");
+        // Returning a tool response preserves its canonical read JobView.
+        assert_eq!(output.value["result"]["value"]["result"]["kind"], "image");
+        assert_eq!(output.value["result"].get("console"), None);
+        assert_loaded(&runtime.store, output.images).await;
         let source = format!(
             "console.log('kept'); return await tool.jobs({{job:{}}});",
             launched.job

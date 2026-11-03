@@ -255,6 +255,7 @@ impl From<McpServerConfig> for RawMcpServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::path::Path;
 
     const STDIO: &str = "transport: 'stdio'\nstart_command: ['server']";
@@ -279,22 +280,16 @@ mod tests {
     }
 
     #[test]
-    fn admission_is_pure_and_retains_runtime_environment_failures() {
-        // Existence/access and environment values remain startup concerns.
+    fn admission_rejects_invalid_connections_commands_and_timeouts() {
+        use McpConfigError::*;
+        // Admission is pure: existence, access and environment values remain
+        // startup concerns, and header names are normalized.
         let config: McpServerConfig = crate::yaml::parse("transport: 'streamable_http'\nurl: 'http://localhost:1234/mcp'\nstart_command: ['/nonexistent/mcp-command']\ncwd: '/nonexistent/mcp-directory'\nheaders: { Authorization: { env: 'MISSING_MCP_TEST_TOKEN' } }").unwrap();
-        let mut raw: RawMcpServerConfig = config.into();
+        let raw: RawMcpServerConfig = config.into();
         let env = "MISSING_MCP_TEST_TOKEN".to_owned();
         assert_eq!(raw.headers["authorization"], Sourced::Env { env });
         let cwd = Some(Path::new("/nonexistent/mcp-directory"));
         assert_eq!(raw.cwd.as_deref(), cwd);
-        raw.start_command = None;
-        let error = McpServerConfig::try_from(raw).unwrap_err();
-        assert_eq!(error, McpConfigError::LaunchWithoutCommand);
-    }
-
-    #[test]
-    fn admission_rejects_invalid_connections_commands_and_timeouts() {
-        use McpConfigError::*;
         let http = "transport: 'streamable_http'\nurl: 'https://example.com/mcp'";
         let cases = [
             ("transport: 'stdio'".into(), MissingCommand),
@@ -361,10 +356,7 @@ mod tests {
         let sse = "transport: 'sse'\nstart_command: ['server']";
         for text in extras.iter().map(String::as_str).chain([sse]) {
             let parsed = crate::yaml::parse::<RawMcpServerConfig>(text);
-            assert!(
-                matches!(parsed, Err(crate::yaml::YamlError::Value(_))),
-                "{text}"
-            );
+            assert_matches!(parsed, Err(crate::yaml::YamlError::Value(_)), "{text}");
         }
     }
 }

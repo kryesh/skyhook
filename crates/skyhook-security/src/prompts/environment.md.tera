@@ -2,7 +2,7 @@
 
 Prepare or describe a running instance for the live work your brief names; it is not an implicit
 permission to exploit. Read the candidates and interfaces your brief names and the existing
-environments (`research_query` `list` `{kind: "environment"}`). Confirm the needed services, build options, identities and roles, network
+environments (`research_query` `list` `{record: {kind: "environment"}}`). Confirm the needed services, build options, identities and roles, network
 exposure, test data, observable success and failure signals, and for a race the cores,
 instrumented build and second actor it needs, and flag deployment differences that would change
 reachability, severity or reproducibility. Request an unavailable capability or approved

@@ -7,15 +7,14 @@ mod registration;
 mod schema;
 mod surface;
 
-pub(crate) use docs::{ScriptManifest, job_view_type};
+pub(crate) use docs::{DOCUMENTED, ScriptManifest, job_view_type};
 pub(crate) use envelope::{BACKGROUND, split_envelope};
 pub use envelope::{ExecutionEnvelope, JobLaunch, JobName, TARGET};
 pub use options::ToolOptions;
-pub(crate) use registration::complete_result_schema;
 pub use registration::{CatalogBuilder, input_schema_for, result_schema};
 pub(crate) use schema::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 pub(crate) use surface::AgentLevel;
-pub use surface::{Catalog, ResultSchema, ToolSpec, ToolSurface};
+pub use surface::{Catalog, ToolSpec, ToolSurface};
 
 use std::{future::Future, sync::Arc};
 
@@ -151,10 +150,7 @@ impl AdmittedInvocation {
     {
         Self {
             result_policy: ToolResultPolicy::JobView,
-            ..Self::new(move |context| async move {
-                let (_, view, images) = run(context).await?.into_parts();
-                Ok(ToolOutput::new(view).with_images(images))
-            })
+            ..Self::new(move |context| async move { Ok(run(context).await?.into_output()) })
         }
     }
 }
@@ -213,14 +209,6 @@ pub enum ToolResultPolicy {
     Value,
     JobView,
     Nothing,
-}
-
-/// Job views a tool returns as its native result. Scripts read them in full.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobViewResult {
-    One,
-    /// A [`JobListing`](crate::job::JobListing).
-    Listing,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -85,7 +85,7 @@ mod tests {
         validation::FetchPlan,
     };
     use super::*;
-    use crate::provider::http::transport::tests::reply;
+    use crate::tests::reply;
     use serde_json::json;
 
     #[test]

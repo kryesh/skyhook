@@ -492,12 +492,12 @@ pub(crate) async fn connect(
             };
             let command = match http_connect(client.clone(), transport.clone()).await {
                 Ok(service) => return Ok(service),
-                Err(error) if unreachable(&error) => match start_if_unreachable {
-                    Some(command) => command,
-                    None => {
-                        return Err(initialize_error(*error));
-                    }
-                },
+                Err(error)
+                    if unreachable(&error)
+                        && let Some(command) = start_if_unreachable =>
+                {
+                    command
+                }
                 Err(error) => return Err(initialize_error(*error)),
             };
             *process = Some(OwnedProcess::spawn(command, workspace, false)?);
@@ -524,6 +524,7 @@ pub(crate) async fn connect(
 mod tests {
     use super::*;
     use crate::tests::bounded;
+    use std::assert_matches;
     use tokio::io::AsyncReadExt;
 
     /// Headers are read when the connection starts: literals as written, commands run,
@@ -550,7 +551,7 @@ mod tests {
         );
         let missing = config("x-missing: {env: SKYHOOK_MCP_TEST_UNSET_47213}");
         let refused = http_config("http://localhost:1/mcp", &missing).await;
-        assert!(matches!(refused, Err(McpError::Header(_))));
+        assert_matches!(refused, Err(McpError::Header(_)));
     }
 
     /// Every attempt follows a wait; only an unreachable server is tried again.
@@ -668,49 +669,36 @@ mod tests {
     async fn http_json_and_error_bodies_are_bounded_before_parsing() {
         let oversized = vec![b'x'; MAX_MESSAGE_BYTES + 1];
         let small = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec();
-        for (status, content_type, body) in [
-            ("200 OK", "application/json", oversized.clone()),
-            ("500 Error", "text/plain", oversized),
-            ("200 OK", "application/json", small),
+        let sse = "text/event-stream";
+        // POST and GET bound an event stream before its event terminator too.
+        for (status, content_type, body, get) in [
+            ("200 OK", "application/json", oversized.clone(), false),
+            ("500 Error", "text/plain", oversized.clone(), false),
+            ("200 OK", "application/json", small, false),
+            ("200 OK", sse, oversized.clone(), false),
+            ("200 OK", sse, oversized, true),
         ] {
             let accepted = body.len() <= MAX_MESSAGE_BYTES;
             let (uri, server) = http_fixture(status, content_type, body).await;
-            let result = test_http_client()
-                .post_message(uri, ping_message(), None, None, HashMap::new())
-                .await;
-            if accepted {
-                assert!(matches!(result, Ok(StreamableHttpPostResponse::Json(..))));
-            } else {
-                assert!(
-                    matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(ref text)) if text.contains("byte limit"))
-                );
-            }
-            server.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn http_post_and_get_bound_sse_before_an_event_terminator() {
-        for post in [true, false] {
-            let body = vec![b'x'; MAX_MESSAGE_BYTES + 1];
-            let (uri, server) = http_fixture("200 OK", "text/event-stream", body).await;
             let client = test_http_client();
-            let mut stream = if post {
-                let response = client
-                    .post_message(uri, ping_message(), None, None, HashMap::new())
-                    .await
-                    .unwrap();
-                let StreamableHttpPostResponse::Sse(stream, _) = response else {
-                    panic!("expected SSE")
-                };
-                stream
-            } else {
-                client
-                    .get_stream(uri, None, None, None, HashMap::new())
-                    .await
-                    .unwrap()
-            };
-            assert!(stream.next().await.unwrap().is_err());
+            if get {
+                let stream = client.get_stream(uri, None, None, None, HashMap::new());
+                assert!(stream.await.unwrap().next().await.unwrap().is_err());
+                server.await.unwrap();
+                continue;
+            }
+            let result =
+                (client.post_message(uri, ping_message(), None, None, HashMap::new())).await;
+            match result {
+                Ok(StreamableHttpPostResponse::Sse(mut stream, _)) if content_type == sse => {
+                    assert!(stream.next().await.unwrap().is_err());
+                }
+                Ok(StreamableHttpPostResponse::Json(..)) => assert!(accepted),
+                Err(StreamableHttpError::UnexpectedServerResponse(ref text)) => {
+                    assert!(!accepted && text.contains("byte limit"), "{text}");
+                }
+                _ => panic!("{status} {content_type}"),
+            }
             server.await.unwrap();
         }
     }
@@ -743,10 +731,11 @@ mod tests {
         let client = test_http_client();
         let post = client.post_message(uri, ping_message(), None, None, HashMap::new());
         let (result, _) = crate::tests::expire(post, connected, client.timeout).await;
-        assert!(
-            matches!(result, Err(StreamableHttpError::Client(ref error)) if error.is_timeout())
+        assert_matches!(
+            result,
+            Err(StreamableHttpError::Client(ref error)) if error.is_timeout()
         );
         server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
+        let _ = server.await;
     }
 }

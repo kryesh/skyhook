@@ -553,6 +553,7 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// `continue` and input restart an interruption while something can.
     /// Without a restarter, as a session without its agent runtime has, neither
@@ -599,13 +600,13 @@ mod tests {
         interrupted(&jobs).await;
         let restored = super::super::tests::reopen(jobs, root.path()).await;
         assert_eq!(continued(&restored).await, 0);
-        assert!(matches!(
+        assert_matches!(
             restored.send(id, Value::Null).await,
             Err(JobError::InputUnavailable {
                 reason: InputUnavailableReason::ResumeUnavailable,
                 ..
             })
-        ));
+        );
         assert_eq!(
             restored.snapshot(id).await.unwrap().state,
             JobState::Interrupted

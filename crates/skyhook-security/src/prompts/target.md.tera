@@ -12,16 +12,16 @@ Establish:
   under a short name in the `interfaces` of the component exposing it.
 - The assumed deployment: process boundaries, exposed interfaces, outbound reach,
   authentication, privileges, and relevant configuration or feature choices.
-- The deployment premises later reviews rest on, each `upsert` `{kind: "premise", scope:
-  "deployment"}`, one statement each: every build flag or feature option, actor (each role,
-  tenant or other identity: what it may do and reach), platform (word size, OS, allocator), host
-  behaviour (how an embedding host calls the code and from how many threads at once, what it
-  limits or checks), concurrency (workers, instances) and input bound (sizes, counts, lengths
-  the deployment allows). Set each one the user's request settles with `set_status`: `holds`
-  when it admits the condition, `fails` when it excludes it. Spell out what a broad request
-  means: "any embedding host" admits each host behaviour the code permits, stated one by one.
-  Leave undecided only what the user has not said; ask the parent once here rather than leaving
-  it to each reviewer.
+- The deployment premises later reviews rest on, each `upsert` `{record: {kind: "premise",
+  scope: "deployment"}}`, one statement each: every build flag or feature option, actor (each role,
+  tenant or other identity: what it may do and reach), platform (OS, architecture, runtime and
+  its version), caller behaviour (how an embedding application, client or front proxy calls the
+  code, from how many threads at once, and what it limits or checks), concurrency (workers,
+  instances) and input bound (sizes, counts, lengths the deployment allows). Set each one the
+  user's request settles with `set_status`: `holds` when it admits the condition, `fails` when it
+  excludes it. Spell out what a broad request means: "any caller" or "any configuration" admits
+  each behaviour the code permits, stated one by one. Leave undecided only what the user has not
+  said; ask the parent once here rather than leaving it to each reviewer.
 - The revision and dirty-state context, available dependencies, and any inaccessible or
   generated code that limits inspection.
 
@@ -35,9 +35,11 @@ interface descriptions, traffic captures and documentation.
 
 Every execution environment, deployment or configuration surface and dependency manifest the
 inventory shows is in scope by default, including client-side code and background processing.
-Excluding one needs the user's confirmation through the parent, recorded as a deployment premise
-that fails; only a region with no reachable code is left out silently. A documented default is
-not proof of the deployed setting, so a non-default option is a deployment premise. Ask once how
+Excluding one needs the parent's confirmation, recorded as a deployment premise that fails;
+only a region with no reachable code is left out silently. An exclusion the request makes is
+recorded the same way, stating what it excludes, never that the excluded code's calls into
+included code are covered. A documented default is not proof
+of the deployed setting, so a non-default option is a deployment premise. Ask once how
 target-specific policies affect what counts as a reportable finding (say denial of service, or
 which data each actor may see), and record the answer as deployment premises.
 
@@ -56,7 +58,9 @@ directory or module patterns:
 
 Map what you cannot read (a binary, a deployed service) by what its material shows (route
 prefixes, services), one component per binary image, each
-body saying what its boundary was inferred from. Code left unassigned is either out of scope with a reason or belongs in a component. The map is
+body saying what its boundary was inferred from. Code left unassigned is either out of scope with a reason or belongs in a component. The
+components mapped before research starts are the run's scope: no later work is scheduled on a
+path entering code outside them, so excluded code stays unmapped. The map is
 navigation, not coverage: sweeps move files between components as they find them. Delegate
 only a scope question, whether a boundary is in or out, to a child launched without a mode,
 which records its answer as a deployment premise rather than only replying. Ask the parent when

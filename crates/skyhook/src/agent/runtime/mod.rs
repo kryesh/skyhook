@@ -89,7 +89,7 @@ struct HarnessInner {
     questions: Option<Arc<dyn QuestionHandler>>,
     host_state: Option<Arc<dyn HostState>>,
     resume_hook: Option<Arc<dyn ResumeHook>>,
-    session_extension: Option<crate::session::Extension>,
+    session_schema: crate::session::Schema,
     extra_tools: ToolRegistry,
     mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
@@ -761,6 +761,24 @@ mod tests {
         Script::new(responses.into_iter().map(Step::new), requests)
     }
 
+    /// The root delegates to a child that launches a background script awaiting
+    /// input, answers early, then answers `last`; the root then answers.
+    pub(super) fn answered_child_with_work(last: &str) -> [Vec<ResponseEvent>; 5] {
+        let script = json!({"source": "return await receive();", "bg": true});
+        [
+            response(vec![tool_call(
+                0,
+                "agent",
+                "agent",
+                json!({"prompt": "work"}),
+            )]),
+            response(vec![tool_call(0, "script", "script", script)]),
+            answer("premature child answer"),
+            answer(last),
+            answer("root done"),
+        ]
+    }
+
     /// A session over `root` (sessions in `root/sessions`) answering from a script.
     pub(super) async fn scripted_session(
         responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
@@ -776,7 +794,7 @@ mod tests {
     pub(super) async fn ephemeral_session(harness: &Harness) -> SessionHandle {
         let store = SessionStore::create_ephemeral(
             &harness.inner.session_root,
-            harness.inner.session_extension,
+            harness.inner.session_schema,
         );
         let store = store.await.unwrap();
         let jobs = JobManager::new(store.clone());
@@ -1054,9 +1072,11 @@ mod tests {
     }
 
     /// A session whose root is held on a child it interrupted mid-response, and
-    /// the root's prompt; `after` scripts the requests that follow.
+    /// the root's prompt; `after` scripts the requests that follow. Only a
+    /// `durable` session can be reopened.
     pub(super) async fn held_on_interrupted_child(
         root: &Path,
+        durable: bool,
         after: impl IntoIterator<Item = Step>,
     ) -> (
         Harness,
@@ -1072,7 +1092,11 @@ mod tests {
         let requests = Requests::default();
         let provider = Script::new(steps.into_iter().chain(after), &requests);
         let harness = test_harness(root, &root.join("sessions"), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = if durable {
+            harness.new_session().await.unwrap()
+        } else {
+            ephemeral_session(&harness).await
+        };
         let parent = spawn_prompt(&session, "delegate");
         provider.request(1).await;
         root_waiting(&session).await;
@@ -1299,6 +1323,18 @@ mod tests {
             capabilities: mode.capabilities.clone(),
             instructions: (mode.instructions.as_ref()).map(|text| text.written().unwrap().clone()),
             hint: mode.hint.clone(),
+        }
+    }
+
+    /// A mode granting `capabilities`, with its `instructions` written out.
+    pub(super) fn mode(
+        capabilities: &[Capability],
+        instructions: Option<&str>,
+    ) -> crate::tool::policy::Mode {
+        crate::tool::policy::Mode {
+            capabilities: listed(capabilities),
+            instructions: instructions.map(|text| text.parse().unwrap()),
+            hint: None,
         }
     }
 

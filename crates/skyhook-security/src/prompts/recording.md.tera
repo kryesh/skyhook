@@ -1,0 +1,34 @@
+# Recording
+
+Record:
+
+- each **flaw** at its location and component, its body the invariant involved, how it fails
+  and every possible effect, with its CWE when one fits;
+- the **premises** each flaw needs (`flaw_premise`) and those a path's flow needs to carry
+  input to it (`path_premise`): the state or logic without which the flaw cannot reach
+  unintended state, each one claim at a location stating that need, never the code's safety
+  guarantee (a guarantee it does not enforce is a flaw);
+- **evidence** at the locations that support or contradict them;
+- each **state** read or written that is not recorded, and each unrecorded access with
+  `path_state` at its location, and the states each flaw leaves wrong (`flaw_state`);
+- a **candidate** whenever flaws chain to an observable vulnerability, listing each action's
+  path in order, the attacker's first, its body naming who performs each.
+
+Link what is already recorded first: read the flaws recorded on the components the code you
+read belongs to (`research_query` `list` `{record: {kind: "flaw", component}}`) and the premises they need,
+and link and chain the ones your work reaches rather than recording them again.
+
+A dangerous-looking operation alone is not a flaw, and a check a documented contract leaves to
+the caller is not a flaw in the callee: a caller that skips it is.
+
+Shared state is also reached by the other paths accessing it (its `node` lists them), a path run
+concurrently with itself, and the threads, tasks or signal handlers a component's body names;
+concurrent access is a flaw only where these let two flows reach it. An unsynchronised access
+another flow can interleave with, a lock order it inverts, or a handler re-entering work it
+interrupted is a flaw at the access; a check whose use reaches the state again by name (a path,
+key or shared value), not through what was checked, is a flaw at the use, the check its evidence.
+Each needs the premise, one per state and window and shared by the flaws needing it, that
+another flow can change the state there, naming what could.
+
+Before judging code safe, look for a counterexample, including error, malformed-input and retry
+paths.

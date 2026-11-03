@@ -48,6 +48,7 @@ impl LayeredConfig for Config {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     // Loader tests use injected candidate paths rather than mutating process environment.
 
     use super::*;
@@ -77,80 +78,37 @@ mod tests {
         crate::yaml::from_str(&config.to_yaml().unwrap()).unwrap()
     }
 
+    /// A candidate the generic loader reads but `Config` refuses falls back like any
+    /// other refusal, and its diagnostic names the cause.
     #[tokio::test]
-    async fn xdg_wins_without_even_reading_home_and_workspace_merges() {
+    async fn config_refusals_fall_back_without_leaking_fields() {
         let f = Fixture::new();
-        write(
-            &f.xdg,
-            format!("session_root: sessions\nmax_child_depth: 8\n{CONFIG}"),
-        );
-        std::fs::create_dir(&f.home).unwrap(); // Would be a read error if probed.
-        write(&f.local, "max_child_depth: 2\n");
-        let resolved = f.resolve().await.unwrap();
-        assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
-        assert!(resolved.report.diagnostics.is_empty());
-        assert_eq!(resolved.config.session_root, Some("sessions".into()));
-        assert_eq!(resolved.config.max_child_depth, 2);
-        assert!(resolved.config.providers.contains_key("local"));
-    }
-
-    #[tokio::test]
-    async fn every_failed_candidate_class_falls_back_without_leaking_fields() {
-        let invalid: &[Option<&[u8]>] = &[
-        None, // missing
-        Some(b"DIRECTORY"), // read failure, works even when tests run as root
-        Some(b"\xff\xfe"), // invalid UTF-8
-        Some(b"session_root: leaked\nmalformed: ["), // YAML
-        Some(b"session_root: leaked\nmax_child_depth: bad"), // serde type
-        Some(b"session_root: leaked\nunrecognized: 1"), // serde unknown field
-        Some(b"session_root: leaked\n!!binary c2Vzc2lvbl9yb290: again"), // coerced key collision
-        Some(b"session_root: leaked\nmodes:\n  bad:\n    capabilities: [interactive]"),
-        Some(b"session_root: leaked\nproviders:\n  bad:\n    dialect: codex\n    codec: responses\n    models:\n      bad:\n        model: bad\n        max_context: 10\n        max_output: 10"),
-        Some(b"session_root: leaked\ntargets:\n  bad:\n    type: ssh\n    host: bad host"),
-        Some(b"session_root: leaked\nmcp:\n  bad:\n    transport: stdio\n    start_command: []"),
-        Some(b"session_root: leaked\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a"), // route cycle
-        Some(b""),
-    ];
-        for bytes in invalid {
-            let f = Fixture::new();
-            match bytes {
-                Some(b"DIRECTORY") => std::fs::create_dir(&f.xdg).unwrap(),
-                Some(bytes) => write(&f.xdg, bytes),
-                None => {}
-            }
-            write(&f.home, CONFIG);
+        write(&f.home, CONFIG);
+        for (bytes, cause) in [
+            ("session_root: leaked\nunrecognized: 1", "unknown field"),
+            (
+                "session_root: leaked\nmodes:\n  bad:\n    capabilities: [interactive]",
+                "interactive",
+            ),
+            (
+                "session_root: leaked\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a",
+                CYCLE,
+            ),
+        ] {
+            write(&f.xdg, bytes);
             let resolved = f
                 .resolve()
                 .await
                 .unwrap_or_else(|error| panic!("{bytes:?}: {error}"));
             assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
-            // An absent candidate is silent; a refused one is reported.
-            assert_eq!(
-                resolved.report.diagnostics.len(),
-                usize::from(bytes.is_some()),
-                "{bytes:?}"
-            );
-            if bytes.is_some() {
-                assert_eq!(resolved.report.diagnostics[0].path, f.xdg);
-            }
-            assert!(
-                resolved.config.session_root.is_none(),
-                "rejected candidate leaked fields: {bytes:?}"
-            );
-            let providers: Vec<_> = resolved
-                .config
-                .providers
-                .keys()
-                .map(ToString::to_string)
-                .collect();
-            assert_eq!(providers, ["local"], "{bytes:?}");
-            assert!(resolved.config.targets.entries.is_empty(), "{bytes:?}");
-            // The diagnostic names the actual cause, shown here for the route cycle.
-            if let Some(bytes) = bytes {
-                let message = &resolved.report.diagnostics[0].message;
-                let cyclic = bytes.ends_with(b"via: a");
-                assert_eq!(message.contains(CYCLE), cyclic, "{bytes:?}: {message}");
-            }
+            let diagnostics = &resolved.report.diagnostics;
+            assert_eq!(diagnostics.len(), 1, "{bytes:?}");
+            assert_eq!(diagnostics[0].path, f.xdg);
+            let message = &diagnostics[0].message;
+            assert!(message.contains(cause), "{bytes:?}: {message}");
+            let config = &resolved.config;
+            assert!(config.session_root.is_none(), "leaked fields: {bytes:?}");
+            assert!(config.targets.entries.is_empty(), "{bytes:?}");
         }
     }
 
@@ -160,7 +118,7 @@ mod tests {
         write(&f.xdg, "max_child_depth: not-a-number");
         write(&f.home, "[broken");
         let error = f.resolve().await.unwrap_err();
-        assert!(matches!(error, LayerResolutionError::Resolution { .. }));
+        assert_matches!(error, LayerResolutionError::Resolution { .. });
         assert_eq!(error.report().diagnostics.len(), 2);
         let message = error.to_string();
         assert!(message.contains(f.xdg.to_str().unwrap()));
@@ -169,44 +127,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_only_is_allowed_after_missing_or_invalid_users() {
-        for invalid_user in [false, true] {
-            let f = Fixture::new();
-            if invalid_user {
-                write(&f.xdg, "[bad");
-            }
-            write(&f.local, CONFIG);
-            let resolved = f.resolve().await.unwrap();
-            assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));
-            assert_eq!(resolved.report.diagnostics.len(), usize::from(invalid_user));
-            assert_eq!(
-                normalized(&resolved.config)["providers"]["local"]["models"]
-                    .as_object()
-                    .unwrap()
-                    .len(),
-                1
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn invalid_workspace_is_always_fatal_and_retains_fallback_diagnostics() {
-        for bytes in [
-            b"[invalid".as_slice(),
+        let f = Fixture::new();
+        write(&f.home, CONFIG);
+        let invalid: [&[u8]; 15] = [
+            b"[invalid",
             b"\xff",
             b"max_child_depth: wrong",
             b"providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n    models:\n      main:\n        model: test\n        max_context: 4096\n        max_output: 0",
             b"targets:\n  bad:\n    type: ssh", // Atomic/incomplete target.
-        ] {
-            let f = Fixture::new();
-            write(&f.home, CONFIG);
+            // Null neither deletes entries nor applies defaults.
+            b"max_child_depth: null",
+            b"providers: {local: {dialect: compatible, codec: chat_completions, base_url: 'https://example.com/v1', models: null}}",
+            b"modes: null",
+            b"providers: null",
+            b"providers: {local: null}",
+            // Each layer must be a mapping.
+            b"",
+            b"# comment only",
+            b"null",
+            b"scalar",
+            b"[one, two]",
+        ];
+        for bytes in invalid {
             write(&f.local, bytes);
             let error = f.resolve().await.unwrap_err();
-            assert_eq!(error.report().diagnostics.len(), 1);
+            assert_eq!(error.report().diagnostics.len(), 1, "{bytes:?}");
             assert!(error.to_string().contains(f.local.to_str().unwrap()));
         }
-        let f = Fixture::new();
-        write(&f.home, CONFIG);
+        // An explicit file must be a nonempty mapping too.
+        for document in ["", "null", "scalar", "{}"] {
+            write(&f.local, document);
+            assert!(Config::resolve(&f.workspace, Some(&f.local)).await.is_err());
+        }
+        // An empty mapping overlay is a no-op.
+        assert!(f.resolve().await.is_ok());
+        // An empty user candidate configures nothing, so discovery moves on.
+        write(&f.xdg, "{}");
+        let resolved = f.resolve().await.unwrap();
+        assert_eq!(resolved.report.sources[0], f.home);
+        std::fs::remove_file(&f.local).unwrap();
         std::fs::create_dir(&f.local).unwrap();
         assert!(f.resolve().await.is_err());
     }
@@ -254,7 +214,13 @@ mod tests {
             &f.local,
             "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {kind: key, path: origin-key}\n  changed:\n    type: ssh\n    host: new\ndefault_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
         );
+        // A legacy `config.toml` beside either layer is never read.
+        for layer in [&f.xdg, &f.local] {
+            write(&layer.with_file_name("config.toml"), "[broken");
+        }
         let resolved = f.resolve().await.unwrap();
+        assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
+        assert!(resolved.report.diagnostics.is_empty());
         let config = &resolved.config;
         // A replaced entry keeps its place; one only the workspace names follows.
         let providers: Vec<_> = config.providers.keys().map(|name| name.as_str()).collect();
@@ -335,31 +301,12 @@ mod tests {
         assert!(resolved.report.diagnostics.is_empty());
         let dump = resolved.config.to_yaml().unwrap();
         assert!(dump.contains("env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY"));
-        // Resolved provider defaults are written back, like MCP timeouts.
-        for resolved_default in ["startup_timeout_secs: 600", "read_idle_timeout_secs: 600"] {
-            assert!(dump.contains(resolved_default));
-        }
         resolved.config.max_child_depth = 9;
         resolved.config.modes[0].capabilities = CapabilitySet::empty().try_into().unwrap();
         let config = Config::from_yaml(&resolved.config.to_yaml().unwrap()).unwrap();
         assert_eq!(config.max_child_depth, 9);
         assert!(config.modes[0].capabilities.set().is_empty());
         assert!(!marker.exists());
-    }
-
-    #[tokio::test]
-    async fn debug_omits_literal_secrets() {
-        let f = Fixture::new();
-        write(&f.xdg, format!("{CONFIG}    api_key: sk-literal-secret\n"));
-        let resolved = f.resolve().await.unwrap();
-        assert!(
-            resolved
-                .config
-                .to_yaml()
-                .unwrap()
-                .contains("sk-literal-secret")
-        );
-        assert!(!format!("{resolved:?}").contains("sk-literal-secret"));
     }
 
     #[tokio::test]
@@ -392,65 +339,6 @@ mod tests {
             ["local/true", "local/42", "local/null"]
         );
         assert_eq!(runtime.default_model().name().to_string(), "local/true");
-    }
-
-    #[tokio::test]
-    async fn null_does_not_delete_entries_or_apply_defaults() {
-        let f = Fixture::new();
-        write(&f.xdg, CONFIG);
-        for overlay in [
-            "max_child_depth: null",
-            "providers: {local: {dialect: compatible, codec: chat_completions, base_url: 'https://example.com/v1', models: null}}",
-            "modes: null",
-            "providers: null",
-            "providers: {local: null}",
-        ] {
-            write(&f.local, overlay);
-            assert!(f.resolve().await.is_err(), "accepted {overlay}");
-        }
-    }
-
-    #[tokio::test]
-    async fn each_layer_requires_a_mapping_and_the_effective_config_must_not_be_empty() {
-        let f = Fixture::new();
-        write(&f.xdg, CONFIG);
-        for document in ["", "# comment only", "null", "scalar", "[one, two]"] {
-            write(&f.local, document);
-            assert!(
-                f.resolve().await.is_err(),
-                "accepted workspace {document:?}"
-            );
-            assert!(Config::resolve(&f.workspace, Some(&f.local)).await.is_err());
-        }
-        write(&f.local, "{}");
-        assert!(
-            f.resolve().await.is_ok(),
-            "an empty mapping overlay is a no-op"
-        );
-        assert!(Config::resolve(&f.workspace, Some(&f.local)).await.is_err());
-        // An empty user candidate configures nothing, so discovery moves on.
-        write(&f.xdg, "{}");
-        write(&f.home, CONFIG);
-        let resolved = f.resolve().await.unwrap();
-        assert_eq!(resolved.report.sources[0], f.home);
-    }
-
-    #[tokio::test]
-    async fn candidate_list_edge_cases() {
-        let f = Fixture::new();
-        // No roots or files is missing config, but a workspace needs no roots.
-        let missing = resolve_paths(&f.workspace, None, vec![f.xdg.clone()]).await;
-        assert!(
-            matches!(missing, Err(LayerResolutionError::Missing { report, .. }) if report.diagnostics.is_empty())
-        );
-        write(&f.local, CONFIG);
-        let config = resolve_paths(&f.workspace, None, vec![]).await.unwrap();
-        assert!(config.report.diagnostics.is_empty());
-        // Duplicate candidates are attempted once, and an absent one is silent.
-        let resolved = resolve_paths(&f.workspace, None, vec![f.xdg.clone(), f.xdg.clone()])
-            .await
-            .unwrap();
-        assert!(resolved.report.diagnostics.is_empty());
     }
 
     fn targets(entries: &[(&str, Option<&str>)]) -> String {

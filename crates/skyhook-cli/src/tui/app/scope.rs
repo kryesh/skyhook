@@ -236,11 +236,11 @@ impl ScopePanel {
     fn edit(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c) => self.insert(c.encode_utf8(&mut [0; 4])),
-            KeyCode::Backspace => {
-                if let Draft::Number { text, .. } = &mut self.drafts[self.cursor] {
-                    text.pop();
-                    self.state = State::Editing { invalid: None };
-                }
+            KeyCode::Backspace
+                if let Draft::Number { text, .. } = &mut self.drafts[self.cursor] =>
+            {
+                text.pop();
+                self.state = State::Editing { invalid: None };
             }
             _ => {}
         }
@@ -588,7 +588,7 @@ mod tests {
         fields.sort_unstable();
         assert!(fields.len() > 2, "{fields:?}\n{narrow}");
         assert!(
-            fields.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            fields.array_windows().all(|[a, b]| a.1 <= b.1),
             "{fields:?}"
         );
         assert_eq!(

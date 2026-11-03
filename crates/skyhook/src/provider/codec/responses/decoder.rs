@@ -392,6 +392,31 @@ mod tests {
             assert!(decoder.feed(done(0, call(Some("{")))).unwrap().is_empty());
             assert!(decoder.feed(completed(output)).is_err());
         }
+        // Truncated arguments under a final item that omits them are discarded by
+        // an abnormal stop, and fail a normal one.
+        let mut final_item = function("fc_1", "call_1", "");
+        final_item.as_object_mut().unwrap().remove("arguments");
+        let prefix = || {
+            vec![
+                added(0, function("fc_1", "call_1", "")),
+                json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                    "item_id":"fc_1", "delta":"{\"path\":"}),
+                done(0, final_item.clone()),
+            ]
+        };
+        let mut events = prefix();
+        events.push(
+            json!({"type":"response.incomplete", "response":{"status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"}, "output":[final_item.clone()]}}),
+        );
+        let reduced = assemble(events).unwrap();
+        assert_eq!(
+            (reduced.completion.outcome(), reduced.items().len()),
+            (Outcome::Cut(CutReason::MaxTokens), 0)
+        );
+        let mut events = prefix();
+        events.push(completed(vec![final_item.clone()]));
+        assert!(assemble(events).is_err());
     }
 
     #[test]

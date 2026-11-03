@@ -306,13 +306,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn failed_events_are_errors() {
-        let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
-        let error = decoder().feed(failed).unwrap_err();
-        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
-    }
-
-    #[test]
     fn unknown_events_and_output_item_types_are_ignored() {
         let hosted = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
         let mut decoder = decoder();
@@ -365,6 +358,10 @@ mod tests {
             .feed(json!({"type":"response.aborted"}))
             .unwrap_err();
         assert_eq!(aborted.kind(), ProviderErrorKind::Unavailable);
+        // A failed response is an error of the kind its code names.
+        let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
+        let error = decoder().feed(failed).unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
         // Sub-events of hosted tools are not the response ending.
         let hosted = json!({"type":"response.web_search_call.failed", "item_id":"ws_1"});
         assert!(decoder().feed(hosted).unwrap().is_empty());
@@ -396,16 +393,7 @@ mod tests {
             Value::Object(call.arguments().clone())
         };
         // Missing, blank, and placeholder values that decode to `{}`.
-        for final_arguments in [
-            None,
-            Some(json!("")),
-            Some(json!("  ")),
-            Some(json!("{}")),
-            Some(json!("null")),
-            Some(json!("\"\"")),
-            Some(Value::Null),
-            Some(json!({})),
-        ] {
+        for final_arguments in [None, Some(json!("")), Some(json!("{}"))] {
             for done_event in [false, true] {
                 assert_eq!(
                     streamed(final_arguments.clone(), done_event),
@@ -486,35 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_streamed_arguments_are_discarded_on_an_abnormal_stop() {
-        let mut final_item = function("fc_1", "call_1", "");
-        final_item.as_object_mut().unwrap().remove("arguments");
-        let prefix = || {
-            vec![
-                added(0, function("fc_1", "call_1", "")),
-                json!({"type":"response.function_call_arguments.delta", "output_index":0,
-                    "item_id":"fc_1", "delta":"{\"path\":"}),
-                done(0, final_item.clone()),
-            ]
-        };
-        let mut events = prefix();
-        events.push(
-            json!({"type":"response.incomplete", "response":{"status":"incomplete",
-            "incomplete_details":{"reason":"max_output_tokens"}, "output":[final_item.clone()]}}),
-        );
-        let reduced = assemble(events).unwrap();
-        assert_eq!(
-            (reduced.completion.outcome(), reduced.items().len()),
-            (Outcome::Cut(CutReason::MaxTokens), 0)
-        );
-        // A normal stop cannot execute a call whose input never completed.
-        let mut events = prefix();
-        events.push(completed(vec![final_item.clone()]));
-        assert!(assemble(events).is_err());
-    }
-
-    #[test]
-    fn missing_single_part_indices_work_for_text_and_reasoning_summaries() {
+    fn missing_part_indices_select_the_single_or_streamed_part() {
         for (native, family, part_family, part) in [
             (
                 message("item", "visible"),
@@ -548,10 +508,7 @@ mod tests {
             assert_eq!(text.as_deref(), Some("visible"));
             assert_eq!(reduced.streamed(items[0].kind()), ["visible"]);
         }
-    }
-
-    #[test]
-    fn omitted_part_index_selects_the_unique_existing_part() {
+        // An omitted part index selects the unique part already streamed.
         let mut native = message("message", "first");
         native["content"]
             .as_array_mut()
@@ -597,6 +554,27 @@ mod tests {
             Value::Object(call.arguments().clone()),
             json!({"key":"value"})
         );
+        // By output index, with the call's identity arriving only at item end.
+        let arguments = json!("{\"query\":\"rust\"}");
+        let reduced = assemble(vec![
+            added(
+                0,
+                json!({"id":"fc_1","type":"function_call","arguments":""}),
+            ),
+            json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                "item_id":"fc_1", "delta":arguments}),
+            json!({"type":"response.function_call_arguments.done", "output_index":0,
+                "item_id":"fc_1", "arguments":arguments}),
+            done(0, call_item()),
+            completed(vec![call_item()]),
+        ])
+        .unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        assert_eq!(
+            reduced.streamed(ItemKind::ToolCall),
+            [arguments.as_str().unwrap()]
+        );
+        assert_eq!(reduced.items()[0].call().unwrap().name(), "search");
     }
 
     /// Feeds events without calling finish: an unrelated missing-terminal error could

@@ -3,7 +3,7 @@
 //! the updates since leave it.
 
 use super::entries::{Dep, presents};
-use super::window::{List, PAGE};
+use super::window::List;
 use skyhook::identity::JobId;
 use skyhook::session::{
     EventRecord, Fact, JobEvent, Message, Page, PageFacts, RecordSeq, RequestRecord, RequestSeq,
@@ -32,12 +32,13 @@ impl Transcript {
         (self.run.kept().iter()).map(|ordinal| (*ordinal, &self.records[ordinal]))
     }
 
-    /// Add what `page` read where it adjoins what is loaded, and what presenting it
-    /// reads; returns the requests it read.
+    /// Add what `page`, of up to `size` records, read where it adjoins what is loaded,
+    /// and what presenting it reads; returns the requests it read.
     pub(super) fn place(
         &mut self,
         page: Page<u64>,
         read: TranscriptPage,
+        size: usize,
     ) -> BTreeMap<RequestSeq, RequestRecord> {
         let TranscriptPage {
             first,
@@ -60,7 +61,7 @@ impl Transcript {
         }
         self.facts.admitted.extend(admitted);
         self.facts.reported.extend(reported);
-        let full = records.len() == PAGE;
+        let full = records.len() == size;
         let read: Vec<_> = (first..).zip(records).collect();
         let kept = read
             .iter()
@@ -101,9 +102,9 @@ impl Transcript {
         (placed, call.map(|(message, call)| Dep::Call(message, call)))
     }
 
-    /// Let go of the loaded records beyond those kept around the view's `shown` ones.
-    pub(super) fn trim(&mut self, shown: std::ops::Range<usize>) -> bool {
-        if !self.run.trim(shown) {
+    /// Let go of the loaded records beyond the `kept` around the view's `shown` ones.
+    pub(super) fn trim(&mut self, shown: std::ops::Range<usize>, kept: usize) -> bool {
+        if !self.run.trim(shown, kept) {
             return false;
         }
         let run = self.run.kept();

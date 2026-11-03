@@ -137,14 +137,12 @@ impl Projection {
             }),
             SessionEvent::ResponseCompleted {
                 attempt, message, ..
-            } => {
-                if let Some((request, Some(state))) = requested
-                    && *request == attempt.request
-                    && let Some(response) = (self.messages.iter_mut().rev())
-                        .find(|projected| projected.sequence == RecordSeq::from(*message))
-                {
-                    response.sent = Some(state.clone());
-                }
+            } if let Some((request, Some(state))) = requested
+                && *request == attempt.request
+                && let Some(response) = (self.messages.iter_mut().rev())
+                    .find(|projected| projected.sequence == RecordSeq::from(*message)) =>
+            {
+                response.sent = Some(state.clone());
             }
             SessionEvent::ModeChanged { .. } => self.unbind(),
             _ => {}
@@ -364,6 +362,7 @@ mod tests {
         tests::TestRuntime,
     };
     use serde_json::json;
+    use std::assert_matches;
 
     /// Sequences the projection fixture journals, by role.
     struct Journaled {
@@ -539,10 +538,10 @@ mod tests {
             let validated = admitted(store, agent, request);
             match expected {
                 None => assert!(validated.is_ok(), "{validated:?}"),
-                Some(expected) => assert!(matches!(
+                Some(expected) => assert_matches!(
                     validated,
                     Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
-                )),
+                ),
             }
         }
     }

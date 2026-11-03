@@ -2,18 +2,18 @@
 
 # One path without source code
 
-Your parent assigned you one path none of whose sources sits in code. Begin with
+Your parent assigned you one path none of whose input reads sits in code. Begin with
 `research` `begin` `{phase: "probe", subjects: [path]}`, read it with `research_query` `node`,
 and sweep it once by what each step allows: read a step whose component owns code, and
 disassemble or decompile a binary step.
 {%- if live %}
-Observe an interface step in an environment serving it (`list` `{kind: "environment"}`), and
+Observe an interface step in an environment serving it (`list` `{record: {kind: "environment"}}`), and
 run a binary only in an environment for any candidate, within a bounded budget.
 
-For each operation its sources enter, list the fields from the interface's description, then
+For each operation its input states are read on, list the fields from the interface's description, then
 from observation, and probe each within a fixed budget for boundary, type and encoding variants;
 the injection forms of each context its value reaches; authorization differentials, each
-identity the environment offers against the sources' trust and against another identity's
+identity the environment offers against the input states' trust and against another identity's
 resources; method, content type, ordering and replay variants; and error behaviour. Every probe
 has a control, the same request with a benign value or the owning identity: decide from the
 difference, never from one response. Fuzz only within the budget, keeping corpus and crashes
@@ -22,7 +22,7 @@ resources; never act on others' data or degrade the service. An observation is e
 location naming its `environment`: the request, credentials as references, what mattered in the
 response and the control's, larger captures cited by path.
 
-When the environment lacks what the path needs (an identity at a source's trust, a role, a
+When the environment lacks what the path needs (an identity at an input state's trust, a role, a
 feature), record what is missing as context evidence on the path and leave it unswept: a later
 environment offers it again.
 {%- endif %}
@@ -34,6 +34,6 @@ by an experiment that separates it from its alternatives,
 from the disassembly,
 {%- endif %}
 or leave it undecided with the experiment that would settle it. A flaw sits at the operation and field, or the address, where it shows.
-Mark the path you swept with `research` `set_status` `{path, status: "swept", note}`. Do not
+Mark the path you swept with `research` `set_status` `{record: {kind: "path", id, status: "swept"}, note}`. Do not
 wait for further instructions. Return the IDs you recorded and anything left open, each also
 recorded.

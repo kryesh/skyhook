@@ -533,7 +533,7 @@ pub(in crate::session) enum Scope<'a, K = i64> {
 
 /// What ties a table's rows to their key: a key column, or the assistant item or user
 /// part the row belongs to.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Owner {
     Message(&'static str),
     Item,
@@ -543,30 +543,43 @@ pub(super) enum Owner {
 impl<K: serde::Serialize> Scope<'_, K> {
     /// `sql` with `{scope}` replaced by a filter that keeps the rows `owner` ties
     /// to a key in scope.
-    pub(super) fn query(self, sql: &str, owner: Owner) -> DbResult<Query> {
-        const SCOPED: &str = "IN (SELECT value FROM json_each(?1))";
+    pub(super) fn query(self, sql: &'static str, owner: Owner) -> DbResult<Query> {
         Ok(match self {
             Self::All => Query {
-                sql: sql.replace("{scope}", ""),
+                sql: scoped(sql, None),
                 params: Vec::new(),
             },
-            Self::Only(messages) => {
-                let filter = match owner {
-                    Owner::Message(column) => format!("{column} {SCOPED}"),
-                    Owner::Item => {
-                        format!("item IN (SELECT id FROM assistant_item WHERE message {SCOPED})")
-                    }
-                    Owner::Part => {
-                        format!("e.part IN (SELECT id FROM user_part WHERE message {SCOPED})")
-                    }
-                };
-                Query {
-                    sql: sql.replace("{scope}", &format!("WHERE {filter}")),
-                    params: params![json(&messages)?],
-                }
-            }
+            Self::Only(messages) => Query {
+                sql: scoped(sql, Some(owner)),
+                params: params![json(&messages)?],
+            },
         })
     }
+}
+
+/// `sql` with `{scope}` replaced by a filter keeping the rows `owner` ties to a key in
+/// scope, or by nothing. Each is built once per process, so that a connection keeps
+/// its statement as it keeps static SQL; there are as many as the templates and
+/// owners the session's reads name.
+fn scoped(sql: &'static str, owner: Option<Owner>) -> &'static str {
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    type Built = HashMap<(&'static str, Option<Owner>), &'static str>;
+    static BUILT: LazyLock<Mutex<Built>> = LazyLock::new(Mutex::default);
+    const SCOPED: &str = "IN (SELECT value FROM json_each(?1))";
+    let mut built = BUILT.lock().unwrap_or_else(PoisonError::into_inner);
+    built.entry((sql, owner)).or_insert_with(|| {
+        let filter = match owner {
+            None => String::new(),
+            Some(Owner::Message(column)) => format!("WHERE {column} {SCOPED}"),
+            Some(Owner::Item) => {
+                format!("WHERE item IN (SELECT id FROM assistant_item WHERE message {SCOPED})")
+            }
+            Some(Owner::Part) => {
+                format!("WHERE e.part IN (SELECT id FROM user_part WHERE message {SCOPED})")
+            }
+        };
+        Box::leak(sql.replace("{scope}", &filter).into_boxed_str())
+    })
 }
 
 impl Messages {

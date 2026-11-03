@@ -229,6 +229,7 @@ impl SensitivePromptHandler for UiInteraction {
 pub(crate) mod tests {
     use super::*;
     use Capability::*;
+    use std::assert_matches;
 
     pub(crate) fn test_config() -> skyhook::config::Config {
         skyhook::config::Config::from_yaml("providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n").unwrap()
@@ -335,8 +336,9 @@ pub(crate) mod tests {
                 approval.clone(),
             ];
             let decision = decided(&policy, &permissions);
-            assert!(
-                matches!(decision, Some(PolicyDecision::Deny { reason }) if reason.contains("interactive"))
+            assert_matches!(
+                decision,
+                Some(PolicyDecision::Deny { reason }) if reason.contains("interactive")
             );
         }
         let (ui, _rx) = UiInteraction::new();

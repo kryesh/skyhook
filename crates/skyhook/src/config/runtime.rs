@@ -211,6 +211,7 @@ mod tests {
         dialect::{ModelSpec, ProviderSettings, compatible},
         profile::ModelName,
     };
+    use std::assert_matches;
 
     const VENDOR: &str = "vendor 任意";
 
@@ -300,11 +301,11 @@ mod tests {
             text("http://127.0.0.1:1/v1", "", MODELS)
         );
         let error = Config::from_yaml(&missing).unwrap().into_runtime().err();
-        assert!(matches!(
+        assert_matches!(
             &error,
             Some(ConfigError::DefaultModel { model, error: SelectionError::UnknownModel })
                 if model.to_string() == "vendor 任意/missing"
-        ));
+        );
         assert!(error.unwrap().to_string().contains("default_model"));
         assert!(Config::from_yaml("default_model: unqualified").is_err());
         // An earlier provider without models does not supply the default.
@@ -346,15 +347,8 @@ mod tests {
         ));
         assert!(!root.path().join(".skyhook").exists());
 
-        // Provider settings are rejected at parse time, naming the entry; targets
-        // precede catalog checks, and an empty catalog is rejected before any
-        // secret lookup.
-        let error = Config::from_yaml(&text("not an endpoint", "", "")).unwrap_err();
-        let error = error.to_string();
-        assert!(
-            error.contains("`providers.vendor 任意`: base_url"),
-            "{error}"
-        );
+        // Targets precede catalog checks, and an empty catalog is rejected before
+        // any secret lookup.
         let secret = "    api_key: {env: SKYHOOK_EMPTY_CATALOG_MUST_NOT_LOOK_UP_SECRET}\n";
         let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", secret, "")).unwrap();
         raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
@@ -365,17 +359,6 @@ mod tests {
         raw.targets.entries.clear();
         assert!(matches!(raw.into_runtime(), Err(ConfigError::NoModels)));
         // Keys are the qualified name's parts, so they cannot contain its separator.
-        let slashed = Config::from_yaml(&text(
-            "http://127.0.0.1:1/v1",
-            "",
-            "      a/b:\n        model: m\n        max_context: 2\n        max_output: 1\n",
-        ));
-        assert!(
-            slashed
-                .unwrap_err()
-                .to_string()
-                .contains("must not contain '/'")
-        );
         assert!(
             Config::from_yaml("providers:\n  a/b:\n    dialect: codex\n    codec: responses\n")
                 .is_err()

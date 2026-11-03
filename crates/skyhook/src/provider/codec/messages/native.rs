@@ -76,10 +76,13 @@ mod tests {
             let error = tool_content(&tool_block(id, name, input), None).unwrap_err();
             assert_eq!(error.kind(), crate::provider::ProviderErrorKind::Protocol);
         }
+        // An incomplete JSON fragment is not an input.
+        let block = tool_block("call", "tool", json!({}));
+        assert!(tool_content(&block, Some("{\"x-vendor\":")).is_err());
     }
 
     #[test]
-    fn empty_missing_and_encoded_inputs_are_objects() {
+    fn empty_missing_encoded_and_fragment_inputs_are_objects() {
         let block = tool_block("call", "list_jobs", json!({}));
         for partial in [None, Some("")] {
             let call = tool_content(&block, partial).unwrap();
@@ -99,17 +102,13 @@ mod tests {
                 "{partial}"
             );
         }
-        // Two different inputs conflict.
-        assert!(tool_content(&started, Some("{\"x\":2}")).is_err());
-    }
-
-    #[test]
-    fn complete_json_fragments_preserve_arbitrary_arguments_and_native_names() {
+        // A complete fragment keeps arbitrary arguments and the native name.
         let input = json!({"x-vendor":{"anyOf":[null, [1, false], "雪"]}});
         let block = tool_block("call", "vendor.tool/雪", json!({}));
-        assert!(tool_content(&block, Some("{\"x-vendor\":")).is_err());
         let call = tool_content(&block, Some(&input.to_string())).unwrap();
         assert_eq!(call.name(), "vendor.tool/雪");
         assert_eq!(Value::Object(call.arguments().clone()), input);
+        // Two different inputs conflict.
+        assert!(tool_content(&started, Some("{\"x\":2}")).is_err());
     }
 }

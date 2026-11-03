@@ -165,6 +165,27 @@ mod tests {
         }
         let mut decoder = decoder();
         assert!(decoder.decode(&sse(None, "{not json")).is_err());
+        // Unknown fields, and known ones with unusable shapes, beside content.
+        for field in [
+            "unknown",
+            "audio",
+            "provider_specific_fields",
+            "thinking_blocks",
+            "reasoning_details",
+        ] {
+            for value in [
+                json!(""),
+                json!(false),
+                json!(0),
+                json!([]),
+                json!({"data":"x"}),
+            ] {
+                let mut payload = json!({"content":"answer"});
+                payload[field] = value;
+                let (items, _, _) = decode(vec![delta(payload), end("stop")]);
+                assert_eq!(contents(&items), [text("answer")]);
+            }
+        }
     }
 
     #[test]
@@ -210,28 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn full_message_beside_streamed_deltas_is_not_duplicated() {
-        let (items, _, outcome) = decode(vec![
-            delta(json!({"content":"hello"})),
-            event(
-                json!({"choices":[{"delta":{},"message":{"content":"hello"},"finish_reason":"stop"}]}),
-            ),
-        ]);
-        assert_eq!(
-            (outcome, contents(&items)),
-            (Outcome::Answer, vec![text("hello")])
-        );
-        let call = json!([{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]);
-        let (items, _, outcome) = decode(vec![
-            delta(json!({"tool_calls":call})),
-            event(
-                json!({"choices":[{"delta":{},"message":{"tool_calls":call},"finish_reason":"tool_calls"}]}),
-            ),
-        ]);
-        assert_eq!((outcome, items.len()), (Outcome::ToolUse, 1));
-    }
-
-    #[test]
     fn full_message_after_streamed_deltas_adds_only_what_is_missing() {
         let call =
             json!([{"id":"c","type":"function","function":{"name":"run","arguments":"{\"a\":1}"}}]);
@@ -246,6 +245,22 @@ mod tests {
         assert_eq!(outcome, Outcome::ToolUse);
         assert_eq!(items.len(), 3);
         assert_eq!(contents(&items)[1], text("answer"));
+        // An identical repeat adds nothing.
+        let (items, _, outcome) = decode(vec![
+            delta(json!({"content":"hello"})),
+            full(json!({"content":"hello"}), "stop"),
+        ]);
+        assert_eq!(
+            (outcome, contents(&items)),
+            (Outcome::Answer, vec![text("hello")])
+        );
+        let streamed =
+            json!([{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]);
+        let (items, _, outcome) = decode(vec![
+            delta(json!({"tool_calls":streamed})),
+            full(json!({"tool_calls":streamed}), "tool_calls"),
+        ]);
+        assert_eq!((outcome, items.len()), (Outcome::ToolUse, 1));
         // A repeat that adds a tool call adds just the call.
         let (items, _, _) = decode(vec![
             delta(json!({"content":"answer"})),

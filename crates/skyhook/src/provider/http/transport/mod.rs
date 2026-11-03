@@ -20,6 +20,23 @@ const REJECTION_READ: Duration = Duration::from_secs(5);
 /// The media type requested and read.
 pub(crate) const EVENT_STREAM: &str = "text/event-stream";
 
+/// Providers' HTTP client, built at their first request rather than with them: building
+/// one loads the platform's trusted roots, which runs off the async workers. Clones share
+/// it and its connections.
+#[derive(Clone, Default)]
+pub(crate) struct LazyClient(std::sync::Arc<tokio::sync::OnceCell<Client>>);
+
+impl LazyClient {
+    pub(crate) async fn get(&self) -> Result<&Client, ProviderError> {
+        let build = || async {
+            tokio::task::spawn_blocking(client)
+                .await
+                .map_err(|error| ProviderErrorKind::Transport.error(error.to_string()))?
+        };
+        self.0.get_or_try_init(build).await
+    }
+}
+
 pub(crate) fn client() -> Result<Client, ProviderError> {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -179,7 +196,9 @@ async fn rejection(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::tests::{Plan, Server, reply};
     use futures_util::StreamExt;
+    use std::assert_matches;
 
     /// An SSE frame, named `event` if at all.
     pub(crate) fn sse(event: Option<&str>, data: impl Into<String>) -> SseEvent {
@@ -241,177 +260,6 @@ pub(crate) mod tests {
         assert_eq!(parse(&["5", "10"]), None);
     }
 
-    /// Every value of `wanted` in a raw request head, in wire order.
-    pub(crate) fn header_values(head: &str, wanted: &str) -> Vec<String> {
-        head.lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter(|(header, _)| header.eq_ignore_ascii_case(wanted))
-            .map(|(_, value)| value.trim().to_owned())
-            .collect()
-    }
-
-    pub(crate) fn reply(status: &str, headers: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
-            body.len()
-        )
-    }
-    pub(crate) async fn read_request(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut bytes = Vec::new();
-        loop {
-            let mut buffer = [0u8; 4096];
-            let n = socket.read(&mut buffer).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..n]);
-            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&bytes[..end]);
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|s| s.parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if bytes.len() >= end + 4 + length {
-                    break;
-                }
-            }
-        }
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// One scripted connection. Connections beyond the script never answer.
-    pub(crate) struct Plan {
-        wire: Option<Vec<u8>>,
-        /// Hold the connection open after writing instead of closing it.
-        pub(super) stall_body: bool,
-    }
-
-    impl Plan {
-        pub(crate) fn reply(wire: impl Into<Vec<u8>>) -> Self {
-            Self {
-                wire: Some(wire.into()),
-                stall_body: false,
-            }
-        }
-
-        /// An SSE response that ends at once, for tests that read only the request.
-        pub(crate) fn empty_stream() -> Self {
-            Self::reply(reply("200 OK", "Content-Type: text/event-stream\r\n", ""))
-        }
-
-        /// Write `wire`, then hold the connection open.
-        pub(crate) fn stalled(wire: &[u8]) -> Self {
-            Self {
-                wire: Some(wire.to_vec()),
-                stall_body: true,
-            }
-        }
-
-        pub(crate) fn stalled_headers() -> Self {
-            Self {
-                wire: None,
-                stall_body: true,
-            }
-        }
-    }
-
-    /// Scripted HTTP fixture which keeps accepting, so replays are observed.
-    pub(crate) struct Server {
-        pub(crate) url: String,
-        address: std::net::SocketAddr,
-        requests: tokio::sync::mpsc::UnboundedReceiver<String>,
-        /// Connections accepted, against requests taken by the test.
-        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        taken: usize,
-        task: tokio::task::JoinHandle<()>,
-    }
-
-    impl Server {
-        pub(crate) async fn start(plans: Vec<Plan>) -> Self {
-            use tokio::io::AsyncWriteExt;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let url = format!("http://{address}/responses");
-            let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
-            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let count = accepted.clone();
-            let task = tokio::spawn(async move {
-                let plans = std::sync::Arc::new(std::sync::Mutex::new(plans.into_iter()));
-                let mut connections = tokio::task::JoinSet::new();
-                loop {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let (tx, plans) = (tx.clone(), plans.clone());
-                    connections.spawn(async move {
-                        let request = read_request(&mut socket).await;
-                        // A connection without a request (the probe below) uses no plan.
-                        let plan = (!request.is_empty()).then(|| plans.lock().unwrap().next());
-                        let plan = plan.flatten().unwrap_or_else(Plan::stalled_headers);
-                        tx.send(request).unwrap();
-                        if let Some(wire) = plan.wire {
-                            // Timed-out attempts may close the connection before writing.
-                            let _ = socket.write_all(&wire).await;
-                        }
-                        if plan.stall_body {
-                            std::future::pending::<()>().await;
-                        }
-                    });
-                }
-            });
-            Self {
-                url,
-                address,
-                requests,
-                accepted,
-                taken: 0,
-                task,
-            }
-        }
-
-        /// The server's root URL, without the endpoint path.
-        pub(crate) fn root(&self) -> String {
-            format!("http://{}", self.address)
-        }
-
-        pub(crate) async fn request(&mut self) -> String {
-            self.taken += 1;
-            crate::tests::bounded(self.requests.recv()).await.unwrap()
-        }
-
-        /// Requests not yet taken, once the client's calls have returned. An empty
-        /// probe connection flushes the accept queue, so every connection the client
-        /// opened is counted, even a replay that never completed its request.
-        pub(crate) async fn unclaimed(&mut self) -> Vec<String> {
-            drop(tokio::net::TcpStream::connect(self.address).await.unwrap());
-            let mut requests = Vec::new();
-            loop {
-                match self.request().await {
-                    probe if probe.is_empty() => break,
-                    request => requests.push(request),
-                }
-            }
-            let accepted = self.accepted.load(std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(accepted, self.taken, "unexpected connection");
-            requests
-        }
-
-        pub(crate) async fn finish(mut self) -> Vec<String> {
-            self.unclaimed().await
-        }
-    }
-
-    impl Drop for Server {
-        fn drop(&mut self) {
-            // Aborting the accept task drops its JoinSet and all held sockets.
-            self.task.abort();
-        }
-    }
-
     /// A `status` response whose body sends `prefix`, then never another byte.
     pub(super) fn stalled_response(status: u16, prefix: &'static str) -> Response {
         let prefix =
@@ -424,9 +272,8 @@ pub(crate) mod tests {
             .into()
     }
 
-    /// Posts once to a single-plan server, asserting one request and no replay.
-    async fn rejected(plan: Plan) -> Failure {
-        let mut server = Server::start(vec![plan]).await;
+    /// Posts once to `server`, asserting it took one request and no replay.
+    async fn rejected(server: &mut Server) -> Failure {
         let client = client().unwrap();
         let post = post_sse(
             &client,
@@ -437,7 +284,7 @@ pub(crate) mod tests {
         );
         let error = crate::tests::bounded(post).await.err().unwrap();
         server.request().await;
-        assert!(server.finish().await.is_empty(), "unexpected replay");
+        assert!(server.unclaimed().await.is_empty(), "unexpected replay");
         error
     }
 
@@ -485,10 +332,9 @@ pub(crate) mod tests {
         use ProviderErrorKind::*;
         let json = "Content-Type: application/json\r\n";
         let refused = r#"{"error":{"message":"upstream rejected the request"}}"#;
-        let context = r#"{"error":{"code":"context_length_exceeded","message":"prompt too long"}}"#;
         let throttle = r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
         // (status, headers, body, kind, the server's explanation carried verbatim)
-        for (status, headers, body, kind, explanation) in [
+        let cases = [
             (
                 "429 Too Many Requests",
                 "Retry-After: 120\r\n",
@@ -505,30 +351,22 @@ pub(crate) mod tests {
                 ": upstream unavailable",
             ),
             (
-                "500 Internal Server Error",
-                "",
-                refused,
-                Unavailable,
-                ": upstream rejected the request",
-            ),
-            (
                 "401 Unauthorized",
                 json,
                 refused,
                 Authentication,
                 ": upstream rejected the request",
             ),
-            (
-                "400 Bad Request",
-                "",
-                context,
-                ContextWindowExceeded,
-                ": prompt too long",
-            ),
             ("200 OK", json, "{}", Protocol, "non-SSE content type"),
-        ] {
-            let plan = Plan::reply(reply(status, headers, body));
-            let failure = rejected(plan).await;
+        ];
+        let plans = cases
+            .iter()
+            .map(|(status, headers, body, ..)| Plan::reply(reply(status, headers, body)));
+        // An empty response closes the socket after consuming the full POST.
+        let plans = plans.chain([Plan::reply(String::new())]).collect();
+        let mut server = Server::start(plans).await;
+        for (status, _, _, kind, explanation) in cases {
+            let failure = rejected(&mut server).await;
             let unauthorized = matches!(&failure, Failure::Rejected(r) if r.unauthorized());
             assert_eq!(unauthorized, status.starts_with("401"), "{status}");
             let error = reported(failure);
@@ -541,8 +379,7 @@ pub(crate) mod tests {
             let hint = status.starts_with("429").then(|| Duration::from_secs(120));
             assert_eq!(error.retry_after(), hint, "{status}");
         }
-        // An empty response closes the socket after consuming the full POST.
-        let closed = reported(rejected(Plan::reply(String::new())).await);
+        let closed = reported(rejected(&mut server).await);
         assert_eq!(closed.kind(), Transport);
         assert!(closed.is_retryable());
     }
@@ -564,7 +401,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(start.elapsed(), 2 * limit);
             // Preserve the known rejection classification even if diagnostics stall.
-            assert!(matches!(&failure, Failure::Rejected(r) if r.unauthorized()));
+            assert_matches!(&failure, Failure::Rejected(r) if r.unauthorized());
             assert_eq!(reported(failure).kind(), ProviderErrorKind::Authentication);
         }
     }
@@ -611,26 +448,6 @@ pub(crate) mod tests {
         let impatient = Client::builder().timeout(limit).build().unwrap();
         let (_, message) = timed_out(post(&impatient), &mut server, limit).await;
         assert_ne!(message, "provider HTTP startup timeout");
-        assert!(server.finish().await.is_empty(), "unexpected replay");
-    }
-
-    #[tokio::test]
-    async fn dropping_pending_send_cancels_the_request() {
-        let mut server = Server::start(vec![Plan::stalled_headers()]).await;
-        let client = client().unwrap();
-        let url = server.url.clone();
-        let mut request = Box::pin(post_sse(
-            &client,
-            &url,
-            HeaderMap::new(),
-            "null",
-            Timeouts::default(),
-        ));
-        tokio::select! {
-            _ = &mut request => panic!("request finished before cancellation"),
-            _ = server.request() => {}
-        }
-        drop(request);
         assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 

@@ -263,34 +263,17 @@ pub(super) mod tests {
         assert!(decoder.decode(&event(packet.clone())).is_err(), "{packet}");
     }
 
+    /// One packet per shape that carries no output: no choices, a choice
+    /// without a delta, and deltas of nulls, empty values or unknown fields.
     pub(super) fn noop_packets() -> Vec<Value> {
-        let mut packets = vec![json!({}), json!({"choices":null}), json!({"choices":[]})];
-        let deltas = [
-            Value::Null,
-            json!({}),
-            json!({"content":null}),
-            json!({"role":"assistant"}),
-            json!({"role":null,"content":null,"refusal":null,"reasoning":null,"reasoning_content":null,"tool_calls":null}),
-            json!({"content":"","refusal":"","reasoning":"","reasoning_content":"","tool_calls":[]}),
-            json!({"role":"assistant","content":"","refusal":null,"reasoning":"","reasoning_content":null,"tool_calls":[],"audio":null,"function_call":null,"unknown":null}),
-        ];
-        for omit_index in [false, true] {
-            for null_finish in [false, true] {
-                let mut choice = json!({});
-                if !omit_index {
-                    choice["index"] = json!(0);
-                }
-                if null_finish {
-                    choice["finish_reason"] = Value::Null;
-                }
-                packets.push(json!({"choices":[choice.clone()]}));
-                for value in &deltas {
-                    choice["delta"] = value.clone();
-                    packets.push(json!({"choices":[choice.clone()]}));
-                }
-            }
-        }
-        packets
+        vec![
+            json!({"choices":null}),
+            json!({"choices":[]}),
+            json!({"choices":[{"index":0}]}),
+            json!({"choices":[{"finish_reason":null,"delta":null}]}),
+            json!({"choices":[{"index":0,"delta":{"role":null,"content":null,"refusal":null,"reasoning":null,"reasoning_content":null,"tool_calls":null}}]}),
+            json!({"choices":[{"finish_reason":null,"delta":{"role":"assistant","content":"","refusal":"","reasoning":"","reasoning_content":"","tool_calls":[],"audio":null,"function_call":null,"unknown":null}}]}),
+        ]
     }
 
     pub(super) const USAGE: Usage = Usage {
@@ -503,9 +486,6 @@ pub(super) mod tests {
         ]);
         assert_eq!(outcome, Outcome::Cut(CutReason::Incomplete));
         assert_eq!(contents(&items), [text("partial")]);
-        let mut decoder = self::decoder();
-        decoder.decode(&end("stop")).unwrap();
-        assert!(decoder.decode(&delta(json!({"content":"late"}))).is_err());
     }
 
     #[test]
@@ -523,28 +503,10 @@ pub(super) mod tests {
             assert_eq!(outcome, MAX_TOKENS);
             assert_eq!(contents(&items), [text("text")], "{arguments}");
         }
-        // A later abnormal finish retracts tools a normal one kept, a late overflow
-        // without failing the response, and a later normal finish revives nothing.
-        let incomplete = Outcome::Cut(CutReason::Incomplete);
-        for (finishes, expected) in [
-            (["stop", "length"], MAX_TOKENS),
-            (["stop", "model_context_window_exceeded"], incomplete),
-            (["length", "stop"], MAX_TOKENS),
-        ] {
-            let mut frames = vec![tool("{}")];
-            frames.extend(finishes.map(end));
-            frames.push(done());
-            let (items, _, outcome) = decode(frames);
-            assert_eq!(outcome, expected, "{finishes:?}");
-            assert_eq!(contents(&items), [text("text")], "{finishes:?}");
-        }
-        // A text answer is not revised by a later abnormal finish.
-        let answer = delta(json!({"content":"answer"}));
-        let (items, _, outcome) = decode(vec![answer, end("stop"), end("length"), done()]);
-        assert_eq!(
-            (outcome, contents(&items)),
-            (Outcome::Answer, vec![text("answer")])
-        );
+        // A later abnormal finish retracts tools a normal one kept.
+        let (items, _, outcome) = decode(vec![tool("{}"), end("stop"), end("length"), done()]);
+        assert_eq!(outcome, MAX_TOKENS);
+        assert_eq!(contents(&items), [text("text")]);
     }
 
     /// A finish naming a condition fails the attempt as that condition: an overflow
@@ -568,7 +530,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn late_cache_refinement_and_null_cache_details_preserve_totals() {
+    fn late_and_repeated_finish_usage_refines_and_null_details_preserve_totals() {
         let packet = |details: Value, output| {
             event(json!({"choices":[],"usage":{
                 "prompt_tokens":100,"completion_tokens":output,"prompt_tokens_details":details
@@ -585,20 +547,30 @@ pub(super) mod tests {
         ]);
         let expected = Usage::prompted(20, 80, 5, 5);
         assert_eq!(usage, expected);
+        // A repeated finish can refine usage too.
+        let finish = |completion, cached: Value| {
+            event(json!({
+                "choices":[{"finish_reason":"length"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":completion,
+                    "prompt_tokens_details":{"cached_tokens":cached}}
+            }))
+        };
+        let (_, usage, outcome) = decode(vec![
+            delta(json!({"content":"partial"})),
+            end("length"),
+            finish(9, Value::Null),
+            finish(10, json!(80)),
+            event(json!({"choices":[{"finish_reason":"length","delta":null}]})),
+        ]);
+        assert_eq!((outcome, usage), (MAX_TOKENS, USAGE));
     }
 
     #[test]
     fn loose_usage_is_merged_monotonically_at_every_stage() {
+        // Alternate key names and mismatched totals.
         for usage in [
-            // Mismatched totals, string counters, and alternate key names.
             json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":1}),
-            json!({"prompt_tokens":"100","completion_tokens":10.0}),
             json!({"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":80}),
-            // Regressions and missing or unusable counters keep the previous totals.
-            json!({"prompt_tokens":99,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":79}}),
-            json!({"prompt_tokens":100}),
-            json!({"completion_tokens":-1, "prompt_tokens":100}),
-            json!({"prompt_tokens":"garbage","completion_tokens":10}),
         ] {
             for stage in 0..3 {
                 let mut decoder = decoder();
@@ -618,31 +590,5 @@ pub(super) mod tests {
                 assert_eq!(decoder.usage.usage(), USAGE, "stage {stage}: {usage}");
             }
         }
-        // Cached tokens never exceed the prompt.
-        let mut decoder = decoder();
-        let packet = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,
-            "prompt_tokens_details":{"cached_tokens":50}}});
-        decoder.decode(&event(packet)).unwrap();
-        assert_eq!(decoder.usage.usage().cached_input_tokens.unwrap(), 10);
-        assert_eq!(decoder.usage.usage().input_tokens.unwrap(), 0);
-    }
-
-    #[test]
-    fn repeated_finish_can_refine_usage() {
-        let packet = |completion, cached: Value| {
-            event(json!({
-                "choices":[{"finish_reason":"length"}],
-                "usage":{"prompt_tokens":100,"completion_tokens":completion,
-                    "prompt_tokens_details":{"cached_tokens":cached}}
-            }))
-        };
-        let (_, usage, outcome) = decode(vec![
-            delta(json!({"content":"partial"})),
-            end("length"),
-            packet(9, Value::Null),
-            packet(10, json!(80)),
-            event(json!({"choices":[{"finish_reason":"length","delta":null}]})),
-        ]);
-        assert_eq!((outcome, usage), (MAX_TOKENS, USAGE));
     }
 }

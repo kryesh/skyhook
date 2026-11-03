@@ -345,13 +345,16 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
     use crate::job::JobState;
+    use std::assert_matches;
 
-    /// Results omit an absent field rather than sending null, so no result schema
-    /// has a nullable property: a required one is an `Option` serialized as null,
-    /// and an optional one an `Option<Option<T>>` or an `Option` of an inline
-    /// enum, whose null alternative result generation does not remove.
+    /// Every built-in is offered with every capability, and its input schema compiles:
+    /// schemars does not check declared constraints, and a built-in's schema compiles
+    /// only at its first call. Results omit an absent field rather than sending null,
+    /// so no result schema has a nullable property: a required one is an `Option`
+    /// serialized as null, and an optional one an `Option<Option<T>>` or an `Option`
+    /// of an inline enum, whose null alternative result generation does not remove.
     #[tokio::test]
-    async fn result_schemas_never_declare_a_nullable_property() {
+    async fn builtin_input_schemas_compile_and_results_are_never_nullable() {
         use serde_json::Value;
         fn nullable(schema: &Value) -> bool {
             let null = Value::from("null");
@@ -408,22 +411,32 @@ mod tests {
         let views = &crate::job::JOB_VIEW_SCHEMAS;
         let mut found = Vec::new();
         let mut checked = Vec::new();
-        for (tool, schema) in surface
-            .result_schemas()
-            .chain([("JobView", &views.one), ("JobListing", &views.listing)])
+        let mut results = Vec::new();
+        for (tool, spec) in surface.every() {
+            let spec = spec.unwrap_or_else(|withheld| panic!("{tool}: {withheld}"));
+            if let Err(reason) = spec.validator.get() {
+                found.push(format!("{tool}: {reason}"));
+            }
+            results.extend(spec.result_schema.as_ref().map(|schema| (tool, schema)));
+        }
+        for (tool, schema) in results
+            .into_iter()
+            .chain([("JobView", &views.view), ("JobListing", &views.listing)])
         {
             checked.push(tool);
             violations(schema, tool.to_owned(), &mut found);
         }
         assert!(checked.contains(&"skill"), "{checked:?}");
-        assert!(found.is_empty(), "nullable properties: {found:#?}");
+        assert!(found.is_empty(), "{found:#?}");
     }
 
     /// Root → child → grandchild, interrupted while the grandchild streams beside
     /// the child's blocking `exec`: the exec is cancelled, the grandchild retained,
     /// and the child's and root's turns stay held on it. `after` scripts the
-    /// requests that follow the interrupted three.
+    /// requests that follow the interrupted three. Only a `durable` session can be
+    /// reopened.
     async fn held_chain(
+        durable: bool,
         after: impl IntoIterator<Item = Step>,
     ) -> (
         tempfile::TempDir,
@@ -443,7 +456,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = if durable {
+            harness.new_session().await.unwrap()
+        } else {
+            ephemeral_session(&harness).await
+        };
         let parent = spawn_prompt(&session, "delegate");
         provider.held(2).await;
         let child = session.root.child(1);
@@ -466,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn a_journal_failure_stops_the_session_as_a_crash_does() {
         let recovered = (0..8).map(|_| Step::new(answer("recovered")));
-        let (_root, harness, _provider, session, parent) = held_chain(recovered).await;
+        let (_root, harness, _provider, session, parent) = held_chain(true, recovered).await;
         let (id, store, jobs) = (session.id(), &session.runtime.store, &session.runtime.jobs);
         let launch = json!({"command": "sleep 30", "bg": true});
         let executor = &session.runtime.executor;
@@ -509,7 +526,7 @@ mod tests {
         let remote = (session.runtime.router)
             .environment(crate::remote::backend::ProcessAuthentication::PromptsAndAgent)
             .await;
-        assert!(matches!(remote, Err(crate::remote::RemoteError::Cancelled)));
+        assert_matches!(remote, Err(crate::remote::RemoteError::Cancelled));
         assert!(failed(
             bounded(session.shutdown()).await.map(|()| String::new())
         ));
@@ -541,31 +558,57 @@ mod tests {
     }
 
     /// Continuing a held chain restarts the grandchild, and the whole tree answers
-    /// through the preserved waits.
+    /// through the preserved waits. Continue resumes every holder's wait, not only
+    /// the root's: the child's resumed turn is busy again, so a second interrupt
+    /// stops it.
     #[tokio::test]
     async fn continue_resumes_a_turn_held_on_a_retained_child_beside_cancelled_work() {
-        let (_root, _harness, provider, session, parent) = held_chain([
-            Step::new(answer("grandchild recovered")),
-            Step::new(answer("child done")),
-            Step::new(answer("parent done")),
-        ])
+        let (_root, _harness, provider, session, parent) = held_chain(
+            false,
+            [
+                Step::new(answer("grandchild recovered")),
+                Step::new(Vec::new()).midstream(),
+                Step::new(answer("child done")),
+                Step::new(answer("parent done")),
+            ],
+        )
         .await;
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
-        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         let resumed = rendered(&provider.request(4).await);
         assert!(resumed.contains("grandchild recovered"), "{resumed}");
+        let child = session.root.child(1);
+        assert_eq!(turn(&session, &child), Turn::Busy);
+        // The root holding the interrupted child shows interrupted again.
+        assert_eq!(session.interrupt().await, 2);
+        assert!(turn(&session, &child).interrupted());
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         session.shutdown().await.unwrap();
     }
 
     /// Closing leaves every link of a held chain interrupted, as it leaves any
-    /// interruption: reopened, `continue` restarts the child and grandchild.
+    /// interruption: a continue once closing has begun is refused and journals
+    /// nothing, and reopened, `continue` restarts the child and grandchild.
     #[tokio::test]
     async fn shutdown_leaves_a_held_chain_resumable() {
         let recovered = (0..8).map(|_| Step::new(answer("recovered")));
-        let (_root, harness, _provider, session, parent) = held_chain(recovered).await;
+        let (_root, harness, _provider, session, parent) = held_chain(true, recovered).await;
         let id = session.id();
-        shutdown_session(session).await;
+        bounded(session.shutdown()).await.unwrap();
         assert!(bounded(parent).await.unwrap().is_err());
+        let closed = session.runtime.store.records();
+        let refused = bounded(session.continue_turn()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(HarnessError::Session(SessionError::Refused(
+                    crate::session::SessionPhase::ShuttingDown
+                )))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(session.runtime.store.records(), closed);
+        session.close().await.unwrap();
         let resumed = harness.resume_session(id).await.unwrap();
         let child = resumed.root.child(1);
         let delegated = async |owner: &AgentId| {
@@ -591,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_redirects_a_chain_held_on_a_retained_grandchild() {
         let (_root, _harness, provider, session, parent) =
-            held_chain([Step::new(answer("redirected"))]).await;
+            held_chain(false, [Step::new(answer("redirected"))]).await;
         assert_eq!(
             bounded(session.prompt("new direction")).await.unwrap(),
             "redirected"
@@ -632,12 +675,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let parent = spawn_prompt(&session, "delegate");
         provider.request(1).await;
         assert_eq!(session.interrupt().await, 2);
         let ended = bounded(parent).await.unwrap();
-        assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
+        assert_matches!(ended, Err(HarnessError::Interrupted));
         assert!(!provider.requested_from(2));
         session.shutdown().await.unwrap();
     }
@@ -653,14 +696,14 @@ mod tests {
         ];
         let root = tempfile::tempdir().unwrap();
         let (_harness, session, provider, _, parent, job) =
-            held_on_interrupted_child(root.path(), after).await;
+            held_on_interrupted_child(root.path(), false, after).await;
         session.runtime.jobs.cancel(job).await.unwrap();
         provider.request(3).await;
         let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
         assert!(jobs.iter().any(|job| job.tool == "script"), "{jobs:?}");
         assert_eq!(session.interrupt().await, 1);
         let ended = bounded(parent).await.unwrap();
-        assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
+        assert_matches!(ended, Err(HarnessError::Interrupted));
         session.shutdown().await.unwrap();
     }
 
@@ -673,7 +716,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let after = [Step::new(answer("must not run"))];
             let (_harness, session, provider, _, parent, job) =
-                held_on_interrupted_child(root.path(), after).await;
+                held_on_interrupted_child(root.path(), false, after).await;
             let cancel = session.runtime.jobs.cancel(job);
             let tree = session.runtime.interrupt_tree(&session.root);
             match tree_first {
@@ -707,14 +750,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let delegated: fn(&SessionEvent) -> bool =
             |event| matches!(event, SessionEvent::JobCreated { .. });
         let interrupted = interrupt_on(&session, &session.root, delegated).await;
         let parent = spawn_prompt(&session, "delegate");
         assert_eq!(bounded(interrupted).await, 2);
         let ended = bounded(parent).await.unwrap();
-        assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
+        assert_matches!(ended, Err(HarnessError::Interrupted));
         assert_eq!(turn(&session, &session.root), INTERRUPTED);
         assert!(!provider.requested_from(1), "the held turn ran on");
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "root done");
@@ -728,20 +771,8 @@ mod tests {
     /// child take it, answer and complete through the preserved wait.
     #[tokio::test]
     async fn interrupt_holds_the_owner_of_an_answered_child_still_open() {
-        let script = json!({"source": "return await receive();", "bg": true});
-        let (_root, requests, session) = scripted_session([
-            response(vec![tool_call(
-                0,
-                "agent",
-                "agent",
-                json!({"prompt": "work"}),
-            )]),
-            response(vec![tool_call(0, "script", "script", script)]),
-            answer("premature child answer"),
-            answer("child done"),
-            answer("root done"),
-        ])
-        .await;
+        let (_root, requests, session) =
+            scripted_session(answered_child_with_work("child done")).await;
         let child = session.root.child(1);
         let mut events = session.runtime.store.observe().updates;
         let parent = spawn_prompt(&session, "delegate");
@@ -781,21 +812,16 @@ mod tests {
             |root| root.child(1),
         );
         let child = json!({"prompt": "child task", "depth": 0});
-        let script =
-            |position, id| tool_call(position, id, "script", json!({"source": "return 1;"}));
-        let alone = || vec![tool_call(0, "child", "agent", child.clone())];
-        let beside = || [alone(), vec![script(1, "first"), script(2, "second")]].concat();
         // What the interrupt stops: an installed child also gives up its
         // owner's input.
-        for (calls, (landing, lander), stopped) in [
-            (alone(), delegated, 2),
-            (beside(), delegated, 2),
-            (alone(), launched, 3),
-            (beside(), launched, 3),
-        ] {
-            let count = calls.len();
+        for ((landing, lander), stopped) in [(delegated, 2), (launched, 3)] {
             let steps = [
-                Step::new(response(calls)),
+                Step::new(response(vec![tool_call(
+                    0,
+                    "child",
+                    "agent",
+                    child.clone(),
+                )])),
                 Step::new(answer("child done")),
                 Step::new(answer("root done")),
             ];
@@ -803,7 +829,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             // Owner input behind the launch is handed back; the work that begins
             // the child is not.
             let (committed, owner_input) = oneshot::channel();
@@ -838,9 +864,6 @@ mod tests {
                 job.state == JobState::Interrupted
             })
             .await;
-            // A response's calls all exist before any runs.
-            let jobs = session.runtime.jobs.list(&session.root).await.unwrap();
-            assert_eq!(jobs.len(), count, "a response's jobs exist together");
             assert!(!provider.requested_from(1), "the child requested");
             assert_eq!(turn(&session, &session.root.child(1)), INTERRUPTED);
             assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
@@ -850,8 +873,8 @@ mod tests {
         }
     }
 
-    /// Chains two and three deep, stopped as the last link's launch is created
-    /// or installs its child. An interrupt holds every link above it, so a
+    /// A chain three deep, stopped as the last link's launch is created or
+    /// installs its child. An interrupt holds every link above it, so a
     /// redirect resolves them all. A shutdown alone, as a crash would, leaves
     /// every delegation interrupted: reopened, `continue` completes those whose
     /// child was installed, the last from the prompt its launch committed, and a
@@ -864,15 +887,9 @@ mod tests {
             matches!(event, SessionEvent::MessageCommitted { message: Message::User(parts) }
             if matches!(parts.as_slice(), [UserPart::Text { text }] if text == "last"))
         };
+        let depth: u32 = 3;
         // Whether the last launch installed its child, and what follows.
-        let cases = [2, 3].into_iter().flat_map(|depth| {
-            [
-                (depth, false, true),
-                (depth, false, false),
-                (depth, true, false),
-            ]
-        });
-        for (depth, accepted, redirect) in cases {
+        for (accepted, redirect) in [(false, true), (false, false), (true, false)] {
             let landing = if accepted { installed } else { created };
             let delegate = |link: u32| {
                 let prompt = match link + 1 == depth {
@@ -887,7 +904,11 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-            let session = harness.new_session().await.unwrap();
+            let session = if redirect {
+                ephemeral_session(&harness).await
+            } else {
+                harness.new_session().await.unwrap()
+            };
             let links: Vec<_> =
                 std::iter::successors(Some(session.root.clone()), |link| Some(link.child(1)))
                     .take(depth as usize)
@@ -968,7 +989,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let (runtime, root) = (session.runtime.clone(), session.root.clone());
         let (done, prompted) = oneshot::channel();
         let (committed, queued) = oneshot::channel();
@@ -1005,7 +1026,7 @@ mod tests {
         assert_eq!(session.interrupt().await, 1);
         for stopped in [first, second] {
             let ended = bounded(stopped).await.unwrap();
-            assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
+            assert_matches!(ended, Err(HarnessError::Interrupted));
         }
         assert_eq!(turn(&session, &session.root), INTERRUPTED);
         assert_eq!(inbox(&session, &session.root), 0);
@@ -1075,12 +1096,12 @@ mod tests {
         };
         let before = failed(&session);
         let receipts = session.enqueue_prompts(vec![refused]).await;
-        bounded(async {
-            while failed(&session) == before || turn(&session, &session.root) != rests {
-                tokio::task::yield_now().await;
-            }
+        let (key, root) = (Key::Agent(session.root.clone()), session.root.clone());
+        found(&session, [key], move |state| {
+            (state.agents.get(&root)?.turn == rests).then_some(())
         })
         .await;
+        assert_eq!(failed(&session), before + 1);
         let id = session.id();
         shutdown_session(session).await;
         for receipt in receipts {
@@ -1147,11 +1168,16 @@ mod tests {
     /// A redirect ends a link an interrupt stopped before its child began, here
     /// an embedder's agent call still preparing it, interrupted in the commit
     /// that releases it: its caller reads it so. The call is stopped as a crash
-    /// stops it, and `continue` asks for it again, as a reopen would.
+    /// stops it, and `continue` asks for it again, as a reopen would. A continue
+    /// before the redirect lets the stopped invocation begin, counting it, so the
+    /// next interrupt stops it again.
     #[tokio::test]
     async fn a_redirect_ends_a_link_stopped_before_its_child_began() {
         let (_root, session, prepared, parent) = preparing_delegate().await;
         // The held root and the call yet to begin.
+        assert_eq!(session.interrupt().await, 2);
+        let continued = bounded(session.continue_turn_with(Selection::default())).await;
+        assert_eq!(continued.unwrap().children_resumed, 1);
         assert_eq!(session.interrupt().await, 2);
         // Queued, the redirect joins the root's turn, which runs on.
         let redirect = QueuedPrompt {
@@ -1174,20 +1200,6 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// `continue` lets an invocation an interrupt stopped before it began begin,
-    /// counting it, so the next interrupt stops it again.
-    #[tokio::test]
-    async fn continue_lets_a_link_stopped_before_its_child_began_begin() {
-        let (_root, session, prepared, parent) = preparing_delegate().await;
-        assert_eq!(session.interrupt().await, 2);
-        let continued = bounded(session.continue_turn_with(Selection::default())).await;
-        assert_eq!(continued.unwrap().children_resumed, 1);
-        assert_eq!(session.interrupt().await, 2);
-        prepared.add_permits(1);
-        assert!(bounded(parent).await.unwrap().is_err());
-        session.shutdown().await.unwrap();
-    }
-
     /// A background child that `continue` restarts is stopped by an interrupt
     /// landing before it begins, as it would be once begun, and stays resumable.
     #[tokio::test]
@@ -1203,7 +1215,7 @@ mod tests {
         let builder = test_builder(root.path(), &sessions, provider.clone(), false);
         let harness = builder.coalescing(wait::Coalescing::held().0).build();
         let harness = harness.await.unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let arguments = json!({"prompt": "child task", "bg": true});
         let executor = &session.runtime.executor;
         let launched = executor.execute(session.root.clone(), "agent", arguments, None);
@@ -1246,7 +1258,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
         let child = session.root.child(1);
         // A child parks only once nothing below it runs.

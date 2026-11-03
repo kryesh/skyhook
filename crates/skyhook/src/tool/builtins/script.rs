@@ -7,23 +7,26 @@ use crate::tool::{
     RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
     diagnostic::{Effects, Operation, Subject},
     executor::ToolExecutor,
+    registry::AdmittedInvocation,
 };
 
 pub(crate) fn install_script_tool(
     builder: &mut ToolRegistryBuilder,
     executor: Weak<OnceLock<ToolExecutor>>,
 ) -> Result<(), RegistryError> {
-    builder.register_product::<ScriptArgs, crate::tool::javascript::ScriptResult, _, _>(
+    builder.register_checked(
         super::names::SCRIPT,
         SCRIPT_DESCRIPTION,
         ToolOptions::default()
             .job_role(crate::job::JobRole::Script)
             .background()
             .input()
-            .script_unavailable(),
-        move |context, args| {
+            .script_unavailable()
+            .result::<crate::tool::javascript::ScriptResult>(),
+        Ok,
+        move |args: ScriptArgs| {
             let executor = executor.clone();
-            async move {
+            AdmittedInvocation::new(move |context| async move {
                 let executor = executor
                     .upgrade()
                     .and_then(|slot| slot.get().cloned())
@@ -35,7 +38,7 @@ pub(crate) fn install_script_tool(
                     .with_location(context.caller_location().clone())
                     .with_capabilities(context.capabilities().clone());
                 crate::tool::javascript::evaluate_captured(args.source, executor, context).await
-            }
+            })
         },
     )?;
     Ok(())

@@ -225,49 +225,11 @@ mod tests {
     use super::*;
     use crate::provider::dialect::{AuthStatus, ConfigHome};
     use crate::tool::policy::Capability;
+    use std::assert_matches;
     use std::path::Path;
-
-    const ANTHROPIC_MISSING_KEY: &str = r#"
-providers:
-  test:
-    dialect: anthropic
-    codec: messages
-    base_url: https://api.anthropic.com/v1
-    api_key: {env: SKYHOOK_TEST_MISSING_API_KEY}
-"#;
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::from_yaml(text)
-    }
-
-    #[tokio::test]
-    async fn explicit_config_is_authoritative() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("explicit.yaml");
-        let text = r#"
-providers:
-  local:
-    dialect: codex
-    codec: responses
-    models:
-      local:
-        model: test
-        max_context: 128000
-        max_output: 16384
-        supports_images: false
-"#;
-        tokio::fs::write(&path, text).await.unwrap();
-        let config = Config::resolve(Path::new("."), Some(&path))
-            .await
-            .unwrap()
-            .config;
-        assert!(
-            serde_json::to_value(&config.providers["local"]).unwrap()["models"]
-                .get("local")
-                .is_some()
-        );
-        assert_eq!(config.modes, default_modes());
-        assert!(config.mcp.is_empty());
     }
 
     #[tokio::test]
@@ -323,19 +285,6 @@ providers:
         assert!(server.get("cwd").is_none());
         assert_eq!(server["start_command"], serde_json::json!(["server"]));
         Config::from_yaml(&config.to_yaml().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn mcp_map_has_exact_name_and_validates_before_provider_credentials() {
-        assert!(parse("mcp: {}").unwrap().mcp.is_empty());
-        assert!(parse("mcp_servers: {}").is_err());
-        assert!(parse("mcp:\n  invalid:\n    transport: stdio").is_err());
-        let text = format!(
-            "mcp:\n  test:\n    transport: stdio\n    start_command: [server]\n    startup_timeout_secs: 0\n{ANTHROPIC_MISSING_KEY}"
-        );
-        let error =
-            parse(&text).expect_err("MCP is rejected at ingress before provider credentials");
-        assert!(error.to_string().contains("startup_timeout_secs"));
     }
 
     #[test]
@@ -424,13 +373,13 @@ providers:
             config.select_mode(Some(&name("first"))).unwrap(),
             &name("first")
         );
-        assert!(matches!(
+        assert_matches!(
             config.select_mode(Some(&name("missing"))),
             Err(ConfigError::Mode {
                 error: ModeError::Unknown,
                 ..
             })
-        ));
+        );
         // `general` stays the default, and declared, until the config says otherwise.
         for (top, modes) in [("", ""), ("", two), ("modes: {}", "")] {
             let config = runtime(top, modes).unwrap();

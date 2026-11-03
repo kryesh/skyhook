@@ -95,9 +95,8 @@ fn main() {
 }
 ```
 
-`main` is `unsafe` because it loads the invocation directory's `.env` and configures SQLite for
-the process before starting Tokio, so the process must still be single-threaded; help and version
-need no `.env` or configuration.
+`main` is `unsafe` because it loads the invocation directory's `.env` before starting Tokio, so
+the process must still be single-threaded; help and version need no `.env` or configuration.
 
 The extension points are:
 
@@ -129,10 +128,18 @@ The extension points are:
 
 Hooks before `opened` create no sessions and write nothing to stdout; a batch run prints the
 session ID first. A product that keeps its own data in each session declares it as
-`Identity::tables`, an `Extension { sql, format, seed }` the host passes to
-`HarnessBuilder::session_extension`: the harness creates those tables in every session it creates
-and checks their format on every one of its own it reopens. `SessionStore::summary`, given the
-host and its tables, refuses one of the host's own sessions that check would refuse, so the
+`Identity::schema`, a `session::Schema` the host passes to `HarnessBuilder::session_schema`: the
+harness creates every session from it and checks the tables' format on every one of its own it
+reopens. `Schema::extended(image, seed)` takes the tables as a `ProductImage` and a function that
+fills their dictionaries in a new session (`Seeding::Fill`) and checks them on an open
+(`Seeding::Check`). `skyhook_schema::image!(format = N, file = "src/schema.sql")` builds the
+image at compile time: the journal's schema with the product's DDL layered on it and the format
+recorded, from `sql = "…"` literals and `file = "…"` paths relative to the crate's manifest, in
+order. A changed file rebuilds the crate. The macro sees its arguments unexpanded, so they must
+be literals or file paths, not `concat!`, `include_str!` or another macro's output; DDL only
+available that way goes through `ProductImage::layered(ddl, format)`, which runs it over the
+journal's image as each session is created. A plain host passes `Schema::JOURNAL`.
+`SessionStore::summary`, given the host and its schema, refuses one of the host's own sessions that check would refuse, so the
 session switcher leaves it out and `--resume` refuses it before `prepare`, as for an earlier
 session format; other hosts' sessions are still listed, view-only. The harness hands host state
 and the resume hook the tables as an `ExtensionDb` on the session's own writer and read pool;
@@ -154,7 +161,8 @@ columns wide, the usual band below it on a narrower one. `AgentPane::Hidden` lea
 off the UI thread, as the extension's own session sees it. A `Page` is a list of typed blocks:
 `Facts` (label and value pairs), a `Pipeline` of stages, `Panels` of labelled values and
 meters, and `Section`s, collapsible tables of records that each open to their detail. Cells
-carry a `Tone`, not a colour. The host lays the page out with its own theme, reflowing panels
+carry a `Tone` and a `Weight`, not a colour or a font. The host lays the page out with its own
+theme, reflowing panels
 and dropping section columns by priority as the width shrinks, and owns disclosure and
 scrolling, so a product needs no terminal code. `Disclosed` says which sections are open, how
 many of their records to supply (`Disclosed::PAGE` at a time), and which records are open,
@@ -275,7 +283,7 @@ rendering as false. Names nested in a value (`capabilities.agents`) are not chec
 agent's runtime state. The harness asks for the section before each request and before a
 compaction summary, places it inside the state block beside the date, live jobs and todos, and
 journals it with the state. It is asked with the host's tables in the session (its
-`session_extension`, so only the host's own sessions have a section) and the agent, so it can
+`session_schema`, so only the host's own sessions have a section) and the agent, so it can
 read what the host keeps in the session and answer per agent. The host renders the text itself;
 `None` adds nothing to that request. Use it for facts an agent needs current, such as a
 workflow's identity, policy and progress, rather than prefixing them to the user's first
@@ -556,11 +564,10 @@ with the session.
 The SQLite layout is versioned. Opening a database validates its identity and version; there is no
 migration or compatibility layer for earlier layouts.
 
-An embedder that runs the library without `skyhook_cli::main` may call
-`skyhook::db::configure_process()` once at startup, before any other thread or SQLite use. It turns
-off SQLite's allocation statistics, whose global mutex serialises parallel readers, but it also
-disables SQLite memory accounting for everything else in the process, so the library never calls
-it on its own.
+Before its first connection the library turns off SQLite's allocation statistics for the
+process, whose global mutex serialises parallel readers. That also disables SQLite memory
+accounting and heap limits for any other SQLite user sharing the process; such a user must not
+start SQLite before the library's first connection opens.
 
 ## Reconstructing model calls
 

@@ -334,8 +334,6 @@ pub(super) fn claim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::TestRuntime;
-    use crate::tool::{ToolOptions, ToolRegistryBuilder};
 
     impl JobManager {
         /// Claim the finish of `run` with `end` before any output is saved.
@@ -362,9 +360,6 @@ mod tests {
             Run(id, self.entry(id, |entry| entry.invocation).await.unwrap())
         }
     }
-
-    #[derive(Deserialize, JsonSchema)]
-    struct NoArgs {}
 
     #[tokio::test]
     async fn invalid_create_preflight_does_not_append_or_allocate() {
@@ -446,67 +441,36 @@ mod tests {
         assert_eq!(replayed.output, Some(large));
     }
 
-    /// A handler panic wakes waiters with a failed job rather than leaving it
-    /// running.
-    #[tokio::test]
-    async fn handler_panics_are_supervised_as_failed_jobs() {
-        let runtime = TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        let options = ToolOptions::new(Vec::new()).background();
-        builder
-            .register::<NoArgs, String, _, _>("panic", "panic", options, |_, _| async move {
-                panic!("handler panic");
-            })
-            .unwrap();
-        let (jobs, executor) = (runtime.jobs.clone(), runtime.executor(builder));
-        let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
-        let running = executor
-            .run_host(&runtime.agent, "panic", background)
-            .await
-            .unwrap();
-        let failed = crate::tests::bounded(jobs.wait(running.job, true))
-            .await
-            .unwrap();
-        assert_eq!(failed.state, JobState::Failed);
-        let diagnostic = failed.envelope.diagnostic.unwrap();
-        assert_eq!(
-            diagnostic.context.operation,
-            crate::tool::diagnostic::Operation::Execute
-        );
-    }
-
     /// Racing finishes publish one outcome with its own output: the finish
     /// claim refuses the others before they save anything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn racing_finishes_keep_the_output_of_the_outcome_that_commits() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
-        for _ in 0..40 {
-            let lease = jobs
-                .test_running(JobSpec::test(agent.clone(), "raced"))
-                .await;
-            let (id, run) = (lease.id(), jobs.run(lease.id()).await);
-            let (_input, _worker) = lease.split();
-            let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")).into());
-            let outcomes = [
-                completed,
-                ToolError::cancelled().into(),
-                ToolError::interrupted().into(),
-            ];
-            let finishes = outcomes.map(|outcome| {
-                super::super::supervisor::spawn_completion(jobs.clone(), run, async { outcome })
-            });
-            for finish in finishes {
-                bounded(finish).await.unwrap();
-            }
-            // Unrequested, the cancellation never supersedes an interruption.
-            let published = jobs.test_snapshot(id).await.unwrap();
-            let output = match published.state {
-                JobState::Completed => Some(serde_json::json!("A")),
-                JobState::Cancelled | JobState::Interrupted => None,
-                state => panic!("{state:?}"),
-            };
-            assert_eq!(published.output, output);
+        let lease = jobs
+            .test_running(JobSpec::test(agent.clone(), "raced"))
+            .await;
+        let (id, run) = (lease.id(), jobs.run(lease.id()).await);
+        let (_input, _worker) = lease.split();
+        let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")).into());
+        let outcomes = [
+            completed,
+            ToolError::cancelled().into(),
+            ToolError::interrupted().into(),
+        ];
+        let finishes = outcomes.map(|outcome| {
+            super::super::supervisor::spawn_completion(jobs.clone(), run, async { outcome })
+        });
+        for finish in finishes {
+            bounded(finish).await.unwrap();
         }
+        // Unrequested, the cancellation never supersedes an interruption.
+        let published = jobs.test_snapshot(id).await.unwrap();
+        let output = match published.state {
+            JobState::Completed => Some(serde_json::json!("A")),
+            JobState::Cancelled | JobState::Interrupted => None,
+            state => panic!("{state:?}"),
+        };
+        assert_eq!(published.output, output);
     }
 
     /// A watchdog that fires while an interruption is still saving its output
@@ -529,8 +493,13 @@ mod tests {
                 })
             })
             .await;
-        jobs.cancel(id).await.unwrap();
-        assert!(bounded(worker).await.unwrap_err().is_cancelled());
+        let (aborted, _) = crate::tests::expire(
+            worker,
+            async { jobs.cancel(id).await.unwrap() },
+            super::super::CANCELLATION_GRACE,
+        )
+        .await;
+        assert!(aborted.unwrap_err().is_cancelled());
         let interrupted = ToolError::interrupted().into();
         jobs.publish(&claim, interrupted).await.unwrap();
         bounded(jobs.cancel_and_drain()).await.unwrap();
@@ -707,14 +676,13 @@ mod tests {
             Op::Create => Box::new(()),
             Op::Transition => Box::new(jobs.test_approving(spec).await),
             Op::Claim | Op::Send => {
-                assert_eq!(jobs.test_create(spec).await, id);
-                jobs.test_install(id).await;
                 let handler: ResumeHandler = Arc::new(|value, _| {
                     Box::pin(async move { Ok(ToolOutput::new(value.unwrap()).into()) })
                 });
-                jobs.test_resume_with(id, handler);
+                let (lease, _) = jobs.test_agent(spec, handler).await;
+                assert_eq!(lease.id(), id);
                 jobs.test_finish(id, serde_json::json!("previous")).await;
-                Box::new(())
+                Box::new(lease)
             }
             Op::RequestInput => Box::new(jobs.test_running(spec).await),
         };

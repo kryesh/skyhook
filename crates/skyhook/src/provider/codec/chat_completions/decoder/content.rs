@@ -230,6 +230,16 @@ mod tests {
                 Outcome::Answer,
                 vec![reasoning("same")],
             ),
+            // Conflicting reasoning aliases prefer `reasoning_content`.
+            (
+                vec![
+                    delta(json!({"reasoning":"alias","reasoning_content":"primary"})),
+                    delta(json!({"reasoning":{}, "content":[{"type":"text","text":"answer"}]})),
+                    end("stop"),
+                ],
+                Outcome::Answer,
+                vec![reasoning("primary"), text("answer")],
+            ),
             // One delta repeats an index for a header and its sequential arguments.
             (
                 vec![
@@ -275,40 +285,5 @@ mod tests {
                 assert_eq!(item.replay().is_some(), item.kind() == ItemKind::Reasoning);
             }
         }
-    }
-
-    #[test]
-    fn unknown_and_malformed_delta_fields_are_ignored() {
-        // Unknown fields, and known ones with unusable shapes.
-        for field in [
-            "unknown",
-            "audio",
-            "provider_specific_fields",
-            "thinking_blocks",
-            "reasoning_details",
-        ] {
-            for value in [
-                json!(""),
-                json!(false),
-                json!(0),
-                json!([]),
-                json!({"data":"x"}),
-            ] {
-                let mut payload = json!({"content":"answer"});
-                payload[field] = value;
-                let (items, _, _) = decode(vec![delta(payload), end("stop")]);
-                assert_eq!(contents(&items), [text("answer")]);
-            }
-        }
-    }
-
-    #[test]
-    fn conflicting_reasoning_aliases_prefer_reasoning_content() {
-        let (items, _, _) = decode(vec![
-            delta(json!({"reasoning":"alias","reasoning_content":"primary"})),
-            delta(json!({"reasoning":{}, "content":[{"type":"text","text":"answer"}]})),
-            end("stop"),
-        ]);
-        assert_eq!(contents(&items), [reasoning("primary"), text("answer")]);
     }
 }

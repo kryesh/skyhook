@@ -1,7 +1,10 @@
 //! Each kind's neighbourhood, read in one snapshot.
 
 use libsql::Row;
-use skyhook::db::{Db, enum_column, optional_enum_column, params};
+use skyhook::{
+    db::{Db, enum_column, optional_enum_column, params},
+    identity::SessionId,
+};
 
 use super::{super::*, views::*};
 
@@ -18,7 +21,7 @@ macro_rules! premise_refs {
         concat!(
             "SELECT p.node,n.title,p.scope,p.status FROM ",
             $from,
-            " JOIN premise_state p ON p.node=x.premise JOIN node n ON n.id=p.node WHERE ",
+            " JOIN premise_standing p ON p.node=x.premise JOIN node n ON n.id=p.node WHERE ",
             $filter,
             " ORDER BY p.node"
         )
@@ -91,24 +94,34 @@ pub(super) fn steps(db: &Db, path: NodeId) -> Result<Vec<Step>> {
     )
 }
 
-pub(super) fn sources(db: &Db, path: NodeId) -> Result<Vec<SourceRef>> {
+pub(super) fn states(db: &Db, path: NodeId) -> Result<Vec<AccessRef>> {
     rows(
         db,
         concat!(
-            "SELECT s.node,n.title,s.trust,s.status,",
+            "SELECT s.node,n.title,s.scope,i.trust,s.status,x.access,",
             location_columns!(),
-            " FROM path_source x JOIN source s ON s.node=x.source JOIN node n ON n.id=s.node",
-            location_joins!("s.location"),
-            " WHERE x.path=?1 ORDER BY s.node"
+            " FROM path_state x JOIN state s ON s.node=x.state JOIN node n ON n.id=s.node LEFT \
+             JOIN input_state i ON i.state=s.node",
+            location_joins!("x.location"),
+            " WHERE x.path=?1 ORDER BY s.node,x.access,x.location"
         ),
         params![path],
         |row| {
-            Ok(SourceRef {
-                id: SourceId(row.get(0)?),
+            let scope = match enum_column(row, 2)? {
+                StateScope::Input => Scoped::Input {
+                    trust: enum_column(row, 3)?,
+                },
+                StateScope::Handed => Scoped::Handed,
+                StateScope::Instance => Scoped::Instance,
+                StateScope::Stored => Scoped::Stored,
+            };
+            Ok(AccessRef {
+                id: StateId(row.get(0)?),
                 title: row.get(1)?,
-                trust: enum_column(row, 2)?,
-                status: enum_column(row, 3)?,
-                location: located(row, 4)?,
+                scope,
+                status: enum_column(row, 4)?,
+                access: enum_column(row, 5)?,
+                location: located(row, 6)?,
             })
         },
     )
@@ -127,8 +140,9 @@ pub(super) fn environments(
     db: &Db,
     sql: &'static str,
     params: Vec<libsql::Value>,
+    limit: usize,
 ) -> Result<Vec<EnvironmentView>> {
-    let mut environments = rows(db, sql, params, |row| {
+    let mut environments = first_rows(db, sql, params, limit, |row| {
         Ok(EnvironmentView {
             id: EnvironmentId(row.get(0)?),
             instructions: row.get(1)?,
@@ -190,16 +204,10 @@ pub(super) fn component(db: &Db, head: Head) -> Result<ComponentView> {
         )?,
         flaws: rows(
             db,
-            "SELECT f.node,n.title,f.status FROM flaw_state f JOIN node n ON n.id=f.node WHERE \
+            "SELECT f.node,n.title,f.status FROM flaw_standing f JOIN node n ON n.id=f.node WHERE \
              f.component=?1 AND n.merged_into IS NULL ORDER BY f.node",
             params![id],
-            |row| {
-                Ok(FlawRef {
-                    id: FlawId(row.get(0)?),
-                    title: row.get(1)?,
-                    status: enum_column(row, 2)?,
-                })
-            },
+            flaw_ref,
         )?,
         head,
     })
@@ -209,7 +217,7 @@ pub(super) fn path(db: &Db, head: Head) -> Result<PathView> {
     let id = head.id;
     Ok(PathView {
         steps: steps(db, id)?,
-        sources: sources(db, id)?,
+        states: states(db, id)?,
         premises: path_premises(db, id)?,
         candidates: rows(
             db,
@@ -229,64 +237,200 @@ pub(super) fn path(db: &Db, head: Head) -> Result<PathView> {
     })
 }
 
-pub(super) fn source(db: &Db, head: Head) -> Result<SourceView> {
+fn flaw_ref(row: &Row) -> Result<FlawRef> {
+    Ok(FlawRef {
+        id: FlawId(row.get(0)?),
+        title: row.get(1)?,
+        status: enum_column(row, 2)?,
+    })
+}
+
+pub(super) fn state(db: &Db, head: Head) -> Result<StateView> {
     let id = head.id;
-    let held = optional(
+    let (scope, status) = stored(
+        db,
+        "SELECT scope,status FROM state WHERE node=?1",
+        params![id],
+        |row| Ok((enum_column(row, 0)?, enum_column(row, 1)?)),
+    )?;
+    let input = optional(
         db,
         concat!(
-            "SELECT s.trust,s.status,",
+            "SELECT i.trust,",
             location_columns!(),
-            " FROM source s",
-            location_joins!("s.location"),
-            " WHERE s.node=?1"
+            " FROM input_state i",
+            location_joins!("i.location"),
+            " WHERE i.state=?1"
         ),
         params![id],
-        |row| Ok((enum_column(row, 0)?, enum_column(row, 1)?, located(row, 2)?)),
+        |row| {
+            Ok(InputView {
+                trust: enum_column(row, 0)?,
+                location: located(row, 1)?,
+            })
+        },
     )?;
-    let live = held
-        .map(|(trust, status, location)| -> Result<_> {
-            Ok(LiveSource {
-                location,
-                trust,
-                status,
-                paths: rows(
-                    db,
-                    "SELECT n.id,n.title FROM path_source x JOIN node n ON n.id=x.path WHERE \
-                     x.source=?1 ORDER BY n.id",
-                    params![id],
-                    ref_row,
-                )?,
+    let accesses = rows(
+        db,
+        concat!(
+            "SELECT n.id,n.title,x.access,",
+            location_columns!(),
+            " FROM path_state x JOIN node n ON n.id=x.path",
+            location_joins!("x.location"),
+            " WHERE x.state=?1 ORDER BY x.path,x.access,x.location"
+        ),
+        params![id],
+        |row| {
+            Ok(AccessView {
+                path: ref_row(row)?,
+                access: enum_column(row, 2)?,
+                location: located(row, 3)?,
+            })
+        },
+    )?;
+    let check = optional(
+        db,
+        concat!(
+            "SELECT c.event,e.note,NOT ifnull(",
+            queues::check_stale!("c.state", "c.event"),
+            ",1) FROM state_check c JOIN event e ON e.id=c.event WHERE c.state=?1"
+        ),
+        params![id],
+        |row| {
+            Ok(CheckView {
+                event: EventId(row.get(0)?),
+                note: row.get(1)?,
+                current: row.get(2)?,
+            })
+        },
+    )?;
+    Ok(StateView {
+        scope,
+        status,
+        input,
+        accesses,
+        flaws: rows(
+            db,
+            "SELECT f.node,n.title,f.status FROM flaw_state x JOIN flaw_standing f ON \
+             f.node=x.flaw JOIN node n ON n.id=f.node WHERE x.state=?1 ORDER BY f.node",
+            params![id],
+            flaw_ref,
+        )?,
+        premises: decided_premises(db, id)?,
+        check,
+        head,
+    })
+}
+
+/// The decided premises of the flaws leaving state `state` wrong.
+pub(in crate::store) fn decided_premises(db: &Db, state: NodeId) -> Result<Vec<DecidedPremise>> {
+    rows(
+        db,
+        "SELECT p.node,n.title,p.scope,p.status,p.decided,(SELECT max(task) FROM event_task WHERE \
+         event=p.decided),(SELECT count(*) FROM evidence WHERE node=p.node) FROM (SELECT DISTINCT \
+         fp.premise FROM flaw_state fs JOIN flaw_premise fp ON fp.flaw=fs.flaw WHERE fs.state=?1) \
+         x JOIN premise_standing p ON p.node=x.premise JOIN node n ON n.id=p.node WHERE \
+         p.status!='undecided' ORDER BY p.node",
+        params![state],
+        |row| {
+            Ok(DecidedPremise {
+                premise: premise_ref(row)?,
+                decided: EventId(row.get(4)?),
+                task: row.get::<Option<i64>>(5)?.map(TaskId),
+                evidence: row.get(6)?,
+            })
+        },
+    )
+}
+
+/// The proposal of each result on node `?1`: its event, agent and outermost task, then its value.
+const PREMISE_PROPOSAL: &str = "SELECT e.id,e.agent,(SELECT max(task) FROM event_task WHERE event=e.id),r.status FROM \
+     premise_standing s JOIN premise_decision r ON r.event=s.proposed JOIN event e ON \
+     e.id=r.event WHERE s.node=?1";
+const FLAW_PROPOSAL: &str = "SELECT e.id,e.agent,(SELECT max(task) FROM event_task WHERE event=e.id),r.status FROM \
+     flaw_standing s JOIN flaw_judgement r ON r.event=s.proposed JOIN event e ON e.id=r.event \
+     WHERE s.node=?1";
+const ASSESSMENT_PROPOSAL: &str = "SELECT e.id,e.agent,(SELECT max(task) FROM event_task WHERE event=e.id),r.vector,\
+     r.severity FROM candidate_result s JOIN candidate_assessment r ON \
+     r.event=s.assessment_proposed JOIN event e ON e.id=r.event WHERE s.candidate=?1";
+const VERDICT_PROPOSAL: &str = "SELECT e.id,e.agent,(SELECT max(task) FROM event_task WHERE event=e.id),r.verdict FROM \
+     candidate_result s JOIN candidate_verdict r ON r.event=s.verdict_proposed JOIN event e ON \
+     e.id=r.event WHERE s.candidate=?1";
+
+/// Node `node`'s proposal `sql` reads, its value from column 3 on.
+fn proposal<T>(
+    db: &Db,
+    session: SessionId,
+    sql: &'static str,
+    node: NodeId,
+    value: impl FnOnce(&Row) -> Result<T>,
+) -> Result<Option<Proposal<T>>> {
+    let found = optional(db, sql, params![node], |row| {
+        Ok((
+            EventId(row.get(0)?),
+            row.get::<i64>(1)?,
+            row.get::<Option<i64>>(2)?.map(TaskId),
+            value(row)?,
+        ))
+    })?;
+    found
+        .map(|(event, agent, task, value)| {
+            Ok(Proposal {
+                value,
+                event,
+                task,
+                agent: events::agent_id(db, session, agent)?,
             })
         })
-        .transpose()?;
-    Ok(SourceView { head, live })
+        .transpose()
 }
 
-/// Contradicting evidence on node `$id` came after `$stamp`, the event that last set its
-/// status.
-macro_rules! disputed {
-    ($id:literal, $stamp:literal) => {
-        concat!(
-            "EXISTS (SELECT 1 FROM evidence d WHERE d.node=",
-            $id,
-            " AND d.stance='contradicts' AND d.event>ifnull(",
-            $stamp,
-            ",0))"
-        )
-    };
+fn scored(row: &Row) -> Result<Scored> {
+    let vector: String = row.get(3)?;
+    let parsed: crate::cvss::Cvss40 = vector
+        .parse()
+        .map_err(|_| corrupt("invalid stored vector"))?;
+    Ok(Scored {
+        score: parsed.score(),
+        vector,
+        severity: enum_column(row, 4)?,
+    })
 }
-pub(in crate::store) use disputed;
 
-pub(super) fn premise(db: &Db, head: Head) -> Result<PremiseView> {
+/// Node `node`'s proposal of the result `phase` records on it, if it carries one.
+pub(in crate::store) fn proposed(
+    db: &Db,
+    session: SessionId,
+    phase: Phase,
+    node: NodeId,
+) -> Result<Option<Proposal<Proposed>>> {
+    match phase {
+        Phase::Settle => proposal(db, session, PREMISE_PROPOSAL, node, |row| {
+            Ok(Proposed::Premise(enum_column(row, 3)?))
+        }),
+        Phase::Chain => proposal(db, session, FLAW_PROPOSAL, node, |row| {
+            Ok(Proposed::Flaw(enum_column(row, 3)?))
+        }),
+        Phase::Assess => proposal(db, session, ASSESSMENT_PROPOSAL, node, |row| {
+            Ok(Proposed::Assessment(scored(row)?))
+        }),
+        Phase::Review => proposal(db, session, VERDICT_PROPOSAL, node, |row| {
+            Ok(Proposed::Verdict(enum_column(row, 3)?))
+        }),
+        Phase::Sweep | Phase::Probe | Phase::Check | Phase::Test | Phase::Report => Ok(None),
+    }
+}
+
+pub(super) fn premise(db: &Db, session: SessionId, head: Head) -> Result<PremiseView> {
     let id = head.id;
     let (scope, status, disputed, location) = stored(
         db,
         concat!(
             "SELECT p.scope,p.status,",
-            disputed!("p.node", "p.decided"),
+            bearing::disputed!("p", "decided"),
             ",",
             location_columns!(),
-            " FROM premise_state p",
+            " FROM premise_standing p",
             location_joins!("p.location"),
             " WHERE p.node=?1"
         ),
@@ -303,6 +447,9 @@ pub(super) fn premise(db: &Db, head: Head) -> Result<PremiseView> {
     Ok(PremiseView {
         scope,
         status,
+        proposed: proposal(db, session, PREMISE_PROPOSAL, id, |row| {
+            Ok(enum_column(row, 3)?)
+        })?,
         disputed,
         location,
         flaws: rows(
@@ -318,6 +465,21 @@ pub(super) fn premise(db: &Db, head: Head) -> Result<PremiseView> {
              x.premise=?1 ORDER BY n.id",
             params![id],
             ref_row,
+        )?,
+        rests_on: rows(
+            db,
+            premise_refs!(
+                "(SELECT rests_on AS premise FROM premise_basis WHERE premise=?1) x",
+                "1"
+            ),
+            params![id],
+            premise_ref,
+        )?,
+        rested_on_by: rows(
+            db,
+            premise_refs!("premise_basis x", "x.rests_on=?1"),
+            params![id],
+            premise_ref,
         )?,
         head,
     })
@@ -345,14 +507,14 @@ pub(in crate::store) fn undecided_premises(db: &Db, candidate: NodeId) -> Result
     )
 }
 
-pub(super) fn flaw(db: &Db, head: Head) -> Result<FlawView> {
+pub(super) fn flaw(db: &Db, session: SessionId, head: Head) -> Result<FlawView> {
     let id = head.id;
     let (component, cwe, status, location) = stored(
         db,
         concat!(
             "SELECT f.component,c.title,f.cwe,f.status,",
             location_columns!(),
-            " FROM flaw_state f JOIN node c ON c.id=f.component",
+            " FROM flaw_standing f JOIN node c ON c.id=f.component",
             location_joins!("f.location"),
             " WHERE f.node=?1"
         ),
@@ -373,8 +535,18 @@ pub(super) fn flaw(db: &Db, head: Head) -> Result<FlawView> {
         component,
         cwe,
         status,
+        proposed: proposal(db, session, FLAW_PROPOSAL, id, |row| {
+            Ok(enum_column(row, 3)?)
+        })?,
         location,
         premises: flaw_premises(db, id)?,
+        states: rows(
+            db,
+            "SELECT n.id,n.title FROM flaw_state x JOIN node n ON n.id=x.state WHERE x.flaw=?1 \
+             ORDER BY n.id",
+            params![id],
+            ref_row,
+        )?,
         candidates: rows(
             db,
             "SELECT n.id,n.title,cf.position FROM candidate_flaw cf JOIN node n ON \
@@ -398,14 +570,13 @@ pub(super) fn flaw(db: &Db, head: Head) -> Result<FlawView> {
     })
 }
 
-pub(super) fn candidate(db: &Db, head: Head) -> Result<CandidateView> {
+pub(super) fn candidate(db: &Db, session: SessionId, head: Head) -> Result<CandidateView> {
     let id = head.id;
     let (status, confidence, assessment, verdict) = stored(
         db,
-        "SELECT s.state,s.confidence,c.vector,c.severity,a.note,c.verdict,r.note,\
-         s.assessed_current,s.reviewed_current FROM candidate c JOIN candidate_state s ON \
-         s.candidate=c.node LEFT JOIN event a ON a.id=c.assessed LEFT JOIN event r ON \
-         r.id=c.reviewed WHERE c.node=?1",
+        "SELECT s.state,s.confidence,s.vector,s.severity,a.note,s.verdict,r.note,\
+         s.assessed_current,s.reviewed_current FROM candidate_state s LEFT JOIN event a ON \
+         a.id=s.assessed LEFT JOIN event r ON r.id=s.reviewed WHERE s.candidate=?1",
         params![id],
         |row| {
             let assessment = match row.get::<Option<String>>(2)? {
@@ -450,7 +621,7 @@ pub(super) fn candidate(db: &Db, head: Head) -> Result<CandidateView> {
         .map(|path| {
             Ok(ActionView {
                 steps: steps(db, path.id)?,
-                sources: sources(db, path.id)?,
+                states: states(db, path.id)?,
                 premises: path_premises(db, path.id)?,
                 path,
             })
@@ -458,16 +629,10 @@ pub(super) fn candidate(db: &Db, head: Head) -> Result<CandidateView> {
         .collect::<Result<_>>()?;
     let chain = rows(
         db,
-        "SELECT f.node,n.title,f.status FROM candidate_flaw cf JOIN flaw_state f ON \
+        "SELECT f.node,n.title,f.status FROM candidate_flaw cf JOIN flaw_standing f ON \
          f.node=cf.flaw JOIN node n ON n.id=f.node WHERE cf.candidate=?1 ORDER BY cf.position",
         params![id],
-        |row| {
-            Ok(FlawRef {
-                id: FlawId(row.get(0)?),
-                title: row.get(1)?,
-                status: enum_column(row, 2)?,
-            })
-        },
+        flaw_ref,
     )?;
     let chain = (chain.into_iter())
         .map(|flaw| {
@@ -512,6 +677,10 @@ pub(super) fn candidate(db: &Db, head: Head) -> Result<CandidateView> {
         confidence,
         assessment,
         verdict,
+        proposed_assessment: proposal(db, session, ASSESSMENT_PROPOSAL, id, scored)?,
+        proposed_verdict: proposal(db, session, VERDICT_PROPOSAL, id, |row| {
+            Ok(enum_column(row, 3)?)
+        })?,
         tests,
         settling_test: stored(
             db,
@@ -527,6 +696,7 @@ pub(super) fn candidate(db: &Db, head: Head) -> Result<CandidateView> {
              SELECT id,instructions,candidate,event FROM environment WHERE candidate IS NULL \
              ORDER BY event",
             params![id],
+            usize::MAX,
         )?,
         head,
     })

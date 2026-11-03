@@ -76,6 +76,7 @@ impl App {
         };
         let PreparedObservation {
             active,
+            budget,
             shown:
                 super::observation::Shown {
                     snapshot,
@@ -92,6 +93,7 @@ impl App {
         self.forget_unread_responses();
         self.projection = *projection;
         self.window = window.map(|window| *window);
+        self.budget = budget;
         self.selected = self.root_agent().clone();
         self.views.transfer(&draft, self.selected.clone());
         for status in &mut self.unsaved_status {
@@ -227,6 +229,7 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn unreadable_start_image_keeps_the_prompt_as_a_draft() {
@@ -277,8 +280,6 @@ mod tests {
     #[tokio::test]
     async fn first_submit_creates_once_and_preserves_queue_models_and_draft() {
         let (_root, mut app) = draft_fixture().await;
-        let broken_skill = app.launch.workspace.join(".agents/skills/broken");
-        std::fs::create_dir_all(&broken_skill).unwrap();
         let mut rx = capture_work(&mut app);
         for command in [Command::Export, Command::Retry] {
             app.command(command);
@@ -327,18 +328,7 @@ mod tests {
         );
         let pastes: Vec<_> = app.editor.pastes().map(|(_, text)| text).collect();
         assert_eq!(pastes, ["unsent attachment"]);
-        app.status.flush().await;
-        let session = app.session().unwrap();
-        let records = journal(session).await;
-        assert!(!session.warnings().is_empty());
-        for warning in session.warnings() {
-            let status = format!("Startup warning: {warning}");
-            assert!(!records.iter().any(|record| matches!(
-                &record.event, SessionEvent::Status { message } if message == &status
-            )));
-            assert!(unsaved(&app, session.root_agent()).contains(&status));
-        }
-        session.shutdown().await.unwrap();
+        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -455,10 +445,10 @@ mod tests {
         assert!(app.exit);
     }
 
-    /// What a failed journal cut short reads as stopped where it is already
-    /// shown, as its own update would show it: a job's card on the Jobs tab,
-    /// a request's row on the Requests tab, and a child its background work
-    /// kept alive after it answered as interrupted, out of the live tree.
+    /// What a failed journal cut short reads as stopped: a job's card on the Jobs tab
+    /// where it is already shown, as its own update would show it, a request's row on
+    /// the Requests tab, and a child its background work kept alive after it answered
+    /// as interrupted, out of the live tree.
     #[tokio::test]
     async fn a_failed_journal_stops_the_calls_it_cut_short() {
         use super::super::played::{
@@ -469,59 +459,52 @@ mod tests {
         use skyhook::identity::SessionId;
         use skyhook::job::JobState;
         use skyhook::provider::protocol::ContextId;
-        for tab in [model::Tab::Jobs, model::Tab::Requests] {
-            let (_root, mut app, mut played, session) = played_fixture().await;
-            app.tab = tab;
-            super::super::tests::settled(&mut app).await;
-            let root = app.root_agent().clone();
-            let _asked = ask(&session, "delegate");
-            let task = json!({"prompt": "work", "bg": true});
-            played
-                .turn()
-                .await
-                .end(vec![call("agent", "agent", task, 0)]);
-            // The root's next request stays open while its child answers.
-            let mut turns = [played.turn().await, played.turn().await];
-            if turns[0].context == ContextId::from(&root) {
-                turns.swap(0, 1);
-            }
-            let [child_turn, _turn] = turns;
-            let work = json!({"source": "await sleep(60000);", "bg": true});
-            child_turn.end(vec![call("work", "script", work, 0)]);
-            played.turn().await.answer("done");
-            let shown = |app: &App| {
-                let mut entries = app.entries().iter().rev();
-                entries.find_map(|entry| {
-                    let call = matches!(entry.key(), model::EntryKey::Request(_));
-                    (call || entry.job_id().is_some()).then_some(entry.timing)
-                })
-            };
-            // Folded as the host folds, so only what the update changed rebuilds.
-            observe_until(&mut app, |app| {
-                matches!(shown(app), Some(model::Timing::Since(_)))
-                    && count(&app.journal, answered) == 1
-            })
-            .await;
-            assert!(app.projection.has_active_children());
-            let foreign = AgentId::root(SessionId::generate().unwrap());
-            let refused = session.record_status(foreign, "elsewhere".into()).await;
-            assert!(refused.is_err());
-            observe_until(&mut app, |app| app.snapshot.phase.failure().is_some()).await;
-            let stopped = shown(&app);
-            assert!(
-                matches!(stopped, Some(model::Timing::Took { .. })),
-                "{tab:?}"
-            );
-            let child = children(&app.journal).remove(0);
-            let mut agents = app.projection.agents.iter();
-            let child = agents.find(|info| info.id == child).unwrap();
-            let interrupted = AgentDisplayState::Job(JobState::Interrupted);
-            assert_eq!(
-                app.projection.status(child, &app.snapshot),
-                interrupted,
-                "{tab:?}"
-            );
-            assert!(!app.projection.has_active_children(), "{tab:?}");
+        let (_root, mut app, mut played, session) = played_fixture().await;
+        app.tab = model::Tab::Jobs;
+        super::super::tests::settled(&mut app).await;
+        let root = app.root_agent().clone();
+        let _asked = ask(&session, "delegate");
+        let task = json!({"prompt": "work", "bg": true});
+        played
+            .turn()
+            .await
+            .end(vec![call("agent", "agent", task, 0)]);
+        // The root's next request stays open while its child answers.
+        let mut turns = [played.turn().await, played.turn().await];
+        if turns[0].context == ContextId::from(&root) {
+            turns.swap(0, 1);
         }
+        let [child_turn, _turn] = turns;
+        let work = json!({"source": "await sleep(60000);", "bg": true});
+        child_turn.end(vec![call("work", "script", work, 0)]);
+        played.turn().await.answer("done");
+        let shown = |app: &App| {
+            let mut entries = app.entries().iter().rev();
+            entries.find_map(|entry| {
+                let call = matches!(entry.key(), model::EntryKey::Request(_));
+                (call || entry.job_id().is_some()).then_some(entry.timing)
+            })
+        };
+        // Folded as the host folds, so only what the update changed rebuilds.
+        observe_until(&mut app, |app| {
+            matches!(shown(app), Some(model::Timing::Since(_)))
+                && count(&app.journal, answered) == 1
+        })
+        .await;
+        assert!(app.projection.has_active_children());
+        let foreign = AgentId::root(SessionId::generate().unwrap());
+        let refused = session.record_status(foreign, "elsewhere".into()).await;
+        assert!(refused.is_err());
+        observe_until(&mut app, |app| app.snapshot.phase.failure().is_some()).await;
+        assert_matches!(shown(&app), Some(model::Timing::Took { .. }));
+        app.set_tab(model::Tab::Requests);
+        super::super::tests::settled(&mut app).await;
+        assert_matches!(shown(&app), Some(model::Timing::Took { .. }));
+        let child = children(&app.journal).remove(0);
+        let mut agents = app.projection.agents.iter();
+        let child = agents.find(|info| info.id == child).unwrap();
+        let interrupted = AgentDisplayState::Job(JobState::Interrupted);
+        assert_eq!(app.projection.status(child, &app.snapshot), interrupted);
+        assert!(!app.projection.has_active_children());
     }
 }

@@ -1,0 +1,38 @@
+{% include "security/recording.md" %}
+
+# States across calls
+
+Your parent assigned you states to check across calls: begin with `research` `begin` `{phase:
+"check", subjects: [states]}`. A group of one state's accesses, assigned within your parent's
+check of it, begins no task and never marks the state. Read each state with `research_query`
+`node`: it lists every path's reads and writes of it, the flaws leaving it wrong, their decided
+premises and its latest check. Reason over the recorded accesses, reading code only for what a
+conclusion needs; never sweep a path again.
+
+Hold the state's invariant against every writer, at each outcome it can return with and each
+point it hands control back to the caller mid-write, and check every reader against what every
+writer leaves, in every order the caller may drive them: a later call, a retry after each
+status, a nested call from a callback, a concurrent one. Record the accesses you find that are
+not recorded, and a flaw where a writer can leave the state breaking what a reader relies on,
+linked with `flaw_state`. An entry point in code outside the run's mapped components is out of
+scope: record no component or path for it. One inside them reaching the state that no path
+records is recorded as a path with its accesses: it owes a sweep of its own, and your check goes
+on. Hold the invariant from the accesses themselves, not from the status of the premises listed
+with the state: where what you find contradicts one, record `contradicts` evidence on that
+premise, which reopens its settling.
+
+A state checked before is checked again from its recorded check, its note and evidence:
+`begin`'s changes name what moved since its last check, the paths whose accesses were recorded
+or removed, and edits and merges. Check each new, removed or changed access against every access
+it interacts with; the pairs checked before stand. An edit or merge of the state, or a check left
+unfinished since the recorded one, means checking it whole.
+
+When a state's accesses are more than you can hold, give children launched without a mode a
+group each, with the accesses it interacts with, and check across groups the pairs no one child
+held. A child that failed is redone, never dropped.
+
+Mark each state with `research` `set_status` `{record: {kind: "state",
+id, status: "checked"}, note}`, the note saying what the check covered. A check you cannot finish leaves the state
+unmarked, the reason recorded as context evidence on it and in your reply. Do not wait for
+further instructions. Return the IDs you and your children recorded and anything left open, each
+also recorded.

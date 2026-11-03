@@ -1,6 +1,8 @@
 //! A research tool's input: an object naming its `action`, with that action's arguments
-//! beside it. The schema's properties are the union of the offered actions' arguments, and
-//! `action`'s description gives each action's signature, which admission enforces.
+//! beside it. An action whose arguments differ by the kind of record takes them inside
+//! [`RECORD`], a union tagged by `kind`. The schema's properties are the union of the offered
+//! actions' arguments, and `action`'s description gives each action's signature, which
+//! admission enforces: the root stays open so that a stray argument is refused here, by name.
 
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -16,6 +18,9 @@ use skyhook::tool::{
 };
 
 use super::{Action, Actions};
+
+/// The argument holding a record whose fields depend on its kind.
+pub(super) const RECORD: &str = "record";
 
 /// A call: its action and, beside it, that action's arguments.
 #[derive(Deserialize)]
@@ -36,20 +41,20 @@ impl<N: Actions> Input<N> {
             AdmissionError::invalid_arguments(reason)
                 .operation(Operation::Deserialize, Subject::argument([name]))
         };
-        // Named only when declared, so a refusal never quotes what the call made up.
-        let declared = |name: &String| catalog.schema["properties"].get(name).is_some();
-        if let Some(name) =
-            (self.arguments.keys()).find(|name| !fields.contains_key(*name) && declared(name))
-        {
+        if let Some(name) = (self.arguments.keys()).find(|name| !fields.contains_key(*name)) {
             let takes: Vec<_> = fields.keys().map(|name| format!("`{name}`")).collect();
             let takes = if takes.is_empty() {
                 "none".to_owned()
             } else {
                 takes.join(", ")
             };
+            let inside = match fields.contains_key(RECORD) {
+                true => format!(": a field of the record goes inside `{RECORD}`"),
+                false => String::new(),
+            };
             return Err(refused(
                 name,
-                format!("not an argument of action `{action}`, which takes {takes}"),
+                format!("not an argument of action `{action}`, which takes {takes}{inside}"),
             ));
         }
         if let Some(name) = (fields.iter())
@@ -144,7 +149,7 @@ fn generator() -> SchemaGenerator {
 /// when the tool lists it among its unions.
 fn root<N: Actions>(generator: &mut SchemaGenerator, actions: &[N]) -> Schema {
     let mut properties = Map::new();
-    let mut unions: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut unions: BTreeMap<String, Vec<(Value, Vec<&str>)>> = BTreeMap::new();
     let mut signatures = Vec::new();
     for &action in actions {
         let arguments = Arguments::of(action.arguments(generator));
@@ -153,8 +158,12 @@ fn root<N: Actions>(generator: &mut SchemaGenerator, actions: &[N]) -> Schema {
             if N::UNIONS.contains(&field.name.as_str()) {
                 properties.entry(&field.name).or_insert(Value::Null);
                 let alternatives = unions.entry(field.name).or_default();
-                if !(alternatives.iter_mut()).any(|known| merge(known, field.schema.clone())) {
-                    alternatives.push(field.schema);
+                let known = (alternatives.iter_mut()).find_map(|(known, taking)| {
+                    merge(known, field.schema.clone()).then_some(taking)
+                });
+                match known {
+                    Some(taking) => taking.push(action.name()),
+                    None => alternatives.push((field.schema, vec![action.name()])),
                 }
             } else if let Some(property) = properties.get_mut(&field.name) {
                 assert!(
@@ -168,10 +177,29 @@ fn root<N: Actions>(generator: &mut SchemaGenerator, actions: &[N]) -> Schema {
             }
         }
     }
+    // Each alternative names the actions taking it.
     for (name, mut alternatives) in unions {
         properties[&name] = match alternatives.len() {
-            1 => alternatives.remove(0),
-            _ => json!({"anyOf": alternatives}),
+            1 => alternatives.remove(0).0,
+            _ => {
+                let alternatives = alternatives.into_iter().map(|(mut schema, taking)| {
+                    let taking: Vec<_> =
+                        taking.iter().map(|action| format!("`{action}`")).collect();
+                    let doc = schema.get("description").and_then(Value::as_str);
+                    let doc = [
+                        Some(format!("For {}.", taking.join(", "))),
+                        doc.map(str::to_owned),
+                    ];
+                    schema["description"] = doc
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .into();
+                    schema
+                });
+                json!({"anyOf": alternatives.collect::<Vec<_>>()})
+            }
         };
     }
     let names: Vec<_> = actions.iter().map(|action| action.name()).collect();
@@ -185,7 +213,6 @@ fn root<N: Actions>(generator: &mut SchemaGenerator, actions: &[N]) -> Schema {
         "type": "object",
         "properties": root,
         "required": ["action"],
-        "additionalProperties": false,
     }))
     .expect("an object")
 }
@@ -204,15 +231,13 @@ struct Field {
 }
 
 impl Arguments {
-    /// An object's properties, or the alternatives' of a tagged or untagged enum: required
-    /// only where every alternative requires it, with a tag taking each one's value.
-    /// Defaults are left out; the signature marks what may be omitted.
+    /// An object's properties, or the alternatives' of a tagged enum: required only where
+    /// every alternative requires it, with a tag taking each one's value. Defaults are left
+    /// out; the signature marks what may be omitted.
     fn of(schema: Schema) -> Self {
         let mut schema = schema.to_value();
         let doc = (schema.get("description").and_then(Value::as_str)).map(str::to_owned);
-        let alternatives = (schema.get_mut("oneOf").map(Value::take))
-            .or_else(|| schema.get_mut("anyOf").map(Value::take));
-        let alternatives = match alternatives {
+        let alternatives = match schema.get_mut("oneOf").map(Value::take) {
             Some(Value::Array(alternatives)) => alternatives,
             _ => vec![schema],
         };
@@ -259,7 +284,8 @@ impl Arguments {
         Self { doc, fields }
     }
 
-    /// `name(required, optional?): doc`, the action's doc followed by its arguments type's.
+    /// `name(required, optional?): doc`, its arguments type's doc followed by the action's,
+    /// which ends with what the action returns.
     fn signature(&self, action: impl Actions) -> String {
         let fields: Vec<_> = (self.fields.iter())
             .map(|field| match field.required {
@@ -267,7 +293,7 @@ impl Arguments {
                 false => format!("{}?", field.name),
             })
             .collect();
-        let doc = [Some(action.doc()), self.doc.as_deref()]
+        let doc = [self.doc.as_deref(), Some(action.doc())]
             .into_iter()
             .flatten()
             .flat_map(str::split_whitespace)

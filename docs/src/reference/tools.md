@@ -15,7 +15,8 @@ none were. The listing payload is in the envelope's `.result`.
 `jobs({job})` reads that job's saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
 [output selections](job-output.md#paging-searching-and-querying) `field` and `limit`, with
-`start`, `offset`, `pattern`, and `context` for text, or `index` and `query` for JSON.
+`start` and `pattern` for text or JSON, `offset` and `context` for text, and `unit` and `query`
+for JSON.
 `all` cannot be combined with `job`, and the other selections require `job` unless they restate
 their defaults. Scripts also control jobs with `tool.job(id).send({value})` and `.cancel()`.
 

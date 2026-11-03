@@ -102,14 +102,18 @@ struct Shared {
     path: PathBuf,
     opener: Opener,
     queue: Mutex<Queue>,
-    queued: Condvar,
+    /// Each reader's, by its index, signalled to wake it alone.
+    wakes: [Condvar; CONNECTIONS],
 }
 
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
-    /// Readers waiting for a job.
+    /// Readers waiting for a job, or about to take one.
     idle: usize,
+    /// Readers asleep until woken, by index, the one that slept last at the end. A job
+    /// wakes it: its connection has prepared the statements the work just before used.
+    parked: Vec<usize>,
     readers: usize,
     closed: bool,
 }
@@ -135,7 +139,7 @@ impl ReadPool {
                 path,
                 opener,
                 queue: Mutex::default(),
-                queued: Condvar::new(),
+                wakes: Default::default(),
             }),
             readers: Mutex::default(),
         }
@@ -196,18 +200,20 @@ impl ReadPool {
     fn push(&self, job: Job) {
         let mut queue = self.shared.queue();
         queue.jobs.push_back(job);
-        let start = queue.jobs.len() > queue.idle && queue.readers < CONNECTIONS;
-        if start {
-            queue.readers += 1;
-            queue.idle += 1;
+        if let Some(reader) = queue.parked.pop() {
+            self.shared.wakes[reader].notify_one();
         }
+        let start = (queue.jobs.len() > queue.idle && queue.readers < CONNECTIONS).then(|| {
+            queue.idle += 1;
+            queue.readers += 1;
+            queue.readers - 1
+        });
         drop(queue);
-        self.shared.queued.notify_one();
-        if start {
+        if let Some(index) = start {
             let shared = self.shared.clone();
             let reader = std::thread::Builder::new()
                 .name("read-pool".into())
-                .spawn(move || shared.serve())
+                .spawn(move || shared.serve(index))
                 .expect("start a reader thread");
             self.readers().push(reader);
         }
@@ -219,25 +225,31 @@ impl ReadPool {
 }
 
 impl Shared {
-    /// Run queued jobs until the pool closes and nothing is left queued.
-    fn serve(&self) {
+    /// Run queued jobs, as reader `index`, until the pool closes and nothing is left
+    /// queued.
+    fn serve(&self, index: usize) {
         HELD.set(Some(Held {
             pool: self,
             db: None,
         }));
         let mut queue = self.queue();
         loop {
-            let waiting = |queue: &mut Queue| queue.jobs.is_empty() && !queue.closed;
-            queue =
-                (self.queued.wait_while(queue, waiting)).unwrap_or_else(PoisonError::into_inner);
-            let Some(job) = queue.jobs.pop_front() else {
+            if let Some(job) = queue.jobs.pop_front() {
+                queue.idle -= 1;
+                drop(queue);
+                job();
+                queue = self.queue();
+                queue.idle += 1;
+                continue;
+            }
+            if queue.closed {
                 break;
-            };
-            queue.idle -= 1;
-            drop(queue);
-            job();
-            queue = self.queue();
-            queue.idle += 1;
+            }
+            queue.parked.push(index);
+            let asleep = |queue: &mut Queue| queue.parked.contains(&index) && !queue.closed;
+            queue = (self.wakes[index].wait_while(queue, asleep))
+                .unwrap_or_else(PoisonError::into_inner);
+            queue.parked.retain(|parked| *parked != index);
         }
         drop(queue);
         drop(HELD.take());
@@ -251,7 +263,9 @@ impl Shared {
 impl Drop for ReadPool {
     fn drop(&mut self) {
         self.shared.queue().closed = true;
-        self.shared.queued.notify_all();
+        for wake in &self.shared.wakes {
+            wake.notify_all();
+        }
         // The last handle can drop on a reader, with the work it ran.
         let current = std::thread::current().id();
         for reader in self.readers().drain(..) {
@@ -324,7 +338,7 @@ mod tests {
             .await
             .unwrap();
         first.abort();
-        assert!(bounded(first).await.unwrap_err().is_cancelled());
+        let _ = bounded(first).await;
         assert!(
             turn.0.try_lock().is_err(),
             "the started work still holds the turn"

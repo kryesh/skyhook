@@ -149,37 +149,35 @@ mod tests {
     use super::*;
     use crate::provider::ProviderErrorKind;
 
+    /// A completed call needs an identity and object arguments, but its name
+    /// follows no Chat rules.
     #[test]
-    fn completed_function_identity_is_nonempty_without_chat_name_rules() {
-        let mut item = json!({"type":"function_call", "call_id":"call", "name":"vendor.tool/雪", "arguments":"{}"});
+    fn completed_function_calls_need_an_identity_and_object_arguments() {
+        let item = json!({"type":"function_call", "call_id":"call", "name":"vendor.tool/雪", "arguments":"{}"});
         assert_eq!(function_call(&item).unwrap().name(), "vendor.tool/雪");
-        for (id, name) in [("", "tool"), ("call", "")] {
-            item["call_id"] = json!(id);
-            item["name"] = json!(name);
+        for (field, value) in [
+            ("call_id", json!("")),
+            ("name", json!("")),
+            ("arguments", json!("[]")),
+        ] {
+            let mut item = item.clone();
+            item[field] = value;
             assert_eq!(
                 function_call(&item).unwrap_err().kind(),
-                ProviderErrorKind::Protocol
+                ProviderErrorKind::Protocol,
+                "{field}"
             );
         }
-    }
-
-    #[test]
-    fn function_arguments_require_a_json_object() {
         let mut item = json!({"type":"function_call", "call_id":"call", "name":"lookup"});
-        item["arguments"] = json!("[]");
-        assert_eq!(
-            function_call(&item).unwrap_err().kind(),
-            ProviderErrorKind::Protocol
-        );
-        item["arguments"] = Value::Null;
-        assert_eq!(
-            function_call(&item).unwrap(),
-            ToolCall::new("call", "lookup", json!({})).unwrap()
-        );
-        item["arguments"] = json!(r#"{"query":"rust"}"#);
-        assert_eq!(
-            function_call(&item).unwrap(),
-            ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
-        );
+        for (arguments, expected) in [
+            (Value::Null, json!({})),
+            (json!(r#"{"query":"rust"}"#), json!({"query":"rust"})),
+        ] {
+            item["arguments"] = arguments;
+            assert_eq!(
+                function_call(&item).unwrap(),
+                ToolCall::new("call", "lookup", expected).unwrap()
+            );
+        }
     }
 }

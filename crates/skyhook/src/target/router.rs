@@ -332,10 +332,8 @@ pub(crate) fn select_location(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex as StdMutex, atomic::Ordering},
-    };
+    use std::assert_matches;
+    use std::sync::{Arc, atomic::Ordering};
 
     use super::*;
     use crate::{
@@ -350,32 +348,13 @@ mod tests {
         },
     };
 
-    /// Replays scripted decisions, then allows; empty allowances adopt the proposed grants.
-    fn recording(decisions: impl IntoIterator<Item = PolicyDecision>) -> Arc<RecordingPolicy> {
-        let decisions = StdMutex::new(decisions.into_iter().collect::<VecDeque<_>>());
-        RecordingPolicy::deciding(move |request| {
-            let mut decision = decisions
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(PolicyDecision::allow);
-            if let PolicyDecision::Allow { grants } = &mut decision
-                && grants.is_empty()
-            {
-                *grants = request
-                    .permissions
-                    .iter()
-                    .filter_map(PermissionUse::proposed_grant)
-                    .collect();
-            }
-            decision
+    /// Allows, adopting the proposed grants.
+    fn recording() -> Arc<RecordingPolicy> {
+        RecordingPolicy::deciding(|request| PolicyDecision::Allow {
+            grants: (request.permissions.iter())
+                .filter_map(PermissionUse::proposed_grant)
+                .collect(),
         })
-    }
-
-    fn deny(reason: &str) -> PolicyDecision {
-        PolicyDecision::Deny {
-            reason: reason.into(),
-        }
     }
 
     fn target(name: &str, via: Option<&str>) -> TargetDefinition {
@@ -422,13 +401,13 @@ mod tests {
         let mut external = target("external", None);
         external.ssh.external_agent = true;
         let targets = [external, target("behind", Some("external"))];
-        let (_root, router) = router(targets, recording([]), None).await;
+        let (_root, router) = router(targets, recording(), None).await;
         let without = CapabilitySet::default();
         let mut with = without.clone();
         with.insert(Capability::SshAgent);
         for hidden in ["external", "behind"] {
             let resolved = router.resolve(&name(hidden), &without);
-            assert!(matches!(resolved, Err(TargetError::Unknown(_))), "{hidden}");
+            assert_matches!(resolved, Err(TargetError::Unknown(_)), "{hidden}");
             router.resolve(&name(hidden), &with).unwrap();
         }
         assert!(router.targets(|targets| targets.list(&without)).is_empty());
@@ -446,7 +425,7 @@ mod tests {
         ] {
             let error = router.add(definition, &subject).await.unwrap_err();
             let diagnostic = error.into_tool_error().diagnostic();
-            assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
+            assert_matches!(diagnostic.cause, Cause::InvalidArguments(_));
             assert_eq!(diagnostic.context.subject, Subject::argument([argument]));
             assert_eq!(diagnostic.context.site, FailureSite::Host);
             assert_eq!(diagnostic.context.effects, Effects::Unchanged);
@@ -528,50 +507,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denial_is_retried_and_jump_updates_change_route_identity() {
-        let policy = recording([deny("no"), PolicyDecision::allow(), PolicyDecision::allow()]);
-        let targets = definitions(&[("gateway", None), ("build", Some("gateway"))]);
-        let (_root, router) = router(targets, policy.clone(), None).await;
-        let subject = subject();
-        let original = router
-            .resolve(&name("build"), &CapabilitySet::default())
-            .unwrap();
-        assert!(matches!(
-            approve(&router, &original, &subject).await,
-            Err(RemoteError::Authorization(AuthorizationError::Denied(reason))) if reason.contains("no")
-        ));
-        approve(&router, &original, &subject).await.unwrap();
-
-        replace_target(&router, target("gateway", None)).await;
-        let changed = router
-            .resolve(&name("build"), &CapabilitySet::default())
-            .unwrap();
-        assert_ne!(original.identity(), changed.identity());
-        approve(&router, &changed, &subject).await.unwrap();
-        assert_eq!(policy.requests.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
     async fn admitted_route_snapshot_survives_later_registry_mutation() {
         let factory = ShimFactory::new();
-        let (_root, router) = router(
-            definitions(&[("build", None)]),
-            recording([]),
-            Some(factory.clone()),
-        )
-        .await;
-        let admitted = router
-            .resolve(&name("build"), &CapabilitySet::default())
-            .unwrap();
+        let targets = definitions(&[("gateway", None), ("build", Some("gateway"))]);
+        let (_root, router) = router(targets, recording(), Some(factory.clone())).await;
+        let resolve = || (router.resolve(&name("build"), &CapabilitySet::default())).unwrap();
+        let admitted = resolve();
         factory.ready.add_permits(1);
         let prepared = prepare(&router, &subject()).await.unwrap();
         assert!(router.remote.is_current(&prepared));
 
-        replace_target(&router, target("build", None)).await;
-        let current = router
-            .resolve(&name("build"), &CapabilitySet::default())
-            .unwrap();
-        assert_ne!(admitted.identity(), current.identity());
+        // Redefining a jump or the destination changes the route's identity.
+        let mut previous = admitted.identity();
+        for redefined in [target("gateway", None), target("build", Some("gateway"))] {
+            replace_target(&router, redefined).await;
+            let current = resolve().identity();
+            assert_ne!(previous, current);
+            previous = current;
+        }
         assert_eq!(admitted.destination.revision, 1);
         // Invalidation removes pool reuse; it does not consume the admitted handle.
         assert!(!router.remote.is_current(&prepared));
@@ -587,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_route_snapshot_is_refused_and_its_startup_stopped() {
         for (during_startup, origin) in [(false, false), (true, false), (true, true)] {
-            let policy = recording([]);
+            let policy = recording();
             let factory = ShimFactory::new();
             let mut build = target("build", Some("gateway"));
             if origin {
@@ -628,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_registration_changes_nothing_and_never_connects() {
         let factory = ShimFactory::new();
-        let (_root, router) = router([], recording([]), Some(factory.clone())).await;
+        let (_root, router) = router([], recording(), Some(factory.clone())).await;
         let subject = subject_for(&router.store);
         subject.cancellation.cancel();
         let error = router
@@ -661,7 +614,7 @@ mod tests {
             assert_eq!(diagnostic.context.effects, effects);
         }
         // A mismatched session rejects append after normalization and graph validation.
-        let (_root, router) = router(definitions(&[("first", None)]), recording([]), None).await;
+        let (_root, router) = router(definitions(&[("first", None)]), recording(), None).await;
         let error = router
             .add(target("second", None), &subject())
             .await
@@ -688,7 +641,7 @@ mod tests {
     /// is refused unasked, even where a grant at the new revision covers it.
     #[tokio::test]
     async fn a_redefinition_leaves_no_grant_naming_its_target_usable() {
-        let policy = recording([]);
+        let policy = recording();
         let targets = [target("build", None), target("deep", Some("build"))];
         let (_root, router) = router(targets, policy.clone(), None).await;
         let mut caller = subject_for(&router.store);
@@ -728,10 +681,7 @@ mod tests {
             &[],
             Asking::Allowed,
         );
-        assert!(matches!(
-            route.await,
-            Err(AuthorizationError::TargetRedefined)
-        ));
+        assert_matches!(route.await, Err(AuthorizationError::TargetRedefined));
         let (tool, arguments) = ("tool".to_owned(), serde_json::Value::Null);
         let permission = PermissionUse::exact(Capability::Write, path("build"));
         let admitted = stale.identity();
@@ -743,10 +693,7 @@ mod tests {
             &admitted,
             Asking::Allowed,
         );
-        assert!(matches!(
-            forwarded.await,
-            Err(AuthorizationError::TargetRedefined)
-        ));
+        assert_matches!(forwarded.await, Err(AuthorizationError::TargetRedefined));
         assert_eq!(asked(), 5);
         // Journaled without the router, so nothing revokes what it replaces.
         let redefined = router.targets(|targets| targets.upsert(vec![target("build", None)]));

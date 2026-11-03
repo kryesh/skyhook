@@ -353,6 +353,7 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A child's name belongs to its owner's installed children, whatever their
@@ -397,13 +398,6 @@ mod tests {
         jobs: &JobManager,
         agent: &AgentId,
     ) -> (JobLease<stage::Running>, Arc<AtomicUsize>) {
-        let spec = JobSpec {
-            accepts_input: true,
-            role: JobRole::Agent,
-            ..JobSpec::test(agent.clone(), "agent")
-        };
-        let lease = jobs.test_running(spec).await;
-        jobs.test_install(lease.id()).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let invoked = calls.clone();
         let handler: ResumeHandler = Arc::new(move |value, _| {
@@ -411,7 +405,9 @@ mod tests {
             let value = value.unwrap_or_else(|| serde_json::json!("resumed"));
             Box::pin(async move { Ok(ToolOutput::new(value).into()) })
         });
-        jobs.test_resume_with(lease.id(), handler);
+        let (lease, _) = jobs
+            .test_agent(JobSpec::test(agent.clone(), "agent"), handler)
+            .await;
         (lease, calls)
     }
 
@@ -436,11 +432,10 @@ mod tests {
                 .send(id, serde_json::json!("not accepted"))
                 .await
                 .unwrap_err();
-            assert!(matches!(
+            assert_matches!(
                 error,
                 JobError::InputUnavailable { job, reason: InputUnavailableReason::State(actual) }
-                    if job == id && actual == state
-            ));
+                    if job == id && actual == state);
             assert!(error.to_string().contains("queued"));
             assert!(!error.to_string().contains("approval"));
         }
@@ -454,11 +449,10 @@ mod tests {
         let completed = ToolOutput::new(serde_json::json!({"retained": true}));
         jobs.test_complete(lease.id(), completed).await;
         let before = jobs.snapshot(lease.id()).await.unwrap();
-        assert!(matches!(
+        assert_matches!(
             jobs.send(lease.id(), serde_json::json!("not accepted")).await,
             Err(JobError::InputUnavailable { job, reason: InputUnavailableReason::ResumeUnavailable })
-                if job == lease.id()
-        ));
+                if job == lease.id());
         assert_eq!(jobs.snapshot(lease.id()).await.unwrap(), before);
     }
 
@@ -483,13 +477,13 @@ mod tests {
             }
             let sent = jobs.send(lease.id(), serde_json::json!("retry")).await;
             if cancel {
-                assert!(matches!(
+                assert_matches!(
                     sent,
                     Err(JobError::InputUnavailable {
                         reason: InputUnavailableReason::State(JobState::Cancelled),
                         ..
                     })
-                ));
+                );
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
             } else {
                 sent.unwrap();

@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 use struson::reader::{JsonReader, JsonStreamReader};
 
 use super::{
-    ElementPage, FieldPointer, MemberPage, OutputFields, OutputPreview, OutputTruncation,
-    ToolError, check_cancelled,
+    ElementPage, FieldPointer, MemberPage, NextChild, OutputFields, OutputPreview,
+    OutputTruncation, ToolError, check_cancelled,
     json::saved_json,
     preview::{self, Accounting, Pooled},
     projection::Presented,
@@ -80,7 +80,7 @@ pub(super) fn page(
             field: Some(field.clone()),
             members,
             total_members: position,
-            next_index: next,
+            next_start: next.map(|position| position + 1),
             shape,
             truncated,
         })
@@ -89,7 +89,7 @@ pub(super) fn page(
             field: Some(field.clone()),
             elements,
             total_elements: position,
-            next_index: next,
+            next_start: next.map(|position| position + 1),
             shape,
             truncated,
         })
@@ -182,8 +182,12 @@ pub(super) fn children<R: Read>(
     while reader.has_next().map_err(saved_json)? {
         check_cancelled(cancellation)?;
         if fields.len() == LISTED_CHILDREN {
-            let next_index = Some(position);
-            return Ok(OutputFields { fields, next_index });
+            let unit = container.unit();
+            let next = Some(NextChild {
+                index: position,
+                unit,
+            });
+            return Ok(OutputFields { fields, next });
         }
         let child = match container {
             Container::Object => {
@@ -196,10 +200,7 @@ pub(super) fn children<R: Read>(
         reader.skip_value().map_err(saved_json)?;
         position += 1;
     }
-    Ok(OutputFields {
-        fields,
-        next_index: None,
-    })
+    Ok(OutputFields { fields, next: None })
 }
 
 /// The container a JSON field is, which names the unit it pages in.
@@ -217,10 +218,10 @@ impl Container {
         }
     }
 
-    pub(super) fn unit(self) -> &'static str {
+    pub(super) fn unit(self) -> super::args::PageUnit {
         match self {
-            Self::Object => "members",
-            Self::Array => "elements",
+            Self::Object => super::args::PageUnit::Members,
+            Self::Array => super::args::PageUnit::Elements,
         }
     }
 }
@@ -267,8 +268,8 @@ mod tests {
             let page = elements(&page);
             assert_eq!(page.total_elements, 250);
             seen.extend(page.elements.iter().cloned());
-            match page.next_index {
-                Some(next) => index = next,
+            match page.next_start {
+                Some(next) => index = next - 1,
                 None => break,
             }
         }
@@ -287,7 +288,7 @@ mod tests {
                 .skip(3)
                 .collect::<serde_json::Map<_, _>>()
         );
-        assert_eq!((page.total_members, page.next_index), (5, None));
+        assert_eq!((page.total_members, page.next_start), (5, None));
     }
 
     #[test]
@@ -336,13 +337,13 @@ mod tests {
         let page = read(&Value::Array(medium), 0, 100);
         let page = elements(&page);
         assert_eq!(page.elements.len(), 3);
-        assert_eq!(page.next_index, Some(3));
+        assert_eq!(page.next_start, Some(4));
         assert!(page.truncated.is_none() && page.shape.is_none());
         let huge: Vec<_> = (0..5000).map(|index| json!({"n": index})).collect();
         let page = read(&json!([huge, 1]), 0, 100);
         let page = elements(&page);
         assert_eq!(page.elements.len(), 1);
-        assert_eq!(page.next_index, Some(1));
+        assert_eq!(page.next_start, Some(2));
         assert_eq!(page.shape, Some(json!([5000, {"n": "integer"}])));
         let cut = page.truncated.as_ref().unwrap();
         assert_eq!(cut[0].field().as_str(), "/result/items/0");
@@ -367,10 +368,10 @@ mod tests {
         let items = json!(vec![0; LISTED_CHILDREN + 1]);
         let first = list(&items, Container::Array, 0);
         assert_eq!(first.fields.len(), LISTED_CHILDREN);
-        assert_eq!(first.next_index, Some(LISTED_CHILDREN));
+        assert_eq!(first.next.map(|next| next.index), Some(LISTED_CHILDREN));
         let rest = list(&items, Container::Array, LISTED_CHILDREN);
         assert_eq!(rest.fields, [FieldPointer::result().index(LISTED_CHILDREN)]);
-        assert_eq!(rest.next_index, None);
+        assert_eq!(rest.next, None);
         let members = list(&json!({"a/b": 1, "c": 2}), Container::Object, 1);
         assert_eq!(members.fields, [FieldPointer::result().property("c")]);
     }

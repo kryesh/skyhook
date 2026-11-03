@@ -14,7 +14,7 @@ mod saved;
 mod shape;
 use args::Selection;
 pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, Selectors, line_matcher};
-pub use args::{OutputArgs, PageLimit};
+pub use args::{OutputArgs, PageLimit, PageUnit, REGEX_SIZE_LIMIT};
 pub(crate) use captures::{
     CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
 };
@@ -22,8 +22,8 @@ pub use captures::{CaptureDescriptor, CaptureKind};
 pub(crate) use finalization::prepare_completed;
 pub(crate) use json::{Detection, parse_text as parse_json_text};
 pub use products::{
-    Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NumberedLine, OutputFields,
-    OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
+    Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NextChild, NumberedLine,
+    OutputFields, OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
 pub(crate) use projection::{Presented, fill_absent, presented_fields};
 use reader::Source;
@@ -78,7 +78,17 @@ pub(crate) enum OutputOptions {
     Model {
         kind: ViewKind,
         reader: Option<super::JobId>,
+        fit: Fit,
     },
+}
+
+/// How much of a finished result a whole read presents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fit {
+    /// Within the presentation budget, as a model reads it.
+    Preview,
+    /// All of it, as a script holds it: what a script returns is presented again.
+    Whole,
 }
 
 impl JobManager {
@@ -102,6 +112,7 @@ impl JobManager {
             OutputOptions::Model {
                 kind: ViewKind::Inspection,
                 reader: None,
+                fit: Fit::Preview,
             },
         );
         let presented = presented.await?;
@@ -141,7 +152,7 @@ impl JobManager {
                 let cancellation = super::CancellationToken::new();
                 let mut listed = OutputFields {
                     fields: Vec::new(),
-                    next_index: None,
+                    next: None,
                 };
                 if terminal
                     && saved.product.is_some()
@@ -211,6 +222,7 @@ impl JobManager {
                                 reader::last_page_start(&reads, target.capture, LIVE_LINES.get())
                             };
                             query.start = Some(held.hold(start).await?);
+                            query.unit = Some(PageUnit::Lines);
                             query.limit = Some(LIVE_LINES);
                         }
                         self.present_output_with(
@@ -241,9 +253,9 @@ impl JobManager {
         options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
         let viewer = viewer.into();
-        let (model, kind, reader) = match options {
-            OutputOptions::Host => (false, ViewKind::Inspection, None),
-            OutputOptions::Model { kind, reader } => (true, kind, reader),
+        let (model, kind, reader, fit) = match options {
+            OutputOptions::Host => (false, ViewKind::Inspection, None, Fit::Preview),
+            OutputOptions::Model { kind, reader, fit } => (true, kind, reader, fit),
         };
         let query = args.admit()?;
         let output_selection = args.selection();
@@ -271,36 +283,47 @@ impl JobManager {
         let output = Output::of(self.store(), args.job, envelope.invocation);
         let (saved, shown) = {
             let (mut query, cancellation) = (query.clone(), cancellation.clone());
-            output.reads.clone().hold(move || {
-                let saved = Saved::load(&output)?;
-                let shown = if !explicit && terminal && saved.product.is_some() {
-                    Shown::Projected(projection::project(&saved, &cancellation)?)
-                } else if question && !explicit {
-                    Shown::Question
-                } else {
-                    if !explicit && !question && saved.product.is_some() {
-                        query.field = FieldPointer::root();
-                    }
-                    // A whole-result query always resolves to "/result" or "" here.
-                    let unavailable = !terminal
-                        && (query.field == FieldPointer::result() || query.field.is_root());
-                    Shown::Page(if unavailable {
-                        if matches!(
-                            query.position,
-                            args::Position::Index(_) | args::Position::Query { .. }
-                        ) {
-                            return Err(ToolError::invalid_arguments(
-                                "the result is saved when the job finishes: page or query it then",
-                            ));
+            output
+                .reads
+                .clone()
+                .hold(move || {
+                    let saved = Saved::load(&output)?;
+                    let shown = if !explicit && terminal && saved.product.is_some() {
+                        match fit {
+                            Fit::Whole => Shown::Whole(saved.result()?),
+                            Fit::Preview => {
+                                Shown::Projected(projection::project(&saved, &cancellation)?)
+                            }
                         }
-                        OutputPreview::Lines(reader::empty(&query.text(), None, false))
+                    } else if question && !explicit {
+                        Shown::Question
                     } else {
-                        page(&saved, &query, terminal, &cancellation)?
-                    })
-                };
-                Ok((saved, shown))
-            })
-            .await?
+                        if !explicit && !question && saved.product.is_some() {
+                            query.field = FieldPointer::root();
+                        }
+                        // A whole-result query always resolves to "/result" or "" here.
+                        let unavailable = !terminal
+                            && (query.field == FieldPointer::result() || query.field.is_root());
+                        Shown::Page(if unavailable {
+                            if matches!(query.position, args::Position::Query { .. }) {
+                                return Err(ToolError::invalid_arguments(
+                                    "the result is saved when the job finishes: query it then",
+                                ));
+                            }
+                            OutputPreview::Lines(reader::empty(&query.text(), None, false))
+                        } else {
+                            page(&saved, &query, terminal, &cancellation)?
+                        })
+                    };
+                    Ok((saved, shown))
+                })
+                .await?
+        };
+        // A whole result holds raw data, to show as its saved fields are shown;
+        // anything else was fitted already.
+        let presented = match &shown {
+            Shown::Whole(_) => saved.presented.clone(),
+            _ => Presented::presentation(FieldPointer::root()),
         };
         let mut captures = captures::available_captures(&saved, terminal);
         let incomplete_capture = terminal
@@ -311,6 +334,7 @@ impl JobManager {
                         || query.field.contains(&capture.field))
             });
         match shown {
+            Shown::Whole(whole) => result = whole,
             Shown::Projected(projected) => {
                 result = projected.result;
                 annotations.shape = projected.shape;
@@ -320,14 +344,6 @@ impl JobManager {
             }
             Shown::Question => annotations.question = asked,
             Shown::Page(mut page) => {
-                if terminal
-                    && saved
-                        .product
-                        .as_ref()
-                        .is_some_and(|product| !product.captures_complete)
-                {
-                    annotations.notice = Some(views::Notice::OutputIncomplete);
-                }
                 if matches!(options, OutputOptions::Model { .. })
                     && args.field.as_ref() == page.field()
                 {
@@ -336,7 +352,9 @@ impl JobManager {
                 annotations.preview = Some(page);
             }
         }
-        if incomplete_capture {
+        // However it is shown, a finished job whose output was cut says so.
+        let cut = (saved.product.as_ref()).is_some_and(|product| !product.captures_complete);
+        if incomplete_capture || terminal && cut {
             annotations.notice = Some(views::Notice::OutputIncomplete);
         }
         let acknowledges =
@@ -365,22 +383,31 @@ impl JobManager {
             state: envelope.state,
             view: envelope.view(viewer, kind, result, annotations),
             images,
+            presented,
             capture_targets,
             acknowledges,
         })
     }
 
-    /// The result `envelope`'s run saved, once it finished.
+    /// The result `envelope`'s run saved, once it finished, with the
+    /// presentations of its fields saved with it.
     pub(crate) async fn saved_result(
         &self,
         envelope: &super::JobEnvelope,
-    ) -> Result<Option<Value>, JobError> {
+    ) -> Result<Option<crate::tool::ToolOutput>, JobError> {
         if !envelope.state.is_terminal() {
             return Ok(None);
         }
         let output = Output::of(self.store(), envelope.id, envelope.invocation);
-        (output.reads.clone())
-            .hold(move || Saved::load(&output)?.result())
+        let reads = output.reads.clone();
+        let saved = move || {
+            let saved = Saved::load(&output)?;
+            let result = saved.result()?;
+            let presented = saved.presented;
+            Ok(result.map(|value| crate::tool::ToolOutput::new(value).with_presented(presented)))
+        };
+        reads
+            .hold(saved)
             .await
             .map_err(|error| JobError::Output(Box::new(error)))
     }
@@ -388,6 +415,7 @@ impl JobManager {
 
 /// What a presentation shows of its saved output besides the envelope.
 enum Shown {
+    Whole(Option<Value>),
     Projected(projection::Projected),
     Question,
     Page(OutputPreview),
@@ -402,56 +430,62 @@ fn check_cancelled(cancellation: &super::CancellationToken) -> Result<(), ToolEr
 }
 
 /// One page of the selected field, in its own unit: lines of text, or the
-/// elements or members of JSON. A selector of the other unit is rejected.
+/// elements or members of JSON, which a pattern filters like lines.
 fn page(
     saved: &Saved,
     query: &args::Query,
     terminal: bool,
     cancellation: &super::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
-    // A query reads its field whole; pages need only prefixes of stored text.
-    let reading = match query.position {
-        args::Position::Query { .. } => render::Reading::Whole,
-        _ => render::Reading::SAMPLED,
+    use args::{Page, Position};
+    // Filters read their field whole; pages need only prefixes of stored text.
+    let reading = match &query.position {
+        Position::Query { .. }
+        | Position::Page(Page {
+            matcher: Some(_), ..
+        }) => render::Reading::Whole,
+        Position::Page(_) => render::Reading::SAMPLED,
     };
+    let text = |text| reader::page(text, &query.text(), terminal, cancellation);
     match render::resolve(saved, &query.field, reading, cancellation)? {
-        None => reader::page(None, &query.text(), terminal, cancellation).map(OutputPreview::Lines),
-        Some(render::Resolved::Text(text)) => match (&query.position, query.lines()) {
-            (args::Position::Query { .. }, _) => Err(ToolError::invalid_arguments(
+        None => text(None).map(OutputPreview::Lines),
+        Some(render::Resolved::Text(field)) => match query.position {
+            Position::Query { .. } => Err(ToolError::invalid_arguments(
                 "field is text: query applies to a JSON object or array",
             )),
-            (_, Some(selection)) => reader::page(Some(text), &selection, terminal, cancellation)
-                .map(OutputPreview::Lines),
-            (_, None) => Err(ToolError::invalid_arguments(
-                "field is text: page it with start and offset, not index",
-            )),
+            Position::Page(_) => {
+                query.starts_in(args::PageUnit::Lines)?;
+                text(Some(field)).map(OutputPreview::Lines)
+            }
         },
         Some(render::Resolved::Json {
             mut json,
             container,
-        }) => match (&query.position, query.index()) {
-            (args::Position::Query { path, index }, _) => query::page(
-                &mut json,
-                &query.field,
-                path,
-                *index,
-                query.limit,
-                cancellation,
-            ),
-            (_, Some(index)) => elements::page(
-                &mut json,
-                container,
-                &query.field,
-                index,
-                query.limit,
-                cancellation,
-            ),
-            (_, None) => Err(ToolError::invalid_arguments(format!(
-                "field is a JSON {}: page its {} with index, not start, offset or pattern",
-                container.name(),
-                container.unit(),
-            ))),
-        },
+        }) => {
+            let (filter, start) = match &query.position {
+                Position::Query { path, start } => (Some(query::Filter::Path(path)), *start),
+                Position::Page(page) if page.offset > 0 || page.context > 0 => {
+                    return Err(ToolError::invalid_arguments(format!(
+                        "field is a JSON {}: start pages its {} and pattern filters them; offset and context apply to text",
+                        container.name(),
+                        container.unit(),
+                    )));
+                }
+                Position::Page(page) => (
+                    page.matcher.as_deref().map(query::Filter::Pattern),
+                    page.start,
+                ),
+            };
+            query.starts_in(match filter {
+                Some(_) => args::PageUnit::Matches,
+                None => container.unit(),
+            })?;
+            let (field, first, limit) = (&query.field, start - 1, query.limit);
+            match filter {
+                Some(filter) => query::page(&mut json, field, filter, first, limit, cancellation),
+                None => elements::page(&mut json, container, field, first, limit, cancellation),
+            }
+        }
     }
 }
 
@@ -470,18 +504,31 @@ fn shows(result: Option<&Value>, field: &FieldPointer) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{CancellationToken, JobOutcome, JobRole, JobSpec, JobState, tests::runtime};
+    use crate::job::{AgentId, CancellationToken, JobOutcome, JobSpec, JobState, tests::runtime};
+    use std::assert_matches;
 
-    /// A running fixture job, finished with `value` when one is given.
+    /// A running job of `manager` that saves its output under `schema`, finished
+    /// with `outcome` when one is given.
+    pub(super) async fn fixture_with(
+        manager: &JobManager,
+        agent: &AgentId,
+        schema: Option<Value>,
+        outcome: Option<JobOutcome>,
+    ) -> JobId {
+        let mut spec = JobSpec::test(agent.clone(), "fixture");
+        spec.output_schema = schema;
+        let id = manager.test_running(spec).await.into_test_id();
+        if let Some(outcome) = outcome {
+            manager.finish(id, outcome).await.unwrap();
+        }
+        id
+    }
+
+    /// A runtime's running fixture job, finished with `value` when one is given.
     pub(super) async fn fixture(value: Option<Value>) -> (tempfile::TempDir, JobManager, JobId) {
         let (root, manager, agent) = runtime().await;
-        let id = manager
-            .test_running(JobSpec::test(agent, "fixture"))
-            .await
-            .into_test_id();
-        if let Some(value) = value {
-            manager.test_finish(id, value).await;
-        }
+        let completed = |value| JobOutcome::Completed(crate::tool::ToolOutput::new(value).into());
+        let id = fixture_with(&manager, &agent, None, value.map(completed)).await;
         (root, manager, id)
     }
 
@@ -498,7 +545,7 @@ mod tests {
         let second = crate::tests::bounded(manager.wait(id, true)).await;
         assert_eq!(second.unwrap().output, Some(json!("second")));
         let shown = manager.saved_result(&first).await.unwrap();
-        assert_eq!(shown, Some(json!("first")));
+        assert_eq!(shown.map(|output| output.value), Some(json!("first")));
     }
 
     fn field_args(id: JobId, field: &str) -> OutputArgs {
@@ -512,27 +559,6 @@ mod tests {
             .inspect_output(args, CancellationToken::new(), &Default::default())
             .await
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn script_returned_json_is_not_replaced_by_child_output() {
-        let (_root, manager, agent) = runtime().await;
-        let mut script = JobSpec::test(agent.clone(), "script");
-        script.role = JobRole::Script;
-        let script = manager.test_running(script).await.into_test_id();
-
-        let mut child = JobSpec::test(agent, "read");
-        child.parent = Some(script);
-        let child = manager.test_running(child).await.into_test_id();
-        manager.test_finish(child, json!({"child":"native"})).await;
-
-        let returned = json!({"kind":"script-value", "child_id":child.get()});
-        manager
-            .test_finish(script, json!({"value":returned.clone()}))
-            .await;
-
-        let view = host(&manager, OutputArgs::new(script)).await;
-        assert_eq!(view["result"]["value"], returned);
     }
 
     async fn model(manager: &JobManager, args: OutputArgs) -> Value {
@@ -585,11 +611,9 @@ mod tests {
             OutputSelection::WholeWithImages
         );
         assert!(view["presentation"]["preview"].is_null());
-        for field in [
-            "field", "start", "limit", "pattern", "context", "offset", "index",
-        ] {
+        for field in ["field", "start", "limit", "pattern", "context", "offset"] {
             let mut args = OutputArgs::new(id);
-            // Text selectors page the text field; the result itself pages by index.
+            // Text selectors page the text field.
             let text = Some("/result/text".parse().unwrap());
             match field {
                 "field" => args.field = text,
@@ -598,7 +622,6 @@ mod tests {
                 "pattern" => (args.field, args.pattern) = (text, Some(String::new())),
                 "context" => args.context = Some(0),
                 "offset" => (args.field, args.offset) = (text, Some(0)),
-                "index" => args.index = Some(0),
                 _ => unreachable!(),
             }
             let selection = args.selection();
@@ -630,6 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn presentation_preserves_nulls_defaults_and_saved_result_presence() {
+        let (_root, manager, agent) = runtime().await;
+        let completed = |value| JobOutcome::Completed(crate::tool::ToolOutput::new(value).into());
         for raw in [
             Value::Null,
             json!({
@@ -638,7 +663,7 @@ mod tests {
                 "array": [null, {"absent": null, "count": 0}]
             }),
         ] {
-            let (_root, manager, id) = fixture(Some(raw.clone())).await;
+            let id = fixture_with(&manager, &agent, None, Some(completed(raw.clone()))).await;
             for view in [
                 model(&manager, OutputArgs::new(id)).await,
                 host(&manager, OutputArgs::new(id)).await,
@@ -659,14 +684,37 @@ mod tests {
                 .into_value();
             assert_eq!(metadata.get("result"), None);
         }
+        // A null result stays present after a failure too; hydration recovers its
+        // availability from the saved presence bit.
+        let failed = |output| JobOutcome::Failed {
+            diagnostic: ToolError::failed("failure").into_facts().0,
+            output,
+        };
+        for (outcome, available) in [
+            (completed(Value::Null), true),
+            (
+                failed(Some(crate::tool::ToolOutput::new(Value::Null))),
+                true,
+            ),
+            (failed(None), false),
+            (ToolError::cancelled().into(), false),
+        ] {
+            let id = fixture_with(&manager, &agent, None, Some(outcome)).await;
+            let view = model(&manager, OutputArgs::new(id)).await;
+            assert_eq!(view.get("result"), available.then_some(&Value::Null));
+            let envelope = manager.snapshot(id).await.unwrap();
+            let result = manager.saved_result(&envelope).await.unwrap();
+            assert_eq!(result.is_some(), available);
+        }
     }
 
     /// Unfinished captures, whether abandoned by a successful result, a failure,
     /// or cancellation, remain discoverable, readable, and marked incomplete.
     #[tokio::test]
     async fn incomplete_captures_remain_discoverable_and_readable() {
+        let (_root, manager, agent) = runtime().await;
         for outcome in ["failed", "cancelled", "unreferenced"] {
-            let (_root, manager, id) = fixture(None).await;
+            let id = fixture_with(&manager, &agent, None, None).await;
             let field = if outcome == "unreferenced" {
                 "/result/abandoned"
             } else {
@@ -697,7 +745,7 @@ mod tests {
                     json!([bytes]),
                     "{outcome}"
                 );
-                if outcome == "unreferenced" && terminal {
+                if outcome != "failed" && terminal {
                     assert_eq!(
                         view["presentation"]["notice"],
                         crate::job::Notice::OutputIncomplete.as_str()
@@ -706,7 +754,8 @@ mod tests {
                         page["presentation"]["notice"],
                         crate::job::Notice::OutputIncomplete.as_str()
                     );
-                } else {
+                }
+                if outcome != "unreferenced" || !terminal {
                     assert!(view["result"].is_null(), "{outcome}");
                 }
             }
@@ -715,77 +764,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_presence_distinguishes_null_results_from_missing_failure_output() {
-        for (state, available) in [
-            (JobState::Completed, true),
-            (JobState::Failed, true),
-            (JobState::Failed, false),
-            (JobState::Cancelled, false),
-        ] {
-            let output = available.then(|| crate::tool::ToolOutput::new(Value::Null));
-            let outcome = match state {
-                JobState::Completed => JobOutcome::Completed(output.unwrap().into()),
-                JobState::Failed => JobOutcome::Failed {
-                    diagnostic: ToolError::failed("failure").into_facts().0,
-                    output,
-                },
-                _ => ToolError::cancelled().into(),
-            };
-            let (_root, manager, id) = fixture(None).await;
-            manager.finish(id, outcome).await.unwrap();
-            let view = model(&manager, OutputArgs::new(id)).await;
-            assert_eq!(view.get("result"), available.then_some(&Value::Null));
-            // Hydration recovers availability from the saved presence bit.
-            let envelope = manager.snapshot(id).await.unwrap();
-            let result = manager.saved_result(&envelope).await.unwrap();
-            assert_eq!(result.is_some(), available);
-        }
-    }
-
-    #[tokio::test]
-    async fn script_console_capture_can_be_paged_while_running_and_after_cancellation() {
-        let (_root, manager, agent) = runtime().await;
-        let mut spec = JobSpec::test(agent, "script");
-        spec.output_schema = Some(json!({"type":"object","properties":{
-            "value":{}, "console":{"type":"string"}
-        }}));
-        let id = manager.test_running(spec).await.into_test_id();
-        let console = "console\n".repeat(150);
-        manager.output(id).await.test_capture(
-            "/result/console",
-            CaptureKind::Text,
-            console.as_bytes(),
-        );
-        let mut query = field_args(id, "/result/console");
-        query.start = Some(101);
-        let lines = |page: &Value| {
-            page["presentation"]["preview"]["lines"]
-                .as_array()
-                .unwrap()
-                .len()
-        };
-        assert_eq!(lines(&model(&manager, query.clone()).await), 50);
-        manager
-            .finish(id, ToolError::cancelled().into())
-            .await
-            .unwrap();
-        let view = model(&manager, OutputArgs::new(id)).await;
-        assert_eq!(view.get("result"), None);
-        assert_eq!(
-            view["presentation"]["captures"],
-            incomplete("/result/console")
-        );
-        assert_eq!(
-            view["presentation"]["notice"],
-            crate::job::Notice::OutputIncomplete.as_str()
-        );
-        assert_eq!(lines(&model(&manager, query).await), 50);
-    }
-
-    #[tokio::test]
     async fn capture_completeness_is_internal_and_only_partial_finished_jobs_have_a_notice() {
+        let (_root, manager, agent) = runtime().await;
         for complete in [true, false] {
-            let (_root, manager, job) = fixture(None).await;
+            let job = fixture_with(&manager, &agent, None, None).await;
             let mut output = crate::tool::ToolOutput::new(json!({"stdout":"line\n".repeat(120)}));
             if !complete {
                 output.streams = crate::tool::StreamEnd::Cut;
@@ -794,15 +776,18 @@ mod tests {
             for field in [None, Some("/result/stdout"), Some("")] {
                 let mut query = OutputArgs::new(job);
                 query.field = field.map(|field| field.parse().unwrap());
-                let view = model(&manager, query).await;
-                assert!(!view.to_string().contains("capture_complete"));
-                if complete {
-                    assert!(view["presentation"]["notice"].is_null());
-                } else {
-                    assert_eq!(
-                        view["presentation"]["notice"],
-                        crate::job::Notice::OutputIncomplete.as_str()
-                    );
+                let view = model(&manager, query.clone()).await;
+                // A script's whole read says so as the model's preview does.
+                let whole = host(&manager, query).await;
+                for view in [view, whole] {
+                    if complete {
+                        assert!(view["presentation"]["notice"].is_null());
+                    } else {
+                        assert_eq!(
+                            view["presentation"]["notice"],
+                            crate::job::Notice::OutputIncomplete.as_str()
+                        );
+                    }
                 }
             }
         }
@@ -861,7 +846,11 @@ mod tests {
         assert_eq!(at, ["/result/items/398/name", "/result/items/399/name"]);
         for (field, query, expected) in [
             ("/result/log", "$", "query applies to a JSON"),
-            ("/result/items", "$[", "not a JSONPath"),
+            (
+                "/result/items",
+                "$[?(@.t =~ /a/)]",
+                "$[?search(@.title, '[Ee]ncoder')]",
+            ),
         ] {
             let mut args = field_args(id, field);
             args.query = Some(query.into());
@@ -871,25 +860,29 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
-        // Selectors restating their defaults select nothing.
+        // JSON pages by start in their unit, and restated text defaults select nothing.
         let mut args = field_args(id, "/result/items");
-        (args.index, args.start, args.offset, args.context) =
-            (Some(399), Some(1), Some(0), Some(0));
+        (args.start, args.unit) = (Some(400), Some(PageUnit::Elements));
+        (args.offset, args.context) = (Some(0), Some(0));
         let preview = page("/result/items", host(&manager, args).await);
         assert_eq!(preview["elements"], json!([items[399]]));
-        let mut args = field_args(id, "/result/log");
-        (args.index, args.start) = (Some(0), Some(2));
-        let preview = page("/result/log", host(&manager, args).await);
-        assert_eq!(preview["lines"], json!(["b"]));
-        for (field, text, expected) in [
+        // A pattern keeps the elements whose JSON text matches.
+        let mut args = field_args(id, "/result/items");
+        args.pattern = Some("pod-39[89]".into());
+        let preview = page("/result/items", host(&manager, args).await);
+        let at: Vec<_> = (preview["matches"].as_array().unwrap().iter())
+            .map(|found| found["at"].as_str().unwrap())
+            .collect();
+        assert_eq!(at, ["/result/items/398", "/result/items/399"]);
+        for (field, offset, expected) in [
             ("/result/items", true, "field is a JSON array"),
-            ("/result/log", false, "field is text"),
+            ("/result/items", false, "query selects JSON matches"),
         ] {
             let mut args = field_args(id, field);
-            if text {
-                args.start = Some(2);
+            if offset {
+                args.offset = Some(2);
             } else {
-                args.index = Some(1);
+                (args.query, args.pattern) = (Some("$".into()), Some("pod".into()));
             }
             let error = manager
                 .inspect_output(args, CancellationToken::new(), &Default::default())
@@ -899,11 +892,55 @@ mod tests {
         }
     }
 
+    /// A position holds only in the unit of the page it continues: a capture
+    /// paged as lines while its job ran is restarted, not skipped into, once
+    /// it is JSON.
+    #[tokio::test]
+    async fn a_line_position_does_not_continue_a_field_that_became_json() {
+        use std::io::Write as _;
+        let (_root, manager, agent) = runtime().await;
+        let schema = json!({"type":"object","properties":{
+            "stdout":{"type":"string","contentMediaType":"application/json"}
+        }});
+        let id = fixture_with(&manager, &agent, Some(schema), None).await;
+        let stdout: FieldPointer = "/result/stdout".parse().unwrap();
+        let mut writer =
+            PendingCapture::create(&manager.output(id).await, &stdout, CaptureKind::Text)
+                .unwrap()
+                .open();
+        writer.write_all(b"[\n").unwrap();
+        writer.flush().unwrap();
+        let view = host(&manager, field_args(id, "/result/stdout")).await;
+        let preview = &view["presentation"]["preview"];
+        assert_eq!(
+            (&preview["lines"], &preview["next_start"]),
+            (&json!(["["]), &json!(2))
+        );
+        let view: crate::job::JobView = serde_json::from_value(view).unwrap();
+        let next = view.continuation().unwrap();
+        assert_eq!((next.start, next.unit), (2, PageUnit::Lines));
+        writer.write_all(b"1, 2]").unwrap();
+        let receipt = writer.finish().unwrap();
+        let completed = crate::tool::ToolOutput::new(json!({})).with_captures(vec![receipt]);
+        manager.test_complete(id, completed).await;
+        for unit in [Some(PageUnit::Lines), None] {
+            let mut args = field_args(id, "/result/stdout");
+            (args.start, args.unit) = (Some(next.start), unit);
+            let error = manager
+                .inspect_output(args, CancellationToken::new(), &Default::default())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("from start 1"), "{error}");
+        }
+        let view = host(&manager, field_args(id, "/result/stdout")).await;
+        assert_eq!(view["presentation"]["preview"]["elements"], json!([1, 2]));
+    }
+
     #[tokio::test]
     async fn json_selectors_wait_for_the_saved_result() {
         let (_root, manager, id) = fixture(None).await;
         let mut args = field_args(id, "/result");
-        args.index = Some(1);
+        args.query = Some("$".into());
         let error = manager
             .inspect_output(args, CancellationToken::new(), &Default::default())
             .await
@@ -985,7 +1022,7 @@ mod tests {
             .await
             .unwrap()
             .into_parts();
-        let schema = &crate::job::JOB_VIEW_SCHEMAS.one;
+        let schema = &crate::job::JOB_VIEW_SCHEMAS.view;
         assert!(jsonschema::is_valid(schema, &view), "{view}");
         (state, view)
     }
@@ -1058,6 +1095,20 @@ mod tests {
                 capture["field"] == "/result/absent"
             );
         }
+        // A field read previews that field and hydrates no capture.
+        let (_, view, _) = manager
+            .inspect_output_with_captures(
+                field_args(job, "/result/present"),
+                CancellationToken::new(),
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(view["presentation"]["preview"]["field"], "/result/present");
+        let captures = view["presentation"]["captures"].as_array().unwrap();
+        assert_eq!(captures.len(), 3);
+        assert!(captures.iter().all(|capture| capture["output"].is_null()));
     }
 
     #[tokio::test]
@@ -1136,10 +1187,9 @@ mod tests {
         let result = manager
             .inspect_output_with_captures(invalid, CancellationToken::new(), &Default::default())
             .await;
-        assert!(matches!(
+        assert_matches!(
             result,
-            Err(error) if matches!(error.diagnostic().cause, crate::tool::diagnostic::Cause::InvalidArguments(_))
-        ));
+            Err(error) if matches!(error.diagnostic().cause, crate::tool::diagnostic::Cause::InvalidArguments(_)));
         let unknown = OutputArgs::new(JobId::new(job.get() + 100).unwrap());
         assert!(
             manager
@@ -1153,108 +1203,19 @@ mod tests {
         );
     }
 
-    /// Images a job produced are retrieved with its whole output, directly or
-    /// through a script, and survive a resume.
-    mod images {
-        use super::*;
-        use crate::{
-            identity::AgentId,
-            session::SessionStore,
-            tests::{TestRuntime, assert_loaded, image_runtime, script, tool_executor},
-            tool::{
-                ToolError, ToolOutput,
-                policy::{Capability, CapabilitySet},
-            },
-        };
-        use serde_json::json;
-
-        #[tokio::test]
-        async fn image_output_text_selections_do_not_attach_and_invalid_queries_fail() {
-            let (runtime, executor, _slot) = image_runtime().await;
-            let agent = &runtime.agent;
-            let read = executor
-                .run_model(agent, "read", json!({"path":"image.png"}))
-                .await
-                .unwrap();
-            assert_loaded(&runtime.store, read.output.images).await;
-            // Selection semantics are tested with the output product; this proves
-            // both entry points forward the selector.
-            let query = json!({"job":read.job, "field":"/result"});
-            let output = executor
-                .run_model(agent, "jobs", query.clone())
-                .await
-                .unwrap();
-            assert!(output.output.images.is_empty());
-            let source = format!("return await tool.jobs({query});");
-            let output = script(&executor, agent, source, false).await;
-            assert!(output.output.images.is_empty());
-            for query in [json!({"job":read.job,"pattern":"["}), json!({"job":999999})] {
-                let response = executor.run_model(agent, "jobs", query).await.unwrap();
-                assert_eq!(response.output.value["state"], "failed");
-            }
-            // A denied image-producing call never creates a retrievable attachment.
-            let mut capabilities = CapabilitySet::default();
-            capabilities.remove(&Capability::Read);
-            let denied = executor.clone().with_capabilities(capabilities);
-            let before = runtime.jobs.list(agent).await.unwrap().len();
-            let arguments = json!({"path":"image.png"});
-            // This is a pre-admission error: public dispatch converts it to an
-            // id:null failure envelope, while the internal executor returns Err.
-            assert!(denied.run_model(agent, "read", arguments).await.is_err());
-            for job in runtime
-                .jobs
-                .list(agent)
-                .await
-                .unwrap()
-                .into_iter()
-                .skip(before)
-            {
-                assert!(
-                    runtime
-                        .jobs
-                        .snapshot(job.id)
-                        .await
-                        .unwrap()
-                        .images
-                        .is_empty()
-                );
-            }
-        }
-
-        #[tokio::test]
-        async fn retrieved_images_survive_resume_including_failed_tool_output() {
-            let runtime = TestRuntime::on_disk().await;
-            let image = crate::media::Image::decode(crate::tests::image_png())
-                .await
-                .unwrap();
-            let image = runtime.store.store_image(Some("image.png".into()), &image);
-            let image = image.await.unwrap();
-            let spec = JobSpec::test(runtime.agent.clone(), "partial-image");
-            let lease = runtime.jobs.create(spec).await.unwrap();
-            let job = lease.id();
-            // Consume the lease before reopening; it retains the manager and journal lock.
-            let output = ToolOutput::new(json!({"image":image})).with_images(vec![image]);
-            lease
-                .fail(
-                    ToolError::failed("failed after producing an image")
-                        .with_result(output)
-                        .into(),
-                )
-                .await;
-            let id = runtime.store.id();
-            drop((runtime.jobs, runtime.store));
-            let sessions = runtime.root.path().join("sessions");
-            let store = SessionStore::open(&sessions, id, None).await.unwrap();
-            let jobs = crate::job::tests::reopened(store.clone()).await;
-            let agent = AgentId::root(id);
-            let (executor, _slot) = tool_executor(jobs, runtime.root.path());
-            let output = executor.run_model(&agent, "jobs", json!({"job":job}));
-            let output = output.await.unwrap().output;
-            assert_eq!(output.value["state"], "failed");
-            assert_loaded(&store, output.images).await;
-            let source = format!("return await tool.jobs({{job:{job}}});");
-            let output = script(&executor, &agent, source, false).await;
-            assert_loaded(&store, output.output.images).await;
-        }
+    /// A text selection of a job's output attaches none of its images.
+    #[tokio::test]
+    async fn image_output_text_selections_do_not_attach() {
+        use crate::tests::{assert_loaded, image_runtime};
+        let (runtime, executor, _slot) = image_runtime().await;
+        let agent = &runtime.agent;
+        let read = executor
+            .run_model(agent, "read", json!({"path":"image.png"}))
+            .await
+            .unwrap();
+        assert_loaded(&runtime.store, read.output.images).await;
+        let query = json!({"job":read.job, "field":"/result"});
+        let output = executor.run_model(agent, "jobs", query).await.unwrap();
+        assert!(output.output.images.is_empty());
     }
 }

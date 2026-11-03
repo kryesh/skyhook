@@ -277,7 +277,8 @@ impl System {
     }
 }
 
-/// Whether an agent runs as the session's root or as a child.
+/// Whether an agent converses with the user, as a root that can ask them, or works an
+/// assigned task to its result, as a child or as a root no one answers.
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Role {
@@ -316,7 +317,7 @@ impl PromptContext {
         };
         Self {
             role: match agent.depth {
-                0 => Role::Root,
+                0 if agent.capabilities.contains(&Capability::Interactive) => Role::Root,
                 _ => Role::Child,
             },
             available_depth: agent.available_depth,
@@ -369,9 +370,9 @@ mod tests {
     }
 
     /// A bare root's prompt carries no capability-gated fragment and none of the parts it
-    /// is not given; a child given every part carries the fragments its grants open, and
-    /// its persona, its mode's instructions as they render for it, its instruction file and
-    /// its target, in order.
+    /// is not given, and works its task as a child does until it can ask the user; a child
+    /// given every part carries the fragments its grants open, and its persona, its mode's
+    /// instructions as they render for it, its instruction file and its target, in order.
     #[test]
     fn system_prompts_carry_the_parts_their_agent_is_given() {
         let gated = ["skyhook/targets.md", "skyhook/agents.md"];
@@ -385,6 +386,13 @@ mod tests {
         for absent in fragments.iter().map(String::as_str).chain(inputs) {
             assert!(!text.contains(absent), "{absent}");
         }
+        assert!(text.starts_with(&library.render("skyhook/child.md", &bare).unwrap()));
+        let interactive = [Capability::Read, Capability::Interactive]
+            .into_iter()
+            .collect();
+        let asking = root(&interactive);
+        let text = library.system(&asking, None, &[]).unwrap();
+        assert!(text.starts_with(&library.render("skyhook/root.md", &asking).unwrap()));
 
         let sources = [
             ("host/persona.md", Source::Template("Persona text.")),

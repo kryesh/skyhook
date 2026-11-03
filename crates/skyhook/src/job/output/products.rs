@@ -1,5 +1,5 @@
 //! Canonical output query and presentation products.
-use super::{FieldPointer, Value};
+use super::{FieldPointer, PageUnit, Presented, Value};
 use crate::{
     job::{JobState, JobView},
     media::ImageRef,
@@ -47,19 +47,27 @@ pub struct LinePage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputFields {
     pub fields: Vec<FieldPointer>,
-    /// The index of the first child after those listed, when there is one.
-    pub next_index: Option<usize>,
+    /// The first child after those listed, when there is one.
+    pub next: Option<NextChild>,
+}
+
+/// A JSON field's child by index, with the unit its field's pages count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NextChild {
+    pub index: usize,
+    pub unit: PageUnit,
 }
 
 /// Whole consecutive array elements; one too large for a page is sampled, with
-/// its shape and cuts at their source pointers. `next_index` is absent at the end.
+/// its shape and cuts at their source pointers. `next_start` is absent at the end.
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ElementPage {
     pub(crate) field: Option<FieldPointer>,
     pub elements: Vec<Value>,
     pub(crate) total_elements: usize,
-    pub(crate) next_index: Option<usize>,
+    #[schemars(range(min = 1))]
+    pub(crate) next_start: Option<usize>,
     pub(crate) shape: Option<Value>,
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
@@ -71,20 +79,23 @@ pub struct MemberPage {
     pub(crate) field: Option<FieldPointer>,
     pub members: serde_json::Map<String, Value>,
     pub(crate) total_members: usize,
-    pub(crate) next_index: Option<usize>,
+    #[schemars(range(min = 1))]
+    pub(crate) next_start: Option<usize>,
     pub(crate) shape: Option<Value>,
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
 
-/// A JSONPath query's matches in document order, duplicates included, paged
-/// like an `ElementPage`. Each `at` is the match's pointer in the saved output.
+/// A JSONPath query's matches in document order, duplicates included, or the
+/// elements or members a pattern keeps, paged like an `ElementPage`. Each `at`
+/// is the match's pointer in the saved output.
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MatchPage {
     pub(crate) field: Option<FieldPointer>,
     pub matches: Vec<Match>,
     pub(crate) total_matches: usize,
-    pub(crate) next_index: Option<usize>,
+    #[schemars(range(min = 1))]
+    pub(crate) next_start: Option<usize>,
     pub(crate) shape: Option<Value>,
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
@@ -112,25 +123,13 @@ pub struct NumberedLine {
 
 /// Where a field's next page starts, in its own unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Continuation<'a> {
-    Lines {
-        field: Option<&'a FieldPointer>,
-        start: usize,
-        offset: Option<usize>,
-    },
-    Index {
-        field: Option<&'a FieldPointer>,
-        index: usize,
-    },
-}
-
-impl Continuation<'_> {
+pub struct Continuation<'a> {
     /// None when the page is of the field that was requested.
-    pub fn field(&self) -> Option<&FieldPointer> {
-        match self {
-            Self::Lines { field, .. } | Self::Index { field, .. } => *field,
-        }
-    }
+    pub field: Option<&'a FieldPointer>,
+    pub start: usize,
+    pub unit: PageUnit,
+    /// Bytes into the `start` line of text, when a long line was cut.
+    pub offset: Option<usize>,
 }
 
 impl OutputPreview {
@@ -177,19 +176,18 @@ impl OutputPreview {
     /// The next page's position; none at end of output.
     pub fn continuation(&self) -> Option<Continuation<'_>> {
         let field = self.field();
-        match self {
-            Self::Lines(page) => Some(Continuation::Lines {
-                field,
-                start: page.next_start?,
-                offset: page.next_offset,
-            }),
-            Self::Elements(ElementPage { next_index, .. })
-            | Self::Members(MemberPage { next_index, .. })
-            | Self::Matches(MatchPage { next_index, .. }) => Some(Continuation::Index {
-                field,
-                index: (*next_index)?,
-            }),
-        }
+        let (start, unit, offset) = match self {
+            Self::Lines(page) => (page.next_start, PageUnit::Lines, page.next_offset),
+            Self::Elements(page) => (page.next_start, PageUnit::Elements, None),
+            Self::Members(page) => (page.next_start, PageUnit::Members, None),
+            Self::Matches(page) => (page.next_start, PageUnit::Matches, None),
+        };
+        Some(Continuation {
+            field,
+            start: start?,
+            unit,
+            offset,
+        })
     }
 }
 
@@ -261,40 +259,33 @@ impl OutputTruncation {
     /// Where reading the cut field continues: its next line, or its first element
     /// or member not shown. None for a summary of cuts.
     pub fn continuation(&self) -> Option<Continuation<'_>> {
+        // One-based: one past the last leading index shown.
         let first_missing = |shown: usize, kept: &Option<Vec<[usize; 2]>>| match kept.as_deref() {
-            Some([[0, last], ..]) => last + 1,
-            Some(_) => 0,
-            None => shown,
+            Some([[0, last], ..]) => last + 2,
+            Some(_) => 1,
+            None => shown + 1,
         };
-        match self {
-            Self::TextGap {
-                field, next_start, ..
-            } => Some(Continuation::Lines {
-                field: Some(field),
-                start: *next_start,
-                offset: None,
-            }),
+        let (start, unit, offset) = match self {
+            Self::TextGap { next_start, .. } => (*next_start, PageUnit::Lines, None),
             Self::Text {
-                field,
                 next_start,
                 next_offset,
                 ..
-            } => Some(Continuation::Lines {
-                field: Some(field),
-                start: *next_start,
-                offset: *next_offset,
-            }),
-            Self::Elements {
-                field, shown, kept, ..
+            } => (*next_start, PageUnit::Lines, *next_offset),
+            Self::Elements { shown, kept, .. } => {
+                (first_missing(*shown, kept), PageUnit::Elements, None)
             }
-            | Self::Members {
-                field, shown, kept, ..
-            } => Some(Continuation::Index {
-                field: Some(field),
-                index: first_missing(*shown, kept),
-            }),
-            Self::Summary { .. } => None,
-        }
+            Self::Members { shown, kept, .. } => {
+                (first_missing(*shown, kept), PageUnit::Members, None)
+            }
+            Self::Summary { .. } => return None,
+        };
+        Some(Continuation {
+            field: Some(self.field()),
+            start,
+            unit,
+            offset,
+        })
     }
 }
 
@@ -306,6 +297,9 @@ pub struct PresentedOutput {
     pub state: JobState,
     pub(crate) view: JobView,
     pub images: Vec<ImageRef>,
+    /// How presenting the view again shows its fields: not at all when it is a
+    /// presentation already, else as its saved result's fields are shown.
+    pub(super) presented: Presented,
     /// Captures absent from a whole presentation, in the descriptor's order.
     pub(super) capture_targets: Vec<HydrationTarget>,
     /// The pending delivery a model-facing read presented.
@@ -344,6 +338,13 @@ impl PresentedOutput {
     }
     pub fn into_parts(self) -> (JobState, Value, Vec<ImageRef>) {
         (self.state, self.view.into_value(), self.images)
+    }
+    /// The view as a tool's output, its result.
+    pub(crate) fn into_output(self) -> crate::tool::ToolOutput {
+        let presented = self.presented.at(&FieldPointer::result());
+        crate::tool::ToolOutput::new(self.view.into_value())
+            .with_images(self.images)
+            .with_presented(presented)
     }
     pub fn into_view(self) -> Value {
         self.view.into_value()

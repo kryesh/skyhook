@@ -194,6 +194,7 @@ mod tests {
     use crate::job::output::shape::COLLECTION_MEMBERS;
     use crate::tool::output::FieldPresentation;
     use serde_json::json;
+    use std::assert_matches;
 
     fn run(value: &Value, complete: &[&str]) -> Preview {
         presented(value, complete, &[])
@@ -250,7 +251,7 @@ mod tests {
         assert_eq!(preview.value["items"], value["items"]);
         assert_eq!(preview.value["log"], "line\n".repeat(TEXT_LINES));
         assert!(preview.shape.is_none());
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/log"),
             OutputTruncation::Text {
                 total_lines: 10_000,
@@ -258,7 +259,7 @@ mod tests {
                 next_offset: None,
                 ..
             }
-        ));
+        );
         assert_eq!(preview.truncated.len(), 1);
     }
 
@@ -317,7 +318,7 @@ mod tests {
         assert!(preview.truncated.is_empty());
         let preview = run(&format!("{short}{}", "y".repeat(2 * TEXT_BYTES)));
         assert_eq!(preview.value["stdout"], "x\n".repeat(TEXT_LINES));
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/stdout"),
             OutputTruncation::Text {
                 total_lines: 301,
@@ -325,7 +326,7 @@ mod tests {
                 next_offset: None,
                 ..
             }
-        ));
+        );
         // Undeclared, the same text keeps only its first lines.
         let preview = presented(&json!({"stdout": short}), &[], &[]);
         assert_eq!(preview.value["stdout"], "x\n".repeat(TEXT_LINES));
@@ -335,13 +336,13 @@ mod tests {
         let preview = presented(&json!({"runs": [{"stdout": numbered}]}), &[], &[field]);
         let shown = preview.value["runs"][0]["stdout"].as_str().unwrap();
         assert!(numbered.starts_with(shown) && shown.len() <= SAMPLE_TEXT_BYTES[0]);
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, field),
             OutputTruncation::Text {
                 total_lines: 5000,
                 ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -379,19 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn deep_detail_never_crowds_out_a_later_first_sample() {
-        let inner: serde_json::Map<_, _> = (0..100)
-            .map(|index| (format!("g{index:02}"), json!(1_234_567_890)))
-            .collect();
-        let heavy: serde_json::Map<_, _> = (0..100)
-            .map(|index| (format!("m{index:02}"), json!(inner)))
-            .collect();
-        let preview = run(&json!({"a": [heavy], "b": [42, 43, 44]}), &[]);
-        assert_eq!(preview.value["b"], json!([42]));
-        assert!(budgeted(&preview) <= PREVIEW_BUDGET);
-    }
-
-    #[test]
     fn a_collections_strings_are_samples_leaving_the_allowance_to_text_fields() {
         let labels: serde_json::Map<_, _> = (0..150)
             .map(|index| (format!("m{index:03}"), json!("v".repeat(1000))))
@@ -416,10 +404,9 @@ mod tests {
         let preview = run(&Value::Array(items), &[]);
         assert_eq!(preview.value.as_array().unwrap().len(), 20);
         assert!(preview.shape.is_none());
-        assert!(matches!(
+        assert_matches!(
             &preview.truncated[..],
-            [OutputTruncation::Text { field, .. }] if field.as_str() == "/result/0/log"
-        ));
+            [OutputTruncation::Text { field, .. }] if field.as_str() == "/result/0/log");
         // Long strings pool only what a sample shows once no whole fit remains.
         let preview = run(&json!(vec!["x".repeat(10_000); 20]), &[]);
         let shown = preview.value.as_array().unwrap();
@@ -441,10 +428,19 @@ mod tests {
         let record: serde_json::Map<_, _> = (0..100)
             .map(|index| (format!("f{index}"), json!("x".repeat(1000))))
             .collect();
-        let preview = run(&json!({"a": vec![record; 10], "b": [42, 43, 44]}), &[]);
-        assert_eq!(preview.value["a"].as_array().unwrap().len(), 1);
-        assert_eq!(preview.value["b"], json!([42]));
-        assert!(budgeted(&preview) <= PREVIEW_BUDGET);
+        // Deep detail crowds no more than wide records do.
+        let inner: serde_json::Map<_, _> = (0..100)
+            .map(|index| (format!("g{index:02}"), json!(1_234_567_890)))
+            .collect();
+        let deep: serde_json::Map<_, _> = (0..100)
+            .map(|index| (format!("m{index:02}"), json!(inner)))
+            .collect();
+        for earlier in [json!(vec![record; 10]), json!([deep])] {
+            let preview = run(&json!({"a": earlier, "b": [42, 43, 44]}), &[]);
+            assert_eq!(preview.value["a"].as_array().unwrap().len(), 1);
+            assert_eq!(preview.value["b"], json!([42]));
+            assert!(budgeted(&preview) <= PREVIEW_BUDGET);
+        }
         // A collection's leading members count as its first sample only until it
         // proves a collection.
         let member: serde_json::Map<_, _> = (0..10)
@@ -468,13 +464,13 @@ mod tests {
         let preview = run(&json!(vec![record; 20]), &[]);
         assert!(json_bytes(&preview.shape) <= PREVIEW_BUDGET / 2);
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result"),
             OutputTruncation::Elements {
                 total_elements: 20,
                 ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -503,11 +499,10 @@ mod tests {
         let shown = preview.value["items"].as_array().unwrap().len();
         assert!((1..=SAMPLES).contains(&shown), "{shown}");
         assert_eq!(preview.value["items"][0], items[0]);
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/items"),
             OutputTruncation::Elements { shown: listed, total_elements: 3000, kept: None, .. }
-                if *listed == shown
-        ));
+                if *listed == shown);
         // The record's own text field sits outside the budget.
         let text = json_bytes(&preview.value["cluster"]);
         assert!(budgeted(&preview) - text <= PREVIEW_BUDGET);
@@ -526,13 +521,13 @@ mod tests {
         let shown = preview.value["labels"].as_object().unwrap().len();
         assert!(shown < 5000);
         assert_eq!(preview.value["labels"]["label-0000"], "v".repeat(20));
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/labels"),
             OutputTruncation::Members {
                 total_members: 5000,
                 ..
             }
-        ));
+        );
         assert_eq!(
             preview.shape.unwrap()["labels"],
             json!({"*": "string", "#": 5000})
@@ -555,25 +550,15 @@ mod tests {
         };
         assert_eq!(kept.last(), Some(&[1500, 1500]));
         assert_eq!(kept[0][0], 0);
-    }
-
-    #[test]
-    fn records_keep_every_member_and_mappings_survive_summaries() {
-        let record: serde_json::Map<_, _> = (0..40)
-            .map(|index| (format!("f{index}"), json!("x".repeat(5000))))
-            .collect();
-        let preview = run(&json!([record]), &[]);
-        assert_eq!(preview.value[0].as_object().unwrap().len(), 40);
         // Enough string cuts to summarize never hide which elements are shown.
         let mut items: Vec<_> = (0..2000)
             .map(|_| json!({"note": "n".repeat(300)}))
             .collect();
         items[1500] = json!({"answer": "a"});
         let preview = run(&json!({"items": items}), &["/result/items/1500/answer"]);
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/items"),
-            OutputTruncation::Elements { kept: Some(kept), .. } if kept.last() == Some(&[1500, 1500])
-        ));
+            OutputTruncation::Elements { kept: Some(kept), .. } if kept.last() == Some(&[1500, 1500]));
     }
 
     #[test]
@@ -585,18 +570,16 @@ mod tests {
         let preview = run(&json!({"logs": [log], "rows": rows}), &[]);
         let prefix = preview.value["logs"][0].as_str().unwrap();
         assert!(prefix.len() <= PREVIEW_BUDGET && log.starts_with(prefix));
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/logs/0"),
-            OutputTruncation::Text { total_lines: lines, .. } if *lines == total_lines
-        ));
+            OutputTruncation::Text { total_lines: lines, .. } if *lines == total_lines);
         let shown = preview.value["rows"].as_array().unwrap();
         assert!(!shown.is_empty());
         assert_eq!(shown, &rows[..shown.len()]);
-        assert!(matches!(
+        assert_matches!(
             cut(&preview, "/result/rows"),
             OutputTruncation::Elements { shown: listed, total_elements, kept: None, .. }
-                if *listed == shown.len() && *total_elements == rows.len()
-        ));
+                if *listed == shown.len() && *total_elements == rows.len());
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
     }
 
@@ -612,11 +595,10 @@ mod tests {
         assert_eq!(preview.truncated.len(), LISTED_CUTS);
         // A container's own record, which continues it, comes before those inside.
         assert_eq!(preview.truncated[0].field().as_str(), "/result/items");
-        assert!(matches!(
+        assert_matches!(
             preview.truncated.last().unwrap(),
             OutputTruncation::Summary { field, cuts }
-                if field.as_str() == "/result/items" && *cuts == total_cuts - (LISTED_CUTS - 1)
-        ));
+                if field.as_str() == "/result/items" && *cuts == total_cuts - (LISTED_CUTS - 1));
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
     }
 }

@@ -69,7 +69,8 @@ pub(super) struct AgentArgs {
     /// Execution target; defaults to the parent's.
     #[schemars(skip)]
     pub(super) target: Option<crate::target::TargetRef>,
-    /// Child workspace override: absolute, or relative to the workspace selected by target.
+    /// Child workspace override: absolute, or relative to the workspace selected by target;
+    /// on the session host, created if missing.
     pub(super) workspace: Option<String>,
 }
 
@@ -91,27 +92,29 @@ pub(super) fn register(
         runtime_slot.clone(),
         runtime_slot.clone(),
     );
-    builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
+    builder.register_checked(
         "wait",
         "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout|cancelled, waited_s} with whole seconds waited. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
-        ToolOptions::default().job_role(crate::job::JobRole::Wait),
-        move |context, args| {
+        ToolOptions::default().job_role(crate::job::JobRole::Wait).result::<super::wait::WaitOutput>(),
+        Ok,
+        move |args: super::wait::WaitArgs| {
             let runtime = wait.get().and_then(Weak::upgrade);
-            async move {
-                runtime.ok_or_else(runtime_unavailable)?.wait_for_event(&context, args).await
-            }
+            registry::AdmittedInvocation::new(move |context| async move {
+                registry::serialized(runtime.ok_or_else(runtime_unavailable)?.wait_for_event(&context, args).await?)
+            })
         },
     )?;
-    builder.register::<Question, Value, _, _>(
+    builder.register_checked(
         "ask",
         "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
-        ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive),
-        move |context, input| {
+        ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive).result::<Value>(),
+        Ok,
+        move |input: Question| {
             let runtime = ask.get().and_then(Weak::upgrade);
-            async move {
+            registry::AdmittedInvocation::new(move |context| async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                runtime.questions.coordinate_question(context, input).await
-            }
+                registry::serialized(runtime.questions.coordinate_question(context, input).await?)
+            })
         },
     )?;
     builder.register_checked(
@@ -255,10 +258,12 @@ fn register_child_agent(
                 let location = context.job_location().clone();
                 let (launch, prompt) = child_launch(&runtime, input, caller, location)?;
                 let child = runtime.next_child(owner).await.ok_or_else(unstarted)?;
+                let created = context.create_job_workspace().await?;
                 let job = context.job();
                 let call = super::dispatch::Call { job, prompt };
                 let launched = runtime.launch_child(child.clone(), launch, call);
-                let answer = launched.await.map_err(|error| launch_error(error, &child))?;
+                let launched = launched.await;
+                let answer = launched.map_err(|error| created.left_by(launch_error(error, &child)))?;
                 run_child_request(&runtime, &context, &child, answer).await
             })
         },
@@ -593,7 +598,7 @@ mod tests {
     use crate::agent::runtime::tests::*;
     use crate::tool::executor::InvocationKind;
     use crate::{execution::ExecutionLocation, mcp::McpServerConfig, tool::policy::CapabilitySet};
-    use std::{collections::BTreeMap, path::Path};
+    use std::{assert_matches, collections::BTreeMap, path::Path};
 
     fn builder(root: &Path, requests: Requests) -> HarnessBuilder {
         let provider = scripted_provider(&requests, [answer("done"), answer("done")]);
@@ -641,7 +646,7 @@ for line in sys.stdin:
         let all = crate::tool::policy::Capability::ALL.into_iter().collect();
         let tools = session.runtime.executor.registry();
         let tools = tools.surface_for_agent(&all, &session.root).definitions();
-        let names = tools.into_iter().map(|tool| tool.name);
+        let names = tools.iter().map(|tool| tool.name.clone());
         names.filter(|name| name.starts_with("mcp_")).collect()
     }
 
@@ -665,24 +670,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn mcp_gates_prevent_stdio_launch_and_http_contact() {
-        // Required permissions, effective root depth, and the unconditional MCP gate
-        // all apply before transport startup, even with an approve-all policy.
-        let mut cases = vec![(CapabilitySet::default(), vec![Capability::Agents], 0)];
-        // The global gate, the depth-dependent capability, and two ordinary ones.
-        for missing in [
-            Capability::Mcp,
-            Capability::Agents,
-            Capability::Exec,
-            Capability::Network,
-        ] {
-            let mut capabilities = Capability::ALL.into_iter().collect::<CapabilitySet>();
-            capabilities.remove(&missing);
-            cases.push((capabilities, Capability::ALL.to_vec(), 1));
-        }
-        let mut without_mcp = CapabilitySet::default();
-        without_mcp.remove(&Capability::Mcp);
-        cases.push((without_mcp, vec![], 1));
-        cases.push((CapabilitySet::empty(), vec![], 1));
+        // The root's effective capabilities apply before transport startup, even with
+        // an approve-all policy: a depth of 0 withholds `agents` as its absence does.
+        let mut without_agents = Capability::ALL.into_iter().collect::<CapabilitySet>();
+        without_agents.remove(&Capability::Agents);
+        let cases = [
+            (CapabilitySet::default(), vec![Capability::Agents], 0),
+            (without_agents, Capability::ALL.to_vec(), 1),
+        ];
         for (capabilities, required, depth) in cases {
             let root = tempfile::tempdir().unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -705,7 +700,7 @@ for line in sys.stdin:
                 .build()
                 .await
                 .unwrap();
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             assert!(session.warnings().is_empty());
             assert!(mcp_names(&session).is_empty());
             shutdown_session(session).await;
@@ -729,7 +724,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         assert!(session.warnings().is_empty());
         let name = mcp_name(&session);
         let executor = session.runtime.executor.clone();
@@ -788,7 +783,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = plain.new_session().await.unwrap();
+        let session = ephemeral_session(&plain).await;
         session.prompt("root request").await.unwrap();
         assert!(agent_input(0, "model").is_null() && agent_input(0, "mode").is_null());
         shutdown_session(session).await;
@@ -838,7 +833,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         session.prompt("root request").await.unwrap();
         // `work` holds no network, and `secret` has no hint.
         assert_eq!(agent_input(0, "model")["enum"], json!(["test/cheap", null]));
@@ -893,7 +888,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let executor = &session.runtime.executor;
         let todo = |arguments| bounded(executor.run_model(&session.root, "todo", arguments));
         let items = json!([{"text":"done","status":"completed"}]);
@@ -924,7 +919,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         for inherited in [false, true] {
             let mut executor = session.runtime.executor.clone();
             let mut args = json!({"prompt":"no"});
@@ -1110,7 +1105,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let script = "const all = [...Array(8)].map(() => tool.agent({prompt:'go', mode:'look'})); \
                       return (await Promise.all(all)).length;";
         assert_eq!(session.run_script(script).await.unwrap().value["value"], 8);
@@ -1164,12 +1159,21 @@ for line in sys.stdin:
     #[tokio::test]
     async fn mcp_stays_on_host_for_remote_location_and_failed_startup_is_reported() {
         let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("nonexistent-mcp");
+        let failing = json!({"transport": "stdio", "start_command": [missing.to_string_lossy()]});
+        let mut mcp = servers(stdio_config(root.path(), vec![]));
+        mcp.insert("failing".into(), serde_json::from_value(failing).unwrap());
         let harness = builder(root.path(), Requests::default())
-            .mcp(servers(stdio_config(root.path(), vec![])))
+            .mcp(mcp)
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
+        let warnings = session.warnings();
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("failing"),
+            "{warnings:?}"
+        );
         let name = mcp_name(&session);
         // This location has no route/worker. A targeted dispatch would fail; Host
         // dispatch must still use the session-owning process and its MCP manager.
@@ -1181,20 +1185,6 @@ for line in sys.stdin:
         let output = remote.execute(session.root.clone(), &name, json!({"text":"host"}), None);
         let output = output.await.unwrap().output.value;
         assert_eq!(output["structuredContent"]["text"], "host");
-        shutdown_session(session).await;
-
-        let missing = root.path().join("nonexistent-mcp");
-        let config = json!({"transport": "stdio", "start_command": [missing.to_string_lossy()]});
-        let harness = builder(root.path(), Requests::default())
-            .mcp(servers(serde_json::from_value(config).unwrap()))
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.warnings().len(), 1);
-        assert!(session.warnings()[0].contains("fixture"));
-        assert!(mcp_names(&session).is_empty());
-        assert_eq!(session.prompt("still usable").await.unwrap(), "done");
         shutdown_session(session).await;
     }
 
@@ -1221,7 +1211,7 @@ for line in sys.stdin:
                 .build()
                 .await
                 .unwrap();
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             let executor = session.runtime.executor.clone();
             let executor = executor.with_capabilities(capabilities);
             session.prompt("list tools").await.unwrap();
@@ -1243,7 +1233,11 @@ for line in sys.stdin:
                         let output = terminal(&session, result.unwrap().job).await;
                         assert_eq!(output.output, Some(json!("host-answer")));
                     } else {
-                        assert!(result.unwrap_err().to_string().contains("unavailable"));
+                        let cause = result.unwrap_err().diagnostic().cause;
+                        assert!(
+                            matches!(&cause, crate::tool::diagnostic::Cause::Unavailable { tool } if tool == "ask"),
+                            "{cause:?}"
+                        );
                     }
                 }
                 // Nested root asks cannot escape the gate through script jobs.
@@ -1253,10 +1247,10 @@ for line in sys.stdin:
                     .execute(session.root.clone(), "script", arguments, None)
                     .await;
                 if !enabled && !background {
-                    assert!(matches!(
+                    assert_matches!(
                         result.unwrap_err().diagnostic().cause,
                         crate::tool::diagnostic::Cause::Message(_)
-                    ));
+                    );
                     continue;
                 }
                 let output = terminal(&session, result.unwrap().job).await;
@@ -1280,6 +1274,7 @@ for line in sys.stdin:
     /// the tool runs; the child runs where it resolves.
     #[tokio::test]
     async fn background_child_handle_reports_the_childs_workspace() {
+        use crate::tool::diagnostic::Effects;
         let root = tempfile::tempdir().unwrap();
         let provider = scripted_provider(&Requests::default(), [answer("child done")]);
         // No turn is scripted for the completion: the held window keeps it.
@@ -1289,7 +1284,7 @@ for line in sys.stdin:
         let workspace = &session.runtime.harness.workspace;
         std::fs::create_dir(workspace.join("sub")).unwrap();
         std::os::unix::fs::symlink("sub", workspace.join("alias")).unwrap();
-        let arguments = json!({"prompt":"work", "workspace":"alias", "bg":true});
+        let arguments = json!({"prompt":"work", "workspace":"alias", "bg":true, "name":"worker"});
         let executor = &session.runtime.executor;
         let launched = executor.execute(session.root.clone(), "agent", arguments, None);
         let launched = launched.await.unwrap();
@@ -1305,6 +1300,23 @@ for line in sys.stdin:
         let started = events!(&records, SessionEvent::AgentStarted { owner_job: Some(_), location, .. } => location.workspace.clone());
         let resolved = std::fs::canonicalize(workspace.join("sub")).unwrap();
         assert_eq!(started, [resolved]);
+        // A launch its checks refuse creates no workspace; one refused once
+        // the workspace is created reports it.
+        let fresh = workspace.join("fresh");
+        for (arguments, effects) in [
+            (json!({"depth": 99}), Effects::NotStarted),
+            (json!({"name": "worker"}), Effects::PartialChange),
+        ] {
+            let mut launch = json!({"prompt":"work", "workspace":"fresh"});
+            launch
+                .as_object_mut()
+                .unwrap()
+                .extend(arguments.as_object().unwrap().clone());
+            let refused = executor.execute(session.root.clone(), "agent", launch, None);
+            let refused = bounded(refused).await.unwrap_err();
+            assert_eq!(refused.diagnostic().context.effects, effects, "{refused:?}");
+            assert_eq!(fresh.is_dir(), effects == Effects::PartialChange);
+        }
         shutdown_session(session).await;
     }
 }

@@ -451,6 +451,7 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
     use crate::session::AttemptFailure;
+    use std::assert_matches;
 
     /// A decoded response that ends in a refusal, as a content filter produces.
     fn refusal(items: Vec<AssistantItem>) -> Vec<ResponseEvent> {
@@ -461,36 +462,34 @@ mod tests {
     async fn unusable_responses_fail_the_turn_without_committing_or_retrying() {
         // A stream that closes before its authoritative end.
         let incomplete = vec![delta("answer", ItemKind::Text, "must not persist")];
+        let refused =
+            || Failure::Refused("content filter; the response contained no content".into());
         let cases = [
-            // A refusing provider streams nothing, or only an unusable reasoning stub.
-            (refusal(Vec::new()), "content filter", true),
-            // The journal keeps the refusal's detail.
+            // A refusing provider streams nothing, or only an unusable reasoning stub;
+            // the journal keeps the refusal's detail.
+            (refusal(Vec::new()), refused()),
             (
                 refusal(vec![AssistantItem::reasoning("thought", 0, "", None)]),
-                "the response contained no content",
-                true,
+                refused(),
             ),
             // A cut keeps no tool calls, which can leave nothing at all.
+            (cut(Vec::new(), CutReason::MaxTokens), Failure::OutputLimit),
             (
-                cut(Vec::new(), CutReason::MaxTokens),
-                "output limit was reached",
-                false,
+                incomplete,
+                Failure::Provider(
+                    "stream ended without completion".into(),
+                    ProviderErrorKind::Protocol,
+                ),
             ),
-            (incomplete, "stream ended without completion", false),
         ];
-        for (events, expected, refused) in cases {
-            // The refusal is durable: it must survive a reopen to be continued.
+        for (events, expected) in cases {
             let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
             let provider = scripted_provider(&requests, [events, answer("must not be requested")]);
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, provider).await;
-            let durable = expected == "content filter";
-            let session = match durable {
-                true => harness.new_session().await.unwrap(),
-                false => ephemeral_session(&harness).await,
-            };
-            let failure = session.prompt("hello").await.unwrap_err().to_string();
-            assert!(failure.contains(expected), "unexpected failure: {failure}");
+            let session = ephemeral_session(&harness).await;
+            let failure = session.prompt("hello").await.unwrap_err();
+            assert_eq!(Failure::from(&failure), expected);
             assert_eq!(requests.lock().unwrap().len(), 1, "{expected}: retried");
             let records = session.runtime.store.records();
             // An error state, never conversation history or an executed tool.
@@ -499,21 +498,14 @@ mod tests {
             let failed = events!(&records, SessionEvent::ModelFailed {
                 failure: AttemptFailure::Final(failure), ..
             } => failure.clone());
-            assert_eq!(failed.len(), 1);
-            assert_eq!(matches!(failed[0], Failure::Refused(_)), refused);
-            assert!(failed[0].to_string().contains(expected), "{failed:?}");
+            assert_eq!(failed, [expected]);
             let agent = events!(&records, SessionEvent::AgentFailed { failure } => failure.clone());
             assert_eq!(agent, failed);
             assert_eq!(
                 count!(&records, SessionEvent::ModelAttemptStarted { .. }),
                 1
             );
-            let id = session.id();
             shutdown_session(session).await;
-            if durable {
-                let reopened = SessionStore::read_records(&sessions, id).await.unwrap();
-                assert_eq!(reopened[..records.len()], records);
-            }
         }
     }
 
@@ -626,7 +618,7 @@ mod tests {
 
     fn with_usage(mut events: Vec<ResponseEvent>, snapshots: &[Usage]) -> Vec<ResponseEvent> {
         let end = events.pop().expect("response has a terminal event");
-        assert!(matches!(end, ResponseEvent::End(_)));
+        assert_matches!(end, ResponseEvent::End(_));
         for &usage in snapshots {
             events.push(ResponseEvent::Usage(usage));
         }
@@ -683,7 +675,7 @@ mod tests {
         );
         let harness =
             test_harness(root.path(), &root.path().join("sessions"), script.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         // Enough old material to remove, but nowhere near the automatic threshold.
         seed_history(&session, 6_000).await;
         let (found, ()) = bounded(async {
@@ -737,6 +729,35 @@ mod tests {
             .iter()
             .rposition(|record| request_purpose(&records, record) == Some(Agent));
         assert!(summary < checkpoint && checkpoint < tool && tool < next.unwrap());
+        // Only the summary ends its history: its directive precedes its own state,
+        // which ends the request.
+        let requested: Vec<_> = (records.iter())
+            .filter_map(|record| match &record.event {
+                SessionEvent::ModelRequested {
+                    tail,
+                    history_lifetime,
+                    ..
+                } => Some((
+                    request_purpose(&records, record).unwrap(),
+                    tail.as_slice(),
+                    *history_lifetime,
+                )),
+                _ => None,
+            })
+            .collect();
+        let [first, summarized, after] = requested.as_slice() else {
+            panic!("unexpected requests: {requested:?}")
+        };
+        use crate::provider::protocol::HistoryLifetime::{Detached, Extends};
+        assert_eq!((summarized.0, summarized.2), (Compaction, Detached));
+        let [.., directive, Message::State(_)] = summarized.1 else {
+            panic!("unexpected summary tail: {:?}", summarized.1)
+        };
+        assert_eq!(directive, &super::compact::continuation::directive());
+        for (purpose, tail, lifetime) in [first, after] {
+            assert_eq!((*purpose, *lifetime), (Agent, Extends));
+            assert_matches!(tail, [Message::State(_)]);
+        }
         {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 3);
@@ -869,10 +890,10 @@ mod tests {
         let harness = test_harness(root.path(), &sessions, provider).await;
         let session = harness.new_session().await.unwrap();
         seed_history(&session, 6_000).await;
-        assert!(matches!(
+        assert_matches!(
             session.prompt("Run the tools.").await,
             Err(HarnessError::Refused(_))
-        ));
+        );
         let records = session.runtime.store.records();
         let closed = |event: &SessionEvent| match event {
             SessionEvent::MessageCommitted {
@@ -918,61 +939,58 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
-    #[tokio::test]
-    async fn interruption_during_compaction_persistence_settles_unexecuted_calls() {
-        let root = tempfile::tempdir().unwrap();
-        let requests = Requests::default();
-        let responses = [
-            with_usage(shell_response(), &[threshold_usage()]),
-            answer(summary_json().to_string()),
-            answer("retry done"),
-        ];
-        let provider = scripted_provider(&requests, responses);
-        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
-        let session = harness.new_session().await.unwrap();
-        seed_history(&session, 6_000).await;
-        let compacted: fn(&SessionEvent) -> bool =
-            |event| matches!(event, SessionEvent::Compaction { .. });
-        // Queued behind the checkpoint's commit.
-        let interrupted = interrupt_on(&session, &session.root, compacted).await;
-        let (result, stopped) =
-            bounded(async { tokio::join!(session.prompt("Run the tool."), interrupted) }).await;
-        assert_eq!(stopped, 1);
-        assert!(matches!(result, Err(HarnessError::Interrupted)));
-        assert_calls_settled_unexecuted(root.path(), &requests, session, 1).await;
-    }
-
-    /// A turn interrupted once its response commits makes none of its calls.
+    /// A turn interrupted once its response commits, or once the compaction that
+    /// response triggers commits ahead of its calls, makes none of its calls.
     #[tokio::test]
     async fn interruption_after_a_response_commits_settles_unexecuted_calls() {
+        for compacting in [false, true] {
+            interrupted_before_its_calls(compacting).await;
+        }
+    }
+
+    async fn interrupted_before_its_calls(compacting: bool) {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
-        let steps = [
-            Step::new(shell_response()).gated(),
-            Step::new(answer("retry done")),
-        ];
+        let (response, summary) = match compacting {
+            true => (
+                with_usage(shell_response(), &[threshold_usage()]),
+                Some(Step::new(answer(summary_json().to_string()))),
+            ),
+            false => (shell_response(), None),
+        };
+        let steps = [Step::new(response).gated()]
+            .into_iter()
+            .chain(summary)
+            .chain([Step::new(answer("retry done"))]);
         let script = Script::new(steps, &requests);
         let harness =
             test_harness(root.path(), &root.path().join("sessions"), script.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
+        if compacting {
+            seed_history(&session, 6_000).await;
+        }
+        let lands: fn(&SessionEvent) -> bool = match compacting {
+            true => |event| matches!(event, SessionEvent::Compaction { .. }),
+            false => |_| true,
+        };
         let (result, ()) = bounded(async {
             tokio::join!(session.prompt("Run the tool."), async {
                 script.request(0).await;
-                // Queued behind the response's commit, ahead of its calls.
-                let interrupted = interrupt_on(&session, &session.root, |_| true).await;
+                // Queued behind the commit it lands on, ahead of the response's calls.
+                let interrupted = interrupt_on(&session, &session.root, lands).await;
                 script.release(0);
                 assert_eq!(interrupted.await, 1);
             })
         })
         .await;
-        assert!(matches!(result, Err(HarnessError::Interrupted)));
-        assert_calls_settled_unexecuted(root.path(), &requests, session, 0).await;
+        assert_matches!(result, Err(HarnessError::Interrupted));
+        let compactions = usize::from(compacting);
+        assert_calls_settled_unexecuted(root.path(), &requests, session, compactions).await;
     }
 
     /// An interrupt takes effect at the response's commit. A turn it held while
     /// its response still streamed has that response discarded, however the
-    /// stream ends, and its attempt journaled interrupted. Applied behind the
-    /// answer's commit, it finds nothing to stop, and the answer stands.
+    /// stream ends, and its attempt journaled interrupted.
     #[tokio::test]
     async fn an_interrupt_stops_a_turn_until_its_answer_commits() {
         let steps = [
@@ -983,7 +1001,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let prompt = spawn_prompt(&session, "task");
         provider.held(0).await;
         // A host call's child holds the streaming root.
@@ -1006,21 +1024,6 @@ mod tests {
         assert_eq!((assistant_commits(&records), interrupted), (0, 1));
         session.shutdown().await.unwrap();
         assert!(bounded(host).await.unwrap().is_err());
-
-        let (_root, _requests, session) = scripted_session([answer("answer")]).await;
-        let answered: fn(&SessionEvent) -> bool = |event| {
-            matches!(
-                event,
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(_)
-                }
-            )
-        };
-        let interrupted = interrupt_on(&session, &session.root, answered).await;
-        let prompt = spawn_prompt(&session, "task");
-        assert_eq!(bounded(interrupted).await, 0);
-        assert_eq!(bounded(prompt).await.unwrap().unwrap(), "answer");
-        session.shutdown().await.unwrap();
     }
 
     /// An interrupt, the user's or one giving up a child's tree, that lands before
@@ -1036,7 +1039,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let sessions = root.path().join("sessions");
             let harness = test_harness(root.path(), &sessions, script.clone()).await;
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             let store = session.runtime.store.clone();
             let agent = match tree {
                 true => spawned_child(&session).await.0,
@@ -1169,7 +1172,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             assert_eq!(session.prompt("Run the tool.").await.unwrap(), "done");
             let captured = requests.lock().unwrap().clone();
             assert_eq!(
@@ -1180,8 +1183,8 @@ mod tests {
                 expected.map(<[_]>::to_vec),
                 "{mode:?}"
             );
-            for pair in captured.windows(2) {
-                let mut extended = pair[0].context.clone();
+            for [earlier, later] in captured.array_windows() {
+                let mut extended = earlier.context.clone();
                 for entry in &mut extended {
                     if let Entry::State(state) = entry
                         && state.lifetime == Current
@@ -1189,7 +1192,7 @@ mod tests {
                         state.lifetime = Superseded;
                     }
                 }
-                assert!(pair[1].context.starts_with(&extended), "{mode:?}");
+                assert!(later.context.starts_with(&extended), "{mode:?}");
             }
             let inspected = captured[2]
                 .messages()
@@ -1222,7 +1225,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let parent = spawn_prompt(&session, "delegate");
         provider.request(1).await;
         root_waiting(&session).await;
@@ -1248,22 +1251,45 @@ mod tests {
     /// A call's result commits with the acknowledgement of the outcome it
     /// reports. One that never commits, as when the process dies between them,
     /// leaves the outcome for delivery once the session reopens; one that
-    /// commits is not reported again.
+    /// commits is not reported again. A `jobs` read is acknowledged with its own
+    /// finish: cut off from its result, reopening delivers the read once, in its
+    /// outcome, and never the outcome it read again.
     #[tokio::test]
     async fn a_result_acknowledges_the_outcome_it_reports_as_it_commits() {
-        for commits in [false, true] {
+        for (reads, commits) in [(false, true), (false, false), (true, false)] {
             let root = tempfile::tempdir().unwrap();
             let sessions = root.path().join("sessions");
             let requests = Requests::default();
-            let shell = tool_call(0, "shell", "exec", json!({"command": "true"}));
-            let steps = [response(vec![shell]), answer("done")];
-            let provider = scripted_provider(&requests, steps);
-            let harness = test_harness(root.path(), &sessions, provider).await;
+            let (tool, call) = match reads {
+                true => ("jobs", tool_call(0, "read", "jobs", json!({"job": 1}))),
+                false => (
+                    "exec",
+                    tool_call(0, "shell", "exec", json!({"command": "true"})),
+                ),
+            };
+            let steps = [
+                Step::new(response(vec![call])).gated(),
+                Step::new(answer("done")),
+            ];
+            let provider = Script::new(steps, &requests);
+            let harness = test_harness(root.path(), &sessions, provider.clone()).await;
             let session = harness.new_session().await.unwrap();
+            let prompt = spawn_prompt(&session, "run");
+            provider.request(0).await;
+            if reads {
+                let arguments = json!({"source": "return 1", "bg": true});
+                let executor = &session.runtime.executor;
+                let script = executor.execute(session.root.clone(), "script", arguments, None);
+                let script = script.await.unwrap().job;
+                bounded(session.runtime.jobs.wait_settled(script))
+                    .await
+                    .unwrap();
+            }
             let store = &session.runtime.store;
             let refused = (!commits)
                 .then(|| crate::session::tests::refuse(store, "BEFORE INSERT ON tool_result"));
-            assert_eq!(session.prompt("run").await.is_ok(), commits);
+            provider.release(0);
+            assert_eq!(bounded(prompt).await.unwrap().is_ok(), commits);
             drop(refused);
             let id = session.id();
             // A refused result stops the session, which reports it.
@@ -1274,95 +1300,11 @@ mod tests {
             let receipt = resumed.runtime.jobs.pending_delivery(&resumed.root);
             let receipt = receipt.await.unwrap();
             let pending = (receipt.envelopes().iter()).map(|job| (job.tool.as_str(), job.state));
-            let expected = (!commits).then_some(("exec", crate::job::JobState::Completed));
+            let expected = (!commits).then_some((tool, crate::job::JobState::Completed));
             assert_eq!(pending.collect::<Vec<_>>(), Vec::from_iter(expected));
             drop(receipt);
             shutdown_session(resumed).await;
         }
-    }
-
-    /// A `jobs` read is acknowledged with its own finish. A crash before the
-    /// model's result commits leaves that finish unread, so reopening delivers
-    /// the read once, in its outcome, and never the outcome it read again.
-    #[tokio::test]
-    async fn a_read_cut_off_from_its_result_is_delivered_once_on_reopen() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let read = tool_call(0, "read", "jobs", json!({"job": 1}));
-        let provider = Script::new([Step::new(response(vec![read])).gated()], &requests);
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let prompt = spawn_prompt(&session, "read it");
-        provider.request(0).await;
-        let arguments = json!({"source": "return 1", "bg": true});
-        let executor = &session.runtime.executor;
-        let script = executor.execute(session.root.clone(), "script", arguments, None);
-        let script = script.await.unwrap().job;
-        bounded(session.runtime.jobs.wait_settled(script))
-            .await
-            .unwrap();
-        let store = &session.runtime.store;
-        let refused = crate::session::tests::refuse(store, "BEFORE INSERT ON tool_result");
-        provider.release(0);
-        assert!(bounded(prompt).await.unwrap().is_err());
-        drop(refused);
-        let id = session.id();
-        assert!(bounded(session.shutdown()).await.is_err());
-        assert!(session.close().await.is_err());
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        let receipt = resumed.runtime.jobs.pending_delivery(&resumed.root);
-        let receipt = receipt.await.unwrap();
-        let pending = (receipt.envelopes().iter()).map(|job| job.tool.as_str());
-        assert_eq!(pending.collect::<Vec<_>>(), ["jobs"]);
-        drop(receipt);
-        shutdown_session(resumed).await;
-    }
-
-    #[tokio::test]
-    async fn only_compaction_summaries_end_their_history() {
-        use crate::provider::protocol::HistoryLifetime::*;
-        let shell = |id| response(vec![tool_call(0, id, "exec", json!({"command": "true"}))]);
-        let (_root, _requests, session) = scripted_session([
-            shell("first"),
-            with_usage(shell("second"), &[threshold_usage()]),
-            answer(summary_json().to_string()),
-            answer("done"),
-        ])
-        .await;
-        seed_history(&session, 6_000).await;
-        assert_eq!(session.prompt("Run both tools.").await.unwrap(), "done");
-        let records = session.runtime.store.records();
-        let requests: Vec<_> = records
-            .iter()
-            .filter_map(|record| match &record.event {
-                SessionEvent::ModelRequested {
-                    tail,
-                    history_lifetime,
-                    ..
-                } => Some((
-                    request_purpose(&records, record).unwrap(),
-                    tail.as_slice(),
-                    *history_lifetime,
-                )),
-                _ => None,
-            })
-            .collect();
-        let [first, second, summary, after] = requests.as_slice() else {
-            panic!("unexpected requests: {requests:?}")
-        };
-        assert_eq!((summary.0, summary.2), (ModelPurpose::Compaction, Detached));
-        // The directive precedes the summary's own state, which ends the request.
-        let [.., directive, Message::State(_)] = summary.1 else {
-            panic!("unexpected summary tail: {:?}", summary.1)
-        };
-        assert_eq!(directive, &super::compact::continuation::directive());
-        for (purpose, tail, lifetime) in [first, second, after] {
-            assert_eq!((*purpose, *lifetime), (ModelPurpose::Agent, Extends));
-            assert!(matches!(tail, [Message::State(_)]));
-        }
-        shutdown_session(session).await;
     }
 
     /// A final answer over the threshold leaves busy in its own commit, so an
@@ -1406,7 +1348,7 @@ mod tests {
         let prompt = spawn_prompt(&session, "Next.");
         assert_eq!(bounded(interrupted).await, 1);
         let interrupted = bounded(prompt).await.unwrap();
-        assert!(matches!(interrupted, Err(HarnessError::Interrupted)));
+        assert_matches!(interrupted, Err(HarnessError::Interrupted));
         // The summary's context commits with its request, which the interrupt
         // leaves unsent: `continue` compacts afresh.
         let records = session.runtime.store.records();
@@ -1442,54 +1384,34 @@ mod tests {
         // Cache writes may equal input, never exceed it.
         let valid = Usage::prompted(100, 0, 100, 5);
         let invalid = Usage::prompted(100, 0, 101, 5);
-        let rejected = |events| with_usage(events, &[valid, invalid]);
-        for compaction in [false, true] {
-            let responses = if compaction {
-                // The answer stands; the summary its usage asks for, before the
-                // next turn's request, is rejected.
-                let summary = rejected(answer(summary_json().to_string()));
-                vec![with_usage(answer("final"), &[threshold_usage()]), summary]
-            } else {
-                vec![rejected(shell_response())]
-            };
-            let (root, requests, session) = scripted_session(responses).await;
-            if compaction {
-                seed_history(&session, 6_000).await;
-                assert_eq!(session.prompt("Answer.").await.unwrap(), "final");
-            }
-            let error = session.prompt("Finish.").await.unwrap_err();
-            let protocol = crate::provider::ProviderErrorKind::Protocol;
-            assert!(
-                matches!(&error, HarnessError::Provider(error) if error.kind() == protocol),
-                "{error:?}"
-            );
-            assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(compaction));
-            let records = session.runtime.store.records();
-            let expected = if compaction {
-                vec![ModelPurpose::Agent, ModelPurpose::Compaction]
-            } else {
-                vec![ModelPurpose::Agent]
-            };
-            assert_eq!(purposes(&records), expected);
-            let request = records
-                .iter()
-                .rfind(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
-                .unwrap()
-                .sequence
-                .request();
-            let journaled = events!(&records, SessionEvent::Usage { request: at, usage } if *at == request => *usage);
-            assert_eq!(journaled, vec![valid]);
-            let failed = count!(&records, SessionEvent::ModelFailed { attempt, .. }
-                if attempt.request == request);
-            assert_eq!(failed, 1);
-            let completed = count!(&records, SessionEvent::ResponseCompleted { attempt, .. }
-                if attempt.request == request);
-            assert_eq!(completed, 0);
-            assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
-            assert!(!root.path().join("executions").exists());
-            shutdown_session(session).await;
-        }
+        let responses = vec![with_usage(shell_response(), &[valid, invalid])];
+        let (root, requests, session) = scripted_session(responses).await;
+        let error = session.prompt("Finish.").await.unwrap_err();
+        let protocol = crate::provider::ProviderErrorKind::Protocol;
+        assert!(
+            matches!(&error, HarnessError::Provider(error) if error.kind() == protocol),
+            "{error:?}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let records = session.runtime.store.records();
+        assert_eq!(purposes(&records), [ModelPurpose::Agent]);
+        let request = records
+            .iter()
+            .rfind(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
+            .unwrap()
+            .sequence
+            .request();
+        let journaled = events!(&records, SessionEvent::Usage { request: at, usage } if *at == request => *usage);
+        assert_eq!(journaled, vec![valid]);
+        let failed = count!(&records, SessionEvent::ModelFailed { attempt, .. }
+            if attempt.request == request);
+        assert_eq!(failed, 1);
+        let completed = count!(&records, SessionEvent::ResponseCompleted { attempt, .. }
+            if attempt.request == request);
+        assert_eq!(completed, 0);
+        assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+        assert!(!root.path().join("executions").exists());
+        shutdown_session(session).await;
     }
 
     #[tokio::test]

@@ -280,7 +280,8 @@ mod tests {
     }
 
     /// Left out, a setting keeps its default; null sends nothing where nothing is a
-    /// choice and is refused where it is not; a value replaces the default.
+    /// choice and is refused where it is not; a value replaces the default; an
+    /// unknown field is refused.
     #[test]
     fn left_out_keeps_the_default_null_sends_nothing_and_values_replace_it() {
         let read = |yaml: &str| Example::resolve(&crate::yaml::parse(yaml).unwrap()).unwrap();
@@ -296,6 +297,17 @@ mod tests {
         let null = read("name: n\nlevel: null");
         assert_eq!(null.level.or(Some("auto".into())), None);
         assert!(crate::yaml::parse::<ExamplePatch>("role: null").is_err());
+        for input in [
+            json!({"enabled": null}),
+            json!({"tags": null}),
+            json!({"name": null}),
+            json!({"unknown": true}),
+        ] {
+            assert!(serde_json::from_value::<ExamplePatch>(input).is_err());
+        }
+        // A settings type without fields is an empty object, not an open map.
+        assert!(serde_json::from_value::<EmptyPatch>(json!({"extra": 1})).is_err());
+        assert_eq!(Empty::resolve(&EmptyPatch::default()).unwrap(), Empty {});
         let lower: ExamplePatch = crate::yaml::parse("level: null").unwrap();
         let higher: ExamplePatch = crate::yaml::parse("level: concise").unwrap();
         let merged = Example::resolve(
@@ -305,7 +317,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged.level, Nullable::Value("concise".into()));
-        for yaml in ["level: null\n", "level: detailed\nrole: user\n"] {
+        for yaml in [
+            "level: null\n",
+            "level: detailed\nrole: user\n",
+            "enabled: false\ntags: []\ntenant: null\n",
+        ] {
             let patch: ExamplePatch = crate::yaml::parse(yaml).unwrap();
             assert_eq!(crate::yaml::to_string(&patch).unwrap(), yaml);
         }
@@ -332,28 +348,5 @@ mod tests {
             serde_json::to_value(ExamplePatch::default()).unwrap(),
             json!({})
         );
-    }
-
-    #[test]
-    fn null_requires_a_nullable_field_and_unknown_fields_are_rejected() {
-        for input in [
-            json!({"enabled": null}),
-            json!({"tags": null}),
-            json!({"name": null}),
-            json!({"unknown": true}),
-        ] {
-            assert!(serde_json::from_value::<ExamplePatch>(input).is_err());
-        }
-        let yaml = "enabled: false\ntags: []\ntenant: null\n";
-        let patch: ExamplePatch = crate::yaml::parse(yaml).unwrap();
-        assert_eq!(crate::yaml::to_string(&patch).unwrap(), yaml);
-    }
-
-    #[test]
-    fn empty_settings_are_an_empty_object_not_an_open_map() {
-        let patch: EmptyPatch = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(Empty::resolve(&patch).unwrap(), Empty {});
-        assert_eq!(serde_json::to_value(&patch).unwrap(), json!({}));
-        assert!(serde_json::from_value::<EmptyPatch>(json!({"extra": 1})).is_err());
     }
 }

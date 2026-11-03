@@ -83,7 +83,10 @@ pub async fn observed(
         if let Some(model) = model {
             session.activate_on(model).await?;
         }
-        Ok::<_, LaunchError>(PreparedObservation::load(session.clone(), extension).await?)
+        Ok::<_, LaunchError>(
+            PreparedObservation::load(session.clone(), extension, super::model::Budget::DEFAULT)
+                .await?,
+        )
     }
     .await;
     match result {
@@ -292,13 +295,13 @@ impl Host {
     pub fn settle(&mut self) -> bool {
         match self.app().host.take() {
             Some(HostRequest::New) if !self.replaceable(self.active) => self.draft(),
-            Some(HostRequest::New) | None => {}
-            Some(HostRequest::Activate(key)) => {
-                let live = |slot: &Slot| slot.key == key && !slot.app.stopping;
-                if let Some(index) = self.slots.iter().position(live) {
-                    self.activate(index);
-                }
+            Some(HostRequest::Activate(key))
+                if let Some(index) =
+                    (self.slots.iter()).position(|slot| slot.key == key && !slot.app.stopping) =>
+            {
+                self.activate(index);
             }
+            Some(HostRequest::New | HostRequest::Activate(_)) | None => {}
             Some(HostRequest::Open(id)) => self.open(id),
             Some(HostRequest::Quit) => self.quit(),
         }

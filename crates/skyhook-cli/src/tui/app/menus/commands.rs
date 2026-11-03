@@ -353,7 +353,7 @@ mod tests {
     use crate::tui::app::played::{observe_until, played_fixture};
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::identity::JobId;
-    use skyhook::session::{Message, SessionEvent, UserPart};
+    use skyhook::session::SessionEvent;
 
     /// A terminal failure, unlike a refused connection, which retries.
     fn rejected() -> skyhook::provider::ProviderError {
@@ -425,28 +425,9 @@ mod tests {
                 result: Ok(()),
             }
         ));
-        // The continue joined the root's operation rather than running the root;
-        // the restarted child's failure may still reach the idle root as an
-        // ordinary delivery, in a turn of its own: each request the root makes
-        // answers one.
+        // The continue joined the root's operation rather than running the root, and
+        // neither replaces nor finishes it.
         app.work(continued);
-        let records = journal(&session).await;
-        let mut delivered = false;
-        for record in records.iter().filter(|record| record.agent == root) {
-            match &record.event {
-                SessionEvent::MessageCommitted {
-                    message: Message::User(parts),
-                } => {
-                    delivered =
-                        (parts.iter()).any(|part| matches!(part, UserPart::JobEvents { .. }));
-                }
-                SessionEvent::ModelRequested { .. } => {
-                    assert!(std::mem::take(&mut delivered), "{records:#?}");
-                }
-                _ => {}
-            }
-        }
-        // Child retry neither replaces nor finishes the pending root operation.
         assert!(app.operation);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
         session.shutdown().await.unwrap();

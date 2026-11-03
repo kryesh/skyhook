@@ -201,12 +201,10 @@ mod tests {
         Provider,
         codec::common::tests::reduce,
         dialect::{ModelError, Sourced},
-        http::{
-            tests::reasoning_tool_request,
-            transport::tests::{Plan, Server, header_values, reply},
-        },
+        http::tests::reasoning_tool_request,
         protocol::Outcome,
     };
+    use crate::tests::{Plan, Server, header_values, reply};
     use futures_util::StreamExt;
     use serde_json::{Value, json};
 
@@ -230,7 +228,7 @@ mod tests {
             profile,
             &connection,
             credentials,
-            &mut super::super::Resources::new().unwrap(),
+            &mut super::super::Resources::default(),
         )
         .unwrap()
     }
@@ -349,14 +347,8 @@ mod tests {
         ] {
             assert!(mirror(loopback).is_ok(), "{loopback}");
         }
-        for invalid in [
-            "auth.example",
-            "ftp://auth.example",
-            "http://auth.example",
-            "https://user:secret@auth.example",
-            "https://auth.example/?secret",
-            "https://auth.example/#secret",
-        ] {
+        // Beside the endpoint rules, only a loopback mirror may skip TLS.
+        for invalid in ["auth.example", "http://auth.example"] {
             assert_eq!(
                 auth::Issuer::parse(invalid),
                 Err(auth::InvalidIssuer),

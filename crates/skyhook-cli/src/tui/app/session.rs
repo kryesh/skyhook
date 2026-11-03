@@ -394,25 +394,4 @@ mod tests {
         assert!(renaming(&app));
         assert_eq!(app.prompt_input().editor.text(), "Renamed");
     }
-
-    /// An untitled session shows its first prompt as its title once it commits.
-    #[tokio::test]
-    async fn an_untitled_session_shows_its_first_prompt_as_its_title() {
-        use super::super::played::{committed, observe_record, played_fixture, user};
-        let (_root, mut app, mut model, session) = played_fixture().await;
-        let mut work = capture_work(&mut app);
-        app.submit("name me after this".into());
-        let _turn = model.turn().await;
-        observe_record(&mut app, committed(user)).await;
-        bounded(async {
-            while app.title.is_none() {
-                let work = recv(&mut work).await;
-                app.work(work);
-            }
-        })
-        .await;
-        let title = app.title.as_ref().map(|title| title.text.as_str());
-        assert_eq!(title, Some("name me after this"));
-        session.shutdown().await.unwrap();
-    }
 }

@@ -735,6 +735,8 @@ pub(crate) fn quoted(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::tool::invocation::OperationError;
     use serde_json::json;
@@ -853,7 +855,7 @@ mod tests {
             ),
         ] {
             let diagnostic = PartialDiagnostic::session(&error).resolve();
-            assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains(message)));
+            assert_matches!(&diagnostic.cause, Cause::Message(text) if text.contains(message));
             assert_eq!(diagnostic.context.site, FailureSite::Host);
             let text = diagnostic.render(&CapabilitySet::default());
             assert!(!text.contains(SECRET));

@@ -341,10 +341,13 @@ mod tests {
 
     #[test]
     fn merged_shapes_mark_optional_members_unions_and_length_ranges() {
+        // Keys stay as written, even one that looks optional.
         let value = json!({"results": [
-            {"id": 1, "license": null, "tags": ["a"], "owner": {"login": "x"}, "archived": true},
+            {"id": 1, "license": null, "tags": ["a"], "owner": {"login": "x"}, "archived": true,
+             "x?": "a"},
             {"id": 2, "license": "mit", "tags": [], "owner": null},
-            {"id": 3.5, "license": "mit", "tags": ["a", "b", "c"], "owner": {"login": "y"}},
+            {"id": 3.5, "license": "mit", "tags": ["a", "b", "c"], "owner": {"login": "y"},
+             "meta": {"k": "v"}},
         ], "forks": [[], []]});
         assert_eq!(
             Shape::of(&value).render(usize::MAX),
@@ -355,22 +358,11 @@ mod tests {
                     "tags": ["0..3", "string"],
                     "owner": {"|": ["null", {"login": "string"}]},
                     "archived": "boolean|absent",
+                    "x?": "string|absent",
+                    "meta": {"|": ["absent", {"k": "string"}]},
                 }],
                 "forks": [2, [0]],
             })
-        );
-    }
-
-    #[test]
-    fn keys_stay_as_written_when_members_are_optional() {
-        let value = json!([{"x": 1, "x?": "a", "owner": {"login": "y"}}, {"x?": "b"}]);
-        assert_eq!(
-            Shape::of(&value).render(usize::MAX),
-            json!([2, {
-                "x": "integer|absent",
-                "x?": "string",
-                "owner": {"|": ["absent", {"login": "string"}]},
-            }])
         );
     }
 

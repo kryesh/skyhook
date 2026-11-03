@@ -19,10 +19,12 @@ chrono.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 http.workspace = true
+ignore.workspace = true
 indexmap.workspace = true
 libsql.workspace = true
 mimalloc.workspace = true
 pulldown-cmark.workspace = true
+regex.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,8 +32,8 @@ serde_with.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
-serde-saphyr.workspace = true
 tempfile.workspace = true

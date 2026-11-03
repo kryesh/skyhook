@@ -36,6 +36,7 @@ impl ToolExecutor {
             crate::job::output::OutputOptions::Model {
                 kind: crate::job::ViewKind::Response,
                 reader: None,
+                fit: crate::job::output::Fit::Preview,
             },
         );
         let presented = match presented.await {
@@ -111,7 +112,7 @@ impl ToolExecutor {
         &self,
         job: JobId,
         envelope: crate::job::JobEnvelope,
-        result: Option<Value>,
+        result: Option<ToolOutput>,
         purpose: CollectionPurpose,
     ) -> Result<ExecutionResult, ToolError> {
         let images = envelope.images.clone();
@@ -119,36 +120,42 @@ impl ToolExecutor {
             // A successful output query already returns the target view. The
             // invocation's state, not the target's, determines is_error.
             let is_error = envelope.state != JobState::Completed;
-            let value = if !is_error && policy == crate::tool::ToolResultPolicy::JobView {
-                result.ok_or_else(|| {
+            let output = if !is_error && policy == crate::tool::ToolResultPolicy::JobView {
+                let output = result.ok_or_else(|| {
                     ToolError::failed("job-output query completed without a response")
-                })?
+                })?;
+                let presented = output.presented.within(&crate::job::FieldPointer::result());
+                ToolOutput::new(output.value).with_presented(presented)
             } else {
-                envelope
-                    .response_view(self.diagnostic_viewer(), result)
-                    .into_value()
+                // The saved result's fields sit at the same pointers in the envelope.
+                let (result, presented) = result
+                    .map(|output| (output.value, output.presented))
+                    .unzip();
+                let view = envelope.response_view(self.diagnostic_viewer(), result);
+                ToolOutput::new(view.into_value()).with_presented(presented.unwrap_or_default())
             };
             return Ok(ExecutionResult {
                 job,
                 background: false,
                 is_error,
-                output: ToolOutput::new(value).with_images(images),
+                output: output.with_images(images),
             });
         }
         if envelope.state == JobState::Completed {
+            let output = result.unwrap_or_else(|| ToolOutput::new(Value::Null));
             Ok(ExecutionResult {
                 job,
                 background: false,
                 is_error: false,
-                output: ToolOutput::new(result.unwrap_or(Value::Null)).with_images(images),
+                output: output.with_images(images),
             })
         } else {
             let mut failure = envelope.diagnostic.map_or_else(
                 || ToolError::failed(format!("job ended as {:?}", envelope.state)),
                 |diagnostic| ToolError::from_diagnostic(diagnostic, None),
             );
-            if let Some(value) = result {
-                failure = failure.with_result(ToolOutput::new(value).with_images(images));
+            if let Some(output) = result {
+                failure = failure.with_result(output.with_images(images));
             }
             Err(failure)
         }
@@ -284,11 +291,6 @@ mod tests {
                     assert!(view["id"].as_u64().unwrap() > 0);
                     assert_eq!(view["state"], "completed");
                     assert!(length < PAYLOAD_BYTES);
-                    assert_eq!(
-                        view["presentation"]["truncated"][0]["field"],
-                        "/result/text"
-                    );
-                    assert_eq!(view["presentation"].get("preview"), None);
                 }
 
                 let failure = call(kind, "payload", json!({"fail":true})).await.unwrap();

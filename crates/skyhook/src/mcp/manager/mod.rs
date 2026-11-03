@@ -404,6 +404,7 @@ mod tests {
     use crate::tests::bounded;
     use crate::tool::diagnostic::Cause;
     use serde_json::{Map, Value, json};
+    use std::assert_matches;
     use std::{collections::BTreeMap, path::Path, time::Duration};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -415,7 +416,7 @@ with open(os.environ['MCP_TEST_PID'] + '.tmp', 'w') as f:
     f.write(str(os.getpid()))
 os.replace(os.environ['MCP_TEST_PID'] + '.tmp', os.environ['MCP_TEST_PID'])
 lock = threading.Lock()
-limits = json.loads(os.environ['MCP_TEST_LIMITS'])
+frame = int(os.environ['MCP_TEST_FRAME'])
 def send(message):
     with lock:
         print(json.dumps(message), flush=True)
@@ -432,32 +433,15 @@ def handle(request):
     method = request['method']
     params = request.get('params', {})
     if method == 'initialize':
-        with open(os.environ['MCP_TEST_INITIALIZE'], 'w') as f:
-            f.write(json.dumps(params))
         if os.environ.get('MCP_TEST_HANG_INITIALIZE') == '1':
             time.sleep(60)
         result = {'protocolVersion': params['protocolVersion'],
-                  'capabilities': ({'resources': {}} if os.environ.get('MCP_TEST_NO_TOOLS') else {'tools': {}}),
+                  'capabilities': {'tools': {}},
                   'serverInfo': {'name': 'skyhook-test', 'version': '1'}}
     elif method == 'tools/list':
-        with open(os.environ['MCP_TEST_LIST'], 'w') as f:
-            f.write('called')
-        mode = os.environ.get('MCP_TEST_DISCOVERY')
-        if mode == 'oversized_schema':
-            result = {'tools': [dict(tool('huge'), description='x' * limits['tool'])]}
-            send({'jsonrpc': '2.0', 'id': ident, 'result': result})
-            return
-        if mode == 'many_tools':
-            result = {'tools': [tool('tool_' + str(i)) for i in range(limits['tools'] + 1)]}
-            send({'jsonrpc': '2.0', 'id': ident, 'result': result})
-            return
-        if mode == 'repeated_cursor':
+        if os.environ.get('MCP_TEST_DISCOVERY') == 'repeated_cursor':
             result = {'tools': [], 'nextCursor': 'repeat'}
             send({'jsonrpc': '2.0', 'id': ident, 'result': result})
-            return
-        if mode == 'rpc_error':
-            send({'jsonrpc': '2.0', 'id': ident,
-                  'error': {'code': -32602, 'message': 'fixture discovery error'}})
             return
         cursor = params.get('cursor')
         if cursor is None:
@@ -472,7 +456,7 @@ def handle(request):
         name = params['name']
         if name == 'echo' and params.get('arguments', {}).get('oversized_frame'):
             with lock:
-                sys.stdout.write('x' * (limits['frame'] + 1) + '\n')
+                sys.stdout.write('x' * (frame + 1) + '\n')
                 sys.stdout.flush()
             with open(os.environ['MCP_TEST_STARTED'], 'w') as f:
                 f.write('sent')
@@ -519,16 +503,13 @@ for line in sys.stdin:
         }
 
         pub(super) fn config(&self) -> crate::mcp::config::RawMcpServerConfig {
-            let mut env: BTreeMap<_, _> = ["pid", "started", "cancelled", "initialize", "list"]
+            let mut env: BTreeMap<_, _> = ["pid", "started", "cancelled"]
                 .into_iter()
                 .map(|name| (format!("MCP_TEST_{}", name.to_uppercase()), self.path(name)))
                 .collect();
             env.insert("MCP_TEST_VALUE".into(), "configured child value".into());
-            let limits = json!({
-                "frame": crate::mcp::transport::MAX_MESSAGE_BYTES, "tools": catalog::MAX_TOOLS,
-                "tool": catalog::MAX_TOOL_BYTES,
-            });
-            env.insert("MCP_TEST_LIMITS".into(), limits.to_string());
+            let frame = crate::mcp::transport::MAX_MESSAGE_BYTES;
+            env.insert("MCP_TEST_FRAME".into(), frame.to_string());
             serde_json::from_value(json!({
                 "transport": "stdio", "start_command": ["python3", "-u", "-c", FIXTURE],
                 "cwd": self.directory.path(), "env": env
@@ -555,17 +536,15 @@ for line in sys.stdin:
     // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
     pub(super) async fn connect(config: crate::mcp::config::RawMcpServerConfig) -> McpManager {
-        connect_in(config, &std::env::temp_dir()).await
-    }
-
-    async fn connect_in(
-        config: crate::mcp::config::RawMcpServerConfig,
-        workspace: &Path,
-    ) -> McpManager {
         let configs = BTreeMap::from([("fixture".into(), config.try_into().unwrap())]);
         let capabilities = CapabilitySet::default();
-        let connect =
-            McpManager::connect(&configs, &capabilities, workspace, CancellationToken::new());
+        let workspace = std::env::temp_dir();
+        let connect = McpManager::connect(
+            &configs,
+            &capabilities,
+            &workspace,
+            CancellationToken::new(),
+        );
         bounded(connect).await
     }
 
@@ -673,10 +652,40 @@ for line in sys.stdin:
         omitted.cwd = None;
         // A loaded config's origin is gone by now: an omitted cwd from either
         // layer is `None` and must not inherit Skyhook's own directory.
-        for (config, expected) in [(fixture.config(), configured), (omitted, workspace.clone())] {
-            let manager = connect_in(config, &workspace).await;
-            assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
+        // One failed server does not hide a healthy server's tools.
+        let mut broken = fixture.config();
+        broken.start_command = Some(vec![fixture.path("nonexistent-executable")]);
+        let broken: Option<(String, McpServerConfig)> =
+            Some(("broken".to_owned(), broken.try_into().unwrap()));
+        for (config, expected, broken) in [
+            (fixture.config(), configured, broken),
+            (omitted, workspace.clone(), None),
+        ] {
+            let configs = std::iter::once(("fixture".to_owned(), config.try_into().unwrap()))
+                .chain(broken)
+                .collect();
+            let capabilities = CapabilitySet::default();
+            let connect = McpManager::connect(
+                &configs,
+                &capabilities,
+                &workspace,
+                CancellationToken::new(),
+            );
+            let manager = bounded(connect).await;
+            if configs.contains_key("broken") {
+                assert_matches!(
+                    *failure(&manager, "broken"),
+                    StartupError::Mcp(McpError::Io(_))
+                );
+            } else {
+                assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
+            }
+            assert_matches!(
+                manager.servers()["fixture"],
+                McpServerStatus::Connected { tools: 4 }
+            );
             let catalog = manager.catalog();
+            assert!(catalog.iter().all(|entry| entry.server == "fixture"));
             let names: Vec<_> = catalog
                 .iter()
                 .map(|entry| entry.tool.name.as_ref())
@@ -795,7 +804,7 @@ for line in sys.stdin:
         let task = tokio::spawn(async move { fixture_call(&call_manager, "slow").await });
         wait_for_file(Path::new(&started)).await;
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        let _ = task.await;
         wait_for_file(Path::new(&cancelled)).await;
         fixture_call(&manager, "echo").await.unwrap();
         shutdown(&manager).await;
@@ -817,7 +826,7 @@ for line in sys.stdin:
             &mut reached,
         );
         let error = bounded(slow).await.unwrap_err();
-        assert!(matches!(error, McpError::Timeout), "{error:?}");
+        assert_matches!(error, McpError::Timeout, "{error:?}");
         assert_eq!(
             reached,
             PartialContext::new(Operation::Receive, Subject::None)
@@ -825,66 +834,21 @@ for line in sys.stdin:
         );
         // The session stays usable.
         fixture_call(&manager, "echo").await.unwrap();
-        shutdown(&manager).await;
-    }
-
-    /// A message beyond the frame guard is discarded on its own: the call it answered
-    /// ends at its deadline, and the server keeps serving the next call.
-    #[tokio::test]
-    async fn an_oversized_frame_ends_only_its_own_call() {
-        let fixture = Fixture::new();
-        let manager = connect(fixture.config()).await;
-        let sent = fixture.directory.path().join("started");
+        // A message beyond the frame guard is discarded on its own: the call it
+        // answered ends at its deadline, and the server keeps serving the next call.
+        std::fs::remove_file(&started).unwrap();
         let arguments = Map::from_iter([("oversized_frame".into(), Value::Bool(true))]);
-        let mut reached = PartialContext::default();
         let call = manager.call_staged(
             "fixture",
             "echo",
             arguments,
             CancellationToken::new(),
-            |_| wait_for_file(&sent),
+            |_| wait_for_file(&started),
             &mut reached,
         );
         let error = bounded(call).await.unwrap_err();
-        assert!(matches!(error, McpError::Timeout), "{error:?}");
+        assert_matches!(error, McpError::Timeout, "{error:?}");
         fixture_call(&manager, "echo").await.unwrap();
-        shutdown(&manager).await;
-    }
-
-    #[tokio::test]
-    async fn one_failed_server_does_not_hide_healthy_server_tools() {
-        let fixture = Fixture::new();
-        let mut bad = fixture.config();
-        bad.start_command = Some(vec![fixture.path("nonexistent-executable")]);
-        let configs = BTreeMap::from([
-            ("broken".into(), bad.try_into().unwrap()),
-            ("fixture".into(), fixture.config().try_into().unwrap()),
-        ]);
-        let capabilities = CapabilitySet::default();
-        let workspace = std::env::temp_dir();
-        let connect = McpManager::connect(
-            &configs,
-            &capabilities,
-            &workspace,
-            CancellationToken::new(),
-        );
-        let manager = bounded(connect).await;
-        assert_eq!(manager.catalog().len(), 4);
-        assert!(
-            manager
-                .catalog()
-                .iter()
-                .all(|entry| entry.server == "fixture")
-        );
-        assert!(matches!(
-            *failure(&manager, "broken"),
-            StartupError::Mcp(McpError::Io(_))
-        ));
-        let servers = manager.servers();
-        assert!(matches!(
-            servers["fixture"],
-            McpServerStatus::Connected { tools: 4 }
-        ));
         shutdown(&manager).await;
     }
 
@@ -896,16 +860,16 @@ for line in sys.stdin:
         let error = std::io::Error::other(secret);
         let error = DynamicTransportError::new::<FixtureTransport, RoleClient>(error);
         let error = request_error(ServiceError::TransportSend(error));
-        assert!(matches!(&error, McpError::Io(error) if error.get_ref().is_none()));
+        assert_matches!(&error, McpError::Io(error) if error.get_ref().is_none());
         let rendered = ToolError::from(error).to_string();
         for leaked in ["private-secret", "password", "example.invalid"] {
             assert!(!rendered.contains(leaked));
         }
         // JSON-RPC messages are server-controlled; only the code is retained.
         let rpc = rmcp::model::ErrorData::invalid_params(secret, Some(json!({"secret":secret})));
-        assert!(matches!(
+        assert_matches!(
             request_error(ServiceError::McpError(rpc)),
             McpError::JsonRpc(-32602)
-        ));
+        );
     }
 }

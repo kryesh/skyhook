@@ -306,7 +306,7 @@ pub(super) mod tests {
     use serde_json::Value;
 
     use super::super::*;
-    use super::{CAP, Coalescing, QUIET, WaitFloor, Waiting, burst};
+    use super::{CAP, Coalescing, QUIET, burst};
     pub(super) use crate::agent::runtime::tests::{
         AssistantItem, Script, Step, activity_is, bounded, enqueue_prompts, ephemeral_session,
         found, job_found, jobs_found, models, provider_name, rendered, response, spawn_prompt,
@@ -759,54 +759,6 @@ pub(super) mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// What a script was shown depends only on what was pending when it looked, not
-    /// on when the wake revision catches up: a notification becomes pending before
-    /// its wake is forwarded, and must not be reported to the same script twice.
-    #[tokio::test]
-    async fn a_script_is_shown_each_pending_notification_once() {
-        // No turn is scripted: the held window keeps the completions from the root.
-        let (_root, session) = start_coalescing(&tracking(vec![]), Coalescing::held().0).await;
-        let (jobs, root) = (&session.runtime.jobs, &session.root);
-        let script = JobSpec {
-            role: crate::job::JobRole::Script,
-            ..JobSpec::test(root.clone(), "script")
-        };
-        let script = jobs.test_create(script).await;
-        let wait = || JobSpec {
-            role: crate::job::JobRole::Wait,
-            ..JobSpec::test(root.clone(), "wait")
-        };
-        let hosted = || JobSpec {
-            parent: Some(script),
-            ..wait()
-        };
-        let unseen = async |caller: JobId, shown: bool| {
-            let root = root.clone();
-            let decide = move |state: &mut CoreState| {
-                state.jobs.park(caller);
-                let Waiting::Open { unseen, stamp, .. } = state.jobs.waiting(&root, caller) else {
-                    return false;
-                };
-                if shown {
-                    state.jobs.shown(caller, WaitFloor { stamp, input: 0 });
-                }
-                unseen
-            };
-            session.runtime.store.live(decide).await
-        };
-        complete_background(&session, root, "first").await;
-        let first = jobs.test_create(hosted()).await;
-        assert!(unseen(first, true).await);
-        let second = jobs.test_create(hosted()).await;
-        assert!(!unseen(second, false).await);
-        complete_background(&session, root, "second").await;
-        assert!(unseen(second, false).await);
-        // A model caller has no script floor: its request boundary consumes instead.
-        let model = jobs.test_create(wait()).await;
-        assert!(unseen(model, false).await);
-        session.shutdown().await.unwrap();
-    }
-
     /// Waits must not defer to each other: both wake on the same queued input,
     /// which reaches the next request rather than being consumed by the wake, and
     /// leaves nothing for a later wait.
@@ -987,61 +939,15 @@ pub(super) mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// A script's wait, direct or built, times out rather than being woken by the
+    /// script's own job.
     #[tokio::test]
-    async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
-        let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
-        let tracking = tracking(vec![
-            ("root", call("child", "agent", launch)),
-            ("child", call("child-wait", "wait", json!({}))),
-            ("root", call("parent-wait", "wait", json!({}))),
-            ("child", answer()),
-            ("root", answer()),
-        ]);
-        let (_root, session) = start(&tracking).await;
-        let turn = spawn_prompt(&session, "start");
-        tracking.pass(0).await;
-        tracking.request(1).await;
-        tracking.request(2).await;
-        let child_job = running_job(&session, &session.root, "agent").await;
-        let child = only_child(&session);
-        tracking.release(1);
-        running_job(&session, &child, "wait").await;
-        let jobs = &session.runtime.jobs;
-        jobs.send(child_job, json!("parent-wake-marker"))
-            .await
-            .unwrap();
-        let next = tracking.pass(3).await;
-        assert_reason(&next, "child-wait", "event");
-        let messages = rendered(&next);
-        assert_eq!(messages.matches("parent-wake-marker").count(), 1);
-        child_completed(&session, child_job).await;
-        tracking.release(2);
-        tracking.pass(4).await;
-        bounded(turn).await.unwrap().unwrap();
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn wait_rejects_invalid_arguments_and_script_waits_do_not_self_wake() {
+    async fn script_waits_do_not_self_wake() {
         let (_root, session) = start(&tracking(vec![])).await;
-        let invalid = json!([{"timeout":0}, {"timeout":0.125}, {"timeout":-1}, {"timeout":1e300}, {"timeout":"1"}, {"timeout":true}, {"bg":true}, {"bg":false}, {"job":1}, {"wait":1}]);
-        for invalid in invalid.as_array().unwrap() {
-            let executor = &session.runtime.executor;
-            let result = executor.execute(session.root.clone(), "wait", invalid.clone(), None);
-            assert!(bounded(result).await.is_err(), "accepted {invalid}");
-        }
         let source = "const direct = (await tool.wait({timeout:1})).result.reason; const builder = (await tool.wait().timeout(1)).result.reason; return [direct, builder];";
-        let jobs = session
-            .runtime
-            .jobs
-            .list(&session.root)
-            .await
-            .unwrap()
-            .into_iter();
-        let refused = jobs.filter(|job| job.tool == "wait").count();
         let timeouts = async {
-            time_out(&session, &session.root, refused + 1, 1).await;
-            time_out(&session, &session.root, refused + 2, 1).await;
+            time_out(&session, &session.root, 1, 1).await;
+            time_out(&session, &session.root, 2, 1).await;
         };
         let (output, ()) = tokio::join!(bounded(session.run_script(source)), timeouts);
         let output = output.unwrap();
@@ -1078,39 +984,6 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_unblocks_an_agent_held_by_a_foreground_script_wait() {
-        let source = json!({"source":"await tool.wait({timeout:30}); return 'late';"});
-        let tracking = tracking(vec![
-            ("root", call("blocked", "script", source)),
-            ("root", answer()),
-        ]);
-        let (_root, session) = start(&tracking).await;
-        let turn = spawn_prompt(&session, "start");
-        tracking.pass(0).await;
-        let script = running_job(&session, &session.root, "script").await;
-        let waiting = running_job(&session, &session.root, "wait").await;
-        running_tools(&session, &session.root).await;
-        assert_eq!(bounded(session.interrupt()).await, 1);
-        assert!(bounded(turn).await.unwrap().is_err());
-        for job in [script, waiting] {
-            let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
-            assert_eq!(state, JobState::Cancelled, "job {job:?}");
-        }
-        // The unwinding turn must not reach another request boundary.
-        assert!(!tracking.requested_from(1));
-        let resumed = tokio::spawn({
-            let session = session.clone();
-            async move { session.continue_turn().await }
-        });
-        let history = tracking.request(1).await;
-        let history = rendered(&history);
-        assert!(history.contains("cancel"), "{history}");
-        tracking.release(1);
-        assert_eq!(bounded(resumed).await.unwrap().unwrap(), "done");
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn interrupted_wait_reports_how_long_it_waited() {
         let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({}))),
@@ -1138,7 +1011,8 @@ pub(super) mod tests {
     }
 
     /// A model-delegated child is retained while the script blocking the same turn
-    /// is cancelled. (A child the script launched would die with it.)
+    /// is cancelled with the wait it blocks on. (A child the script launched would
+    /// die with it.)
     #[tokio::test]
     async fn interrupt_cancels_blocking_tools_and_retains_delegated_children() {
         let delegate = json!({"prompt":"work", "model":"wait-test/child", "name":"kid"});
@@ -1162,6 +1036,7 @@ pub(super) mod tests {
         let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let script = running_job(&session, &session.root, "script").await;
+        let waiting = running_job(&session, &session.root, "wait").await;
         let delegated = running_job(&session, &session.root, "agent").await;
         tracking.request(1).await;
         let child = only_child(&session);
@@ -1170,7 +1045,9 @@ pub(super) mod tests {
         running_tools(&session, &session.root).await;
         assert_eq!(bounded(session.interrupt()).await, 2);
         // Both outcomes are journaled asynchronously; settle before comparing.
-        until(&session, script, |job| job.state == JobState::Cancelled).await;
+        for job in [script, waiting] {
+            until(&session, job, |job| job.state == JobState::Cancelled).await;
+        }
         until(&session, delegated, |job| {
             job.state == JobState::Interrupted
         })

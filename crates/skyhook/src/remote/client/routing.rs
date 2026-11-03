@@ -221,8 +221,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        build, fixture_context, fixture_context_with_capabilities, output, route_fixture, sink,
-        test_connection, write_result,
+        build, fixture_context, fixture_context_with, output, route_fixture, sink, test_connection,
+        write_result,
     };
     use super::*;
     use crate::remote::protocol::AuthorizationId;
@@ -231,6 +231,7 @@ mod tests {
         Asking, AuthorizationArguments, AuthorizationCoordinator, Reauthorization,
     };
     use crate::tool::policy::{Capability, PermissionUse, ResourceId};
+    use std::assert_matches;
 
     const PROMPT: PromptId = PromptId::new(9);
     const AUTHORIZATION: AuthorizationId = AuthorizationId::new(7);
@@ -322,22 +323,22 @@ mod tests {
             let completed = receiver.await.unwrap().unwrap();
             assert_eq!(completed.output.value, "second");
             write_frame(&mut requests, &prompt()).await.unwrap();
-            assert!(matches!(
+            assert_matches!(
                 control(&mut replies).await,
                 Some(Request::Control(ControlRequest::SensitiveAnswer {
                     prompt_id: PROMPT,
                     answer: PromptAnswer::Rejected
                 }))
-            ));
+            );
             release.notify_one();
-            assert!(matches!(
+            assert_matches!(
                 control(&mut replies).await,
                 Some(Request::AuthorizationDecision {
                     authorization_id: AUTHORIZATION,
                     decision: Ok(()),
                     ..
                 })
-            ));
+            );
         })
         .await;
         // No further incoming frame should be required to observe callback failure.
@@ -352,10 +353,7 @@ mod tests {
         assert_eq!(error.context.operation, Operation::Send);
         assert_eq!(error.context.site, FailureSite::Host);
         assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
-        assert!(matches!(
-            error.cause,
-            crate::tool::diagnostic::Cause::Io { .. }
-        ));
+        assert_matches!(error.cause, crate::tool::diagnostic::Cause::Io { .. });
         reader.await.unwrap();
     }
 
@@ -367,12 +365,12 @@ mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let policy = crate::tests::RecordingPolicy::allowing();
         let capabilities = [Capability::Network].into_iter().collect();
-        let context = fixture_context_with_capabilities(&runtime, capabilities)
-            .with_invocation_authority(
-                AuthorizationCoordinator::new(policy.clone()),
-                "read".into(),
-                AuthorizationArguments::default(),
-            );
+        let job = crate::identity::JobId::new(1).unwrap();
+        let context = fixture_context_with(&runtime, job, capabilities).with_invocation_authority(
+            AuthorizationCoordinator::new(policy.clone()),
+            "read".into(),
+            AuthorizationArguments::default(),
+        );
         assert_eq!(
             context.execution_location().target,
             crate::target::TargetRef::Root
@@ -391,13 +389,13 @@ mod tests {
             request: forwarded(Reauthorization::Network(origin.to_owned())),
         };
         write_frame(&mut requests, &request).await.unwrap();
-        assert!(matches!(
+        assert_matches!(
             bounded(control(&mut replies)).await,
             Some(Request::AuthorizationDecision {
                 decision: Ok(()),
                 ..
             })
-        ));
+        );
         {
             let seen = policy.requests.lock().unwrap();
             let [request] = &seen[..] else {
@@ -446,10 +444,7 @@ mod tests {
             );
             assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
             if invalid_frame {
-                assert!(matches!(
-                    error.cause,
-                    crate::tool::diagnostic::Cause::Io { .. }
-                ));
+                assert_matches!(error.cause, crate::tool::diagnostic::Cause::Io { .. });
             }
             reader.await.unwrap();
         }

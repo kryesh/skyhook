@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_bounds_limits_and_rejects_unknown_fields_and_body_kinds() {
+    fn schema_bounds_limits_and_rejects_unknown_body_kinds() {
         let schema = serde_json::to_value(schema_for!(FetchArgs)).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for (key, max) in [
@@ -299,12 +299,8 @@ mod tests {
                 }
             }
         }
-        for input in [
-            json!({"url":"https://example.org", "unknown":true}),
-            json!({"url":"https://example.org", "body":{"kind":"multipart", "parts":[]}}),
-        ] {
-            assert!(!validator.is_valid(&input), "{input}");
-            assert!(serde_json::from_value::<FetchArgs>(input).is_err());
-        }
+        let input = json!({"url":"https://example.org", "body":{"kind":"multipart", "parts":[]}});
+        assert!(!validator.is_valid(&input), "{input}");
+        assert!(serde_json::from_value::<FetchArgs>(input).is_err());
     }
 }

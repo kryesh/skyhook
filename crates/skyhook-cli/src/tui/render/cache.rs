@@ -413,7 +413,7 @@ pub(super) mod tests {
         played::{
             answered, ask, call, count, exchange, observe_record, observe_until, played_fixture,
         },
-        tests::{capture_work, draw, draw_sized, fixture, recv, viewing},
+        tests::{capture_work, draw, draw_sized, fixture, recv, viewing, viewing_within},
     };
     use super::*;
     use crate::tests::bounded;
@@ -435,24 +435,28 @@ pub(super) mod tests {
         (root, app, session)
     }
 
-    /// A session whose root journaled statuses of mixed heights, more than a window
-    /// keeps, with a run of records that show nothing, longer than it keeps beside the
-    /// view, after the first of them.
-    pub(in crate::tui::render) async fn mixed_history() -> (tempfile::TempDir, App, SessionHandle) {
+    /// A session whose root journaled statuses of mixed heights, more than a window of
+    /// `budget` keeps, with a run of records that show nothing, longer than it keeps
+    /// beside the view, after the first of them.
+    pub(in crate::tui::render) async fn mixed_history(
+        budget: model::Budget,
+    ) -> (tempfile::TempDir, App, SessionHandle) {
         let (root, app) = fixture().await;
         let session = app.session().unwrap().clone();
         let agent = session.root_agent().clone();
         let long = "word ".repeat(60);
-        for status in 0..model::KEPT + 2 * model::PAGE {
-            let tail = if status / 100 % 2 == 1 {
+        for status in 0..budget.kept + 2 * budget.page {
+            // Runs of alternating heights, a hundred statuses long at the terminal's
+            // budget, scaled with it.
+            let tail = if status * model::Budget::DEFAULT.page / (100 * budget.page) % 2 == 1 {
                 long.as_str()
             } else {
                 ""
             };
             let message = format!("status {status} {tail}");
             session.record_status(agent.clone(), message).await.unwrap();
-            if status == model::KEPT / 2 {
-                for title in 0..model::KEPT / 2 + model::PAGE {
+            if status == budget.kept / 2 {
+                for title in 0..budget.kept / 2 + budget.page {
                     session
                         .rename(Some(format!("title {title}")))
                         .await
@@ -490,7 +494,9 @@ pub(super) mod tests {
     /// keeps its entry, and the fling goes on through it to the start.
     #[tokio::test]
     async fn a_fling_stops_at_what_is_not_loaded_and_reads_it_once() {
-        let (_root, _app, session) = statuses(400).await;
+        const PAGE: usize = model::Budget::DEFAULT.page;
+        const STATUSES: usize = 5 * PAGE / 2;
+        let (_root, _app, session) = statuses(STATUSES).await;
         let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
         let mut work = capture_work(&mut app);
         let loaded = app.loads;
@@ -525,7 +531,7 @@ pub(super) mod tests {
         })
         .await;
         assert_eq!(app.loads - loaded, pages);
-        assert_eq!(pages, (400 - model::PAGE).div_ceil(model::PAGE));
+        assert_eq!(pages, (STATUSES - PAGE).div_ceil(PAGE));
     }
 
     /// A run of records that show nothing, longer than a window keeps, is read across
@@ -537,13 +543,14 @@ pub(super) mod tests {
         let (_root, app) = fixture().await;
         let session = app.session().unwrap().clone();
         let agent = session.root_agent().clone();
+        let budget = model::Budget::SMALL;
         for side in 0..2 {
             for status in 0..20 {
                 let message = format!("side {side} status {status}");
                 session.record_status(agent.clone(), message).await.unwrap();
             }
             for title in (side == 0)
-                .then_some(0..4 * model::KEPT)
+                .then_some(0..budget.kept + budget.page)
                 .into_iter()
                 .flatten()
             {
@@ -553,7 +560,7 @@ pub(super) mod tests {
                     .unwrap();
             }
         }
-        let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
+        let (_viewer, mut app) = viewing_within(&session, Tab::Conversation, budget).await;
         let mut work = capture_work(&mut app);
         let kept = |app: &App| {
             let transcript = app.window.as_ref().and_then(model::Window::transcript);
@@ -567,7 +574,7 @@ pub(super) mod tests {
                 loop {
                     app.event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
                     settle(&mut app, &mut work).await;
-                    assert!(kept(&app) <= model::KEPT, "{}", kept(&app));
+                    assert!(kept(&app) <= budget.kept, "{}", kept(&app));
                     if draw(&mut app).contains(end) {
                         break;
                     }
@@ -665,12 +672,13 @@ pub(super) mod tests {
     /// A new width lays out the entries the window holds, never what it has not loaded.
     #[tokio::test]
     async fn a_resize_lays_out_only_the_loaded_window() {
-        let (_root, _app, session) = statuses(400).await;
+        let page = model::Budget::DEFAULT.page;
+        let (_root, _app, session) = statuses(2 * page).await;
         let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
         let statuses = app.entries().iter();
         let statuses = statuses.filter(|entry| entry.text().starts_with("Status"));
         assert!(
-            statuses.count() < 400,
+            statuses.count() < 2 * page,
             "the window holds part of the transcript"
         );
         app.render.laid_out = 0;

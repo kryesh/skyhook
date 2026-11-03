@@ -1,6 +1,7 @@
 //! The synthesis of the run's work: what every phase owes, what runs, what two tasks tried
-//! without settling, what the user is asked, what stands unproven, what no path reaches and
-//! which interfaces wait on an environment; and the counts the Research page draws.
+//! without settling, what the user is asked, what stands unproven, what no path reaches,
+//! which interfaces wait on an environment and what lies outside the scope; and the counts the
+//! Research page draws.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -29,7 +30,8 @@ pub struct Exhausted {
     pub reply: Option<String>,
 }
 
-/// An undecided deployment premise a review waits on: the user's to answer.
+/// A deployment premise for the user to answer: undecided while a review waits on it, or
+/// carrying a status proposed within scheduled work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Asked {
     pub premise: PremiseId,
@@ -44,7 +46,7 @@ pub struct Unproven {
     pub premises: Vec<PremiseRef>,
 }
 
-/// An interface that unswept paths with no source in code wait on: no environment for any
+/// An interface that unswept paths reading no caller-supplied state in code wait on: no environment for any
 /// candidate serves it, or the launch does no live work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Uncovered {
@@ -65,6 +67,7 @@ pub struct Synthesis {
     /// Components no path steps through.
     pub unreached: Vec<ComponentId>,
     pub uncovered: Vec<Uncovered>,
+    pub outside: Outside,
 }
 
 /// The run's work in counts, read without the details the synthesis gives: what the
@@ -77,7 +80,7 @@ pub struct Summary {
     pub running: BTreeMap<Phase, u64>,
     /// Per phase, the subjects exhausted while they owe it.
     pub exhausted: BTreeMap<Phase, u64>,
-    /// Undecided deployment premises a review waits on.
+    /// Deployment premises for the user to answer.
     pub asked: u64,
     /// Interfaces unswept paths wait on.
     pub uncovered: u64,
@@ -172,17 +175,18 @@ fn running(db: &Db) -> Result<BTreeMap<Phase, u64>> {
     )
 }
 
-/// The undecided deployment premises a review waits on, as `p.node` and `n.title`.
+/// The deployment premises for the user to answer, as `p.node` and `n.title`: undecided while
+/// a review waits on one, or carrying a proposal while a live candidate rests on it.
 macro_rules! asked {
     () => {
         concat!(
-            "SELECT p.node,n.title FROM premise_state p JOIN node n ON n.id=p.node WHERE \
-             p.scope='deployment' AND p.status='undecided' AND n.merged_into IS NULL AND EXISTS \
-             (SELECT 1 FROM (",
+            "SELECT p.node,n.title FROM premise_standing p JOIN node n ON n.id=p.node WHERE \
+             p.scope='deployment' AND n.merged_into IS NULL AND EXISTS (SELECT 1 FROM (",
             bearing::premise_candidates!("p.node"),
-            ") ap JOIN node an ON an.id=ap.candidate WHERE an.merged_into IS NULL AND ",
+            ") ap JOIN node an ON an.id=ap.candidate WHERE an.merged_into IS NULL AND \
+             (p.proposed IS NOT NULL OR (p.status='undecided' AND ",
             queues::review_owed!("ap.candidate"),
-            ")"
+            ")))"
         )
     };
 }
@@ -197,18 +201,21 @@ macro_rules! unreached {
     };
 }
 
-/// The interfaces recorded sources of unswept probed paths sit on and wait for, as
-/// `xi.interface`, with how many paths wait.
+/// The interfaces unswept probed paths within the scope read recorded caller-supplied states on
+/// and wait for, as `xi.interface`, with how many paths wait.
 macro_rules! uncovered_interfaces {
     () => {
         concat!(
             "SELECT xi.interface,count(DISTINCT p.node) FROM path p JOIN node pn ON pn.id=p.node \
-             JOIN path_source xs ON xs.path=p.node JOIN source xo ON xo.node=xs.source JOIN \
-             interface_location xi ON xi.location=xo.location WHERE pn.merged_into IS NULL AND \
-             p.status='unswept' AND xo.status='recorded' AND ",
+             JOIN path_state xs ON xs.path=p.node AND xs.access='read' JOIN state xo ON \
+             xo.node=xs.state AND xo.scope IN ('input','handed') JOIN interface_location xi ON \
+             xi.location=xs.location WHERE pn.merged_into IS NULL AND p.status='unswept' AND \
+             xo.status='recorded' AND ",
             queues::probed!("p.node"),
             " AND NOT ",
             queues::served!("xi.interface"),
+            " AND NOT ",
+            scope::unscoped!("p.node"),
             " GROUP BY xi.interface"
         )
     };
@@ -247,6 +254,7 @@ struct Found {
     unproven: Vec<Unproven>,
     unreached: Vec<ComponentId>,
     uncovered: Vec<Uncovered>,
+    outside: Outside,
 }
 
 fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
@@ -266,9 +274,9 @@ fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
     }
     let unproven = rows(
         db,
-        "SELECT c.node,n.title FROM candidate c JOIN node n ON n.id=c.node WHERE \
-         c.verdict='unproven' AND (SELECT state FROM candidate_state WHERE candidate=c.node)=\
-         'unproven' ORDER BY c.node",
+        "SELECT c.candidate,n.title FROM candidate_result c JOIN node n ON n.id=c.candidate \
+         WHERE c.verdict='unproven' AND (SELECT state FROM candidate_state WHERE \
+         candidate=c.candidate)='unproven' ORDER BY c.candidate",
         Vec::new(),
         |row| Ok((CandidateId(row.get(0)?), row.get::<String>(1)?)),
     )?
@@ -314,6 +322,7 @@ fn synthesis(db: &Db, spent: &queues::Spent) -> Result<Found> {
                 })
             },
         )?,
+        outside: scope::outside(db)?,
     })
 }
 
@@ -328,7 +337,7 @@ fn counts<T: NamedEnum + Ord>(db: &Db, sql: &'static str) -> Result<BTreeMap<T, 
 /// What the run holds, by kind and standing, merged and retracted nodes aside.
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct Coverage {
-    pub sources: u64,
+    pub states: u64,
     pub paths: u64,
     pub swept: u64,
     pub components: u64,
@@ -336,7 +345,8 @@ pub struct Coverage {
     pub unreached: u64,
     /// Live premises by status.
     pub premises: BTreeMap<PremiseStatus, u64>,
-    /// Live premises with contradicting evidence since their latest status.
+    /// Live premises disputed: a proposal disagrees with their standing, or contradicting
+    /// evidence came after it.
     pub disputed: u64,
     pub flaws: BTreeMap<FlawStatus, u64>,
     /// Live candidates by status.
@@ -345,10 +355,11 @@ pub struct Coverage {
     pub findings: u64,
     /// Tasks begun, by phase.
     pub tasks: BTreeMap<Phase, u64>,
+    pub outside: Outside,
 }
 
 /// The live candidates by status, their root groups' facts read once.
-const CANDIDATE_STATES: &str = concat!(
+pub(super) const CANDIDATE_STATES: &str = concat!(
     "WITH ",
     bearing::demonstrations!(),
     " SELECT ",
@@ -358,10 +369,11 @@ const CANDIDATE_STATES: &str = concat!(
 );
 
 fn coverage(db: &Db) -> Result<Coverage> {
-    let (sources, paths, swept, components) = stored(
+    let (states, paths, swept, components) = stored(
         db,
-        "SELECT (SELECT count(*) FROM source WHERE status='recorded'),(SELECT count(*) FROM path \
-         p JOIN node n ON n.id=p.node WHERE n.merged_into IS NULL AND p.status!='retracted'),\
+        "SELECT (SELECT count(*) FROM state s JOIN node n ON n.id=s.node WHERE n.merged_into IS \
+         NULL AND s.status='recorded'),(SELECT count(*) FROM path p JOIN node n ON n.id=p.node \
+         WHERE n.merged_into IS NULL AND p.status!='retracted'),\
          (SELECT count(*) FROM path p JOIN node n ON n.id=p.node WHERE n.merged_into IS NULL AND \
          p.status='swept'),(SELECT count(*) FROM component c JOIN node n ON n.id=c.node WHERE \
          n.merged_into IS NULL AND c.status='recorded')",
@@ -369,7 +381,7 @@ fn coverage(db: &Db) -> Result<Coverage> {
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     Ok(Coverage {
-        sources,
+        states,
         paths,
         swept,
         components,
@@ -380,21 +392,21 @@ fn coverage(db: &Db) -> Result<Coverage> {
         )?,
         premises: counts(
             db,
-            "SELECT p.status,count(*) FROM premise_state p JOIN node n ON n.id=p.node WHERE \
+            "SELECT p.status,count(*) FROM premise_standing p JOIN node n ON n.id=p.node WHERE \
              n.merged_into IS NULL GROUP BY p.status",
         )?,
         disputed: count(
             db,
             concat!(
-                "SELECT count(*) FROM premise p JOIN node n ON n.id=p.node WHERE n.merged_into IS \
-                 NULL AND ",
-                reads::disputed!("p.node", "p.decided")
+                "SELECT count(*) FROM premise_standing p JOIN node n ON n.id=p.node WHERE \
+                 n.merged_into IS NULL AND ",
+                bearing::disputed!("p", "decided")
             ),
             Vec::new(),
         )?,
         flaws: counts(
             db,
-            "SELECT f.status,count(*) FROM flaw_state f JOIN node n ON n.id=f.node WHERE \
+            "SELECT f.status,count(*) FROM flaw_standing f JOIN node n ON n.id=f.node WHERE \
              n.merged_into IS NULL GROUP BY f.status",
         )?,
         candidates: counts(db, CANDIDATE_STATES)?,
@@ -407,6 +419,7 @@ fn coverage(db: &Db) -> Result<Coverage> {
             Vec::new(),
         )?,
         tasks: counts(db, "SELECT phase,count(*) FROM task GROUP BY phase")?,
+        outside: scope::outside(db)?,
     })
 }
 
@@ -460,8 +473,8 @@ pub struct RunState {
 
 impl Store {
     /// What every phase owes, what runs, what is exhausted with its last child's reply, the
-    /// scheduler's `spent` work included, what the user is asked, what stands unproven and
-    /// what no path reaches.
+    /// scheduler's `spent` work included, what the user is asked, what stands unproven, what no
+    /// path reaches and what lies outside the scope.
     pub fn synthesis(&self, spent: &[SpentWork]) -> Result<Synthesis> {
         let spent = &queues::Spent::of(spent)?;
         let found = self.read(|db| synthesis(db, spent))?;
@@ -485,6 +498,7 @@ impl Store {
             unproven: found.unproven,
             unreached: found.unreached,
             uncovered: found.uncovered,
+            outside: found.outside,
         })
     }
 
@@ -527,23 +541,53 @@ mod tests {
         super::{
             queues::tests::queued,
             tests::{
-                HIGH, assess, begun, component, fixture, operation, path_from, plan, premise,
+                HIGH, assess, begun, component, end_job, fixture, operation, path_from, premise,
                 scenario, sweep, text, validated, verdict,
             },
         },
         *,
     };
 
-    /// Coverage reads its root groups' facts once: no candidate's standing seeks its group's
-    /// members.
+    /// A deployment premise's status counts when recorded outside every task, as the user's
+    /// answer relayed; recorded within scheduled work it only proposes one, which the user is
+    /// asked until they answer.
     #[test]
-    fn coverage_reads_group_facts_once() {
-        let (_session, store, _) = fixture();
-        let seeks: Vec<String> = (plan(&store, CANDIDATE_STATES).into_iter())
-            .map(|step| step.detail)
-            .filter(|step| step.contains("candidate_flaw_flaw"))
-            .collect();
-        assert!(seeks.is_empty(), "{seeks:#?}");
+    fn a_deployment_premise_is_answered_outside_scheduled_work() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let deployment = premise(&store, &actor, PremiseScope::Deployment);
+        let rests = Link::FlawPremise {
+            flaw: scenario.flaw,
+            premise: deployment,
+        };
+        store.link(&actor, &[rests]).unwrap();
+        let answer = |agent: &AgentId, status| {
+            let change = StatusChange::Premise(deployment, status);
+            store.set_status(agent, change, &text("answered")).unwrap();
+        };
+        let read = || {
+            let NodeView::Premise(view) = store.node(deployment.into()).unwrap() else {
+                panic!("a premise")
+            };
+            let asked = store.synthesis(&[]).unwrap().asked;
+            let asked: Vec<PremiseId> = asked.iter().map(|asked| asked.premise).collect();
+            (view.status, view.proposed.map(|p| p.value), asked)
+        };
+        answer(&actor, PremiseStatus::Holds);
+        assert_eq!(read(), (PremiseStatus::Holds, None, vec![]));
+        let (reviewer, job, _) = begun(&store, &Begin::Review(vec![scenario.candidate]));
+        answer(&reviewer, PremiseStatus::Fails);
+        end_job(&store, job);
+        assert_eq!(
+            read(),
+            (
+                PremiseStatus::Holds,
+                Some(PremiseStatus::Fails),
+                vec![deployment]
+            )
+        );
+        answer(&actor, PremiseStatus::Fails);
+        assert_eq!(read(), (PremiseStatus::Fails, None, vec![]));
     }
 
     /// A candidate left unproven is listed with the undecided premises of its chain alone.
@@ -552,7 +596,7 @@ mod tests {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         sweep(&store, scenario.path);
-        assess(&store, &actor, scenario.candidate, HIGH);
+        assess(&store, scenario.candidate, HIGH);
         let [open, decided] = [PremiseScope::Code, PremiseScope::Deployment]
             .map(|scope| premise(&store, &actor, scope));
         let rests = [open, decided].map(|premise| Link::FlawPremise {
@@ -564,7 +608,7 @@ mod tests {
         store
             .set_status(&actor, holds, &text("the user runs it"))
             .unwrap();
-        verdict(&store, &actor, scenario.candidate, Verdict::Unproven);
+        verdict(&store, scenario.candidate, Verdict::Unproven);
         let unproven = store.synthesis(&[]).unwrap().unproven;
         assert_eq!(
             (unproven.iter())
@@ -586,9 +630,9 @@ mod tests {
             validated(&store, &actor, "b").candidate,
         );
         let (_, _, task) = begun(&store, &Begin::Test(vec![merged]));
-        let merge = Merge::Candidate {
-            candidate: merged,
-            into: kept,
+        let merge = Merge {
+            node: merged.into(),
+            into: kept.into(),
             note: text("same"),
         };
         store.merge(&actor, &merge).unwrap();
@@ -602,11 +646,12 @@ mod tests {
         );
     }
 
-    /// A retracted source enters no path's work and counts nowhere: a path only it enters owes
-    /// no sweep or probe, and an interface only it sits on waits on nothing. A retracted component is
-    /// neither counted nor unreached. Restored, a source enters its paths again.
+    /// A retracted input state is read in no path's work and counts nowhere: a path reading only
+    /// it owes no sweep or probe, and an interface only it is read on waits on nothing. A
+    /// retracted component is neither counted nor unreached. Restored, an input state is read
+    /// on its paths again.
     #[test]
-    fn retracted_sources_and_components_count_nowhere() {
+    fn retracted_states_and_components_count_nowhere() {
         let (_session, store, actor) = fixture();
         let decoder = scenario(&store, &actor, "decoder");
         let idle = component(&store, &actor, "idle");
@@ -616,11 +661,11 @@ mod tests {
             let NodeView::Path(view) = store.node(path.into()).unwrap() else {
                 panic!("a path")
             };
-            view.sources[0].id
+            view.states[0].id
         });
         let read = || {
             let (coverage, synthesis) = (store.coverage().unwrap(), store.synthesis(&[]).unwrap());
-            let counts = (coverage.sources, coverage.components, coverage.unreached);
+            let counts = (coverage.states, coverage.components, coverage.unreached);
             let uncovered = synthesis.uncovered.len();
             let structure = [Phase::Sweep, Phase::Probe].map(|phase| queued(&store, phase));
             (counts, synthesis.unreached, uncovered, structure.concat())
@@ -628,11 +673,13 @@ mod tests {
         let swept = vec![NodeId::from(decoder.path)];
         assert_eq!(read(), ((2, 3, 1), vec![idle], 1, swept.clone()));
         let mark = |change| store.set_status(&actor, change, &text("in error")).unwrap();
-        mark(StatusChange::Source(code, InventoryStatus::Retracted));
-        mark(StatusChange::Source(interface, InventoryStatus::Retracted));
+        let retracted = StateMark::Inventory(InventoryStatus::Retracted);
+        mark(StatusChange::State(code, retracted));
+        mark(StatusChange::State(interface, retracted));
         mark(StatusChange::Component(idle, InventoryStatus::Retracted));
         assert_eq!(read(), ((0, 2, 0), vec![], 0, vec![]));
-        mark(StatusChange::Source(code, InventoryStatus::Recorded));
+        let recorded = StateMark::Inventory(InventoryStatus::Recorded);
+        mark(StatusChange::State(code, recorded));
         assert_eq!(read(), ((1, 2, 0), vec![], 0, swept));
     }
 }

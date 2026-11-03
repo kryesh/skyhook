@@ -9,17 +9,20 @@ use super::*;
 
 mod list;
 mod neighbours;
+mod search;
 mod shelf;
 mod views;
 
 pub use list::*;
-pub(super) use neighbours::{disputed, undecided_premises};
+pub(super) use neighbours::{decided_premises, proposed, undecided_premises};
+pub use search::*;
 pub use shelf::*;
 pub use views::*;
 
 impl Store {
     /// The node `id`, merged or not, with its neighbourhood.
     pub fn node(&self, id: NodeId) -> Result<NodeView> {
+        let session = self.id();
         self.read(|db| {
             let (kind, head) = optional(
                 db,
@@ -46,10 +49,10 @@ impl Store {
             Ok(match kind {
                 NodeKind::Component => NodeView::Component(component(db, head)?),
                 NodeKind::Path => NodeView::Path(path(db, head)?),
-                NodeKind::Source => NodeView::Source(source(db, head)?),
-                NodeKind::Premise => NodeView::Premise(premise(db, head)?),
-                NodeKind::Flaw => NodeView::Flaw(flaw(db, head)?),
-                NodeKind::Candidate => NodeView::Candidate(candidate(db, head)?),
+                NodeKind::State => NodeView::State(state(db, head)?),
+                NodeKind::Premise => NodeView::Premise(premise(db, session, head)?),
+                NodeKind::Flaw => NodeView::Flaw(flaw(db, session, head)?),
+                NodeKind::Candidate => NodeView::Candidate(candidate(db, session, head)?),
                 NodeKind::Finding => NodeView::Finding(finding(db, head)?),
             })
         })
@@ -60,9 +63,9 @@ impl Store {
         self.read(|db| {
             let items = environments(
                 db,
-                "SELECT id,instructions,candidate,event FROM environment WHERE id>?1 ORDER BY \
-                 id LIMIT ?2",
-                params![page.after, page.limit()],
+                "SELECT id,instructions,candidate,event FROM environment WHERE id>?1 ORDER BY id",
+                params![page.after],
+                page.limit(),
             )?;
             Ok(Listing::keyset(items, page))
         })
@@ -72,30 +75,45 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::tests::{begun, fixture, premise, scenario, text},
+        super::tests::{
+            access, check, component, fixture, location, path, premise, scenario, state, sweep,
+            text,
+        },
         *,
     };
 
-    /// A node's view lists its tasks newest first, and a merge's survivor lists the merged
-    /// node's too.
+    /// A state's check stands until an access, edit or merge comes after it, whether or not the
+    /// state is still owed one: retracting the state leaves a stale check stale.
     #[test]
-    fn a_node_lists_its_tasks_through_a_merge() {
+    fn a_checks_currency_outlives_its_states_retraction() {
         let (_session, store, actor) = fixture();
-        let (merged, kept) = (
-            scenario(&store, &actor, "one"),
-            scenario(&store, &actor, "two"),
-        );
-        let (_, _, first) = begun(&store, &Begin::Assess(vec![merged.candidate]));
-        let (_, _, second) = begun(&store, &Begin::Assess(vec![kept.candidate]));
-        let merge = Merge::Candidate {
-            candidate: merged.candidate,
-            into: kept.candidate,
-            note: text("same"),
+        let decoder = component(&store, &actor, "decoder");
+        let stream = path(&store, &actor, "stream", &[decoder]);
+        let window = state(&store, &actor, NewState::Instance);
+        let write = |line| {
+            access(
+                stream,
+                window,
+                Access::Write,
+                location("decoder/lib.c", line),
+            )
         };
-        store.merge(&actor, &merge).unwrap();
-        let tasks = |id: CandidateId| store.node(id.into()).unwrap().head().tasks.clone();
-        assert_eq!(tasks(kept.candidate), [second, first]);
-        assert_eq!(tasks(merged.candidate), [first]);
+        store.link(&actor, &[write(3)]).unwrap();
+        sweep(&store, stream);
+        check(&store, window);
+        let current = || {
+            let NodeView::State(view) = store.node(window.into()).unwrap() else {
+                panic!("a state")
+            };
+            view.check.expect("a check").current
+        };
+        assert!(current());
+        store.link(&actor, &[write(4)]).unwrap();
+        assert!(!current());
+        let retracted =
+            StatusChange::State(window, StateMark::Inventory(InventoryStatus::Retracted));
+        store.set_status(&actor, retracted, &text("gone")).unwrap();
+        assert!(!current());
     }
 
     /// Evidence recorded on a node of any kind shows in its view.
@@ -112,7 +130,7 @@ mod tests {
         let nodes: [NodeId; 7] = [
             scenario.component.into(),
             scenario.path.into(),
-            path.sources[0].id.into(),
+            path.states[0].id.into(),
             premise(&store, &actor, PremiseScope::Code).into(),
             scenario.flaw.into(),
             scenario.candidate.into(),

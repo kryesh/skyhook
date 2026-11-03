@@ -337,11 +337,11 @@ mod tests {
             text: "cached".into(),
             cache: true,
         }];
-        request.tools = vec![ToolDefinition {
+        request.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "look".into(),
             description: "Look".into(),
             input_schema: json!({"type":"object"}),
-        }];
+        })];
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         request.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
         request.reasoning = Some("high".into());
@@ -581,6 +581,16 @@ mod tests {
         assert_eq!(
             body["messages"][1]["content"],
             json!([unsigned, {"type":"text","text":"one","cache_control":{"type":"ephemeral"}}])
+        );
+        // A server that takes back only signed thinking never gets unsigned blocks.
+        let dropped = Dialect {
+            unsigned: crate::provider::codec::UnsignedReasoning::Dropped,
+            ..Dialect::standard()
+        };
+        let body = encode(&request, Default::default(), &dropped).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type":"text","text":"one","cache_control":{"type":"ephemeral"}}])
         );
         // A signed block anywhere in the context makes unsigned ones unsendable.
         request.context.extend(entries([

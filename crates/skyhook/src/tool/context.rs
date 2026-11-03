@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use crate::tool::{authorization::AuthorizationError, invocation::AdmissionError};
+use crate::tool::{
+    authorization::AuthorizationError,
+    builtins::workspace::Directories,
+    diagnostic::Subject,
+    invocation::{AdmissionError, JobWorkspace},
+};
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 
@@ -28,12 +33,14 @@ pub struct ToolContext {
     /// Where the job runs: the execution location, unless its input places
     /// it elsewhere, with a local workspace resolved.
     job_location: ExecutionLocation,
+    job_workspace: JobWorkspace,
     pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
     authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,
     /// The opened source argument, when the tool has one.
     source: Option<crate::tool::source::Source>,
+    fit: crate::job::output::Fit,
 }
 
 impl ToolContext {
@@ -56,6 +63,7 @@ impl ToolContext {
         Self {
             subject,
             job_location: execution_location.clone(),
+            job_workspace: JobWorkspace::Exists,
             execution_location,
             caller_location,
             process_environment: Default::default(),
@@ -63,7 +71,19 @@ impl ToolContext {
             input: Arc::new(Mutex::new(input)),
             jobs,
             source: None,
+            fit: crate::job::output::Fit::Preview,
         }
+    }
+
+    /// How much of a finished result this invocation's reads present.
+    pub(crate) const fn fit(&self) -> crate::job::output::Fit {
+        self.fit
+    }
+
+    #[must_use]
+    pub(crate) const fn with_fit(mut self, fit: crate::job::output::Fit) -> Self {
+        self.fit = fit;
+        self
     }
 
     /// Record that this invocation presented `read`, for its job's finish to
@@ -73,8 +93,13 @@ impl ToolContext {
     }
 
     #[must_use]
-    pub(crate) fn with_job_location(mut self, location: ExecutionLocation) -> Self {
+    pub(crate) fn with_job_location(
+        mut self,
+        location: ExecutionLocation,
+        workspace: JobWorkspace,
+    ) -> Self {
         self.job_location = location;
+        self.job_workspace = workspace;
         self
     }
 
@@ -135,6 +160,19 @@ impl ToolContext {
 
     pub(crate) fn job_location(&self) -> &ExecutionLocation {
         &self.job_location
+    }
+
+    /// Create the job's workspace its call found missing, once the call has
+    /// checked what it can without changing anything.
+    pub(crate) async fn create_job_workspace(&self) -> Result<Directories, ToolError> {
+        match self.job_workspace {
+            JobWorkspace::Exists => Ok(Directories::Existed),
+            JobWorkspace::Missing => {
+                let workspace = &self.job_location.workspace;
+                let subject = Subject::working_directory(workspace);
+                Directories::create(workspace, subject).await
+            }
+        }
     }
 
     pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {

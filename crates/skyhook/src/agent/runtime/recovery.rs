@@ -176,15 +176,16 @@ impl SessionRuntime {
 mod tests {
     //! Exercise provider-neutral recovery through the real agent loop and durable journal.
 
+    use std::assert_matches;
     use std::sync::{Arc, atomic::Ordering};
     use std::time::Duration;
 
     use super::*;
     use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Served, Step, bounded, count, delta, enqueue_prompts,
-        events, input, journaled_usage, model_ref, next_recovery, recoverable, rendered, response,
-        retrying, send, spawn_prompt, spawned_child, summary_json, test_builder, test_harness,
-        tool_call, until_queued, usage,
+        ephemeral_session, events, input, journaled_usage, model_ref, next_recovery, recoverable,
+        rendered, response, retrying, send, spawn_prompt, spawned_child, summary_json,
+        test_builder, test_harness, tool_call, until_queued, usage,
     };
     use crate::provider::{
         ProviderError, ProviderErrorKind,
@@ -251,7 +252,7 @@ mod tests {
             let provider = script.clone();
             let sessions = workspace.path().join("sessions");
             let builder = test_builder(workspace.path(), &sessions, provider, true);
-            let session = builder.build().await.unwrap().new_session().await.unwrap();
+            let session = ephemeral_session(&builder.build().await.unwrap()).await;
             Self {
                 workspace,
                 session,
@@ -456,7 +457,7 @@ mod tests {
         let reported = events!(&records, SessionEvent::Usage { request: at, usage } if *at == request => *usage);
         assert_eq!(reported, [observed; 4]);
         let requests = fixture.requests();
-        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(requests.array_windows().all(|[a, b]| a == b));
         let (history, assistants) = fixture.history().await;
         assert_eq!(assistants, 1);
         assert!(!history.contains("private"));
@@ -477,8 +478,8 @@ mod tests {
         assert_eq!(fixture.prompt("write and finish").await, "done");
         let requests = fixture.requests();
         assert_eq!(requests.len(), 6);
-        assert!(requests[..3].windows(2).all(|pair| pair[0] == pair[1]));
-        assert!(requests[3..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(requests[..3].array_windows().all(|[a, b]| a == b));
+        assert!(requests[3..].array_windows().all(|[a, b]| a == b));
         assert_ne!(requests[2], requests[3]);
         for request in &requests[3..] {
             let tool = |message: &&Sent| matches!(message, Sent::Tool(_));
@@ -527,39 +528,17 @@ mod tests {
         };
         let requests = fixture.session.store().observe().snapshot.requests;
         let phase = &requests.get(attempt.request).unwrap().phase;
-        assert!(matches!(
+        assert_matches!(
             phase,
             crate::session::RequestPhase::Interrupted {
                 attempt: Some(1),
                 ..
             }
-        ));
+        );
         assert_eq!(fixture.requests().len(), 1);
         assert_eq!(fixture.script.remaining(), 1);
         fixture.session.shutdown().await.unwrap();
         assert_eq!(fixture.requests().len(), 1);
-    }
-
-    /// A permanent failure, at startup or in the stream, fails the turn without a
-    /// recovery whatever its message says.
-    #[tokio::test]
-    async fn a_permanent_failure_ignores_a_retry_sounding_message() {
-        for streaming in [false, true] {
-            let message =
-                "websocket connection lost; retry this request; previous_response_not_found";
-            let error = ProviderErrorKind::Protocol.error(message);
-            let failure = if streaming {
-                Step::stream(vec![Err(error)])
-            } else {
-                Step::fail(error)
-            };
-            let fixture = Fixture::new([failure, answer("must not run")]).await;
-            let result = fixture.session.prompt("fail without recovery").await;
-            assert!(result.is_err(), "{streaming}");
-            assert_eq!(fixture.requests().len(), 1, "{streaming}");
-            assert!(recoveries(&fixture.records()).is_empty(), "{streaming}");
-            fixture.session.shutdown().await.unwrap();
-        }
     }
 
     #[tokio::test]
@@ -653,13 +632,19 @@ mod tests {
         fixture.session.runtime.commit(root, history).await.unwrap();
         let answer = fixture.prompt("continue").await;
         assert_eq!(answer, "recovered after compaction");
+        // Summarization and retries keep the agent's context.
+        let opened = fixture
+            .script
+            .opened
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(opened, 1);
         let requests = fixture.requests();
         assert_eq!(requests.len(), 8);
         let summaries = requests
             .iter()
             .filter(|request| request.response_schema.is_some());
         assert_eq!(summaries.count(), 1);
-        assert!(requests[..5].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(requests[..5].array_windows().all(|[a, b]| a == b));
         assert_ne!(requests[4], requests[6]);
         assert_eq!(requests[6], requests[7]);
         assert_eq!(fixture.script.remaining(), 0);
@@ -684,7 +669,8 @@ mod tests {
             ])
             .await;
             let error = fixture.session.prompt("continue").await.unwrap_err();
-            assert!(error.to_string().contains("scripted context overflow"));
+            assert_matches!(&error, HarnessError::Provider(error)
+                if error.kind() == ProviderErrorKind::ContextWindowExceeded);
             let requests = fixture.requests();
             assert_eq!(
                 requests.len(),
@@ -711,11 +697,20 @@ mod tests {
     }
 
     /// A separate reader sees only committed transactions: the attempt start is
-    /// durable, and replays to what was sent, before the provider is invoked.
+    /// durable, and replays to what was sent, before the provider is invoked. A
+    /// permanent failure, at startup or in the stream, fails the turn without a
+    /// recovery whatever its message says.
     #[tokio::test]
     async fn failed_provider_call_is_journaled_before_invocation() {
-        let failure = ProviderErrorKind::Protocol.error("intentional provider failure");
-        let provider = Script::new([Step::fail(failure).gated()], &Requests::default());
+        let message = "websocket connection lost; retry this request; previous_response_not_found";
+        let failure = || ProviderErrorKind::Protocol.error(message);
+        let steps = [
+            Step::fail(failure()).gated(),
+            Step::stream(vec![Err(failure())]),
+            answer("must not run"),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
         let workspace = tempfile::tempdir().unwrap();
         let sessions = workspace.path().join("sessions");
         let harness = test_harness(workspace.path(), &sessions, provider.clone()).await;
@@ -734,8 +729,16 @@ mod tests {
         let reconstructed = session.runtime.store.reconstruct_model_request(sequence);
         assert_eq!(reconstructed.await.unwrap(), (model_ref("test"), request));
         provider.release(0);
-        let error = bounded(prompt).await.unwrap().unwrap_err();
-        assert!(error.to_string().contains("intentional provider failure"));
+        let protocol = |result: Result<String, HarnessError>| {
+            matches!(result, Err(HarnessError::Provider(error))
+                if error.kind() == ProviderErrorKind::Protocol)
+        };
+        assert!(protocol(bounded(prompt).await.unwrap()));
+        assert!(protocol(
+            bounded(session.prompt("fail in the stream")).await
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(recoveries(&session.runtime.store.records()).is_empty());
         session.shutdown().await.unwrap();
     }
 }

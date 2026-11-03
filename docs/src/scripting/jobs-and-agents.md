@@ -35,7 +35,7 @@ reply in `.result.reply`; earlier replies are not concatenated into it. A foregr
 earlier visible replies are not message events: its result saves them in `messages`, oldest
 first, each `{text, at}` with `at` the RFC 3339 UTC time it was made. Like any large result, a
 long `messages` is shortened in the call's view and listed in `presentation.truncated`; read the
-rest with `jobs({job, field: "/result/messages", index})`. Replies a session restart cuts off
+rest with `jobs({job, field: "/result/messages", start, unit: "elements"})`. Replies a session restart cuts off
 from a call whose child still ran arrive as message events. `messages` is absent when there are
 none. The parent cannot make another model request until its foreground calls return.
 

@@ -159,6 +159,7 @@ pub enum ArtifactError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn catalog(names: &[&str]) -> Result<EmbeddedShimCatalog, ArtifactError> {
         EmbeddedShimCatalog::from_embedded_assets(names, |_| Some(Cow::Borrowed(b"abc")))
@@ -195,20 +196,20 @@ mod tests {
     fn find_distinguishes_missing_from_unreadable_shims() {
         let platform = Platform::parse("linux", "x86_64").unwrap();
         let find = |catalog: EmbeddedShimCatalog| catalog.find(ShimProtocol::Ssh, platform);
-        assert!(matches!(
+        assert_matches!(
             find(EmbeddedShimCatalog::default()),
             Err(DeploymentError::NoShims)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             find(catalog(&["linux-ssh-aarch64"]).unwrap()),
             Err(DeploymentError::NoShim { .. })
-        ));
+        );
         let unreadable =
             EmbeddedShimCatalog::from_embedded_assets(["linux-ssh-x86_64"], |_| None).unwrap();
-        assert!(matches!(
+        assert_matches!(
             find(unreadable),
             Err(DeploymentError::Unreadable { name }) if &*name == "linux-ssh-x86_64"
-        ));
+        );
     }
 
     #[test]
@@ -224,8 +225,9 @@ mod tests {
             "linux-scp-x86_64",
             "darwin-ssh-x86_64",
         ] {
-            assert!(
-                matches!(catalog(&[name]), Err(ArtifactError::InvalidName(value)) if value == name),
+            assert_matches!(
+                catalog(&[name]),
+                Err(ArtifactError::InvalidName(value)) if value == name,
                 "accepted invalid name {name:?}"
             );
         }

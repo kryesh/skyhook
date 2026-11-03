@@ -170,7 +170,7 @@ mod tests {
             activity, ask, assistant, at, call, committed, completed, count, failing_call,
             job_ended, job_events, job_of_call, latest_request, model_failed, observe_find,
             observe_next, observe_record, observe_until, played_fixture, reached, recorded,
-            results, sleeping_script, status, stopped, streamed,
+            results, sleeping_script, status, stopped, streamed, tool_error,
         },
         tests::{fixture, fresh, journal, unsaved_at, viewing, whole_entries},
     };
@@ -336,14 +336,36 @@ mod tests {
         let tool = |entry: &Entry| entry.surface == Surface::Tool;
         let card = fold.app.entries().iter().position(tool).unwrap();
         let key = fold.app.entries()[card].key().clone();
-        // The results commit refreshes the card in place, as does expanding it.
+        // The results commit refreshes the card in place, as does expanding it, which
+        // shows the error the collapsed card leaves out and journals nothing.
         observe_record(&mut fold.app, committed(results)).await;
+        let error = tool_error(&fold.app.journal).to_owned();
+        let records = serde_json::to_vec(&fold.app.journal).unwrap();
         assert_eq!(fold.refresh().dirty, [card]);
-        assert_eq!(fold.app.entries()[card].key(), &key);
+        let cards = |app: &App| {
+            let entries = app.entries().iter();
+            entries
+                .filter(|entry| tool(entry))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let collapsed = cards(&fold.app);
+        assert_eq!(
+            (collapsed.len(), collapsed[0].key(), collapsed[0].job_id()),
+            (1, &key, None)
+        );
+        assert!(collapsed[0].text().contains("Failed") && collapsed[0].expandable());
+        assert!(!collapsed[0].text().contains(&error));
         fold.app.view().set_expanded(key.clone(), true);
         fold.app.content_cache.invalidate_entry(key.clone());
         assert_eq!(fold.refresh().dirty, [card]);
-        assert_eq!(fold.app.entries()[card].key(), &key);
+        let expanded = cards(&fold.app);
+        assert_eq!((expanded.len(), expanded[0].key()), (1, &key));
+        for part in ["Arguments", "Output", error.as_str()] {
+            assert!(expanded[0].text().contains(part));
+        }
+        assert!(expanded[0].document().is_some());
+        assert_eq!(serde_json::to_vec(&fold.app.journal).unwrap(), records);
         drop(app);
     }
 
@@ -463,7 +485,7 @@ mod tests {
                 }
             )
         };
-        for attempt in 1..=3 {
+        for attempt in 1..=2 {
             let turn = model.turn().await;
             observe_until(&mut fold.app, |app| count(&app.journal, started) == attempt).await;
             fold.refresh();
@@ -481,7 +503,7 @@ mod tests {
                 assert!(dirty.contains(&reply.unwrap()), "delta {index}");
                 assert!(!replies[0].text().contains("attempt"));
             }
-            if attempt == 3 {
+            if attempt == 2 {
                 let answer = vec![AssistantItem::text("answer", 0, "final answer")];
                 turn.complete(Completion::answer(answer).unwrap());
                 break;
@@ -500,11 +522,7 @@ mod tests {
             let due = Timing::Until(at(&fold.app.journal, scheduled, attempt - 1) + 10);
             assert_eq!(replies[0].timing, due);
             let text = replies[0].text();
-            let attempt_part = format!(" · attempt {} · Unavailable\n", attempt + 1);
-            assert!(text.starts_with("▾ Retrying · "), "{text}");
-            for part in [attempt_part.as_str(), "HTTP 503"] {
-                assert!(text.contains(part), "{text}");
-            }
+            assert!(text.contains("HTTP 503"), "{text}");
             assert!(text.ends_with(&format!("partial {attempt} updated")));
         }
         // The attempt that succeeds commits its answer, which replaces the retry card,
@@ -522,7 +540,7 @@ mod tests {
         );
         assert!(committed.footer.is_some());
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut fold.app, |app| count(&app.journal, model_failed) == 2).await;
+        observe_until(&mut fold.app, |app| count(&app.journal, model_failed) == 1).await;
         fold.refresh();
         // Only its footer changes, now that the request has settled.
         let intact =

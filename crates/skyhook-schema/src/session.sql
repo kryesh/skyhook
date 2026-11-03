@@ -1,4 +1,5 @@
--- Skyhook session database (application_id 0x534B5948, user_version 28). Tables are STRICT;
+-- Skyhook session database. The identity below is the one place the journal's format
+-- is set: every image carries it and every open checks it. Tables are STRICT;
 -- subtype rows reference entry(seq), whose kind the decoder requires them to match.
 -- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
 -- saturate to i64::MAX.
@@ -8,6 +9,9 @@
 -- job.arguments, tool_definition.input_schema, model_context.response_schema,
 -- reasoning_replay.payload, job_output.result and user_part_job_event.view. Job output
 -- schemas are JSON blobs, stored once per distinct schema.
+
+PRAGMA application_id = 1397446984; -- 0x534B5948
+PRAGMA user_version = 30;
 
 -- ───────────────────────── Ledger, session, agents ─────────────────────────
 

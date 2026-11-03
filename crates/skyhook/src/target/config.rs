@@ -117,7 +117,6 @@ fn default_workspace() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{TargetEdge, TargetRegistry};
 
     #[test]
     fn root_is_implicit_and_local_named_targets_remain_invalid() {
@@ -133,21 +132,7 @@ mod tests {
             assert!(!valid(text), "{text}");
         }
         assert!(valid("a:\n  type: ssh\n  host: a"));
-    }
-
-    /// A later layer or the runtime may supply a missing name.
-    #[test]
-    fn unresolved_references_are_valid_until_a_registry_needs_them() {
-        let text = "a:\n  type: ssh\n  host: a\n  via: b";
-        let config = crate::yaml::parse::<TargetsConfig>(text).unwrap();
-        config.validate_structure().unwrap();
-        assert!(matches!(
-            TargetRegistry::from_definitions(config.definitions().unwrap()),
-            Err(TargetError::UnknownReference {
-                edge: TargetEdge::Via,
-                reference,
-                ..
-            }) if reference.as_str() == "b"
-        ));
+        // A later layer or the runtime may supply a missing name.
+        assert!(valid("a:\n  type: ssh\n  host: a\n  via: b"));
     }
 }

@@ -1,7 +1,7 @@
 //! Tool arguments deserialized with reasons that never quote them. serde's errors embed
 //! the rejected value, which may be a credential or user content, so arguments are
 //! read through a deserializer whose error keeps only what a type expected, what kind
-//! of value it found, the declared names involved, and a type's own explanation.
+//! of value it found, the field names involved, and a type's own explanation.
 
 use serde::de::{
     self, Deserializer, Expected, IntoDeserializer, Unexpected, Visitor,
@@ -17,11 +17,34 @@ use super::{
 
 /// Why a value did not deserialize, without the value.
 #[derive(Debug)]
-pub(crate) struct Reason(String);
+pub(crate) enum Reason {
+    Explained(String),
+    /// A field its object's type does not take: a field name is no value, so it is named.
+    UnknownField {
+        field: String,
+        expected: &'static [&'static str],
+    },
+}
 
 impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Explained(reason) => f.write_str(reason),
+            Self::UnknownField {
+                field,
+                expected: [],
+            } => {
+                write!(f, "unknown field {}", quoted(field))
+            }
+            Self::UnknownField { field, expected } => {
+                let field = quoted(field);
+                write!(
+                    f,
+                    "unknown field {field}, expected one of {}",
+                    one_of(expected)
+                )
+            }
+        }
     }
 }
 
@@ -51,41 +74,41 @@ impl de::Error for Reason {
     /// The explanation a type gives for rejecting a value it parsed, such as a
     /// conversion's error. serde's own messages, which quote the value, never reach it.
     fn custom<T: std::fmt::Display>(message: T) -> Self {
-        Self(message.to_string())
+        Self::Explained(message.to_string())
     }
 
     fn invalid_type(unexpected: Unexpected<'_>, expected: &dyn Expected) -> Self {
-        Self(format!("expected {expected}, found {}", kind(unexpected)))
+        Self::Explained(format!("expected {expected}, found {}", kind(unexpected)))
     }
 
     fn invalid_value(unexpected: Unexpected<'_>, expected: &dyn Expected) -> Self {
-        Self(format!("found {} that is not {expected}", kind(unexpected)))
+        Self::Explained(format!("found {} that is not {expected}", kind(unexpected)))
     }
 
     fn invalid_length(length: usize, expected: &dyn Expected) -> Self {
-        Self(format!("expected {expected}, found {length} elements"))
+        Self::Explained(format!("expected {expected}, found {length} elements"))
     }
 
     fn unknown_variant(_variant: &str, expected: &'static [&'static str]) -> Self {
-        Self(format!(
+        Self::Explained(format!(
             "unknown variant, expected one of {}",
             one_of(expected)
         ))
     }
 
-    fn unknown_field(_field: &str, expected: &'static [&'static str]) -> Self {
-        Self(format!(
-            "unknown field, expected one of {}",
-            one_of(expected)
-        ))
+    fn unknown_field(field: &str, expected: &'static [&'static str]) -> Self {
+        Self::UnknownField {
+            field: field.to_owned(),
+            expected,
+        }
     }
 
     fn missing_field(field: &'static str) -> Self {
-        Self(format!("missing field `{field}`"))
+        Self::Explained(format!("missing field `{field}`"))
     }
 
     fn duplicate_field(field: &'static str) -> Self {
-        Self(format!("duplicate field `{field}`"))
+        Self::Explained(format!("duplicate field `{field}`"))
     }
 }
 
@@ -306,9 +329,16 @@ pub fn deserialize_arguments<T: serde::de::DeserializeOwned>(
 ) -> Result<T, AdmissionError> {
     let unquoted = Unquoted::Object(arguments);
     serde_path_to_error::deserialize(unquoted).map_err(|error| {
+        let mut segments: Vec<_> = error.path().iter().collect();
+        // An unknown field is located at the object it is in.
+        if let Reason::UnknownField { field, .. } = error.inner()
+            && matches!(segments.last(), Some(serde_path_to_error::Segment::Map { key }) if key == field)
+        {
+            segments.pop();
+        }
         let path = safe_argument_path(
             schema,
-            error.path().iter().map(|segment| match segment {
+            segments.into_iter().map(|segment| match segment {
                 serde_path_to_error::Segment::Map { key } => ArgumentPathSegment::Property(key),
                 serde_path_to_error::Segment::Seq { index } => ArgumentPathSegment::Index(*index),
                 _ => ArgumentPathSegment::Unknown,
@@ -319,14 +349,54 @@ pub fn deserialize_arguments<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Compile an argument schema for validation, or say why it cannot be compiled.
+/// A tool's argument schema as declared, compiled: as the tool is offered, or at its
+/// first use for a schema that compiles by construction.
+#[derive(Debug)]
+pub(crate) enum ArgumentValidator {
+    Compiled(std::sync::Arc<jsonschema::Validator>),
+    Deferred(
+        Value,
+        std::sync::OnceLock<std::sync::Arc<jsonschema::Validator>>,
+    ),
+}
+
+impl ArgumentValidator {
+    /// The compiled schema, or why it does not compile.
+    pub(crate) fn get(&self) -> Result<&jsonschema::Validator, String> {
+        match self {
+            Self::Compiled(validator) => Ok(validator),
+            Self::Deferred(_, compiled) if let Some(validator) = compiled.get() => Ok(validator),
+            Self::Deferred(schema, compiled) => {
+                let validator = argument_validator(schema)?;
+                Ok(compiled.get_or_init(|| validator))
+            }
+        }
+    }
+}
+
+/// Compile an argument schema for validation, or say why it cannot be compiled. Each
+/// schema compiles once per process: every registry and surface declaring it shares the
+/// outcome, so the process keeps one per distinct schema it has validated.
 pub(crate) fn argument_validator(
     schema: &serde_json::Value,
-) -> Result<jsonschema::Validator, String> {
-    jsonschema::options()
+) -> Result<std::sync::Arc<jsonschema::Validator>, String> {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, LazyLock, Mutex, PoisonError},
+    };
+    type Compiled = Result<Arc<jsonschema::Validator>, String>;
+    static COMPILED: LazyLock<Mutex<HashMap<String, Compiled>>> = LazyLock::new(Mutex::default);
+    let compiled = || COMPILED.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = schema.to_string();
+    if let Some(compiled) = compiled().get(&key) {
+        return compiled.clone();
+    }
+    let built = jsonschema::options()
         .with_retriever(NoExternalArgumentSchemas)
         .build(schema)
-        .map_err(|error| error.to_string())
+        .map(Arc::new)
+        .map_err(|error| error.to_string());
+    compiled().entry(key).or_insert(built).clone()
 }
 
 /// Schema diagnostics must never retrieve filesystem or network resources, even
@@ -351,6 +421,7 @@ pub(crate) fn schema_argument_failure(
 ) -> (String, String) {
     // JSON pointers cannot distinguish numeric map keys from array indices.
     // Decode against the instance, preserving empty property names too.
+    let error = failing_alternative(schema, error);
     let pointer: FieldPointer = error.instance_path().as_str().parse().unwrap_or_default();
     let components: Vec<_> = pointer.segments().collect();
     let mut node = input;
@@ -370,10 +441,167 @@ pub(crate) fn schema_argument_failure(
         .unwrap_or(&serde_json::Value::Null);
         segment
     });
-    (
-        safe_argument_path(schema, segments),
-        validation_expectation(error.kind(), 0),
-    )
+    let path = safe_argument_path(schema, segments);
+    let found = input.pointer(error.instance_path().as_str());
+    let expectation = match (expected_types(error), found) {
+        (Some(expected), Some(found)) => {
+            type_expectation(&expected, crate::json_schema::value_type(found))
+        }
+        _ => validation_expectation(error.kind(), 0),
+    };
+    (path, expectation)
+}
+
+/// The failure a union's meant alternative reports, else the union's own.
+fn failing_alternative<'e, 'a>(
+    schema: &serde_json::Value,
+    error: &'e jsonschema::ValidationError<'a>,
+) -> &'e jsonschema::ValidationError<'a> {
+    match meant(schema, error).and_then(|meant| meant.failures.first()) {
+        Some(failure) => failing_alternative(schema, failure),
+        None => error,
+    }
+}
+
+/// A union's alternative: how the value fails it, and its schema where known.
+struct Alternative<'e, 's> {
+    failures: &'e [jsonschema::ValidationError<'static>],
+    schema: Option<&'s serde_json::Value>,
+}
+
+impl Alternative<'_, '_> {
+    /// Whether a value may hold `property` here: an unknown schema may.
+    fn accepts(&self, property: &str) -> bool {
+        self.schema.is_none_or(|schema| {
+            schema["properties"].get(property).is_some()
+                || schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        })
+    }
+}
+
+/// The alternative of union `error` the value was meant for, read through a union it fails as a
+/// whole. An alternative is not meant when the value lacks its tag: it fails a `const` or a type,
+/// holds a property it does not take, or lacks one it requires that another does not take. Of
+/// the rest, the one with the fewest failures is meant, when it alone has that few.
+fn meant<'e, 's>(
+    schema: &'s serde_json::Value,
+    error: &'e jsonschema::ValidationError<'_>,
+) -> Option<Alternative<'e, 's>> {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let (Kind::AnyOf { context } | Kind::OneOfNotValid { context }) = error.kind() else {
+        return None;
+    };
+    let at = error.instance_path();
+    let resolver = crate::json_schema::Resolver::new(schema);
+    let declared = schema.pointer(error.schema_path().as_str());
+    let alternatives: Vec<_> = (context.iter().enumerate())
+        .map(|(index, failures)| match failures.as_slice() {
+            [union]
+                if union.instance_path() == at
+                    && let Some(meant) = meant(schema, union) =>
+            {
+                meant
+            }
+            failures => Alternative {
+                failures,
+                schema: (declared.and_then(|declared| declared.get(index)))
+                    .and_then(|declared| resolver.resolve(resolver.root().child(declared)))
+                    .map(|node| node.schema),
+            },
+        })
+        .collect();
+    let failing = |index: usize, untagged: &dyn Fn(&jsonschema::ValidationError<'_>) -> bool| {
+        alternatives[index].failures.iter().any(untagged)
+    };
+    let tagged: Vec<_> = (0..alternatives.len())
+        .filter(|&index| {
+            !failing(index, &|failure| match failure.kind() {
+                Kind::Constant { .. } => true,
+                Kind::Type { .. } => failure.instance_path() == at,
+                _ => false,
+            })
+        })
+        .collect();
+    // Holding a property an alternative does not take tags against it, when another takes them
+    // all; so does lacking one it requires that another does not take.
+    let extra = |index: usize| {
+        failing(index, &|failure| {
+            matches!(failure.kind(), Kind::AdditionalProperties { .. })
+                && failure.instance_path() == at
+        })
+    };
+    let tagged = match tagged.iter().any(|&index| !extra(index)) {
+        true => tagged.into_iter().filter(|&index| !extra(index)).collect(),
+        false => tagged,
+    };
+    let candidates: Vec<_> = (tagged.iter().copied())
+        .filter(|&index| {
+            !failing(index, &|failure| match failure.kind() {
+                Kind::Required { property } if failure.instance_path() == at => {
+                    let property = property.as_str().unwrap_or_default();
+                    (tagged.iter())
+                        .any(|&other| other != index && !alternatives[other].accepts(property))
+                }
+                _ => false,
+            })
+        })
+        .collect();
+    let fewest = (candidates.iter())
+        .map(|&index| alternatives[index].failures.len())
+        .min();
+    let mut closest = (candidates.into_iter())
+        .filter(|&index| Some(alternatives[index].failures.len()) == fewest);
+    match (closest.next(), closest.next()) {
+        (Some(index), None) => alternatives.into_iter().nth(index),
+        _ => None,
+    }
+}
+
+/// The types `error` expects where it fails, when every failure it holds is of the value's type
+/// there.
+fn expected_types(error: &jsonschema::ValidationError<'_>) -> Option<Vec<jsonschema::JsonType>> {
+    use jsonschema::error::{TypeKind, ValidationErrorKind as Kind};
+    match error.kind() {
+        Kind::Type {
+            kind: TypeKind::Single(kind),
+        } => Some(vec![*kind]),
+        Kind::Type {
+            kind: TypeKind::Multiple(kinds),
+        } => Some(kinds.iter().collect()),
+        Kind::AnyOf { context } | Kind::OneOfNotValid { context } => {
+            let mut types = Vec::new();
+            for failure in context.iter().flatten() {
+                if failure.instance_path() != error.instance_path() {
+                    return None;
+                }
+                for kind in expected_types(failure)? {
+                    if !types.contains(&kind) {
+                        types.push(kind);
+                    }
+                }
+            }
+            Some(types)
+        }
+        _ => None,
+    }
+}
+
+/// What a value of the wrong type was expected to be, and what it is: an object or array sent
+/// as its JSON text is told so.
+fn type_expectation(expected: &[jsonschema::JsonType], found: jsonschema::JsonType) -> String {
+    use jsonschema::JsonType;
+    let expected_names: Vec<_> = expected.iter().map(|kind| argument_type(*kind)).collect();
+    let text = format!(
+        "expected {}, found {}",
+        expected_names.join(" or "),
+        argument_type(found)
+    );
+    match found == JsonType::String
+        && (expected.iter()).any(|kind| matches!(kind, JsonType::Object | JsonType::Array))
+    {
+        true => format!("{text}: send the value itself, not its JSON text"),
+        false => text,
+    }
 }
 
 fn validation_expectation(kind: &jsonschema::error::ValidationErrorKind, depth: usize) -> String {
@@ -419,8 +647,12 @@ fn validation_expectation(kind: &jsonschema::error::ValidationErrorKind, depth: 
         Kind::ContentMediaType { content_media_type } => {
             format!("expected content media type {}", quoted(content_media_type))
         }
-        Kind::AdditionalProperties { .. } | Kind::UnevaluatedProperties { .. } => {
-            "additional properties are not allowed".into()
+        Kind::AdditionalProperties { unexpected } | Kind::UnevaluatedProperties { unexpected } => {
+            let names: Vec<_> = unexpected.iter().map(|name| quoted(name)).collect();
+            match names.as_slice() {
+                [name] => format!("property {name} is not allowed"),
+                names => format!("properties {} are not allowed", names.join(", ")),
+            }
         }
         Kind::UnevaluatedItems { .. } => "additional array items are not allowed".into(),
         Kind::AnyOf { context } | Kind::OneOfNotValid { context } if depth < 3 => {
@@ -510,17 +742,16 @@ pub(crate) fn safe_argument_path<'a>(
     for segment in path {
         rendered.push('/');
         node = match segment {
-            ArgumentPathSegment::Property(key) => {
-                match node.and_then(|node| declaring(node, "properties", Some(key))) {
-                    Some(child) => {
-                        rendered.push_str(&escape_pointer_segment(key));
-                        Some(child)
-                    }
-                    None => {
-                        rendered.push('*');
-                        node.and_then(|node| declaring(node, "additionalProperties", None))
-                    }
-                }
+            ArgumentPathSegment::Property(key)
+                if let Some(child) =
+                    node.and_then(|node| declaring(node, "properties", Some(key))) =>
+            {
+                rendered.push_str(&escape_pointer_segment(key));
+                Some(child)
+            }
+            ArgumentPathSegment::Property(_) => {
+                rendered.push('*');
+                node.and_then(|node| declaring(node, "additionalProperties", None))
             }
             ArgumentPathSegment::Index(index) => {
                 rendered.push_str(&index.to_string());
@@ -612,6 +843,29 @@ mod tests {
         #[allow(dead_code)]
         struct Input {
             entries: Vec<std::collections::HashMap<String, Entry>>,
+            links: Option<Links>,
+            record: Option<Record>,
+        }
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(untagged, deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum Record {
+            New { title: u32, body: u32, scope: u32 },
+            Edit { id: u32 },
+        }
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(untagged)]
+        #[allow(dead_code)]
+        enum Links {
+            Add(Vec<Link>),
+            Remove(Vec<Mode>),
+        }
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum Link {
+            Step { path: u32 },
+            State { state: u32 },
         }
         #[derive(Debug, Deserialize, JsonSchema)]
         #[allow(dead_code)]
@@ -649,6 +903,23 @@ mod tests {
                 json!({"entries": [{"secret-key": {"a~/b": 1, "mode": "secret-value"}}]}),
                 "/entries/0/*/mode",
                 vec!["expected one of", "fast", "safe"],
+            ),
+            // A union fails at its closest alternative's element, naming the field it refuses.
+            (
+                json!({"entries": [], "links": [{"step": {"path": 1}}, {"step": {"path": 2}, "position": 1}]}),
+                "/links/1",
+                vec!["property `position` is not allowed"],
+            ),
+            // An alternative not taking a property the value holds is not the one meant.
+            (
+                json!({"entries": [], "record": {"title": 1}}),
+                "/record",
+                vec!["missing required field `body`"],
+            ),
+            (
+                json!({"entries": "[]"}),
+                "/entries",
+                vec!["expected an array, found a string: send the value itself"],
             ),
         ] {
             let error = validator.validate(&value).unwrap_err();
@@ -706,6 +977,28 @@ mod tests {
         let text = diagnostic.render(&CapabilitySet::default());
         assert!(
             text.contains("an id must be positive") && !text.contains("7311"),
+            "{text}"
+        );
+        // A field the schema admits but the type does not take is named in its object.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Closed {
+            #[expect(dead_code)]
+            id: u32,
+        }
+        let value = json!({"report": {"id": 1, "status": "secret-value"}});
+        let error = deserialize_arguments::<BTreeMap<String, Closed>>(
+            &json!({}),
+            value.as_object().unwrap(),
+        )
+        .err()
+        .unwrap();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.subject, Subject::Argument("/*".into()));
+        let text = diagnostic.render(&CapabilitySet::default());
+        assert!(
+            text.contains("unknown field `status`, expected one of `id`")
+                && !text.contains("secret"),
             "{text}"
         );
     }

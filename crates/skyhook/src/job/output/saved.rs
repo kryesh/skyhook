@@ -423,7 +423,7 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobManager, JobSpec, tests::runtime};
+    use crate::job::{JobManager, output::tests::fixture_with, tests::runtime};
     use crate::tool::ToolOutput;
 
     /// The result `output`'s saved document holds.
@@ -464,9 +464,7 @@ mod tests {
             // Short inline text that is not JSON stays inline, unclassified.
             ("42\n", false, None, json!("42\n")),
         ] {
-            let mut spec = JobSpec::test(agent.clone(), "classified");
-            spec.output_schema = Some(schema.clone());
-            let id = manager.test_running(spec).await.into_test_id();
+            let id = fixture_with(&manager, &agent, Some(schema.clone()), None).await;
             let output = manager.output(id).await;
             // Candidate text is classified whether it streamed or returned inline;
             // other strings are never parsed.
@@ -508,7 +506,8 @@ mod tests {
             );
             if detection == Some(Detection::Sequence) {
                 let mut args = OutputArgs::new(id);
-                (args.field, args.index) = (Some(stdout.clone()), Some(1));
+                (args.field, args.start) = (Some(stdout.clone()), Some(2));
+                args.unit = Some(PageUnit::Elements);
                 let view = manager
                     .inspect_output(args, Default::default(), &Default::default())
                     .await
@@ -527,14 +526,12 @@ mod tests {
         captures_complete: bool,
     ) -> (tempfile::TempDir, JobManager, Saved) {
         let (root, manager, agent) = runtime().await;
-        let mut spec = JobSpec::test(agent, "saved");
-        spec.output_schema = Some(schema.clone());
-        let id = manager.test_running(spec).await.into_test_id();
         let mut output = ToolOutput::new(result);
         if !captures_complete {
             output.streams = crate::tool::StreamEnd::Cut;
         }
-        manager.test_complete(id, output).await;
+        let outcome = crate::job::JobOutcome::Completed(output.into());
+        let id = fixture_with(&manager, &agent, Some(schema.clone()), Some(outcome)).await;
         let saved = Saved::load(&manager.output(id).await).unwrap();
         (root, manager, saved)
     }
@@ -575,12 +572,9 @@ mod tests {
         let items: Vec<_> = (0..2000).map(|id| json!({"id": id})).collect();
         let complete = json!({"properties":{"text":{"x-skyhook-preview":"complete"}}});
         for schema in [json!(true), complete] {
-            let mut spec = JobSpec::test(agent.clone(), "sized");
-            spec.output_schema = Some(schema.clone());
-            let id = manager.test_running(spec).await.into_test_id();
-            manager
-                .test_finish(id, json!({"text": text, "items": items}))
-                .await;
+            let result = ToolOutput::new(json!({"text": text, "items": items}));
+            let outcome = crate::job::JobOutcome::Completed(result.into());
+            let id = fixture_with(&manager, &agent, Some(schema), Some(outcome)).await;
             let args = OutputArgs::new(id);
             let view = (manager.inspect_output(args, Default::default(), &Default::default()))
                 .await
@@ -603,10 +597,7 @@ mod tests {
     #[tokio::test]
     async fn large_containers_are_stored_whole_unless_something_inside_is_stored_alone() {
         let (_root, manager, agent) = runtime().await;
-        let id = manager
-            .test_running(JobSpec::test(agent, "offloaded"))
-            .await
-            .into_test_id();
+        let id = fixture_with(&manager, &agent, None, None).await;
         let output = manager.output(id).await;
         let items: Vec<_> = (0..400).map(|id| json!({"id":id,"name":"pod"})).collect();
         let result = json!({

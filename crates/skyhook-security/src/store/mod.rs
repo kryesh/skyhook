@@ -30,6 +30,7 @@ mod reads;
 mod review;
 mod runs;
 mod schedule;
+mod scope;
 mod synthesis;
 mod tasks;
 mod testing;
@@ -43,11 +44,12 @@ pub use findings::*;
 pub use links::*;
 pub use locations::*;
 pub use nodes::*;
-pub use queues::{QueueEntry, SpentWork};
+pub use queues::{Behind, QueueEntry, SpentWork};
 pub use reads::*;
 pub use review::*;
 pub use runs::*;
 pub use schedule::*;
+pub use scope::Outside;
 pub use synthesis::*;
 pub use tasks::*;
 pub use testing::*;
@@ -95,16 +97,6 @@ impl fmt::Display for Bound {
     }
 }
 
-/// The names of fields, as a request spells them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fields(pub Vec<&'static str>);
-
-impl fmt::Display for Fields {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.join(", "))
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("research database: {0}")]
@@ -141,14 +133,27 @@ pub enum Error {
         expected: NodeKind,
         found: NodeKind,
     },
-    #[error("a new {kind} needs {fields}")]
-    Missing { kind: NodeKind, fields: Fields },
     #[error("a candidate lists at least one {0}")]
     Empty(NodeKind),
     #[error("a node is not merged into itself")]
     SelfMerge,
-    #[error("source {0} is at that location: merge into it")]
-    SourceAt(SourceId),
+    #[error(
+        "node {node} is a {node_kind}; node {into} is a {into_kind}: merge joins nodes of one kind"
+    )]
+    MergeKinds {
+        node: NodeId,
+        node_kind: NodeKind,
+        into: NodeId,
+        into_kind: NodeKind,
+    },
+    #[error("a finding is not merged: it follows its root flaw")]
+    FindingMerge,
+    #[error("a premise does not rest on itself")]
+    SelfBasis,
+    #[error("input state {0} is read at that location: merge into it")]
+    StateAt(StateId),
+    #[error("only an input state has a trust and a location")]
+    NotInput,
     #[error("work is begun by the agent job that does it")]
     TaskNeedsJob,
     #[error("a task begins with at least one subject")]
@@ -205,6 +210,16 @@ fn rows<T>(
     map: impl FnMut(&Row) -> Result<T>,
 ) -> Result<Vec<T>> {
     db.query_as(sql, params, map)
+}
+
+fn first_rows<T>(
+    db: &Db,
+    sql: impl Into<skyhook::db::SqlText>,
+    params: Vec<libsql::Value>,
+    limit: usize,
+    map: impl FnMut(&Row) -> Result<T>,
+) -> Result<Vec<T>> {
+    db.query_up_to(sql, params, limit, map)
 }
 
 fn exists(
@@ -352,10 +367,11 @@ pub(crate) mod tests {
             )
             .default_model("test/test".parse().unwrap())
             .host_capabilities(identity.capabilities)
-            .session_extension(identity.tables)
+            .session_schema(identity.schema)
     }
 
     pub(crate) const HIGH: &str = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N";
+    pub(crate) const NONE: &str = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N";
 
     pub(crate) fn text(value: &str) -> Text {
         value.parse().unwrap()
@@ -390,7 +406,7 @@ pub(crate) mod tests {
     /// A new run under `live`.
     pub(crate) fn fixture_under(live: LivePolicy) -> (Session, Store, AgentId) {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -437,7 +453,7 @@ pub(crate) mod tests {
         )
     }
 
-    /// A path entered by a source of its own in code, stepping through `through` in order.
+    /// A path reading an input state of its own in code, stepping through `through` in order.
     pub(crate) fn path(
         store: &Store,
         actor: &AgentId,
@@ -453,7 +469,7 @@ pub(crate) mod tests {
         )
     }
 
-    /// A path entered by a source of its own at `at`, stepping through `through` in order.
+    /// A path reading an input state of its own at `at`, stepping through `through` in order.
     pub(crate) fn path_from(
         store: &Store,
         actor: &AgentId,
@@ -466,18 +482,16 @@ pub(crate) mod tests {
                 .upsert(actor, &Upsert::Path(Change::Create(new(name, ()))))
                 .unwrap(),
         );
-        let detail = NewSource {
-            location: at,
+        let detail = NewState::Input {
+            location: at.clone(),
             trust: Trust::Untrusted,
         };
-        let source = Link::PathSource {
-            path,
-            source: created(
-                store
-                    .upsert(actor, &Upsert::Source(Change::Create(new(name, detail))))
-                    .unwrap(),
-            ),
-        };
+        let input = created(
+            store
+                .upsert(actor, &Upsert::State(Change::Create(new(name, detail))))
+                .unwrap(),
+        );
+        let read = access(path, input, Access::Read, at);
         let steps = (through.iter()).map(|component| Link::PathStep {
             path,
             component: *component,
@@ -485,9 +499,25 @@ pub(crate) mod tests {
             note: text("calls"),
             position: None,
         });
-        let links: Vec<Link> = std::iter::once(source).chain(steps).collect();
+        let links: Vec<Link> = std::iter::once(read).chain(steps).collect();
         store.link(actor, &links).unwrap();
         path
+    }
+
+    /// A state the target keeps, of `detail`'s scope.
+    pub(crate) fn state(store: &Store, actor: &AgentId, detail: NewState) -> StateId {
+        let change = Change::Create(new("decoder state", detail));
+        created(store.upsert(actor, &Upsert::State(change)).unwrap())
+    }
+
+    /// Path `path`'s `access` of `state` at `at`.
+    pub(crate) fn access(path: PathId, state: StateId, access: Access, at: Location) -> Link {
+        Link::PathState {
+            path,
+            state,
+            access,
+            location: at,
+        }
     }
 
     /// A binary image's code at `start`, entering a path.
@@ -585,22 +615,68 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn assess(store: &Store, actor: &AgentId, id: CandidateId, vector: &str) {
-        let vector = vector.parse().unwrap();
-        store.assess(actor, id, vector, &text("scored")).unwrap();
+    /// Run `record` as a child of the root whose job began `work`, then end its job: what it
+    /// records is that phase's own work.
+    pub(crate) fn within<T>(store: &Store, work: &Begin, record: impl FnOnce(&AgentId) -> T) -> T {
+        let (agent, job, _) = begun(store, work);
+        let recorded = record(&agent);
+        end_job(store, job);
+        recorded
     }
 
-    pub(crate) fn verdict(store: &Store, actor: &AgentId, id: CandidateId, verdict: Verdict) {
-        store
-            .verdict(actor, id, verdict, &text("reviewed"))
-            .unwrap();
+    /// Assess `id` at `vector` in an assessment of it.
+    pub(crate) fn assess(store: &Store, id: CandidateId, vector: &str) {
+        within(store, &Begin::Assess(vec![id]), |agent| {
+            let vector = vector.parse().unwrap();
+            store.assess(agent, id, vector, &text("scored")).unwrap();
+        });
+    }
+
+    /// Judge `id` in a review of it.
+    pub(crate) fn verdict(store: &Store, id: CandidateId, verdict: Verdict) {
+        within(store, &Begin::Review(vec![id]), |agent| {
+            store
+                .verdict(agent, id, verdict, &text("reviewed"))
+                .unwrap();
+        });
+    }
+
+    /// Validate `id` anew in reviews of it: disproved, then validated, so the validation is a
+    /// new verdict rather than a restatement.
+    pub(crate) fn revalidate(store: &Store, id: CandidateId) {
+        verdict(store, id, Verdict::Disproved);
+        verdict(store, id, Verdict::Validated);
+    }
+
+    /// Decide `premise` in a settle of it.
+    pub(crate) fn decide(store: &Store, premise: PremiseId, status: PremiseStatus) {
+        within(store, &Begin::Settle(vec![premise]), |agent| {
+            let change = StatusChange::Premise(premise, status);
+            store.set_status(agent, change, &text("settled")).unwrap();
+        });
+    }
+
+    /// Judge `flaw` in a chain of it.
+    pub(crate) fn judge(store: &Store, flaw: FlawId, status: FlawStatus) {
+        within(store, &Begin::Chain(vec![flaw]), |agent| {
+            let change = StatusChange::Flaw(flaw, status);
+            store.set_status(agent, change, &text("chained")).unwrap();
+        });
+    }
+
+    /// Check `state` across calls in a check of it.
+    pub(crate) fn check(store: &Store, state: StateId) {
+        within(store, &Begin::Check(vec![state]), |agent| {
+            let checked = StatusChange::State(state, StateMark::Checked);
+            store.set_status(agent, checked, &text("checked")).unwrap();
+        });
     }
 
     /// A new scenario assessed high and validated.
     pub(crate) fn validated(store: &Store, actor: &AgentId, name: &str) -> Scenario {
         let scenario = scenario(store, actor, name);
-        assess(store, actor, scenario.candidate, HIGH);
-        verdict(store, actor, scenario.candidate, Verdict::Validated);
+        assess(store, scenario.candidate, HIGH);
+        verdict(store, scenario.candidate, Verdict::Validated);
         scenario
     }
 
@@ -642,7 +718,7 @@ pub(crate) mod tests {
     /// A child of the root whose running job began `work`.
     pub(crate) fn begun(store: &Store, work: &Begin) -> (AgentId, i64, TaskId) {
         let (agent, job) = child_agent(store, JobState::Running);
-        let task = store.begin(&agent, work).unwrap();
+        let task = store.begin(&agent, work).unwrap().task;
         (agent, job, task)
     }
 

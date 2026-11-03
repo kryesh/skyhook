@@ -522,6 +522,25 @@ mod tests {
                 assert_eq!(text, Some("abcdef"), "{body:?} at {width}");
             }
         }
+        // A table in a task item keeps the item's checkbox indent in its width, so its
+        // cells stay selectable when narrow.
+        let body = "- [ ] task\n\n  | H |\n  | - |\n  | abcdef |";
+        let selection = select(&transcript(&[answer(body, None)], 80), "abcdef", "abcdef");
+        let narrow = transcript(&[answer(body, None)], 14);
+        let reflowed = selection.reflow(&narrow).expect("the cell keeps its text");
+        assert_eq!(reflowed.text(), "abcdef");
+        let (start, end) = reflowed.rows();
+        let lit =
+            (start.row..=end.row).filter(|&row| !highlights(&reflowed, &narrow, row).is_empty());
+        let shown: String = lit
+            .map(|row| narrow[row].text())
+            .collect::<Vec<_>>()
+            .concat();
+        let letters: String = shown.split_whitespace().collect();
+        assert_eq!(
+            letters, "abcdef",
+            "every letter shown is selected: {shown:?}"
+        );
     }
 
     /// A grapheme too wide for a narrow cell is shown replaced, but positions
@@ -598,8 +617,8 @@ mod tests {
     }
 
     /// A cell with no visible text still holds its source: an empty cell is
-    /// an empty copied line however narrow the table, and hidden whitespace
-    /// is still copied.
+    /// an empty copied line however narrow the table, cells padded onto a short row
+    /// each copy as a line of their own, and hidden whitespace is still copied.
     #[test]
     fn invisible_table_cells_keep_their_source() {
         for (body, expected) in [
@@ -618,29 +637,9 @@ mod tests {
                 assert!(!highlights(&reflowed, &narrow, row).is_empty(), "{cell}");
             }
         }
-    }
-
-    /// A table in a task item keeps the item's checkbox indent in its width,
-    /// so its cells stay selectable when narrow.
-    #[test]
-    fn tables_in_task_items_stay_selectable_when_narrow() {
-        let body = "- [ ] task\n\n  | H |\n  | - |\n  | abcdef |";
-        let selection = select(&transcript(&[answer(body, None)], 80), "abcdef", "abcdef");
-        let narrow = transcript(&[answer(body, None)], 14);
-        let reflowed = selection.reflow(&narrow).expect("the cell keeps its text");
-        assert_eq!(reflowed.text(), "abcdef");
-        let (start, end) = reflowed.rows();
-        let lit =
-            (start.row..=end.row).filter(|&row| !highlights(&reflowed, &narrow, row).is_empty());
-        let shown: String = lit
-            .map(|row| narrow[row].text())
-            .collect::<Vec<_>>()
-            .concat();
-        let letters: String = shown.split_whitespace().collect();
-        assert_eq!(
-            letters, "abcdef",
-            "every letter shown is selected: {shown:?}"
-        );
+        let body = "| A | B | C |\n| - | - | - |\n| x |\n\nafter";
+        let rows = transcript(&[answer(body, None)], 80);
+        assert_eq!(select(&rows, "x", "after").text(), "x\n\n\n\nafter");
     }
 
     /// Dragging past a table, onto a row without source or past a row's end,
@@ -695,15 +694,6 @@ mod tests {
             checked >= 3,
             "{checked} layouts wrapped the first column alone"
         );
-    }
-
-    /// Cells padded onto a short row are distinct, if empty: each copies as
-    /// a line of its own.
-    #[test]
-    fn padded_cells_copy_as_lines_of_their_own() {
-        let body = "| A | B | C |\n| - | - | - |\n| x |\n\nafter";
-        let rows = transcript(&[answer(body, None)], 80);
-        assert_eq!(select(&rows, "x", "after").text(), "x\n\n\n\nafter");
     }
 
     /// Rows without source (box edges, separators) snap to the entry's

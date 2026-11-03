@@ -170,7 +170,7 @@ async fn load_saved(root: &Path, identity: &Identity) -> Result<Vec<Saved>, Stri
 /// cannot be read, or that this product could not open as its own, is left out.
 async fn scan(root: &Path, id: SessionId, identity: &Identity) -> Option<Saved> {
     let (summary, open) = tokio::join!(
-        SessionStore::summary(root, id, identity.owner()),
+        SessionStore::summary(root, id, Some(identity.owner())),
         SessionStore::is_open(root, id)
     );
     let summary = summary.ok()?;
@@ -229,8 +229,10 @@ mod tests {
         use skyhook::job::JobState;
         let (_root, app) = draft_fixture().await;
         let root = app.launch.sessions.clone();
+        // Only the saved rows' states need real sessions; the rest are open peers,
+        // whose saved rows are stand-ins.
         let mut stores = vec![];
-        for index in 0..8 {
+        for index in 2..5 {
             let (session, mut model) = played(&app.launch).await;
             // A prompt no answer followed resumes interrupted; its request, sent once
             // the prompt commits, stays open.
@@ -248,12 +250,31 @@ mod tests {
             let last = session.store().observe().snapshot.last_activity.unwrap();
             stores.push((session, last));
         }
-        let ids: Vec<_> = stores.iter().map(|(session, _)| session.id()).collect();
         let mut saved = load_saved(&root, &app.launch.identity).await.unwrap();
-        assert_eq!(saved.len(), 8);
+        assert_eq!(saved.len(), 3);
+        for row in &saved {
+            let (_, last) = (stores.iter())
+                .find(|(session, _)| session.id() == row.id)
+                .unwrap();
+            assert_eq!(row.last, *last);
+        }
+        let ids: Vec<_> = (0..8)
+            .map(|index| match index {
+                2..5 => stores[index - 2].0.id(),
+                _ => SessionId::generate().unwrap(),
+            })
+            .collect();
+        saved.extend([0, 1, 5, 6, 7].map(|index| Saved {
+            id: ids[index],
+            host: "skyhook".parse().unwrap(),
+            last: 0,
+            label: String::new(),
+            events: String::new(),
+            mode: String::new(),
+            state: SavedState::Closed(AgentDisplayState::Ready),
+        }));
         for row in &mut saved {
             let index = ids.iter().position(|id| *id == row.id).unwrap();
-            assert_eq!(row.last, stores[index].1);
             // Appends use wall time; row ordering must not depend on clock resolution.
             row.last = [5, 6, 20, 40, 30, 7, 8, 9][index];
         }
@@ -329,7 +350,7 @@ mod tests {
         peers[0].session = open(ids[0], 1, Activated);
         let items = session_rows(vec![], &peers, today, &"skyhook".parse().unwrap());
         assert!(items[0].value == live[0] && items[0].emphasis == strong);
-        stores[4].0.shutdown().await.unwrap();
-        stores[4].0.close().await.unwrap();
+        stores[2].0.shutdown().await.unwrap();
+        stores[2].0.close().await.unwrap();
     }
 }

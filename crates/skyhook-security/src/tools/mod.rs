@@ -267,23 +267,22 @@ pub(crate) mod tests {
             .expect("test deadline")
     }
 
-    /// Records one source, component and path through it, a flaw on the component and a
+    /// Records one input state, component and path reading it, a flaw on the component and a
     /// candidate of it along the path, assessed critical; binds their ids.
     const DISCOVER: &str = r#"
         const research = async action => (await tool.research(action)).unwrap();
         const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
-        const component = await research({action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']});
-        const source = await research({action:'upsert',kind:'source',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'});
-        const path = await research({action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'});
-        await research({action:'link',links:[{path_source:{path,source}},{path_step:{path,component,note:'parse is called on every request'}}]});
-        const flaw = await research({action:'upsert',kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120});
-        const candidate = await research({action:'upsert',kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]});
+        const component = await research({action:'upsert',record:{kind:'component',title:'parser',body:'request parser',files:['input.c']}});
+        const input = await research({action:'upsert',record:{kind:'state',scope:'input',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'}});
+        const path = await research({action:'upsert',record:{kind:'path',title:'request parsing',body:'raw request parsing'}});
+        await research({action:'link',links:[{path_state:{path,state:input,access:'read',location:at('input.c',1)}},{path_step:{path,component,note:'parse is called on every request'}}]});
+        const flaw = await research({action:'upsert',record:{kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120}});
+        const candidate = await research({action:'upsert',record:{kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]}});
         await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',note:'unauthenticated request controls memory corruption'});
     "#;
 
     struct Fixture {
         _root: tempfile::TempDir,
-        registry: ToolRegistry,
         session: SessionHandle,
     }
     impl Fixture {
@@ -323,11 +322,10 @@ pub(crate) mod tests {
             live: LivePolicy,
         ) -> Self {
             let root = tempfile::tempdir().unwrap();
-            let registry = registry().unwrap();
             let harness = harness(root.path())
                 .capabilities(capabilities)
                 .policy(Arc::new(skyhook::tool::policy::AllowAll))
-                .tools(registry.clone())
+                .tools(registry().unwrap())
                 .build()
                 .await
                 .unwrap();
@@ -339,7 +337,6 @@ pub(crate) mod tests {
                 .unwrap();
             Self {
                 _root: root,
-                registry,
                 session,
             }
         }
@@ -364,28 +361,19 @@ pub(crate) mod tests {
             response["result"].clone()
         }
 
-        fn schema(&self, capabilities: &CapabilitySet, tool: &str) -> Option<Value> {
-            let surface = self
-                .registry
-                .surface_for_agent(capabilities, self.session.root_agent());
-            Some(surface.get(tool)?.input_schema.clone())
+        /// Assess `candidate` and validate it through an assessing and a reviewing child, each
+        /// [`scripted`] within its work.
+        async fn validate(&self, candidate: &Value) {
+            self.script(format!(
+                r#"for (const [mode, work] of [["assess", "Assess"], ["validate", "Review"]])
+                    await tool.agent({{mode, depth: 1, name: `${{mode}}-{candidate}`, prompt: `${{work}} candidate {candidate}.`}});"#
+            ))
+            .await;
         }
 
-        fn actions(&self, capabilities: &CapabilitySet, tool: &str) -> Option<Vec<String>> {
-            let schema = self.schema(capabilities, tool)?;
-            let actions = schema["properties"]["action"]["enum"].as_array()?;
-            let mut names: Vec<_> = (actions.iter())
-                .map(|name| name.as_str().unwrap().to_owned())
-                .collect();
-            names.sort();
-            Some(names)
-        }
-
-        /// One path from one source through one component, with one flaw on it raised as an
-        /// assessed candidate.
         async fn discover(&self) -> Value {
             self.script(format!(
-                "{DISCOVER}\nreturn {{source, path, component, flaw, candidate}};"
+                "{DISCOVER}\nreturn {{input, path, component, flaw, candidate}};"
             ))
             .await
         }
@@ -396,6 +384,28 @@ pub(crate) mod tests {
     }
 
     const RESEARCH_TOOLS: [&str; 2] = ["research", "research_query"];
+
+    /// The input schema `tool` surfaces to an agent holding `capabilities`, if it surfaces.
+    fn schema(registry: &ToolRegistry, capabilities: &CapabilitySet, tool: &str) -> Option<Value> {
+        let agent = AgentId::root(skyhook::identity::SessionId::from_bytes([0; 16]));
+        let surface = registry.surface_for_agent(capabilities, &agent);
+        Some(surface.get(tool)?.input_schema.clone())
+    }
+
+    /// The actions `tool` surfaces to an agent holding `capabilities`, sorted.
+    fn actions(
+        registry: &ToolRegistry,
+        capabilities: &CapabilitySet,
+        tool: &str,
+    ) -> Option<Vec<String>> {
+        let schema = schema(registry, capabilities, tool)?;
+        let actions = schema["properties"]["action"]["enum"].as_array()?;
+        let mut names: Vec<_> = (actions.iter())
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        Some(names)
+    }
 
     fn capabilities(extra: impl IntoIterator<Item = Capability>) -> CapabilitySet {
         [Capability::Read].into_iter().chain(extra).collect()
@@ -415,21 +425,25 @@ pub(crate) mod tests {
     }
 
     /// Each capability admits its action group at the surface, and the executor refuses an
-    /// action outside the surfaced schema before it reaches the store.
+    /// action outside the surfaced schema before it reaches the store, as it does a field its
+    /// action does not define at any depth, so a misspelt or renamed field is an error rather
+    /// than silently dropped, another action's argument, even null, a missing one, and a status
+    /// its node's kind does not take.
     #[tokio::test]
     async fn actions_follow_capabilities_at_the_surface_and_the_executor() {
         let [research, verdict, test, scheduled, coordinate] =
             SecurityCapability::ALL.map(SecurityCapability::capability);
-        let fixture = Fixture::new(all_capabilities()).await;
+        let registry = registry().unwrap();
         let read = capabilities([]);
         let researcher = capabilities([research.clone()]);
+        let actions_of = |granted: &CapabilitySet, tool: &str| actions(&registry, granted, tool);
         let owned = |actions: &[&str]| Some(actions.iter().map(|a| a.to_string()).collect());
         for (granted, tool, actions) in [
             (&read, "research", None),
             (
                 &read,
                 "research_query",
-                owned(&["history", "list", "node", "synthesis", "task"]),
+                owned(&["history", "list", "node", "search", "synthesis", "task"]),
             ),
             (&capabilities([verdict.clone()]), "research", None),
             (
@@ -445,17 +459,19 @@ pub(crate) mod tests {
                 owned(&["generate"]),
             ),
         ] {
-            assert_eq!(fixture.actions(granted, tool), actions, "{tool}");
+            assert_eq!(actions_of(granted, tool), actions, "{tool}");
         }
         // Only the root mode schedules the run and writes its reports out, and only a mode
         // the scheduler launches, whose instructions begin its work, can begin work.
         for (mode, preset) in crate::presets::tests::editions(LivePolicy::Yes) {
             let granted: CapabilitySet = preset.capabilities.into();
             let offers = |tool, action| {
-                (fixture.actions(&granted, tool).unwrap_or_default().iter()).any(|a| a == action)
+                (actions_of(&granted, tool).unwrap_or_default().iter()).any(|a| a == action)
             };
             let root = mode == crate::presets::root();
             assert_eq!(offers("research_query", "startable"), root, "{mode}");
+            let query = schema(&registry, &granted, "research_query").unwrap();
+            assert_eq!(query.to_string().contains("startable"), root, "{mode}");
             assert_eq!(offers("research", "generate"), root, "{mode}");
             let begins = (preset.instructions.unwrap().as_str()).contains("`research` `begin`");
             assert_eq!(offers("research", "begin"), root || begins, "{mode}");
@@ -479,91 +495,58 @@ pub(crate) mod tests {
                 &["verdict", "begin"],
             ),
         ] {
-            let actions = fixture.actions(granted, "research").unwrap();
+            let actions = actions_of(granted, "research").unwrap();
             assert!(
                 with.iter().all(|a| actions.iter().any(|b| b == a))
                     && !without.iter().any(|a| actions.iter().any(|b| b == a)),
                 "{actions:?}"
             );
         }
-        fixture.close().await;
 
         let fixture = Fixture::new(researcher).await;
         let history = || fixture.success("research_query", json!({"action":"history"}));
         let before = history().await["items"].clone();
-        let denied = fixture
-            .call(
+        let component = json!({"action":"upsert","record":{"kind":"component","title":"parser","body":"parses"}});
+        let mut unknown = component.clone();
+        unknown["priority"] = json!("high");
+        for (tool, call) in [
+            (
                 "research",
                 json!({"action":"verdict","candidate":1,"verdict":"unproven","note":"x"}),
-            )
-            .await;
-        assert_eq!(denied["state"], "failed", "{denied}");
+            ),
+            ("research", unknown),
+            ("research_query", json!({"action":"node"})),
+            ("research_query", json!({"action":"synthesis","page":{}})),
+            ("research_query", json!({"action":"synthesis","page":null})),
+            (
+                "research",
+                json!({"action":"set_status","record":{"kind":"premise","id":1,"status":"swept"},"note":"n"}),
+            ),
+            (
+                "research_query",
+                json!({"action":"list","record":{"kind":"flaw","status":"holds"}}),
+            ),
+        ] {
+            let refused = fixture.call(tool, call.clone()).await;
+            assert_eq!(refused["state"], "failed", "{call}: {refused}");
+        }
         assert_eq!(
             history().await["items"],
             before,
             "refused actions must not write audit records"
         );
-        fixture.close().await;
-    }
-
-    /// An input refuses a field it does not define at any depth, so a misspelt or renamed
-    /// field is an error rather than silently dropped, and a value its type cannot hold by
-    /// the field's path.
-    #[tokio::test]
-    async fn inputs_refuse_unknown_fields() {
-        let fixture = Fixture::new(capabilities(
-            [SecurityCapability::Research, SecurityCapability::Verdict]
-                .map(SecurityCapability::capability),
-        ))
-        .await;
-        let component =
-            json!({"action":"upsert","kind":"component","title":"parser","body":"parses"});
-        let mut unknown = component.clone();
-        unknown["priority"] = json!("high");
-        let refused = fixture.call("research", unknown).await;
+        // An edit's kind is its node's: what the kind takes is admitted, and nothing else.
+        let id = fixture.success("research", component).await;
+        let edit = json!({"action":"upsert","record":{"id":id,"title":"request parser"}});
+        fixture.success("research", edit).await;
+        let foreign = json!({"action":"upsert","record":{"id":id,"scope":"code"}});
+        let refused = fixture.call("research", foreign).await;
         assert_eq!(refused["state"], "failed", "{refused}");
-        fixture.success("research", component).await;
-        let error = |response: &Value| response["error"].as_str().unwrap_or_default().to_owned();
-        // Schema validation refuses a nested id below 1, before deserializing.
-        let zero = fixture
-            .call(
-                "research",
-                json!({"action":"link","links":[{"path_source":{"path":0,"source":1}}]}),
-            )
-            .await;
-        assert!(error(&zero).contains("minimum 1"), "{zero}");
-        // An action's arguments sit beside it: a missing required one is refused at its
-        // name, and so is another action's, even null.
-        let missing = fixture
-            .call("research_query", json!({"action":"node"}))
-            .await;
-        assert!(error(&missing).contains("`/id`"), "{missing}");
-        for argument in [json!({}), Value::Null] {
-            let stray = fixture
-                .call(
-                    "research_query",
-                    json!({"action":"synthesis","page":argument}),
-                )
-                .await;
-            assert!(error(&stray).contains("`/page`"), "{stray}");
-        }
-        // A status is one its node's kind takes.
-        for (call, tool) in [
-            (
-                json!({"action":"set_status","premise":1,"status":"swept","note":"n"}),
-                "research",
-            ),
-            (
-                json!({"action":"list","kind":"flaw","status":"holds"}),
-                "research_query",
-            ),
-        ] {
-            let refused = fixture.call(tool, call).await;
-            assert_eq!(refused["state"], "failed", "{refused}");
-        }
-        fixture
-            .success("research_query", json!({"action":"history"}))
-            .await;
+        // A record's field left beside it is pointed inside.
+        let beside = json!({"action":"upsert","kind":"path","title":"t","body":"b"});
+        let refused = fixture.call("research", beside).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("goes inside `record`"), "{error}");
         fixture.close().await;
     }
 
@@ -604,9 +587,9 @@ pub(crate) mod tests {
     /// only arguments that action's signature lists. The template tests run with every
     /// capability, so only this ties a call to the grant of the mode whose prompt holds it;
     /// argument values are checked by running the templates.
-    #[tokio::test]
-    async fn every_template_call_names_an_action_its_mode_surfaces() {
-        let fixture = Fixture::new(all_capabilities()).await;
+    #[test]
+    fn every_template_call_names_an_action_its_mode_surfaces() {
+        let registry = registry().unwrap();
         let mut checked = 0;
         for live in [LivePolicy::Yes, LivePolicy::No] {
             for (mode, granted) in crate::presets::tests::editions(live) {
@@ -623,7 +606,7 @@ pub(crate) mod tests {
                         .and_then(|rest| rest.split_once('"'))
                         .unwrap_or_else(|| panic!("{mode}: no literal action in {call:.80}"))
                         .0;
-                    let schema = fixture.schema(&granted, tool);
+                    let schema = schema(&registry, &granted, tool);
                     let signature = schema.as_ref().and_then(|schema| {
                         let description = schema["properties"]["action"]["description"].as_str()?;
                         (description.lines())
@@ -654,7 +637,7 @@ pub(crate) mod tests {
                         else {
                             continue;
                         };
-                        let offered = fixture.actions(&granted, tool).unwrap_or_default();
+                        let offered = actions(&registry, &granted, tool).unwrap_or_default();
                         assert!(
                             offered.iter().any(|offered| offered == action),
                             "{mode}: prose names {tool} {action}, which it does not offer"
@@ -665,22 +648,20 @@ pub(crate) mod tests {
             }
         }
         assert_ne!(checked, 0);
-        fixture.close().await;
     }
 
     /// The report script reads a root's reportable scenarios with the test each stands on and the
     /// previous report, before and after a report.
     #[tokio::test]
     async fn the_report_script_reads_the_group_and_its_previous_report() {
-        let fixture = Fixture::new(all_capabilities()).await;
+        let fixture = Fixture::with_children(LivePolicy::Yes, scripted).await;
         let ids = fixture.discover().await;
         let candidate = ids["candidate"].clone();
-        let verdict = json!({"action":"verdict","candidate":candidate,"verdict":"validated","note":"reviewed the path"});
         let test =
             json!({"action":"test","candidate":candidate,"result":"failed","note":"no crash"});
-        fixture.success("research", verdict.clone()).await;
+        fixture.validate(&candidate).await;
         fixture.success("research", test.clone()).await;
-        fixture.success("research", verdict).await;
+        fixture.validate(&candidate).await;
         let settling = fixture.success("research", test).await;
         fixture.success("research", json!({"action":"test","candidate":candidate,"result":"pending","note":"needs a board"})).await;
         let body = template_body(include_str!("../prompts/scripts/report-scenarios.js"));
@@ -711,16 +692,19 @@ pub(crate) mod tests {
         let fixture = Fixture::new(all_capabilities()).await;
         let ids = fixture.discover().await;
         let premise = fixture
-            .success("research", json!({"action":"upsert","kind":"premise","title":"the listener is enabled","body":"set at startup","scope":"code"}))
+            .success("research", json!({"action":"upsert","record":{"kind":"premise","title":"the listener is enabled","body":"set at startup","scope":"code"}}))
             .await;
         let link = json!({"action":"link","links":[{"flaw_premise":{"flaw":ids["flaw"],"premise":premise}}]});
         fixture.success("research", link).await;
         let body = template_body(include_str!("../prompts/scripts/validate-gaps.js"));
         let gaps = async || {
             let result = fixture
-                .script(format!("const candidate = {};\n{body}", ids["candidate"]))
+                .script(format!(
+                    "const candidates = [{}];\n{body}",
+                    ids["candidate"]
+                ))
                 .await;
-            result["gaps"].clone()
+            result[0]["gaps"].clone()
         };
         let undecided = format!(
             "code premise {premise} of flaw {} is undecided: the listener is enabled",
@@ -730,12 +714,12 @@ pub(crate) mod tests {
         let later = fixture.script(format!(r#"
             const research = async action => (await tool.research(action)).unwrap();
             const at = (file, line) => ({{code: {{file, start_line: line, end_line: line}}}});
-            const component = await research({{action:'upsert',kind:'component',title:'store',body:'session store',files:['store.c']}});
-            const source = await research({{action:'upsert',kind:'source',title:'login',body:'login form',location:at('store.c',1),trust:'untrusted'}});
-            const path = await research({{action:'upsert',kind:'path',title:'login',body:'login writes the session'}});
-            await research({{action:'link',links:[{{path_source:{{path,source}}}},{{path_step:{{path,component,note:'writes'}}}}]}});
-            const flaw = await research({{action:'upsert',kind:'flaw',title:'Stale session',body:'kept after logout',component,location:at('store.c',4)}});
-            await research({{action:'upsert',kind:'candidate',id:{candidate},flaws:[{root},flaw]}});
+            const component = await research({{action:'upsert',record:{{kind:'component',title:'store',body:'session store',files:['store.c']}}}});
+            const input = await research({{action:'upsert',record:{{kind:'state',scope:'input',title:'login',body:'login form',location:at('store.c',1),trust:'untrusted'}}}});
+            const path = await research({{action:'upsert',record:{{kind:'path',title:'login',body:'login writes the session'}}}});
+            await research({{action:'link',links:[{{path_state:{{path,state:input,access:'read',location:at('store.c',1)}}}},{{path_step:{{path,component,note:'writes'}}}}]}});
+            const flaw = await research({{action:'upsert',record:{{kind:'flaw',title:'Stale session',body:'kept after logout',component,location:at('store.c',4)}}}});
+            await research({{action:'upsert',record:{{kind:'candidate',id:{candidate},flaws:[{root},flaw]}}}});
             return {{path, flaw}};
         "#, candidate = ids["candidate"], root = ids["flaw"])).await;
         let off = format!(
@@ -743,12 +727,12 @@ pub(crate) mod tests {
             later["flaw"]
         );
         assert_eq!(gaps().await, json!([undecided, off]));
-        let actions = json!({"action":"upsert","kind":"candidate","id":ids["candidate"],"paths":[ids["path"],later["path"]]});
+        let actions = json!({"action":"upsert","record":{"kind":"candidate","id":ids["candidate"],"paths":[ids["path"],later["path"]]}});
         fixture.success("research", actions).await;
         assert_eq!(gaps().await, json!([undecided]));
         let link = json!({"action":"link","links":[{"path_premise":{"path":later["path"],"premise":premise}}]});
         fixture.success("research", link).await;
-        let repeated = json!({"action":"upsert","kind":"candidate","id":ids["candidate"],"paths":[later["path"],ids["path"],later["path"]]});
+        let repeated = json!({"action":"upsert","record":{"kind":"candidate","id":ids["candidate"],"paths":[later["path"],ids["path"],later["path"]]}});
         fixture.success("research", repeated).await;
         let on_path = format!(
             "code premise {premise} of path {} is undecided: the listener is enabled",
@@ -787,23 +771,28 @@ pub(crate) mod tests {
         fixture.close().await;
     }
 
-    /// The paths script groups the one-source paths its children record by their first step,
-    /// whatever its file is called, and lists a path without one.
+    /// The paths script groups the one-step entry paths its children record by that step,
+    /// whatever its file is called, never with completed routes converging on it, and lists a
+    /// path without steps and a recorded input state on no path.
     #[tokio::test]
-    async fn the_paths_script_groups_paths_by_their_first_step() {
+    async fn the_paths_script_groups_entries_and_lists_unlinked_inputs() {
         let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
         let result = fixture.script(r#"
             const research = async action => (await tool.research(action)).unwrap();
             const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
-            const parser = await research({action:'upsert',kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']});
-            const decoder = await research({action:'upsert',kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']});
+            const parser = await research({action:'upsert',record:{kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']}});
+            const decoder = await research({action:'upsert',record:{kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']}});
             const paths = [];
-            for (const [component, line] of [[parser, 9], [parser, 9], [decoder, 4], [null, 0]]) {
-                const path = await research({action:'upsert',kind:'path',title:`entry ${paths.length}`,body:'request'});
-                if (component) await research({action:'link',links:[{path_step:{path,component,location:at(component === parser ? 'src/a b:c.c' : 'vendor/x.c', line),note:'calls'}}]});
+            for (const steps of [[[parser, 9]], [[parser, 9]], [[decoder, 4]], [], [[parser, 1], [decoder, 4]], [[parser, 2], [decoder, 4]]]) {
+                const path = await research({action:'upsert',record:{kind:'path',title:`entry ${paths.length}`,body:'request'}});
+                for (const [component, line] of steps) await research({action:'link',links:[{path_step:{path,component,location:at(component === parser ? 'src/a b:c.c' : 'vendor/x.c', line),note:'calls'}}]});
                 paths.push(path);
             }
-            return {parser, decoder, paths};
+            const linked = await research({action:'upsert',record:{kind:'state',scope:'input',title:'cookie',body:'session cookie',location:at('src/a b:c.c',1),trust:'untrusted'}});
+            await research({action:'link',links:[{path_state:{path:paths[4],state:linked,access:'read',location:at('src/a b:c.c',1)}}]});
+            const unlinked = await research({action:'upsert',record:{kind:'state',scope:'input',title:'body',body:'request body',location:at('vendor/x.c',2),trust:'authenticated'}});
+            await research({action:'upsert',record:{kind:'state',scope:'instance',title:'parser',body:'parser state'}});
+            return {parser, decoder, paths, unlinked};
         "#).await;
         let paths = template_body(include_str!("../prompts/scripts/paths.live.js"));
         let grouped = fixture
@@ -812,28 +801,14 @@ pub(crate) mod tests {
         let at = |file: &str, line: u32| json!({"code": {"file": file, "start_line": line, "end_line": line, "function": null}});
         let paths = &result["paths"];
         assert_eq!(
-            grouped["handoffs"],
+            grouped["entries"],
             json!([
                 {"component": result["parser"], "at": at("src/a b:c.c", 9), "paths": [paths[0], paths[1]]},
                 {"component": result["decoder"], "at": at("vendor/x.c", 4), "paths": [paths[2]]},
             ])
         );
         assert_eq!(grouped["unmatched"], json!([paths[3]]));
-        fixture.close().await;
-    }
-
-    /// A script reads an optional field a result omits as `null`, as its action's result
-    /// type declares it, in a record and in a page of them.
-    #[tokio::test]
-    async fn scripts_read_an_omitted_optional_result_field_as_null() {
-        let fixture = Fixture::new(all_capabilities()).await;
-        let result = fixture.script(r#"
-            const premise = (await tool.research({action: 'upsert', kind: 'premise', title: 'bounded', body: 'by the caller', scope: 'code'})).unwrap();
-            const one = (await tool.research_query({action: 'node', id: premise})).unwrap();
-            const page = (await tool.research_query({action: 'list', kind: 'premise'})).unwrap();
-            return [one.location, one.merged_into, page.next_after].map(field => field === null);
-        "#).await;
-        assert_eq!(result, json!([true, true, true]));
+        assert_eq!(grouped["unlinked"], json!([result["unlinked"]]));
         fixture.close().await;
     }
 
@@ -854,9 +829,9 @@ pub(crate) mod tests {
         }
         let path = fixture.script(r#"
             const research = async action => (await tool.research(action)).unwrap();
-            const parser = await research({action:'upsert',kind:'component',title:'parser',body:'parses',files:['src/a.c','src/b.c']});
-            const main = await research({action:'upsert',kind:'component',title:'main',body:'starts',files:['main.c']});
-            const path = await research({action:'upsert',kind:'path',title:'request',body:'request'});
+            const parser = await research({action:'upsert',record:{kind:'component',title:'parser',body:'parses',files:['src/a.c','src/b.c']}});
+            const main = await research({action:'upsert',record:{kind:'component',title:'main',body:'starts',files:['main.c']}});
+            const path = await research({action:'upsert',record:{kind:'path',title:'request',body:'request'}});
             await research({action:'link',links:[{path_step:{path,component:main,note:'reads'}},{path_step:{path,component:parser,note:'parses'}}]});
             return path;
         "#).await;
@@ -908,12 +883,17 @@ pub(crate) mod tests {
 
     /// Marks the path it began swept.
     const SWEEP: Then = Then::Record(
-        |path| json!({"action": "set_status", "path": path, "status": "swept", "note": "walked it"}),
+        |path| json!({"action": "set_status", "record": {"kind": "path", "id": path, "status": "swept"}, "note": "walked it"}),
     );
 
     /// The assessment a scripted researcher records of `candidate`.
     fn assessment(candidate: &Value) -> Value {
         json!({"action": "assess", "candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"})
+    }
+
+    /// The validation a scripted reviewer records of `candidate`.
+    fn validation(candidate: &Value) -> Value {
+        json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"})
     }
 
     type Decide = Arc<dyn Fn(&str) -> Then + Send + Sync>;
@@ -1003,27 +983,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// The `research` `begin` call a brief asks for, from the phase and the node ids the
-    /// scheduler names in it: "Settle premises 4 (…), 5 (…).".
+    /// The `research` `begin` call a brief's first work asks for, from the phase and the node
+    /// ids the scheduler names in it: "Settle premises 4, 5.".
     fn begin(brief: &str) -> Value {
-        let (head, _) = brief.split_once(|c: char| c.is_ascii_digit()).unwrap();
+        let work = brief.split(['.']).next().unwrap();
+        let (head, ids) = work.split_at(work.find(|c: char| c.is_ascii_digit()).unwrap());
         let phase = match head.trim().trim_end_matches('s') {
             "Sweep path" => "sweep",
+            "Check state" => "check",
             "Settle premise" => "settle",
             "Chain flaw" => "chain",
             "Assess candidate" => "assess",
             "Review candidate" => "review",
-            "Demonstrate candidate" => "test",
+            "Test candidate" => "test",
             "Report root flaw" => "report",
             other => panic!("no phase is briefed as {other:?}"),
         };
-        let subjects: Vec<u64> = (brief.split("), "))
-            .map(|entry| {
-                let id = entry.trim_start_matches(|c: char| !c.is_ascii_digit());
-                let end = id.find(|c: char| !c.is_ascii_digit()).unwrap_or(id.len());
-                id[..end].parse().unwrap()
-            })
-            .collect();
+        let subjects: Vec<u64> = ids.split(", ").map(|id| id.parse().unwrap()).collect();
         json!({"action": "begin", "phase": phase, "subjects": subjects})
     }
 
@@ -1036,13 +1012,13 @@ pub(crate) mod tests {
         };
         const receive = () => new Promise(() => {});";
 
-    /// `count` paths, each through a component of its own and owing a sweep.
-    async fn sweeps(fixture: &Fixture, count: usize) -> Vec<PathId> {
+    /// A path per name in `names`, each through a component of its own and owing a sweep.
+    async fn sweeps(fixture: &Fixture, names: std::ops::Range<usize>) -> Vec<PathId> {
         use crate::store::tests::{component, path};
         let store = Store::of(fixture.session.store().extension().unwrap());
         let agent = fixture.session.root_agent().clone();
         tokio::task::spawn_blocking(move || {
-            (0..count)
+            names
                 .map(|i| {
                     let name = format!("part{i}");
                     let component = component(&store, &agent, &name);
@@ -1054,141 +1030,116 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// The scheduler's launch briefs, each cut to its phase and first node.
-    const BRIEFS: &str = "started.map(p => p.match(/^\\D+\\d+/)[0])";
-
     /// The scheduler's launch briefs, each cut to its first sentence: its work and subjects.
     const HEADS: &str = "started.map(p => p.split('. ')[0])";
 
-    /// The orchestrator's scheduler reads only what it starts: with one worker and a long
-    /// queue, the rows it reads grow with the work, not with its square. Every child fails,
-    /// so each sweep is tried twice before it is exhausted.
+    /// The scheduler launches what the store starts, briefing each child with its work's phase
+    /// and node ids. A pool wider than the largest page reads its work a page at a time, and a
+    /// launch still waiting to begin holds its node: it is not launched again. With one worker
+    /// and a long queue, the rows it reads grow with the work, not with its square. Every child
+    /// fails, so each node is tried twice, a child that never began counting as a try, then
+    /// exhausted with its last reply, which releases the chain a sweep held back.
     #[tokio::test]
-    async fn the_scheduler_reads_a_bounded_page_per_launch() {
-        const SWEEPS: usize = 10;
-        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
-        sweeps(&fixture, SWEEPS).await;
-        let stubs = "let rows = 0;
-            const real = globalThis.tool;
-            const tool = {
-                jobs: real.jobs, research: real.research, agent: real.agent,
-                research_query: async action => { const result = await real.research_query(action); if (action.action === 'startable') rows += result.unwrap().items.length; return result; },
-            };
-            const receive = () => new Promise(() => {});
-            const workers = 1, artifacts = 'artifacts';";
-        let returned = "{rows, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, stubs, &scheduler(LivePolicy::No), returned).await;
-        assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
-        let rows = result["rows"].as_u64().unwrap() as usize;
-        assert!(rows <= 2 * SWEEPS, "{rows} rows for {SWEEPS} sweeps");
-        fixture.close().await;
-    }
-
-    /// A pool wider than the largest page still reads its work a page at a time.
-    #[tokio::test]
-    async fn the_scheduler_pages_a_pool_wider_than_a_page() {
-        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
-        sweeps(&fixture, 2).await;
-        let stubs = format!("{RECORDING}\nconst workers = 1001, artifacts = 'artifacts';");
-        let returned = "{launched: started.length, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), returned).await;
-        assert_eq!(result, json!({"launched": 4, "exhausted": 2}));
-        fixture.close().await;
-    }
-
-    /// A child holds its node from its launch until it begins its task, which holds it from
-    /// then on: a launch still waiting to begin is not launched again.
-    #[tokio::test]
-    async fn the_scheduler_holds_a_launched_subject_until_its_child_begins() {
-        const SWEEPS: usize = 6;
-        const LAUNCHES: usize = 2 * SWEEPS;
-        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
-        sweeps(&fixture, SWEEPS).await;
-        // The first launch begins once every other sweep is exhausted.
-        let stubs = format!(
-            "let launched = 0, waiting = null, begin;
+    async fn the_scheduler_launches_a_page_of_briefed_work_at_a_time() {
+        let unbegun = Arc::new(std::sync::OnceLock::<String>::new());
+        let briefed = unbegun.clone();
+        let fixture = Fixture::with_children(LivePolicy::No, move |brief| {
+            match briefed.get().is_some_and(|path| brief.starts_with(path)) {
+                true => Then::Unbegun,
+                false => Then::Fail,
+            }
+        })
+        .await;
+        let wide = sweeps(&fixture, 0..2).await;
+        // The first launch begins once the other sweep is exhausted.
+        let stubs = "let launched = 0, waiting = null, begin;
             const held = [], real = globalThis.tool;
             const others = new Promise(resolve => begin = resolve);
-            const tool = {{
+            const tool = {
                 jobs: real.jobs, research: real.research,
-                research_query: async action => {{
+                research_query: async action => {
                     if (action.action === 'startable' && waiting !== null) held.push(action.running.includes(waiting));
                     return real.research_query(action);
-                }},
-                agent: async args => {{
-                    if (++launched === {SWEEPS} * 2 - 1) begin();
+                },
+                agent: async args => {
+                    if (++launched === 3) begin();
                     if (launched > 1) return real.agent(args);
                     waiting = Number(args.prompt.match(/\\d+/)[0]);
                     await others;
                     waiting = null;
                     return real.agent(args);
-                }},
-            }};
-            const receive = () => new Promise(() => {{}});
-            const workers = 2, artifacts = 'artifacts';"
-        );
+                },
+            };
+            const receive = () => new Promise(() => {});
+            const workers = 1001, artifacts = 'artifacts', source = '.';";
         let returned = "{launched, held, exhausted: outcome.synthesis.exhausted.length}";
-        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), returned).await;
-        assert_eq!(result["launched"], json!(LAUNCHES), "{result}");
-        assert_eq!(result["exhausted"], json!(SWEEPS), "{result}");
+        let result = run_template(&fixture, stubs, &scheduler(LivePolicy::No), returned).await;
+        assert_eq!(result["launched"], json!(4), "{result}");
+        assert_eq!(result["exhausted"], json!(2), "{result}");
         let held = result["held"].as_array().unwrap();
         assert!(
             !held.is_empty() && held.iter().all(|running| running == true),
             "{result}"
         );
+
+        let paths = sweeps(&fixture, 2..5).await;
+        let store = Store::of(fixture.session.store().extension().unwrap());
+        let agent = fixture.session.root_agent().clone();
+        let first = paths[0];
+        let flaw = tokio::task::spawn_blocking(move || {
+            let NodeView::Path(view) = store.node(first.into()).unwrap() else {
+                panic!("a path")
+            };
+            let component = view.steps[0].component.id.get().try_into().unwrap();
+            crate::store::tests::flaw(&store, &agent, component)
+        })
+        .await
+        .unwrap();
+        unbegun.set(format!("Sweep path {first}.")).unwrap();
+        let stubs = format!(
+            "let rows = 0;
+            {RECORDING}
+            tool.research_query = async action => {{ const result = await real.research_query(action); if (action.action === 'startable') rows += result.unwrap().items.length; return result; }};
+            const workers = 1, artifacts = 'artifacts', source = '.';"
+        );
+        let returned = format!(
+            "{{rows, started: {HEADS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node]), reply: outcome.synthesis.exhausted.find(e => e.node === {first}).reply}}"
+        );
+        let mut result =
+            run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await;
+        let rows = result["rows"].take().as_u64().unwrap();
+        let reply = result["reply"].take();
+        let launches = paths
+            .iter()
+            .map(|path| format!("Sweep path {path}"))
+            .chain([format!("Chain flaw {flaw}")])
+            .flat_map(|head| [head.clone(), head]);
+        assert_eq!(
+            result["started"],
+            json!(launches.collect::<Vec<_>>()),
+            "{result}"
+        );
+        assert!(rows <= 8, "{rows} rows for 8 launches");
+        let exhausted = (wide.iter().chain(&paths))
+            .map(|path| json!(["sweep", path]))
+            .chain([json!(["chain", flaw])]);
+        assert_eq!(
+            result["exhausted"],
+            json!(exhausted.collect::<Vec<_>>()),
+            "{result}"
+        );
+        let reply = reply.as_str().unwrap();
+        assert!(reply.contains("the child failed"), "{reply}");
         fixture.close().await;
     }
 
-    /// `count` candidates on one parser component along one path a source enters, which owes
-    /// its sweep: each on a flaw of its own, or all on the first one's, sharing its root;
-    /// identified, or assessed and validated. Returns the path and each candidate with its root.
-    async fn candidates(fixture: &Fixture, count: usize, shared: bool, validated: bool) -> Value {
-        fixture.script(format!(r#"
-            const research = async action => (await tool.research(action)).unwrap();
-            const at = (file, line) => ({{code: {{file, start_line: line, end_line: line}}}});
-            const component = await research({{action:'upsert',kind:'component',title:'parser',body:'request parser',files:['input.c']}});
-            const path = await research({{action:'upsert',kind:'path',title:'request parsing',body:'raw request parsing'}});
-            const source = await research({{action:'upsert',kind:'source',title:'request',body:'the raw request',location:at('input.c',1),trust:'untrusted'}});
-            await research({{action:'link',links:[{{path_source:{{path,source}}}},{{path_step:{{path,component,note:'parse is called on every request'}}}}]}});
-            const candidates = [];
-            let flaw;
-            for (let i = 0; i < {count}; i++) {{
-                if (i === 0 || !{shared}) flaw = await research({{action:'upsert',kind:'flaw',title:`Unchecked copy ${{i}}`,body:'the request length is copied into a fixed buffer',component,location:at('input.c',8 + i)}});
-                const candidate = await research({{action:'upsert',kind:'candidate',title:`Unchecked copy ${{i}}`,body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]}});
-                if ({validated}) {{
-                    await research({{...{assess},candidate}});
-                    await research({{action:'verdict',candidate,verdict:'validated',note:'reviewed the path'}});
-                }}
-                candidates.push({{candidate, root: flaw}});
-            }}
-            return {{path, candidates}};
-        "#, assess = assessment(&Value::Null))).await
-    }
-
-    /// A decision that lets the first child briefed with `prefix` and a node never begin, nor
-    /// any later child briefed so with that node, and `otherwise` decide the rest.
-    fn unbegun_first(
-        prefix: &'static str,
-        otherwise: fn(&str) -> Then,
-    ) -> impl Fn(&str) -> Then + Send + Sync + 'static {
-        let first = std::sync::Mutex::new(None::<String>);
-        move |brief| {
-            let Some(rest) = brief.strip_prefix(prefix) else {
-                return otherwise(brief);
-            };
-            let node = rest.split(' ').next().unwrap().to_owned();
-            let mut first = first.lock().unwrap();
-            match *first.get_or_insert_with(|| node.clone()) == node {
-                true => Then::Unbegun,
-                false => otherwise(brief),
-            }
-        }
-    }
-
-    fn sweeps_then_fail(brief: &str) -> Then {
-        match brief.starts_with("Sweep") {
-            true => SWEEP,
-            false => Then::Fail,
+    /// Sweeps, assessments and validations recorded; any other work fails.
+    fn scripted(brief: &str) -> Then {
+        match brief.split(' ').next() {
+            Some("Sweep") => SWEEP,
+            Some("Assess") => Then::Record(assessment),
+            Some("Review") => Then::Record(validation),
+            _ => Then::Fail,
         }
     }
 
@@ -1202,9 +1153,9 @@ pub(crate) mod tests {
             })
         })
         .await;
-        let path = sweeps(&fixture, 1).await[0];
+        let path = sweeps(&fixture, 0..1).await[0];
         let result = fixture.script(format!(r#"
-            for (let i = 0; i < 2; i++) await tool.agent({{mode: "sweep", depth: 1, name: `sweep-${{i}}`, prompt: "Sweep path {path} (part0)."}});
+            for (let i = 0; i < 2; i++) await tool.agent({{mode: "sweep", depth: 1, name: `sweep-${{i}}`, prompt: "Sweep path {path}."}});
             const [exhausted] = (await tool.research_query({{action: "synthesis"}})).unwrap().exhausted;
             const task = (await tool.research_query({{action: "task", id: exhausted.tasks.at(-1)}})).unwrap();
             return {{tasks: exhausted.tasks.length, subjects: task.subjects, state: task.state, reply: task.reply}};
@@ -1216,124 +1167,14 @@ pub(crate) mod tests {
         fixture.close().await;
     }
 
-    /// A child that fails before it begins its task counts toward its node's two tries in the
-    /// run: the node is launched twice, then listed exhausted with its last child's reply,
-    /// though the store holds no task of it. Running no more, it holds back nothing: the next
-    /// test runs and none is held.
-    #[tokio::test]
-    async fn the_scheduler_returns_a_subject_whose_children_never_began() {
-        let fixture = Fixture::with_children(
-            LivePolicy::Yes,
-            unbegun_first("Demonstrate candidate ", sweeps_then_fail),
-        )
-        .await;
-        let made = candidates(&fixture, 2, false, true).await;
-        let [first, second] = [0, 1].map(|i| made["candidates"][i].clone());
-        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let body = scheduler(LivePolicy::Yes);
-        let returned = "{tests: started.filter(p => p.startsWith('Demonstrate')).map(p => Number(p.match(/\\d+/)[0])), held: outcome.held, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node]), reply: outcome.synthesis.exhausted[0].reply}";
-        let mut result = run_template(&fixture, &stubs, &body, returned).await;
-        let reply = result["reply"].take();
-        let (c1, c2) = (&first["candidate"], &second["candidate"]);
-        assert_eq!(
-            result,
-            json!({
-                "tests": [c1, c1, c2, c2],
-                "held": false,
-                "exhausted": [["test", c1], ["test", c2], ["report", first["root"]], ["report", second["root"]]],
-                "reply": null,
-            })
-        );
-        let reply = reply.as_str().unwrap();
-        assert!(reply.contains("the child failed"), "{reply}");
-        fixture.close().await;
-    }
-
-    /// A node spent on children that never began is exhausted for the rest of the run, so what
-    /// waits on its exhaustion goes ahead: the test of a candidate sharing its root, then the
-    /// root's report.
-    #[tokio::test]
-    async fn a_spent_test_releases_its_root_group_in_the_same_run() {
-        let fixture = Fixture::with_children(
-            LivePolicy::Yes,
-            unbegun_first("Demonstrate candidate ", sweeps_then_fail),
-        )
-        .await;
-        let made = candidates(&fixture, 2, true, true).await;
-        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let body = scheduler(LivePolicy::Yes);
-        let returned = format!(
-            "{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
-        );
-        let (c1, c2, root) = (
-            &made["candidates"][0]["candidate"],
-            &made["candidates"][1]["candidate"],
-            &made["candidates"][0]["root"],
-        );
-        let (test, report) = ("Demonstrate candidate", format!("Report root flaw {root}"));
-        assert_eq!(
-            run_template(&fixture, &stubs, &body, &returned).await,
-            json!({
-                "started": [format!("Sweep path {}", made["path"]), format!("{test} {c1}"), format!("{test} {c1}"),
-                    format!("{test} {c2}"), format!("{test} {c2}"), &report, &report],
-                "exhausted": [["test", c1], ["test", c2], ["report", root]],
-            })
-        );
-        fixture.close().await;
-    }
-
-    /// A second launch that settles the work it was spent on suppresses nothing: the
-    /// assessment's first child never begins and its second records it, so the candidate's
-    /// review starts in the same run, then its root's report, and only the report is exhausted.
-    #[tokio::test]
-    async fn a_launch_that_settles_spent_work_releases_its_next_phase() {
-        let assessments = std::sync::atomic::AtomicBool::new(false);
-        let fixture = Fixture::with_children(LivePolicy::No, move |brief| {
-            if brief.starts_with("Sweep") {
-                SWEEP
-            } else if brief.starts_with("Assess") {
-                match assessments.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    false => Then::Unbegun,
-                    true => Then::Record(assessment),
-                }
-            } else {
-                Then::Record(|candidate| {
-                    json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"})
-                })
-            }
-        })
-        .await;
-        let made = candidates(&fixture, 1, false, false).await;
-        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let returned = format!(
-            "{{started: {BRIEFS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
-        );
-        let (candidate, root) = (
-            &made["candidates"][0]["candidate"],
-            &made["candidates"][0]["root"],
-        );
-        let report = format!("Report root flaw {root}");
-        assert_eq!(
-            run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await,
-            json!({
-                "started": [format!("Sweep path {}", made["path"]), format!("Assess candidate {candidate}"),
-                    format!("Assess candidate {candidate}"), format!("Review candidate {candidate}"), &report, &report],
-                "exhausted": [["report", root]],
-            })
-        );
-        fixture.close().await;
-    }
-
-    /// The scheduler returns with held tests and nothing else to start; run again with an
-    /// approval, the store passes over the tests it may still not start to reach
-    /// the approved one, a page per launch. Two children leaving that test owed exhaust it,
-    /// which releases its root's report.
+    /// The scheduler returns with the tests it holds and nothing else to start; run again with
+    /// the user's approval, it reaches the approved test, a page per launch. Two children
+    /// leaving that test owed exhaust it, which releases its root's report.
     #[tokio::test]
     async fn the_scheduler_returns_held_tests_and_reaches_the_approved_one_when_rerun() {
-        const CANDIDATES: usize = 31;
-        let fixture = Fixture::with_children(LivePolicy::Ask, sweeps_then_fail).await;
-        let made = candidates(&fixture, CANDIDATES, false, true).await;
-        let approved = made["candidates"][CANDIDATES - 1].clone();
+        let fixture = Fixture::with_children(LivePolicy::Ask, scripted).await;
+        let ids = fixture.discover().await;
+        fixture.validate(&ids["candidate"]).await;
         let stubs = "let reads = 0;
             const started = [], real = globalThis.tool;
             const tool = {
@@ -1342,8 +1183,8 @@ pub(crate) mod tests {
                 agent: args => (started.push(args.prompt), real.agent(args)),
             };
             const receive = () => new Promise(() => {});
-            const workers = 1, artifacts = 'artifacts';";
-        let returned = format!("{{reads, started: {BRIEFS}, held: outcome.held}}");
+            const workers = 1, artifacts = 'artifacts', source = '.';";
+        let returned = format!("{{reads, started: {HEADS}, held: outcome.held}}");
         let run = async |inputs: Vec<(&'static str, String)>| {
             let body = inputs
                 .iter()
@@ -1355,54 +1196,17 @@ pub(crate) mod tests {
         };
         assert_eq!(
             run(Vec::new()).await,
-            json!({"reads": 2, "started": [format!("Sweep path {}", made["path"])], "held": true})
+            json!({"reads": 2, "started": [format!("Sweep path {}", ids["path"])], "held": true})
         );
-        let test = format!("Demonstrate candidate {}", approved["candidate"]);
-        let report = format!("Report root flaw {}", approved["root"]);
+        let test = format!("Test candidate {}", ids["candidate"]);
+        let report = format!("Report root flaw {}", ids["flaw"]);
         let rerun = run(vec![(
             "[/* under ask: candidates the user approved */]",
-            format!("[{}]", approved["candidate"]),
+            format!("[{}]", ids["candidate"]),
         )]);
         assert_eq!(
             rerun.await,
-            json!({"reads": 5, "started": [&test, &test, &report, &report], "held": true})
-        );
-        fixture.close().await;
-    }
-
-    /// A sweep's and a chain's children are briefed with the path and the flaw and their
-    /// titles; a sweep two children left owed is exhausted, which releases the chain it held
-    /// back.
-    #[tokio::test]
-    async fn the_scheduler_briefs_sweeps_and_chains_and_exhausts_what_children_leave_owed() {
-        let fixture = Fixture::with_children(LivePolicy::No, |_| Then::Fail).await;
-        let path = sweeps(&fixture, 1).await[0];
-        let store = Store::of(fixture.session.store().extension().unwrap());
-        let agent = fixture.session.root_agent().clone();
-        let flaw = tokio::task::spawn_blocking(move || {
-            let NodeView::Path(view) = store.node(path.into()).unwrap() else {
-                panic!("a path")
-            };
-            let component = view.steps[0].component.id.get().try_into().unwrap();
-            crate::store::tests::flaw(&store, &agent, component)
-        })
-        .await
-        .unwrap();
-        let stubs = format!("{RECORDING}\nconst workers = 1, artifacts = 'artifacts';");
-        let returned = format!(
-            "{{started: {HEADS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
-        );
-        let result = run_template(&fixture, &stubs, &scheduler(LivePolicy::No), &returned).await;
-        let (sweep, chain) = (
-            format!("Sweep path {path} (part0)"),
-            format!("Chain flaw {flaw} (unbounded copy)"),
-        );
-        assert_eq!(
-            result,
-            json!({
-                "started": [&sweep, &sweep, &chain, &chain],
-                "exhausted": [["sweep", path], ["chain", flaw]],
-            })
+            json!({"reads": 5, "started": [&test, &test, &report, &report], "held": false})
         );
         fixture.close().await;
     }
@@ -1416,20 +1220,26 @@ pub(crate) mod tests {
         // The parser's children run until the first scheduler is killed; every other fails.
         let killing = Arc::new(AtomicBool::new(true));
         let hangs = killing.clone();
+        let parsing = Arc::new(std::sync::OnceLock::<String>::new());
+        let briefed = parsing.clone();
         let fixture = Fixture::with_children(LivePolicy::No, move |brief| {
-            match brief.contains("(part1)") && hangs.load(SeqCst) {
+            let parser = briefed
+                .get()
+                .is_some_and(|parser| brief.starts_with(parser));
+            match parser && hangs.load(SeqCst) {
                 true => Then::Hang,
                 false => Then::Fail,
             }
         })
         .await;
-        let paths = sweeps(&fixture, 2).await;
+        let paths = sweeps(&fixture, 0..2).await;
         let (decoder, parser) = (paths[0], paths[1]);
+        parsing.set(format!("Sweep path {parser}.")).unwrap();
         // The decoder's second launch never reaches its child.
         let killed = format!(
             "{RECORDING}
-            tool.agent = args => (started.push(args.prompt), started.filter(p => p === args.prompt).length > 1 && args.prompt.includes('(part0)') ? new Promise(() => {{}}) : real.agent(args));
-            const workers = 2, artifacts = 'artifacts';"
+            tool.agent = args => (started.push(args.prompt), started.filter(p => p === args.prompt).length > 1 && args.prompt.startsWith('Sweep path {decoder}.') ? new Promise(() => {{}}) : real.agent(args));
+            const workers = 2, artifacts = 'artifacts', source = '.';"
         );
         let store = Store::of(fixture.session.store().extension().unwrap());
         let mut updates = fixture.session.store().observe().updates;
@@ -1468,7 +1278,8 @@ pub(crate) mod tests {
             .run_script(format!("{killed}\n{}", scheduler(LivePolicy::No)));
         let _ = bounded(async { tokio::join!(run, tried) }).await;
 
-        let stubs = format!("{RECORDING}\nconst workers = 2, artifacts = 'artifacts';");
+        let stubs =
+            format!("{RECORDING}\nconst workers = 2, artifacts = 'artifacts', source = '.';");
         let returned = format!(
             "{{started: {HEADS}, exhausted: outcome.synthesis.exhausted.map(e => [e.phase, e.node])}}"
         );
@@ -1477,8 +1288,8 @@ pub(crate) mod tests {
             result,
             json!({
                 "started": [
-                    format!("Sweep path {decoder} (part0)"),
-                    format!("Sweep path {parser} (part1)"),
+                    format!("Sweep path {decoder}"),
+                    format!("Sweep path {parser}"),
                 ],
                 "exhausted": [["sweep", decoder], ["sweep", parser]],
             })

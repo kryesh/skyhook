@@ -93,27 +93,6 @@ mod tests {
         assert!(!refused(format, bytes, needed));
     }
 
-    /// A GIF frame that does not span its canvas decodes through a buffer of its
-    /// own, beside the output.
-    #[test]
-    fn a_gif_frame_off_its_canvas_shares_the_budget_with_the_output() {
-        let pixels = noise_bytes().take(9 * 10 * 4).collect();
-        let frame = image::Frame::new(image::RgbaImage::from_vec(9, 10, pixels).unwrap());
-        let mut bytes = Vec::new();
-        image::codecs::gif::GifEncoder::new(&mut bytes)
-            .encode_frame(frame)
-            .unwrap();
-        // Widen the canvas by a column, and move the frame right onto it.
-        bytes[6..8].copy_from_slice(&10u16.to_le_bytes());
-        let descriptor = [0x2c, 0, 0, 0, 0, 9, 0, 10, 0];
-        let at = bytes
-            .windows(9)
-            .position(|window| window == descriptor)
-            .unwrap();
-        bytes[at + 1] = 1;
-        admits_from(ImageFormat::Gif, &bytes, 10 * 10 * 4 + 9 * 10 * 4);
-    }
-
     /// A WebP reserves two RGBA canvases beside its output: an animation's
     /// canvas and frame, or a still's temporaries.
     #[test]

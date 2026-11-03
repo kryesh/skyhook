@@ -209,6 +209,8 @@ pub struct App {
     gesture: Gesture,
     pub hover: Option<(u16, u16)>,
     pub render: super::render::RenderState,
+    /// What the viewed tab's window reads and keeps.
+    pub budget: model::Budget,
     /// Every record observed, in order, for tests to read what the session journaled.
     #[cfg(test)]
     pub journal: Vec<std::sync::Arc<skyhook::session::EventRecord>>,
@@ -242,9 +244,10 @@ impl App {
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
         let draft = observation.is_none();
-        let (phase, snapshot, projection, window) = match observation {
+        let (phase, snapshot, projection, window, budget) = match observation {
             Some(PreparedObservation {
                 active,
+                budget,
                 shown:
                     observation::Shown {
                         snapshot,
@@ -260,12 +263,14 @@ impl App {
                 *snapshot,
                 *projection,
                 window.map(|window| *window),
+                budget,
             ),
             None => (
                 Phase::Draft { root: draft_root() },
                 ObservationSnapshot::default(),
                 Projection::empty(&launch.identity.host),
                 None,
+                model::Budget::DEFAULT,
             ),
         };
         let selected = match &phase {
@@ -333,6 +338,7 @@ impl App {
             gesture: Gesture::Released,
             hover: None,
             render: super::render::RenderState::new(selected, tx),
+            budget,
             #[cfg(test)]
             journal: Vec::new(),
             #[cfg(test)]
@@ -399,7 +405,14 @@ pub(super) mod tests {
         (root, app)
     }
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {
+        fixture_within(model::Budget::DEFAULT).await
+    }
+    /// [`fixture`], its windows reading and keeping `budget`.
+    pub(in super::super) async fn fixture_within(
+        budget: model::Budget,
+    ) -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
+        app.budget = budget;
         let session = app
             .launch
             .create(crate::Opening::New(None))
@@ -490,7 +503,11 @@ pub(super) mod tests {
     }
     /// `session` observed, as opening it reads it.
     pub(in crate::tui) async fn prepared(session: SessionHandle) -> PreparedObservation {
-        crate::tests::bounded(PreparedObservation::load(session, Arc::new(())))
+        prepared_within(session, model::Budget::DEFAULT).await
+    }
+    /// [`prepared`], its windows reading and keeping `budget`.
+    async fn prepared_within(session: SessionHandle, budget: model::Budget) -> PreparedObservation {
+        crate::tests::bounded(PreparedObservation::load(session, Arc::new(()), budget))
             .await
             .unwrap()
     }
@@ -503,13 +520,13 @@ pub(super) mod tests {
             let mut records = Vec::new();
             for agent in agents.agents {
                 let mut page = Some(skyhook::session::Page::First);
+                let size = model::Budget::DEFAULT.page;
                 while let Some(read) = page {
                     let store = session.store();
-                    let read = store.transcript(&agent.agent, read, model::PAGE).await;
+                    let read = store.transcript(&agent.agent, read, size).await;
                     let read = read.unwrap();
-                    page = (read.records.len() == model::PAGE).then(|| {
-                        skyhook::session::Page::After(read.first + model::PAGE as u64 - 1)
-                    });
+                    page = (read.records.len() == size)
+                        .then(|| skyhook::session::Page::After(read.first + size as u64 - 1));
                     records.extend(read.records);
                 }
             }
@@ -560,9 +577,7 @@ pub(super) mod tests {
     /// its live slice, every page of it, and every agent's summary.
     pub(in crate::tui) async fn read(session: &SessionHandle, agent: &AgentId) -> Whole {
         crate::tests::bounded(async {
-            let prepared = PreparedObservation::load(session.clone(), Arc::new(()))
-                .await
-                .unwrap();
+            let prepared = prepared(session.clone()).await;
             Whole {
                 live: *prepared.shown.snapshot,
                 window: pages::whole(session, agent).await.unwrap(),
@@ -600,8 +615,9 @@ pub(super) mod tests {
         .await;
     }
     /// Replace a draft fixture with one opened on `session`.
+    /// `session` attached to `app`, its windows reading and keeping `app`'s budget.
     pub(in crate::tui) async fn attach(app: &mut App, session: SessionHandle) {
-        let observation = prepared(session).await;
+        let observation = prepared_within(session, app.budget).await;
         *app = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
     }
     /// A 1x1 PNG.
@@ -645,7 +661,16 @@ pub(super) mod tests {
         session: &SessionHandle,
         tab: Tab,
     ) -> (tempfile::TempDir, App) {
+        viewing_within(session, tab, model::Budget::DEFAULT).await
+    }
+    /// [`viewing`], its windows reading and keeping `budget`.
+    pub(in crate::tui) async fn viewing_within(
+        session: &SessionHandle,
+        tab: Tab,
+        budget: model::Budget,
+    ) -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
+        app.budget = budget;
         attach(&mut app, session.clone()).await;
         app.tab = tab;
         settled(&mut app).await;

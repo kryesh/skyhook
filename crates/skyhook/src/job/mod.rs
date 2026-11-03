@@ -33,8 +33,8 @@ use crate::{
 pub(crate) mod output;
 pub use output::{
     CaptureDescriptor, CaptureKind, Continuation, ElementPage, FieldPointer, LinePage, Match,
-    MatchPage, MemberPage, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
-    OutputSelection, OutputTruncation, PageLimit, PresentedOutput, omit_null_fields,
+    MatchPage, MemberPage, NextChild, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
+    OutputSelection, OutputTruncation, PageLimit, PageUnit, PresentedOutput, omit_null_fields,
 };
 mod cancellation;
 pub(crate) use cancellation::{CANCELLATION_GRACE, CancelScope};
@@ -846,6 +846,7 @@ pub(crate) mod tests {
         /// `envelope` with the result its run saved.
         pub(crate) async fn hydrated(&self, envelope: JobEnvelope) -> Result<Hydrated, JobError> {
             let output = self.saved_result(&envelope).await?;
+            let output = output.map(|output| output.value);
             Ok(Hydrated { envelope, output })
         }
 
@@ -897,6 +898,23 @@ pub(crate) mod tests {
             self.acknowledge(delivery).await
         }
 
+        /// A running agent job of `spec`, its child installed, resumed by `handler`.
+        pub(crate) async fn test_agent(
+            &self,
+            spec: JobSpec,
+            handler: ResumeHandler,
+        ) -> (JobLease<stage::Running>, AgentId) {
+            let spec = JobSpec {
+                accepts_input: true,
+                role: JobRole::Agent,
+                ..spec
+            };
+            let lease = self.test_running(spec).await;
+            let child = self.test_install(lease.id()).await;
+            self.test_resume_with(lease.id(), handler);
+            (lease, child)
+        }
+
         /// A running agent job, called `tool`, whose resume handler answers `answer`.
         pub(super) async fn test_resumable(
             &self,
@@ -904,19 +922,12 @@ pub(crate) mod tests {
             tool: &str,
             answer: Value,
         ) -> JobId {
-            let spec = JobSpec {
-                accepts_input: true,
-                role: JobRole::Agent,
-                ..JobSpec::test(agent, tool)
-            };
-            let id = self.test_running(spec).await.into_test_id();
-            self.test_install(id).await;
             let handler: ResumeHandler = Arc::new(move |_, _| {
                 let answer = answer.clone();
                 Box::pin(async move { Ok(ToolOutput::new(answer).into()) })
             });
-            self.test_resume_with(id, handler);
-            id
+            let (lease, _) = self.test_agent(JobSpec::test(agent, tool), handler).await;
+            lease.into_test_id()
         }
 
         /// Install a child in running agent job `id`, as its call would.

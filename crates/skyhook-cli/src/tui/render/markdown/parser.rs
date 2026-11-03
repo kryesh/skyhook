@@ -464,12 +464,12 @@ impl Renderer<'_> {
             }
             Event::End(TagEnd::Link | TagEnd::Image) => {
                 let style = self.style();
-                if let Some(url) = self.links.pop() {
-                    // Autolinks already show the destination.
-                    if !url.is_empty() && !self.spans.last().is_some_and(|span| span.content == url)
-                    {
-                        self.spans.push(Span::styled(format!(" ({url})"), style));
-                    }
+                // Autolinks already show the destination.
+                if let Some(url) = self.links.pop()
+                    && !url.is_empty()
+                    && !self.spans.last().is_some_and(|span| span.content == url)
+                {
+                    self.spans.push(Span::styled(format!(" ({url})"), style));
                 }
             }
             Event::Text(value) | Event::Html(value) | Event::InlineHtml(value) => {
@@ -741,6 +741,13 @@ pub(in super::super) mod tests {
         }
         let lines = rendered("- ```rust\n  let x = 1;  \n\n  ```", 80);
         assert_eq!(strings(&lines), ["• let x = 1;  ", "  "]);
+        // A named fence falls back to plain text with the code role.
+        let body = format!("small\n{}  \n\nlast\n", "x".repeat(tool_view::MAX_SECTION));
+        let oversized = rendered(&format!("```rust\n{body}```"), 80);
+        assert_eq!(oversized, rendered(&format!("```\n{body}```"), 80));
+        let lines = rendered("```not-a-language\nplain\n```", 80);
+        assert_eq!(strings(&lines), ["plain"]);
+        assert_eq!(span_style(&lines, "plain").fg, Some(theme().ui.emphasis));
     }
 
     #[test]
@@ -754,16 +761,6 @@ pub(in super::super) mod tests {
         let plain = rendered(open, 80);
         assert_eq!(render(open), plain);
         assert_ne!(render(&closed), plain);
-    }
-
-    #[test]
-    fn named_code_fallback_keeps_plain_text_and_the_code_role() {
-        let body = format!("small\n{}  \n\nlast\n", "x".repeat(tool_view::MAX_SECTION));
-        let oversized = rendered(&format!("```rust\n{body}```"), 80);
-        assert_eq!(oversized, rendered(&format!("```\n{body}```"), 80));
-        let lines = rendered("```not-a-language\nplain\n```", 80);
-        assert_eq!(strings(&lines), ["plain"]);
-        assert_eq!(span_style(&lines, "plain").fg, Some(theme().ui.emphasis));
     }
 
     #[test]

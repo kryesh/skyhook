@@ -1,7 +1,7 @@
 //! The viewed agent's history read a page at a time, off the event loop, as `Work`:
 //! drawing asks for what the view nears, and the window folds what lands.
 use super::*;
-use model::{CHILD_PAGE, ChildPage, Direction, Edge, LIST_PAGE, Loaded, Near, PAGE, Read, Want};
+use model::{Budget, CHILD_PAGE, ChildPage, Direction, Edge, Loaded, Near, Read, Want};
 use skyhook::agent::HarnessError;
 use skyhook::job::{JobEnvelope, JobRole, JobScope};
 use skyhook::session::Page;
@@ -11,24 +11,26 @@ use std::ops::RangeInclusive;
 /// Child pages a page load reads under the scripts it shows, nearest first.
 const FAMILY_PAGES: usize = 32;
 
-/// Read what `want` asks of `agent`'s history.
+/// Read what `want` asks of `agent`'s history, a page of `budget` at a time.
 pub(super) async fn load(
     session: &SessionHandle,
     agent: &AgentId,
     want: Want,
+    budget: Budget,
 ) -> Result<Loaded, HarnessError> {
     let (read, jobs, parents) = match want {
         Want::Transcript(page) => {
-            let read = session.store().transcript(agent, page, PAGE).await?;
+            let read = session.store().transcript(agent, page, budget.page).await?;
             return shown(session, page, read, FAMILY_PAGES).await;
         }
         Want::Requests(page) => {
-            let requests = session.store().requests(agent, page, LIST_PAGE).await?;
+            let requests = (session.store()).requests(agent, page, budget.list_page);
+            let requests = requests.await?;
             (Read::Requests(page, requests), Vec::new(), Vec::new())
         }
         Want::Roots(page) => {
             let scope = JobScope::Roots(agent.clone());
-            let jobs = session.jobs().page(scope, page, LIST_PAGE).await?;
+            let jobs = session.jobs().page(scope, page, budget.list_page).await?;
             (Read::Roots(page), jobs, Vec::new())
         }
         Want::Children(parents) => (Read::Children, Vec::new(), parents),
@@ -96,12 +98,13 @@ pub(super) async fn whole(
     session: &SessionHandle,
     agent: &AgentId,
 ) -> Result<model::Window, HarnessError> {
-    let mut pages = Vec::new();
+    let (mut pages, budget) = (Vec::new(), Budget::DEFAULT);
     let mut following = Some(Page::First);
     while let Some(page) = following {
-        let read = session.store().transcript(agent, page, PAGE).await?;
+        let read = session.store().transcript(agent, page, budget.page).await?;
         // A page short of full reads the end.
-        let last = (read.records.len() == PAGE).then(|| read.first + PAGE as u64 - 1);
+        let full = read.records.len() == budget.page;
+        let last = full.then(|| read.first + budget.page as u64 - 1);
         following = last.map(Page::After);
         let mut shown = shown(session, page, read, usize::MAX).await?;
         // An export shows every child, so their pages are read to the end.
@@ -118,7 +121,12 @@ pub(super) async fn whole(
         }
         pages.push(shown);
     }
-    Ok(model::Window::whole(agent.clone(), window_id(), pages))
+    Ok(model::Window::whole(
+        agent.clone(),
+        window_id(),
+        pages,
+        budget,
+    ))
 }
 
 /// Window ids, unique across sessions, so a load lands only in the window it was read for.
@@ -139,9 +147,9 @@ impl App {
             return;
         }
         self.window = Some(match self.session() {
-            Some(_) => model::Window::new(agent, tab, window_id(), focus),
+            Some(_) => model::Window::new(agent, tab, window_id(), focus, self.budget),
             // A draft has no history to read.
-            None => model::Window::empty(agent, tab, window_id()),
+            None => model::Window::empty(agent, tab, window_id(), self.budget),
         });
         // What the new view reads, it reads as the session left it.
         self.projection.retain_released(&Default::default());
@@ -172,9 +180,9 @@ impl App {
                 self.loads += 1;
             }
             let (id, agent, tx) = (window.id, window.agent.clone(), self.tx.clone());
-            let session = session.clone();
+            let (session, budget) = (session.clone(), window.budget);
             tokio::spawn(async move {
-                let result = load(&session, &agent, want).await;
+                let result = load(&session, &agent, want, budget).await;
                 let _ = tx.send(Work::Page {
                     window: id,
                     direction,
@@ -228,15 +236,16 @@ mod tests {
     /// loaded: what lies far above is let go, to be read again when the view nears it.
     #[tokio::test]
     async fn a_followed_transcript_keeps_only_its_newest_entries_loaded() {
-        let (_root, mut app) = fixture().await;
+        let budget = Budget::SMALL;
+        let (_root, mut app) = fixture_within(budget).await;
         let session = app.session().unwrap().clone();
         let root = session.root_agent().clone();
-        let total = model::KEPT + 2 * PAGE;
+        let total = budget.kept + 2 * budget.page;
         let shown = |event: &skyhook::session::SessionEvent| {
             matches!(event, skyhook::session::SessionEvent::Status { .. })
         };
         // A batch at a time, so the app keeps up with the updates.
-        for batch in (0..total).collect::<Vec<_>>().chunks(PAGE) {
+        for batch in (0..total).collect::<Vec<_>>().chunks(budget.page) {
             let statuses = batch.iter().map(|status| {
                 let message = format!("status {status}");
                 session.record_status(root.clone(), message)
@@ -255,7 +264,7 @@ mod tests {
             .filter(|entry| entry.text().starts_with("Status"));
         let loaded = statuses.count();
         assert!(
-            (model::KEPT / 2..=model::KEPT / 2 + PAGE).contains(&loaded),
+            (budget.kept / 2..=budget.kept / 2 + budget.page).contains(&loaded),
             "{loaded}"
         );
         let last = app.journal.last().unwrap();
@@ -279,27 +288,32 @@ mod tests {
         use futures_util::StreamExt;
         let (_root, app) = fixture().await;
         let session = app.session().unwrap().clone();
-        let total = model::KEPT + LIST_PAGE + 2;
+        // Four list pages kept, as the terminal keeps.
+        let budget = Budget {
+            kept: 4 * Budget::SMALL.list_page,
+            ..Budget::SMALL
+        };
+        let total = budget.kept + budget.list_page + 2;
         // Run together: nothing below depends on the order the scripts ran in.
         let scripts = futures_util::stream::repeat_with(|| session.run_script("return 1;"));
         let scripts = scripts.take(total).buffer_unordered(64);
         let ran = bounded(scripts.collect::<Vec<_>>()).await;
         assert!(ran.into_iter().all(|ran| ran.is_ok()));
-        let (_viewer, mut app) = viewing(&session, Tab::Jobs).await;
+        let (_viewer, mut app) = viewing_within(&session, Tab::Jobs, budget).await;
         let jobs = |app: &App| {
             app.entries()
                 .iter()
                 .filter_map(model::Entry::job_id)
                 .count()
         };
-        assert_eq!(jobs(&app), LIST_PAGE);
+        assert_eq!(jobs(&app), budget.list_page);
         let earlier = model::EntryKey::Gap(model::Gap::Earlier);
         assert_eq!(app.entries()[0].key(), &earlier);
         app.focus = super::super::Focus::Content;
-        for _ in 0..total.div_ceil(LIST_PAGE) {
+        for _ in 0..total.div_ceil(budget.list_page) {
             key(&mut app, KeyCode::Home, M::NONE);
             settled(&mut app).await;
-            assert!(jobs(&app) <= model::KEPT);
+            assert!(jobs(&app) <= budget.kept);
         }
         let roots = JobScope::Roots(app.selected.clone());
         let first = bounded(session.jobs().page(roots, Page::First, 1)).await;
@@ -399,7 +413,8 @@ mod tests {
             let loaded = bounded(loaded).await.unwrap();
             let focus = Edge::At(model::Focus::Ordinal(ordinal));
             let id = window_id();
-            let mut window = model::Window::new(root.clone(), Tab::Conversation, id, focus);
+            let budget = Budget::DEFAULT;
+            let mut window = model::Window::new(root.clone(), Tab::Conversation, id, focus, budget);
             window.plan(&[], focus..=focus);
             window.loaded(Direction::Down, loaded);
             reads.push(Whole {

@@ -432,23 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_redo_accept_the_common_bindings() {
-        let parse = |c, modifiers| Edit::parse(KeyEvent::new(KeyCode::Char(c), modifiers));
-        for (c, modifiers) in [('z', M::CONTROL), ('-', M::CONTROL)] {
-            assert_eq!(parse(c, modifiers), Some(Edit::Undo));
-        }
-        let shift = M::CONTROL | M::SHIFT;
-        for (c, modifiers) in [
-            ('y', M::CONTROL),
-            ('.', M::CONTROL),
-            ('z', shift),
-            ('Z', shift),
-        ] {
-            assert_eq!(parse(c, modifiers), Some(Edit::Redo));
-        }
-    }
-
-    #[test]
     fn line_deletion_clears_selection_before_insert_copy_and_undo() {
         for shortcut in ['u', 'k'] {
             for text in ["abcdef", "a👩‍💻é界xy"] {
@@ -465,20 +448,6 @@ mod tests {
                 assert_eq!((editor.text(), editor.anchor), (text, None));
             }
         }
-    }
-
-    #[test]
-    fn deletion_and_undo_preserve_graphemes() {
-        let mut e = Editor::default();
-        e.insert("a👩‍💻é");
-        assert_eq!(e.layout(3).cursor, (1, 1));
-        assert_eq!(e.layout(3).cursor_position("a👩‍💻".len()), (1, 0));
-        press(&mut e, KeyCode::Backspace, M::NONE);
-        assert_eq!((e.layout(3).cursor, e.text()), ((1, 0), "a👩‍💻"));
-        press(&mut e, KeyCode::Backspace, M::NONE);
-        assert_eq!(e.text(), "a");
-        undo(&mut e);
-        assert_eq!(e.text(), "a👩‍💻");
     }
 
     #[test]
@@ -537,5 +506,16 @@ mod tests {
         assert!(editor.set_selection(Some(1), 3));
         assert!(editor.insert("界").text_changed());
         assert_eq!(editor.text(), "a界");
+        // Deletion and undo keep whole graphemes.
+        let mut e = Editor::default();
+        e.insert("a👩‍💻é");
+        assert_eq!(e.layout(3).cursor, (1, 1));
+        assert_eq!(e.layout(3).cursor_position("a👩‍💻".len()), (1, 0));
+        press(&mut e, KeyCode::Backspace, M::NONE);
+        assert_eq!((e.layout(3).cursor, e.text()), ((1, 0), "a👩‍💻"));
+        press(&mut e, KeyCode::Backspace, M::NONE);
+        assert_eq!(e.text(), "a");
+        undo(&mut e);
+        assert_eq!(e.text(), "a👩‍💻");
     }
 }

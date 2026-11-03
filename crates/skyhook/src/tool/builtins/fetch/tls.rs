@@ -67,7 +67,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::tests::executor;
-    use crate::provider::http::transport::tests::read_request;
+    use crate::tests::read_request;
     use rcgen::generate_simple_self_signed;
     use serde_json::json;
     use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};

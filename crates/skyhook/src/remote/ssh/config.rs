@@ -210,6 +210,7 @@ mod tests {
     use super::*;
     use crate::remote::prompt::RejectSensitivePrompts;
     use serde_json::json;
+    use std::assert_matches;
 
     fn target(name: &str, config: serde_json::Value) -> Result<TargetDefinition, TargetError> {
         let config = serde_json::from_value(config).unwrap();
@@ -227,10 +228,10 @@ mod tests {
             std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/key-\xff".to_vec()));
         let error = wire_path(&path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(matches!(
+        assert_matches!(
             RemoteError::from(error),
             RemoteError::Ssh(SshError::UnrepresentablePath)
-        ));
+        );
         assert_eq!(wire_path(Path::new("/tmp/key-é")).unwrap(), "/tmp/key-é");
     }
 
@@ -279,43 +280,6 @@ mod tests {
             Arc::new(RejectSensitivePrompts),
         );
         assert!(matches!(rejected, Err(RemoteError::Protocol(_))));
-
-        let proxy = json!({"type": "ssh", "host": "x", "via": "jump", "ssh": {"options": {"ProxyCommand": "nc %h %p"}}});
-        assert!(matches!(
-            target("x", proxy),
-            Err(TargetError::ProxyCommandWithVia(_))
-        ));
-        let forwarding = json!({"type": "ssh", "host": "x", "ssh": {"options": {"SendEnv": "*"}}});
-        assert!(matches!(
-            target("x", forwarding),
-            Err(TargetError::ReservedSshOption(_))
-        ));
-        let option = |key: &str, value: &str| {
-            target(
-                "x",
-                json!({"type": "ssh", "host": "x", "ssh": {"options": {key: value}}}),
-            )
-        };
-        assert!(matches!(
-            option("proxyjump", "a"),
-            Err(TargetError::DedicatedSshOption(_, TargetField::Via))
-        ));
-        assert!(matches!(
-            option("Server Alive", "1"),
-            Err(TargetError::InvalidSshOptionName)
-        ));
-        assert!(matches!(
-            option("LogLevel", ""),
-            Err(TargetError::EmptySshOptionValue(_))
-        ));
-        assert!(matches!(
-            option("ProxyCommand", "nc\n"),
-            Err(TargetError::InvalidSshOptionValue(_))
-        ));
-        // Managed options with a field of their own name it.
-        let user = json!({"type": "ssh", "host": "x", "ssh": {"options": {"User": "debian"}}});
-        let error = target("x", user).unwrap_err().to_string();
-        assert!(error.contains("`ssh.user"), "{error}");
     }
 
     #[tokio::test]

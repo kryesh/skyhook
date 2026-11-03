@@ -100,28 +100,89 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, StartupError>
 #[cfg(test)]
 mod tests {
     use super::super::tests::assert_process_reaped;
-    use super::super::tests::{Fixture, connect, failure, shutdown};
+    use super::super::tests::{Fixture, failure, shutdown};
     use super::super::{McpError, McpManager};
     use super::*;
     use crate::tests::bounded;
+    use rmcp::ServiceExt;
     use serde_json::{Value, json};
+    use std::assert_matches;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    /// Discovery from an in-process server that advertises `tools` and answers every
+    /// tools/list with `listed`; returns what discovery found and the requests it saw.
+    async fn discovered(
+        tools: bool,
+        listed: Value,
+    ) -> (Result<Vec<Tool>, StartupError>, Vec<Value>) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let (mut lines, mut requests) = (tokio::io::BufReader::new(read).lines(), Vec::new());
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                requests.push(request.clone());
+                let Some(id) = request.get("id") else {
+                    continue;
+                };
+                let mut reply = match request["method"].as_str() {
+                    Some("initialize") => json!({"result": {
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": if tools { json!({"tools": {}}) } else { json!({"resources": {}}) },
+                        "serverInfo": {"name": "fixture", "version": "1"},
+                    }}),
+                    _ => listed.clone(),
+                };
+                (reply["jsonrpc"], reply["id"]) = ("2.0".into(), id.clone());
+                let reply = format!("{reply}\n");
+                // Discovery may stop reading once it fails.
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            requests
+        });
+        let (read, write) = tokio::io::split(client);
+        let transport = rmcp::transport::async_rw::AsyncRwTransport::new_client(read, write);
+        let client = bounded(().serve(transport)).await.unwrap();
+        let result = bounded(discover(&client)).await;
+        drop(client);
+        (result, bounded(server).await.unwrap())
+    }
 
     #[tokio::test]
     async fn discovery_limits_skip_and_reap_unusable_servers() {
-        const LIMITS: [(&str, DiscoveryLimit); 3] = [
-            ("oversized_schema", DiscoveryLimit::ToolSize),
-            ("many_tools", DiscoveryLimit::CatalogSize),
-            ("repeated_cursor", DiscoveryLimit::RepeatedCursor),
-        ];
-        let modes = LIMITS.map(|(mode, _)| mode);
-        let fixtures: [Fixture; LIMITS.len()] = std::array::from_fn(|_| Fixture::new());
-        let configs = std::iter::zip(modes, &fixtures)
-            .map(|(mode, fixture)| {
-                let mut config = fixture.config();
-                config.env.insert("MCP_TEST_DISCOVERY".into(), mode.into());
-                (mode.to_owned(), config.try_into().unwrap())
-            })
+        let tool = |name: String| json!({"name": name, "inputSchema": {"type": "object"}});
+        let huge = json!({"name": "huge", "description": "x".repeat(MAX_TOOL_BYTES),
+            "inputSchema": {"type": "object"}});
+        let many: Vec<_> = (0..=MAX_TOOLS)
+            .map(|index| tool(format!("tool_{index}")))
             .collect();
+        for (listed, limit) in [
+            (json!({"tools": [huge]}), DiscoveryLimit::ToolSize),
+            (json!({"tools": many}), DiscoveryLimit::CatalogSize),
+            (
+                json!({"tools": [], "nextCursor": "repeat"}),
+                DiscoveryLimit::RepeatedCursor,
+            ),
+        ] {
+            let (result, _) = discovered(true, json!({"result": listed})).await;
+            assert_matches!(result, Err(StartupError::Limit(found)) if found == limit);
+        }
+        // A failed tools/list also rejects the server, retaining discovery context.
+        let error = json!({"error": {"code": -32602, "message": "fixture discovery error"}});
+        let (result, _) = discovered(true, error).await;
+        assert_matches!(
+            result,
+            Err(StartupError::Discovery(McpError::JsonRpc(-32602))),
+            "{result:?}"
+        );
+        // A server rejected at discovery is skipped and its process reaped.
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        let repeated = "repeated_cursor";
+        (config.env).insert("MCP_TEST_DISCOVERY".into(), repeated.into());
+        let configs = [(repeated.to_owned(), config.try_into().unwrap())].into();
         let manager = McpManager::connect(
             &configs,
             &Default::default(),
@@ -130,35 +191,10 @@ mod tests {
         )
         .await;
         assert!(manager.catalog().is_empty());
-        for (mode, limit) in LIMITS {
-            assert!(matches!(*failure(&manager, mode), StartupError::Limit(l) if l == limit));
-        }
-        for fixture in &fixtures {
-            assert_process_reaped(fixture.pid()).await;
-        }
-        shutdown(&manager).await;
-
-        // A failed tools/list also rejects the server, retaining discovery context.
-        let fixture = &fixtures[0];
-        let mut config = fixture.config();
-        config
-            .env
-            .insert("MCP_TEST_DISCOVERY".into(), "rpc_error".into());
-        let workspace = std::env::temp_dir();
-        let connect = super::super::connection::connect_one(
-            config.try_into().unwrap(),
-            &workspace,
-            Default::default(),
-            std::future::pending(),
-        );
-        let Some(Err(error)) = bounded(connect).await else {
-            panic!("failed tools/list must reject the server");
-        };
-        assert!(
-            matches!(error, StartupError::Discovery(McpError::JsonRpc(-32602))),
-            "{error}"
-        );
+        let limit = DiscoveryLimit::RepeatedCursor;
+        assert_matches!(*failure(&manager, repeated), StartupError::Limit(l) if l == limit);
         assert_process_reaped(fixture.pid()).await;
+        shutdown(&manager).await;
     }
 
     #[test]
@@ -169,20 +205,15 @@ mod tests {
 
     #[tokio::test]
     async fn resources_only_server_gets_no_tools_requests_or_extra_client_capabilities() {
-        let fixture = Fixture::new();
-        let mut config = fixture.config();
-        config.env.insert("MCP_TEST_NO_TOOLS".into(), "1".into());
-        let manager = connect(config).await;
-        assert!(manager.catalog().is_empty());
-        assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-        assert!(!fixture.directory.path().join("list").exists());
-        let initialize: Value =
-            serde_json::from_str(&std::fs::read_to_string(fixture.path("initialize")).unwrap())
-                .unwrap();
-        let capabilities = initialize["capabilities"].as_object().unwrap();
+        let (result, requests) = discovered(false, Value::Null).await;
+        assert!(result.unwrap().is_empty());
+        let methods: Vec<_> = (requests.iter())
+            .filter_map(|request| request["method"].as_str())
+            .collect();
+        assert!(!methods.contains(&"tools/list"), "{methods:?}");
+        let capabilities = requests[0]["params"]["capabilities"].as_object().unwrap();
         assert!(!capabilities.contains_key("sampling"));
         assert!(!capabilities.contains_key("elicitation"));
         assert!(!capabilities.contains_key("roots"));
-        shutdown(&manager).await;
     }
 }

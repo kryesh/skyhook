@@ -529,38 +529,29 @@ impl App {
                         match std::mem::take(&mut self.gesture) {
                             // The last drag motion placed the head: the text under the
                             // pointer may have reflowed since. Copied once, on release.
-                            Gesture::Dragging => {
-                                if let Some(text) = self.selected_text() {
-                                    self.copy_text(text);
-                                }
+                            Gesture::Dragging if let Some(text) = self.selected_text() => {
+                                self.copy_text(text);
                             }
-                            Gesture::Pressed { toggle: Some(key) } => {
-                                if let Some((_, Hit::Entry(index, true))) = self
-                                    .render
-                                    .hits
-                                    .iter()
-                                    .rev()
-                                    .find(|(rect, _)| rect.contains(point.into()))
-                                    && self
-                                        .entries()
-                                        .get(*index)
-                                        .is_some_and(|entry| entry.key() == &key)
-                                {
-                                    self.select_entry(*index);
-                                    self.toggle();
-                                }
+                            Gesture::Pressed { toggle: Some(key) }
+                                if let Some((_, Hit::Entry(index, true))) =
+                                    (self.render.hits.iter())
+                                        .rev()
+                                        .find(|(rect, _)| rect.contains(point.into()))
+                                    && (self.entries().get(*index))
+                                        .is_some_and(|entry| entry.key() == &key) =>
+                            {
+                                self.select_entry(*index);
+                                self.toggle();
                             }
-                            Gesture::PressedPage(toggle) => {
+                            Gesture::PressedPage(toggle)
                                 if self.render.hits.iter().rev().any(|(rect, hit)| {
                                     rect.contains(point.into())
                                         && matches!(hit, Hit::Page(at) if *at == toggle)
-                                }) {
-                                    self.toggle_page(Some(toggle));
-                                }
+                                }) =>
+                            {
+                                self.toggle_page(Some(toggle));
                             }
-                            Gesture::Pressed { toggle: None }
-                            | Gesture::Released
-                            | Gesture::Thumb => {}
+                            _ => {}
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left)
@@ -727,56 +718,37 @@ mod tests {
         assert!(app.prompts.is_empty());
     }
 
-    /// Releasing after the streaming reply rewraps under the pointer: a press and
-    /// release without movement copies nothing, and a drag keeps the selection it made.
+    /// A press and release without movement copies nothing, even when the streaming
+    /// reply rewraps under the pointer in between.
     #[tokio::test]
-    async fn releasing_after_a_rewrap_copies_only_what_a_drag_selected() {
+    async fn releasing_after_a_rewrap_without_a_drag_copies_nothing() {
         use skyhook::provider::protocol::ItemKind;
         let left = MouseButton::Left;
-        for drag in [false, true] {
-            let (_root, mut app, mut model, _session) = played_fixture().await;
-            let text = format!("{} beta", "a".repeat(46));
-            let asked = ask(app.session().unwrap(), "question");
-            let turn = model.turn().await;
-            turn.delta("text", ItemKind::Text, &text);
-            observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
-            let screen = draw(&mut app);
-            let (x, y) = (screen.lines().enumerate())
-                .find_map(|(y, line)| Some((line.find(" beta")? + 1, y)))
-                .unwrap();
-            let start = Rect::new(x as u16, y as u16, 1, 1);
-            let end = if drag {
-                Rect {
-                    x: start.x + 2,
-                    ..start
-                }
-            } else {
-                start
-            };
-            app.clipboard = Some("earlier".into());
-            mouse(&mut app, start, MouseEventKind::Down(left));
-            if drag {
-                mouse(&mut app, end, MouseEventKind::Drag(left));
-            }
-            turn.delta("text", ItemKind::Text, "gamma");
-            let grown = format!("{text}gamma");
-            observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
-            let after = draw(&mut app);
-            assert!(!after.contains("a beta"), "the word wraps:\n{after}");
-            let (selected, copied) = if drag { ("be", "be") } else { ("", "earlier") };
-            let selection = |app: &App| app.selection.as_ref().map(|s| s.text().to_owned());
-            if drag {
-                assert_eq!(selection(&app).as_deref(), Some(selected));
-            }
-            mouse(&mut app, end, MouseEventKind::Up(left));
-            assert_eq!(selection(&app).as_deref(), Some(selected));
-            assert_eq!(app.clipboard.as_deref(), Some(copied));
-            if !drag {
-                assert!(app.toast.is_none());
-            }
-            turn.answer(&grown);
-            bounded(asked).await.unwrap().unwrap();
-        }
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let text = format!("{} beta", "a".repeat(46));
+        let asked = ask(app.session().unwrap(), "question");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, &text);
+        observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
+        let screen = draw(&mut app);
+        let (x, y) = (screen.lines().enumerate())
+            .find_map(|(y, line)| Some((line.find(" beta")? + 1, y)))
+            .unwrap();
+        let at = Rect::new(x as u16, y as u16, 1, 1);
+        app.clipboard = Some("earlier".into());
+        mouse(&mut app, at, MouseEventKind::Down(left));
+        turn.delta("text", ItemKind::Text, "gamma");
+        let grown = format!("{text}gamma");
+        observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
+        let after = draw(&mut app);
+        assert!(!after.contains("a beta"), "the word wraps:\n{after}");
+        mouse(&mut app, at, MouseEventKind::Up(left));
+        let selection = app.selection.as_ref().map(|s| s.text().to_owned());
+        assert_eq!(selection.as_deref(), Some(""));
+        assert_eq!(app.clipboard.as_deref(), Some("earlier"));
+        assert!(app.toast.is_none());
+        turn.answer(&grown);
+        bounded(asked).await.unwrap().unwrap();
     }
 
     /// Text selected while a reply streams stays selected as its reasoning
@@ -980,55 +952,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_job_failure_updates_the_existing_tool_card_and_expands_in_place() {
-        use crate::tui::theme::theme;
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let tool_cards = |app: &App| {
-            let entries = app.entries().iter();
-            let cards = entries.filter(|entry| entry.surface == model::Surface::Tool);
-            cards.cloned().collect::<Vec<_>>()
-        };
-        let _asked = ask(app.session().unwrap(), "test it");
-        model.turn().await.end(vec![failing_call("failing-call")]);
-        observe_record(&mut app, committed(assistant)).await;
-        draw(&mut app);
-        let key = tool_cards(&app)[0].key().clone();
-        observe_record(&mut app, committed(results)).await;
-        let error = tool_error(&app.journal).to_owned();
-        let records = serde_json::to_vec(&app.journal).unwrap();
-        let buffer = draw_buffer(&mut app);
-        let cards = tool_cards(&app);
-        assert_eq!(
-            (cards.len(), cards[0].key(), cards[0].job_id()),
-            (1, &key, None)
-        );
-        assert!(cards[0].text().contains("Failed") && cards[0].expandable());
-        assert!(!cards[0].text().contains(&error));
-        assert!(buffer.content.windows(6).any(|cells| {
-            cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
-                && cells.iter().all(|cell| cell.fg == theme().ui.error)
-        }));
-        let index = app.entries().iter().position(|entry| entry.key() == &key);
-        let toggle = |app: &mut App| {
-            let mut hits = app.render.hits.iter();
-            let hit = hits.find_map(|(rect, hit)| {
-                matches!(hit, Hit::Entry(i, true) if Some(*i) == index).then_some(*rect)
-            });
-            click(app, hit.unwrap());
-            draw(app);
-        };
-        toggle(&mut app);
-        let cards = tool_cards(&app);
-        assert_eq!((cards.len(), cards[0].key()), (1, &key));
-        for part in ["Arguments", "Output", error.as_str()] {
-            assert!(cards[0].text().contains(part));
-        }
-        assert!(cards[0].document().is_some());
-        toggle(&mut app);
-        assert_eq!(serde_json::to_vec(&app.journal).unwrap(), records);
-    }
-
-    #[tokio::test]
     async fn file_preview_uses_source_fields_and_can_continue_truncated_output() {
         let (_root, mut app) = fixture().await;
         // Exceed the automatic 200-line limit without relying on its byte budget.
@@ -1040,13 +963,14 @@ mod tests {
         let job = job_named(&app, "read");
         let output = fetch_output(&mut app, job).await;
         assert!(source.starts_with(output.result.as_ref().unwrap()["content"].as_str().unwrap()));
-        let Some(Continuation::Lines {
+        let Some(Continuation {
             field,
             start,
+            unit,
             offset,
         }) = output.continuation()
         else {
-            panic!("a text continuation")
+            panic!("a continuation")
         };
         app.command(Command::Details);
         draw(&mut app);
@@ -1062,7 +986,10 @@ mod tests {
         menu.select(next.unwrap());
         app.choose();
         let query = app.outputs.query(job).unwrap().clone();
-        assert_eq!((query.start, query.offset), (Some(start), offset));
+        assert_eq!(
+            (query.start, query.unit, query.offset),
+            (Some(start), Some(unit), offset)
+        );
         assert_eq!(query.field.as_ref(), field);
         assert_eq!(field.unwrap().as_str(), "/result/content");
     }

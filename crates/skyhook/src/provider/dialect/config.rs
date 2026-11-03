@@ -91,10 +91,10 @@ impl Sourced {
     pub(crate) fn admit(&self, field: ValueField) -> Result<Source, ValueError> {
         let problem = match self {
             Self::Literal(value) if value.trim().is_empty() => ValueProblem::Blank,
-            Self::Literal(value) => match HeaderValue::from_str(value) {
-                Ok(value) => return Ok(Source::Literal(value)),
-                Err(_) => ValueProblem::InvalidHeaderValue,
-            },
+            Self::Literal(value) if let Ok(value) = HeaderValue::from_str(value) => {
+                return Ok(Source::Literal(value));
+            }
+            Self::Literal(_) => ValueProblem::InvalidHeaderValue,
             Self::Env { env } if env.trim().is_empty() || env.contains(['=', '\0']) => {
                 ValueProblem::InvalidEnvName
             }

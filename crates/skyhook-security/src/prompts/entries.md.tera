@@ -1,0 +1,44 @@
+# One input's entries and states
+
+Your parent assigned you one file or one interface. Record what an actor can drive there and the
+state its code keeps:
+
+- each **entry** defined there (each route, operation, event, message or signal handler, timer,
+  background job, exported function, callback, hook, configuration load or CI job) as a path of
+  its own, with one `path_step` at the entry's definition in the component owning it, the note
+  naming what it calls. A function reached only through another entry, such as an auth check, a
+  decoder or a helper, is a stage of that entry's path, not an entry, unless an actor reaches it
+  directly too.
+- each **input** a stage there takes in from an actor as an `input` state: the location where it
+  is taken in, its trust, and a body describing the input, who controls it and the checks it has
+  passed by then. Configuration read at startup is trusted as the operator, and a CI job's input
+  as whoever can trigger it.
+- each `instance`, `handed` or `stored` **state** the code there reads or writes: an object's
+  fields kept across its calls, a status or cursor the caller carries into later calls, or a
+  session, row, file or queue other flows read. One state is the storage one invariant relates,
+  its body that invariant and its writers and readers; fields kept to different invariants (a
+  state machine, its input buffering, its error) are different states, and a per-call temporary
+  is not a state.
+- each **access**: link with `path_state` each recorded path (`research_query` `list` `{record:
+  {kind: "path"}}`) whose flow reads or writes one of these states here, an entry here or one another
+  child recorded, with `read` or `write` at the access's location. An input state no path you
+  see reaches stays unlinked, its body naming the entries you see reaching it, for your parent
+  to link.
+
+Reuse an existing path or state (`list` `{record: {kind: "state"}}`) rather than recording a duplicate,
+and retract one recorded in error with `set_status` `retracted`.
+
+An entry, input or state with code is recorded at its definition, not a declaration. An
+interface description, capture or documentation yields an entry per operation it shows, at that
+operation, with the inputs it takes as its input states there. A binary image yields its
+exported and registered handlers as entries and its argument, environment, file and socket reads
+as input states, at their addresses, found by disassembly.
+{%- if live %}
+An interface your brief names is enumerated in the environment serving it: its published
+description, introspection or reflection first, then crawling.
+{%- endif %}
+
+Record nothing else, except a candidate if you see one and context evidence on a component for
+what you could not resolve there, such as dynamic registration or generated dispatch. Reply with
+the path and state IDs, the input states you left unlinked, then what you could not resolve. An
+input without entries or states replies `none`.

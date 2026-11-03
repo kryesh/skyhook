@@ -368,6 +368,7 @@ mod tests {
         tool::{ToolContext, policy::Capability},
     };
     use serde_json::json;
+    use std::assert_matches;
 
     type Batches = Arc<StdMutex<Vec<Vec<Question>>>>;
     type Backgrounds = Arc<StdMutex<Vec<bool>>>;
@@ -429,7 +430,7 @@ mod tests {
     async fn hanging_session(root: &tempfile::TempDir) -> SessionHandle {
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
-        harness.new_session().await.unwrap()
+        ephemeral_session(&harness).await
     }
 
     async fn mode_session(
@@ -450,7 +451,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        (harness.new_session().await.unwrap(), batches, backgrounds)
+        (ephemeral_session(&harness).await, batches, backgrounds)
     }
 
     #[tokio::test]
@@ -478,29 +479,21 @@ mod tests {
             assert_eq!(results[1].result["result"], "yes");
         }
         assert_eq!(*backgrounds.lock().unwrap(), [false]);
-        shutdown_session(session).await;
 
         // A mixed batch, or a foreground batch inside a background script, is
         // irrevocable on dismissal; neither nesting nor launch mode alone is.
-        for (script_background, ask_background) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
-            let root = tempfile::tempdir().unwrap();
-            let background = script_background || ask_background;
-            let provider = Arc::new(HangingProvider);
-            let (session, _, backgrounds) =
-                mode_session(root.path(), provider, "yes", background).await;
+        let asks = async |session: &SessionHandle, script_background, ask_background| {
             let source = format!(
                 "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
             );
             let arguments = json!({"source": source, "bg": script_background});
             let script = (session.runtime.executor).run_model(&session.root, "script", arguments);
             let script = bounded(script).await.unwrap();
-            let output = terminal(&session, script.job).await.output.unwrap();
+            let output = terminal(session, script.job).await.output.unwrap();
             for ask in output["value"].as_array().unwrap() {
                 if let Some(job) = ask.get("job") {
                     let job = serde_json::from_value(job.clone()).unwrap();
-                    let result = terminal(&session, job).await;
+                    let result = terminal(session, job).await;
                     assert_eq!(result.state, JobState::Failed);
                     assert!(
                         result
@@ -508,16 +501,24 @@ mod tests {
                             .unwrap()
                             .contains("question cancelled")
                     );
-                } else if background {
+                } else if script_background || ask_background {
                     let error = ask["error"].as_str().unwrap();
                     assert!(error.contains("question cancelled"));
                 } else {
                     assert_eq!(ask["answer"], json!("yes"));
                 }
             }
-            assert_eq!(*backgrounds.lock().unwrap(), [background]);
-            shutdown_session(session).await;
+        };
+        asks(&session, false, false).await;
+        assert_eq!(*backgrounds.lock().unwrap(), [false, false]);
+        shutdown_session(session).await;
+        let provider = Arc::new(HangingProvider);
+        let (session, _, backgrounds) = mode_session(root.path(), provider, "yes", true).await;
+        for (script_background, ask_background) in [(false, true), (true, false), (true, true)] {
+            asks(&session, script_background, ask_background).await;
         }
+        assert_eq!(*backgrounds.lock().unwrap(), [true; 3]);
+        shutdown_session(session).await;
     }
 
     /// A sibling ask holds its batch open until it joins or, like one rejected
@@ -577,8 +578,11 @@ mod tests {
         shutdown_session(session).await;
     }
 
+    /// A background child's asks from separate calls merge into its owner's
+    /// questions; a repeated id fails. Answering them is
+    /// `a_childs_batched_questions_resolve_one_answer_at_a_time`'s.
     #[tokio::test]
-    async fn background_child_asks_merge_across_turns_and_resolve_independently() {
+    async fn background_child_asks_merge_across_turns() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
         let owner = owner(&session, false).await;
@@ -589,7 +593,6 @@ mod tests {
             let asked = move |state: &CoreState| asked(state).filter(|ids| ids.len() == count);
             found(&session, [Key::Job(owner)], asked).await
         };
-        let mut asks = Vec::new();
         for (index, id) in ["first", "second", "second"].into_iter().enumerate() {
             let arguments = json!({"id":id, "prompt":"Question?", "bg":true});
             let child = session.root.child(1);
@@ -601,22 +604,8 @@ mod tests {
                 assert_eq!(terminal(&session, result.job).await.state, JobState::Failed);
                 continue;
             }
-            asks.push(result.job);
             waiting_with(index + 1).await;
         }
-        let answers = [("first", "one"), ("second", "two")];
-        for (index, (id, value)) in answers.into_iter().enumerate() {
-            assert!(jobs.answer(owner, json!({(id):value})).await.unwrap());
-            let output = terminal(&session, asks[index]).await.output;
-            assert_eq!(output, Some(json!(value)));
-            if index == 0 {
-                let remaining = jobs.snapshot(owner).await.unwrap();
-                assert_eq!(remaining.state, JobState::WaitingInput);
-                let left = session.runtime.store.read(asked);
-                assert_eq!(left, Some(vec!["second".to_owned()]));
-            }
-        }
-        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
         jobs.cancel(owner).await.unwrap();
         shutdown_session(session).await;
     }
@@ -649,7 +638,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let session = harness.new_session().await.unwrap();
+            let session = ephemeral_session(&harness).await;
             // The idle root is told about its background child's question and would
             // spend a scripted response on it; this test answers through scripts.
             let root_inbox = quiet_root(&session);
@@ -679,44 +668,42 @@ mod tests {
 
     #[tokio::test]
     async fn question_coordinator_rechecks_root_gate_before_waiting_for_input() {
-        for with_handler in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let batches = Batches::default();
-            let mut capabilities = CapabilitySet::default();
-            capabilities.remove(&Capability::Interactive);
-            let (provider, sessions) = (Arc::new(HangingProvider), root.path().join("sessions"));
-            let mut builder =
-                test_builder(root.path(), &sessions, provider, false).capabilities(capabilities);
-            if with_handler {
-                let batches = batches.clone();
-                let handler = RecordingQuestions {
-                    batches,
-                    ..Default::default()
-                };
-                builder = builder.question_handler(Arc::new(handler));
-            }
-            let session = builder.build().await.unwrap().new_session().await.unwrap();
-            let (jobs, questions) = (&session.runtime.jobs, &session.runtime.questions);
-            for background in [false, true] {
-                let spec = JobSpec {
-                    accepts_input: true,
-                    background,
-                    ..JobSpec::test(session.root.clone(), "ask")
-                };
-                let (context, _worker) = ask_context(&session, root.path(), spec).await;
-                let job = context.job();
-                let asked = questions.coordinate_question(context, question("bypass"));
-                let error = bounded(asked).await.unwrap_err();
-                assert!(matches!(
-                    error.diagnostic().cause,
-                    crate::tool::diagnostic::Cause::Denied(_)
-                ));
-                let state = jobs.snapshot(job).await.unwrap().state;
-                assert_ne!(state, JobState::WaitingInput);
-                jobs.cancel(job).await.unwrap();
-            }
-            assert!(batches.lock().unwrap().is_empty());
-            shutdown_session(session).await;
+        let root = tempfile::tempdir().unwrap();
+        let batches = Batches::default();
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(&Capability::Interactive);
+        let (provider, sessions) = (Arc::new(HangingProvider), root.path().join("sessions"));
+        let handler = RecordingQuestions {
+            batches: batches.clone(),
+            ..Default::default()
+        };
+        let harness = test_builder(root.path(), &sessions, provider, false)
+            .capabilities(capabilities)
+            .question_handler(Arc::new(handler))
+            .build()
+            .await
+            .unwrap();
+        let session = ephemeral_session(&harness).await;
+        let (jobs, questions) = (&session.runtime.jobs, &session.runtime.questions);
+        for background in [false, true] {
+            let spec = JobSpec {
+                accepts_input: true,
+                background,
+                ..JobSpec::test(session.root.clone(), "ask")
+            };
+            let (context, _worker) = ask_context(&session, root.path(), spec).await;
+            let job = context.job();
+            let asked = questions.coordinate_question(context, question("bypass"));
+            let error = bounded(asked).await.unwrap_err();
+            assert_matches!(
+                error.diagnostic().cause,
+                crate::tool::diagnostic::Cause::Denied(_)
+            );
+            let state = jobs.snapshot(job).await.unwrap().state;
+            assert_ne!(state, JobState::WaitingInput);
+            jobs.cancel(job).await.unwrap();
         }
+        assert!(batches.lock().unwrap().is_empty());
+        shutdown_session(session).await;
     }
 }

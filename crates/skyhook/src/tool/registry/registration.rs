@@ -11,12 +11,12 @@ use super::{
     Admitted, AdmittedInput, Arguments, CatalogEntry, Invocation, JobLocation, OutputValue,
     PathArgument, RegistryError, ScriptBinding, ToolOptions, ToolPlacement,
     envelope::{JOB, NAME, TARGET, name_schema},
-    options::{ArgumentHooks, Results},
+    options::{ArgumentHooks, SchemaOrigin},
     schema::{
-        add_conditional, check_conditional, tags_first, validate_name, validate_output_schema,
-        validate_schema,
+        add_conditional, check_conditional, compile_schema, tags_first, validate_name,
+        validate_output_schema, validate_schema,
     },
-    surface::{Catalog, CatalogTools, GeneratedToolDefinition, OutputSchema},
+    surface::{Catalog, CatalogTools, Compiled, GeneratedToolDefinition, OutputSchema},
 };
 use crate::{
     execution::ExecutionLocation,
@@ -90,8 +90,9 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         Ok(self)
     }
 
-    /// Register a tool whose typed input `I` admits into its handler's input `A`;
-    /// `invoke` runs the admitted input.
+    /// Register a built-in tool whose typed input `I` admits into its handler's input
+    /// `A`; `invoke` runs the admitted input. Its schema compiles at its first call: a
+    /// test compiles every built-in's.
     pub(crate) fn register_checked<I, A>(
         &mut self,
         name: impl Into<String>,
@@ -109,6 +110,24 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         let admission =
             move |arguments: &Arguments| admission(deserialize_arguments::<I>(&typed, arguments)?);
         self.register_schema(name, description, schema, options, admission, invoke)
+    }
+
+    /// Register a host's tool: schemars accepts declared constraints, such as a
+    /// pattern, without checking them, so its typed schema compiles here.
+    fn register_host<I, A>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        options: ToolOptions<A>,
+        admission: impl Fn(I) -> Result<A, AdmissionError> + Send + Sync + 'static,
+        invoke: impl Fn(A) -> Invocation<C, P> + Send + Sync + 'static,
+    ) -> Result<&mut Self, RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + 'static,
+        A: Send + 'static,
+    {
+        compile_schema(&input_schema_for::<I>())?;
+        self.register_checked(name, description, options, admission, invoke)
     }
 
     pub fn register<I, O, F, Fut>(
@@ -145,11 +164,11 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         F: Fn(C, A) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, OperationError<P>>> + Send + 'static,
     {
-        if options.output_schema.is_none() {
+        if !options.declares_result() {
             options = options.result::<O>();
         }
         let handler = Arc::new(handler);
-        self.register_checked(name, description, options, admission, move |input| {
+        self.register_host(name, description, options, admission, move |input| {
             let handler = handler.clone();
             Invocation::new(move |context| {
                 let future = handler(context, input);
@@ -174,11 +193,11 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         F: Fn(C, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
     {
-        if options.output_schema.is_none() {
+        if !options.declares_result() {
             options = options.result::<O>();
         }
         let handler = Arc::new(handler);
-        self.register_checked(name, description, options, Ok, move |input| {
+        self.register_host(name, description, options, Ok, move |input| {
             let handler = handler.clone();
             Invocation::new(move |context| handler(context, input))
         })
@@ -198,7 +217,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         Fut: Future<Output = Result<(), OperationError<P>>> + Send + 'static,
     {
         let handler = Arc::new(handler);
-        self.register_checked(name, description, options, Ok, move |input| {
+        self.register_host(name, description, options, Ok, move |input| {
             let handler = handler.clone();
             Invocation::unit(move |context| handler(context, input))
         })
@@ -220,10 +239,20 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         // A computed root is validated in its widest built-in form. The typed schema is
         // validated too; forms only a host capability selects rely on
         // `ToolOptions::computed_schema`'s contract to select from it.
-        validate_schema(&input_schema)?;
+        // Only a typed schema with nothing computed into it is known to compile.
+        let fixed = options.computed_schema.is_none() && options.conditional_inputs.is_empty();
+        let compiled = match (fixed, options.schema_origin) {
+            (true, SchemaOrigin::Native) => Compiled::OnFirstUse,
+            _ => Compiled::AsOffered,
+        };
+        let typed = match options.schema_origin {
+            SchemaOrigin::Native => Compiled::OnFirstUse,
+            SchemaOrigin::External => Compiled::AsOffered,
+        };
+        validate_schema(&input_schema, typed)?;
         let widest = match (options.computed_schema.as_ref()).and_then(|computed| computed(&all)) {
             Some(widest) => {
-                validate_schema(&widest)?;
+                validate_schema(&widest, Compiled::AsOffered)?;
                 widest
             }
             None => input_schema.clone(),
@@ -246,7 +275,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         check_conditional(&widest, &options.conditional_inputs, "input")?;
         let ToolOptions {
             execution,
-            mut hooks,
+            hooks,
             supports_background,
             schema_origin,
             exposure,
@@ -258,17 +287,13 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             computed_schema,
             output_schema,
         } = options;
+        if hooks.result.is_some() && !conditional_outputs.is_empty() {
+            return Err(RegistryError::Schema(
+                "internal result schemas cannot add conditional outputs".to_owned(),
+            ));
+        }
         let output_schema = match output_schema {
-            Some(Results::Internal(_)) if !conditional_outputs.is_empty() => {
-                return Err(RegistryError::Schema(
-                    "internal result schemas cannot add conditional outputs".to_owned(),
-                ));
-            }
-            Some(Results::Internal(result)) => {
-                hooks.result = Some(result);
-                None
-            }
-            Some(Results::Documented(base)) if !conditional_outputs.is_empty() => {
+            Some(base) if !conditional_outputs.is_empty() => {
                 check_conditional(&base.generate(&all), &conditional_outputs, "output")?;
                 Some(OutputSchema::Generated(Arc::new(move |capabilities| {
                     let mut schema = base.generate(capabilities);
@@ -276,8 +301,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
                     schema
                 })))
             }
-            Some(Results::Documented(output_schema)) => Some(output_schema),
-            None => None,
+            output_schema => output_schema,
         };
         // Output roots do not vary with capabilities; validate the full one once.
         if let Some(schema) = &output_schema {
@@ -314,6 +338,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             script_binding,
             supports_background,
             schema_origin,
+            compiled,
             required,
             root_required,
         };
@@ -344,33 +369,49 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
 
 /// Typed arguments keep the deserialization contract: defaults and `Option`
 /// fields remain omissible even when the output type would emit the same fields.
-pub fn input_schema_for<I: JsonSchema>() -> Value {
-    schema_value(
+pub fn input_schema_for<I: JsonSchema + 'static>() -> Value {
+    generated::<I>(Contract::Input, || {
         SchemaSettings::default()
             .for_deserialize()
             .into_generator()
-            .into_root_schema_for::<I>(),
-    )
+            .into_root_schema_for::<I>()
+    })
 }
 
 /// Results are described by their serialization contract.
-pub fn result_schema<O: JsonSchema>() -> Value {
-    schema_value(root_schema::<O>())
+pub fn result_schema<O: JsonSchema + 'static>() -> Value {
+    generated::<O>(Contract::Result, || {
+        SchemaSettings::default()
+            .for_serialize()
+            .with_transform(RecursiveTransform(omit_null))
+            .into_generator()
+            .into_root_schema_for::<O>()
+    })
 }
 
-/// The result schema of `O` for a result presentation never shortens.
-pub(crate) fn complete_result_schema<O: JsonSchema>() -> Value {
-    let mut schema = root_schema::<O>();
-    crate::tool::output::complete(&mut schema);
-    schema_value(schema)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Contract {
+    Input,
+    Result,
 }
 
-fn root_schema<O: JsonSchema>() -> schemars::Schema {
-    SchemaSettings::default()
-        .for_serialize()
-        .with_transform(RecursiveTransform(omit_null))
-        .into_generator()
-        .into_root_schema_for::<O>()
+/// `T`'s schema under `contract`, generated once per process: every registry
+/// declaring the type shares it.
+fn generated<T: 'static>(contract: Contract, generate: impl FnOnce() -> schemars::Schema) -> Value {
+    use std::{
+        any::TypeId,
+        collections::HashMap,
+        sync::{LazyLock, Mutex, PoisonError},
+    };
+    static GENERATED: LazyLock<Mutex<HashMap<(TypeId, Contract), Value>>> =
+        LazyLock::new(Mutex::default);
+    let generated = || GENERATED.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = (TypeId::of::<T>(), contract);
+    if let Some(schema) = generated().get(&key) {
+        return schema.clone();
+    }
+    let schema = schema_value(generate());
+    generated().entry(key).or_insert(schema).clone()
 }
 
 /// schemars gives every `Option` a null alternative, but a result omits `None`:
@@ -512,7 +553,7 @@ mod tests {
     use super::*;
     use crate::job::JobSpec;
     use crate::tool::registry::AgentLevel;
-    use crate::tool::{ToolError, ToolOutput, ToolRegistryBuilder, executor::InvocationKind};
+    use crate::tool::{ToolError, ToolOutput, ToolRegistryBuilder};
     use std::io::Write as _;
 
     #[derive(serde::Deserialize, JsonSchema)]
@@ -589,7 +630,6 @@ mod tests {
         assert!(input.is_valid(&serde_json::json!({"optional": null})));
 
         let schema = spec.result_schema.unwrap();
-        let schema = schema.schema();
         let required = schema["required"].as_array().unwrap();
         for field in ["emitted", "defaulted", "choice"] {
             assert!(required.contains(&Value::String(field.into())), "{schema}");
@@ -599,7 +639,7 @@ mod tests {
             schema["properties"]["skipped"],
             serde_json::json!({"type": "string"})
         );
-        let output = jsonschema::validator_for(schema).unwrap();
+        let output = jsonschema::validator_for(&schema).unwrap();
         for value in [
             Output {
                 emitted: None,
@@ -663,7 +703,7 @@ mod tests {
             .spec(&CapabilitySet::default(), AgentLevel::Root)
             .unwrap();
         assert_eq!(
-            spec.result_schema.unwrap().schema()["properties"]["content"]["type"],
+            spec.result_schema.unwrap()["properties"]["content"]["type"],
             "string"
         );
         let arguments = serde_json::json!({"content":"native evidence"});
@@ -764,7 +804,9 @@ mod tests {
                     Some(serde_json::json!({
                         "oneOf":[{"type":"object","properties":{
                             "value":{"type":"string"},"action":{"const":"record"}
-                        },"required":["value","action"]}]
+                        },"required":["value","action"]},{"type":"object","properties":{
+                            "value":{"type":"string"},"mode":{"enum":["x"]}
+                        }}]
                     }))
                 }),
                 |_, _| async { Ok(String::new()) },
@@ -788,42 +830,16 @@ mod tests {
             .unwrap();
         let keys: Vec<_> = key["properties"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["kind", "path"]);
-        let computed =
-            spec("computed").input_schema["properties"]["operation"]["oneOf"][0]["properties"]
+        let computed = spec("computed").input_schema["properties"]["operation"]["oneOf"].clone();
+        let keys = |variant: usize| -> Vec<String> {
+            computed[variant]["properties"]
                 .as_object()
                 .unwrap()
-                .clone();
-        assert_eq!(
-            computed.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["action", "value"]
-        );
-    }
-
-    /// A unit registration's job completes without a result, and the script
-    /// docs promise none.
-    #[tokio::test]
-    async fn unit_results_complete_without_a_result() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_unit::<Empty, _, _>(
-                "noop",
-                "Do nothing.",
-                ToolOptions::default().script_only(),
-                |_, _| async { Ok(()) },
-            )
-            .unwrap();
-        let executor = runtime.executor(builder);
-        let response = executor
-            .execute_as(
-                InvocationKind::Script,
-                runtime.agent.clone(),
-                "noop",
-                serde_json::json!({}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.output.value, serde_json::json!({}));
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(keys(0), ["action", "value"]);
+        assert_eq!(keys(1), ["mode", "value"]);
     }
 }

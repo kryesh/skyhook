@@ -64,13 +64,16 @@ pub fn modes() -> IndexMap<ModeName, Mode> {
             Some("Select the research target, record its deployment premises, and map the code into components."),
         ),
         mode("paths", &[Exec, Network], &[Research],
-            Some("Inventory the entry points an actor can drive and group them into paths that share one flow."),
+            Some("Record each entry an actor can drive as a path through the stages handling it, with the states its code reads and writes."),
         ),
-        mode("sources", &[Exec, Network], &[Research],
-            Some("Record one file's or interface's entry points as sources, each on a path of its own up to its handoff."),
+        mode("entries", &[Exec, Network], &[Research],
+            Some("Record one file's or interface's entries as paths, the input states taken in there and the states its code reads or writes, with their accesses."),
         ),
         mode("sweep", &[], &[Research, Scheduled],
-            Some("Sweep one path once, splitting a long one into stretches: its flaws, the premises they and its flow rely on, and its candidates."),
+            Some("Sweep paths once, splitting a long path into stretches: their flaws, premises, the states flaws leave wrong, and candidates."),
+        ),
+        mode("check", &[], &[Research, Scheduled],
+            Some("Check states across calls: every writer against every reader, in every order the caller may drive them, recording the flaws that leave a state wrong."),
         ),
         mode("sweep-part", &[], &[Research],
             Some("Sweep one stretch of a long path: its flaws, the premises they rely on, and its candidates."),
@@ -85,13 +88,13 @@ pub fn modes() -> IndexMap<ModeName, Mode> {
             Some("Score one candidate's CVSS 4.0 vector were every premise to hold."),
         ),
         mode("validate", &[Exec, Network], &[Research, Scheduled, Verdict],
-            Some("Independently review one candidate: settle what it rests on, then record a verdict."),
+            Some("Independently review one candidate: examine what it rests on, then record a verdict."),
         ),
         mode("environment", &[Write, Exec, Network], &[Research],
             Some("Prepare and record an approved, reproducible environment for live work."),
         ),
         mode("poc", &[Write, Exec, Network], &[Research, Scheduled, Test],
-            Some("Demonstrate a validated candidate in an authorized environment and record the outcome."),
+            Some("Test a candidate in an authorized environment: demonstrate a validated one, or observe the code premises an unproven one waits on."),
         ),
         mode("report", &[Write, Exec, Network], &[Research, Scheduled, Verdict],
             Some("Write one root flaw's evidence-based report, covering its group's validated scenarios, citing its tests."),
@@ -170,7 +173,12 @@ pub(crate) mod tests {
                 }
             }
         }
-        for launch in ["paths sources", "sweep sweep-part", "orchestrate poc"] {
+        for launch in [
+            "paths entries",
+            "sweep sweep-part",
+            "orchestrate check",
+            "orchestrate poc",
+        ] {
             assert!(checked.iter().any(|checked| checked == launch), "{launch}");
         }
     }

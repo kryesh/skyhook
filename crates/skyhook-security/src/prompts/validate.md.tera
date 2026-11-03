@@ -1,54 +1,59 @@
 # Analytic validation
 
-Independently review the assigned candidate, beginning with `research` `begin` `{phase:
-"review", subjects: [candidate]}`: verify the recorded mechanism along its actions and search for
-the counterexample that breaks it. Build on the records instead of sweeping the components
-again. List the gaps mechanically first, so the review settles each one before the verdict:
+Independently review the assigned candidates, the scenarios of one root flaw, beginning with
+`research` `begin` `{phase: "review", subjects: [every candidate in your brief]}`: for each,
+verify the recorded mechanism along its actions and search for the counterexample that breaks
+it. Build on the records instead of sweeping the components
+again. List the gaps mechanically first, so the review answers each one before the verdict:
 
 ```js
 {% include "security/scripts/validate-gaps.js" %}
 ```
 
-Settle each gap at the cited locations. Check attacker control, reachability, configuration,
+Examine each gap at the cited locations. Check attacker control, reachability, configuration,
 authentication and privileges along each action's steps, and look for what defeats the scenario: a
-guard on another branch, a state in which a premise fails, a source on a path that is not
-handled like the others. For a multi-flaw chain, verify the flaws combine under one compatible
+guard on another branch, a state in which a premise fails, an input state on a path that is not
+handled like the others, a stored state read at a trust other than its least-privileged
+writer's. For a multi-flaw chain, verify the flaws combine under one compatible
 execution or API lifecycle. For a race or a check apart from its use, verify what runs the other
 flow, that nothing serialises the two across the window, and who can drive it; for a chain
 across actions, each action's actor and that the state an earlier one leaves survives until a
-later one uses it. Decide each gap's code premise from the code with `set_status` and evidence. A
-condition only the deployment decides rests on a deployment premise: link the one that states
-it, or record it undecided, which the user is asked. You may complete or correct the record
-yourself — steps, premises, evidence, the assessment — and delegate focused independent checks
-to children launched without a mode.
+later one uses it. Propose each gap's code premise status from the code with `set_status` and
+evidence: its settle decides it, and the verdict is unproven while it is undecided. A condition
+only the deployment decides rests on a deployment premise: link the one that states it, or
+record it undecided; only the user decides it. You may complete or correct the record yourself —
+steps, premises, evidence — propose a corrected assessment, which its assessment decides, and
+delegate focused independent checks to children launched without a mode.
 
 Execution serves understanding the code: reading, searching, building or indexing it, short
 deterministic checks of a language or library behaviour a premise depends on (seconds, no
 target process, no network to the target, no loops over inputs), and a bounded local harness
-that settles a premise (no network, no target systems, short timeouts, a few runs per review, or
+that tests a premise (no network, no target systems, short timeouts, a few runs per review, or
 one race-detector run for a window premise), recording what it showed as evidence.
 {%- if live %}
-An action on a path with no source in code was probed: re-observe it in an environment serving
+An action on a path with no input read in code was probed: re-observe it in an environment serving
 its interfaces, repeating the recorded observations with their controls and probing for the
 counterexample. The review establishes the mechanism; the test demonstrates the consequence.
 {%- endif %}
 
-Record the verdict with `research` `verdict`, the note citing what decided it:
+Record each verdict with `research` `verdict`, the note citing what decided it:
 
 - `validated`: the mechanism, its reachable preconditions and the stated consequence survive
   review, and every premise it rests on holds;
-- `disproved`: the mechanism does not hold, a chain flaw is refuted or a code premise fails;
+- `disproved`: a code premise fails or a chain flaw is refuted; where the mechanism does not
+  hold, propose the flaw `refuted`, which its chain decides;
 - `excluded`: a deployment premise it rests on fails, so the deployment keeps a real finding
   out of reports;
 - `unproven`: a premise stays undecided, recorded on the chain flaw or path it bears on with the
   exact check that would settle it.
 
-A duplicate is merged into the candidate it repeats, not judged. A variant of another scenario
-of the same root is reviewed on its own. When the scenario fails as formulated but its flaws
-support another reading — a different consequence, another path, a different order — record that
-reading as its own candidate; the verdict covers only the scenario you were given. This is analytic validation, not a demonstration. Record a
-bounded demonstration plan for the test as context evidence on the candidate. Return the
-verdict, its remaining limitations, the ids of any deployment premise left for the user, and the
-plan.
+A verdict stands only while the statuses it claims do. A duplicate is merged into the candidate
+it repeats, not judged. Each variant of the root is judged on its own: what you found on one is
+evidence for the others, never their verdict. When the scenario fails as formulated but its
+flaws support another reading — a different consequence, another path, a different order —
+record that reading as its own candidate; each verdict covers only its own scenario. This is analytic
+validation, not a demonstration. Record a bounded demonstration plan for each test as context
+evidence on its candidate. Return each verdict, its remaining limitations, the ids of any
+deployment premise left for the user, and the plans.
 
 {% include "security/cvss.md" %}

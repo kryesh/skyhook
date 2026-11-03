@@ -69,7 +69,7 @@ impl Encoder {
                 )
                 .map(drop)
             }
-            SessionEvent::ModelContext { context } => self::context(db, seq, context),
+            SessionEvent::ModelContext { context } => self.context(db, seq, context),
             _ => unreachable!("{} is not a contract event", event.kind()),
         }
     }
@@ -191,6 +191,70 @@ fn profile(db: &Db, snapshot: &ProfileSnapshot) -> DbResult<i64> {
     by_digest(db, "model_profile", digest)
 }
 
+/// A tool definition by its allocation, which it keeps: the surface that generated it
+/// shares it with every context it opens.
+pub(super) struct Shared(std::sync::Arc<ToolDefinition>);
+
+impl PartialEq for Shared {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Shared {}
+
+impl std::hash::Hash for Shared {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::sync::Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+impl Encoder {
+    fn context(&mut self, db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
+        self::context(db, seq, context)?;
+        for (position, tool) in context.tools.iter().enumerate() {
+            let shared = Shared(tool.clone());
+            let tool = match self.tools.get(&shared) {
+                Some(tool) => *tool,
+                None => {
+                    let id = self::tool(db, tool)?;
+                    *self.tools.entry(shared).or_insert(id)
+                }
+            };
+            db.execute(
+                "INSERT INTO model_context_tool (context, position, tool) VALUES (?1, ?2, ?3)",
+                params![seq, position, tool],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The row of `tool`, inserted unless a context recorded it before.
+fn tool(db: &Db, tool: &ToolDefinition) -> DbResult<i64> {
+    let digest = digest(tool)?;
+    let known = db.query_row(
+        "SELECT id FROM tool_definition WHERE digest = ?1",
+        params![digest.clone()],
+        |row| Ok(row.get::<i64>(0)?),
+    )?;
+    // Most contexts repeat known tools: only a new one's schema is serialized.
+    match known {
+        Some(tool) => Ok(tool),
+        None => db.insert(
+            "INSERT INTO tool_definition (name, description, input_schema, digest) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &tool.name,
+                &tool.description,
+                json(&tool.input_schema)?,
+                digest
+            ],
+        ),
+    }
+}
+
+/// `context`'s own rows, but for its tools.
 fn context(db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
     let profile = profile(db, &context.profile)?;
     let prompt_digest = digest(&context.system)?;
@@ -216,29 +280,8 @@ fn context(db: &Db, seq: u64, context: &ModelContext) -> DbResult<()> {
         "INSERT INTO model_context (entry, purpose, profile, system_prompt, \
          response_schema_name, response_schema) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![seq, context.purpose, profile, prompt, schema_name, schema],
-    )?;
-    for (position, tool) in context.tools.iter().enumerate() {
-        let digest = digest(tool)?;
-        // Most contexts repeat known tools: only a new one's schema is serialized.
-        let tool = match known(db, "tool_definition", digest.clone())? {
-            Some(tool) => tool,
-            None => db.insert(
-                "INSERT INTO tool_definition (name, description, input_schema, digest) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    &tool.name,
-                    &tool.description,
-                    json(&tool.input_schema)?,
-                    digest
-                ],
-            )?,
-        };
-        db.execute(
-            "INSERT INTO model_context_tool (context, position, tool) VALUES (?1, ?2, ?3)",
-            params![seq, position, tool],
-        )?;
-    }
-    Ok(())
+    )
+    .map(drop)
 }
 
 pub(super) fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
@@ -326,6 +369,34 @@ pub(super) fn targets(events: &Events) -> DbResult<HashMap<i64, Vec<TargetDefini
         targets.entry(entry).or_default().push(target);
     }
     Ok(targets)
+}
+
+/// The tool definition row `id` holds, decoded once per process by its `digest`: a
+/// content digest, so every session's row of the same digest holds the same definition.
+fn definition(db: &Db, id: i64, digest: Vec<u8>) -> DbResult<std::sync::Arc<ToolDefinition>> {
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+    type Decoded = HashMap<Vec<u8>, Arc<ToolDefinition>>;
+    static DECODED: LazyLock<Mutex<Decoded>> = LazyLock::new(Mutex::default);
+    let decoded = || DECODED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(tool) = decoded().get(&digest) {
+        return Ok(tool.clone());
+    }
+    let tool = db.query_row(
+        "SELECT name, description, input_schema FROM tool_definition WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(ToolDefinition {
+                name: row.get(0)?,
+                description: row.get(1)?,
+                input_schema: parse_json(&row.get::<String>(2)?)?,
+            })
+        },
+    )?;
+    let tool = tool.ok_or_else(|| corrupt("tool definition is missing"))?;
+    Ok(decoded()
+        .entry(digest)
+        .or_insert_with(|| Arc::new(tool))
+        .clone())
 }
 
 /// Agent starts, mode and model changes, and model contexts.
@@ -428,19 +499,13 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
     let tools = grouped(
         db,
         events.scoped(
-            "SELECT t.context, d.name, d.description, d.input_schema FROM model_context_tool t \
+            "SELECT t.context, t.tool, d.digest FROM model_context_tool t \
              JOIN tool_definition d ON d.id = t.tool \
              WHERE t.context IN (SELECT c.entry FROM model_context c {scope}) \
              ORDER BY t.context, t.position",
             "c.entry",
         )?,
-        |row| {
-            Ok(ToolDefinition {
-                name: row.get(1)?,
-                description: row.get(2)?,
-                input_schema: parse_json(&row.get::<String>(3)?)?,
-            })
-        },
+        |row| definition(db, row.get(1)?, row.get(2)?),
     )?;
     events.load(
         "SELECT c.entry, c.purpose, c.profile, c.system_prompt, c.response_schema_name, \

@@ -397,19 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn styled_completion_is_not_reinterpreted_as_fallback_by_span_color() {
-        let (mut cache, queued, completed) = queued_cache(1);
-        let document = code("source", "js", Role::Warning);
-        cache.prepare(std::iter::once(&document));
-        let styled = Some(vec![Line::from("source")]);
-        complete(&completed, queued.try_recv().unwrap(), styled);
-        assert!(cache.poll());
-        let rendered = document.lines(Some(&cache));
-        assert_eq!(rendered[0].spans.last().unwrap().style.fg, None);
-        assert_eq!(text(&rendered), "source");
-    }
-
-    #[test]
     fn disconnected_worker_releases_inflight_entries_without_claiming_completion() {
         let (mut cache, queued, completed) = queued_cache(1);
         let document = code("source", "js", Role::Warning);
@@ -463,32 +450,16 @@ mod tests {
                 "unsupported syntax was requeued"
             );
         }
-    }
-
-    #[test]
-    fn admitted_highlights_retry_after_queue_pressure_without_repreparing_documents() {
+        // A styled completion is never taken for the fallback by its span colour.
         let (mut cache, queued, completed) = queued_cache(1);
-        let mut document = Document::default();
-        for source in ["one", "two"] {
-            document.code(source, "unknown", 0, Default::default(), Role::Plain);
-        }
+        let document = code("source", "js", Role::Warning);
         cache.prepare(std::iter::once(&document));
-        assert_eq!(
-            states(&cache, |state| matches!(state, HighlightState::InFlight)),
-            1
-        );
-        assert_eq!(
-            states(&cache, |state| matches!(state, HighlightState::Unscheduled)),
-            1
-        );
-        for _ in 0..2 {
-            complete(&completed, queued.try_recv().unwrap(), None);
-            assert!(cache.poll());
-        }
-        let fallback = |state: &_| matches!(state, HighlightState::Ready(None));
-        assert_eq!(states(&cache, fallback), 2);
-        assert!(!cache.prepare(std::iter::once(&document)));
-        assert!(queued.try_recv().is_err());
+        let styled = Some(vec![Line::from("source")]);
+        complete(&completed, queued.try_recv().unwrap(), styled);
+        assert!(cache.poll());
+        let rendered = document.lines(Some(&cache));
+        assert_eq!(rendered[0].spans.last().unwrap().style.fg, None);
+        assert_eq!(text(&rendered), "source");
     }
 
     #[test]
@@ -598,6 +569,29 @@ mod tests {
             .map(|index| format!("const value = {index};"))
             .collect();
         assert_eq!(order, expected);
+        // Highlights admitted under queue pressure are sent once room frees, without preparing the documents again.
+        let (mut cache, queued, completed) = queued_cache(1);
+        let mut document = Document::default();
+        for source in ["one", "two"] {
+            document.code(source, "unknown", 0, Default::default(), Role::Plain);
+        }
+        cache.prepare(std::iter::once(&document));
+        assert_eq!(
+            states(&cache, |state| matches!(state, HighlightState::InFlight)),
+            1
+        );
+        assert_eq!(
+            states(&cache, |state| matches!(state, HighlightState::Unscheduled)),
+            1
+        );
+        for _ in 0..2 {
+            complete(&completed, queued.try_recv().unwrap(), None);
+            assert!(cache.poll());
+        }
+        let fallback = |state: &_| matches!(state, HighlightState::Ready(None));
+        assert_eq!(states(&cache, fallback), 2);
+        assert!(!cache.prepare(std::iter::once(&document)));
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]

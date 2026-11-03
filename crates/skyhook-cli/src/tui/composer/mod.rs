@@ -614,13 +614,19 @@ mod tests {
         editor.insert(" middle ");
         editor.insert_paste("末尾\n".into());
         editor.insert(OBJECT);
+        let file = Attachment::Text {
+            file: Some("a.rs".into()),
+            content: "fn a() {}".into(),
+        };
+        editor.attach(file.clone());
         let expected = "before a\n\n b\r\n middle 末尾\n\u{fffc}";
         assert_eq!(editor.expanded_text(), expected);
         assert_eq!(
             editor.pastes().map(|(id, _)| id).collect::<Vec<_>>(),
             [1, 2]
         );
-        assert_eq!(editor.take().text, expected);
+        let (text, attachments) = (expected.into(), vec![file]);
+        assert_eq!(editor.take(), Submission { text, attachments });
         assert!(editor.is_empty() && !editor.has_pastes());
         undo(&mut editor);
         assert!(editor.is_empty(), "sent documents cannot reappear via undo");
@@ -883,21 +889,5 @@ mod tests {
         assert_eq!(editor.paste(1), Some("kept attachment"));
         assert_eq!(editor.paste(2), Some("new attachment"));
         assert_document_invariants(&editor);
-    }
-
-    #[test]
-    fn attachments_are_taken_with_the_draft() {
-        let mut editor = Composer::default();
-        editor.insert("look");
-        let file = Attachment::Text {
-            file: Some("a.rs".into()),
-            content: "fn a() {}".into(),
-        };
-        editor.attach(file.clone());
-        let submission = editor.take();
-        assert!(editor.is_empty());
-        let attachments = vec![file];
-        let text = "look".into();
-        assert_eq!(submission, Submission { text, attachments });
     }
 }

@@ -1,5 +1,5 @@
-//! Work each phase owes, derived from the graph: paths owing a sweep or a probe, premises a settling
-//! look, flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
+//! Work each phase owes, derived from the graph: paths owing a sweep or a probe, states a check
+//! across calls, premises a settling look, flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
 //! A subject is offered while it owes the phase, no task of it is live, and fewer than two of
 //! its tasks began at its current basis, the latest event of the phase's `bearing` on it; once
 //! two did and none is live it is exhausted until the basis moves, as is work the scheduler
@@ -54,8 +54,22 @@ macro_rules! retryable {
     };
 }
 
-/// `$phase` owes work on live node `$id` (`$owed`) that is not exhausted: a task of it is
-/// live, or it may be tried again. Only such work holds other work back.
+/// `$phase`'s work on node `$id` is not exhausted: a task of it is live, or it may be tried
+/// again.
+macro_rules! unexhausted {
+    ($phase:tt, $id:expr) => {
+        concat!(
+            "(",
+            task_live!($phase, $id),
+            " OR ",
+            retryable!($phase, $id),
+            ")"
+        )
+    };
+}
+
+/// `$phase` owes work on live node `$id` (`$owed`) that is not exhausted. Only such work holds
+/// other work back.
 macro_rules! pending {
     ($phase:tt, $id:expr, $owed:expr) => {
         concat!(
@@ -63,23 +77,23 @@ macro_rules! pending {
             $id,
             " AND pn.merged_into IS NULL) AND ",
             $owed,
-            " AND (",
-            task_live!($phase, $id),
-            " OR ",
-            retryable!($phase, $id),
-            "))"
+            " AND ",
+            unexhausted!($phase, $id),
+            ")"
         )
     };
 }
 
 /// A phase's statements over its live subjects `n`, each row the key, title, basis and the
-/// pending test it resumes: the page of offered entries that are `$ready`, past `?1` up to `?3`,
-/// limit `?2`; every `$owed` subject without a live task, flagged when exhausted, and those of
-/// them bound as `?1`; and, for a bundled phase, the offered and ready entries `$naming` selects
-/// from the nodes bound as `?1`. Each statement but the whole listing reads the facts of only
-/// the root groups of the subjects it may list.
+/// pending test it resumes: the page of offered entries that are `$ready`, past `?1` up to `?2`;
+/// every `$owed` subject without a live task, flagged when exhausted; and, for a bundled phase,
+/// the offered and ready entries `$naming` selects from the nodes bound as `?1`, at least every
+/// one about one of them, and those `$bundle` selects as the bundle of the entry bound as `?1`.
+/// Each statement but the whole listing reads the facts of only the root groups of the subjects
+/// it may list.
 macro_rules! phase_sql {
-    ($phase:tt, $kind:literal, $owed:expr, $ready:expr, $pending:expr, $naming:expr) => {
+    ($phase:tt, $kind:literal, $owed:expr, $ready:expr, $pending:expr, $naming:expr,
+        $bundle:expr) => {
         phase_sql!(
             @ $kind,
             concat!(
@@ -103,21 +117,22 @@ macro_rules! phase_sql {
             concat!($owed, " AND NOT ", task_live!($phase, "n.id")),
             retryable!($phase, "n.id"),
             $ready,
-            $naming
+            $naming,
+            $bundle
         )
     };
     (@ $kind:literal, $select:expr, $flagged:expr, $unstarted:expr, $retryable:expr, $ready:expr,
-        $naming:expr) => {
+        $naming:expr, $bundle:expr) => {
         Sql {
             page: concat!(
                 relations!(concat!("SELECT id FROM node WHERE kind='", $kind,
-                    "' AND merged_into IS NULL AND id>?1 AND id<=?3")),
-                $select, "n.id>?1 AND n.id<=?3 AND ", $unstarted, " AND ",
-                $retryable, " AND ", $ready, " ORDER BY n.id LIMIT ?2"),
+                    "' AND merged_into IS NULL AND id>?1 AND id<=?2")),
+                $select, "n.id>?1 AND n.id<=?2 AND ", $unstarted, " AND ",
+                $retryable, " AND ", $ready, " ORDER BY n.id"),
             owed: concat!(relations!(), $flagged, $unstarted, " ORDER BY n.id"),
-            owing: concat!(relations!("SELECT value FROM json_each(?1)"), $flagged,
-                "n.id IN (SELECT value FROM json_each(?1)) AND ", $unstarted, " ORDER BY n.id"),
             naming: concat!(relations!($naming), $select, "n.id IN (", $naming, ") AND ", $unstarted,
+                " AND ", $retryable, " AND ", $ready, " ORDER BY n.id"),
+            bundle: concat!(relations!($bundle), $select, "n.id IN (", $bundle, ") AND ", $unstarted,
                 " AND ", $retryable, " AND ", $ready, " ORDER BY n.id"),
         }
     };
@@ -147,25 +162,27 @@ macro_rules! relations {
 struct Sql {
     page: &'static str,
     owed: &'static str,
-    owing: &'static str,
     naming: &'static str,
+    bundle: &'static str,
 }
 
 mod candidates;
 mod reports;
 mod structure;
 
-pub(super) use self::{
-    candidates::review_owed,
-    reports::{current_finding, reported},
-    structure::{probed, served},
-};
+pub use self::candidates::Behind;
 use self::{candidates::*, reports::*, structure::*};
+pub(super) use self::{
+    candidates::{behind, review_owed},
+    reports::{current_finding, reported},
+    structure::{check_stale, probed, served},
+};
 
 const fn sql(phase: Phase) -> Sql {
     match phase {
         Phase::Sweep => SWEEP,
         Phase::Probe => PROBE,
+        Phase::Check => CHECK,
         Phase::Settle => SETTLE,
         Phase::Chain => CHAIN,
         Phase::Assess => ASSESS,
@@ -235,9 +252,14 @@ impl Spent {
     }
 }
 
-/// The entries `sql` lists, each with what it is about.
-fn listed(db: &Db, sql: &'static str, params: Vec<libsql::Value>) -> Result<Vec<QueueEntry>> {
-    let mut entries = rows(db, sql, params, |row| {
+/// The first `limit` entries `sql` lists, each with what it is about.
+fn listed(
+    db: &Db,
+    sql: &'static str,
+    params: Vec<libsql::Value>,
+    limit: usize,
+) -> Result<Vec<QueueEntry>> {
+    let mut entries = first_rows(db, sql, params, limit, |row| {
         Ok(QueueEntry {
             node: NodeId(row.get(0)?),
             title: row.get(1)?,
@@ -281,10 +303,10 @@ pub(super) fn owed(db: &Db, phase: Phase, spent: &Spent) -> Result<Vec<Owed>> {
     rows(db, sql(phase).owed, spent.bound(Vec::new()), owed_row)
 }
 
-/// Those of `nodes` that `phase` owes with no task of it live, as [`owed`] lists them with none
-/// spent.
-pub(super) fn owing(db: &Db, phase: Phase, nodes: &[NodeId]) -> Result<Vec<Owed>> {
-    rows(db, sql(phase).owing, params![json_list(nodes)?], owed_row)
+/// Whether `phase` owes any subject with no task of it live. Each of its other statements lists
+/// only such subjects, and costs more to compile for what it adds.
+pub(super) fn owes(db: &Db, phase: Phase, spent: &Spent) -> Result<bool> {
+    exists(db, sql(phase).owed, spent.bound(Vec::new()))
 }
 
 /// The next page of `phase` work that can start now: a subject whose prerequisites are still
@@ -299,24 +321,42 @@ pub(super) fn page(
 ) -> Result<Listing<QueueEntry>> {
     let (mut after, mut width, mut items) = (page.after, page.limit(), Vec::new());
     loop {
-        let end: Option<i64> = optional(
+        let subjects: Vec<i64> = first_rows(
             db,
-            "SELECT id FROM node WHERE kind=?1 AND merged_into IS NULL AND id>?2 ORDER BY id \
-             LIMIT 1 OFFSET ?3",
-            params![phase.subject(), after, width - 1],
+            "SELECT id FROM node WHERE kind=?1 AND merged_into IS NULL AND id>?2 ORDER BY id",
+            params![phase.subject(), after],
+            width,
             |row| Ok(row.get(0)?),
         )?;
-        let wanted = page.limit() - items.len() as i64;
-        let window = params![after, wanted, end.unwrap_or(i64::MAX)];
-        items.extend(listed(db, sql(phase).page, spent.bound(window))?);
+        let end = (subjects.len() == width).then(|| subjects[width - 1]);
+        let wanted = page.limit() - items.len();
+        let window = params![after, end.unwrap_or(i64::MAX)];
+        items.extend(listed(db, sql(phase).page, spent.bound(window), wanted)?);
         match end {
-            Some(end) if (items.len() as i64) < page.limit() => (after, width) = (end, width * 2),
+            Some(end) if items.len() < page.limit() => (after, width) = (end, width * 2),
             _ => return Ok(Listing::keyset(items, page)),
         }
     }
 }
 
-/// The offered and ready entries of bundled `phase` about one of `nodes`, in key order.
+/// The offered and ready entries of bundled `phase` in `head`'s bundle, `head` among them, in
+/// key order.
+pub(super) fn bundle(
+    db: &Db,
+    phase: Phase,
+    head: NodeId,
+    spent: &Spent,
+) -> Result<Vec<QueueEntry>> {
+    listed(
+        db,
+        sql(phase).bundle,
+        spent.bound(params![json_list(&[head])?]),
+        usize::MAX,
+    )
+}
+
+/// The offered and ready entries of bundled `phase` about one of `nodes`, perhaps more, in key
+/// order.
 pub(super) fn naming(
     db: &Db,
     phase: Phase,
@@ -327,6 +367,7 @@ pub(super) fn naming(
         db,
         sql(phase).naming,
         spent.bound(params![json_list(nodes)?]),
+        usize::MAX,
     )
 }
 
@@ -392,8 +433,8 @@ pub(super) mod tests {
 
     use super::{
         super::tests::{
-            HIGH, Step, assess, begun, child_of, end_job, fixture, plan, premise, scenario, sweep,
-            test, text, verdict,
+            HIGH, NONE, Step, assess, begun, child_of, decide, end_job, fixture, last_event, marks,
+            plan, premise, scenario, sweep, test, text, verdict,
         },
         *,
     };
@@ -442,8 +483,8 @@ pub(super) mod tests {
     }
 
     /// Spent work is exhausted only in its phase and at the basis it was spent on, and holds
-    /// back nothing: a spent sweep releases the assessment waiting on it, and a spent
-    /// assessment is offered again once its candidate changes.
+    /// back nothing: a spent sweep releases the assessment waiting on it, a spent assessment is
+    /// offered again once its candidate changes, and once settled releases the review.
     #[test]
     fn spent_work_is_exhausted_only_at_its_basis() {
         let (_session, store, actor) = fixture();
@@ -495,6 +536,111 @@ pub(super) mod tests {
         };
         assert_eq!((moved.phase, moved.node), (Phase::Assess, assess.node));
         assert!(moved.basis > assess.basis);
+        crate::store::tests::assess(&store, scenario.candidate, HIGH);
+        let [review] = started(&[sweep, moved])[..] else {
+            panic!("work settled at the basis it was spent on releases its next phase")
+        };
+        assert_eq!((review.phase, review.node), (Phase::Review, assess.node));
+        let exhausted = store.synthesis(&[sweep, moved]).unwrap().exhausted;
+        assert_eq!(
+            (exhausted.iter())
+                .map(|entry| (entry.phase, entry.node))
+                .collect::<Vec<_>>(),
+            [(Phase::Sweep, sweep.node)]
+        );
+    }
+
+    /// What a review, and a child it launches that begins a review of its own, records of the
+    /// results other phases own only proposes them: a premise it fails reads undecided and owes
+    /// its settle, a flaw it refutes stays suspected on a live candidate, its disproval does not
+    /// stand while what it claims does not, and its reassessment owes an assessment while the
+    /// candidate keeps its standing one. Once a settle fails the premise, the review is owed
+    /// again and its disproval stands. A new differing proposal owes the assessment afresh,
+    /// however many assessments decided earlier ones.
+    #[test]
+    fn a_reviews_decisions_outside_their_phases_are_proposals() {
+        let (_session, store, actor) = fixture();
+        let decoder = scenario(&store, &actor, "decoder");
+        let (candidate, flaw) = (decoder.candidate, decoder.flaw);
+        sweep(&store, decoder.path);
+        let premise = premise(&store, &actor, PremiseScope::Code);
+        store
+            .link(&actor, &[Link::FlawPremise { flaw, premise }])
+            .unwrap();
+        assess(&store, candidate, HIGH);
+
+        let (reviewer, review, _) = begun(&store, &Begin::Review(vec![candidate]));
+        let (child, nested) = child_of(&store, &reviewer, JobState::Running);
+        store
+            .begin(&child, &Begin::Review(vec![candidate]))
+            .unwrap();
+        let fails = StatusChange::Premise(premise, PremiseStatus::Fails);
+        store
+            .set_status(&child, fails, &text("an exhaustive audit"))
+            .unwrap();
+        let refuted = StatusChange::Flaw(flaw, FlawStatus::Refuted);
+        store
+            .set_status(&reviewer, refuted, &text("the premise fails"))
+            .unwrap();
+        store
+            .verdict(&reviewer, candidate, Verdict::Disproved, &text("refuted"))
+            .unwrap();
+        let none = NONE.parse().unwrap();
+        store
+            .assess(&reviewer, candidate, none, &text("no impact"))
+            .unwrap();
+        for job in [nested, review] {
+            end_job(&store, job);
+        }
+
+        let NodeView::Premise(view) = store.node(premise.into()).unwrap() else {
+            panic!("a premise")
+        };
+        let proposed = view.proposed.expect("the child's decision is proposed");
+        assert_eq!(
+            (view.status, proposed.value, &proposed.agent),
+            (PremiseStatus::Undecided, PremiseStatus::Fails, &child)
+        );
+        let NodeView::Flaw(view) = store.node(flaw.into()).unwrap() else {
+            panic!("a flaw")
+        };
+        assert_eq!(view.status, FlawStatus::Suspected);
+        assert_eq!(queued(&store, Phase::Settle), [NodeId::from(premise)]);
+        assert_eq!(queued(&store, Phase::Chain), [NodeId::from(flaw)]);
+        let NodeView::Candidate(view) = store.node(candidate.into()).unwrap() else {
+            panic!("a candidate")
+        };
+        assert_eq!(
+            (view.status, view.assessment.unwrap().severity),
+            (Status::Shortlisted, Severity::Critical)
+        );
+        assert_eq!(
+            view.proposed_assessment.unwrap().value.severity,
+            Severity::None
+        );
+        assert_eq!(queued(&store, Phase::Assess), [NodeId::from(candidate)]);
+
+        decide(&store, premise, PremiseStatus::Fails);
+        let NodeView::Premise(view) = store.node(premise.into()).unwrap() else {
+            panic!("a premise")
+        };
+        assert_eq!(view.status, PremiseStatus::Fails);
+        assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 1);
+        assess(&store, candidate, HIGH);
+        assert_eq!(queued(&store, Phase::Review), [NodeId::from(candidate)]);
+        verdict(&store, candidate, Verdict::Disproved);
+        assert_eq!(status(&store, candidate), Status::Disproved);
+
+        let lower = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N";
+        store
+            .assess(&actor, candidate, lower.parse().unwrap(), &text("lower"))
+            .unwrap();
+        assert_eq!(
+            marks(&store, last_event(&store)),
+            [(candidate.into(), EventEffect::Disputes)]
+        );
+        assert_eq!(status(&store, candidate), Status::Disproved);
+        assert_eq!(queued(&store, Phase::Assess), [NodeId::from(candidate)]);
     }
 
     /// What a phase's tasks on a subject record, by their agents or those beneath them, never
@@ -506,11 +652,10 @@ pub(super) mod tests {
         let scenario = scenario(&store, &actor, "decoder");
         let id = scenario.candidate;
         sweep(&store, scenario.path);
-        assess(&store, &actor, id, HIGH);
+        assess(&store, id, HIGH);
         let rely = |agent: &AgentId| {
             let premise = premise(&store, &actor, PremiseScope::Code);
-            let holds = StatusChange::Premise(premise, PremiseStatus::Holds);
-            store.set_status(&actor, holds, &text("checked")).unwrap();
+            decide(&store, premise, PremiseStatus::Holds);
             let link = Link::FlawPremise {
                 flaw: scenario.flaw,
                 premise,
@@ -532,7 +677,7 @@ pub(super) mod tests {
         rely(&actor);
         assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
 
-        verdict(&store, &actor, id, Verdict::Validated);
+        verdict(&store, id, Verdict::Validated);
         for _ in 0..2 {
             let (prover, job, _) = begun(&store, &Begin::Test(vec![id]));
             test(&store, &prover, id, TestResult::Pending);
@@ -542,7 +687,8 @@ pub(super) mod tests {
     }
 
     /// Every phase's statements, the views deriving standing and the open tests seek the log,
-    /// the task log and the graph by node: the only scans are of a per-subject result, the bound
+    /// the task log and the graph by node: the only scans are of a per-subject result (among
+    /// them the premises a premise rests on or that rest on it, walked by index), the bound
     /// lists, the run's one row, the environments prepared for any candidate, the paths for any
     /// sweep a chain waits on, the facts selecting tests, the root groups they are read for and
     /// the live jobs, uncorrelated and so read once per statement. Only a phase's whole listing
@@ -550,7 +696,8 @@ pub(super) mod tests {
     /// window's end, and the subjects of live tasks and the spent work are read once, as lists
     /// each subject is looked up in. No task is sought by its phase alone, which would visit the phase's whole
     /// task log, and a node's events are walked only down its effects, which hold none of its
-    /// test records.
+    /// test records. Coverage reads its root groups' facts once: no candidate's standing seeks
+    /// its group's members.
     #[test]
     fn phase_statements_seek_by_node() {
         let (_session, store, _) = fixture();
@@ -565,12 +712,12 @@ pub(super) mod tests {
             let sql = sql(phase);
             whole.push(sql.owed);
             pages.push(sql.page);
-            statements.extend([sql.page, sql.owing, crate::store::bearing::lookup(phase)]);
+            statements.extend([sql.page, crate::store::bearing::lookup(phase)]);
             if phase.bundled() {
-                statements.push(sql.naming);
+                statements.extend([sql.naming, sql.bundle]);
             }
         }
-        let every_group = "SCAN c USING INDEX candidate_validated";
+        let every_group = "SCAN n USING INDEX node_live";
         let allowed = [
             "SCAN ob",
             "SCAN cp",
@@ -587,6 +734,8 @@ pub(super) mod tests {
             "SCAN ur",
             "SCAN (subquery-",
             "SCAN j USING INDEX job_status_live",
+            "SCAN above",
+            "SCAN below",
         ];
         let statements =
             (statements.iter().map(|sql| (sql, false))).chain(whole.iter().map(|sql| (sql, true)));
@@ -622,6 +771,12 @@ pub(super) mod tests {
             (pages.iter())
                 .filter(|sql| !plan(&store, sql).iter().any(|step| step.detail == range))
                 .map(|sql| format!("no range seek in {sql}")),
+        );
+        let coverage = crate::store::synthesis::CANDIDATE_STATES;
+        scans.extend(
+            (plan(&store, coverage).into_iter())
+                .filter(|step| step.detail.contains("candidate_flaw_flaw"))
+                .map(|step| format!("{} in {coverage}", step.detail)),
         );
         assert!(scans.is_empty(), "{scans:#?}");
     }

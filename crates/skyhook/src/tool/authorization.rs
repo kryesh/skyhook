@@ -224,13 +224,10 @@ impl AuthorizationCoordinator {
     /// for the revisions it was approved for.
     pub(crate) fn revoke(&self, redefined: &[TargetDefinition]) {
         let mut state = self.state();
-        state.decisions.retain(|_, decision| {
-            let revoked = replaces(redefined, &decision.revisions);
-            if revoked {
-                decision.revoked.cancel();
-            }
-            !revoked
-        });
+        let revoked = |_: &u64, decision: &mut Decision| replaces(redefined, &decision.revisions);
+        for (_, decision) in state.decisions.extract_if(revoked) {
+            decision.revoked.cancel();
+        }
     }
 
     /// Ask the policy for what `permissions` need beyond the grants held, sharing
@@ -465,10 +462,12 @@ enum Pending {
 }
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::{
         identity::SessionId,
-        tool::policy::{ApprovalCoverage, Capability, ResourceId},
+        tool::policy::{Capability, ResourceId},
     };
 
     fn subject(cancellation: CancellationToken) -> AuthorizationSubject {
@@ -501,13 +500,18 @@ mod tests {
             .map(drop)
     }
 
+    /// A grant is cached for any resource; a denial is not, so the call asks again.
     #[tokio::test]
-    async fn grants_are_cached_for_arbitrary_resources() {
+    async fn grants_are_cached_for_arbitrary_resources_but_denials_are_not() {
         let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
         let policy = Arc::new(crate::tests::PromptingPolicy(prompts));
         let coordinator = AuthorizationCoordinator::new(policy);
         let subject = subject(CancellationToken::new());
         let resource = ResourceId::mcp("server", "operation");
+        let denied = authorize(&coordinator, &subject, &resource);
+        let refuse = async { drop(asked.recv().await.unwrap()) };
+        let denied = tokio::join!(denied, refuse).0;
+        assert_matches!(denied, Err(AuthorizationError::Denied(_)));
         let first = authorize(&coordinator, &subject, &resource);
         let answer = async { asked.recv().await.unwrap().1.send(()).unwrap() };
         tokio::join!(first, answer).0.unwrap();
@@ -538,7 +542,7 @@ mod tests {
             assert!(futures_util::poll!(&mut waiting).is_pending());
             first.cancel();
             let cancelled = spawned.await.unwrap();
-            assert!(matches!(cancelled, Err(AuthorizationError::Cancelled)));
+            assert_matches!(cancelled, Err(AuthorizationError::Cancelled));
             assert!(futures_util::poll!(&mut waiting).is_pending());
             assert!(!reply.is_closed());
             if answered {
@@ -547,7 +551,7 @@ mod tests {
             } else {
                 second.cancel();
                 let cancelled = crate::tests::bounded(waiting).await;
-                assert!(matches!(cancelled, Err(AuthorizationError::Cancelled)));
+                assert_matches!(cancelled, Err(AuthorizationError::Cancelled));
                 crate::tests::bounded(reply.closed()).await;
             }
             assert!(asked.try_recv().is_err());
@@ -587,13 +591,13 @@ mod tests {
             .send(())
             .unwrap();
         let failed = crate::tests::bounded(futures_util::future::join(asking, joined)).await;
-        assert!(matches!(
+        assert_matches!(
             failed,
             (
                 Err(AuthorizationError::PolicyFailed),
                 Err(AuthorizationError::PolicyFailed)
             )
-        ));
+        );
         assert!(asked.try_recv().is_err());
     }
 
@@ -628,17 +632,5 @@ mod tests {
             Ok(Some(Pending::Asked(_)))
         ));
         drop((never, allowed));
-    }
-
-    #[test]
-    fn exact_proposals_cannot_be_widened() {
-        let resource = ResourceId::session("one");
-        let proposed = ApprovalGrant::exact(Capability::Write, resource.clone());
-        let widened = ApprovalGrant {
-            capability: Capability::Write,
-            resource,
-            coverage: ApprovalCoverage::Descendants,
-        };
-        assert!(!proposed.permits(&widened));
     }
 }

@@ -92,7 +92,8 @@ that answer other requests with an empty page or a non-HTML variant return their
 that serve no HTML still return JSON; `readable` sends
 `text/html,application/xhtml+xml;q=0.9,*/*;q=0.8`.
 `save_to` saves the response to a file on success instead of embedding the payload, creating
-missing parent directories, and ignores `response_format`. Errors or cancellation do not replace
+missing parent directories, and ignores `response_format`. It and `overwrite` are offered only to
+agents with the `write` capability. Errors or cancellation do not replace
 an existing destination.
 
 HTML is returned as `{kind: "page", title, byline?, site_name?, language?, scope, markdown}`.

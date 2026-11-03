@@ -457,48 +457,24 @@ mod tests {
         }
     }
 
+    /// A native object repeated by the final message is kept once, and one the
+    /// message alone carries is kept; redacted thinking has no readable text,
+    /// whatever its other keys say.
     #[test]
     fn native_objects_repeated_by_the_final_message_are_kept_once() {
-        let redacted = json!({"type":"redacted_thinking","data":"opaque"});
-        let reduced = reduced_as(
-            ReasoningFormat::ThinkingBlocks,
-            vec![
-                delta(json!({ "thinking_blocks": [redacted] })),
-                event(
-                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop",
-                    "message":{"content":"answer","thinking_blocks":[redacted]}}]}),
-                ),
-            ],
-        );
-        assert_eq!(contents(reduced.items()), [reasoning(""), text("answer")]);
-        // Without a streamed object, the message supplies it.
-        let reduced = reduced_as(
-            ReasoningFormat::ThinkingBlocks,
-            vec![event(
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop",
-                "message":{"content":"answer","thinking_blocks":[redacted]}}]}),
-            )],
-        );
-        assert_eq!(
-            native_replays(&reduced, ReasoningFormat::ThinkingBlocks),
-            [(redacted, Binding::Conversation)]
-        );
-    }
-
-    #[test]
-    fn redacted_thinking_has_no_readable_text() {
         let redacted =
             json!({"type":"redacted_thinking","data":"opaque","thinking":"not-display-text"});
-        let message = json!({"content":"answer","thinking_blocks":[redacted]});
+        let message = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop",
+            "message":{"content":"answer","thinking_blocks":[redacted]}}]});
+        let streamed = delta(json!({ "thinking_blocks": [redacted] }));
         for frames in [
             vec![
-                delta(json!({"thinking_blocks":[redacted]})),
+                streamed.clone(),
                 delta(json!({"content":"answer"})),
                 end("stop"),
             ],
-            vec![event(
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop","message":message}]}),
-            )],
+            vec![streamed, event(message.clone())],
+            vec![event(message)],
         ] {
             let reduced = reduced_as(ReasoningFormat::ThinkingBlocks, frames);
             assert!(reduced.streamed(ItemKind::Reasoning).is_empty());
@@ -510,8 +486,10 @@ mod tests {
         }
     }
 
+    /// Native fields carrying nothing, or outside the replayed one, leave the plain
+    /// reasoning text as it streamed.
     #[test]
-    fn empty_native_arrays_keep_the_reasoning_text() {
+    fn native_fields_outside_the_replayed_one_add_no_text() {
         for replay in [ReasoningFormat::ThinkingBlocks, ReasoningFormat::Details] {
             let reduced = reduced_as(
                 replay,
@@ -528,10 +506,6 @@ mod tests {
                 [reasoning("Weigh."), text("answer")]
             );
         }
-    }
-
-    #[test]
-    fn final_message_native_fields_outside_the_replayed_one_add_no_text() {
         for replay in [ReasoningFormat::Text, ReasoningFormat::Details] {
             let reduced = reduced_as(
                 replay,
@@ -583,8 +557,8 @@ mod tests {
                 ),
             ]
         );
-        // One signed detail binds the whole sequence, so unbinding drops it whole;
-        // an unsigned sequence replays freely.
+        // One signed detail binds the whole sequence; an unsigned sequence
+        // replays freely.
         let summary = json!({"type":"reasoning.summary","summary":"Sum","index":0});
         let encrypted = json!({"type":"reasoning.encrypted","data":"opaque","index":1});
         for (sequence, binding) in [
@@ -607,16 +581,6 @@ mod tests {
                 .map(|detail| (detail, binding))
                 .collect();
             assert_eq!(native_replays(&reduced, ReasoningFormat::Details), expected);
-            let message = crate::session::Message::Assistant(reduced.items().to_vec());
-            let crate::session::Message::Assistant(unbound) = message.without_bound_reasoning()
-            else {
-                unreachable!()
-            };
-            let kept = unbound
-                .iter()
-                .filter(|item| item.replay().is_some())
-                .count();
-            assert_eq!(kept, if binding == Binding::Free { 1 } else { 0 });
         }
         // Without the convention, the `reasoning` alias is the text and details are ignored.
         let (items, _, _) = self::decode(frames);

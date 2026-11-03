@@ -40,8 +40,7 @@ fn exit_on<T>(label: &str, result: Result<T, impl std::fmt::Display>) -> T {
 /// Call `remote::askpass_main()` before this entry point.
 ///
 /// # Safety
-/// The process must still be single-threaded: `.env` loading mutates its environment, and
-/// SQLite's process configuration ([`skyhook::db::configure_process`]) requires it.
+/// The process must still be single-threaded: `.env` loading mutates its environment.
 /// No runtime, terminal worker, provider, or tracing subscriber may have been started.
 /// Product syntax hooks and Clap value parsers must preserve this until configuration begins.
 pub unsafe fn main<P: Product>(product: P) {
@@ -50,8 +49,6 @@ pub unsafe fn main<P: Product>(product: P) {
         args::parse_product(&product, std::env::args_os()).unwrap_or_else(|error| error.exit());
     // SAFETY: the caller guarantees single-threaded startup; syntax hooks must preserve it.
     exit_on(identity.name(), unsafe { dotenv::load_invocation_env() });
-    // SAFETY: still single-threaded, and nothing has used SQLite yet.
-    unsafe { skyhook::db::configure_process() };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -70,7 +67,7 @@ async fn run<P: Product>(product: P, invocation: Invocation<P>) {
         ),
         Invocation::Stats(request) => exit_on(
             &format!("{name} stats"),
-            stats::run(request, &identity).await,
+            stats::run(request, &identity, &mut std::io::stdout().lock()).await,
         ),
         Invocation::Auth(command) => {
             exit_on(&format!("{name} auth"), auth::run(command, &identity).await)
@@ -81,7 +78,10 @@ async fn run<P: Product>(product: P, invocation: Invocation<P>) {
                 name,
                 launch::configure(&product, args, &request.execution, true).await,
             );
-            exit_on(name, headless::run(request, input, host).await)
+            exit_on(
+                name,
+                headless::run(request, input, host, &mut std::io::stdout()).await,
+            )
         }
         Invocation::Interactive(request, input, args) => {
             exit_on(name, tui::check_terminal(&identity));

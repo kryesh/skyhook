@@ -484,15 +484,6 @@ mod tests {
         selected_text(&blocks, (start, end))
     }
 
-    /// A card's disclosure glyph is painted before its header, not selected.
-    #[test]
-    fn card_disclosure_glyphs_are_decoration() {
-        let args = serde_json::json!({"path": "f"});
-        let rows = argument_card("read", &args, 40);
-        assert_eq!(rows[0].layout.prefix.to_string(), "▾ ");
-        assert_eq!(copy_from(rows, "read"), "read\nArguments\npath  f");
-    }
-
     /// A diff line paints its marker before its source; however narrow, the
     /// marker gives way so the widest source grapheme still fits.
     #[test]

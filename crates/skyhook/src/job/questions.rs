@@ -215,6 +215,7 @@ mod tests {
     use crate::job::tests::{asked, asked_by, runtime};
     use crate::tests::bounded;
     use serde_json::json;
+    use std::assert_matches;
 
     /// A running agent job and `count` running asks of its child under it, each
     /// with its mailbox and worker.
@@ -291,7 +292,7 @@ mod tests {
         first_worker.fail(answered()).await;
         assert_eq!(questions(&jobs, owner), Some(vec!["second".to_owned()]));
         let repeated = jobs.request_input(owner, asked_by(owner, "second")).await;
-        assert!(matches!(repeated, Err(JobError::DuplicateQuestion(id)) if id == "second"));
+        assert_matches!(repeated, Err(JobError::DuplicateQuestion(id)) if id == "second");
         // The lone question left was answered already.
         assert!(jobs.answer(owner, json!("again")).await.unwrap());
         assert!(second_input.try_recv().is_err());

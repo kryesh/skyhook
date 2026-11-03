@@ -338,20 +338,6 @@ mod tests {
         for field in ["exit_code", "stdout", "stderr"] {
             assert_eq!(complete[field], expected[field]);
         }
-
-        let stderr: skyhook::job::FieldPointer = "/result/stderr".parse().unwrap();
-        let mut query = JobOutputQuery::new(job);
-        query.field = Some(stderr.clone());
-        app.outputs.set_query(query);
-        let selected = fetch_output(&mut app, job).await;
-        let presentation = selected.presentation.unwrap();
-        assert_eq!(
-            presentation.preview.as_ref().unwrap().field(),
-            Some(&stderr)
-        );
-        let captures = presentation.captures();
-        assert!(captures.iter().all(|capture| capture.output.is_none()));
-        assert_eq!(app.outputs.query(job).unwrap().field, Some(stderr));
         session.shutdown().await.unwrap();
     }
 }

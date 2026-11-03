@@ -108,6 +108,23 @@ mod tests {
             assert!(found, "{token}: {spans:?}");
         }
         assert!(highlight_code(&key("hello", "not-a-real-language")).is_none());
+        // JavaScript function names use the standard scopes.
+        let source = "async function declared() { const result = called(); return object.method(); }\nconst object = { async method() { return declared(); } };\nconst quoted = \"declared() called() method()\"; // declared() called() method()\n";
+        let lines = highlight_code(&key(source, "javascript")).unwrap();
+        assert_eq!(text(&lines), source);
+        for token in ["declared", "called", "method"] {
+            assert_source_color(&lines[..2], token, theme().ui.strong);
+        }
+        assert_source_color(&lines[..1], "result", theme().ui.fg);
+        for (token, color) in [
+            ("declared() called() method()", theme().ui.success),
+            (" declared() called() method()", theme().ui.muted),
+        ] {
+            let found = has_span(&lines[2], |content, fg| {
+                content == token && fg == Some(color)
+            });
+            assert!(found, "{token}: {:?}", lines[2]);
+        }
     }
 
     /// Assert source ranges, not just scope names: grammars can classify real
@@ -131,26 +148,6 @@ mod tests {
                 colored,
                 "{needle:?} at {start} should be {expected:?}: {lines:?}"
             );
-        }
-    }
-
-    #[test]
-    fn javascript_function_names_use_standard_scopes() {
-        let source = "async function declared() { const result = called(); return object.method(); }\nconst object = { async method() { return declared(); } };\nconst quoted = \"declared() called() method()\"; // declared() called() method()\n";
-        let lines = highlight_code(&key(source, "javascript")).unwrap();
-        assert_eq!(text(&lines), source);
-        for token in ["declared", "called", "method"] {
-            assert_source_color(&lines[..2], token, theme().ui.strong);
-        }
-        assert_source_color(&lines[..1], "result", theme().ui.fg);
-        for (token, color) in [
-            ("declared() called() method()", theme().ui.success),
-            (" declared() called() method()", theme().ui.muted),
-        ] {
-            let found = has_span(&lines[2], |content, fg| {
-                content == token && fg == Some(color)
-            });
-            assert!(found, "{token}: {:?}", lines[2]);
         }
     }
 }

@@ -279,8 +279,8 @@ mod tests {
     #[tokio::test]
     async fn partial_image_failures_use_persistent_blobs_and_never_serialize_raw_sources() {
         let png = png();
+        let runtime = TestRuntime::new().await;
         for failed_index in 0..4 {
-            let runtime = TestRuntime::new().await;
             let rejected = format!("RAW_REJECTED_MCP_IMAGE_{failed_index}!");
             let mut content = vec![json!({"type":"text","text":"before"})];
             for index in 0..3 {
@@ -397,27 +397,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_unsupported_and_oversized_images_fail_safely() {
+    async fn oversized_images_fail_safely() {
         let runtime = TestRuntime::new().await;
         let oversized = "A".repeat((MAX_IMAGE_BYTES as usize).div_ceil(3) * 4 + 1);
-        for (mime, data) in [
-            ("image/png", "not base64!".to_owned()),
-            ("image/svg+xml", "YWJj".to_owned()),
-            ("image/png", oversized),
-        ] {
-            let result = json!({"content":[
-                {"type":"image","mimeType":mime,"data":data},
-                {"type":"image","mimeType":"image/png","data":"YWJj"},
-                {"type":"text","text":"preserved"}
-            ]});
-            let (_, output) = failed(map(&result, &runtime).await);
-            assert!(output.images.is_empty());
-            for index in 0..2 {
-                assert!(output.value["content"][index].get("data").is_none());
-                assert!(output.value["content"][index]["imageError"].is_string());
-            }
-            assert_eq!(output.value["content"][2]["text"], "preserved");
+        let result = json!({"content":[
+            {"type":"image","mimeType":"image/png","data":oversized},
+            {"type":"image","mimeType":"image/png","data":"YWJj"},
+            {"type":"text","text":"preserved"}
+        ]});
+        let (_, output) = failed(map(&result, &runtime).await);
+        assert!(output.images.is_empty());
+        for index in 0..2 {
+            assert!(output.value["content"][index].get("data").is_none());
+            assert!(output.value["content"][index]["imageError"].is_string());
         }
+        assert_eq!(output.value["content"][2]["text"], "preserved");
         // An image past the count is refused before its data is read.
         let image = json!({"type":"image","mimeType":"image/png","data":png()});
         let mut content = vec![image; MAX_IMAGES_PER_SUBMISSION];

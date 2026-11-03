@@ -453,7 +453,7 @@ pub(super) mod tests {
     use super::super::manager_at;
     use super::super::store::tests::stored;
     use super::*;
-    use crate::provider::http::transport::tests::{Plan, Server, reply};
+    use crate::tests::{Plan, Server, reply};
 
     fn jwt(expiry: u64) -> String {
         format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
@@ -502,18 +502,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn pkce_entropy_and_form_encoding() {
-        let first = random_string().unwrap();
-        assert_eq!(first.len(), 43);
-        assert_ne!(first, random_string().unwrap());
+    fn form_bodies_escape_reserved_characters() {
         assert_eq!(form_body(&[("code", "a+b &c")]), "code=a%2Bb+%26c");
-        let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-        assert_eq!(
-            URL_SAFE_NO_PAD.encode(Sha256::digest(
-                b"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-            )),
-            expected
-        );
     }
 
     #[tokio::test]

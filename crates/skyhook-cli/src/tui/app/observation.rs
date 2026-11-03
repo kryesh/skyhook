@@ -38,6 +38,8 @@ enum Link {
 /// separately by the event loop.
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
+    /// What its windows read and keep.
+    pub(super) budget: model::Budget,
     pub(super) shown: Shown,
 }
 
@@ -56,18 +58,23 @@ impl PreparedObservation {
     pub async fn load(
         session: SessionHandle,
         extension: std::sync::Arc<dyn crate::SessionExtension>,
+        budget: model::Budget,
     ) -> Result<Self, HarnessError> {
         let root = session.root_agent().clone();
         let view = (root, Tab::Conversation, model::Edge::End);
         let Observation { snapshot, updates } = session.store().observe();
-        let shown = Shown::read(&session, snapshot, Some(view), None).await?;
+        let shown = Shown::read(&session, snapshot, Some(view), None, budget).await?;
         let link = Link::Live(updates);
         let active = ActiveObservation {
             session,
             extension,
             link,
         };
-        Ok(Self { active, shown })
+        Ok(Self {
+            active,
+            budget,
+            shown,
+        })
     }
 
     pub fn session(&self) -> &SessionHandle {
@@ -84,6 +91,7 @@ impl Shown {
         snapshot: ObservationSnapshot,
         view: Option<(AgentId, Tab, model::Edge)>,
         read: Option<RecordSeq>,
+        budget: model::Budget,
     ) -> Result<Self, HarnessError> {
         let agents = session.store().agents().await?;
         let owners = agents.agents.iter().filter_map(|agent| agent.owner_job);
@@ -91,9 +99,10 @@ impl Shown {
         let projection = Projection::new(agents, owners, &snapshot, session.host());
         let mut window = None;
         if let Some((agent, tab, focus)) = view {
-            let mut shown = model::Window::new(agent, tab, super::pages::window_id(), focus);
+            let id = super::pages::window_id();
+            let mut shown = model::Window::new(agent, tab, id, focus, budget);
             for (direction, want) in shown.plan(&[], focus..=focus) {
-                let loaded = super::pages::load(session, &shown.agent, want).await?;
+                let loaded = super::pages::load(session, &shown.agent, want, budget).await?;
                 shown.loaded(direction, loaded);
             }
             window = Some(Box::new(shown));
@@ -214,7 +223,7 @@ impl App {
             updates,
             held: Vec::new(),
         };
-        let (session, tx) = (observation.session.clone(), self.tx.clone());
+        let (session, tx, budget) = (observation.session.clone(), self.tx.clone(), self.budget);
         // A session out of view reads no view again; one in view reads it around its top.
         let view = (self.window.as_ref())
             .map(|window| (window.agent.clone(), window.tab, self.focus_of_view()));
@@ -225,7 +234,7 @@ impl App {
         self.content_dirty = true;
         self.dirty = true;
         tokio::spawn(async move {
-            let result = Shown::read(&session, snapshot, view, Some(since)).await;
+            let result = Shown::read(&session, snapshot, view, Some(since), budget).await;
             let result = result.map(Box::new);
             let _ = tx.send(Work::Observed { revision, result });
         });
@@ -286,7 +295,13 @@ impl App {
             (_, Some(shown)) => {
                 let focus = self.focus_of_view();
                 let id = super::pages::window_id();
-                Some(model::Window::new(shown.agent, shown.tab, id, focus))
+                Some(model::Window::new(
+                    shown.agent,
+                    shown.tab,
+                    id,
+                    focus,
+                    self.budget,
+                ))
             }
             (_, None) => None,
         };
@@ -308,6 +323,7 @@ mod tests {
     use super::super::played::*;
     use super::super::tests::*;
     use super::*;
+    use std::assert_matches;
 
     fn replace_receiver(app: &mut App, receiver: broadcast::Receiver<ObservedEvent>) {
         let Phase::Open { observation, .. } = &mut app.phase else {
@@ -338,32 +354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopping_keeps_an_interrupted_reply_at_its_journal_position() {
-        use skyhook::provider::protocol::ItemKind;
-        let (_root, mut app, mut model, session) = played_fixture().await;
-        let agent = app.selected.clone();
-        let _asked = ask(&session, "question");
-        let turn = model.turn().await;
-        turn.delta("text", ItemKind::Text, "cut short");
-        let shown = |app: &App| {
-            app.entries()
-                .iter()
-                .any(|entry| entry.text().contains("cut short"))
-        };
-        observe_until(&mut app, shown).await;
-        // The interruption ends the live reply before stopping settles it.
-        session.interrupt().await;
-        observe_until(&mut app, |app| stopped(&app.snapshot, &app.selected)).await;
-        let request = latest_request(&app.journal).unwrap();
-        assert!(
-            app.snapshot.views.responses[&(agent, request)]
-                .settlement()
-                .is_some()
-        );
-        assert!(shown(&app), "settled");
-    }
-
-    #[tokio::test]
     async fn closed_receiver_retains_session_and_resubscribe_installs_snapshot_with_updates() {
         let (_root, mut app) = fixture().await;
         let session = app.session().unwrap().clone();
@@ -372,7 +362,7 @@ mod tests {
         replace_receiver(&mut app, receiver);
         drop(sender);
         let closed = app.recv_observation().await;
-        assert!(matches!(closed, Err(broadcast::error::RecvError::Closed)));
+        assert_matches!(closed, Err(broadcast::error::RecvError::Closed));
         app.close_observation();
         assert_eq!(app.session_id(), Some(session.id()));
         assert!(futures_util::poll!(std::pin::pin!(app.recv_observation())).is_pending());
@@ -387,22 +377,19 @@ mod tests {
             .await
             .unwrap();
         let event = crate::tests::bounded(app.recv_observation()).await.unwrap();
-        assert!(matches!(&event.event, RuntimeEvent::Record(record)
-            if matches!(&record.event, SessionEvent::Status { message } if message == "after subscription")));
+        assert_matches!(&event.event, RuntimeEvent::Record(record)
+            if matches!(&record.event, SessionEvent::Status { message } if message == "after subscription"));
         // Lag likewise replaces both the snapshot and the receiver.
         let (sender, receiver) = broadcast::channel(1);
         sender.send(event.clone()).unwrap();
         sender.send(event).unwrap();
         replace_receiver(&mut app, receiver);
         let lagged = app.recv_observation().await;
-        assert!(matches!(
-            lagged,
-            Err(broadcast::error::RecvError::Lagged(_))
-        ));
+        assert_matches!(lagged, Err(broadcast::error::RecvError::Lagged(_)));
         resubscribe(&mut app).await;
         assert!(has_status(&mut app, "after subscription"));
         let empty = app.try_recv_observation();
-        assert!(matches!(empty, Err(broadcast::error::TryRecvError::Empty)));
+        assert_matches!(empty, Err(broadcast::error::TryRecvError::Empty));
         // What arrives while the app reads its view again waits for that read.
         let mut work = capture_work(&mut app);
         app.resubscribe();
@@ -439,7 +426,7 @@ mod tests {
     }
 
     /// A root failure the lag hid stays to be checked when the read that would have
-    /// found it is superseded: the queue still pauses.
+    /// found it is superseded: the queue still pauses, holding a later submission.
     #[tokio::test]
     async fn a_superseded_read_leaves_the_root_failure_it_missed_to_the_next() {
         use skyhook::provider::ProviderErrorKind;
@@ -463,6 +450,10 @@ mod tests {
         }
         assert!(app.held().is_none(), "the latest read lands");
         assert_eq!(app.paused, Some(Paused::Stopped));
+        app.submit("second".into());
+        let row = app.queue.iter().find(|row| row.submission.text == "second");
+        assert!(matches!(row.unwrap().state, RowState::Waiting));
+        session.shutdown().await.unwrap();
     }
 
     /// While the view is read again, a reply to a request the lagged slice never saw

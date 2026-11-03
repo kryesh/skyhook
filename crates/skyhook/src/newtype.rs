@@ -17,20 +17,41 @@ pub fn nonblank(what: &'static str, value: &str) -> Result<(), Blank> {
 /// Declare a `String` newtype whose values passed `$check`, a `fn(&str) ->
 /// Result<(), $error>`. Serde, a string schema, `TryFrom<String>`, `FromStr`,
 /// `Display`, `as_str` and `From<Self> for String` come with it; add further derives such
-/// as `Ord` as attributes. `schema = ...` states a narrower schema than a plain string.
+/// as `Ord` as attributes. `schema = ...` states a narrower schema than a plain string, which
+/// the type's doc comment describes unless the schema has a description of its own; it is one
+/// definition, which the fields of the type refer to.
 #[macro_export]
 macro_rules! string_newtype {
-    (@schema $generator:ident) => {
+    (@named $name:ident) => {
+        (true, <String as ::schemars::JsonSchema>::schema_name(), <String as ::schemars::JsonSchema>::schema_id())
+    };
+    (@named $name:ident $schema:expr) => {
+        (
+            false,
+            ::std::borrow::Cow::Borrowed(stringify!($name)),
+            ::std::borrow::Cow::Borrowed(concat!(module_path!(), "::", stringify!($name))),
+        )
+    };
+    (@schema $generator:ident $(#[$($attr:tt)*])*) => {
         <String as ::schemars::JsonSchema>::json_schema($generator)
     };
-    (@schema $generator:ident $schema:expr) => {
-        $schema
+    (@schema $generator:ident $(#[$($attr:tt)*])* ; $schema:expr) => {
+        $crate::described($schema, &$crate::string_newtype!(@docs [] $(#[$($attr)*])*))
+    };
+    (@docs [$($docs:literal)*]) => {
+        [$($docs),*]
+    };
+    (@docs [$($docs:literal)*] #[doc = $doc:literal] $($rest:tt)*) => {
+        $crate::string_newtype!(@docs [$($docs)* $doc] $($rest)*)
+    };
+    (@docs [$($docs:literal)*] #[$($attr:tt)*] $($rest:tt)*) => {
+        $crate::string_newtype!(@docs [$($docs)*] $($rest)*)
     };
     (
-        $(#[$attr:meta])*
+        $(#[$($attr:tt)*])*
         $vis:vis struct $name:ident($error:ty) = $check:expr $(, schema = $schema:expr)?;
     ) => {
-        $(#[$attr])*
+        $(#[$($attr)*])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, ::serde::Deserialize, ::serde::Serialize)]
         #[serde(try_from = "String", into = "String")]
         $vis struct $name(String);
@@ -79,21 +100,33 @@ macro_rules! string_newtype {
 
         impl ::schemars::JsonSchema for $name {
             fn inline_schema() -> bool {
-                true
+                $crate::string_newtype!(@named $name $($schema)?).0
             }
             fn schema_name() -> ::std::borrow::Cow<'static, str> {
-                <String as ::schemars::JsonSchema>::schema_name()
+                $crate::string_newtype!(@named $name $($schema)?).1
             }
             fn schema_id() -> ::std::borrow::Cow<'static, str> {
-                <String as ::schemars::JsonSchema>::schema_id()
+                $crate::string_newtype!(@named $name $($schema)?).2
             }
             fn json_schema(_generator: &mut ::schemars::SchemaGenerator) -> ::schemars::Schema {
-                $crate::string_newtype!(@schema _generator $($schema)?)
+                $crate::string_newtype!(@schema _generator $(#[$($attr)*])* $(; $schema)?)
             }
         }
     };
 }
 pub use string_newtype;
+
+/// `schema`, described by `docs`, the lines of a type's doc comment, unless it has a
+/// description of its own.
+pub fn described(mut schema: schemars::Schema, docs: &[&str]) -> schemars::Schema {
+    let lines: Vec<_> = (docs.iter().map(|line| line.trim()))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if !lines.is_empty() && schema.get("description").is_none() {
+        schema.insert("description".to_owned(), lines.join(" ").into());
+    }
+    schema
+}
 
 string_newtype! {
     /// Text written for a reader, such as instructions or a hint: never blank.
@@ -152,11 +185,16 @@ mod tests {
     use super::*;
 
     string_newtype! {
-        /// A word that is not empty.
+        /// A word that is not empty:
+        ///
+        /// one token.
         #[derive(PartialOrd, Ord)]
-        struct Word(Blank) = |word| nonblank("word", word);
+        struct Word(Blank) = |word| nonblank("word", word),
+            schema = schemars::json_schema!({"type": "string", "pattern": "\\S"});
     }
 
+    /// A word is checked once however it arrives, and its narrower schema is described by its
+    /// doc, as one line.
     #[test]
     fn checked_once_for_text_json_and_parsing() {
         let word = "hello".parse::<Word>().unwrap();
@@ -174,5 +212,9 @@ mod tests {
             assert_eq!(blank.parse::<Word>().unwrap_err(), Blank("word"));
             assert!(serde_json::from_value::<Word>(serde_json::json!(blank)).is_err());
         }
+        assert_eq!(
+            schemars::schema_for!(Word).get("description"),
+            Some(&serde_json::json!("A word that is not empty: one token."))
+        );
     }
 }

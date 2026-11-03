@@ -65,6 +65,7 @@ mod tests {
     use crate::tui::editor::TextField;
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::media::Attachment;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn file_menu_preserves_non_unicode_paths_and_attaches_images() {
@@ -150,10 +151,10 @@ mod tests {
         }
         // The chosen file consumes only the `@` that opened its picker.
         assert_eq!(app.editor.text(), "mail user@");
-        assert!(matches!(
+        assert_matches!(
             app.editor.attachments(),
             [a] if matches!(&**a, Attachment::Text { file: Some(_), content } if content == "notes")
-        ));
+        );
         assert!(!app.editor.has_pastes());
     }
 }

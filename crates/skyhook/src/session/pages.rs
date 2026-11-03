@@ -228,7 +228,7 @@ mod tests {
             store,
             agent,
             ..
-        } = TestRuntime::on_disk().await;
+        } = TestRuntime::new().await;
         let status = async |text: &str| {
             let message = format!("{text}\n{text}");
             let event = SessionEvent::Status { message };

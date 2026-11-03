@@ -3,6 +3,7 @@ use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
+use crate::tool::registry::Invocation;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,15 +22,17 @@ use crate::{
 };
 
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
-    builder.register_product::<ReadArgs, ReadOutput, _, _>(
+    builder.register_checked(
         crate::tool::builtins::names::READ,
         "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut ReadArgs| {
                 vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
-            }),
-        read,
+            })
+            .result::<ReadOutput>(),
+        Ok,
+        |args| Invocation::new(|context| read(context, args)),
     )?;
     Ok(())
 }
@@ -253,6 +256,7 @@ impl DirectoryGroups {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -292,13 +296,13 @@ mod tests {
         for input in [&b"valid\xff"[..], b"valid\0"] {
             assert_eq!(copy(&mut &input[..]).unwrap(), TextRead::NotText);
         }
-        assert!(matches!(
+        assert_matches!(
             copy(&mut Reader(None)).unwrap_err().diagnostic().cause,
             Cause::Io {
                 kind: IoKind::InvalidData,
                 ..
             }
-        ));
+        );
         // The first reader cancels during copying; the second starts cancelled.
         for reader in [
             &mut Reader(Some(cancellation.clone())) as &mut dyn std::io::Read,
@@ -350,13 +354,13 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.diagnostic().context.operation, operation);
-            assert!(matches!(
+            assert_matches!(
                 error.diagnostic().cause,
                 Cause::Io {
                     kind: IoKind::PermissionDenied,
                     ..
                 }
-            ));
+            );
             output.settle().await.unwrap();
         }
     }

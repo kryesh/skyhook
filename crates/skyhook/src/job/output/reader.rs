@@ -369,10 +369,7 @@ fn fit_line(
     budget: usize,
     full_line: bool,
 ) -> Option<(String, usize, usize)> {
-    let mut maximum = text.len().min(budget);
-    while !text.is_char_boundary(maximum) {
-        maximum -= 1;
-    }
+    let maximum = text.floor_char_boundary(budget);
     let full_line = full_line && maximum == text.len();
     let text = &text[..maximum];
     if full_line {
@@ -825,8 +822,8 @@ mod tests {
 
     /// A pattern sees a whole line far longer than any argument a model supplies.
     #[test]
-    fn patterns_match_lines_longer_than_model_content() {
-        let line = format!("{}needle\n", "x".repeat(crate::limits::MODEL_CONTENT_BYTES));
+    fn patterns_match_lines_longer_than_a_read_ahead() {
+        let line = format!("{}needle\n", "x".repeat(READ_AHEAD));
         let source = saved(&line);
         let matcher = super::super::args::pattern_matcher("needle").unwrap();
         for stored in [false, true] {

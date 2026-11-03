@@ -6,11 +6,13 @@ use crate::{
     identity::JobId,
     job::{
         FieldPointer, JobError, JobListing, JobManager, ViewKind,
-        output::{DEFAULT_LIMIT, MAX_CONTEXT, OutputArgs, OutputOptions, PageLimit, Selectors},
+        output::{
+            DEFAULT_LIMIT, MAX_CONTEXT, OutputArgs, OutputOptions, PageLimit, PageUnit, Selectors,
+        },
     },
     tool::{
-        AdmissionError, JobViewResult, RegistryError, ToolContext, ToolError, ToolOptions,
-        ToolOutput, ToolRegistryBuilder,
+        AdmissionError, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput,
+        ToolRegistryBuilder,
         diagnostic::{Effects, Operation, PartialContext, Subject},
         registry::Invocation,
     },
@@ -23,8 +25,16 @@ pub(crate) fn register(
     let admitted = jobs.clone();
     builder.register_checked(
         "jobs",
-        "Without `job`, list this agent's active jobs as {jobs, older}, excluding this call and its containing script; `all` adds finished jobs, and `limit` keeps the newest jobs, counting those left out in `older` when any are. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: text by line (start/offset/pattern), JSON by element or member (index), or query matches.",
-        ToolOptions::default().job_views(JobViewResult::Listing),
+        "Without `job`, list this agent's active jobs as {jobs, older}, excluding this call and its containing script; `all` adds finished jobs, and `limit` keeps the newest jobs, counting those left out in `older` when any are. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: start/limit page lines of text or elements of JSON; pattern filters either; query selects JSON matches.",
+        ToolOptions::default()
+            .output_schema(crate::job::JOB_VIEW_SCHEMAS.listing.clone())
+            .internal_result(|request| {
+                let schemas = &crate::job::JOB_VIEW_SCHEMAS;
+                match request {
+                    JobsRequest::List { .. } => schemas.listing.clone(),
+                    JobsRequest::Output(_) => schemas.view.clone(),
+                }
+            }),
         |args: JobsArgs| JobsRequest::try_from(args),
         move |request| {
             let jobs = admitted.clone();
@@ -42,6 +52,7 @@ pub(crate) fn register(
                         OutputOptions::Model {
                             kind: ViewKind::Inspection,
                             reader: Some(context.job()),
+                            fit: context.fit(),
                         },
                     );
                     let presented = presented.await.map_err(|error| error.or(read))?;
@@ -52,37 +63,41 @@ pub(crate) fn register(
         },
     )?;
     let send = jobs.clone();
-    builder.register_unit::<JobSendArgs, _, _>(
+    builder.register_checked(
         "job_send",
         "Send JSON input to a job. For child agents, answer pending questions or deliver follow-up instructions automatically at the next model-request boundary. Sending to a completed, failed, or interrupted child agent appends to its retained conversation and resumes it under the same job ID; cancelled jobs remain non-resumable. Background scripts read input with await receive().",
         ToolOptions::default()
             .script_only()
             .job_method("send", "job"),
-        move |_context, args| {
+        Ok,
+        move |args: JobSendArgs| {
             let jobs = send.clone();
-            async move {
+            Invocation::unit(move |_| async move {
                 jobs.send(args.job, args.value)
                     .await
                     .map_err(|error| job_failure(error, Operation::Send, args.job))
-            }
+            })
         },
     )?;
     let cancel = jobs.clone();
-    builder.register::<JobArgs, Value, _, _>(
+    builder.register_checked(
         "job_cancel",
         "Request cancellation of job/descendants; confirm terminal state with jobs.",
         ToolOptions::default()
-            .job_views(JobViewResult::One)
+            .output_schema(crate::job::JOB_VIEW_SCHEMAS.view.clone())
             .script_only()
             .job_method("cancel", "job"),
-        move |context, args| {
+        Ok,
+        move |args: JobArgs| {
             let jobs = cancel.clone();
-            async move {
+            Invocation::new(move |context: ToolContext| async move {
                 jobs.cancel(args.job)
                     .await
                     .map_err(|error| job_failure(error, Operation::Terminate, args.job))
-                    .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
-            }
+                    .map(|job| {
+                        ToolOutput::new(job.metadata_view(context.diagnostic_viewer()).into_value())
+                    })
+            })
         },
     )?;
     Ok(())
@@ -148,7 +163,9 @@ async fn list(
         older: std::num::NonZeroUsize::new(older),
     };
     let listing = serde_json::to_value(listing).expect("a job listing serializes");
-    Ok(ToolOutput::new(listing))
+    // Bounded by its limit, a listing is a presentation already.
+    let presented = crate::job::output::Presented::presentation(FieldPointer::result());
+    Ok(ToolOutput::new(listing).with_presented(presented))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -161,24 +178,23 @@ struct JobsArgs {
     all: bool,
     /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console.
     field: Option<FieldPointer>,
-    /// Text fields: one-based first source line; use returned next_start to continue.
+    /// One-based first line of text, or element, member or query match of JSON; use returned next_start to continue.
     #[schemars(range(min = 1), extend("default" = 1))]
     start: Option<usize>,
+    /// What start counts, as the page it continues names its values: lines, elements, members or matches. Required past start 1 on JSON.
+    unit: Option<PageUnit>,
     /// Maximum returned lines (including match context), values or query matches; without job, the newest jobs listed.
     #[schemars(extend("default" = DEFAULT_LIMIT))]
     limit: Option<PageLimit>,
-    /// Text fields: case-sensitive line regex; use (?i) for case-insensitive matching.
+    /// Case-sensitive regex keeping the lines of text, or the elements and members of JSON whose compact JSON matches; use (?i) for case-insensitive matching.
     pattern: Option<String>,
-    /// Surrounding lines per match.
+    /// Text fields: surrounding lines per pattern match.
     #[schemars(range(min = 0, max = MAX_CONTEXT), extend("default" = 0))]
     context: Option<usize>,
     /// Text fields: zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
     #[schemars(range(min = 0), extend("default" = 0))]
     offset: Option<usize>,
-    /// JSON fields: zero-based first element, member or query match; use returned next_index to continue.
-    #[schemars(range(min = 0), extend("default" = 0))]
-    index: Option<usize>,
-    /// JSONPath (RFC 9535) query over a JSON field, with `$` as the field; returns matches with their pointers. Numeric comparisons use double precision.
+    /// JSONPath (RFC 9535) query over a JSON field, with `$` as the field, e.g. $[?search(@.name, '^api') && @.phase == 'Failed']; returns matches with their pointers. Numeric comparisons use double precision.
     query: Option<String>,
 }
 
@@ -196,11 +212,11 @@ impl TryFrom<JobsArgs> for JobsRequest {
             all,
             field,
             start,
+            unit,
             limit,
             pattern,
             context,
             offset,
-            index,
             query,
         } = args;
         match job {
@@ -211,26 +227,26 @@ impl TryFrom<JobsArgs> for JobsRequest {
                 job,
                 field,
                 start,
+                unit,
                 limit,
                 pattern,
                 context,
                 offset,
-                index,
                 query,
             })),
             None if field.is_some()
+                || unit.is_some()
                 || pattern.is_some()
                 || query.is_some()
                 || (Selectors {
                     start,
                     offset,
-                    index,
                     context,
                 })
                 .is_set() =>
             {
                 Err(AdmissionError::invalid_arguments(
-                    "field, start, offset, pattern, context, index and query read a job's output; pass job",
+                    "field, start, unit, offset, pattern, context and query read a job's output; pass job",
                 ))
             }
             None => Ok(Self::List {
@@ -287,7 +303,7 @@ mod tests {
             })
         ));
         // Selectors restating their defaults are a listing's, as schema-filling models send them.
-        let listing = json!({"all":true, "limit":5, "start":1, "offset":0, "index":0, "context":0});
+        let listing = json!({"all":true, "limit":5, "start":1, "offset":0, "context":0});
         assert!(matches!(
             request(listing),
             Ok(JobsRequest::List { all: true, limit }) if limit.get() == 5
@@ -425,6 +441,54 @@ mod tests {
         );
     }
 
+    /// A script's whole read of a saved result holds all of it, while a model's read of the
+    /// same result is a preview. Reading those reads again, the model's preview stays as it
+    /// was, and the script's whole result is previewed as its saved fields are.
+    #[tokio::test]
+    async fn a_script_reads_a_saved_result_whole() {
+        let runtime = TestRuntime::new().await;
+        let (agent, jobs) = (&runtime.agent, &runtime.jobs);
+        let mut spec = JobSpec {
+            background: true,
+            ..JobSpec::test(agent.clone(), "exec")
+        };
+        let ends = json!({"type": "string", crate::tool::output::PREVIEW: "ends"});
+        spec.output_schema = Some(json!({"type": "object", "properties": {"stdout": ends}}));
+        let target = jobs.test_create(spec).await;
+        let stdout: String = (1..=5000).map(|line| format!("line {line}\n")).collect();
+        let finished = JobOutcome::Completed(ToolOutput::new(json!({"stdout": stdout})).into());
+        jobs.finish(target, finished).await.unwrap();
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, jobs.clone()).unwrap();
+        let executor = runtime.executor(builder);
+        let spec = JobSpec {
+            background: true,
+            role: JobRole::Script,
+            ..JobSpec::test(agent.clone(), "script")
+        };
+        let script = jobs.create(spec).await.unwrap();
+        let read = |job: JobId| json!({"job": job});
+        let model = executor
+            .run_model(agent, "jobs", read(target))
+            .await
+            .unwrap();
+        let shown = &model.output.value;
+        assert!(shown["presentation"]["truncated"].is_array(), "{shown}");
+        let kind = crate::tool::executor::InvocationKind::Script;
+        let scripted = executor
+            .execute_as(kind, agent.clone(), "jobs", read(target), Some(script.id()))
+            .await
+            .unwrap();
+        assert_eq!(scripted.output.value["result"]["stdout"], stdout);
+        assert_eq!(scripted.output.value.get("presentation"), None);
+        let again = executor.run_model(agent, "jobs", read(model.job)).await;
+        assert_eq!(&again.unwrap().output.value["result"], shown);
+        let child = executor.run_model(agent, "jobs", read(scripted.job)).await;
+        let child = child.unwrap().output.value;
+        let cut = &child["presentation"]["truncated"][0];
+        assert_eq!(cut["field"], "/result/result/stdout", "{child}");
+    }
+
     /// An output read acknowledges the outcome it presents with its own finish:
     /// one the journal refuses leaves that outcome pending for its owner.
     #[tokio::test]
@@ -450,5 +514,53 @@ mod tests {
         drop(refused);
         assert!(failed.is_err());
         assert!(jobs.has_pending(agent));
+    }
+
+    /// A script receives what is sent to it in order, across calls, and one cancelled
+    /// while it waits on `receive()` ends cancelled.
+    #[tokio::test]
+    async fn script_messages_preserve_order_across_calls_and_cancel_waiting_receivers() {
+        let runtime = TestRuntime::new().await;
+        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let run = async |source: String, bg: bool| {
+            crate::tests::script(&executor, &runtime.agent, source, bg).await
+        };
+        let value =
+            async |source: String| run(source, false).await.output.value["result"]["value"].clone();
+        let source = "const messages=[]; for(let i=0;i<4;i++) messages.push(await receive()); return messages;";
+        let running = run(source.into(), true).await.job;
+        let id = running.get();
+        let queued = value(format!(
+            r#"
+    const accepted = [];
+    for (const value of [{{text:"hello", nested:[1,true]}}, null, false]) {{
+      accepted.push((await tool.job({id}).send({{value}})).unwrap());
+    }}
+    const pending = await tool.jobs({{job:{id}}});
+    return {{accepted, state:pending.state}};
+    "#
+        ))
+        .await;
+        assert_eq!(queued["accepted"], json!([null, null, null]));
+        assert_eq!(queued["state"], "running");
+        value(format!("return tool.job({id}).send({{value:\"last\"}});")).await;
+        runtime.jobs.wait(running, true).await.unwrap();
+        let completed = value(format!("return tool.jobs({{job:{id}}});")).await;
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(
+            completed["result"]["value"],
+            json!([{"text":"hello", "nested":[1,true]}, null, false, "last"])
+        );
+
+        let waiting = run("return await receive();".into(), true).await.job;
+        let id = waiting.get();
+        // The cancel result is the target's view, with no denial code.
+        let cancel = format!(
+            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === null;"
+        );
+        assert_eq!(value(cancel).await, true);
+        runtime.jobs.wait(waiting, true).await.unwrap();
+        let cancelled = value(format!("return tool.jobs({{job:{id}}});")).await;
+        assert_eq!(cancelled["state"], "cancelled");
     }
 }

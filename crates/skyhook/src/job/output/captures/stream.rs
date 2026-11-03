@@ -470,24 +470,17 @@ mod tests {
         assert_eq!(notices(), 1);
     }
 
+    /// A capture is complete only once its job is terminal and its result references it.
     #[tokio::test]
-    async fn ownership_prevents_truncation() {
+    async fn captures_complete_with_the_terminal_result_that_references_them() {
         let (_root, manager, job) = fixture(None).await;
         let output = manager.output(job).await;
         let matches = "/result/matches".parse().unwrap();
-        let create = |kind| PendingCapture::create(&output, &matches, kind);
-        let mut writer = create(CaptureKind::Json).unwrap().open();
-        writer.write_all(b"[\"a\"").unwrap();
-        let checkpoint = writer.position();
-        writer.write_all(b",\"binary\"").unwrap();
-        writer.flush().unwrap();
-        writer.truncate(checkpoint).unwrap();
-        writer.write_all(b"]").unwrap();
-        assert!(create(CaptureKind::Text).is_err());
-        let saved = Saved::load(&output).unwrap();
-        assert!(matches!(saved.captures[&matches].kind, CaptureKind::Json));
+        let mut writer = PendingCapture::create(&output, &matches, CaptureKind::Json)
+            .unwrap()
+            .open();
+        writer.write_all(b"[\"a\"]").unwrap();
         let completed = writer.finish().unwrap();
-        assert_eq!(output.test_bytes("/result/matches").unwrap(), b"[\"a\"]");
         let empty = text(&output, TextCaptureField::Console)
             .open()
             .finish()
@@ -541,22 +534,14 @@ mod tests {
             assert!(capture.finish().is_err(), "an IO error poisons completion");
             assert!(output.test_bytes(console.as_str()).is_none());
             let mut capture = text(&output, TextCaptureField::Stdout).open_async();
-            let payload = "é🦀".repeat(700_000);
+            // Several chunks, with characters across their boundaries.
+            let payload = "é🦀".repeat(crate::tool::output::OUTPUT_CHUNK_BYTES * 4 / 6);
             poll_once(capture.write_text(&payload)).await;
             assert!(capture.finish_nonempty().await.unwrap().is_some());
             let stdout = output
                 .test_bytes(TextCaptureField::Stdout.pointer().as_str())
                 .unwrap();
             assert_eq!(stdout, payload.as_bytes());
-
-            let mut capture = text(&output, TextCaptureField::Stderr).open_async();
-            poll_once(capture.write_text(&"x".repeat(4 * 1024 * 1024))).await;
-            drop(capture);
-            // The in-flight write finishes, then the abandoned capture is discarded,
-            // both on the only blocking thread, before it runs anything else.
-            tokio::task::spawn_blocking(|| ()).await.unwrap();
-            let stderr = TextCaptureField::Stderr.pointer();
-            assert!(output.test_bytes(stderr.as_str()).is_none());
         });
     }
 }

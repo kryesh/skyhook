@@ -158,6 +158,17 @@ impl FieldPointer {
             .strip_prefix(self.0.as_str())
             .is_some_and(|rest| rest.starts_with('/'))
     }
+
+    /// `relative`, addressed from a value placed at this pointer.
+    pub(crate) fn join(&self, relative: &Self) -> Self {
+        Self(format!("{}{}", self.0, relative.0))
+    }
+
+    /// This pointer relative to `base`, when it addresses `base` or a descendant.
+    pub(crate) fn relative_to(&self, base: &Self) -> Option<Self> {
+        let rest = self.0.strip_prefix(base.0.as_str())?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| Self(rest.to_owned()))
+    }
 }
 
 /// One JSON Pointer reference token, with `~` and `/` escaped.

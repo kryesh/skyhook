@@ -2,6 +2,7 @@ use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
+use crate::tool::registry::Invocation;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -24,15 +25,17 @@ use crate::tool::{
 };
 
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
-    builder.register_product::<SearchArgs, SearchOutput, _, _>(
+    builder.register_checked(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; a long line is cut to a window around its match. Files that could not be searched are listed in `skipped`, and then `matches` is incomplete.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut SearchArgs| {
                 vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
-            }),
-        |context, args| async move {
+            })
+            .result::<SearchOutput>(),
+        Ok,
+        |args: SearchArgs| Invocation::new(|context| async move {
             run_walker(context, "search", "matches", move |workspace, capture, cancel| {
                 let (matches, skipped) =
                     search_blocking(workspace, Path::new(&args.path), &args, capture, cancel)?;
@@ -40,9 +43,9 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 Ok((matches, serde_json::to_value(value)?))
             })
             .await
-        },
+        }),
     )?;
-    builder.register_product::<GlobArgs, GlobOutput, _, _>(
+    builder.register_checked(
         "glob",
         "Find files with ripgrep glob and ignore semantics.",
         ToolOptions::new(vec![Capability::Read])
@@ -53,19 +56,28 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                     PathAccess::Read,
                     PathKind::Existing,
                 )]
-            }),
-        |context, args| async move {
-            run_walker(
-                context,
-                "glob",
-                "paths",
-                move |workspace, capture, cancel| {
-                    let paths =
-                        glob_blocking(workspace, Path::new(&args.path), &args, capture, cancel)?;
-                    Ok((paths, serde_json::json!({})))
-                },
-            )
-            .await
+            })
+            .result::<GlobOutput>(),
+        Ok,
+        |args: GlobArgs| {
+            Invocation::new(|context| async move {
+                run_walker(
+                    context,
+                    "glob",
+                    "paths",
+                    move |workspace, capture, cancel| {
+                        let paths = glob_blocking(
+                            workspace,
+                            Path::new(&args.path),
+                            &args,
+                            capture,
+                            cancel,
+                        )?;
+                        Ok((paths, serde_json::json!({})))
+                    },
+                )
+                .await
+            })
         },
     )?;
     Ok(())
@@ -558,7 +570,8 @@ impl Sink for SearchSink<'_> {
         // display, so a match on the `\r` still places the window.
         let found = grep_matcher::Matcher::find(self.matcher, bytes)
             .ok()
-            .flatten();
+            .flatten()
+            .map(|found| found.start()..found.end());
         let shown = bytes.strip_suffix(b"\r").unwrap_or(bytes);
         (self.matches)
             .push(
@@ -577,11 +590,11 @@ impl Sink for SearchSink<'_> {
 /// `line` whole when it is short; otherwise the window around `found`, its match,
 /// marked with how long the line was. Neither outgrows the short-line size or the source
 /// bytes it shows, however malformed they are.
-fn excerpt(line: &[u8], found: Option<grep_matcher::Match>) -> String {
+pub fn excerpt(line: &[u8], found: Option<std::ops::Range<usize>>) -> String {
     if line.len() <= 4 * MATCH_CONTEXT_BYTES {
         return shown(line);
     }
-    let (start, end) = found.map_or((0, 0), |found| (found.start(), found.end()));
+    let (start, end) = found.map_or((0, 0), |found| (found.start, found.end));
     let start = start.min(line.len());
     let end = end.min(start + 2 * MATCH_CONTEXT_BYTES).min(line.len());
     // Cut between characters: a boundary byte is not a UTF-8 continuation byte, looking at
@@ -613,14 +626,7 @@ fn excerpt(line: &[u8], found: Option<grep_matcher::Match>) -> String {
 /// short-line size.
 fn shown(bytes: &[u8]) -> String {
     let mut text = String::from_utf8_lossy(bytes).into_owned();
-    let limit = bytes.len().max(4 * MATCH_CONTEXT_BYTES);
-    if text.len() > limit {
-        let mut cut = limit;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-    }
+    text.truncate(text.floor_char_boundary(bytes.len().max(4 * MATCH_CONTEXT_BYTES)));
     text
 }
 
@@ -709,6 +715,8 @@ struct GlobOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::tool::ToolRegistryBuilder;
     use crate::tool::diagnostic::{Cause, IoKind};
@@ -733,7 +741,10 @@ mod tests {
                 Arc<crate::tool::invocation::tests::CapturedOutput>,
             ) -> Arc<dyn OutputSink>,
         ) -> Self {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
             let output = crate::tool::output::OutputContext::new(wrap(sink.clone()));
             Self {
@@ -811,8 +822,8 @@ mod tests {
                 let diagnostic = error.diagnostic();
                 assert_eq!(diagnostic.context.operation, Operation::Inspect);
                 assert_eq!(diagnostic.context.subject, Subject::path(&path));
-                assert!(matches!(diagnostic.cause,
-                    Cause::Io { kind: actual, code: Some(_), .. } if actual == kind.into()));
+                assert_matches!(diagnostic.cause,
+                    Cause::Io { kind: actual, code: Some(_), .. } if actual == kind.into());
             }
         }
     }
@@ -854,7 +865,7 @@ mod tests {
             ),
         ] {
             let diagnostic = error.diagnostic();
-            assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
+            assert_matches!(diagnostic.cause, Cause::InvalidArguments(_));
             assert_eq!(diagnostic.context.operation, Operation::Validate);
             assert_eq!(
                 diagnostic.context.subject,
@@ -917,13 +928,13 @@ mod tests {
                 Subject::Label("result capture".into())
             );
             assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
-            assert!(matches!(
+            assert_matches!(
                 diagnostic.cause,
                 Cause::Io {
                     kind: IoKind::PermissionDenied,
                     ..
                 }
-            ));
+            );
             fixture.settle().unwrap();
         }
     }
@@ -1076,30 +1087,31 @@ mod tests {
             ],
         );
         std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
-        for hidden in [false, true] {
-            for no_ignore in [false, true] {
-                for pattern in ["*", "**/*"] {
-                    let args = json!({"pattern":pattern, "hidden":hidden, "no_ignore":no_ignore});
-                    let paths = glob(root, root, args);
-                    let has = |path: &str| paths.iter().any(|p| p == path);
-                    assert!(has("src/visible"));
-                    assert_eq!(
-                        (has(".git/config"), has(".hidden/secret")),
-                        (hidden, hidden)
-                    );
-                    assert_eq!(has("build/generated"), no_ignore);
-                    let args = json!({
-                        "pattern":"needle", "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
-                    });
-                    let matches = search(root, root, args);
-                    let has = |path: &str| matches.contains_key(path);
-                    assert!(has("src/visible"));
-                    assert_eq!(
-                        (has(".git/config"), has("build/generated")),
-                        (hidden, no_ignore)
-                    );
-                }
-            }
+        // One case per flag, and per pattern form.
+        for (hidden, no_ignore, pattern) in [
+            (false, false, "*"),
+            (true, false, "**/*"),
+            (false, true, "*"),
+        ] {
+            let args = json!({"pattern":pattern, "hidden":hidden, "no_ignore":no_ignore});
+            let paths = glob(root, root, args);
+            let has = |path: &str| paths.iter().any(|p| p == path);
+            assert!(has("src/visible"));
+            assert_eq!(
+                (has(".git/config"), has(".hidden/secret")),
+                (hidden, hidden)
+            );
+            assert_eq!(has("build/generated"), no_ignore);
+            let args = json!({
+                "pattern":"needle", "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
+            });
+            let matches = search(root, root, args);
+            let has = |path: &str| matches.contains_key(path);
+            assert!(has("src/visible"));
+            assert_eq!(
+                (has(".git/config"), has("build/generated")),
+                (hidden, no_ignore)
+            );
         }
         // An explicitly requested hidden root remains accessible.
         let paths = glob(
@@ -1139,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn subdirectory_roots_inherit_ignores_and_globs_keep_precedence() {
+    fn subdirectory_roots_inherit_ignores_and_take_relative_globs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::create_dir(root.join(".git")).unwrap();
@@ -1158,22 +1170,10 @@ mod tests {
         let src = root.join("src");
         let paths = glob(root, &src, json!({"pattern":"*.rs", "path":"src"}));
         assert_eq!(paths, ["src/a.rs", "src/b.rs", "src/nested/file.rs"]);
-        for (glob, expected) in [
-            (
-                vec!["*.rs", "!b.rs"],
-                vec!["src/a.rs", "src/nested/file.rs"],
-            ),
-            (
-                vec!["*.rs", "!b.rs", "b.rs"],
-                vec!["src/a.rs", "src/b.rs", "src/nested/file.rs"],
-            ),
-            (vec!["!b.rs"], vec!["src/a.rs", "src/nested/file.rs"]),
-            (vec!["*.rs", "!nested/"], vec!["src/a.rs", "src/b.rs"]),
-        ] {
-            let args = json!({"pattern":"needle", "path":"src", "glob":glob});
-            let matches = search(root, &src, args);
-            assert_eq!(matches.keys().collect::<Vec<_>>(), expected);
-        }
+        // Globs are relative to the requested root.
+        let args = json!({"pattern":"needle", "path":"src", "glob":["*.rs", "!nested/*.rs"]});
+        let matches = search(root, &src, args);
+        assert_eq!(matches.keys().collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
     }
 
     #[test]

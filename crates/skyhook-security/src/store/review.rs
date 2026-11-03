@@ -1,6 +1,6 @@
-//! Assessments and verdicts, recorded in place on the candidate. Each names the event that
-//! recorded it, whose note is its rationale; it is current while nothing its phase reads
-//! changed after it.
+//! Assessments and verdicts, each recorded by an event whose note is its rationale. The latest
+//! recorded within its phase's work on the candidate stands, current while nothing its phase
+//! reads changed after it; one recorded elsewhere is a proposal, which that phase decides.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -17,6 +17,23 @@ pub struct Assessment {
     pub shortlisted: bool,
 }
 
+const ASSESSMENT: Standing = standing_of!(
+    "candidate_result",
+    "candidate",
+    "vector",
+    "assessment_proposed",
+    crate::store::bearing::owns!("assess", "?2", "?1"),
+    Standing
+);
+const VERDICT: Standing = standing_of!(
+    "candidate_result",
+    "candidate",
+    "verdict",
+    "verdict_proposed",
+    crate::store::bearing::owns!("review", "?2", "?1"),
+    Standing
+);
+
 impl Store {
     /// Score `id` at `vector`: its impact were every premise of its chain to hold.
     pub fn assess(
@@ -30,10 +47,10 @@ impl Store {
         self.write(|db| {
             let id = live(db, id)?;
             audit(db, actor, EventKind::Assessed, Some(note), |event| {
-                db.execute(
-                    "UPDATE candidate SET vector=?2,severity=?3,assessed=?4 WHERE node=?1",
-                    params![id, vector.to_string(), severity, event],
-                )?;
+                let sql = "INSERT INTO candidate_assessment(event,candidate,vector,severity,owned) \
+                           VALUES (?1,?2,?3,?4,?5)";
+                let row = params![event, id, vector.to_string(), severity];
+                let effect = ASSESSMENT.record(db, id, event, vector.to_string(), sql, row)?;
                 let shortlisted = stored(
                     db,
                     "SELECT k.rank>=t.rank FROM run JOIN severity_kind t ON t.name=run.threshold \
@@ -46,7 +63,7 @@ impl Store {
                     score: vector.score(),
                     shortlisted,
                 };
-                Ok((assessment, Marks::of(id, EventEffect::Standing)))
+                Ok((assessment, Marks::of(id, effect)))
             })
         })
     }
@@ -62,11 +79,11 @@ impl Store {
         self.write(|db| {
             let id = live(db, id)?;
             audit(db, actor, EventKind::Verdict, Some(note), |event| {
-                db.execute(
-                    "UPDATE candidate SET verdict=?2,reviewed=?3 WHERE node=?1",
-                    params![id, verdict, event],
-                )?;
-                Ok(((), Marks::of(id, EventEffect::Standing)))
+                let sql = "INSERT INTO candidate_verdict(event,candidate,verdict,owned) VALUES \
+                           (?1,?2,?3,?4)";
+                let row = params![event, id, verdict];
+                let effect = VERDICT.record(db, id, event, verdict, sql, row)?;
+                Ok(((), Marks::of(id, effect)))
             })
         })
     }

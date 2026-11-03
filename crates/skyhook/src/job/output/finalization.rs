@@ -221,23 +221,14 @@ fn slot<'a>(cursor: &'a mut Value, key: &str) -> &'a mut Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobSpec, tests::runtime};
+    use crate::job::{AgentId, output::tests::fixture_with, tests::runtime};
     use crate::tool::ToolOutput;
 
     /// Two running jobs of one session: receipts are bound to exactly one of them.
-    async fn outputs() -> (tempfile::TempDir, JobManager, Output, Output) {
-        let (root, manager, agent) = runtime().await;
-        let mut outputs = Vec::new();
-        for name in ["first", "second"] {
-            let id = manager
-                .test_running(JobSpec::test(agent.clone(), name))
-                .await
-                .into_test_id();
-            outputs.push(manager.output(id).await);
-        }
-        let second = outputs.pop().unwrap();
-        let first = outputs.pop().unwrap();
-        (root, manager, first, second)
+    async fn outputs(manager: &JobManager, agent: &AgentId) -> (Output, Output) {
+        let first = fixture_with(manager, agent, None, None).await;
+        let second = fixture_with(manager, agent, None, None).await;
+        (manager.output(first).await, manager.output(second).await)
     }
 
     fn completed(
@@ -278,7 +269,8 @@ mod tests {
 
     #[tokio::test]
     async fn completed_receipts_install_omitted_fields_and_preserve_existing_wire_references() {
-        let (_root, manager, output, _) = outputs().await;
+        let (_root, manager, agent) = runtime().await;
+        let (output, _) = outputs(&manager, &agent).await;
         let captures = [
             ("/result/text", CaptureKind::Text, "é\ntext".as_bytes()),
             ("/result/matches", CaptureKind::Json, br#"{"a":[1,true]}"#),
@@ -314,6 +306,7 @@ mod tests {
     /// still exists). JSON validation covers the full payload, not only its prefix.
     #[tokio::test]
     async fn invalid_capture_receipts_publish_the_product_with_incomplete_captures() {
+        let (_root, manager, agent) = runtime().await;
         for (failure, bytes) in [
             ("job", &b"valid"[..]),
             ("registration", &b"valid"[..]),
@@ -323,17 +316,20 @@ mod tests {
             ("json", &b"{} trailing"[..]),
             ("utf8", &b"ok\xff"[..]),
             ("ancestor", &b"valid"[..]),
+            // An existing primitive abandons even completed bytes, which are never
+            // inspected, since IO completion alone did not reference them.
+            ("existing", &b"\xff"[..]),
         ] {
-            let (_root, manager, output, other) = outputs().await;
+            let (output, other) = outputs(&manager, &agent).await;
             let kind = if failure == "json" {
                 CaptureKind::Json
             } else {
                 CaptureKind::Text
             };
-            let field = if failure == "ancestor" {
-                "/result/scalar/raw"
-            } else {
-                "/result/raw"
+            let field = match failure {
+                "ancestor" => "/result/scalar/raw",
+                "existing" => "/result/number",
+                _ => "/result/raw",
             };
             let mut proofs = vec![completed(&output, field, kind, bytes)];
             // A valid sibling receipt is still referenced beside a rejected one.
@@ -361,10 +357,12 @@ mod tests {
                 _ => {}
             }
             let target = if failure == "job" { &other } else { &output };
-            finish(&manager, target, json!({"scalar":"text"}), proofs).await;
+            let result = json!({"scalar":"text", "number":4});
+            finish(&manager, target, result, proofs).await;
             let document = document(target);
             assert_eq!(document["result"]["scalar"], "text", "{failure}");
-            assert!(document.pointer(field).is_none(), "{failure}");
+            let kept = (failure == "existing").then(|| json!(4));
+            assert_eq!(document.pointer(field), kept.as_ref(), "{failure}");
             let referenced = target.test_fields();
             let expected: &[&str] = if failure == "job" {
                 &[]
@@ -416,30 +414,10 @@ mod tests {
         }
     }
 
-    /// Existing primitives abandon even completed bytes of every kind: invalid
-    /// UTF-8/JSON is deliberately not inspected, since IO completion alone did not
-    /// reference it.
-    #[tokio::test]
-    async fn existing_primitives_abandon_completed_captures() {
-        for kind in [CaptureKind::Text, CaptureKind::Json] {
-            let (_root, manager, output, _) = outputs().await;
-            let initial = json!({"null":null, "bool":true, "number":4});
-            let captures = ["null", "bool", "number"]
-                .map(|field| completed(&output, &format!("/result/{field}"), kind, b"\xff"));
-            finish(&manager, &output, initial.clone(), captures.into()).await;
-            assert_eq!(document(&output)["result"], initial);
-            assert!(output.test_fields().is_empty());
-            assert!(
-                captures::available_captures(&saved(&output), true)
-                    .iter()
-                    .all(|capture| !capture.complete)
-            );
-        }
-    }
-
     #[tokio::test]
     async fn unrelated_capture_is_neither_adopted_nor_overwritten_by_ordinary_results() {
-        let (_root, manager, output, _) = outputs().await;
+        let (_root, manager, agent) = runtime().await;
+        let (output, _) = outputs(&manager, &agent).await;
         let _unreferenced = completed(
             &output,
             "/result/raw",

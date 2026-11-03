@@ -46,6 +46,8 @@ impl ResolvedWorkspacePath {
 /// What admission makes of a requested path.
 pub(crate) enum Resolution {
     Resolved(ResolvedWorkspacePath),
+    /// A job's workspace missing inside the root, which its call creates.
+    MissingWorkspace(ResolvedWorkspacePath),
     /// A path outside the root that admission refuses, as the path it would
     /// be. Its failure is reported only once the call is authorized without
     /// asking anyone: asking would reveal what lies outside.
@@ -124,14 +126,14 @@ fn resolve(
                     if trace.requires_directory && kind != PathKind::Workspace {
                         Err(io::Error::from_raw_os_error(libc::EISDIR))
                     } else {
-                        Ok((trace.reached.clone(), false))
+                        Ok((trace.reached.clone(), Entry::Missing))
                     }
                 }
                 found => found,
             }
         }
     };
-    let (path, directory) = match resolved {
+    let (path, entry) = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
             let subject = match joined.parent() {
@@ -156,11 +158,19 @@ fn resolve(
     }
     let outside = trace.outside || !path.starts_with(root);
     match PathText::new(&path) {
-        Ok(path) => Ok(Resolution::Resolved(ResolvedWorkspacePath {
-            path,
-            directory,
-            outside,
-        })),
+        Ok(path) => {
+            let resolved = ResolvedWorkspacePath {
+                path,
+                directory: entry == Entry::Directory,
+                outside,
+            };
+            Ok(match (kind, entry, outside) {
+                (PathKind::Workspace, Entry::Missing, false) => {
+                    Resolution::MissingWorkspace(resolved)
+                }
+                _ => Resolution::Resolved(resolved),
+            })
+        }
         Err(error) => {
             let context = PartialContext::default().path(PathRole::Resolved, &path);
             let error = AdmissionError::from(error).or(context);
@@ -169,20 +179,43 @@ fn resolve(
     }
 }
 
-fn existing(path: &Path) -> io::Result<(PathBuf, bool)> {
+/// What a resolved path names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    Directory,
+    Other,
+    /// Nothing yet: a write creates it.
+    Missing,
+}
+
+impl Entry {
+    const fn found(directory: bool) -> Self {
+        if directory {
+            Self::Directory
+        } else {
+            Self::Other
+        }
+    }
+}
+
+fn existing(path: &Path) -> io::Result<(PathBuf, Entry)> {
     let path = std::fs::canonicalize(path)?;
     let directory = std::fs::metadata(&path)?.is_dir();
-    Ok((path, directory))
+    Ok((path, Entry::found(directory)))
 }
 
 /// The entry a removal names: its parent resolved, its own final link not.
-fn removable(parent: &Path, name: &OsStr, requires_directory: bool) -> io::Result<(PathBuf, bool)> {
+fn removable(
+    parent: &Path,
+    name: &OsStr,
+    requires_directory: bool,
+) -> io::Result<(PathBuf, Entry)> {
     let entry = std::fs::canonicalize(parent)?.join(name);
     let directory = std::fs::symlink_metadata(&entry)?.is_dir();
     if requires_directory && !directory {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
-    Ok((entry, directory))
+    Ok((entry, Entry::found(directory)))
 }
 
 /// Whether `path` ends in a separator or `.`, which only a directory satisfies.
@@ -277,13 +310,14 @@ fn trace(root: &Path, path: &Path, follow_last: bool) -> Trace {
                     (reached, directory) = (entry, found.is_dir());
                     continue;
                 }
-                Ok(_) if links < MAX_LINKS => {
-                    if let Ok(target) = std::fs::read_link(&entry) {
-                        links += 1;
-                        requires_directory |= last && names_directory(&target);
-                        path = reached.join(target).join(rest);
-                        continue 'links;
-                    }
+                Ok(_)
+                    if links < MAX_LINKS
+                        && let Ok(target) = std::fs::read_link(&entry) =>
+                {
+                    links += 1;
+                    requires_directory |= last && names_directory(&target);
+                    path = reached.join(target).join(rest);
+                    continue 'links;
                 }
                 _ => {}
             }
@@ -314,40 +348,17 @@ fn trace(root: &Path, path: &Path, follow_last: bool) -> Trace {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     async fn resolved(workspace: &Path, input: &str, kind: PathKind) -> PathBuf {
         match resolve_for_authorization(workspace, workspace, input, kind).await {
-            Ok(Resolution::Resolved(resolved)) => resolved.path.into(),
+            Ok(Resolution::Resolved(resolved) | Resolution::MissingWorkspace(resolved)) => {
+                resolved.path.into()
+            }
             _ => panic!("{input} did not resolve"),
         }
-    }
-
-    #[tokio::test]
-    async fn writable_admission_names_the_attempted_parent_not_the_destination() {
-        let root = tempfile::tempdir().unwrap();
-        let resolution = resolve_for_authorization(
-            root.path(),
-            root.path(),
-            "missing/../file.txt",
-            PathKind::Writable,
-        );
-        let Err(error) = resolution.await else {
-            panic!("a parent under a missing entry resolved");
-        };
-        let diagnostic = error.diagnostic();
-        assert_eq!(diagnostic.context.operation, Operation::Canonicalize);
-        assert_eq!(
-            diagnostic.context.subject,
-            Subject::ParentDirectory(root.path().join("missing/.."))
-        );
-        assert!(matches!(
-            diagnostic.cause,
-            crate::tool::diagnostic::Cause::Io {
-                kind: crate::tool::diagnostic::IoKind::NotFound,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -380,13 +391,13 @@ mod tests {
         let Err(error) = crate::tests::bounded(cycle).await else {
             panic!("a symbolic link cycle resolves");
         };
-        assert!(matches!(
+        assert_matches!(
             error.diagnostic().cause,
             crate::tool::diagnostic::Cause::Io {
                 code: Some(libc::ELOOP),
                 ..
             }
-        ));
+        );
         // The root and a child workspace in it, and every directory holding
         // either, refuse removal; reached by way of an entry outside the root,
         // only once authorized.
@@ -477,14 +488,12 @@ mod tests {
         ] {
             let resolution = resolve_for_authorization(&workspace, &workspace, input, kind);
             match (resolution.await, authorized_as) {
-                (Err(error), None) => assert!(
-                    matches!(
-                        error.diagnostic().cause,
-                        crate::tool::diagnostic::Cause::Io {
-                            kind: crate::tool::diagnostic::IoKind::NotFound,
-                            ..
-                        }
-                    ),
+                (Err(error), None) => assert_matches!(
+                    error.diagnostic().cause,
+                    crate::tool::diagnostic::Cause::Io {
+                        kind: crate::tool::diagnostic::IoKind::NotFound,
+                        ..
+                    },
                     "{input}: {error:?}"
                 ),
                 (Ok(Resolution::Unresolved(would_be, _)), Some((path, directory))) => {
@@ -499,6 +508,22 @@ mod tests {
                 (resolution, _) => panic!("{input}: {:?}", resolution.err()),
             }
         }
+        // A write names the parent it attempted, not the destination.
+        let resolution = resolve_for_authorization(
+            &workspace,
+            &workspace,
+            "missing/../file.txt",
+            PathKind::Writable,
+        );
+        let Err(error) = resolution.await else {
+            panic!("a parent under a missing entry resolved");
+        };
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Canonicalize);
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::ParentDirectory(workspace.join("missing/.."))
+        );
     }
 
     /// A trailing separator or `.` requires a directory, as in the kernel,
@@ -532,11 +557,10 @@ mod tests {
             let Err(error) = resolution.await else {
                 panic!("{input} resolved");
             };
-            assert!(
-                matches!(
+            assert_matches!(
                     error.diagnostic().cause,
                     crate::tool::diagnostic::Cause::Io { code: Some(found), .. } if found == code
-                ),
+                ,
                 "{input}: {error:?}"
             );
         }
@@ -582,12 +606,12 @@ mod tests {
         let Err(error) = resolution.await else {
             panic!("a path in a missing workspace resolved");
         };
-        assert!(matches!(
+        assert_matches!(
             error.diagnostic().cause,
             crate::tool::diagnostic::Cause::Io {
                 kind: crate::tool::diagnostic::IoKind::NotFound,
                 ..
             }
-        ));
+        );
     }
 }

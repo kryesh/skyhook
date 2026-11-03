@@ -403,10 +403,8 @@ impl App {
             Focus::Scope => self.scope_key(key),
             Focus::Tree => match key.code {
                 KeyCode::Up | KeyCode::Down => self.step_agent(key.code == KeyCode::Up),
-                KeyCode::Enter => {
-                    if let Some(&index) = self.tree_agents().get(self.tree_cursor) {
-                        self.open_agent(self.projection.agents[index].id.clone());
-                    }
+                KeyCode::Enter if let Some(&index) = self.tree_agents().get(self.tree_cursor) => {
+                    self.open_agent(self.projection.agents[index].id.clone());
                 }
                 KeyCode::Left => self.command(Command::Parent),
                 KeyCode::Right => self.command(Command::Child),
@@ -444,11 +442,11 @@ impl App {
                 }
                 KeyCode::Char('y') => self.copy(),
                 KeyCode::Char('o') => self.output_menu(),
-                KeyCode::Char('c') => {
-                    let row = self.selected_entry();
-                    if let Some(job) = row.and_then(|row| self.entries()[row].job_id()) {
-                        self.confirm(ConfirmAction::CancelJob(job));
-                    }
+                KeyCode::Char('c')
+                    if let Some(job) =
+                        (self.selected_entry()).and_then(|row| self.entries()[row].job_id()) =>
+                {
+                    self.confirm(ConfirmAction::CancelJob(job));
                 }
                 _ => {}
             },

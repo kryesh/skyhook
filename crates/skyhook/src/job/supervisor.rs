@@ -382,6 +382,11 @@ mod tests {
             if tool == "rejected" {
                 assert!(!cancellation.is_cancelled());
             }
+            if tool == "panic" {
+                let diagnostic = result.diagnostic.as_ref().unwrap();
+                let execute = crate::tool::diagnostic::Operation::Execute;
+                assert_eq!(diagnostic.context.operation, execute);
+            }
             if tool.starts_with("abandoned") {
                 assert_eq!(state(&jobs.test_replay(), id).await, expected);
             }

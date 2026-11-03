@@ -443,13 +443,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .filter(|input| input.set(String::new()));
-        for (width, stats, status) in [
-            (40, false, false),
-            (65, false, false),
-            (66, false, true),
-            (80, false, true),
-            (120, true, true),
-        ] {
+        // Which widths drop which columns is the columns' own rule.
+        for (width, stats, status) in [(40, false, false), (120, true, true)] {
             let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
             app.render.content_rect = r(0, 0, width, 10);
             app.render.hits.clear();
@@ -519,38 +514,9 @@ mod tests {
         assert!(line.ends_with("1 · 2 · 3 · 1h 02m 03s"), "{line}");
     }
 
-    /// A strong row is bold throughout, label and columns alike; a normal one is not.
-    #[test]
-    fn strong_menu_rows_are_bold() {
-        let kind = MenuKind::Sessions(vec![]);
-        let columns = ["0123", "14:02"].map(String::from);
-        for (emphasis, bold) in [(Emphasis::Normal, false), (Emphasis::Strong, true)] {
-            let item = ItemRef {
-                index: 0,
-                label: "Session",
-                detail: "",
-                columns: &columns,
-                emphasis,
-                search: "",
-            };
-            let layout = MenuColumns::new(std::slice::from_ref(&item), 40);
-            let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
-            terminal
-                .draw(|frame| {
-                    let row = frame.area();
-                    draw_menu_item(frame, row, &item, &kind, &layout, false, theme().ui.input);
-                })
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let text = (0..40).filter(|&x| buffer[(x, 0)].symbol() != " ");
-            let cells: Vec<_> = text.map(|x| buffer[(x, 0)].modifier).collect();
-            assert!(cells.len() > "Session".len() + "14:02".len());
-            assert!(cells.iter().all(|m| m.contains(Modifier::BOLD) == bold));
-        }
-    }
-
     /// Columns stay whole and right-aligned; the label keeps its room, so the
-    /// leftmost columns go first, and the detail gives way to both.
+    /// leftmost columns go first, and the detail gives way to both. A strong row is
+    /// bold throughout, label and columns alike; a normal one is not.
     #[test]
     fn menu_columns_are_muted_right_aligned_and_yield_to_labels() {
         let kind = MenuKind::Commands(vec![]);
@@ -642,6 +608,31 @@ mod tests {
                     assert_eq!(cell(row.right()).bg, theme().ui.base);
                 }
             }
+        }
+        let kind = MenuKind::Sessions(vec![]);
+        let columns = ["0123", "14:02"].map(String::from);
+        for (emphasis, bold) in [(Emphasis::Normal, false), (Emphasis::Strong, true)] {
+            let item = ItemRef {
+                index: 0,
+                label: "Session",
+                detail: "",
+                columns: &columns,
+                emphasis,
+                search: "",
+            };
+            let layout = MenuColumns::new(std::slice::from_ref(&item), 40);
+            let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let row = frame.area();
+                    draw_menu_item(frame, row, &item, &kind, &layout, false, theme().ui.input);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..40).filter(|&x| buffer[(x, 0)].symbol() != " ");
+            let cells: Vec<_> = text.map(|x| buffer[(x, 0)].modifier).collect();
+            assert!(cells.len() > "Session".len() + "14:02".len());
+            assert!(cells.iter().all(|m| m.contains(Modifier::BOLD) == bold));
         }
     }
 }

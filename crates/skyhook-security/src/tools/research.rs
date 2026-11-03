@@ -1,8 +1,13 @@
-use serde_json::Value;
+use std::{borrow::Cow, sync::LazyLock};
+
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Map, Value};
 use skyhook::{
     identity::AgentId,
     tool::{
-        RegistryError, ToolContext, ToolError, ToolRegistryBuilder,
+        AdmissionError, RegistryError, ToolContext, ToolError, ToolRegistryBuilder,
+        arguments::deserialize_arguments,
         policy::{Capability, CapabilitySet},
     },
 };
@@ -13,37 +18,41 @@ use crate::{
     cvss::Cvss40,
     reporting::{self, Generated},
     store::{
-        Assessment, CandidateId, EnvironmentId, EvidenceId, FindingId, FlawId, NewEnvironment,
-        NewEvidence, NewTest, NodeId, Served, Serves, StatusInput, Store, TaskId, TestArtifact,
-        TestId, TestResult, Text, Upsert, UpsertInput,
+        Assessment, Begun, CandidateId, EditRecord, EnvironmentId, EvidenceId, FindingId, FlawId,
+        NewEnvironment, NewEvidence, NewRecord, NewTest, NodeId, Served, Serves, StatusRecord,
+        Store, TestArtifact, TestId, TestResult, Text, Upsert,
     },
 };
 
 actions! {
     enum Research {
         /// When your brief assigns you scheduled work, begin it before anything else: one phase
-        /// and its subjects.
+        /// and its subjects. Its result names what changed for each subject since its last task
+        /// in this phase.
         /// Afterwards, job events list changes other agents make to what it rests on; re-read
-        /// those records before you decide on them.
-        begin => Begin(crate::store::Begin) -> TaskId,
-        /// Create a node of `kind` (no `id`: its fields), or edit node `id` (the fields given).
-        /// A source at a location already recorded returns the source there.
-        upsert => Upsert(UpsertInput) -> NodeId,
+        /// those records before you decide on them. → {task, changes?: per subject worked before
+        /// in the phase, what changed since, proposals?: per subject, the result recorded outside
+        /// this phase for it to decide, premises?: per state checked, the decided premises of the
+        /// flaws leaving it wrong}
+        begin => Begin(crate::store::Begin) -> Begun,
+        /// Create a node, its fields inside `record`: `{action: "upsert", record: {kind: "path",
+        /// title, body}}`; or edit node `id`, the fields given: `{action: "upsert", record: {id,
+        /// title}}`. → node id
+        upsert => Upsert { record: UpsertRecord } -> NodeId,
         /// Add edges; an ordered one at `position`, or last.
         link => Link { links: Vec<crate::store::Link> } -> (),
         /// Remove edges; a path step by its position.
         unlink => Unlink { links: Vec<crate::store::Unlink> } -> (),
-        /// Observations about one node; contradicting evidence disputes it.
+        /// Observations about one node; contradicting evidence disputes it. → evidence ids
         evidence => Evidence { node: NodeId, items: Vec<NewEvidence> } -> Vec<EvidenceId>,
-        /// Fold a duplicate node of any kind but a finding into `into`, one of its kind: its
-        /// edges move to `into`.
         merge => Merge(crate::store::Merge) -> (),
-        /// Decide a premise, judge a flaw, mark a path swept or unswept, or retract a source,
-        /// path or component recorded in error: it then stands in no work or count until marked
-        /// `recorded` (a path `unswept`) again.
-        set_status => SetStatus(StatusInput) -> (),
-        /// The store scores `vector` and returns its severity and score: record the vector,
-        /// never compute a score.
+        /// Decide a premise, judge a flaw, mark a path swept or unswept, mark a state `checked`
+        /// across calls, or retract a state, path or component recorded in error: it then stands
+        /// in no work or count until marked `recorded` (a path `unswept`) again.
+        /// `{action: "set_status", record: {kind: "path", id, status: "swept"}, note}`.
+        set_status => SetStatus { record: StatusRecord, note: Text } -> (),
+        /// The store scores `vector`: record the vector, never compute a score. → {severity,
+        /// score, shortlisted}
         assess => Assess {
             candidate: CandidateId,
             /// `CVSS:4.0/AV:_/AC:_/AT:_/PR:_/UI:_/VC:_/VI:_/VA:_/SC:_/SI:_/SA:_`, every base
@@ -54,7 +63,7 @@ actions! {
         verdict => Verdict { candidate: CandidateId, verdict: crate::store::Verdict, note: Text } -> (),
         /// `failed`: evidence shows the scenario does not work as formulated; `pending`: waits on the user (say
         /// for what); `unavailable`: no real demonstration can run here; `declined`: the user
-        /// turned it down.
+        /// turned it down. → test id
         test => Test {
             candidate: CandidateId,
             result: TestResult,
@@ -65,7 +74,7 @@ actions! {
             artifacts: Vec<TestArtifact>,
         } -> TestId,
         /// A running instance, for one candidate or any: how to work in it, and the interfaces
-        /// it serves.
+        /// it serves. → environment id
         environment => Environment {
             instructions: Text,
             candidate: Option<CandidateId>,
@@ -73,13 +82,13 @@ actions! {
             #[schemars(with = "Vec<Served>")]
             serves: Serves,
         } -> EnvironmentId,
-        /// The root flaw's report: markdown citing node and test ids.
+        /// The root flaw's report: markdown citing node and test ids. → finding id
         report => Report { root: FlawId, title: Text, body: Text } -> FindingId,
         /// Render the run's reports/ from the store: a folder per root with a current
-        /// finding, and an index.
+        /// finding, and an index. → {reports: root ids written, unwritten: [{root, error}]}
         generate => Generate {} -> Generated,
     }
-    unions: [links]
+    unions: [links, record]
 }
 
 impl Action for Research {
@@ -117,18 +126,17 @@ impl Research {
     ) -> Result<Value, ToolError> {
         match self {
             Self::Begin(work) => output::<result::Begin>(store.begin(actor, &work)),
-            Self::Upsert(input) => output::<result::Upsert>(
-                Upsert::try_from(input).and_then(|upsert| store.upsert(actor, &upsert)),
-            ),
+            Self::Upsert(a) => {
+                output::<result::Upsert>(store.upsert(actor, &a.record.read(store)?))
+            }
             Self::Link(a) => output::<result::Link>(store.link(actor, &a.links)),
             Self::Unlink(a) => output::<result::Unlink>(store.unlink(actor, &a.links)),
             Self::Evidence(a) => {
                 output::<result::Evidence>(store.evidence(actor, a.node, &a.items))
             }
             Self::Merge(merge) => output::<result::Merge>(store.merge(actor, &merge)),
-            Self::SetStatus(input) => {
-                let (change, note) = input.change();
-                output::<result::SetStatus>(store.set_status(actor, change, note))
+            Self::SetStatus(a) => {
+                output::<result::SetStatus>(store.set_status(actor, a.record.into(), &a.note))
             }
             Self::Assess(a) => {
                 output::<result::Assess>(store.assess(actor, a.candidate, a.vector, &a.note))
@@ -164,11 +172,71 @@ impl Research {
     }
 }
 
+/// An upsert's record, read as a new node's without an `id`, else as an edit's, whose kind,
+/// when it leaves it out, is node `id`'s.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct UpsertRecord(Map<String, Value>);
+
+/// Arguments holding a `record`, so a refusal is located inside it.
+#[derive(Deserialize, JsonSchema)]
+struct Recorded<T> {
+    record: T,
+}
+
+impl UpsertRecord {
+    fn read(mut self, store: &Store) -> Result<Upsert, ToolError> {
+        #[derive(Deserialize)]
+        struct Edit {
+            id: NodeId,
+        }
+        let upsert = match self.0.contains_key("id") {
+            false => Upsert::try_from(self.parse::<NewRecord>()?),
+            true => {
+                if !self.0.contains_key("kind") {
+                    let kind = store.kind(self.parse::<Edit>()?.id);
+                    let kind = kind.map_err(ToolError::failed)?;
+                    self.0.insert("kind".to_owned(), kind.as_str().into());
+                }
+                Upsert::try_from(self.parse::<EditRecord>()?)
+            }
+        };
+        upsert.map_err(ToolError::failed)
+    }
+
+    fn parse<T: DeserializeOwned>(&self) -> Result<T, AdmissionError> {
+        static SCHEMA: LazyLock<Value> =
+            LazyLock::new(skyhook::tool::input_schema_for::<Recorded<UpsertRecord>>);
+        let arguments = Map::from_iter([("record".to_owned(), Value::Object(self.0.clone()))]);
+        deserialize_arguments::<Recorded<T>>(&SCHEMA, &arguments).map(|read| read.record)
+    }
+}
+
+impl JsonSchema for UpsertRecord {
+    fn schema_name() -> Cow<'static, str> {
+        "UpsertRecord".into()
+    }
+
+    /// A new node, an edit of one of a kind, or an edit leaving its kind out.
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({"anyOf": [
+            generator.subschema_for::<NewRecord>(),
+            generator.subschema_for::<EditRecord>(),
+            {
+                "description": "An edit of node `id` leaving out its `kind`: the fields its kind takes.",
+                "type": "object",
+                "properties": {"id": generator.subschema_for::<NodeId>()},
+                "required": ["id"],
+            },
+        ]})
+    }
+}
+
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     super::register(
         builder,
         "research",
-        "Record the run's research graph: begin your work, create and edit nodes, link them, record evidence, merge duplicates, set statuses, assess, judge and test candidates, describe environments, and report root flaws. Result: JobView<T>: begin → task id; upsert → node id; evidence → evidence ids; assess → {severity, score, shortlisted}; test, environment, report → the new id; generate → {reports: root ids written, unwritten: [{root, error}]}; the rest → null.",
+        "Record the run's research graph. Result: JobView<T>, T as each action gives after →, else null.",
         options::<Research>(),
         |store, actor, context, research| research.execute(store, actor, context),
     )

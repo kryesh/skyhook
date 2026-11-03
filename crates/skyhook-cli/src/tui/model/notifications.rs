@@ -121,7 +121,12 @@ mod tests {
         all: bool,
     ) -> Vec<Entry> {
         let agent = root(1);
-        let window = Window::empty(agent.clone(), Tab::Conversation, 0);
+        let window = Window::empty(
+            agent.clone(),
+            Tab::Conversation,
+            0,
+            crate::tui::model::Budget::DEFAULT,
+        );
         let (projection, outputs) = (
             Projection::empty(&"test".parse().unwrap()),
             OutputStore::default(),

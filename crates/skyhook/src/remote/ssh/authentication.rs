@@ -178,6 +178,7 @@ pub(crate) fn worker_authentication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn external_agent_routes_and_prompt_only_processes_never_start_the_private_agent() {
@@ -219,7 +220,7 @@ mod tests {
             ProcessAuthentication::PromptsAndAgent,
         ] {
             let refused = authentication.process_environment(request).await;
-            assert!(matches!(refused, Err(RemoteError::Cancelled)));
+            assert_matches!(refused, Err(RemoteError::Cancelled));
         }
         assert!(authentication.agent.lock().await.is_none());
         assert!(matches!(

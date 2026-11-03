@@ -489,15 +489,15 @@ pub(in crate::tui) mod tests {
             app.session().unwrap().shutdown().await.unwrap();
         }
 
-        // Reopened sessions: one started with exact capabilities records no mode;
-        // in the others the configuration redefined `tools` without mcp, while
-        // `general` may grant it instead.
+        // Reopened sessions: one started with exact capabilities records no mode; in
+        // the other the configuration redefined `tools` without mcp, while `general`
+        // grants it instead. How the configuration narrows what a resumed session may
+        // use is the library's.
         let exact = [Capability::Read, Capability::Mcp].into_iter().collect();
-        let tools = || Permissions::Mode("tools".parse().unwrap());
+        let tools = Permissions::Mode("tools".parse().unwrap());
         let cases = [
             (Permissions::Exact(exact), "read", "read, mcp"),
-            (tools(), "read", "read"),
-            (tools(), "read, mcp", "read"),
+            (tools, "read, mcp", "read"),
         ];
         let mut reopened = Vec::new();
         for (created, general, tools) in cases {
@@ -530,12 +530,10 @@ pub(in crate::tui) mod tests {
             reopened[0],
             (reader(Available, true), reader(Removed, true))
         );
-        // The journal still says `tools` grants mcp, but the session no longer does.
-        assert_eq!(reopened[1], (vec![], vec![]));
         // Still able to use mcp, the root would lose it on its next message in the
         // redefined `tools`, whose name it already runs under.
         assert_eq!(
-            reopened[2],
+            reopened[1],
             (reader(Removed, true), reader(Available, true))
         );
     }

@@ -291,7 +291,7 @@ pub struct ModelContext {
     pub purpose: ModelPurpose,
     pub profile: ProfileSnapshot,
     pub system: Vec<SystemSegment>,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<Arc<ToolDefinition>>,
     pub response_schema: Option<ResponseSchema>,
 }
 

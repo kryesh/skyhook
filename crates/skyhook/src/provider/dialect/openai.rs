@@ -137,27 +137,22 @@ impl DialectConfig for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
+    use crate::provider::dialect::tests::head;
+    use crate::provider::dialect::tests::replay_scope;
 
     #[tokio::test]
     async fn key_and_identity_headers_ride_every_request() {
         let config: Config = crate::yaml::parse("{organization: org_1, project: proj_1}").unwrap();
         let head = head(&config, CodecName::Responses, "k").await;
-        assert_eq!(header_values(&head, "authorization"), ["Bearer k"]);
-        assert_eq!(header_values(&head, "openai-organization"), ["org_1"]);
-        assert_eq!(header_values(&head, "openai-project"), ["proj_1"]);
+        assert_eq!(head.header("authorization"), ["Bearer k"]);
+        assert_eq!(head.header("openai-organization"), ["org_1"]);
+        assert_eq!(head.header("openai-project"), ["proj_1"]);
         assert!(crate::yaml::parse::<Config>("organization: \"bad\\nvalue\"").is_err());
     }
 
     #[test]
     fn replay_identity_tracks_tenant_headers() {
-        let scope = |yaml| {
-            crate::yaml::parse::<Config>(yaml)
-                .unwrap()
-                .admit(CodecName::Responses)
-                .unwrap()
-                .scope
-        };
+        let scope = |yaml| replay_scope::<Config>(yaml, CodecName::Responses);
         let tenant = scope("organization: org_1\nproject: project_1");
         for other in [
             "{}",

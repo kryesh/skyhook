@@ -83,7 +83,7 @@ impl Product for Security {
     fn identity(&self) -> Identity {
         Identity {
             host: "skyhook-security".parse().expect("static host identity"),
-            tables: Some(crate::store::EXTENSION),
+            schema: crate::store::SCHEMA,
             display_name: "Skyhook Security",
             about: "Evidence-led security research over a flaw-first ledger",
             placeholder: "Set the scope above and describe the target to start the security analysis, or /sessions to open one.",
@@ -202,7 +202,7 @@ impl Security {
     async fn owns(&self, workspace: &Path, id: SessionId) -> Result<bool, Error> {
         let identity = self.identity();
         let root = workspace_session_root(workspace);
-        let summary = SessionStore::summary(&root, id, identity.owner()).await?;
+        let summary = SessionStore::summary(&root, id, Some(identity.owner())).await?;
         Ok(summary.host == identity.host)
     }
 }
@@ -215,7 +215,7 @@ async fn runs(
 ) -> Result<Vec<(SessionId, Result<(Run, u64), Error>)>, Error> {
     let mut runs = Vec::new();
     for id in SessionStore::ids(root).await? {
-        let summary = SessionStore::summary(root, id, identity.owner());
+        let summary = SessionStore::summary(root, id, Some(identity.owner()));
         let summary = match summary.await {
             Ok(summary) if summary.host != identity.host => continue,
             Ok(_) => {
@@ -247,8 +247,10 @@ fn run_detail(store: &Store) -> Result<String, crate::store::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
-    use crate::store::tests::{component, fixture};
+    use crate::store::tests::{component, fixture, harness};
 
     /// A run's detail lists every record of a section, however many there are.
     #[test]
@@ -265,5 +267,92 @@ mod tests {
             })
             .count();
         assert_eq!(listed, count, "{detail}");
+    }
+
+    /// The product's configuration for `opening` of `workspace`, from the `security.yaml` in
+    /// it, with `live` given on the command line.
+    async fn configure(
+        workspace: &Path,
+        opening: Opening<'_>,
+        headless: bool,
+        live: Option<LivePolicy>,
+    ) -> Result<Configured, Error> {
+        let args = Args {
+            live,
+            shortlist: None,
+            workers: None,
+            security_config: Some(workspace.join("security.yaml")),
+        };
+        let context = SessionContext {
+            workspace,
+            opening,
+            headless,
+        };
+        let mut config = Config::from_yaml("{}").unwrap();
+        Security.configure(&mut config, args, context).await
+    }
+
+    /// The run a new session of `configured` starts.
+    async fn start(workspace: &Path, configured: Configured) -> SessionId {
+        let context = SessionContext {
+            workspace,
+            opening: Opening::New(None),
+            headless: true,
+        };
+        let prepared = configured.factory.prepare(harness(workspace), context);
+        let prepared = prepared.await.unwrap();
+        let session = prepared.builder.build().await.unwrap().new_session().await;
+        let session = session.unwrap();
+        prepared.extension.opened(&session, context).await.unwrap();
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+        session.id()
+    }
+
+    /// Why configuration refused a launch.
+    fn refusal(result: Result<Configured, Error>) -> crate::config::Error {
+        let error = result.err().expect("the launch is refused");
+        *error.downcast().unwrap()
+    }
+
+    /// A headless launch is refused when its run would ask: a new run under the command
+    /// line's or the configuration's policy, a resumed run under its own, which `--live`
+    /// cannot change. `runs` lists every run.
+    #[tokio::test]
+    async fn headless_admission_follows_the_policy_the_run_is_under() {
+        use crate::config::Error::{HeadlessAsk, LiveOnResume};
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let policy = |live: &str| {
+            std::fs::write(workspace.join("security.yaml"), format!("live: {live}\n")).unwrap()
+        };
+        policy("ask");
+        let new = Opening::New(None);
+        let refused = refusal(configure(workspace, new, true, None).await);
+        assert_matches!(refused, HeadlessAsk);
+        let quiet = configure(workspace, new, true, Some(LivePolicy::No)).await;
+        let quiet = start(workspace, quiet.unwrap()).await;
+        let asking = start(
+            workspace,
+            configure(workspace, new, false, None).await.unwrap(),
+        )
+        .await;
+        let resume = Opening::Resume(quiet);
+        configure(workspace, resume, true, None).await.unwrap();
+        let live = Some(LivePolicy::Yes);
+        let refused = refusal(configure(workspace, resume, true, live).await);
+        assert_matches!(refused, LiveOnResume);
+        policy("no");
+        let refused = refusal(configure(workspace, Opening::Resume(asking), true, None).await);
+        assert_matches!(refused, HeadlessAsk);
+
+        let listed = runs(&workspace_session_root(workspace), &Security.identity()).await;
+        let listed: Vec<_> = (listed.unwrap().into_iter())
+            .map(|(id, run)| (id, run.unwrap().0.live))
+            .collect();
+        assert_eq!(listed.len(), 2);
+        for run in [(quiet, LivePolicy::No), (asking, LivePolicy::Ask)] {
+            assert!(listed.contains(&run), "{listed:?}");
+        }
     }
 }

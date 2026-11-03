@@ -22,9 +22,12 @@ pub enum Link {
         note: Text,
         position: Option<u32>,
     },
-    PathSource {
+    /// Where the path's flow reads or writes the state.
+    PathState {
         path: PathId,
-        source: SourceId,
+        state: StateId,
+        access: Access,
+        location: Location,
     },
     PathPremise {
         path: PathId,
@@ -34,16 +37,48 @@ pub enum Link {
         flaw: FlawId,
         premise: PremiseId,
     },
+    /// The premise holds only if `rests_on` does.
+    PremiseBasis {
+        premise: PremiseId,
+        rests_on: PremiseId,
+    },
+    /// The flaw leaves the state wrong.
+    FlawState {
+        flaw: FlawId,
+        state: StateId,
+    },
 }
 
 /// An edge to remove; a path's step by its position.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Unlink {
-    PathStep { path: PathId, position: u32 },
-    PathSource { path: PathId, source: SourceId },
-    PathPremise { path: PathId, premise: PremiseId },
-    FlawPremise { flaw: FlawId, premise: PremiseId },
+    PathStep {
+        path: PathId,
+        position: u32,
+    },
+    PathState {
+        path: PathId,
+        state: StateId,
+        access: Access,
+        location: Location,
+    },
+    PathPremise {
+        path: PathId,
+        premise: PremiseId,
+    },
+    FlawPremise {
+        flaw: FlawId,
+        premise: PremiseId,
+    },
+    PremiseBasis {
+        premise: PremiseId,
+        rests_on: PremiseId,
+    },
+    FlawState {
+        flaw: FlawId,
+        state: StateId,
+    },
 }
 
 /// The statements keeping path `?1`'s step positions contiguous: how many it has, read off
@@ -138,11 +173,18 @@ fn link(db: &Db, link: &Link, marks: &mut Marks) -> Result<()> {
             }
             ends(marks, !restated, path, EventEffect::Changed, component);
         }
-        Link::PathSource { path, source } => {
-            let (path, source) = (live(db, *path)?, live(db, *source)?);
-            let sql = "INSERT INTO path_source(path,source) VALUES (?1,?2) ON CONFLICT DO NOTHING";
-            let added = db.execute(sql, params![path, source])? > 0;
-            ends(marks, added, path, EventEffect::Changed, source);
+        Link::PathState {
+            path,
+            state,
+            access,
+            location,
+        } => {
+            let (path, state) = (live(db, *path)?, live(db, *state)?);
+            let sql = "INSERT INTO path_state(path,state,access,location) VALUES (?1,?2,?3,?4) ON \
+                       CONFLICT DO NOTHING";
+            let at = location_id(db, location)?;
+            let added = db.execute(sql, params![path, state, *access, at])? > 0;
+            accessed(marks, added, path, state);
         }
         Link::PathPremise { path, premise } => {
             let (path, premise) = (live(db, *path)?, live(db, *premise)?);
@@ -158,8 +200,45 @@ fn link(db: &Db, link: &Link, marks: &mut Marks) -> Result<()> {
             let added = db.execute(sql, params![flaw, premise])? > 0;
             ends(marks, added, flaw, EventEffect::Standing, premise);
         }
+        Link::PremiseBasis { premise, rests_on } => {
+            let (premise, rests_on) = basis_ends(db, *premise, *rests_on)?;
+            let sql = "INSERT INTO premise_basis(premise,rests_on) VALUES (?1,?2) ON CONFLICT DO \
+                       NOTHING";
+            db.execute(sql, params![premise, rests_on])?;
+            ends(marks, false, premise, EventEffect::Concerns, rests_on);
+        }
+        Link::FlawState { flaw, state } => {
+            let (flaw, state) = (live(db, *flaw)?, live(db, *state)?);
+            let sql = "INSERT INTO flaw_state(flaw,state) VALUES (?1,?2) ON CONFLICT DO NOTHING";
+            let added = db.execute(sql, params![flaw, state])? > 0;
+            ends(marks, added, flaw, EventEffect::Standing, state);
+        }
     }
     Ok(())
+}
+
+/// The live ends of a premise's basis, two premises.
+fn basis_ends(db: &Db, premise: PremiseId, rests_on: PremiseId) -> Result<(PremiseId, PremiseId)> {
+    let (premise, rests_on) = (live(db, premise)?, live(db, rests_on)?);
+    if premise == rests_on {
+        return Err(Error::SelfBasis);
+    }
+    Ok((premise, rests_on))
+}
+
+/// How an access recorded or removed bears on its path and state: the path's standing moves,
+/// and the state's check alone; restated, it only concerns them.
+fn accessed(marks: &mut Marks, edited: bool, path: PathId, state: StateId) {
+    match edited {
+        true => {
+            marks.mark(path, EventEffect::Standing);
+            marks.alone(state);
+        }
+        false => {
+            marks.mark(path, EventEffect::Concerns);
+            marks.mark(state, EventEffect::Concerns);
+        }
+    }
 }
 
 fn unlink(db: &Db, unlink: &Unlink, marks: &mut Marks) -> Result<()> {
@@ -180,11 +259,18 @@ fn unlink(db: &Db, unlink: &Unlink, marks: &mut Marks) -> Result<()> {
                 None => marks.mark(path, EventEffect::Concerns),
             }
         }
-        Unlink::PathSource { path, source } => {
-            let (path, source) = (live(db, *path)?, live(db, *source)?);
-            let sql = "DELETE FROM path_source WHERE path=?1 AND source=?2";
-            let removed = db.execute(sql, params![path, source])? > 0;
-            ends(marks, removed, path, EventEffect::Changed, source);
+        Unlink::PathState {
+            path,
+            state,
+            access,
+            location,
+        } => {
+            let (path, state) = (live(db, *path)?, live(db, *state)?);
+            let sql = "DELETE FROM path_state WHERE path=?1 AND state=?2 AND access=?3 AND \
+                       location=?4";
+            let at = location_id(db, location)?;
+            let removed = db.execute(sql, params![path, state, *access, at])? > 0;
+            accessed(marks, removed, path, state);
         }
         Unlink::PathPremise { path, premise } => {
             let (path, premise) = (live(db, *path)?, live(db, *premise)?);
@@ -198,44 +284,30 @@ fn unlink(db: &Db, unlink: &Unlink, marks: &mut Marks) -> Result<()> {
             let removed = db.execute(sql, params![flaw, premise])? > 0;
             ends(marks, removed, flaw, EventEffect::Standing, premise);
         }
+        Unlink::PremiseBasis { premise, rests_on } => {
+            let (premise, rests_on) = basis_ends(db, *premise, *rests_on)?;
+            let sql = "DELETE FROM premise_basis WHERE premise=?1 AND rests_on=?2";
+            db.execute(sql, params![premise, rests_on])?;
+            ends(marks, false, premise, EventEffect::Concerns, rests_on);
+        }
+        Unlink::FlawState { flaw, state } => {
+            let (flaw, state) = (live(db, *flaw)?, live(db, *state)?);
+            let sql = "DELETE FROM flaw_state WHERE flaw=?1 AND state=?2";
+            let removed = db.execute(sql, params![flaw, state])? > 0;
+            ends(marks, removed, flaw, EventEffect::Standing, state);
+        }
     }
     Ok(())
 }
 
-/// A duplicate folded into `into`, a node of its kind, with the actor's reason.
+/// Fold duplicate `node`, of any kind but a finding, into `into`, a node of its kind: its edges
+/// move to `into`.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum Merge {
-    Component {
-        component: ComponentId,
-        into: ComponentId,
-        note: Text,
-    },
-    Source {
-        source: SourceId,
-        into: SourceId,
-        note: Text,
-    },
-    Path {
-        path: PathId,
-        into: PathId,
-        note: Text,
-    },
-    Premise {
-        premise: PremiseId,
-        into: PremiseId,
-        note: Text,
-    },
-    Flaw {
-        flaw: FlawId,
-        into: FlawId,
-        note: Text,
-    },
-    Candidate {
-        candidate: CandidateId,
-        into: CandidateId,
-        note: Text,
-    },
+#[serde(deny_unknown_fields)]
+pub struct Merge {
+    pub node: NodeId,
+    pub into: NodeId,
+    pub note: Text,
 }
 
 /// The statements moving one kind of edge from node `?1` to node `?2`: the nodes at their
@@ -288,23 +360,40 @@ fn repoint(
     Ok(())
 }
 
-/// `from`'s evidence moves to `into`, and `from` and what was merged into it point at `into`.
-fn absorb(db: &Db, from: NodeId, into: NodeId) -> Result<()> {
+/// `from`'s evidence moves to `into`, and `from` and what was merged into it point at `into`,
+/// retargeted by merge `event`: the merge changes both, and only concerns each node it repoints.
+fn absorb(db: &Db, event: EventId, from: NodeId, into: NodeId, marks: &mut Marks) -> Result<()> {
     db.execute(
         "UPDATE evidence SET node=?2 WHERE node=?1",
         params![from, into],
     )?;
     db.execute(
-        "UPDATE node SET merged_into=?2 WHERE id=?1 OR merged_into=?1",
+        "INSERT INTO node_merge(node,event,kind,survivor) SELECT id,?1,kind,?3 FROM node WHERE \
+         id=?2 OR merged_into=?2",
+        params![event, from, into],
+    )?;
+    let repointed = rows(
+        db,
+        "UPDATE node SET merged_into=?2 WHERE merged_into=?1 RETURNING id",
+        params![from, into],
+        |row| Ok(NodeId(row.get(0)?)),
+    )?;
+    db.execute(
+        "UPDATE node SET merged_into=?2 WHERE id=?1",
         params![from, into],
     )?;
+    for node in repointed {
+        marks.mark(node, EventEffect::Concerns);
+    }
+    marks.mark(from, EventEffect::Changed);
+    marks.mark(into, EventEffect::Changed);
     Ok(())
 }
 
 /// Flaw `from`'s places in chains go to `into`: a chain holding both keeps the earlier place,
 /// so its root stays the flaw it was or the one that flaw became. The root's finding follows
 /// it, or is absorbed by `into`'s.
-fn rechain(db: &Db, from: FlawId, into: FlawId, marks: &mut Marks) -> Result<()> {
+fn rechain(db: &Db, event: EventId, from: FlawId, into: FlawId, marks: &mut Marks) -> Result<()> {
     let held = rows(
         db,
         "SELECT candidate,EXISTS (SELECT 1 FROM candidate_flaw WHERE candidate=f.candidate AND \
@@ -340,9 +429,7 @@ fn rechain(db: &Db, from: FlawId, into: FlawId, marks: &mut Marks) -> Result<()>
     };
     match (finding(from)?, finding(into)?) {
         (Some(absorbed), Some(kept)) => {
-            absorb(db, absorbed, kept)?;
-            marks.mark(absorbed, EventEffect::Changed);
-            marks.mark(kept, EventEffect::Changed);
+            absorb(db, event, absorbed, kept, marks)?;
         }
         (Some(rekeyed), None) => {
             db.execute(
@@ -356,76 +443,76 @@ fn rechain(db: &Db, from: FlawId, into: FlawId, marks: &mut Marks) -> Result<()>
     Ok(())
 }
 
-/// The live ends of a merge of two nodes of `I`'s kind.
-fn pair<I: KindId>(db: &Db, from: I, into: I) -> Result<(I, I)> {
-    let (from, into) = (live(db, from)?, live(db, into)?);
-    if Into::<NodeId>::into(from) == into.into() {
-        return Err(Error::SelfMerge);
-    }
-    Ok((from, into))
-}
-
-/// Fold `merge`'s duplicate into its survivor: every edge naming it names the survivor,
-/// marking the nodes at their other ends. A merged source gives up its row, so its location
-/// is free for a live source. A merged path keeps its steps as history, the
-/// survivor's standing for the flow. A merged candidate keeps its chain, actions, tests
-/// and verdict as history, and leaves its root's group as a candidate losing its root does;
-/// the survivor performs, after its own actions, each of the duplicate's it has no
-/// counterpart for: as many of a path as the duplicate performs beyond its own.
-fn fold(db: &Db, merge: &Merge, marks: &mut Marks) -> Result<(NodeId, NodeId)> {
-    Ok(match merge {
-        Merge::Component {
-            component, into, ..
-        } => {
-            let (from, into) = pair(db, *component, *into)?;
+/// Fold live duplicate `from` into survivor `into`, both of `kind`: every edge naming it names
+/// the survivor, marking the nodes at their other ends. A finding is not merged. A merged input
+/// state gives up its trust and location, so its location is free for a live one, and a merged
+/// state its check. A merged path keeps its steps as history, the survivor's standing for the
+/// flow, and its states' accesses move to the survivor, moving their checks. A merged candidate
+/// keeps its chain, actions, tests and verdict as history, and leaves its root's group as a
+/// candidate losing its root does; the survivor performs, after its own actions, each of the
+/// duplicate's it has no counterpart for: as many of a path as the duplicate performs beyond its
+/// own.
+fn fold(
+    db: &Db,
+    event: EventId,
+    kind: NodeKind,
+    from: NodeId,
+    into: NodeId,
+    marks: &mut Marks,
+) -> Result<()> {
+    match kind {
+        NodeKind::Component => {
             let edges = [
                 repoint!("component_file", "component", "NULL"),
                 repoint!("component_interface", "component", "NULL"),
                 repoint!("path_step", "component", "path"),
                 repoint!("flaw", "component", "node"),
             ];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
-            (from.into(), into.into())
+            repoint(db, &edges, from, into, marks)
         }
-        Merge::Source { source, into, .. } => {
-            let (from, into) = pair(db, *source, *into)?;
-            let edges = [repoint!("path_source", "source", "path", duplicates)];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
-            db.execute("DELETE FROM source WHERE node=?1", params![from])?;
-            (from.into(), into.into())
-        }
-        Merge::Path { path, into, .. } => {
-            let (from, into) = pair(db, *path, *into)?;
+        NodeKind::State => {
             let edges = [
-                repoint!("path_source", "path", "source", duplicates),
+                repoint!("path_state", "state", "path", duplicates),
+                repoint!("flaw_state", "state", "flaw", duplicates),
+            ];
+            repoint(db, &edges, from, into, marks)?;
+            for sql in [
+                "DELETE FROM input_state WHERE state=?1",
+                "DELETE FROM state_check WHERE state=?1",
+            ] {
+                db.execute(sql, params![from])?;
+            }
+            Ok(())
+        }
+        NodeKind::Path => {
+            marks.accesses(db, PathId::of(from))?;
+            let edges = [
+                repoint!("path_state", "path", "NULL", duplicates),
                 repoint!("path_premise", "path", "premise", duplicates),
                 repoint!("candidate_action", "path", "candidate"),
             ];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
-            (from.into(), into.into())
+            repoint(db, &edges, from, into, marks)
         }
-        Merge::Premise { premise, into, .. } => {
-            let (from, into) = pair(db, *premise, *into)?;
+        NodeKind::Premise => {
             let edges = [
                 repoint!("flaw_premise", "premise", "flaw", duplicates),
                 repoint!("path_premise", "premise", "path", duplicates),
+                repoint!("premise_basis", "premise", "rests_on", duplicates),
+                repoint!("premise_basis", "rests_on", "premise", duplicates),
             ];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
-            (from.into(), into.into())
+            repoint(db, &edges, from, into, marks)
         }
-        Merge::Flaw { flaw, into, .. } => {
-            let (from, into) = pair(db, *flaw, *into)?;
-            let edges = [repoint!("flaw_premise", "flaw", "premise", duplicates)];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
-            rechain(db, from, into, marks)?;
-            (from.into(), into.into())
+        NodeKind::Flaw => {
+            let edges = [
+                repoint!("flaw_premise", "flaw", "premise", duplicates),
+                repoint!("flaw_state", "flaw", "NULL", duplicates),
+            ];
+            repoint(db, &edges, from, into, marks)?;
+            rechain(db, event, FlawId::of(from), FlawId::of(into), marks)
         }
-        Merge::Candidate {
-            candidate, into, ..
-        } => {
-            let (from, into) = pair(db, *candidate, *into)?;
+        NodeKind::Candidate => {
             let edges = [repoint!("environment", "candidate", "NULL")];
-            repoint(db, &edges, from.into(), into.into(), marks)?;
+            repoint(db, &edges, from, into, marks)?;
             let mut actions: Vec<PathId> = ACTIONS.held(db, into)?;
             let mut unmatched = BTreeMap::<NodeId, usize>::new();
             for path in &actions {
@@ -445,9 +532,10 @@ fn fold(db: &Db, merge: &Merge, marks: &mut Marks) -> Result<(NodeId, NodeId)> {
                 |row| Ok(FlawId(row.get(0)?)),
             )?;
             marks.rerooted(root, None);
-            (from.into(), into.into())
+            Ok(())
         }
-    })
+        NodeKind::Finding => Err(Error::FindingMerge),
+    }
 }
 
 impl Store {
@@ -484,21 +572,29 @@ impl Store {
     }
 
     /// Merge a duplicate node into a live node of its kind, with the actor's reason; ids of
-    /// merged nodes name the node they were merged into.
+    /// merged nodes name the node they were merged into, so two already one are left as they are.
     pub fn merge(&self, actor: &AgentId, merge: &Merge) -> Result<()> {
-        let (Merge::Component { note, .. }
-        | Merge::Source { note, .. }
-        | Merge::Path { note, .. }
-        | Merge::Premise { note, .. }
-        | Merge::Flaw { note, .. }
-        | Merge::Candidate { note, .. }) = merge;
         self.write(|db| {
-            audit(db, actor, EventKind::Merged, Some(note), |_| {
+            let (from, kind) = live_node(db, merge.node)?;
+            let (into, into_kind) = live_node(db, merge.into)?;
+            if kind != into_kind {
+                return Err(Error::MergeKinds {
+                    node: merge.node,
+                    node_kind: kind,
+                    into: merge.into,
+                    into_kind,
+                });
+            }
+            if merge.node == merge.into {
+                return Err(Error::SelfMerge);
+            }
+            if from == into {
+                return Ok(());
+            }
+            audit(db, actor, EventKind::Merged, Some(&merge.note), |event| {
                 let mut marks = Marks::default();
-                let (from, into) = fold(db, merge, &mut marks)?;
-                absorb(db, from, into)?;
-                marks.mark(from, EventEffect::Changed);
-                marks.mark(into, EventEffect::Changed);
+                fold(db, event, kind, from, into, &mut marks)?;
+                absorb(db, event, from, into, &mut marks)?;
                 Ok(((), marks))
             })
         })
@@ -507,12 +603,14 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::{
         super::{
             queues::tests::queued,
             tests::{
-                candidate, component, daemon, fixture, flaw, last_event, marks, path, path_from,
-                premise, scenario, text,
+                HIGH, assess, begun, candidate, component, daemon, decide, end_job, fixture, flaw,
+                last_event, marks, path, path_from, premise, scenario, text, verdict,
             },
         },
         *,
@@ -618,9 +716,16 @@ mod tests {
             scenario(&store, &actor, "one"),
             scenario(&store, &actor, "two"),
         );
-        let [first_premise, second_premise] =
-            [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let [first_premise, second_premise, resting] =
+            [(); 3].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let rests = |premise, rests_on| Link::PremiseBasis { premise, rests_on };
+        assert_matches!(
+            store.link(&actor, &[rests(resting, resting)]),
+            Err(Error::SelfBasis)
+        );
         let links = [
+            rests(first_premise, second_premise),
+            rests(resting, first_premise),
             Link::FlawPremise {
                 flaw: one.flaw,
                 premise: first_premise,
@@ -653,20 +758,20 @@ mod tests {
         let note = text("duplicate");
         let merge = |merge: Merge| store.merge(&actor, &merge).unwrap();
 
-        merge(Merge::Premise {
-            premise: first_premise,
-            into: second_premise,
+        merge(Merge {
+            node: first_premise.into(),
+            into: second_premise.into(),
             note: note.clone(),
         });
-        merge(Merge::Flaw {
-            flaw: one.flaw,
-            into: two.flaw,
+        merge(Merge {
+            node: one.flaw.into(),
+            into: two.flaw.into(),
             note: note.clone(),
         });
         assert_eq!(chain(&store, both), [two.flaw, between]);
-        merge(Merge::Candidate {
-            candidate: one.candidate,
-            into: both,
+        merge(Merge {
+            node: one.candidate.into(),
+            into: both.into(),
             note: note.clone(),
         });
         assert_eq!(actions(&store, both), [two.path.into(), one.path.into()]);
@@ -684,9 +789,9 @@ mod tests {
             .get()
             .try_into()
             .unwrap();
-        merge(Merge::Candidate {
-            candidate: twice,
-            into: both,
+        merge(Merge {
+            node: twice.into(),
+            into: both.into(),
             note: note.clone(),
         });
         assert_eq!(
@@ -697,24 +802,40 @@ mod tests {
         let kept = store
             .report(&actor, third, &text("finding"), &text("report"))
             .unwrap();
-        merge(Merge::Flaw {
-            flaw: two.flaw,
-            into: third,
+        merge(Merge {
+            node: two.flaw.into(),
+            into: third.into(),
             note: note.clone(),
         });
-        let refused = |flaw, into| {
-            let merge = Merge::Flaw {
-                flaw,
+        let refused = |node: NodeId, into: NodeId| {
+            let merge = Merge {
+                node,
                 into,
                 note: note.clone(),
             };
             store.merge(&actor, &merge).unwrap_err()
         };
-        assert!(matches!(refused(third, one.flaw), Error::SelfMerge));
-        assert!(matches!(
-            refused(third, FlawId(two.path.0)),
-            Error::WrongKind { .. }
-        ));
+        // A merge already made, here through `two.flaw`, is a no-op; a node itself, or one of
+        // another kind, is refused.
+        let before = last_event(&store);
+        store
+            .merge(
+                &actor,
+                &Merge {
+                    node: one.flaw.into(),
+                    into: third.into(),
+                    note: note.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(last_event(&store), before);
+        assert_matches!(refused(third.into(), third.into()), Error::SelfMerge);
+        let (path, component) = (two.path.into(), two.component.into());
+        assert_matches!(
+            refused(path, component),
+            Error::MergeKinds { node, node_kind: NodeKind::Path, into, into_kind: NodeKind::Component }
+                if node == path && into == component
+        );
         store
             .evidence(
                 &actor,
@@ -738,6 +859,15 @@ mod tests {
                 .map(|premise| premise.id)
                 .collect::<Vec<_>>(),
             [second_premise]
+        );
+        let NodeView::Premise(survivor) = view(second_premise.into()) else {
+            panic!()
+        };
+        let ids = |premises: &[PremiseRef]| premises.iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(
+            (ids(&survivor.rests_on), ids(&survivor.rested_on_by)),
+            (vec![], vec![resting]),
+            "a basis between the merged pair is dropped"
         );
         let NodeView::Flaw(flaw) = view(third.into()) else {
             panic!()
@@ -781,11 +911,165 @@ mod tests {
         );
     }
 
-    /// A merged path moves its sources, premises and places in candidates' actions to the
-    /// survivor, keeping its steps; a merged source the paths it enters, freeing its location
-    /// for the survivor; and a merged component its files, interfaces, steps and flaws. Each
-    /// leaves the sweep and probe queues and every coverage count, a merged path reaching no
-    /// component and listed by none.
+    /// A merged premise or candidate keeps the results its own work recorded as they stood,
+    /// and its survivor inherits none of them. Work begun on a node merged away records its
+    /// results on the survivor of the time, which keeps them once merged on in turn, whatever
+    /// work on its own survivor records, and owns them on the next survivor from that merge on.
+    #[test]
+    fn a_merged_node_keeps_its_own_results() {
+        let (_session, store, actor) = fixture();
+        let (one, two) = (
+            scenario(&store, &actor, "one"),
+            scenario(&store, &actor, "two"),
+        );
+        let [merged, survivor, first, kept] =
+            [(); 4].map(|_| premise(&store, &actor, PremiseScope::Code));
+        decide(&store, merged, PremiseStatus::Holds);
+        assess(&store, one.candidate, HIGH);
+        verdict(&store, one.candidate, Verdict::Validated);
+        let note = text("duplicate");
+        let merges = [
+            Merge {
+                node: merged.into(),
+                into: survivor.into(),
+                note: note.clone(),
+            },
+            Merge {
+                node: one.candidate.into(),
+                into: two.candidate.into(),
+                note,
+            },
+        ];
+        for merge in &merges {
+            store.merge(&actor, merge).unwrap();
+        }
+        let premise = |id: PremiseId| {
+            let NodeView::Premise(view) = store.node(id.into()).unwrap() else {
+                panic!("a premise")
+            };
+            (view.status, view.proposed.is_some())
+        };
+        assert_eq!(premise(merged), (PremiseStatus::Holds, false));
+        assert_eq!(premise(survivor), (PremiseStatus::Undecided, false));
+        let candidate = |id: CandidateId| {
+            let NodeView::Candidate(view) = store.node(id.into()).unwrap() else {
+                panic!("a candidate")
+            };
+            let proposed = view.proposed_assessment.is_some() || view.proposed_verdict.is_some();
+            (view.assessment.is_some(), view.verdict.is_some(), proposed)
+        };
+        assert_eq!(candidate(one.candidate), (true, true, false));
+        assert_eq!(candidate(two.candidate), (false, false, false));
+
+        let [last, four] = ["three", "four"].map(|name| scenario(&store, &actor, name).candidate);
+        let (settler, settle, _) = begun(&store, &Begin::Settle(vec![first]));
+        let (assessor, assessment, _) = begun(&store, &Begin::Assess(vec![two.candidate]));
+        let (reviewer, review, _) = begun(&store, &Begin::Review(vec![two.candidate]));
+        let merge = |premise: PremiseId,
+                     into: PremiseId,
+                     candidate: CandidateId,
+                     into_candidate: CandidateId| {
+            let note = text("duplicate");
+            let merges = [
+                Merge {
+                    node: premise.into(),
+                    into: into.into(),
+                    note: note.clone(),
+                },
+                Merge {
+                    node: candidate.into(),
+                    into: into_candidate.into(),
+                    note,
+                },
+            ];
+            for merge in &merges {
+                store.merge(&actor, merge).unwrap();
+            }
+        };
+        merge(first, kept, two.candidate, last);
+        let holds = StatusChange::Premise(first, PremiseStatus::Holds);
+        store.set_status(&settler, holds, &text("traced")).unwrap();
+        let vector = HIGH.parse().unwrap();
+        store
+            .assess(&assessor, two.candidate, vector, &text("scored"))
+            .unwrap();
+        store
+            .verdict(
+                &reviewer,
+                two.candidate,
+                Verdict::Validated,
+                &text("reviewed"),
+            )
+            .unwrap();
+        for job in [assessment, review] {
+            end_job(&store, job);
+        }
+        merge(kept, survivor, last, four);
+        let holds = StatusChange::Premise(first, PremiseStatus::Holds);
+        store.set_status(&settler, holds, &text("traced")).unwrap();
+        end_job(&store, settle);
+        assert_eq!(premise(survivor), (PremiseStatus::Holds, false));
+        decide(&store, survivor, PremiseStatus::Fails);
+        assess(&store, four, HIGH);
+        verdict(&store, four, Verdict::Disproved);
+        assert_eq!(premise(kept), (PremiseStatus::Holds, false));
+        assert_eq!(candidate(last), (true, true, false));
+    }
+
+    /// A task begun on a node merged away since records on the survivor as its own work, however
+    /// many merges touch the retired node after its retirement: a flaw of its kept chain merged
+    /// into one the survivor does not hold leaves it retired into the same survivor.
+    #[test]
+    fn a_retired_subjects_tasks_own_their_results_on_the_survivor() {
+        let (_session, store, actor) = fixture();
+        let (one, two) = (
+            scenario(&store, &actor, "one"),
+            scenario(&store, &actor, "two"),
+        );
+        let other = flaw(&store, &actor, one.component);
+        let (assessor, _, _) = begun(&store, &Begin::Assess(vec![one.candidate]));
+        let (reviewer, _, _) = begun(&store, &Begin::Review(vec![one.candidate]));
+        let note = text("duplicate");
+        let merges = [
+            Merge {
+                node: one.candidate.into(),
+                into: two.candidate.into(),
+                note: note.clone(),
+            },
+            Merge {
+                node: one.flaw.into(),
+                into: other.into(),
+                note,
+            },
+        ];
+        for merge in &merges {
+            store.merge(&actor, merge).unwrap();
+        }
+        let vector = HIGH.parse().unwrap();
+        store
+            .assess(&assessor, one.candidate, vector, &text("scored"))
+            .unwrap();
+        store
+            .verdict(
+                &reviewer,
+                one.candidate,
+                Verdict::Validated,
+                &text("reviewed"),
+            )
+            .unwrap();
+        let NodeView::Candidate(view) = store.node(two.candidate.into()).unwrap() else {
+            panic!("a candidate")
+        };
+        assert!(view.assessment.is_some() && view.verdict.is_some());
+        assert!(view.proposed_assessment.is_none() && view.proposed_verdict.is_none());
+    }
+
+    /// A merged path moves its accesses, premises and places in candidates' actions to the
+    /// survivor, keeping its steps; a merged input state its accesses and the flaws leaving it
+    /// wrong, freeing its location, which no other input state takes until then, for the
+    /// survivor; and a merged component its files, interfaces, steps and flaws. Each leaves the
+    /// sweep and probe queues and every coverage count, a merged path reaching no component and
+    /// listed by none.
     #[test]
     fn a_merged_inventory_node_leaves_its_queues_and_counts() {
         let (_session, store, actor) = fixture();
@@ -804,20 +1088,20 @@ mod tests {
         let counts = || {
             let coverage = store.coverage().unwrap();
             let unreached = store.synthesis(&[]).unwrap().unreached;
-            let counts = (coverage.sources, coverage.paths, coverage.components);
+            let counts = (coverage.states, coverage.paths, coverage.components);
             (counts, coverage.unreached, unreached)
         };
         assert_eq!(counts(), ((4, 4, 2), 0, vec![]));
         let note = text("duplicate");
         let merge = |merge: Merge| store.merge(&actor, &merge).unwrap();
-        merge(Merge::Path {
-            path: one.path,
-            into: two.path,
+        merge(Merge {
+            node: one.path.into(),
+            into: two.path.into(),
             note: note.clone(),
         });
-        merge(Merge::Path {
-            path: probes[1],
-            into: probes[0],
+        merge(Merge {
+            node: probes[1].into(),
+            into: probes[0].into(),
             note: note.clone(),
         });
         assert_eq!(queued(&store, Phase::Sweep), [NodeId::from(two.path)]);
@@ -832,46 +1116,61 @@ mod tests {
             survivor.premises.iter().map(|p| p.id).collect::<Vec<_>>(),
             [relied]
         );
-        let (merged_source, kept_source) = (survivor.sources[0].id, survivor.sources[1].id);
-        assert_eq!(survivor.sources.len(), 2);
-
-        merge(Merge::Source {
-            source: merged_source,
-            into: kept_source,
+        let [merged_input, kept_input] = [0, 1].map(|at| survivor.states[at].id);
+        let [freed, held] = [0, 1].map(|at| survivor.states[at].location.clone());
+        let wrong = Link::FlawState {
+            flaw: one.flaw,
+            state: merged_input,
+        };
+        store.link(&actor, &[wrong]).unwrap();
+        let adopt = |location: &Location| {
+            let edit = Edit {
+                title: None,
+                body: None,
+                detail: StateEdit {
+                    location: Some(location.clone()),
+                    trust: None,
+                },
+            };
+            store.upsert(&actor, &Upsert::State(Change::Edit(kept_input, edit)))
+        };
+        assert_matches!(
+            adopt(&freed),
+            Err(Error::StateAt(at)) if at == merged_input
+        );
+        merge(Merge {
+            node: merged_input.into(),
+            into: kept_input.into(),
             note: note.clone(),
         });
-        let NodeView::Source(merged) = store.node(merged_source.into()).unwrap() else {
-            panic!("a source")
+        let NodeView::State(merged) = store.node(merged_input.into()).unwrap() else {
+            panic!("a state")
         };
         assert_eq!(
-            (merged.head.merged_into, merged.live.is_none()),
-            (Some(kept_source.into()), true)
+            (merged.head.merged_into, merged.input.is_none()),
+            (Some(kept_input.into()), true)
         );
-        let adopt = Edit {
-            title: None,
-            body: None,
-            detail: SourceEdit {
-                location: Some(survivor.sources[0].location.clone()),
-                trust: None,
-            },
-        };
-        let adopt = Upsert::Source(Change::Edit(kept_source, adopt));
-        store.upsert(&actor, &adopt).unwrap();
-        merge(Merge::Component {
-            component: one.component,
-            into: two.component,
+        adopt(&freed).unwrap();
+        merge(Merge {
+            node: one.component.into(),
+            into: two.component.into(),
             note,
         });
         assert_eq!(counts(), ((3, 2, 1), 0, vec![]));
-        let NodeView::Source(source) = store.node(kept_source.into()).unwrap() else {
-            panic!("a source")
+        let NodeView::State(kept) = store.node(kept_input.into()).unwrap() else {
+            panic!("a state")
         };
-        let source = source.live.unwrap();
         assert_eq!(
-            (source.paths.iter().map(|path| path.id)).collect::<Vec<_>>(),
-            [NodeId::from(two.path)]
+            (kept.accesses.iter())
+                .map(|access| (access.path.id, access.location.clone()))
+                .collect::<Vec<_>>(),
+            [(two.path.into(), freed.clone()), (two.path.into(), held)]
         );
-        assert_eq!(source.location, survivor.sources[0].location);
+        assert_eq!(kept.input.unwrap().location, freed);
+        assert_eq!(
+            kept.flaws.iter().map(|flaw| flaw.id).collect::<Vec<_>>(),
+            [one.flaw]
+        );
         let NodeView::Component(component) = store.node(two.component.into()).unwrap() else {
             panic!("a component")
         };

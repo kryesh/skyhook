@@ -136,7 +136,8 @@ impl ToolExecutor {
             input,
             self.shared.jobs.clone(),
         )
-        .with_job_location(plan.job_runs_in)
+        .with_job_location(plan.job_runs_in, plan.creates)
+        .with_fit(plan.fit)
         .with_invocation_authority(
             self.shared.authorization.clone(),
             tool.name().to_owned(),
@@ -225,9 +226,22 @@ impl ToolExecutor {
         let (agent, tool, parent) = (call.agent, call.tool, call.parent);
         let arguments = std::sync::Arc::unwrap_or_clone(call.arguments);
         let planned = self.plan_registered(InvocationKind::Host, agent, &tool, arguments, parent);
-        let plan = planned
+        let mut plan = planned
             .await
             .map_err(|error| error.effects(Effects::NotStarted))?;
+        // A script's call keeps its whole results when it is planned again.
+        if let Some(parent) = parent
+            && self
+                .shared
+                .jobs
+                .snapshot(parent)
+                .await
+                .map_err(job_error)?
+                .role
+                == crate::job::JobRole::Script
+        {
+            plan.fit = crate::job::output::Fit::Whole;
+        }
         if plan.job_location != call.location {
             return Err(refusal(&plan, AuthorizationError::TargetRedefined));
         }
@@ -375,7 +389,10 @@ mod tests {
         session::SessionEvent,
         target::TargetDefinition,
         tests::bounded,
-        tool::{ToolOptions, ToolRegistryBuilder},
+        tool::{
+            ToolOptions, ToolRegistryBuilder,
+            diagnostic::{Cause, Effects},
+        },
     };
 
     fn remote_executor(executor: ToolExecutor, router: TargetRouter) -> ToolExecutor {
@@ -448,6 +465,8 @@ mod tests {
         struct Unit {
             fail: bool,
         }
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Empty {}
         let runtime = crate::tests::TestRuntime::new().await;
         let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
         let mut builder = ToolRegistryBuilder::default();
@@ -468,6 +487,14 @@ mod tests {
                         Ok(())
                     }
                 },
+            )
+            .unwrap();
+        builder
+            .register_unit::<Empty, _, _>(
+                "noop",
+                "Do nothing.",
+                ToolOptions::default().script_only(),
+                |_, _| async { Ok(()) },
             )
             .unwrap();
         let executor = runtime.executor(builder);
@@ -491,6 +518,18 @@ mod tests {
                 None
             );
         }
+        // A script's unit call completes with nothing in place of a result.
+        let response = executor
+            .execute_as(
+                InvocationKind::Script,
+                runtime.agent.clone(),
+                "noop",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.output.value, serde_json::json!({}));
     }
 
     #[tokio::test]
@@ -536,9 +575,9 @@ mod tests {
         );
         // Cancelled while connecting, none of them started.
         for task in tasks {
-            let error = task.await.unwrap().unwrap_err().to_string();
-            let not_started = "operation cancelled; operation did not start";
-            assert!(error.ends_with(not_started), "{error}");
+            let diagnostic = task.await.unwrap().unwrap_err().diagnostic();
+            assert_eq!(diagnostic.cause, Cause::Cancelled);
+            assert_eq!(diagnostic.context.effects, Effects::NotStarted);
         }
         router.shutdown().await;
     }
@@ -573,7 +612,10 @@ mod tests {
         let state = runtime.jobs.snapshot(tool_request.job).await.unwrap().state;
         assert_eq!(state, JobState::AwaitingApproval);
         runtime.jobs.cancel(tool_request.job).await.unwrap();
-        assert!(running.await.unwrap().is_err());
+        let failed = bounded(running).await.unwrap().unwrap_err();
+        assert_eq!(failed.diagnostic().cause, Cause::Cancelled);
+        let state = runtime.jobs.snapshot(tool_request.job).await.unwrap().state;
+        assert_eq!(state, JobState::Cancelled);
     }
 
     /// A redefinition of the target a call would connect to plans the call again:

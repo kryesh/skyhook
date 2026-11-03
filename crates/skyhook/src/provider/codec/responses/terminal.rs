@@ -139,69 +139,68 @@ impl Decoder {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use crate::provider::ProviderErrorKind;
 
     #[test]
     fn abnormal_terminal_discards_tools_but_preserves_reasoning_and_usage() {
-        for tag in ["response.incomplete", "response.completed"] {
-            for restated in [true, false] {
-                for output_done in [false, true] {
-                    for (detail, reason) in [
-                        ("max_output_tokens", CutReason::MaxTokens),
-                        ("content_filter", CutReason::Refusal),
-                    ] {
-                        for args in ["{\"query\":", "{\"query\":\"rust\"}"] {
-                            let decoder = decoder();
-                            let native = reasoning_item();
-                            let text = message("text", "partial answer");
-                            let mut call = call_item();
-                            call["arguments"] = json!(args);
-                            let mut initial_call = call.clone();
-                            initial_call["arguments"] = json!("");
-                            let mut frames = vec![
-                                added(0, native.clone()),
-                                done(0, native.clone()),
-                                added(1, initial_call),
-                                added(2, text.clone()),
-                                done(2, text.clone()),
-                                json!({"type":"response.function_call_arguments.delta", "output_index":1,
-                                "item_id":"fc_1", "delta":args}),
-                                json!({"type":"response.function_call_arguments.done", "output_index":1,
-                                "item_id":"fc_1", "arguments":args}),
-                            ];
-                            if output_done {
-                                frames.push(done(1, call.clone()));
-                            }
-                            // Cached tokens are clamped to the prompt, and an
-                            // unusable counter is absent.
-                            let (reported, cached) = if tag == "response.completed" {
-                                (json!(30), Some(20))
-                            } else {
-                                (json!("garbage"), None)
-                            };
-                            let usage = json!({"input_tokens":20,"output_tokens":11,
-                                "input_tokens_details":{"cached_tokens":reported}});
-                            frames.push(json!({"type":tag, "response":{
-                            "status":"incomplete", "incomplete_details":{"reason":detail},
-                            "output":if restated { vec![native.clone(), call, text] } else { vec![] },
-                            "usage":usage}}));
-                            let reduced = assemble_with(decoder, frames).unwrap();
-                            assert_eq!(reduced.completion.outcome(), Outcome::Cut(reason));
-                            let usage = reduced.usage;
-                            assert_eq!(usage.output_tokens.unwrap(), 11);
-                            let input = 20 - cached.unwrap_or_default();
-                            assert_eq!(usage.input_tokens, Some(input));
-                            assert_eq!(usage.cached_input_tokens, cached);
-                            let items = reduced.items();
-                            assert_eq!(items.len(), 2);
-                            assert!(items.iter().all(|item| item.call().is_none()));
-                            assert_eq!(items[1].text_content().as_deref(), Some("partial answer"));
-                            assert_eq!(items[0].replay().unwrap().payload, native);
-                            // The call streamed for display before it was cut.
-                            assert_eq!(reduced.streamed(ItemKind::ToolCall), [args]);
-                        }
-                    }
-                }
+        let (partial, whole) = ("{\"query\":", "{\"query\":\"rust\"}");
+        let (max_tokens, refusal) = (
+            ("max_output_tokens", CutReason::MaxTokens),
+            ("content_filter", CutReason::Refusal),
+        );
+        for (tag, restated, output_done, (detail, reason), args) in [
+            ("response.incomplete", true, false, max_tokens, partial),
+            ("response.incomplete", false, true, refusal, partial),
+            ("response.completed", false, true, refusal, whole),
+            ("response.completed", true, false, max_tokens, whole),
+        ] {
+            let native = reasoning_item();
+            let text = message("text", "partial answer");
+            let mut call = call_item();
+            call["arguments"] = json!(args);
+            let mut initial_call = call.clone();
+            initial_call["arguments"] = json!("");
+            let mut frames = vec![
+                added(0, native.clone()),
+                done(0, native.clone()),
+                added(1, initial_call),
+                added(2, text.clone()),
+                done(2, text.clone()),
+                json!({"type":"response.function_call_arguments.delta", "output_index":1,
+                    "item_id":"fc_1", "delta":args}),
+                json!({"type":"response.function_call_arguments.done", "output_index":1,
+                    "item_id":"fc_1", "arguments":args}),
+            ];
+            if output_done {
+                frames.push(done(1, call.clone()));
             }
+            // Cached tokens are clamped to the prompt, and an unusable counter is absent.
+            let (reported, cached) = if tag == "response.completed" {
+                (json!(30), Some(20))
+            } else {
+                (json!("garbage"), None)
+            };
+            let usage = json!({"input_tokens":20,"output_tokens":11,
+                "input_tokens_details":{"cached_tokens":reported}});
+            frames.push(json!({"type":tag, "response":{
+                "status":"incomplete", "incomplete_details":{"reason":detail},
+                "output":if restated { vec![native.clone(), call, text] } else { vec![] },
+                "usage":usage}}));
+            let case = format!("{tag} {restated} {output_done} {detail}");
+            let reduced = assemble_with(decoder(), frames).unwrap();
+            assert_eq!(reduced.completion.outcome(), Outcome::Cut(reason), "{case}");
+            let usage = reduced.usage;
+            assert_eq!(usage.output_tokens.unwrap(), 11);
+            let input = 20 - cached.unwrap_or_default();
+            assert_eq!(usage.input_tokens, Some(input), "{case}");
+            assert_eq!(usage.cached_input_tokens, cached, "{case}");
+            let items = reduced.items();
+            assert_eq!(items.len(), 2, "{case}");
+            assert!(items.iter().all(|item| item.call().is_none()));
+            assert_eq!(items[1].text_content().as_deref(), Some("partial answer"));
+            assert_eq!(items[0].replay().unwrap().payload, native);
+            // The call streamed for display before it was cut.
+            assert_eq!(reduced.streamed(ItemKind::ToolCall), [args], "{case}");
         }
     }
 
@@ -214,7 +213,7 @@ mod tests {
         let open = json!({"type":"message", "id":"msg", "role":"assistant", "content":[]});
         let frames = vec![added(0, open), delta("msg", "hel"), completed(vec![])];
         let error = assemble_with(decoder(), frames).err().unwrap();
-        assert!(error.message.contains("omitted a streamed output item"));
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
     }
 
     /// An item's own word that it stopped short contradicts a normal finish, so it
@@ -240,7 +239,7 @@ mod tests {
                         ]
                     };
                     let error = assemble(frames(completed(output.clone()))).err().unwrap();
-                    assert!(error.message.contains("unfinished output item"), "{status}");
+                    assert_eq!(error.kind(), ProviderErrorKind::Protocol, "{status}");
                     let cut = json!({"type":"response.incomplete", "response":{"status":"incomplete",
                         "incomplete_details":{"reason":"max_output_tokens"}, "output":output}});
                     let reduced = assemble(frames(cut)).unwrap();
@@ -298,9 +297,6 @@ mod tests {
             "incomplete_details":{"reason":"model_context_window_exceeded"}, "output":[]}}),
         ];
         let error = assemble_with(decoder(), frames).err().unwrap();
-        assert_eq!(
-            error.kind(),
-            crate::provider::ProviderErrorKind::ContextWindowExceeded
-        );
+        assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
     }
 }

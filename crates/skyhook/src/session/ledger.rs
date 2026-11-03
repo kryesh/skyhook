@@ -278,17 +278,17 @@ impl ResidentLedger {
                 }
                 named = Some(request);
             }
-            SessionEvent::ModelAttemptStarted(attempt) => {
-                if let Some(request) = self.requests.get_mut(&attempt.request) {
-                    named = Some(attempt.request);
-                    request.attempts += 1;
-                    request.phase = RequestPhase::Open {
-                        attempt: attempt.attempt,
-                        message: None,
-                        usage: None,
-                    };
-                    request.phased = record.sequence;
-                }
+            SessionEvent::ModelAttemptStarted(attempt)
+                if let Some(request) = self.requests.get_mut(&attempt.request) =>
+            {
+                named = Some(attempt.request);
+                request.attempts += 1;
+                request.phase = RequestPhase::Open {
+                    attempt: attempt.attempt,
+                    message: None,
+                    usage: None,
+                };
+                request.phased = record.sequence;
             }
             SessionEvent::MessageCommitted {
                 message: Message::Assistant(items),
@@ -366,17 +366,17 @@ impl ResidentLedger {
                     });
                 }
             }
-            SessionEvent::Usage { request, usage } => {
-                if let Some(record) = self.requests.get_mut(request) {
-                    record.usage.accumulate(*usage);
-                    if let RequestPhase::Open {
-                        usage: reported, ..
-                    } = &mut record.phase
-                    {
-                        reported.get_or_insert_default().accumulate(*usage);
-                    }
-                    named = Some(*request);
+            SessionEvent::Usage { request, usage }
+                if let Some(record) = self.requests.get_mut(request) =>
+            {
+                record.usage.accumulate(*usage);
+                if let RequestPhase::Open {
+                    usage: reported, ..
+                } = &mut record.phase
+                {
+                    reported.get_or_insert_default().accumulate(*usage);
                 }
+                named = Some(*request);
             }
             SessionEvent::MessageCommitted {
                 message: Message::Tool(result),

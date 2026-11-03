@@ -158,13 +158,11 @@ fn enter<'a>(
             writer.open(Mark::Emphasis(emphasis));
             Close::Span
         }
-        Kind::Link => match node.attr("href") {
-            Some(href) if !inline_data(&href) => {
-                writer.open(Mark::Link(node));
-                Close::Span
-            }
-            _ => return Ok(None),
-        },
+        Kind::Link if node.attr("href").is_some_and(|href| !inline_data(&href)) => {
+            writer.open(Mark::Link(node));
+            Close::Span
+        }
+        Kind::Link => return Ok(None),
         Kind::Quote => {
             writer.block()?;
             writer.push_prefix(Prefix::Quote);
@@ -556,7 +554,7 @@ mod tests {
 
     fn convert(html: &str, scope: Scope) -> Result<String, Unreadable> {
         let base = reqwest::Url::parse("https://example.com/a/").unwrap();
-        let budget = Budget::default();
+        let budget = Budget::new(budget::Limits::SMALL);
         let document = budget::parse(html, &budget).unwrap();
         markdown(document.body().unwrap(), scope, &base, &budget)
     }
@@ -663,10 +661,10 @@ mod tests {
         ]);
         // A spanning cell is written once, however much it reads to write little.
         let spanning = format!(
-            "<table><tr><th>h</th></tr><tr><td colspan=1000 rowspan=0>{}{}</td></tr>{}</table>",
-            " ".repeat(1 << 20),
-            "<i></i>".repeat(10_000),
-            "<tr></tr>".repeat(500)
+            "<table><tr><th>h</th></tr><tr><td colspan=100 rowspan=0>{}{}</td></tr>{}</table>",
+            " ".repeat(budget::Limits::SMALL.decoded_bytes / 10),
+            "<i></i>".repeat(budget::Limits::SMALL.elements / 5),
+            "<tr></tr>".repeat(50)
         );
         assert!(convert(&spanning, Scope::Page).is_ok());
     }

@@ -49,6 +49,7 @@ impl Store {
                         finding
                     }
                 };
+                bearing::record_scenarios(db, event, root)?;
                 let mut marks = Marks::of(finding, EventEffect::Changed);
                 for candidate in rows(
                     db,
@@ -136,7 +137,7 @@ fn scenarios(db: &Db, root: FlawId) -> Result<Vec<ReportedScenario>> {
     let mut scenarios = rows(
         db,
         "SELECT s.candidate,n.title,c.vector,s.severity,s.state,s.confidence FROM \
-         finding_scenario s JOIN candidate c ON c.node=s.candidate JOIN node n ON \
+         finding_scenario s JOIN candidate_result c ON c.candidate=s.candidate JOIN node n ON \
          n.id=s.candidate WHERE s.root=?1 ORDER BY s.rank DESC,s.candidate",
         params![root],
         |row| {
@@ -261,7 +262,7 @@ fn hardening(db: &Db) -> Result<Vec<Hardening>> {
         concat!(
             "SELECT f.node,n.title,f.cwe,e.note,b.candidate,b.severity,",
             location_columns!(),
-            " FROM flaw_state f JOIN node n ON n.id=f.node JOIN event e ON e.id=f.judged \
+            " FROM flaw_standing f JOIN node n ON n.id=f.node JOIN event e ON e.id=f.judged \
              LEFT JOIN (SELECT uf.flaw,u.candidate,u.severity,row_number() OVER (PARTITION BY \
              uf.flaw ORDER BY u.rank DESC,u.candidate) AS nth FROM candidate_flaw uf JOIN \
              candidate_core u ON u.candidate=uf.candidate WHERE u.upheld AND NOT u.shortlisted \

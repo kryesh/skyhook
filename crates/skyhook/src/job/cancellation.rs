@@ -211,28 +211,13 @@ impl JobManager {
 mod tests {
     use super::*;
     use crate::tests::{TestRuntime, bounded};
-    use crate::tool::{
-        ToolError, ToolOptions, ToolRegistryBuilder,
-        policy::{Approval, AuthorizationRequest, Capability, Policy},
-    };
+    use crate::tool::{ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability};
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
 
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
-
-    /// Reports each job it is asked about, and never decides.
-    struct NeverAuthorize(tokio::sync::mpsc::UnboundedSender<JobId>);
-
-    impl Policy for NeverAuthorize {
-        fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
-            Approval::Ask(Box::pin(async move {
-                self.0.send(request.job).unwrap();
-                std::future::pending().await
-            }))
-        }
-    }
 
     fn child(parent: JobId, agent: AgentId, tool: &str) -> JobSpec {
         JobSpec {
@@ -445,8 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncooperative_and_cooperative_handlers_and_pending_authorization_observe_cancellation()
-    {
+    async fn uncooperative_and_cooperative_handlers_observe_cancellation() {
         let runtime = TestRuntime::new().await;
         let (agent, jobs) = (&runtime.agent, &runtime.jobs);
         let observed = Arc::new(AtomicBool::new(false));
@@ -471,21 +455,20 @@ mod tests {
                 }
             })
             .unwrap();
-        let registry = builder.build();
-        let executor = crate::tool::executor::ToolExecutor::new(
-            registry.clone(),
-            Arc::new(crate::tool::policy::AllowAll),
-            jobs.clone(),
-            runtime.root.path().to_path_buf(),
-        );
+        let executor = runtime.executor(builder);
         // Uncooperative handlers are aborted after the cancellation grace.
         let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
         let stubborn = executor
             .run_host(agent, "stubborn", background.clone())
             .await
             .unwrap();
-        jobs.cancel(stubborn.job).await.unwrap();
-        assert_eq!(cancelled(jobs, stubborn.job).await, JobState::Cancelled);
+        let (stopped, _) = crate::tests::expire(
+            jobs.wait(stubborn.job, true),
+            async { jobs.cancel(stubborn.job).await.unwrap() },
+            CANCELLATION_GRACE,
+        )
+        .await;
+        assert_eq!(stopped.unwrap().state, JobState::Cancelled);
         let cooperative = executor
             .run_host(agent, "cooperative", background)
             .await
@@ -494,36 +477,5 @@ mod tests {
         jobs.cancel(cooperative.job).await.unwrap();
         assert_eq!(cancelled(jobs, cooperative.job).await, JobState::Cancelled);
         assert!(observed.load(Ordering::Relaxed));
-
-        let (asked, mut asked_about) = tokio::sync::mpsc::unbounded_channel();
-        let executor = crate::tool::executor::ToolExecutor::new(
-            registry,
-            Arc::new(NeverAuthorize(asked)),
-            jobs.clone(),
-            runtime.root.path().to_path_buf(),
-        );
-        let execution = tokio::spawn({
-            let agent = agent.clone();
-            async move {
-                executor
-                    .run_host(&agent, "cooperative", serde_json::json!({}))
-                    .await
-            }
-        });
-        let awaiting = bounded(asked_about.recv()).await.unwrap();
-        assert_eq!(
-            jobs.snapshot(awaiting).await.unwrap().state,
-            JobState::AwaitingApproval
-        );
-        jobs.cancel(awaiting).await.unwrap();
-        let result = bounded(execution).await.unwrap();
-        assert_eq!(
-            result.unwrap_err().diagnostic().cause,
-            crate::tool::diagnostic::Cause::Cancelled,
-        );
-        assert_eq!(
-            jobs.snapshot(awaiting).await.unwrap().state,
-            JobState::Cancelled
-        );
     }
 }

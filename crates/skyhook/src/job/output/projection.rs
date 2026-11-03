@@ -50,6 +50,26 @@ impl Presented {
         (self.complete.iter().map(of(FieldPresentation::Complete)))
             .chain(self.ends.iter().map(of(FieldPresentation::Ends)))
     }
+
+    /// The value at `field` is a presentation already: presenting it again
+    /// leaves it whole.
+    pub(crate) fn presentation(field: FieldPointer) -> Self {
+        Self::from_iter([(field, FieldPresentation::Complete)])
+    }
+
+    /// These presentations, of a value placed at `field`.
+    pub(crate) fn at(&self, field: &FieldPointer) -> Self {
+        let placed = |(inner, presentation)| (field.join(inner), presentation);
+        self.fields().map(placed).collect()
+    }
+
+    /// The presentations of the value at `field`, addressed from it.
+    pub(crate) fn within(&self, field: &FieldPointer) -> Self {
+        let inside = |(inner, presentation): (&FieldPointer, _)| {
+            Some((inner.relative_to(field)?, presentation))
+        };
+        self.fields().filter_map(inside).collect()
+    }
 }
 
 impl Extend<(FieldPointer, FieldPresentation)> for Presented {
@@ -422,33 +442,27 @@ mod tests {
     use super::*;
     use crate::{
         job::{
-            JobOutcome, JobSpec,
+            JobOutcome,
             output::preview::{SAMPLE_TEXT_BYTES, TEXT_BYTES},
         },
         tool::ToolOutput,
     };
 
+    /// A job of `manager` that saved `value` under `schema`, failing with `error`
+    /// when one is given.
     async fn fixture(
+        manager: &JobManager,
+        agent: &crate::job::AgentId,
         value: Value,
         schema: Value,
         error: Option<String>,
-    ) -> (tempfile::TempDir, JobManager, JobId) {
-        let crate::tests::TestRuntime {
-            root,
-            jobs: manager,
-            agent,
-            ..
-        } = crate::tests::TestRuntime::on_disk().await;
-        let mut spec = JobSpec::test(agent, "annotated");
-        spec.output_schema = Some(schema);
-        let id = manager.test_create(spec).await;
+    ) -> JobId {
         let output = ToolOutput::new(value);
         let outcome = match error {
             Some(message) => ToolError::failed(message).with_result(output).into(),
             None => JobOutcome::Completed(output.into()),
         };
-        manager.finish(id, outcome).await.unwrap();
-        (root, manager, id)
+        super::super::tests::fixture_with(manager, agent, Some(schema), Some(outcome)).await
     }
 
     /// Follows a truncation marker or page continuation as a new field query.
@@ -485,7 +499,13 @@ mod tests {
             "instructions":"i".repeat(2 * TEXT_BYTES), "exit_code":7});
         let schema = json!({"type":"object","properties":{"instructions":{PREVIEW:"complete"}}});
         let error = "failure details ".repeat(2000);
-        let (root, manager, id) = fixture(value.clone(), schema, Some(error.clone())).await;
+        let crate::tests::TestRuntime {
+            root,
+            jobs: manager,
+            agent,
+            ..
+        } = crate::tests::TestRuntime::on_disk().await;
+        let id = fixture(&manager, &agent, value.clone(), schema, Some(error.clone())).await;
         let view = manager
             .present_output(OutputArgs::new(id), &Default::default())
             .await
@@ -560,7 +580,7 @@ mod tests {
     }
 
     /// A stream its schema declares to keep both ends reads its last lines from
-    /// storage; the record continues at the gap, and the view replays after resume.
+    /// storage, and the record continues at the gap.
     #[tokio::test]
     async fn declared_streams_keep_their_last_lines_from_storage() {
         let line = |line: usize| format!("line {line}\n");
@@ -568,7 +588,8 @@ mod tests {
         let value = json!({"stdout": stdout, "stderr": "warning\n", "exit_code": 1});
         let ends = json!({"type":"string", PREVIEW:"ends"});
         let schema = json!({"type":"object","properties":{"stdout":ends,"stderr":ends}});
-        let (root, manager, id) = fixture(value.clone(), schema, None).await;
+        let (_root, manager, agent) = crate::job::tests::runtime().await;
+        let id = fixture(&manager, &agent, value.clone(), schema, None).await;
         let view = manager
             .present_output(OutputArgs::new(id), &Default::default())
             .await
@@ -590,19 +611,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["presentation"]["preview"]["lines"][0], "line 61");
-        let restored = crate::job::tests::reopen(manager, root.path()).await;
-        assert_eq!(
-            restored
-                .present_output(OutputArgs::new(id), &Default::default())
-                .await
-                .unwrap(),
-            view
-        );
     }
 
     #[tokio::test]
     async fn initial_positions_read_remaining_service_and_container_lines_without_gaps() {
         let schema = json!(true);
+        let (_root, manager, agent) = crate::job::tests::runtime().await;
         for (width, count) in [
             (40, 300),
             (223, 150),
@@ -612,7 +626,14 @@ mod tests {
             let text: String = (1..=count)
                 .map(|line| format!("{line:0width$}\r\n"))
                 .collect();
-            let (_root, manager, id) = fixture(json!({"stdout":text}), schema.clone(), None).await;
+            let id = fixture(
+                &manager,
+                &agent,
+                json!({"stdout":text}),
+                schema.clone(),
+                None,
+            )
+            .await;
             let view = manager
                 .present_output(OutputArgs::new(id), &Default::default())
                 .await

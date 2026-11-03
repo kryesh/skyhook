@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::super::workspace::{Parents, atomic_write};
+use super::super::workspace::{Directories, atomic_write};
 use crate::fs::{Contents, FileKind};
 use crate::limits::{MODEL_CONTENT_BYTES, WHOLE_VALUE_BYTES};
 use crate::tool::{
@@ -50,15 +50,17 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         ReplaceArgs::admit,
         |args| Invocation::unit(|_| args.run()),
     )?;
-    builder.register::<RemoveArgs, RemoveOutput, _, _>(
+    builder.register_checked(
         "remove",
         "Remove a workspace file, symlink, or directory.",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .argument_paths(|args: &mut RemoveArgs| {
                 vec![PathArgument::new(&mut args.path, PathAccess::Write, PathKind::Removable)]
-            }),
-        |_, args| async move {
+            })
+            .result::<RemoveOutput>(),
+        Ok,
+        |args| Invocation::new(move |_| async move {
             let path = PathBuf::from(&args.path);
             let metadata = fs::symlink_metadata(&path)
                 .await
@@ -115,8 +117,8 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                     guarded(crate::fs::remove_file_unless_live, None).await?
                 }
             }
-            Ok(RemoveOutput { kind })
-        },
+            serialized(RemoveOutput { kind })
+        }),
     )?;
     Ok(())
 }
@@ -218,7 +220,7 @@ impl Write {
                     .operation(Operation::Read, Subject::argument([SOURCE_ARGUMENT]))
             })?),
         };
-        let parents = Parents::create(&path).await?;
+        let parents = Directories::above(&path).await?;
         let bytes =
             (atomic_write(&path, contents).await).map_err(|error| parents.left_by(error))?;
         Ok(WriteOutput { bytes })
@@ -321,6 +323,8 @@ const fn default_one() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use serde_json::json;
     use std::sync::Arc;
 
@@ -453,8 +457,7 @@ mod tests {
                 .unwrap_err();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.subject, Subject::path("missing/file"));
-            assert!(
-                matches!(&diagnostic.cause, Cause::InvalidArguments(text) | Cause::Message(text) if text.contains(expected)),
+            assert_matches!(&diagnostic.cause, Cause::InvalidArguments(text) | Cause::Message(text) if text.contains(expected),
                 "{diagnostic:?}"
             );
         }
@@ -580,22 +583,21 @@ mod tests {
                 "missing/../../workspace/link/pwned",
             ] {
                 let error = write(&executor, &runtime, path, "text").await.unwrap_err();
-                assert!(
-                    matches!(
-                        error.diagnostic().cause,
-                        Cause::Io {
-                            kind: IoKind::NotFound,
-                            ..
-                        }
-                    ),
+                assert_matches!(
+                    error.diagnostic().cause,
+                    Cause::Io {
+                        kind: IoKind::NotFound,
+                        ..
+                    },
                     "{path}: {error:?}"
                 );
             }
             assert_eq!(policy.requests.lock().unwrap().len(), asked);
             for path in paths {
                 let error = write(&executor, &runtime, &path, "text").await.unwrap_err();
-                assert!(
-                    matches!(error.diagnostic().cause, Cause::Denied(_)),
+                assert_matches!(
+                    error.diagnostic().cause,
+                    Cause::Denied(_),
                     "{path}: {error:?}"
                 );
                 if path.starts_with("link/") {

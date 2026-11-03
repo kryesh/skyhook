@@ -39,7 +39,7 @@ ids!(
     NodeId,
     ComponentId,
     PathId,
-    SourceId,
+    StateId,
     PremiseId,
     FlawId,
     CandidateId,
@@ -71,7 +71,7 @@ macro_rules! kind_ids {
 kind_ids!(
     ComponentId: Component,
     PathId: Path,
-    SourceId: Source,
+    StateId: State,
     PremiseId: Premise,
     FlawId: Flaw,
     CandidateId: Candidate,
@@ -81,18 +81,19 @@ kind_ids!(
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum NodeKind {
-        Component = "component", Path = "path", Source = "source", Premise = "premise",
+        Component = "component", Path = "path", State = "state", Premise = "premise",
         Flaw = "flaw", Candidate = "candidate", Finding = "finding",
     }
 }
 
 named_enum! {
-    /// Work the scheduler derives: paths owing a sweep or a probe, premises a settling look,
-    /// flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
+    /// Work the scheduler derives: paths owing a sweep or a probe, states a check across calls,
+    /// premises a settling look, flaws a chain, candidates an assessment, a review or a test, and
+    /// root flaws a report.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum Phase {
-        Sweep = "sweep", Probe = "probe", Settle = "settle", Chain = "chain", Assess = "assess",
-        Review = "review", Test = "test", Report = "report",
+        Sweep = "sweep", Probe = "probe", Check = "check", Settle = "settle", Chain = "chain",
+        Assess = "assess", Review = "review", Test = "test", Report = "report",
     }
 }
 impl Phase {
@@ -100,6 +101,7 @@ impl Phase {
     pub const fn subject(self) -> NodeKind {
         match self {
             Self::Sweep | Self::Probe => NodeKind::Path,
+            Self::Check => NodeKind::State,
             Self::Settle => NodeKind::Premise,
             Self::Chain | Self::Report => NodeKind::Flaw,
             Self::Assess | Self::Review | Self::Test => NodeKind::Candidate,
@@ -110,7 +112,7 @@ impl Phase {
     /// stage goes first and holds back the later work it touches.
     pub const fn stage(self) -> u8 {
         match self {
-            Self::Sweep | Self::Probe => 0,
+            Self::Sweep | Self::Probe | Self::Check => 0,
             Self::Settle | Self::Chain => 1,
             Self::Assess => 2,
             Self::Review => 3,
@@ -119,20 +121,38 @@ impl Phase {
         }
     }
 
-    /// Whether its entries go out in bundles: one agent takes every ready one sharing a node.
+    /// Whether its entries go out in bundles: one agent takes every ready one of an entry's
+    /// bundle, paths by state, premises and flaws by path, candidates by root group.
     pub const fn bundled(self) -> bool {
-        matches!(self, Self::Settle | Self::Chain)
+        matches!(
+            self,
+            Self::Sweep | Self::Settle | Self::Chain | Self::Review
+        )
     }
 }
 
+// Scopes are inlined like statuses, so that a request's `scope` takes either kind's. A state
+// lives as input an actor writes and the target takes in, target-written state the caller hands
+// back into later calls, one instance's fields across its calls, or storage that outlives the
+// caller's interaction, read by other flows.
 named_enum! {
-    /// Who can drive a source's input.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum StateScope { Input = "input", Handed = "handed", Instance = "instance", Stored = "stored" }
+}
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    pub enum Access { Read = "read", Write = "write" }
+}
+named_enum! {
+    /// Who can drive an input state.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum Trust { Untrusted = "untrusted", Authenticated = "authenticated", Local = "local", Privileged = "privileged" }
 }
+// Whether a premise is about the code, or a deployment condition only the user answers.
 named_enum! {
-    /// Whether a premise is about the code, or a deployment condition only the user answers.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
     pub enum PremiseScope { Code = "code", Deployment = "deployment" }
 }
 // The statuses a request sets are inlined, so that its `status` takes any of them.
@@ -154,11 +174,17 @@ named_enum! {
     #[schemars(inline)]
     pub enum PathStatus { Swept = "swept", Unswept = "unswept", Retracted = "retracted" }
 }
-// Whether a source or component stands as recorded, or was recorded in error.
+// Whether a state or component stands as recorded, or was recorded in error.
 named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     #[schemars(inline)]
     pub enum InventoryStatus { Recorded = "recorded", Retracted = "retracted" }
+}
+// A state's inventory status, or its check across calls recorded done. Any agent marks it.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[schemars(inline)]
+    pub enum StateStatus { Checked = "checked", Recorded = "recorded", Retracted = "retracted" }
 }
 named_enum! {
     /// A review's conclusion; its rationale is the verdict event's note.
@@ -205,7 +231,7 @@ pub enum TextError {
 }
 
 string_newtype! {
-    /// Agent-authored text: nonblank and at most 1 MB.
+    /// Nonblank, at most 1 MB.
     #[derive(PartialOrd, Ord)]
     pub struct Text(TextError) = |value| {
         if value.trim().is_empty() {
@@ -254,10 +280,20 @@ pub struct TestArtifact {
 }
 
 named_enum! {
-    /// How an event bears on a node it names, weakest first: it only concerns it, it moves
-    /// the node's standing, or it changes the node itself.
+    /// How an event bears on a node it names, weakest first: it only concerns it, it proposes
+    /// a result differing from the one standing on it, which only that result's work reads, it
+    /// moves the node's standing, or it changes the node itself.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    pub enum EventEffect { Concerns = "concerns", Standing = "standing", Changed = "changed" }
+    pub enum EventEffect {
+        Concerns = "concerns", Disputes = "disputes", Standing = "standing", Changed = "changed",
+    }
+}
+named_enum! {
+    /// How an event of a phase's bearing on a node moves that work: it moves what the work rests
+    /// on, as a material edit of the node or otherwise, or it disputes the result standing on the
+    /// node, which gives the work fresh tries but leaves that result current.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    pub enum BearingRole { Rests = "rests", Edits = "edits", Disputes = "disputes" }
 }
 
 /// Maximum number of run-owned artifact references accepted by one test.
@@ -305,8 +341,8 @@ impl Page {
     pub const fn new(after: i64, limit: Bounded<1, 1000>) -> Self {
         Self { after, limit }
     }
-    pub(crate) fn limit(self) -> i64 {
-        u64::from(self.limit) as i64
+    pub(crate) fn limit(self) -> usize {
+        u64::from(self.limit) as usize
     }
 }
 impl Default for Page {
@@ -354,7 +390,7 @@ impl<T> IntoIterator for Listing<T> {
 impl<T: Keyed> Listing<T> {
     /// A full page continues after its last key; a shorter one is the end.
     pub(crate) fn keyset(items: Vec<T>, page: Page) -> Self {
-        let next_after = (items.len() as i64 == page.limit())
+        let next_after = (items.len() == page.limit())
             .then(|| items.last().map(Keyed::key))
             .flatten();
         Self { items, next_after }
@@ -403,7 +439,8 @@ named_enum! {
 pub struct InvalidInterfaceName;
 
 string_newtype! {
-    /// A component's interface, by the short name it was recorded under.
+    /// A component's interface by its short name, 1 to 128 bytes without whitespace; a location
+    /// or an environment names one already recorded in a component's `interfaces`.
     #[derive(PartialOrd, Ord)]
     pub struct InterfaceName(InvalidInterfaceName) = |name| {
         if name.is_empty() || name.len() > 128 || name.chars().any(char::is_whitespace) {
@@ -415,17 +452,41 @@ string_newtype! {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("an address is an absolute URL with a host, such as tcp://10.0.0.5:7000")]
+#[error("{}", SERVICE_ADDRESS)]
 pub struct InvalidServiceAddress;
 
+/// What a service address is, as its schema and its refusal state it.
+const SERVICE_ADDRESS: &str = "an absolute URL with a host, such as tcp://10.0.0.5:7000, or a file \
+                               URL with an absolute path, such as file:///srv/harness/decode";
+
 string_newtype! {
-    /// Where an environment serves an interface: an absolute URL with a host.
+    /// Where an environment serves an interface: an absolute URL with a host, or a file URL
+    /// naming a local socket, binary or harness by its absolute path.
     pub struct ServiceAddress(InvalidServiceAddress) = |address| {
-        match address.parse::<http::Uri>() {
-            Ok(uri) if uri.scheme().is_some() && uri.host().is_some_and(|host| !host.is_empty()) => Ok(()),
-            _ => Err(InvalidServiceAddress),
-        }
-    }, schema = schemars::json_schema!({"type": "string", "format": "uri"});
+        let valid = match url::Url::parse(address) {
+            Ok(url) if url.scheme() == "file" => names_local_path(address, &url),
+            _ => address.parse::<http::Uri>().is_ok_and(|uri| {
+                uri.scheme().is_some() && uri.host().is_some_and(|host| !host.is_empty())
+            }),
+        };
+        if valid { Ok(()) } else { Err(InvalidServiceAddress) }
+    }, schema = schemars::json_schema!({"type": "string", "format": "uri", "description": SERVICE_ADDRESS});
+}
+
+/// Whether file URL `url`, parsed from `address`, names an absolute local path as written:
+/// parsing drops or escapes whitespace and control characters and keeps malformed escapes, so
+/// `address` holds none, and each escape decodes to a byte a path may hold.
+fn names_local_path(address: &str, url: &url::Url) -> bool {
+    let escapes = address.split('%').skip(1).all(|escaped| {
+        (escaped.get(..2))
+            .is_some_and(|hex| hex != "00" && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    escapes
+        && !address.chars().any(|c| c.is_control() || c.is_whitespace())
+        && url.path() != "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.to_file_path().is_ok()
 }
 
 impl Sql for &Text {

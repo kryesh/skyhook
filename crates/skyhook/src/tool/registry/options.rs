@@ -31,15 +31,6 @@ pub(super) struct ArgumentHooks<A> {
     pub(super) result: Option<ArgumentResult<A>>,
 }
 
-/// What describes a tool's results.
-pub(super) enum Results<A> {
-    /// A schema tool descriptions document.
-    Documented(OutputSchema),
-    /// A schema chosen per call from its admitted input, for detection, presentation
-    /// and scripts without being documented to models.
-    Internal(ArgumentResult<A>),
-}
-
 /// (object pointer, property name, the property's schema under an agent's capabilities)
 pub(super) type ConditionalProperty = (String, String, ComputedSchema);
 /// A schema, or `None` when the agent's capabilities leave nothing to offer.
@@ -78,7 +69,8 @@ pub struct ToolOptions<A = Value> {
     pub(super) conditional_outputs: Vec<ConditionalProperty>,
     /// Replaces the typed input schema per capability set; see [`Self::computed_schema`].
     pub(super) computed_schema: Option<ComputedSchema>,
-    pub(super) output_schema: Option<Results<A>>,
+    /// The result schema tool descriptions document.
+    pub(super) output_schema: Option<OutputSchema>,
 }
 
 impl<A> ToolOptions<A> {
@@ -314,29 +306,28 @@ impl<A> ToolOptions<A> {
 
     #[must_use]
     pub fn output_schema(mut self, schema: Value) -> Self {
-        self.output_schema = Some(Results::Documented(OutputSchema::Static(schema)));
+        self.output_schema = Some(OutputSchema::Static(schema));
         self
     }
 
     /// The schema a call's stored result follows, chosen from its admitted input:
     /// it describes the result to detection, presentation and scripts, but tool
-    /// descriptions leave it out.
+    /// descriptions leave it out, documenting only a declared output schema.
     #[must_use]
     pub fn internal_result(mut self, schema: impl Fn(&A) -> Value + Send + Sync + 'static) -> Self {
-        self.output_schema = Some(Results::Internal(Arc::new(schema)));
+        self.hooks.result = Some(Arc::new(schema));
         self
     }
 
-    #[must_use]
-    pub(crate) fn job_views(mut self, views: super::JobViewResult) -> Self {
-        self.output_schema = Some(Results::Documented(OutputSchema::JobViews(views)));
-        self
+    /// Whether a schema describes the tool's results, documented or chosen per call.
+    pub(super) const fn declares_result(&self) -> bool {
+        self.output_schema.is_some() || self.hooks.result.is_some()
     }
 
     /// Describe results by `O`'s serialization contract: an absent field is a
     /// skipped `Option<T>`, described as `T`.
     #[must_use]
-    pub(crate) fn result<O: JsonSchema>(self) -> Self {
+    pub(crate) fn result<O: JsonSchema + 'static>(self) -> Self {
         self.output_schema(result_schema::<O>())
     }
 

@@ -267,13 +267,22 @@ mod tests {
         let schema = json!({"type":"object", "properties":{
             "timeout":{"type":"integer"}, "ratio":{"type":"number"}, "bg":{"type":"boolean"},
             "limit":{"type":["integer","null"]}, "name":{"type":"string"},
-            "count":{"type":"integer"}
+            "count":{"type":"integer"}, "either":{"type":["integer","number"]}
         }});
         let arguments = json!({"timeout":"30", "ratio":"0.5", "bg":"true", "limit":"null",
             "name":42, "count":3.0});
         assert_eq!(
-            coerced(schema, arguments),
+            coerced(schema.clone(), arguments),
             json!({"timeout":30, "ratio":0.5, "bg":true, "limit":null, "name":"42", "count":3})
+        );
+        // Valid as JSON Schema, but typed tools reject `3.0` for an integer.
+        // Only that is normalized; other valid values are untouched.
+        assert_eq!(
+            coerced(
+                schema,
+                json!({"count":3.0, "ratio":2.0, "name":"5", "either":4.0})
+            ),
+            json!({"count":3, "ratio":2.0, "name":"5", "either":4.0})
         );
     }
 
@@ -290,22 +299,19 @@ mod tests {
             json!({"big":1e20, "b":"true"}),
             json!({"big":1.10, "b":"true"}),
             json!({"b":"yes"}),
+            json!({"n":3.5}),
         ] {
             assert_eq!(coerced(schema.clone(), arguments.clone()), arguments);
         }
         // Already valid: untouched even where a conversion would be possible.
         let valid = json!({"s":"30", "either":"7"});
         assert_eq!(coerced(schema, valid.clone()), valid);
-    }
-
-    #[test]
-    fn valid_union_arguments_are_not_rewritten_into_another_branch() {
-        let schema = json!({"type":"object", "oneOf":[
+        let union = json!({"type":"object", "oneOf":[
             {"properties":{"kind":{"const":"a"}, "n":{"type":"integer"}}, "required":["kind"]},
             {"properties":{"kind":{"const":"b"}, "n":{"type":"string"}}, "required":["kind"]}
         ]});
         let arguments = json!({"kind":"b", "n":"5"});
-        assert_eq!(coerced(schema, arguments.clone()), arguments);
+        assert_eq!(coerced(union, arguments.clone()), arguments);
     }
 
     #[test]
@@ -379,26 +385,6 @@ mod tests {
             "properties":{"n":{"type":"integer"}},
             "anyOf":[{"required":["n"]}, {"required":["m"]}]});
         assert_eq!(coerced(schema, json!({"n":"5"})), json!({"n":5}));
-    }
-
-    #[test]
-    fn integral_floats_become_integers_where_an_integer_is_required() {
-        let schema = json!({"type":"object", "properties":{
-            "n":{"type":"integer"}, "x":{"type":"number"}, "s":{"type":"string"},
-            "either":{"type":["integer","number"]}
-        }});
-        // Valid as JSON Schema, but typed tools reject `3.0` for an integer.
-        // Only that is normalized; other valid values are untouched.
-        assert_eq!(
-            coerced(
-                schema.clone(),
-                json!({"n":3.0, "x":2.0, "s":"5", "either":4.0})
-            ),
-            json!({"n":3, "x":2.0, "s":"5", "either":4.0})
-        );
-        // A non-integral float is not an integer; validation reports it.
-        let invalid = json!({"n":3.5});
-        assert_eq!(coerced(schema, invalid.clone()), invalid);
     }
 
     #[test]

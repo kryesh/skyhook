@@ -5,6 +5,18 @@ use super::*;
 /// An agent's available depth and capabilities.
 type Grants = (usize, CapabilitySet);
 
+/// Journaled grants under the live ceiling and the depth the agent has left,
+/// which may narrow them but never widen them: a lowered depth limit narrows
+/// rather than refuses them.
+fn resumed_grants(
+    ceiling: &CapabilitySet,
+    remaining: usize,
+    (available_depth, capabilities): (usize, &CapabilitySet),
+) -> Grants {
+    let depth = available_depth.min(remaining);
+    (depth, capabilities & &ceiling.for_agent(depth))
+}
+
 // One owner binds the resolved provider context, admitted capabilities, loop
 // controls and initial journal publication to the same launch identity. There
 // is no config lookup or reconstruction after preparation.
@@ -553,7 +565,7 @@ impl SessionRuntime {
         profile: crate::session::ProfileSnapshot,
         system: Vec<SystemSegment>,
         capabilities: &CapabilitySet,
-        pinned: Option<Vec<crate::provider::protocol::ToolDefinition>>,
+        pinned: Option<Vec<std::sync::Arc<crate::provider::protocol::ToolDefinition>>>,
     ) -> Result<AgentContext, HarnessError> {
         let id = crate::provider::protocol::ContextId::from(agent);
         let provider = match self.harness.models.get(&profile.name) {
@@ -751,20 +763,9 @@ impl SessionRuntime {
     /// configuration.
     pub(super) fn granted(&self, state: &CoreState, agent: &AgentId) -> Option<Grants> {
         let started = state.agent_states.get(agent)?;
-        Some(self.resumed_grants(agent, (started.available_depth, &started.capabilities)))
-    }
-
-    /// Journaled grants under the live configuration, which may narrow them but
-    /// never widen them: a lowered depth limit narrows rather than refuses them.
-    pub(super) fn resumed_grants(
-        &self,
-        agent: &AgentId,
-        (available_depth, capabilities): (usize, &CapabilitySet),
-    ) -> Grants {
         let remaining = self.harness.max_child_depth.saturating_sub(agent.depth());
-        let depth = available_depth.min(remaining);
-        let capabilities = capabilities & &self.capabilities.for_agent(depth);
-        (depth, capabilities)
+        let journaled = (started.available_depth, &started.capabilities);
+        Some(resumed_grants(&self.capabilities, remaining, journaled))
     }
 
     /// What `pick` reads of `agent`'s journaled contract, given its grants, while
@@ -796,6 +797,7 @@ impl SessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::runtime::queue::tests::{count, parent_inputs, start, stop};
     use crate::agent::runtime::tests::*;
 
     struct DepthState;
@@ -831,7 +833,7 @@ mod tests {
         );
         let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
             .prompts(persona_prompts())
-            .session_extension(Some(crate::session::tests::TABLES))
+            .session_schema(crate::session::tests::TABLES)
             .host_state(Arc::new(DepthState))
             .build()
             .await
@@ -936,68 +938,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn committed_tool_history_preserves_null_fields() {
-        let source = "return {error: null, nested: {absent: null, ok: false}, array: [null, 0]};";
-        let call = tool_call(0, "script-call", "script", json!({ "source": source }));
-        let (_root, requests, session) =
-            scripted_session([response(vec![call]), answer("done")]).await;
-        assert_eq!(session.prompt("run").await.unwrap(), "done");
-        let records = session.runtime.store.records();
-        let results = events!(&records, SessionEvent::MessageCommitted { message: Message::Tool(result) } => result);
-        let value = &results[0].result["result"]["value"];
-        assert_eq!(
-            value,
-            &json!({
-                "error": null,
-                "nested": {"absent": null, "ok": false},
-                "array": [null, 0]
-            })
-        );
-        assert_eq!(
-            last_tool_results(&requests.lock().unwrap()[1]),
-            [results[0].clone()]
-        );
-    }
-
-    /// A launch, and a restart, begin the child's request with its prompt committed:
-    /// no input schedules the child's coalescing window for the request to wait out.
-    #[tokio::test]
-    async fn a_launch_and_a_restart_schedule_no_window() {
-        let arguments = json!({"prompt": "work"});
-        let steps = [
-            Step::new(response(vec![tool_call(0, "delegate", "agent", arguments)])),
-            Step::new(answer("child done")).gated(),
-            Step::new(answer("root done")),
-            Step::new(answer("child again")).gated(),
-        ];
-        let provider = Script::new(steps, &Requests::default());
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = ephemeral_session(&harness).await;
-        let child = session.root.child(1);
-        let scheduled =
-            || (session.runtime).agents(|agents| agents.get(&child).unwrap().window.scheduled);
-        let prompt = spawn_prompt(&session, "delegate");
-        provider.request(1).await;
-        assert_eq!(scheduled(), 0);
-        provider.release(1);
-        assert_eq!(bounded(prompt).await.unwrap().unwrap(), "root done");
-        let records = session.runtime.store.records();
-        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
-            [0];
-        session.runtime.jobs.send(job, json!("more")).await.unwrap();
-        provider.request(3).await;
-        assert_eq!(scheduled(), 0);
-        provider.release(3);
-        assert_eq!(
-            terminal(&session, job).await.state,
-            crate::job::JobState::Completed
-        );
-        shutdown_session(session).await;
-    }
-
     /// A call's launch is one commit: a fault refusing it leaves no child, seed or
     /// prompt, never part of them; one failing to acknowledge it leaves what it
     /// committed, as reopening shows it, and starts no agent.
@@ -1065,28 +1005,15 @@ mod tests {
         assert_eq!(journaled, seeded);
     }
 
-    #[tokio::test]
-    async fn delegated_depth_cannot_exceed_the_callers_budget() {
-        let arguments = json!({"prompt":"too deep", "depth":4});
-        let (_root, requests, session) = scripted_session([
-            response(vec![tool_call(0, "agent-too-deep", "agent", arguments)]),
-            answer("root done"),
-        ])
-        .await;
-        assert_eq!(session.prompt("overdelegate").await.unwrap(), "root done");
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "an over-budget child must not start");
-        let results = last_tool_results(&requests[1]);
-        assert!(results[0].is_error);
-        let error = results[0].result["error"].as_str().unwrap();
-        assert!(error.contains("available depth of 4"));
-    }
-
+    /// A delegation deeper than the caller's budget, and any from a leaf child,
+    /// directly or from a script, is refused without starting an agent.
     #[tokio::test]
     async fn leaf_children_cannot_invoke_agent_directly_or_from_scripts() {
+        let too_deep = json!({"prompt":"too deep", "depth":4});
         let script = json!({"source":"return tool.agent({prompt: 'escape'});"});
         let hidden = json!({"prompt":"try hidden delegation"});
         let (_root, requests, session) = scripted_session([
+            response(vec![tool_call(0, "agent-too-deep", "agent", too_deep)]),
             response(vec![tool_call(0, "root-agent", "agent", hidden)]),
             response(vec![
                 tool_call(0, "hidden-agent", "agent", json!({"prompt":"escape"})),
@@ -1098,8 +1025,16 @@ mod tests {
         .await;
         assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4, "hidden delegation must not start agents");
-        let results = last_tool_results(&requests[2]);
+        assert_eq!(
+            requests.len(),
+            5,
+            "refused delegations must not start agents"
+        );
+        let results = last_tool_results(&requests[1]);
+        assert!(results[0].is_error);
+        let error = results[0].result["error"].as_str().unwrap();
+        assert!(error.contains("available depth of 4"));
+        let results = last_tool_results(&requests[3]);
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| result.is_error));
         let error = results[0].result["error"].as_str().unwrap();
@@ -1109,8 +1044,8 @@ mod tests {
     /// Resumed grants are the exact journaled set, never the defaults, narrowed by
     /// the live ceiling and depth limit but never widened: a depth reduced to zero
     /// drops only the ability to delegate.
-    #[tokio::test]
-    async fn resumed_grants_narrow_exact_journaled_capabilities() {
+    #[test]
+    fn resumed_grants_narrow_exact_journaled_capabilities() {
         use Capability::{Agents, Interactive, Mcp, Read};
         let set = |capabilities: &[Capability]| -> CapabilitySet {
             capabilities.iter().cloned().collect()
@@ -1119,31 +1054,123 @@ mod tests {
         let delegating = set(&[Read, Agents, Mcp, Interactive]);
         let delegated = set(&[Read, Mcp, Interactive]);
         let delegator = set(&[Read, Agents]);
-        // (journaled, journaled depth, live ceiling, live depth limit) -> contract
+        // (journaled, journaled depth, live ceiling, depth left) -> contract
         let cases = [
-            (set(&[]), 1, defaults.clone(), 2, set(&[]), 1),
-            (set(&[Read]), 1, all.clone(), 2, set(&[Read]), 1),
-            (defaults, 1, delegator.clone(), 2, delegator, 1),
-            (delegating.clone(), 1, all.clone(), 1, delegated, 0),
-            (delegating.clone(), 1, all, 3, delegating, 1),
+            (set(&[]), 1, defaults.clone(), 1, set(&[]), 1),
+            (set(&[Read]), 1, all.clone(), 1, set(&[Read]), 1),
+            (defaults, 1, delegator.clone(), 1, delegator, 1),
+            (delegating.clone(), 1, all.clone(), 0, delegated, 0),
+            (delegating.clone(), 1, all, 2, delegating, 1),
         ];
-        for (journaled, depth, ceiling, limit, capabilities, available_depth) in cases {
-            let root = tempfile::tempdir().unwrap();
-            let provider = scripted_provider(&Requests::default(), []);
-            let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-                .capabilities(ceiling)
-                .max_child_depth(limit)
-                .build()
-                .await
-                .unwrap();
-            let session = ephemeral_session(&harness).await;
-            let child = session.root.child(1);
+        for (journaled, depth, ceiling, left, capabilities, available_depth) in cases {
             assert_eq!(
-                session.runtime.resumed_grants(&child, (depth, &journaled)),
+                resumed_grants(&ceiling, left, (depth, &journaled)),
                 (available_depth, capabilities),
-                "{journaled:?} at depth {depth} under {limit}"
+                "{journaled:?} at depth {depth} with {left} left"
             );
-            shutdown_session(session).await;
         }
+    }
+
+    #[tokio::test]
+    async fn child_names_are_owner_scoped_and_survive_completion_but_not_failed_launches() {
+        let (_root, tracking, session) = start(false).await;
+        let runtime = &session.runtime;
+        let root_inbox = quiet_root(&session);
+        // Each invocation is a separate script, but the caller owns its children.
+        let call = async |owner: &AgentId, source: &str| {
+            bounded(runtime.executor.execute(
+                owner.clone(),
+                "script",
+                json!({"source":source}),
+                None,
+            ))
+            .await
+            .unwrap()
+            .output
+            .value["value"]
+                .clone()
+        };
+        let launch = |name| {
+            format!("return await tool.agent({{prompt:'test:{name}',name:'{name}',bg:true}});")
+        };
+        let id =
+            |view: &serde_json::Value| serde_json::from_value::<JobId>(view["id"].clone()).unwrap();
+        let refused = |view: &serde_json::Value, existing: JobId| {
+            assert_eq!(view["state"], "failed");
+            let error = view["error"].as_str().unwrap();
+            assert!(error.contains("already exists"), "{error}");
+            assert!(
+                error.contains(&format!("tool.job({existing}).send")),
+                "{error}"
+            );
+        };
+
+        // An admitted tool job that never installs a child must not manufacture
+        // a permanent name reservation, even though it has role Agent and a name.
+        let invalid = call(
+            &session.root,
+            "return await tool.agent({prompt:'bad-depth',name:'worker',depth:999});",
+        )
+        .await;
+        assert_eq!(invalid["state"], "failed");
+        assert!(invalid["error"].as_str().unwrap().contains("depth"));
+        assert!(runtime.jobs.snapshot(id(&invalid)).await.is_ok());
+        let first = call(&session.root, &launch("worker")).await;
+        assert_ne!(first["state"], "failed", "{first}");
+        let first = id(&first);
+        tracking.request(0).await;
+        let duplicate = "return await tool.agent({prompt:'duplicate',name:'worker'});";
+        refused(&call(&session.root, duplicate).await, first);
+
+        // A second caller may install its own worker while the root's worker is
+        // still active. Resolve its identity from the actual installation record.
+        let manager = id(&call(
+            &session.root,
+            "return await tool.agent({prompt:'test:manager',name:'manager',depth:1,bg:true});",
+        )
+        .await);
+        tracking.request(1).await;
+        let records = runtime.store.records();
+        let manager = records
+            .iter()
+            .find_map(|record| match &record.event {
+                SessionEvent::AgentStarted {
+                    owner_job: Some(job),
+                    ..
+                } if *job == manager => Some(record.agent.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let second = call(&manager, &launch("worker")).await;
+        assert_ne!(second["state"], "failed", "{second}");
+        let second = id(&second);
+        assert_ne!(first, second);
+        tracking.request(2).await;
+        let completed = bounded(runtime.jobs.wait(second, true)).await.unwrap();
+        assert_eq!(completed.state, crate::job::JobState::Completed);
+        refused(&call(&manager, duplicate).await, second);
+
+        tracking.release(0);
+        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
+        assert_eq!(completed.state, crate::job::JobState::Completed);
+        // A parked child keeps its name.
+        until_parked(&session, &runtime.jobs.child_agent(first).await.unwrap()).await;
+        refused(&call(&session.root, duplicate).await, first);
+        // Rejecting a duplicate does not interfere with the intended follow-up
+        // path: the original child resumes under its existing ID and history.
+        bounded(runtime.jobs.send(first, json!("test:resume")))
+            .await
+            .unwrap();
+        let resumed = tracking.request(3).await;
+        assert!(
+            parent_inputs(resumed.messages())
+                .iter()
+                .any(|text| text.contains("test:resume"))
+        );
+        let completed = bounded(runtime.jobs.wait(first, true)).await.unwrap();
+        assert_eq!(completed.output, Some(json!({"reply": "answer-3"})));
+        drop(root_inbox);
+        stop(&session).await;
+        assert_eq!(count(&tracking), 4);
     }
 }

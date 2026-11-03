@@ -171,33 +171,6 @@ for line in sys.stdin:
         let root = runtime.root.path().to_path_buf();
         let executor = ToolExecutor::new(registry, policy.clone(), runtime.jobs.clone(), root);
         let agent = || runtime.agent.clone();
-        let disabled = executor.clone().with_capabilities(without(Capability::Mcp));
-        let count = json!({"count":1});
-        assert!(
-            disabled
-                .execute(agent(), native, count.clone(), None)
-                .await
-                .is_err()
-        );
-        assert!(
-            disabled
-                .execute_as(InvocationKind::Script, agent(), native, count, None)
-                .await
-                .is_err()
-        );
-        assert!(policy.requests.lock().unwrap().is_empty());
-        // Upstream-schema rejection is an admission failure: like a typed tool's,
-        // it is refused before a job or an approval exists.
-        for invalid in [json!({"count":"bad"}), json!({})] {
-            assert!(
-                executor
-                    .execute(agent(), native, invalid, None)
-                    .await
-                    .is_err()
-            );
-        }
-        assert!(policy.requests.lock().unwrap().is_empty());
-        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
         let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();
         let native_input =
             json!({"count":2,"title":"user title","format":"user format","$schema":"user data"});

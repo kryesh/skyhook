@@ -397,10 +397,7 @@ mod tests {
             assert!(lines.iter().all(|line| line.width() <= 24), "{lines:?}");
             assert!(lines.iter().any(|line| line.contains('┼')));
         }
-    }
-
-    #[test]
-    fn table_borders_use_the_same_unicode_width_as_the_screen() {
+        // Borders use the same unicode width as the screen.
         use ratatui::{buffer::Buffer, layout::Rect};
         let source = "| H |\n| --- |\n| **لالالا** |\n| 界👩‍💻e\u{301} |";
         for width in 6..30 {

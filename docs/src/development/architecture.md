@@ -58,78 +58,114 @@ finish, beside the store's write generation; what the run holds keys on the gene
 The Research tab renders those facts as a page of typed blocks, which the host lays out once per
 page, disclosure and width and only turns its spinners as it draws.
 
-The store is one graph. Every object is a `node` of one kind (component, path, source, premise,
+The store is one graph. Every object is a `node` of one kind (component, path, state, premise,
 flaw, candidate, finding) with a title and a body; a per-kind detail table shares its id, and a
-composite key to `node(id, kind)` makes the schema guarantee a detail row's kind. Edges are
-tables between detail rows: a path's ordered steps through components and its sources, the
-premises a flaw or a path relies on, and a candidate's ordered chain of flaws, whose first is
+composite key to `node(id, kind)` makes the schema guarantee a detail row's kind. A state's scope
+is fixed in its row, and only an input state has the detail row holding its trust and defining
+location, keyed to the state and its scope. Edges are tables between detail rows: a path's ordered
+steps through components and its accesses (a read or write of a state at a location), the
+premises a flaw or a path relies on, the premises a premise rests on (`premise_basis`, never
+itself, so a merge drops a basis between the pair it merges), the states a flaw leaves wrong,
+and a candidate's ordered chain of flaws, whose first is
 its root, and its ordered actions, the paths its scenario performs from where the attacker
 starts; a chain's flaws are not bound to an action. Ordered edges keep positions 0..n-1 through
 the writes that move them. A duplicate of any kind but a finding merges. A merge repoints every
 edge of the merged node to the survivor, but a merged path keeps its steps and a merged
 candidate its chain and actions as history, the survivor appending after its own actions each
-path the merged one performs as often as it does beyond them; a merged source gives up its detail
-row, so only live sources hold locations. `merged_into` is one hop, so readers never resolve
-merges on edges; an id argument naming a merged node resolves to the survivor at the boundary. Inventory recorded in error is retracted rather than deleted: a
-path's one status is unswept, swept or retracted, and a source's or component's recorded or
+path the merged one performs as often as it does beyond them; a merged input state gives up its
+detail row, so only live input states hold locations, and a merged state its check. `merged_into` is one hop, so readers never resolve
+merges on edges, and a merge marks each node it repoints as only concerned, so the merges marking a
+retired node name the node it lived on as at any event; an id argument naming a merged node resolves to the survivor at the boundary. Inventory recorded in error is retracted rather than deleted: a
+path's one status is unswept, swept or retracted, and a state's or component's recorded or
 retracted. A retracted node keeps its edges and shows as retracted, but every queue, coverage
-count, synthesis list and derived standing reads only recorded sources and components and
+count, synthesis list and derived standing reads only recorded states and components and
 unretracted paths: a premise a retracted path relies on owes it no settling look and stands in no
 chain of a candidate performing it. A status set back restores it.
 
 A `location` is a supertype in the same shape: a kind and a detail row sharing its id, for a code
 region, an address range of a binary image (link-base addresses stored by their bit pattern,
 their span checked in Rust) or an operation and field of a named interface. Each is recorded once
-per key, and sources, flaws, premises, path steps and evidence each hold one location of any
-kind; a location holds one live source, so recording a source where one is already recorded
-returns that one, and a merged source's location is free for the survivor or a new source. A
+per key, and input states, accesses, flaws, premises, path steps and evidence each hold one
+location of any kind; a location defines one live input state, so recording one where one is
+already recorded returns that one, and a merged one's location is free for the survivor or a new
+one. A
 component owns its interfaces by name as it owns its files, and an environment records the
 interfaces it serves with their addresses; evidence naming an environment is an observation made
 there.
 
 Every write is one `event` in one audit log, by the journal's agent row, with the actor's note,
-and `event_node` names each node it bears on with the strongest of three ordered effects:
-`concerns`, `standing` or `changed`. A write names its direct marks, and one rule carries them
+and `event_node` names each node it bears on with the strongest of four ordered effects:
+`concerns`, `disputes`, `standing` or `changed`. A write names its direct marks, and one rule carries them
 along the graph as it stands after the write: a premise moves the standing of the flaws and
-paths relying on it, a source passes its effect to the paths it enters, and a flaw or path
+paths relying on it, a state passes its effect to the paths accessing it, and a flaw or path
 passes its effect to the live candidates chaining or performing it. Some marks stand on their
 node alone: a candidate taking or losing a flaw as its root marks that flaw alone, so its other
-candidates are re-owed only when the flaw itself changes, and a status set on a path, source or
-component marks that node alone, with a source's paths, so it moves only their sweeps; but a path
+candidates are re-owed only when the flaw itself changes, an access recorded or removed marks
+its state alone, so it moves only the state's check, and a status set on a path, state or
+component marks that node alone, with a state's paths, so it moves only their sweeps; but a path
 retracted or restored moves its standing along the graph, since its premises leave or rejoin its
 candidates' chains. A chain is edited whole through its candidate; a flaw joining or leaving
 it at another place is only concerned, and a chain's work also rests on the verdicts of the
-candidates holding its flaw and on the chain edits it joins or leaves, so a disproval or a leave
-releases the flaw with fresh tries. Results are recorded in place and stamped with the event
-that recorded them (`candidate.assessed`, `candidate.reviewed`, a finding's `reported`, and the `decided` or `judged` of a premise's or flaw's latest status, restated or
-not); nothing counts revisions. An assessment, verdict, report, flaw judgement or test's verdict
-recorded within a task of its phase on its subject stands on that task's basis rather than on
-its own event, so another agent's change after the task began owes the work again.
+candidates holding its flaw, on the chain edits it joins or leaves, so a disproval or a leave
+releases the flaw with fresh tries, and on the accesses recorded or removed of the states it
+leaves wrong. Premise and flaw statuses, assessments and verdicts are histories of rows keyed by
+the event recording each (`premise_decision`, `flaw_judgement`, `candidate_assessment`,
+`candidate_verdict`); a finding's `reported` and a state's check are recorded in place. A result
+stands on the basis of the task of its phase on its subject it was recorded within, so another
+agent's change after the task began owes the work again; one recorded outside such a task stands
+on nothing (`stamp`), and a report or a test's verdict outside one on its own event. Each row
+records whether its owning work recorded it (`owned`), decided once at the write: a code
+premise's settle, a deployment premise's answer outside every task, a flaw's chain, a
+candidate's assessment and review. The standing result is the latest owned one. An owned one
+that restates it, current or not, only concerns its node, so nothing resting on it moves, while
+its task's basis still makes it current. A later one
+recorded elsewhere that differs from it is a proposal (`proposed`), which owes its phase and marks
+its node `disputes`, carried nowhere; one that agrees only concerns its node, as does one repeating
+an earlier proposal while the first owned result after that one stands on the phase's current
+basis, so anything moving the basis since asks it again. A retired node keeps
+its own results, standing as its retirement left them: a task on a node merged away since is on
+the node it lived on as when each result was recorded, the one the latest merge retargeting it
+(retiring or repointing it, `node_merge`) pointed it at before then, and the merge retiring a node
+is no edit of it.
 
 What each phase's work on a node reads is its phase's arm of one relation, generated per phase with
 the node bound in every arm so it seeks by node (`bearing`): standing or changed events for a sweep,
-settle, chain or report (the root's and each current member's), those and the environments for
-any candidate serving one of its sources' interfaces (any such one when they sit on none) for a
-probe, but none recorded within a probe, changed events for an assessment,
-all but test records for a review, and verdicts, assessments, test records and environments for a
-test. `event_node` holds its event's kind, and its effects are indexed without test records, which
+check, settle, chain or report (the root's and each current member's), with the disputes of its
+result for a settle, chain, assessment or review, and, for a settle, the
+decisions and disputes of the premises it rests on, those and the environments
+for any candidate serving an interface the path reads an input state on (any such one when it
+reads none on an interface) for a probe, but none recorded within a probe, changed events for an assessment,
+all but test records and other results' disputes for a review, and assessments, test records and environments for a test, with, as its edits, a verdict of
+another value and a change of its candidate's chain or actions (a standing or changed mark on the
+candidate but evidence changing it, its flaws or its paths). `event_node` holds its event's kind, and its effects are indexed without test records, which
 arms read from `test`, so a walk down a node's effects never visits its tests. Every arm leaves out what was recorded within a task of that phase on the node: `event_task`
-names the tasks an event's agent and the agents above it held when it was recorded, so a phase's own
-work, its helpers' included, never moves what it rests on. Two events are never left out: a merge,
+names the tasks of the outermost agent holding any, the event's own or one above it, when it was
+recorded, so a task begun beneath another belongs to the enclosing one, and a phase's own work,
+its helpers' included, never moves what it rests on. Two events are never left out: a merge,
 which work on the survivor rests on whoever made it, and a pending test's record, which a test
-resumes rather than repeats. A basis is that relation's latest event, or the node's latest while the
+resumes rather than repeats. What is fixed when an event is recorded is stored with it, append
+only: the work it was recorded within, with each task's basis (`event_work`), and its arms that
+read only its own effects and test records (`event_bearing`, whose role marks a dispute or a
+material edit). Arms through relations a later event may change (what a premise rests on, a
+flaw's candidates and states, a root's members, environments, which a merge moves to its
+survivor) are read when asked, and every aggregate stays derived. A basis is that relation's latest event, or the node's latest while the
 relation has none, so owed work always rests on one; work is owed while its result predates its
-basis, or, for an unproven verdict, once no premise of its chain is undecided, and a notice is
-one of its events after a task began. Candidate standing (`candidate_state`) and confidence are
+basis, disputes aside, which give it fresh tries but leave a standing result current, or, for a verdict, once the standings it claims (`candidate_core`) no longer hold, and a
+notice is one of its events after a task began. Candidate standing (`candidate_state`) and confidence are
 derived views over those results, the chain's flaw and premise statuses, and the
-root group's demonstrations. A premise's or flaw's status counts once set at or after its latest
-material edit or merge into it, but those made within its own settle or chain (`premise_state`,
-`flaw_state`); an edit since reads it as undecided or suspected again, so its settle or chain is
-owed again. A test records the verdict it tested, and one settling test per candidate
+root group's demonstrations. A premise's or flaw's standing status counts once set at or after
+its latest material edit or merge into it, but those made within its own settle or chain
+(`premise_standing`, `flaw_standing`); an edit since reads it as undecided or suspected again, so its settle or chain is
+owed again. A flaw carrying a proposal owes its chain even while a live candidate holds it. One settling test per candidate
 (`settling_test`: its latest that is not pending when that is a decline, which stands across
-verdicts, or else its latest recorded at its latest verdict) decides its demonstration, its
+verdicts, or else its latest with no edit of the test's bearing after its work began) decides its demonstration, its
 testing's settlement and what its report states; `finding_scenario` is the validated and noted
-members a root's finding reports.
+members a root's finding reports. Each report write records the members it covered, and each
+report task the members it was offered as it began (`report_scenario`); its finding is current
+only while the covered ones are those `finding_scenario` lists now: a restated verdict only
+concerns its candidate, yet can make it reportable again. The begin of a report task offered
+other members than its group has now joins the report's bearing as a dispute does, giving it
+fresh tries however its members changed, without making a current finding stale.
 
 Scheduling is derived; nothing is planned. Work started is a log: a `task` belongs to the
 journal job of the agent that began it (an agent without a job cannot begin), and its
@@ -140,26 +176,56 @@ log's history; its work is done when its subject is no longer owed. A subject is
 while its phase owes it, no task of it is live, and fewer than two of its tasks began at its
 current basis; `startable` pages the offered entries in pipeline order, leaving out what running
 work holds and later work an earlier ready bundle touches, and admitting tests by the live
-policy, approvals and unblocked pending tests. A path is
-swept when a recorded source entering it sits in code and probed otherwise, and a probe is owed only while
-the launch does live work and an environment for any candidate serves every interface its
-sources sit on, or its sources sit only in binaries. Test selection reads each root group's facts once per
-statement, and only for the groups of the subjects a read can list; a page reads the subjects
+policy, approvals and unblocked pending tests. A bundle is the ready sweeps of the paths keyed
+on one state, a path's key being the recorded handed state it accesses that the most paths
+access, else such an instance state, ties to the lowest, a path with none swept alone; one path's ready settles with every premise they rest on at any
+remove, or its ready chains, a shared stage's going with its lowest path and a premise with the
+lowest path of itself and the premises resting on it; or one root group's ready reviews. A
+check is ready once no path whose first event is no later than its basis owes a pending sweep,
+whatever states the path accesses: the earliest such path is read once per statement, so a path
+recorded since never holds a check back, and its sweep's accesses owe the check again. A check is
+owed while its state's basis is later than the basis of the check recorded last (`state_check`),
+or that check was recorded outside one.
+A settle is owed while a live flaw or unretracted path relies on its premise or, through
+`premise_basis` at any remove, on a premise resting on it; a decided premise owes it again once
+a premise it rests on is decided or disputed after the stamp of its decision, outside its own
+settle. A flaw that is not refuted and leaves a recorded state wrong owes a chain while its chain
+basis is later than that of its latest chain task, whatever its candidates: one look covers
+every reader, and an access recorded since owes one more. The run's scope is the components created
+outside every task (`scope`: the first event naming one has no `event_task` row); a path is
+outside it when its entry step's component and the owner of its file through `component_file`
+are both outside it. Every phase's owed predicate skips a path outside it, a state, or a flaw by
+the paths through its component and its candidates' entries, that only such paths reach, a
+premise only such work relies on, and a candidate whose entry is such a path; nothing records
+the scope. A path is swept when one of its reads of a recorded input state
+sits in code and probed otherwise, and a probe is owed only while the launch does live work and
+an environment for any candidate serves every interface it reads one on, or it reads them only
+in binaries. Test selection reads each root group's facts once per
+statement, and only for the groups of the subjects a read can list; an unproven candidate is
+selected instead by the code premises of its chain left undecided by an exhausted settle, each
+through the most severe unproven candidate resting on it whose test is not exhausted; a page reads the subjects
 past its cursor in windows that double until it fills. The orchestrator's scheduler keeps only its own run's
 launch replies: an entry launched twice at one basis is passed back as spent, which the one
 exhaustion predicate every queue and hold shares compares with the phase's current basis as it
-does a task's. The synthesis counts owed, running and exhausted work, the undecided deployment
-premises a review waits on, the candidates standing unproven with their undecided premises, the
-components no path reaches, and the interfaces unswept probed paths wait on. An environment recorded beneath
+does a task's. The synthesis counts owed, running and exhausted work, the deployment premises
+undecided while a review waits on them or carrying a proposal, the candidates standing unproven with their undecided premises, the
+components no path reaches, the interfaces unswept probed paths wait on, and the paths and
+candidates outside the scope. An environment recorded beneath
 a test task is for that test's candidate unless it names another.
 
 An agent with tasks is told of others' changes as a host event: for each subject of its job's tasks,
 the bearing relation's events after the task began and after its cursor (for a subject merged away,
 from the merge that retired it on), which leaves out those the agent or one beneath it recorded.
 Each changed subject gets one digest, never omitted: the event count, the latest event and the kinds seen, with
-its few newest events and their strongest marks, so a delivery is bounded by subjects times recent
-events; the latest event read is the cursor. Nothing is stored: the subscription is the task log. An
-agent found with nothing to be told is skipped until research is written again.
+its few newest events, their notes and their strongest marks, and each node the older events moved once, so a
+delivery is bounded by subjects times recent events and the nodes their work rests on; the latest event read is
+the cursor. Nothing is stored: the subscription is the task log. An
+agent found with nothing to be told is skipped until research is written again. Beginning a task
+returns the same digests for its revisits: for each subject a task of that phase worked before,
+the bearing relation's events after the latest basis such a task began on; a first visit returns
+none. A check's begin, like its state's view, also lists the decided premises of the flaws leaving
+the state wrong (`flaw_state` to `flaw_premise`), with their deciding event and task and evidence
+count.
 
 `reports/` is a projection of the findings that report their scenarios as they stand, which the
 orchestrator's `generate` renders from the store alone: a folder per root, replaced in one step
@@ -232,7 +298,9 @@ identity from its history. A model change prepares its replacement before commit
 and preserves journal history. Reselecting the current model keeps the current context. A mode
 change also replaces the prompt and tool surface and invalidates earlier bound reasoning. A host's
 persona renders into every agent's prompt; a resumed agent keeps its recorded prompt until a mode
-change rebuilds it. Resume opens a fresh provider context under the same context identity, or none for a root whose
+change rebuilds it. A root reopened under a ceiling that changes the grant its prompt was rendered
+for, such as a host without the user, changes into its own mode under the new grant as its next
+work starts. Resume opens a fresh provider context under the same context identity, or none for a root whose
 model the configuration no longer has: the session still activates for writes, and only running the root
 fails with `UnknownModel` until a selection, or `activate_on`, which journals the switch in the
 activation commit, moves it to a configured model. A child whose own model is gone restarts on the
@@ -243,7 +311,8 @@ meanwhile and a refused batch is held again unchanged while the children run on.
 Prompt text is embedded Tera templates (`prompts`). An agent's prompt renders when its contract
 is fixed, as it starts or changes mode, from its typed context (role, available depth,
 capabilities, mode and the `skyhook_context` location), to which a host's `Prompts` add the
-fields of its own section. One render path serves both: a mode whose instructions are a host
+fields of its own section. Only a root granted `Interactive` takes the root role; a root no one
+can ask is instructed as a child, working its task to a result. One render path serves both: a mode whose instructions are a host
 template (`Instructions::Template`) renders them for the agent entering it into an `Edition`,
 the text the journal records; the system prompt then places the host's persona, rendered for the
 agent, that text and the workspace's instruction files around the library's parts, and the
@@ -485,6 +554,17 @@ those a finish never committed. JavaScript receives complete results, while the 
 delivered to the model. [Saved job output](../reference/job-output.md) documents the user-facing
 limits.
 
+How a preview shows each field is saved with the result (`job/output/projection.rs`): what its
+schema declares, complete fields and text keeping both ends, joined with what its producer
+marks. Whether a value is shortened again follows one rule for every tool: a presentation
+already is marked complete at its root; anything else is raw data, previewed by its fields'
+presentations. A `jobs` listing, and a view fitted for a model or paging a field, are
+presentations. A script's whole read of a result is raw data: its view carries that result's
+saved presentations, while its own fields stay whole as the view's schema declares. Scripts
+receive each response with the presentations its job saved, and these follow the values a
+script returns, so a view returned by a script, or read again as the `jobs` call's own saved
+output, shows its result as a direct read would.
+
 Each script runs in a fresh QuickJS runtime (`tool/javascript`) with a 512 MiB engine allocation
 limit set before context creation. This does not cap Rust-side bridge or job memory; allocation
 failures use ordinary JavaScript error handling. Its runtime is embedded ES
@@ -492,8 +572,7 @@ modules (`tool/javascript/js`), compiled to bytecode once per process and instan
 script; the submitted body is compiled separately, as its own module, so failure reports
 can keep only its frames. One conversion turns tool arguments and returned values into JSON at
 the host boundary (`bridge.rs`), and the host fills a response's declared absent fields with
-`null` there, from the schema its job stores, which also declares its presentations
-(`job/output/projection.rs`).
+`null` there, from the schema its job stores.
 
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
@@ -533,8 +612,12 @@ returns otherwise. The helper, its environment and prompt attribution are descri
 ## Session core and transaction boundaries
 
 Each durable session is one SQLite database, `session.db`, holding the append-only, normalized
-event ledger beside its blobs, saved job results and captures; `session/schema.sql` documents the
-tables and the few JSON columns. Closing any descriptor of a file releases every POSIX lock the
+event ledger beside its blobs, saved job results and captures; `skyhook-schema/src/session.sql`
+documents the tables and the few JSON columns, and sets the format the journal's identity
+carries. The `skyhook-schema` proc macro runs that DDL, with any product tables layered on it,
+in an in-memory database at compile time and embeds the serialized result: creating a session
+writes those bytes as its file (or copies them into memory), after checking their identity
+against the journal image's, and only fills the dictionaries, whose rows come from Rust enums. Closing any descriptor of a file releases every POSIX lock the
 process holds on it, SQLite's included, so one registry under one lock (`db::live`) records both
 each database the process has open (its file, `-wal`, `-shm` and `-journal`, by identity and by
 name) and every handle another in-process opener holds (`fs::OpenFile`, by identity). An opener
@@ -622,16 +705,12 @@ descendant.
 
 ### Log and reads
 
-The ledger is only appended to: triggers refuse updates and deletes on every ledger and dictionary
-table. A write the journal cannot take stops the session as a crash does. No commit checkpoints
-the log, since a pass would hold the commits behind it while it syncs the database file: a thread
-with its own connection copies the log into the database every so many commits,
-without blocking the writer or a reader, except that once the log has grown well past its bound
-under commits that never pause, one pass holds the writer so the log can start over. A read holds
-its snapshot for that read alone, so the log stays bounded by what commits between passes plus
-what commits during the longest read. Closing a session copies the log into the
-database and empties it without waiting for a reader; frames a reader still holds stay for the
-next open to recover. A writer lock excludes competing session owners, not read-only inspection.
+The ledger is only appended to: the store's writer offers no update or delete of a ledger or
+dictionary row. A write the journal cannot take stops the session as a crash does. Commits do not
+sync the log; the core syncs it once per group of commands. SQLite's automatic checkpoint copies
+the log into the database as it grows, and the last connection to close copies and removes it.
+A read holds its snapshot for that read alone, so the log stays bounded by what commits during the
+longest read. A writer lock excludes competing session owners, not read-only inspection.
 
 Reads that do not belong to the core, such as job output, the blobs a request sends, an agent's
 history, history pages, request reconstruction, the title, the session list, statistics and
@@ -641,10 +720,9 @@ keeps a fixed few read connections, each on a thread of its own, and a read wait
 than opening another. Reads are async, and one waiting for
 a connection holds no thread. The core reads on a connection of its own, so its reads never wait
 behind other reads. The pool and the turn it takes are `db` primitives; the journal and the
-security store each supply how their readers open. The CLI host turns SQLite's allocation
-statistics off for the process at startup (`db::configure_process`): counting takes one global
-mutex, which would serialise readers that otherwise run in parallel. The library never changes
-process-wide SQLite state on its own.
+security store each supply how their readers open. The library turns SQLite's allocation
+statistics off for the process before its first connection: counting takes one global mutex,
+which would serialise readers that otherwise run in parallel.
 
 ### Observation
 

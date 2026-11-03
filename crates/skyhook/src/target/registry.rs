@@ -511,6 +511,7 @@ impl TargetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn target(name: &str, via: Option<&str>) -> TargetDefinition {
         TargetDefinition::test(name, ".", via)
@@ -534,7 +535,43 @@ mod tests {
         let mut changed = target("edge", Some("build"));
         changed.source = TargetSource::Session;
         let result = registry.upsert(vec![changed]);
-        assert!(matches!(result, Err(TargetError::Cycle(_))));
+        assert_matches!(result, Err(TargetError::Cycle(_)));
+    }
+
+    #[test]
+    fn ssh_options_leave_routing_and_managed_settings_to_their_fields() {
+        let option = |key: &str, value: &str, via: Option<&str>| {
+            let mut definition = target("x", via);
+            definition.ssh.options.insert(key.into(), value.into());
+            definition.validate()
+        };
+        assert_matches!(
+            option("ProxyCommand", "nc %h %p", Some("jump")),
+            Err(TargetError::ProxyCommandWithVia(_))
+        );
+        assert_matches!(
+            option("SendEnv", "*", None),
+            Err(TargetError::ReservedSshOption(_))
+        );
+        assert_matches!(
+            option("proxyjump", "a", None),
+            Err(TargetError::DedicatedSshOption(_, TargetField::Via))
+        );
+        assert_matches!(
+            option("Server Alive", "1", None),
+            Err(TargetError::InvalidSshOptionName)
+        );
+        assert_matches!(
+            option("LogLevel", "", None),
+            Err(TargetError::EmptySshOptionValue(_))
+        );
+        assert_matches!(
+            option("ProxyCommand", "nc\n", None),
+            Err(TargetError::InvalidSshOptionValue(_))
+        );
+        // Managed options with a field of their own name it.
+        let error = option("User", "debian", None).unwrap_err().to_string();
+        assert!(error.contains("`ssh.user"), "{error}");
     }
 
     #[test]
@@ -589,14 +626,15 @@ mod tests {
                 TargetEdge::Origin => invalid.origin = Some(name("missing")),
             }
             let result = registry.upsert(vec![target("added", None), invalid]);
-            assert!(matches!(result, Err(TargetError::UnknownReference {
+            assert_matches!(result, Err(TargetError::UnknownReference {
                 target,
                 edge: actual,
                 reference,
-            }) if target == name("invalid") && actual == edge && reference == name("missing")));
+            }) if target == name("invalid") && actual == edge && reference == name("missing"));
         }
-        assert!(
-            matches!(registry.route(&name("absent")), Err(TargetError::Unknown(unknown)) if unknown == name("absent"))
+        assert_matches!(
+            registry.route(&name("absent")),
+            Err(TargetError::Unknown(unknown)) if unknown == name("absent")
         );
     }
 
@@ -637,21 +675,22 @@ mod tests {
         let via_origin = from_config(
             serde_json::json!({"type": "ssh", "host": "h", "via": "shim", "origin": "shim"}),
         );
-        assert!(matches!(via_origin, Err(TargetError::ViaIsOrigin(_))));
+        assert_matches!(via_origin, Err(TargetError::ViaIsOrigin(_)));
         // `origin: root` spells the default; root is never a jump.
         let from_root =
             from_config(serde_json::json!({"type": "ssh", "host": "h", "origin": "root"}));
         assert_eq!(from_root.unwrap().origin, None);
         let via_root = from_config(serde_json::json!({"type": "ssh", "host": "h", "via": "root"}));
-        assert!(matches!(via_root, Err(TargetError::RootCannotBeJump)));
+        assert_matches!(via_root, Err(TargetError::RootCannotBeJump));
         // A bad link is the link's fault, not the valid name's.
         for edge in [TargetEdge::Origin, TargetEdge::Via] {
             let bad = from_config(
                 serde_json::json!({"type": "ssh", "host": "h", edge.to_string(): "bad target"}),
             );
             let error = bad.unwrap_err();
-            assert!(
-                matches!(error, TargetError::InvalidReference { edge: found } if found == edge)
+            assert_matches!(
+                error,
+                TargetError::InvalidReference { edge: found } if found == edge
             );
             let diagnostic = error.into_admission_error().diagnostic();
             assert_eq!(

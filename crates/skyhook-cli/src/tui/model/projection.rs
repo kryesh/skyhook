@@ -356,10 +356,10 @@ impl Projection {
                     lifecycle: AgentLifecycle::Active,
                 });
             }
-            SessionEvent::ModelChanged { profile } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
-                    agent.model = profile.name.clone();
-                }
+            SessionEvent::ModelChanged { profile }
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) =>
+            {
+                agent.model = profile.name.clone();
             }
             SessionEvent::ModeChanged { mode, capabilities } => {
                 self.contract = self.contract.max(Some(record.sequence));
@@ -778,39 +778,41 @@ mod tests {
     #[tokio::test]
     async fn wait_tool_status_tracks_classification_and_settlement() {
         use AgentDisplayState as State;
-        for (tool, arguments, running) in [
-            ("wait", json!({}), State::Waiting(WaitReason::Event)),
-            (
-                "exec",
-                json!({"command": ["sleep", "60"]}),
-                State::RunningTools,
-            ),
-        ] {
-            let (_root, mut app, mut model, session) = played_fixture().await;
-            let root = app.root_agent().clone();
-            let _asked = ask(&session, "work");
-            let background = json!({"command": ["sleep", "60"], "bg": true});
-            model.turn().await.end(vec![
-                call("background", "exec", background, 0),
-                call("foreground", tool, arguments, 1),
-            ]);
-            let job = observe_find(&mut app, |app| job_of_call(&app.journal, "foreground")).await;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let root = app.root_agent().clone();
+        let _asked = ask(&session, "work");
+        let (sleep, background) = (
+            json!({"command": ["sleep", "60"]}),
+            json!({"command": ["sleep", "60"], "bg": true}),
+        );
+        model.turn().await.end(vec![
+            call("background", "exec", background, 0),
+            call("wait", "wait", json!({}), 1),
+            call("foreground", "exec", sleep, 2),
+        ]);
+        let mut jobs = vec![];
+        for name in ["wait", "foreground", "background"] {
+            let job = observe_find(&mut app, |app| job_of_call(&app.journal, name)).await;
             reached(&mut app, job, JobTransition::Running).await;
-            assert_eq!(status(&app, &root).await, running, "{tool}");
-            // Created first, but it starts beside the foreground call.
-            let background = job_of_call(&app.journal, "background").unwrap();
-            reached(&mut app, background, JobTransition::Running).await;
-            session.cancel_job(job).await.unwrap();
-            observe_record(&mut app, job_finished(job)).await;
-            // The root may already be requesting its next turn: its jobs alone decide.
-            let idle = ObservedActivity {
-                state: AgentActivity::Idle,
-                since: 0,
-            };
-            app.snapshot.activity.insert(root.clone(), idle);
-            assert_eq!(status(&app, &root).await, State::RunningTools, "{tool}");
-            session.cancel_job(background).await.unwrap();
+            jobs.push(job);
         }
+        let [wait, foreground, background] = jobs[..] else {
+            unreachable!()
+        };
+        assert_eq!(status(&app, &root).await, State::Waiting(WaitReason::Event));
+        session.cancel_job(wait).await.unwrap();
+        observe_record(&mut app, job_finished(wait)).await;
+        assert_eq!(status(&app, &root).await, State::RunningTools);
+        session.cancel_job(foreground).await.unwrap();
+        observe_record(&mut app, job_finished(foreground)).await;
+        // The root may already be requesting its next turn: its jobs alone decide.
+        let idle = ObservedActivity {
+            state: AgentActivity::Idle,
+            since: 0,
+        };
+        app.snapshot.activity.insert(root.clone(), idle);
+        assert_eq!(status(&app, &root).await, State::RunningTools);
+        session.cancel_job(background).await.unwrap();
     }
 
     /// A completed child stays briefly in the tree and retires once. Input to its

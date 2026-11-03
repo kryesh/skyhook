@@ -460,11 +460,11 @@ mod tests {
             text: "s".into(),
             cache: true,
         }];
-        request.tools = vec![ToolDefinition {
+        request.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "t".into(),
             description: "d".into(),
             input_schema: json!({"type":"object"}),
-        }];
+        })];
         request.response_schema = Some(
             ResponseSchema::new(
                 "r",
@@ -547,5 +547,23 @@ mod tests {
         assert!(!ToolNames::OpenAi.accepts(&"a".repeat(MAX_TOOL_NAME_BYTES + 1)));
         assert!(ToolNames::Anthropic.accepts(&"a".repeat(ANTHROPIC_MAX_TOOL_NAME_BYTES)));
         assert!(!ToolNames::Anthropic.accepts("vendor.tool"));
+        // An encoder refuses a tool its names reject.
+        let mut request = common::tests::request("m");
+        request.tools = vec![std::sync::Arc::new(
+            crate::provider::protocol::ToolDefinition {
+                name: "vendor.tool".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        )];
+        let mut codec = Codec::ChatCompletions(chat_completions::Dialect::compatible());
+        let context = "c".parse().unwrap();
+        assert!(codec.encode(&request, Default::default(), &context).is_ok());
+        *codec.tool_names_mut() = ToolNames::OpenAi;
+        assert!(
+            codec
+                .encode(&request, Default::default(), &context)
+                .is_err()
+        );
     }
 }

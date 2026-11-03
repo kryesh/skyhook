@@ -31,7 +31,9 @@ shutdown. Interrupt and termination signals also trigger cleanup and journaled s
 a terminal prompt.
 
 A batch job never has human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
-can still ask their owning parent agent. Operations requiring human approval fail immediately;
+can still ask their owning parent agent. The root is instructed as a delegated agent: it completes the
+prompt's task and returns the result, answering its children's questions itself rather than ending
+its turn to ask. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all: true`)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.

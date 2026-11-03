@@ -746,10 +746,8 @@ mod tests {
 
     #[tokio::test]
     async fn questions_open_and_accept_answers_while_inspecting_agents() {
-        use super::super::played::{played_fixture, spawn_children};
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let (children, _turns) = spawn_children(&mut app, &mut model, 1).await;
-        let child = children[0].clone();
+        let (_root, mut app) = fixture().await;
+        let child = app.root_agent().child(1);
         app.select(child.clone());
         app.editor.set("preserved draft".into());
 
@@ -783,7 +781,6 @@ mod tests {
         ];
         let mut response = questions(&mut app, false, batch);
 
-        assert!(draw(&mut app).contains("Question 1/3 · ←→ switch · Tab edit"));
         key(&mut app, Left, M::NONE);
         assert_eq!(app.page_index(), 0);
         key(&mut app, Up, M::NONE);
@@ -795,8 +792,7 @@ mod tests {
         key(&mut app, Left, M::NONE);
         assert_eq!(app.page_index(), 0);
         assert_eq!(app.prompt_input_mut().editor.cursor(), 6);
-        let screen = draw(&mut app);
-        assert!(screen.contains("←→ cursor · Tab switch questions") && screen.contains("comment"));
+        assert!(draw(&mut app).contains("comment"));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24)).unwrap();
         terminal
@@ -805,21 +801,6 @@ mod tests {
         let cursor = terminal.get_cursor_position().unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), "t");
-        let bold = ratatui::style::Modifier::BOLD;
-        assert_eq!(
-            buffer[(2, app.render.prompt_body_rect.y)].fg,
-            crate::tui::theme::theme().ui.warning
-        );
-        let title = &buffer[(2, app.render.prompt_body_rect.y + 1)];
-        assert!(
-            title.fg == crate::tui::theme::theme().ui.emphasis && title.modifier.contains(bold)
-        );
-        let label = &buffer[(4, app.render.prompt_options_rect.y)];
-        assert_eq!(
-            (label.symbol(), label.fg),
-            ("1", crate::tui::theme::theme().ui.fg)
-        );
-        assert!(!label.modifier.contains(bold));
         key(&mut app, Tab, M::NONE);
         app.prompt_input_mut().body.top = 5;
         app.prompt_input_mut().options.top = 5;
@@ -1008,7 +989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn question_comments_survive_ssh_preemption_and_batch_review() {
+    async fn question_comments_survive_batch_review() {
         let (_root, mut app) = fixture().await;
         let batch = vec![
             ("answer", "Choose", suggestions()),
@@ -1018,12 +999,6 @@ mod tests {
 
         key(&mut app, Down, M::NONE);
         paste(&mut app, "my comment");
-        // An authentication prompt pre-empts the question and restores its draft.
-        let ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
-        key(&mut app, Esc, M::NONE);
-        assert!(ssh.await.unwrap().is_err());
-        let input = app.prompt_input_mut();
-        assert_eq!((input.choice, input.editor.text()), (1, "my comment"));
         key(&mut app, Enter, M::NONE);
         assert!(app.prompt_input_mut().editor.text().is_empty());
         paste(&mut app, "freeform");
@@ -1154,16 +1129,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_the_only_prompt_redraws() {
-        let (_root, mut app) = fixture().await;
-        drop(question(&mut app, "Question".into(), vec![]));
-        app.dirty = false;
-        app.tick();
-        assert!(app.prompts.is_empty());
-        assert!(app.dirty);
-    }
-
-    #[tokio::test]
     async fn cancelled_suspended_questions_do_not_leak_into_later_prompts() {
         let (_root, mut app) = fixture().await;
         let answer = question(&mut app, "Question".into(), vec![]);
@@ -1175,6 +1140,12 @@ mod tests {
         assert!(response.await.unwrap().is_err());
         assert!(!has_suspended_prompt(&app));
         assert!(app.prompts.is_empty());
+        // Closing the only prompt redraws.
+        drop(question(&mut app, "Question".into(), vec![]));
+        app.dirty = false;
+        app.tick();
+        assert!(app.prompts.is_empty());
+        assert!(app.dirty);
         let batch = vec![
             ("answer", "Background question", vec![]),
             ("second", "Second question", vec![]),

@@ -66,7 +66,7 @@ impl RunState {
             (phases.iter()).any(|phase| coverage.tasks.get(phase).is_some_and(|count| *count > 0))
         };
         let questions = [Phase::Settle, Phase::Chain];
-        let structure = [Phase::Sweep, Phase::Probe];
+        let structure = [Phase::Sweep, Phase::Probe, Phase::Check];
         let owed =
             |phases: &[Phase]| -> u64 { phases.iter().map(|phase| summary.owed(*phase)).sum() };
         let mut test = work(&[Phase::Test]);
@@ -82,7 +82,7 @@ impl RunState {
                 "paths",
                 coverage.paths,
                 Work {
-                    active: coverage.sources > 0 && coverage.paths == 0,
+                    active: coverage.states > 0 && coverage.paths == 0,
                     exhausted: false,
                 },
                 coverage.paths > 0,
@@ -142,7 +142,7 @@ impl RunState {
             title: "Coverage".to_owned(),
             columns: Vec::new(),
             rows: vec![
-                row("sources", count(coverage.sources), None),
+                row("states", count(coverage.states), None),
                 row("paths", count(coverage.paths), None),
                 row(
                     "  swept",
@@ -164,6 +164,7 @@ impl RunState {
                     None,
                 ),
                 row("  uncovered interfaces", flagged(summary.uncovered), None),
+                row("  outside scope", count(coverage.outside.paths), None),
                 row("components", count(coverage.components), None),
                 row(
                     "  reached",
@@ -214,6 +215,13 @@ impl RunState {
         ));
         if abandoned > 0 {
             rows.push(row("test abandoned", flagged(abandoned), None));
+        }
+        if coverage.outside.candidates > 0 {
+            rows.push(row(
+                "outside scope",
+                count(coverage.outside.candidates),
+                None,
+            ));
         }
         let funnel = Panel {
             title: "Candidates".to_owned(),
@@ -309,37 +317,5 @@ fn stage(label: &str, value: impl Display, work: Work, started: bool) -> Stage {
         label: label.to_owned(),
         value: value.to_string(),
         state: work.state(started),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use skyhook_cli::page::Disclosed;
-
-    use super::*;
-    use crate::store::{
-        PremiseScope,
-        tests::{fixture, premise},
-    };
-
-    /// The coverage panel counts undecided premises of both scopes.
-    #[test]
-    fn undecided_premises_count_both_scopes() {
-        let (_session, store, actor) = fixture();
-        for scope in [PremiseScope::Code, PremiseScope::Deployment] {
-            premise(&store, &actor, scope);
-        }
-        let page = (store.run_state().unwrap())
-            .page(&store, &Disclosed::default())
-            .unwrap();
-        let undecided = (page.blocks.iter())
-            .find_map(|block| match block {
-                Block::Panels(panels) => (panels.iter())
-                    .flat_map(|panel| &panel.rows)
-                    .find(|row| row.label == "premises undecided"),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(undecided.values[0].text, "2");
     }
 }

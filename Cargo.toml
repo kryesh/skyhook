@@ -3,21 +3,23 @@ resolver = "2"
 members = [
     "crates/skyhook",
     "crates/skyhook-cli",
+    "crates/skyhook-schema",
     "crates/skyhook-security",
     "crates/linux-ssh",
 ]
 default-members = ["crates/skyhook-cli", "crates/skyhook-security"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 repository = "https://github.com/kryesh/skyhook"
 
 [workspace.dependencies]
 skyhook = { path = "crates/skyhook" }
 skyhook-cli = { path = "crates/skyhook-cli" }
+skyhook-schema = { path = "crates/skyhook-schema" }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
@@ -39,6 +41,7 @@ libsql = { version = "0.10", default-features = false, features = ["core"] }
 mimalloc = { version = "0.1", features = ["override"] }
 jsonschema = { version = "0.60", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
+regex = "1"
 schemars = { version = "1", features = ["chrono04", "preserve_order"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
@@ -65,6 +68,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
+url = "2"
 zeroize = "1"
 
 [profile.dev.package."*"]

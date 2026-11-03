@@ -17,33 +17,38 @@ pub(super) fn relative_path(workspace: &Path, path: &Path) -> String {
     }
 }
 
-/// Whether a write created directories to hold its destination.
+/// Whether a call created directories to hold what it makes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum Parents {
+pub(crate) enum Directories {
     #[default]
     Existed,
     Created,
 }
 
-impl Parents {
+impl Directories {
     /// Create the missing directories above `path`.
-    pub(super) async fn create(path: &Path) -> Result<Self, LocalError> {
+    pub(super) async fn above(path: &Path) -> Result<Self, LocalError> {
         let Some(parent) = path.parent() else {
             return Ok(Self::Existed);
         };
-        if tokio::fs::metadata(parent)
+        Self::create(parent, Subject::ParentDirectory(parent.to_owned())).await
+    }
+
+    /// Create `directory`, named as `subject`, and the missing directories above it.
+    pub(crate) async fn create<O>(
+        directory: &Path,
+        subject: Subject,
+    ) -> Result<Self, OperationError<O>> {
+        if tokio::fs::metadata(directory)
             .await
             .is_ok_and(|found| found.is_dir())
         {
             return Ok(Self::Existed);
         }
-        let context = PartialContext::new(
-            Operation::CreateDirectories,
-            Subject::ParentDirectory(parent.to_owned()),
-        );
-        tokio::fs::create_dir_all(parent)
+        let context = PartialContext::new(Operation::CreateDirectories, subject);
+        tokio::fs::create_dir_all(directory)
             .await
-            .map_err(LocalError::annotated(
+            .map_err(OperationError::annotated(
                 context.effects(Effects::PartialChange),
             ))?;
         Ok(Self::Created)
@@ -51,7 +56,7 @@ impl Parents {
 
     /// `error` as it leaves the directories created for a destination it did not
     /// replace.
-    pub(super) fn left_by<O>(self, error: OperationError<O>) -> OperationError<O> {
+    pub(crate) fn left_by<O>(self, error: OperationError<O>) -> OperationError<O> {
         let replaced = error.diagnostic().context.effects == Effects::DestinationReplaced;
         if self == Self::Created && !replaced {
             error.effects(Effects::PartialChange)

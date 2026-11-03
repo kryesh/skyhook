@@ -85,10 +85,12 @@ impl AskpassServer {
         ]);
         // Name this process's image rather than its file: a rebuild or upgrade that
         // replaces the binary mid-run would otherwise leave OpenSSH a missing helper.
-        #[cfg(target_os = "linux")]
-        let helper = std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()));
-        #[cfg(not(target_os = "linux"))]
-        let helper = std::env::current_exe()?;
+        let helper = cfg_select! {
+            target_os = "linux" => {
+                std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()))
+            }
+            _ => std::env::current_exe()?,
+        };
         let mut helper_file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -275,6 +277,7 @@ fn answer_value(answer: PromptAnswer) -> Result<SecretValue, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     struct FixedAnswer(&'static str);
 
@@ -356,11 +359,8 @@ mod tests {
             let runtime = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
-            for (mask, runtime) in [
-                ("000", Some(&runtime)),
-                ("777", Some(&runtime)),
-                ("777", None),
-            ] {
+            // Both umask extremes, and both directory choices.
+            for (mask, runtime) in [("000", Some(&runtime)), ("777", None)] {
                 let mut command = std::process::Command::new("/bin/sh");
                 command
                     .arg("-c")
@@ -475,10 +475,7 @@ mod tests {
         ] {
             let (client, server) = UnixStream::pair().unwrap();
             let task = tokio::spawn(serve_one(server, handler, None, None));
-            assert!(matches!(
-                ask_for(client, prompt).await,
-                PromptAnswer::Rejected
-            ));
+            assert_matches!(ask_for(client, prompt).await, PromptAnswer::Rejected);
             task.await.unwrap().unwrap();
         }
     }
@@ -503,7 +500,7 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let jobs = Some(runtime.jobs.clone());
         let task = tokio::spawn(serve_one(server, recording.clone(), None, jobs));
-        assert!(matches!(ask(client).await, PromptAnswer::Rejected));
+        assert_matches!(ask(client).await, PromptAnswer::Rejected);
         task.await.unwrap().unwrap();
         let requesters = recording.0.lock().unwrap();
         assert_eq!(

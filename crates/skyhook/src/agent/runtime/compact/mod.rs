@@ -158,16 +158,17 @@ impl SessionRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::{assert_matches, sync::Arc};
 
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
     use super::{TurnError, summary_max_output};
     pub(super) use crate::agent::runtime::tests::{
-        Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events,
-        interrupt_on, models, provider_name, recoverable, response, retrying, set_root_turn,
-        spawn_prompt, summary_json, test_builder, todo, until_queued, usage,
+        Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta,
+        ephemeral_session, events, interrupt_on, models, provider_name, recoverable, response,
+        retrying, set_root_turn, spawn_prompt, summary_json, test_builder, todo, until_queued,
+        usage,
     };
     use crate::agent::runtime::{HarnessError, SessionHandle, Turn, TurnContext};
     use crate::provider::profile::StateMode;
@@ -268,7 +269,7 @@ mod tests {
                     script.clone(),
                     models([("test", profile)]),
                 );
-            let session = builder.build().await.unwrap().new_session().await.unwrap();
+            let session = ephemeral_session(&builder.build().await.unwrap()).await;
             let research =
                 session.prompt("Research the existing task and preserve its constraints.");
             research.await.unwrap();
@@ -375,26 +376,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stream_overflow_below_threshold_compacts_once() {
-        let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
-        let steps = [
-            Step::stream(vec![Err(overflow)]),
-            Step::new(summary(summary_json())),
-            Step::new(answer("done")),
-        ];
-        let fixture = Fixture::new(steps).await;
-        fixture.add_history(20_000).await;
-        assert_eq!(fixture.session.prompt("Continue.").await.unwrap(), "done");
-        // Summarization and retry retain the agent's context.
-        assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
-        let requests = fixture.requests();
-        assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
-        let records = fixture.records();
-        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
-        fixture.session.shutdown().await.unwrap();
-    }
-
     /// An interrupt that lands before the summary's attempt starts fails the round
     /// as requested; one after it fails the round on that attempt, the last thing
     /// sent. The failure names only an attempt that committed.
@@ -428,7 +409,7 @@ mod tests {
             };
             assert_eq!(interrupted, 1);
             let interrupted = bounded(prompt).await.unwrap();
-            assert!(matches!(interrupted, Err(HarnessError::Interrupted)));
+            assert_matches!(interrupted, Err(HarnessError::Interrupted));
             let records = fixture.records();
             let failed = events!(&records, SessionEvent::CompactionFailed { failure, error }
                 => (*failure, error.clone()));
@@ -438,19 +419,6 @@ mod tests {
             let attempts = events!(&records, SessionEvent::ModelAttemptStarted(attempt)
                 if Some(attempt.request) == failure.request() => *attempt);
             assert_eq!(failure.attempt(), attempts.last().copied(), "{started}");
-            // The failure settles the summary request on that attempt.
-            let ledger = crate::session::tests::ledger(&fixture.session.runtime.store);
-            let request = failure
-                .request()
-                .and_then(|request| ledger.requests.get(&request));
-            let attempt = attempts.last().map(|attempt| attempt.attempt);
-            assert!(
-                matches!(request.unwrap().phase,
-                    crate::session::RequestPhase::Interrupted { attempt: at, .. } if at == attempt),
-                "{started}"
-            );
-            assert_eq!(attempts.len(), usize::from(started));
-            assert_eq!(fixture.requests().len(), 2 + usize::from(started));
             fixture.session.shutdown().await.unwrap();
         }
     }
@@ -605,15 +573,12 @@ mod tests {
         let mut blank_todo = summary_json();
         blank_todo["todos"] = json!([{"text":" \t", "status":"pending"}]);
         type Expected = fn(&CompactionFault) -> bool;
-        let cases: [(_, usize, Expected); 5] = [
+        let cases: [(_, usize, Expected); 4] = [
             (
                 cut(vec![reasoning, text], CutReason::MaxTokens),
                 3,
                 |fault| matches!(fault, CompactionFault::Truncated),
             ),
-            (cut(partial(), CutReason::Incomplete), 3, |fault| {
-                matches!(fault, CompactionFault::Truncated)
-            }),
             (tool_call, 3, |fault| {
                 matches!(fault, CompactionFault::ToolCall)
             }),

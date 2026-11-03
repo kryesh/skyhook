@@ -9,6 +9,7 @@ use crate::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::Effects,
         policy::{Capability, PermissionUse, ResourceId},
+        registry::{AdmittedInvocation, serialized},
     },
 };
 
@@ -100,21 +101,26 @@ pub(super) fn register(
     router: TargetRouter,
 ) -> Result<(), RegistryError> {
     let listed = router.clone();
-    builder.register::<TargetsArgs, Vec<TargetView>, _, _>(
+    builder.register_checked(
         "targets",
         "List available execution targets and their hostnames without connecting.",
-        ToolOptions::default().requires(Capability::Targets),
-        move |context, _| {
+        ToolOptions::default()
+            .requires(Capability::Targets)
+            .result::<Vec<TargetView>>(),
+        Ok,
+        move |_: TargetsArgs| {
             let router = listed.clone();
-            async move {
+            AdmittedInvocation::new(move |context| async move {
                 let targets = router.targets(|targets| targets.list(context.capabilities()));
-                Ok(std::iter::once(TargetView::root())
-                    .chain(targets.into_iter().map(TargetView::from))
-                    .collect())
-            }
+                serialized(
+                    std::iter::once(TargetView::root())
+                        .chain(targets.into_iter().map(TargetView::from))
+                        .collect::<Vec<_>>(),
+                )
+            })
         },
     )?;
-    builder.register_unit::<TargetAddArgs, _, _>(
+    builder.register_checked(
         "target_add",
         r#"Add or replace a session target without connecting to it or changing your current target.
 
@@ -135,9 +141,10 @@ ssh.options can run commands, so it also requires exec."#,
                 }),
             )
             .argument_permissions(|_, args: &TargetAddArgs| Ok(add_permissions(&args.config.ssh))),
-        move |context, args| {
+        Ok,
+        move |args: TargetAddArgs| {
             let router = router.clone();
-            async move {
+            AdmittedInvocation::unit(move |context| async move {
                 let definition = TargetDefinition::from_config(args.name, args.config)
                     .map_err(|error| {
                         ToolError::from(error.into_admission_error()).effects(Effects::Unchanged)
@@ -147,7 +154,7 @@ ssh.options can run commands, so it also requires exec."#,
                     .await
                     .map_err(|e| e.into_tool_error())?;
                 Ok(())
-            }
+            })
         },
     )?;
     Ok(())
@@ -258,18 +265,15 @@ mod tests {
         assert_eq!(capabilities(both), [Capability::Exec, Capability::SshAgent]);
     }
 
+    /// The registry adds `external_agent` back under this definition only with
+    /// ssh_agent; admission validates against this schema before serde runs.
     #[test]
-    fn external_agent_is_absent_from_the_base_schema() {
-        // The registry adds it back under this definition only with ssh_agent.
+    fn the_base_schema_omits_external_agent_and_rejects_unknown_fields() {
         let schema = serde_json::to_value(schemars::schema_for!(TargetAddArgs)).unwrap();
         let properties = &schema["$defs"]["SshOptions"]["properties"];
         assert!(properties.is_object(), "{schema}");
         assert!(properties.get("external_agent").is_none(), "{schema}");
-    }
-
-    #[test]
-    fn add_rejects_unknown_fields_through_the_flattened_config() {
-        let invalid = r#"{"name":"db","type":"ssh","host":"db","target":"root"}"#;
-        assert!(serde_json::from_str::<TargetAddArgs>(invalid).is_err());
+        let invalid = serde_json::json!({"name":"db","type":"ssh","host":"db","target":"root"});
+        assert!(!jsonschema::is_valid(&schema, &invalid), "{schema}");
     }
 }

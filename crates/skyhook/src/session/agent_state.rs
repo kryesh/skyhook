@@ -231,10 +231,8 @@ impl AgentStates {
                 self.contexts.push((agent.clone(), context.purpose, at));
                 return;
             }
-            _ => match self.agents.get_mut(agent) {
-                Some(state) => state,
-                None => return,
-            },
+            _ if let Some(state) = self.agents.get_mut(agent) => state,
+            _ => return,
         };
         match &record.event {
             SessionEvent::ModelChanged { .. } => {

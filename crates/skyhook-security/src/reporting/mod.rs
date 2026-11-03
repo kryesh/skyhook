@@ -198,11 +198,10 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => {
                 wanted(cancelled)?;
-                match reports.remove_tree(OsStr::new(&root.to_string())) {
-                    Err(removal) if removal.kind() != io::ErrorKind::NotFound => {
-                        return Err(removal.into());
-                    }
-                    _ => {}
+                if let Err(removal) = reports.remove_tree(OsStr::new(&root.to_string()))
+                    && removal.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(removal.into());
                 }
                 generated.unwritten.push(Unwritten {
                     root,
@@ -234,7 +233,7 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{assert_matches, fs, os::unix::fs::symlink};
 
     use skyhook::identity::AgentId;
 
@@ -243,10 +242,10 @@ mod tests {
     const MEDIUM: &str = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:A/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N";
 
     use crate::store::{
-        FlawStatus, NewTest, StatusChange, TestId, TestResult, Verdict,
+        Begin, FlawStatus, NewTest, StatusChange, TestId, TestResult, Verdict,
         tests::{
-            HIGH, Scenario, Session, artifact, assess, candidate, fixture, flaw, text, validated,
-            verdict,
+            self, HIGH, Scenario, Session, artifact, assess, candidate, fixture, flaw, revalidate,
+            text, validated, verdict,
         },
     };
 
@@ -312,7 +311,8 @@ mod tests {
     /// `reports/` holds only current reports: a root folder replaced by a link is replaced
     /// without being followed, anything else placed there goes, and a root whose report went
     /// stale leaves until its report is written again. Run again with nothing changed, it
-    /// rewrites nothing.
+    /// rewrites nothing. The index sets each report's title as a link's text whatever it holds,
+    /// and a `reports/` that is itself a link is refused.
     #[test]
     fn generation_keeps_reports_to_the_current_findings() {
         let fixture = Fixture::new();
@@ -334,16 +334,23 @@ mod tests {
         assert_eq!(fixture.listing(), [root.as_str(), "index.json", "index.md"]);
 
         let candidate = fixture.scenario.candidate;
-        verdict(
-            &fixture.store,
-            &fixture.actor,
-            candidate,
-            Verdict::Validated,
-        );
+        revalidate(&fixture.store, candidate);
         fixture.generate();
         assert_eq!(fixture.listing(), ["index.json", "index.md"]);
-        fixture.report("Unchecked size in the parser");
+        fixture.report("Copy [past](http://x) | the end");
         assert_eq!(fixture.generate().reports, [fixture.scenario.flaw]);
+        let index = fs::read_to_string(fixture.store.report_root().join(INDEX_MD)).unwrap();
+        assert!(
+            index.contains(&format!(
+                "Copy \\[past\\](http://x) \\| the end]({root}/README.md)"
+            )),
+            "{index}"
+        );
+
+        fs::remove_dir_all(fixture.store.report_root()).unwrap();
+        symlink(&elsewhere, fixture.store.report_root()).unwrap();
+        assert_matches!(generate(&fixture.store, &|| false), Err(Error::LinkedRoot));
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
     /// A test's artifacts are copied by role with their checksums, and a confirmation shows
@@ -380,22 +387,6 @@ mod tests {
         assert!(!fixture.folder().exists());
     }
 
-    /// The index sets each report's title as a link's text whatever it holds.
-    #[test]
-    fn the_index_escapes_titles() {
-        let fixture = Fixture::new();
-        fixture.report("Copy [past](http://x) | the end");
-        fixture.generate();
-        let index = fs::read_to_string(fixture.store.report_root().join(INDEX_MD)).unwrap();
-        let root = fixture.scenario.flaw;
-        assert!(
-            index.contains(&format!(
-                "Copy \\[past\\](http://x) \\| the end]({root}/README.md)"
-            )),
-            "{index}"
-        );
-    }
-
     /// A confirmed flaw no finding reports is listed in `hardening.md`, which the index links:
     /// with why no chain was found while no validated candidate holds it, then with the
     /// candidate and its severity once one validated below the threshold does; the list goes
@@ -405,10 +396,12 @@ mod tests {
         let fixture = Fixture::new();
         let (store, actor, scenario) = (&fixture.store, &fixture.actor, &fixture.scenario);
         let apart = flaw(store, actor, scenario.component);
-        let confirmed = StatusChange::Flaw(apart, FlawStatus::Confirmed);
-        store
-            .set_status(actor, confirmed, &text("no leak path"))
-            .unwrap();
+        tests::within(store, &Begin::Chain(vec![apart]), |agent| {
+            let confirmed = StatusChange::Flaw(apart, FlawStatus::Confirmed);
+            store
+                .set_status(agent, confirmed, &text("no leak path"))
+                .unwrap();
+        });
         fixture.generate();
         let read = |name| fs::read_to_string(store.report_root().join(name)).unwrap();
         assert!(read(INDEX_MD).contains("[Hardening](hardening.md)"));
@@ -422,8 +415,8 @@ mod tests {
 
         let holder = candidate(store, actor, scenario.path, &[apart]);
         for (vector, below) in [(MEDIUM, true), (HIGH, false)] {
-            assess(store, actor, holder, vector);
-            verdict(store, actor, holder, Verdict::Validated);
+            assess(store, holder, vector);
+            verdict(store, holder, Verdict::Validated);
             fixture.generate();
             if below {
                 let page = read(HARDENING_MD);
@@ -435,19 +428,6 @@ mod tests {
         }
         assert!(!store.report_root().join(HARDENING_MD).exists());
         assert!(!read(INDEX_MD).contains(HARDENING_MD));
-    }
-
-    #[test]
-    fn a_linked_reports_directory_is_refused() {
-        let fixture = Fixture::new();
-        let elsewhere = fixture.store.directory().join("elsewhere");
-        fs::create_dir(&elsewhere).unwrap();
-        symlink(&elsewhere, fixture.store.report_root()).unwrap();
-        assert!(matches!(
-            generate(&fixture.store, &|| false),
-            Err(Error::LinkedRoot)
-        ));
-        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
     /// A cancelled generation leaves no folder half-built, and the next one writes it;
@@ -464,13 +444,13 @@ mod tests {
             checks.get() > 3
         };
         let cancelled = generate(&fixture.store, &late);
-        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+        assert_matches!(cancelled, Err(Error::Cancelled));
         assert_eq!(fixture.listing(), Vec::<String>::new());
         assert_eq!(fixture.generate().reports, [fixture.scenario.flaw]);
 
         fs::write(fixture.store.report_root().join("notes.txt"), "foreign").unwrap();
         let cancelled = generate(&fixture.store, &|| true);
-        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+        assert_matches!(cancelled, Err(Error::Cancelled));
         assert!(fixture.store.report_root().join("notes.txt").exists());
     }
 }

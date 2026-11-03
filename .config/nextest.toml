@@ -1,3 +1,14 @@
 [profile.default]
 # A hung test fails instead of wedging the run.
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+# The slowest tests start first, so none of them is left running alone at the end of a run.
+# Measured alone: the security scheduler, queue, session and research view tests take 0.4-2.3 s.
+[[profile.default.overrides]]
+filter = 'binary_id(skyhook-security::bin/skyhook-security) & (test(/^tools::tests::/) | test(/^store::/) | test(/^session::tests::/) | test(/^research_view::/))'
+priority = 100
+
+# Then the other tests measured at 0.5-1.5 s alone.
+[[profile.default.overrides]]
+filter = 'test(/^tui::app::pages::tests::home_reads/) | test(/^tui::render::(track|cache)::tests::/) | test(/^tui::app::queue::tests::an_edit_keeps/) | test(/^cvss::tests::every_base_vector/) | test(/^agent::runtime::lifecycle::tests::every_link/) | test(/^tool::builtins::fetch::text::tests::/)'
+priority = 50

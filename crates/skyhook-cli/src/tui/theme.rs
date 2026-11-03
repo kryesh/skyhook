@@ -47,6 +47,7 @@ pub struct Palette {
     pub accent: Color,
     pub success: Color,
     pub warning: Color,
+    pub caution: Color,
     pub error: Color,
 }
 
@@ -66,6 +67,7 @@ impl Palette {
         accent: Color::Rgb(0, 206, 233),
         success: Color::Rgb(0, 208, 147),
         warning: Color::Rgb(246, 185, 1),
+        caution: Color::Rgb(255, 140, 40),
         error: Color::Rgb(255, 102, 127),
     };
 }

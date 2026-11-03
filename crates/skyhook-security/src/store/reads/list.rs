@@ -11,7 +11,9 @@ use super::super::*;
 pub enum ListQuery {
     Component,
     Path,
-    Source,
+    State {
+        scope: Option<StateScope>,
+    },
     Premise {
         scope: Option<PremiseScope>,
         status: Option<PremiseStatus>,
@@ -32,7 +34,7 @@ impl ListQuery {
         match self {
             Self::Component => NodeKind::Component,
             Self::Path => NodeKind::Path,
-            Self::Source => NodeKind::Source,
+            Self::State { .. } => NodeKind::State,
             Self::Premise { .. } => NodeKind::Premise,
             Self::Flaw { .. } => NodeKind::Flaw,
             Self::Candidate { .. } => NodeKind::Candidate,
@@ -70,7 +72,7 @@ impl Keyed for NodeSummary {
 /// The node of `kind` in a row of its id, title and own status.
 pub(super) fn summary(row: &libsql::Row, kind: NodeKind) -> Result<NodeSummary> {
     let status = match kind {
-        NodeKind::Component | NodeKind::Source => {
+        NodeKind::Component | NodeKind::State => {
             optional_enum_column(row, 2)?.map(NodeStatus::Inventory)
         }
         NodeKind::Path => optional_enum_column(row, 2)?.map(NodeStatus::Path),
@@ -86,7 +88,7 @@ pub(super) fn summary(row: &libsql::Row, kind: NodeKind) -> Result<NodeSummary> 
     })
 }
 
-/// Live nodes read as `n` after key `?1`, limit `?2`, with `$status` and from `$from` where
+/// Live nodes read as `n` after key `?1`, of kind `?2`, with `$status` and from `$from` where
 /// `$filter` holds.
 macro_rules! list_sql {
     ($status:literal, $from:literal, $filter:literal) => {
@@ -95,9 +97,9 @@ macro_rules! list_sql {
             $status,
             " FROM node n ",
             $from,
-            " WHERE n.kind=?3 AND n.merged_into IS NULL AND n.id>?1 AND ",
+            " WHERE n.kind=?2 AND n.merged_into IS NULL AND n.id>?1 AND ",
             $filter,
-            " ORDER BY n.id LIMIT ?2"
+            " ORDER BY n.id"
         )
     };
 }
@@ -106,20 +108,27 @@ impl Store {
     /// A page of live nodes of one kind, oldest first.
     pub fn list(&self, query: &ListQuery, page: Page) -> Result<Listing<NodeSummary>> {
         let kind = query.kind();
-        let mut bound = params![page.after, page.limit(), kind];
+        let mut bound = params![page.after, kind];
         let sql = match *query {
             ListQuery::Component => {
                 list_sql!("c.status", "JOIN component c ON c.node=n.id", "1")
             }
             ListQuery::Path => list_sql!("p.status", "JOIN path p ON p.node=n.id", "1"),
-            ListQuery::Source => list_sql!("s.status", "JOIN source s ON s.node=n.id", "1"),
+            ListQuery::State { scope } => {
+                bound.extend(params![scope]);
+                list_sql!(
+                    "s.status",
+                    "JOIN state s ON s.node=n.id",
+                    "(?3 IS NULL OR s.scope=?3)"
+                )
+            }
             ListQuery::Finding => list_sql!("NULL", "", "1"),
             ListQuery::Premise { scope, status } => {
                 bound.extend(params![scope, status]);
                 list_sql!(
                     "p.status",
-                    "JOIN premise_state p ON p.node=n.id",
-                    "(?4 IS NULL OR p.scope=?4) AND (?5 IS NULL OR p.status=?5)"
+                    "JOIN premise_standing p ON p.node=n.id",
+                    "(?3 IS NULL OR p.scope=?3) AND (?4 IS NULL OR p.status=?4)"
                 )
             }
             ListQuery::Flaw { status, component } => {
@@ -127,14 +136,13 @@ impl Store {
                 match component {
                     Some(_) => {
                         "SELECT n.id,n.title,f.status FROM flaw x CROSS JOIN node n ON n.id=x.node \
-                         JOIN flaw_state f ON f.node=n.id WHERE x.component=?5 AND x.node>?1 AND \
-                         n.merged_into IS NULL AND (?4 IS NULL OR f.status=?4) ORDER BY x.node \
-                         LIMIT ?2"
+                         JOIN flaw_standing f ON f.node=n.id WHERE x.component=?4 AND x.node>?1 AND \
+                         n.merged_into IS NULL AND (?3 IS NULL OR f.status=?3) ORDER BY x.node"
                     }
                     None => list_sql!(
                         "f.status",
-                        "JOIN flaw_state f ON f.node=n.id",
-                        "(?4 IS NULL OR f.status=?4)"
+                        "JOIN flaw_standing f ON f.node=n.id",
+                        "(?3 IS NULL OR f.status=?3)"
                     ),
                 }
             }
@@ -144,19 +152,19 @@ impl Store {
                     Some(_) => {
                         "SELECT n.id,n.title,s.state FROM candidate_flaw r CROSS JOIN node n ON \
                          n.id=r.candidate JOIN candidate_state s ON s.candidate=n.id WHERE \
-                         r.flaw=?4 AND r.position=0 AND r.candidate>?1 AND n.merged_into IS NULL \
-                         AND (?5 IS NULL OR s.state=?5) ORDER BY r.candidate LIMIT ?2"
+                         r.flaw=?3 AND r.position=0 AND r.candidate>?1 AND n.merged_into IS NULL \
+                         AND (?4 IS NULL OR s.state=?4) ORDER BY r.candidate"
                     }
                     None => list_sql!(
                         "s.state",
                         "JOIN candidate_state s ON s.candidate=n.id",
-                        "(?5 IS NULL OR s.state=?5)"
+                        "(?4 IS NULL OR s.state=?4)"
                     ),
                 }
             }
         };
         self.read(|db| {
-            let items = rows(db, sql, bound, |row| summary(row, kind))?;
+            let items = first_rows(db, sql, bound, page.limit(), |row| summary(row, kind))?;
             Ok(Listing::keyset(items, page))
         })
     }

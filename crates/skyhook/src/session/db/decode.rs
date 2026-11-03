@@ -31,7 +31,7 @@ pub(super) struct Events<'a> {
 impl Events<'_> {
     /// `sql` with `{scope}` replaced by a filter keeping the rows whose `column` names
     /// an entry in scope.
-    pub(super) fn scoped(&self, sql: &str, column: &'static str) -> DbResult<Query> {
+    pub(super) fn scoped(&self, sql: &'static str, column: &'static str) -> DbResult<Query> {
         self.scope.query(sql, Owner::Message(column))
     }
 
@@ -39,7 +39,7 @@ impl Events<'_> {
     /// `{scope}` filters as `column`.
     pub(super) fn load(
         &mut self,
-        sql: &str,
+        sql: &'static str,
         column: &'static str,
         mut event: impl FnMut(&Row) -> DbResult<SessionEvent>,
     ) -> DbResult<()> {
@@ -97,14 +97,14 @@ pub(super) fn job(value: i64) -> DbResult<JobId> {
 
 /// A statement and its parameters; plain text takes none.
 pub(super) struct Query {
-    pub sql: String,
+    pub sql: &'static str,
     pub params: Vec<Value>,
 }
 
-impl From<&str> for Query {
-    fn from(sql: &str) -> Self {
+impl From<&'static str> for Query {
+    fn from(sql: &'static str) -> Self {
         Self {
-            sql: sql.to_owned(),
+            sql,
             params: Vec::new(),
         }
     }

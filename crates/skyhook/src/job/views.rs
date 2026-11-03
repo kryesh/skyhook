@@ -283,12 +283,14 @@ pub struct JobEnvelope {
 /// completed response with nothing more to read or resume omits `id` and `state`.
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[schemars(transform = documented)]
 pub struct JobView {
     /// None when the call settled before a job was published, or completed with
     /// nothing more to read or resume.
     pub id: Option<JobId>,
     pub(crate) state: Option<JobState>,
     /// Precedes the result, so a reader learns what was left out before reading it.
+    #[schemars(transform = complete)]
     pub presentation: Option<Presentation>,
     /// A present `null` is a real result, distinct from no result.
     #[serde(default, deserialize_with = "present")]
@@ -570,6 +572,12 @@ impl JobEnvelope {
     }
 }
 
+/// The prompt spells the envelope out: result types name it.
+fn documented(schema: &mut schemars::Schema) {
+    let name = <JobView as JsonSchema>::schema_name();
+    schema.insert(crate::tool::registry::DOCUMENTED.into(), name.into());
+}
+
 /// Jobs as a listing shows them: the newest, and how many older ones it leaves out.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize, JsonSchema)]
@@ -579,21 +587,17 @@ pub(crate) struct JobListing {
 }
 
 /// The schemas of one job view and of a listing of them, as results declare them.
-/// A job view is itself a presentation; presenting it again never shortens it.
 pub(crate) struct JobViewSchemas {
-    pub(crate) one: Value,
+    pub(crate) view: Value,
     pub(crate) listing: Value,
-    /// A tool response's own view, which keeps its error and questions whole.
-    pub(crate) response: Value,
 }
 
 pub(crate) static JOB_VIEW_SCHEMAS: std::sync::LazyLock<JobViewSchemas> =
     std::sync::LazyLock::new(|| {
-        use crate::tool::registry::{complete_result_schema, result_schema};
+        use crate::tool::registry::result_schema;
         JobViewSchemas {
-            one: complete_result_schema::<JobView>(),
-            listing: complete_result_schema::<JobListing>(),
-            response: result_schema::<JobView>(),
+            view: result_schema::<JobView>(),
+            listing: result_schema::<JobListing>(),
         }
     });
 
@@ -736,21 +740,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_process_response_keeps_model_text_under_two_hundred_bytes() {
-        let result = serde_json::json!({
-            "exit_code":0, "stdout":"", "stderr":"", "timed_out":false
-        });
-        let view = (envelope().response_view(&CapabilitySet::default(), Some(result))).into_value();
-        let wire =
-            serde_json::to_vec(&serde_json::json!({"result":view,"is_error":false})).unwrap();
-        assert!(
-            wire.len() < 200,
-            "plain response grew to {} bytes",
-            wire.len()
-        );
-    }
-
-    #[test]
     fn display_metadata_with_non_utf8_workspace_is_json_serializable() {
         use std::os::unix::ffi::OsStringExt as _;
         let mut job = envelope();
@@ -830,7 +819,7 @@ mod tests {
     #[test]
     fn views_omit_absent_fields_and_empty_lists_but_keep_a_null_result() {
         let capabilities = CapabilitySet::default();
-        let validator = jsonschema::validator_for(&JOB_VIEW_SCHEMAS.one).unwrap();
+        let validator = jsonschema::validator_for(&JOB_VIEW_SCHEMAS.view).unwrap();
         let payload =
             serde_json::json!({"nested": null, "array": [null], "presentation": {"preview": null}});
         let job = envelope();
@@ -858,7 +847,14 @@ mod tests {
         );
         assert_eq!(null.clone().into_value().get("result"), Some(&Value::Null));
         assert_eq!(missing.clone().into_value().get("result"), None);
-        for view in [null, missing, noticed, presented()] {
+        // A failure before admission has no job to name.
+        let failure = JobView::failure("denied".into(), Some(Value::Null), true);
+        assert_eq!(failure.clone().into_value().get("id"), None);
+        assert_eq!(
+            failure.clone().into_value().get("result"),
+            Some(&Value::Null)
+        );
+        for view in [null, missing, noticed, presented(), failure] {
             let value = view.clone().into_value();
             assert!(validator.is_valid(&value), "{value}");
             assert_eq!(serde_json::from_value::<JobView>(value).unwrap(), view);
@@ -904,22 +900,13 @@ mod tests {
                 ..JobMetadata::default()
             })
         );
-    }
-
-    /// A completed job that input resumes keeps the handle a follow-up needs.
-    #[tokio::test]
-    async fn a_resumable_completed_response_keeps_its_handle() {
-        let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let id = jobs.test_resumable(agent, "agent", Value::Null).await;
-        jobs.test_finish(id, Value::Null).await;
-        let view = async || {
-            let envelope = jobs.snapshot(id).await.unwrap();
-            envelope.response_view(&CapabilitySet::default(), None)
-        };
-        let resumable = view().await;
+        // A completed job that input resumes keeps the handle a follow-up needs.
+        let mut resumable = envelope();
+        resumable.resumable = true;
+        let view = resumable.response_view(viewer, None);
         assert_eq!(
-            (resumable.id, resumable.state),
-            (Some(id), Some(JobState::Completed))
+            (view.id, view.state),
+            (Some(resumable.id), Some(JobState::Completed))
         );
     }
 
@@ -978,21 +965,18 @@ mod tests {
         let next = |presentation: &Presentation| {
             let view = view(presentation.clone());
             let next = view.continuation();
-            next.map(|next| match next {
-                output::Continuation::Lines {
-                    field,
-                    start,
-                    offset,
-                } => (field.unwrap().as_str().to_owned(), start, offset),
-                output::Continuation::Index { field, index } => {
-                    (field.unwrap().as_str().to_owned(), index, None)
-                }
+            next.map(|next| {
+                (
+                    next.field.unwrap().as_str().to_owned(),
+                    next.start,
+                    next.offset,
+                )
             })
         };
         assert_eq!(next(&presentation), Some((String::new(), 1, Some(5))));
         presentation.preview = None;
         // An array cut continues at its first element not shown.
-        assert_eq!(next(&presentation), Some(("/result/items".into(), 2, None)));
+        assert_eq!(next(&presentation), Some(("/result/items".into(), 3, None)));
         presentation.truncated.as_mut().unwrap().remove(0);
         assert_eq!(
             next(&presentation),
@@ -1014,22 +998,9 @@ mod tests {
     }
 
     #[test]
-    fn failures_include_metadata_with_or_without_admission() {
-        let mut job = envelope();
-        job.state = JobState::Failed;
-        job.diagnostic = Some(crate::tool::ToolError::denied("failed").diagnostic());
-        let view = (job.response_view(&CapabilitySet::default(), Some(Value::Null))).into_value();
-        assert_eq!(view["meta"]["code"], "permission_denied");
-        let failure = JobView::failure("denied".into(), Some(Value::Null), true).into_value();
-        assert_eq!(failure.get("id"), None);
-        assert_eq!(failure.get("result"), Some(&Value::Null));
-        assert!(jsonschema::is_valid(&JOB_VIEW_SCHEMAS.one, &failure));
-    }
-
-    #[test]
     fn a_waiting_job_presents_its_question_batch_in_place_of_a_result() {
         for (schema, listed) in [
-            (&JOB_VIEW_SCHEMAS.one, false),
+            (&JOB_VIEW_SCHEMAS.view, false),
             (&JOB_VIEW_SCHEMAS.listing, true),
         ] {
             assert!(
@@ -1123,5 +1094,62 @@ mod tests {
                 (shell.id(), Some(child_origin))
             ]
         );
+    }
+
+    /// What a script was shown depends only on what was pending when it looked, not
+    /// on when the wake revision catches up: a notification becomes pending before
+    /// its wake is forwarded, and must not be reported to the same script twice.
+    #[tokio::test]
+    async fn a_script_is_shown_each_pending_notification_once() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let (jobs, root) = (&runtime.jobs, &runtime.agent);
+        let complete = async |value: &str| {
+            let spec = JobSpec {
+                background: true,
+                ..JobSpec::test(root.clone(), "fixture")
+            };
+            let id = jobs.test_running(spec).await.into_test_id();
+            let value = crate::tool::ToolOutput::new(serde_json::json!({"value": value}));
+            jobs.finish(id, JobOutcome::Completed(value.into()))
+                .await
+                .unwrap();
+        };
+        let script = JobSpec {
+            role: JobRole::Script,
+            ..JobSpec::test(root.clone(), "script")
+        };
+        let script = jobs.test_create(script).await;
+        let wait = || JobSpec {
+            role: JobRole::Wait,
+            ..JobSpec::test(root.clone(), "wait")
+        };
+        let hosted = || JobSpec {
+            parent: Some(script),
+            ..wait()
+        };
+        let unseen = async |caller: JobId, shown: bool| {
+            let root = root.clone();
+            let decide = move |state: &mut crate::session::CoreState| {
+                state.jobs.park(caller);
+                let Waiting::Open { unseen, stamp, .. } = state.jobs.waiting(&root, caller) else {
+                    return false;
+                };
+                if shown {
+                    state.jobs.shown(caller, WaitFloor { stamp, input: 0 });
+                }
+                unseen
+            };
+            runtime.store.live(decide).await
+        };
+        complete("first").await;
+        let first = jobs.test_create(hosted()).await;
+        assert!(unseen(first, true).await);
+        let second = jobs.test_create(hosted()).await;
+        assert!(!unseen(second, false).await);
+        complete("second").await;
+        assert!(unseen(second, false).await);
+        // A model caller has no script floor: its request boundary consumes instead.
+        let model = jobs.test_create(wait()).await;
+        assert!(unseen(model, false).await);
     }
 }

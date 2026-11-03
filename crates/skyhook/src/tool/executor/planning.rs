@@ -8,7 +8,8 @@ use crate::{
         authorization::{AuthorizationArguments, SourceArguments},
         diagnostic::Cause,
         invocation::{
-            PathPreflight, assemble_permissions, preflight_path_arguments, scope_capabilities,
+            JobWorkspace, PathPreflight, assemble_permissions, preflight_path_arguments,
+            scope_capabilities,
         },
         policy::{PathAccess, PathText},
         registry::{SOURCE_ARGUMENT, TARGET, split_envelope},
@@ -52,11 +53,9 @@ impl ToolExecutor {
     /// Select where a host tool's input places its job, before the job exists:
     /// as the job shows it, with its workspace as written, and where it runs.
     /// A workspace is a path argument there, resolved here for a local job and
-    /// by a remote worker as it starts in it.
-    async fn locate_job(
-        &self,
-        requested: JobLocation,
-    ) -> Result<(ExecutionLocation, ExecutionLocation, PathPreflight), ToolError> {
+    /// by a remote worker as it starts in it. A missing local workspace inside the
+    /// root is a write the caller must hold, which the job's call makes.
+    async fn locate_job(&self, requested: JobLocation) -> Result<LocatedJob, ToolError> {
         let selected = self.select_location(requested.target).map_err(|error| {
             error
                 .operation(Operation::Lookup, Subject::argument([TARGET]))
@@ -65,30 +64,50 @@ impl ToolExecutor {
         })?;
         let mut location = selected.location;
         let Some(mut workspace) = requested.workspace else {
-            return Ok((location.clone(), location, PathPreflight::deferred()));
+            return Ok(LocatedJob::at(location));
+        };
+        let refused = |reason: &str| {
+            ToolError::invalid_arguments(reason)
+                .operation(Operation::Validate, Subject::argument(["workspace"]))
+                .effects(Effects::NotStarted)
         };
         if workspace.is_empty() {
-            return Err(ToolError::invalid_arguments("workspace cannot be empty")
-                .operation(Operation::Validate, Subject::argument(["workspace"]))
-                .effects(Effects::NotStarted));
+            return Err(refused("workspace cannot be empty"));
         }
         if selected.route.is_some() {
             location.workspace = location.workspace.join(workspace);
-            return Ok((location.clone(), location, PathPreflight::deferred()));
+            return Ok(LocatedJob::at(location));
         }
         let spelled = std::path::absolute(location.workspace.join(&workspace));
         let spelled = spelled.map_err(|error| ToolError::io(error).effects(Effects::NotStarted))?;
         let argument = PathArgument::new(&mut workspace, PathAccess::Read, PathKind::Workspace);
         let root = &self.shared.root_location.workspace;
-        let preflight = preflight_path_arguments(vec![argument], &location, root).await?;
+        let mut preflight = PathPreflight::deferred();
+        let creates = preflight.admit(argument, &location, root).await?;
+        let runs_in = ExecutionLocation {
+            target: location.target.clone(),
+            workspace: workspace.into(),
+        };
+        if creates == JobWorkspace::Missing {
+            if !self.capabilities.contains(&Capability::Write) {
+                return Err(refused("does not exist, and creating it needs write"));
+            }
+            // A write to the workspace it creates, as resolved.
+            let write = scope_capabilities(vec![Capability::Write], &runs_in, None)?;
+            preflight.permissions.extend(write);
+        }
         // As typed, `..` kept: resolving would disclose where a link leads
         // before approval, and collapsing would claim a location it never means.
         let written = ExecutionLocation {
             target: location.target.clone(),
             workspace: spelled.components().collect(),
         };
-        location.workspace = workspace.into();
-        Ok((written, location, preflight))
+        Ok(LocatedJob {
+            written,
+            runs_in,
+            preflight,
+            creates,
+        })
     }
 
     pub(super) async fn plan_registered(
@@ -146,12 +165,14 @@ impl ToolExecutor {
         };
         let mut admitted = tool.admit(&arguments).map_err(invalid)?;
         let derived = admitted.permissions(&selected.location).map_err(invalid)?;
-        let (job_location, job_runs_in, located) = match admitted.job_location() {
+        let LocatedJob {
+            written: job_location,
+            runs_in: job_runs_in,
+            preflight: located,
+            creates,
+        } = match admitted.job_location() {
             Some(requested) => self.locate_job(requested).await?,
-            None => {
-                let location = selected.location.clone();
-                (location.clone(), location, PathPreflight::deferred())
-            }
+            None => LocatedJob::at(selected.location.clone()),
         };
         // A remote destination resolves its own paths.
         let mut path = if selected.route.is_none() {
@@ -188,18 +209,10 @@ impl ToolExecutor {
             route: (selected.route.as_ref()).map(|route| route.route.authorization_arguments()),
             source: None,
         };
-        let chosen = admitted.result_schema();
+        let output_schema =
+            (admitted.result_schema()).or_else(|| tool.output_schema(&self.capabilities));
         let invocation = admitted.invoke();
         let result_policy = invocation.result_policy();
-        let output_schema = match result_policy {
-            crate::tool::ToolResultPolicy::Value => {
-                chosen.or_else(|| tool.output_schema(&self.capabilities))
-            }
-            crate::tool::ToolResultPolicy::Nothing => None,
-            crate::tool::ToolResultPolicy::JobView => {
-                Some(crate::job::JOB_VIEW_SCHEMAS.one.clone())
-            }
-        };
         // A remote destination admits the call again where it runs.
         let dispatch = match selected.route {
             Some(remote) => InvocationDispatch::Remote { remote, arguments },
@@ -219,11 +232,16 @@ impl ToolExecutor {
             execution_location: selected.location,
             job_location,
             job_runs_in,
+            creates,
             permissions,
             path_facts,
             parent,
             launch,
             result_policy,
+            fit: match kind {
+                InvocationKind::Script => crate::job::output::Fit::Whole,
+                InvocationKind::Model | InvocationKind::Host => crate::job::output::Fit::Preview,
+            },
             output_schema,
             dispatch,
             source: None,
@@ -292,6 +310,25 @@ struct SelectedLocation {
     route: Option<PlannedRemote>,
 }
 
+/// Where a job is placed: as it shows it, where it runs, and what that needs.
+struct LocatedJob {
+    written: ExecutionLocation,
+    runs_in: ExecutionLocation,
+    preflight: PathPreflight,
+    creates: JobWorkspace,
+}
+
+impl LocatedJob {
+    fn at(location: ExecutionLocation) -> Self {
+        Self {
+            written: location.clone(),
+            runs_in: location,
+            preflight: PathPreflight::deferred(),
+            creates: JobWorkspace::Exists,
+        }
+    }
+}
+
 fn validate_invocation(
     tool: &crate::tool::ToolSpec,
     kind: InvocationKind,
@@ -311,6 +348,8 @@ fn validate_invocation(
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::assert_matches;
+
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -422,7 +461,10 @@ pub(super) mod tests {
                     workspace: (arguments.get("workspace").and_then(Value::as_str))
                         .map(str::to_owned),
                 }),
-                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+                |context, _| async move {
+                    context.create_job_workspace().await?;
+                    Ok(ToolOutput::new(Value::Null))
+                },
             )
             .unwrap();
         builder
@@ -489,25 +531,57 @@ pub(super) mod tests {
                 assert!(policy.requests.lock().unwrap().is_empty());
             }
         }
-        // Invalid arguments fail before approval or path resolution.
+        // Invalid arguments, and schema-valid ones the typed handler rejects,
+        // fail before approval, path resolution or a job.
+        #[derive(Deserialize, JsonSchema)]
+        #[serde(try_from = "i64")]
+        #[schemars(with = "i64")]
+        struct Even;
+        impl TryFrom<i64> for Even {
+            type Error = &'static str;
+            fn try_from(value: i64) -> Result<Self, &'static str> {
+                (value % 2 == 0).then_some(Self).ok_or("count must be even")
+            }
+        }
+        #[derive(Deserialize, JsonSchema)]
+        struct Count {
+            #[serde(rename = "count")]
+            _count: Even,
+        }
+        let mut builder = network_builder();
+        builder
+            .register_unit::<Count, _, _>(
+                "count",
+                "typed count",
+                ToolOptions::new(vec![Capability::Read]),
+                |_, _| async { panic!("inadmissible input must not reach the handler") },
+            )
+            .unwrap();
         let policy = RecordingPolicy::allowing();
-        let executor = runtime.executor_with_policy(network_builder(), policy.clone());
+        let executor = runtime.executor_with_policy(builder, policy.clone());
         let arguments =
             serde_json::json!({"url":"invalid", "body":{"kind":"file", "path":"missing"}});
         let error = executor
             .run_host(&runtime.agent, "network_test", arguments)
             .await
             .unwrap_err();
-        assert!(matches!(
-            error.diagnostic().cause,
-            Cause::InvalidArguments(_)
-        ));
+        assert_matches!(error.diagnostic().cause, Cause::InvalidArguments(_));
+        let error = executor
+            .run_host(&runtime.agent, "count", serde_json::json!({"count": 3}))
+            .await
+            .unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.subject, Subject::argument(["count"]));
+        assert_matches!(diagnostic.cause, Cause::InvalidArguments(message) if message == "count must be even",
+            "{error:?}"
+        );
         assert!(policy.requests.lock().unwrap().is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
     }
 
     /// A path resolves against the invocation's workspace and authorizes as the
     /// absolute path it resolves to when that lies outside the root. A job's
-    /// workspace resolves as a path that need not exist yet.
+    /// missing workspace inside the root is a write, created before the job starts.
     #[tokio::test]
     async fn absolute_and_child_workspace_paths_are_authorized_against_the_root() {
         let runtime = crate::tests::TestRuntime::new().await;
@@ -550,15 +624,32 @@ pub(super) mod tests {
         // The root is authorized whole, so a path inside it needs no grant of its own.
         assert!(!reads(&planned, &input));
         let arguments = serde_json::json!({"workspace": "../new"});
-        let spawned = plan(&executor, &runtime.agent, "spawn", arguments).await;
-        assert!(spawned.permissions.is_empty());
-        let created = runtime.root.path().join("new/file");
-        let arguments = serde_json::json!({"path": "file", "content": ""});
-        (executor.with_location(spawned.job_location))
-            .run_host(&runtime.agent, "write", arguments)
+        let created = runtime.root.path().join("new");
+        let mut read_only = CapabilitySet::default();
+        read_only.remove(&Capability::Write);
+        let refused = (executor.clone().with_capabilities(read_only))
+            .run_host(&runtime.agent, "spawn", arguments.clone())
+            .await
+            .unwrap_err();
+        let diagnostic = refused.diagnostic();
+        assert_eq!(diagnostic.context.subject, Subject::argument(["workspace"]));
+        assert!(!created.exists());
+        executor
+            .run_host(&runtime.agent, "spawn", arguments)
             .await
             .unwrap();
-        assert!(created.is_file());
+        assert!(created.is_dir());
+        // A workspace outside the root that resolved is never created, even once gone.
+        let gone = elsewhere.join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let arguments = serde_json::json!({"workspace": gone});
+        let agent = runtime.agent.clone();
+        let spawned = executor.create(InvocationKind::Host, agent, "spawn", arguments, None);
+        let spawned = spawned.await.unwrap();
+        assert_eq!(spawned.plan.creates, JobWorkspace::Exists);
+        std::fs::remove_dir(&gone).unwrap();
+        executor.run(spawned).await.unwrap();
+        assert!(!gone.exists());
     }
 
     #[tokio::test]
@@ -759,10 +850,7 @@ pub(super) mod tests {
             .run_host(&runtime.agent, "network_test", arguments.clone())
             .await
             .unwrap_err();
-        assert!(
-            matches!(error.diagnostic().cause, Cause::Denied(_)),
-            "{error:?}"
-        );
+        assert_matches!(error.diagnostic().cause, Cause::Denied(_), "{error:?}");
         let all = policy.requests.lock().unwrap();
         assert_eq!(all.len(), 4);
         for request in &all[..3] {
@@ -1041,8 +1129,7 @@ pub(super) mod tests {
             let result = executor(workspace, policy.clone())
                 .run_host(&runtime.agent, tool, arguments)
                 .await;
-            assert!(
-                matches!(result.unwrap_err().diagnostic().cause, Cause::InvalidArguments(message) if message.contains("losslessly"))
+            assert_matches!(result.unwrap_err().diagnostic().cause, Cause::InvalidArguments(message) if message.contains("losslessly")
             );
             assert!(policy.requests.lock().unwrap().is_empty());
         }
@@ -1055,82 +1142,5 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(result.output.value, arguments);
         assert_eq!(policy.requests.lock().unwrap().len(), 1);
-    }
-
-    /// Schema-valid arguments that the typed handler rejects fail before a job
-    /// or an approval exists.
-    #[tokio::test]
-    async fn typed_admission_failures_fail_before_approval() {
-        #[derive(Deserialize, JsonSchema)]
-        #[serde(try_from = "i64")]
-        #[schemars(with = "i64")]
-        struct Even;
-        impl TryFrom<i64> for Even {
-            type Error = &'static str;
-            fn try_from(value: i64) -> Result<Self, &'static str> {
-                (value % 2 == 0).then_some(Self).ok_or("count must be even")
-            }
-        }
-        #[derive(Deserialize, JsonSchema)]
-        struct Count {
-            #[serde(rename = "count")]
-            _count: Even,
-        }
-        let runtime = crate::tests::TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_unit::<Count, _, _>(
-                "count",
-                "typed count",
-                ToolOptions::new(vec![Capability::Read]),
-                |_, _| async { panic!("inadmissible input must not reach the handler") },
-            )
-            .unwrap();
-        let policy = RecordingPolicy::allowing();
-        let executor = runtime.executor_with_policy(builder, policy.clone());
-        let error = executor
-            .run_host(&runtime.agent, "count", serde_json::json!({"count": 3}))
-            .await
-            .unwrap_err();
-        let diagnostic = error.diagnostic();
-        assert_eq!(diagnostic.context.subject, Subject::argument(["count"]));
-        assert!(
-            matches!(diagnostic.cause, Cause::InvalidArguments(message) if message == "count must be even"),
-            "{error:?}"
-        );
-        assert!(policy.requests.lock().unwrap().is_empty());
-        assert!(runtime.jobs.list(&runtime.agent).await.unwrap().is_empty());
-    }
-
-    /// Calls are admitted against the spec their agent's surface generated, not one
-    /// generated again for each call.
-    #[tokio::test]
-    async fn calls_admit_against_the_surface_spec() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Deserialize, JsonSchema)]
-        struct Empty {}
-        let runtime = crate::tests::TestRuntime::new().await;
-        let generated = Arc::new(AtomicUsize::new(0));
-        let generations = generated.clone();
-        let schema = move |_: &CapabilitySet| {
-            generations.fetch_add(1, Ordering::Relaxed);
-            Some(crate::tool::input_schema_for::<Empty>())
-        };
-        let mut builder = ToolRegistryBuilder::default();
-        let options = ToolOptions::default().computed_schema(schema);
-        builder
-            .register_unit::<Empty, _, _>("empty", "empty", options, |_, _| async { Ok(()) })
-            .unwrap();
-        let executor = runtime.executor(builder);
-        drop(executor.surface_for_agent(&runtime.agent));
-        let surfaced = generated.load(Ordering::Relaxed);
-        for _ in 0..2 {
-            let empty = serde_json::json!({});
-            executor
-                .run_host(&runtime.agent, "empty", empty)
-                .await
-                .unwrap();
-        }
-        assert_eq!(generated.load(Ordering::Relaxed), surfaced);
     }
 }

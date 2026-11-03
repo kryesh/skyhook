@@ -97,27 +97,7 @@ mod tests {
     };
 
     #[test]
-    fn access_programs_are_optional() {
-        let req = request("gpt-6-astra");
-        for cyber in [
-            None,
-            Some(CyberAccessProgram::Standard),
-            Some(CyberAccessProgram::DaybreakRed),
-        ] {
-            let dialect = Dialect {
-                cyber_access_program: cyber,
-                ..Dialect::stateless()
-            };
-            let body = encode(&req, Default::default(), &dialect).unwrap();
-            assert_eq!(
-                body.get("access_programs"),
-                cyber.map(|cyber| json!({"cyber": cyber})).as_ref()
-            );
-        }
-    }
-
-    #[test]
-    fn summary_and_effort_are_placed_by_the_dialect() {
+    fn summary_effort_and_access_programs_are_placed_by_the_dialect() {
         let mut req = request("gpt-5");
         let summarized = Dialect {
             reasoning_summary: Some(ReasoningSummary::Auto),
@@ -137,6 +117,23 @@ mod tests {
         assert_eq!(body["reasoning"], json!({"effort":"low"}));
         req.reasoning = Some("adaptive".into());
         assert!(encode(&req, Default::default(), &silent).is_err());
+        // An access program is sent only where the dialect selects one.
+        req.reasoning = None;
+        for cyber in [
+            None,
+            Some(CyberAccessProgram::Standard),
+            Some(CyberAccessProgram::DaybreakRed),
+        ] {
+            let dialect = Dialect {
+                cyber_access_program: cyber,
+                ..Dialect::stateless()
+            };
+            let body = encode(&req, Default::default(), &dialect).unwrap();
+            assert_eq!(
+                body.get("access_programs"),
+                cyber.map(|cyber| json!({"cyber": cyber})).as_ref()
+            );
+        }
     }
 
     #[test]
@@ -164,11 +161,11 @@ mod tests {
             text: "system".into(),
             cache: false,
         }];
-        req.tools = vec![ToolDefinition {
+        req.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "search".into(),
             description: "Search".into(),
             input_schema: json!({"type":"object"}),
-        }];
+        })];
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
         req.reasoning = Some("high".into());

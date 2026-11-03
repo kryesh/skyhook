@@ -29,6 +29,8 @@ pub(super) struct Entry {
 pub(in crate::session) struct Encoder {
     agents: HashMap<Vec<u32>, i64>,
     targets: HashMap<TargetRef, i64>,
+    /// Tool definitions by the allocation contexts share them in.
+    pub(super) tools: HashMap<super::contract::Shared, i64>,
     /// Each agent's next entry ordinal, seeded from the journal on its first entry.
     ordinals: HashMap<i64, i64>,
 }
@@ -37,6 +39,7 @@ impl Encoder {
     pub(in crate::session) fn reset(&mut self) {
         self.agents.clear();
         self.targets.clear();
+        self.tools.clear();
         self.ordinals.clear();
     }
 
@@ -283,11 +286,11 @@ mod tests {
                 text: "system".into(),
                 cache: true,
             }],
-            tools: vec![ToolDefinition {
+            tools: vec![std::sync::Arc::new(ToolDefinition {
                 name: "read".into(),
                 description: "read a file".into(),
                 input_schema: json!({"type": "object"}),
-            }],
+            })],
             response_schema: None,
         };
         let context = one!(SessionEvent::ModelContext {
@@ -670,8 +673,8 @@ mod tests {
             .collect();
         assert!(
             schemas
-                .windows(2)
-                .all(|pair| std::sync::Arc::ptr_eq(&pair[0], &pair[1]))
+                .array_windows()
+                .all(|[a, b]| std::sync::Arc::ptr_eq(a, b))
         );
         // Per-message decode reads what the whole journal's decode does.
         let committed: Vec<_> = (decoded.iter())

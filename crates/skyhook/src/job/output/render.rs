@@ -465,10 +465,7 @@ fn descend<R: Read>(
             }
             Ok(false)
         }
-        ValueType::Array => {
-            let Some(index) = FieldPointer::array_index(segment) else {
-                return Ok(false);
-            };
+        ValueType::Array if let Some(index) = FieldPointer::array_index(segment) => {
             reader.begin_array().map_err(saved_json)?;
             for _ in 0..index {
                 check_cancelled(cancellation)?;

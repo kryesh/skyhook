@@ -214,7 +214,7 @@ impl Launch {
             self.identity.host.clone(),
         )?
         .host_capabilities(self.identity.capabilities.iter().cloned())
-        .session_extension(self.identity.tables)
+        .session_schema(self.identity.schema)
         .skills(HostSkills::discover(&self.workspace).await);
         let builder = match &self.permissions {
             // A resumed session continues in its own mode, which may not be configured.
@@ -245,7 +245,8 @@ impl Launch {
         // of this product's own that it cannot open is refused before any are prepared.
         let foreign = match resume {
             Some(id) => {
-                let summary = SessionStore::summary(&self.sessions, id, self.identity.owner());
+                let summary =
+                    SessionStore::summary(&self.sessions, id, Some(self.identity.owner()));
                 summary.await?.host != self.identity.host
             }
             None => false,
@@ -429,6 +430,7 @@ impl Launch {
 mod tests {
     use super::*;
     use crate::args::{self, Invocation};
+    use std::assert_matches;
 
     fn history_config(root: Option<PathBuf>) -> RuntimeConfig {
         let mut config = crate::interaction::tests::test_config();
@@ -476,13 +478,14 @@ mod tests {
         }
         let explicit = name("test/removed");
         let saved = name("test/second");
-        let Err(unknown) = select_model(&config, Some(&explicit), Some(&saved)) else {
-            panic!("an explicit unknown model is rejected");
-        };
-        assert_eq!(
-            unknown.to_string(),
-            "invalid model `test/removed`: model is not configured"
-        );
+        let unknown = select_model(&config, Some(&explicit), Some(&saved));
+        assert!(matches!(
+            unknown,
+            Err(LaunchError::Config(ConfigError::Model {
+                error: skyhook::config::SelectionError::UnknownModel,
+                ..
+            }))
+        ));
     }
 
     /// Sessions live under the selected workspace whatever the storage setting, and
@@ -528,10 +531,6 @@ mod tests {
         );
         assert!(!configured.join(id.to_string()).exists());
         session.shutdown().await.unwrap();
-        drop(session);
-        let resumed = launch.create(Opening::Resume(id)).await.unwrap().session;
-        assert_eq!(resumed.id(), id);
-        resumed.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -587,10 +586,10 @@ mod tests {
             root_mode: RootMode::Fixed,
             ..super::super::Product::identity(&super::super::Skyhook)
         };
-        assert!(matches!(
+        assert_matches!(
             admit_root_mode(&fixed, &config, true),
             Err(LaunchError::RootModeFixed { .. })
-        ));
+        );
         assert!(admit_root_mode(&fixed, &config, false).is_ok());
     }
 

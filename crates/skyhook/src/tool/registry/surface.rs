@@ -8,14 +8,13 @@ use std::{
 use serde_json::Value;
 
 use super::{
-    Arguments, CatalogEntry, JobViewResult, OutputValue, ScriptBinding, ScriptManifest,
-    ToolExposure,
+    Arguments, CatalogEntry, OutputValue, ScriptBinding, ScriptManifest, ToolExposure,
     options::{ComputedSchema, SchemaOrigin},
-    schema::{add_background, optional_defaults, sanitize_schema, sanitize_schema_inner},
+    schema::{add_background, normalize_result_schema, optional_defaults, sanitize_schema_inner},
 };
 use crate::tool::{
     AdmissionError,
-    arguments::{argument_validator, schema_argument_failure},
+    arguments::{ArgumentValidator, argument_validator, schema_argument_failure},
     diagnostic::{Operation, Subject},
     executor::InvocationKind,
     invocation::OperationError,
@@ -31,28 +30,11 @@ pub struct ToolSpec {
     pub input_schema: Value,
     /// `input_schema` as declared, before sanitizing, compiled; the only authority on
     /// admission.
-    pub(crate) validator: Arc<jsonschema::Validator>,
+    pub(crate) validator: Arc<ArgumentValidator>,
     /// Handler result, without the background job alternative.
-    pub result_schema: Option<ResultSchema>,
+    pub result_schema: Option<Value>,
     pub exposure: ToolExposure,
     pub script_binding: ScriptBinding,
-}
-
-/// A tool's native result: JSON its schema describes, or job views.
-#[derive(Clone, Debug)]
-pub enum ResultSchema {
-    Json(Value),
-    JobViews(JobViewResult),
-}
-
-impl ResultSchema {
-    pub fn schema(&self) -> &Value {
-        match self {
-            Self::Json(schema) => schema,
-            Self::JobViews(JobViewResult::One) => &crate::job::JOB_VIEW_SCHEMAS.one,
-            Self::JobViews(JobViewResult::Listing) => &crate::job::JOB_VIEW_SCHEMAS.listing,
-        }
-    }
 }
 
 impl ToolSpec {
@@ -66,14 +48,15 @@ impl ToolSpec {
         if !arguments.is_object() {
             return Err(AdmissionError::arguments_must_be_object());
         }
+        let validator = (self.validator.get()).map_err(|reason| {
+            AdmissionError::failed(format!(
+                "the tool's input schema does not compile: {reason}"
+            ))
+        })?;
         if matches!(kind, InvocationKind::Model) {
-            crate::tool::coerce::coerce_arguments(
-                &self.input_schema,
-                &self.validator,
-                &mut arguments,
-            );
+            crate::tool::coerce::coerce_arguments(&self.input_schema, validator, &mut arguments);
         }
-        if let Err(error) = self.validator.validate(&arguments) {
+        if let Err(error) = validator.validate(&arguments) {
             let (path, expectation) =
                 schema_argument_failure(&self.input_schema, &arguments, &error);
             return Err(AdmissionError::invalid_arguments(expectation)
@@ -92,7 +75,6 @@ pub(super) type SchemaGenerator = Arc<dyn Fn(&CapabilitySet) -> Value + Send + S
 pub(super) enum OutputSchema {
     Static(Value),
     Generated(SchemaGenerator),
-    JobViews(JobViewResult),
 }
 
 impl OutputSchema {
@@ -100,7 +82,6 @@ impl OutputSchema {
         match self {
             Self::Static(schema) => schema.clone(),
             Self::Generated(generate) => generate(capabilities),
-            Self::JobViews(views) => ResultSchema::JobViews(*views).schema().clone(),
         }
     }
 }
@@ -116,8 +97,20 @@ pub(super) struct GeneratedToolDefinition {
     pub(super) script_binding: ScriptBinding,
     pub(super) supports_background: bool,
     pub(super) schema_origin: SchemaOrigin,
+    pub(super) compiled: Compiled,
     pub(super) required: BTreeSet<Capability>,
     pub(super) root_required: BTreeSet<Capability>,
+}
+
+/// When a surface compiles a tool's argument schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Compiled {
+    /// A typed schema, compiled at a host's registration or, for a built-in, by test,
+    /// so only a call to the tool compiles it.
+    OnFirstUse,
+    /// An external or computed schema may not compile: the surface compiles it as it
+    /// admits the tool, and withholds the tool when it does not.
+    AsOffered,
 }
 
 /// Which agent a spec is generated for: root-only requirements bind only the root.
@@ -176,21 +169,21 @@ impl<C, O: OutputValue> CatalogEntry<C, O> {
             optional_defaults(&mut input_schema);
         }
         // Admission checks the schema as declared; only what providers see is sanitized.
-        let validator = argument_validator(&input_schema).map_err(Withheld::Invalid)?;
-        let validator = Arc::new(validator);
+        let validator = Arc::new(match definition.compiled {
+            Compiled::OnFirstUse => {
+                ArgumentValidator::Deferred(input_schema.clone(), Default::default())
+            }
+            Compiled::AsOffered => ArgumentValidator::Compiled(
+                argument_validator(&input_schema).map_err(Withheld::Invalid)?,
+            ),
+        });
         sanitize_schema_inner(&mut input_schema, definition.schema_origin);
         // The stored native payload's schema; every presentation wraps it.
-        let result_schema = definition
-            .output_schema
-            .as_ref()
-            .map(|schema| match schema {
-                OutputSchema::JobViews(views) => ResultSchema::JobViews(*views),
-                schema => {
-                    let mut schema = schema.generate(capabilities);
-                    sanitize_schema(&mut schema);
-                    ResultSchema::Json(schema)
-                }
-            });
+        let result_schema = definition.output_schema.as_ref().map(|schema| {
+            let mut schema = schema.generate(capabilities);
+            normalize_result_schema(&mut schema);
+            schema
+        });
         Ok(ToolSpec {
             supports_background: definition.supports_background,
             job_role: self.execution.job_role,
@@ -210,6 +203,9 @@ pub struct ToolSurface {
     pub(super) tools: BTreeMap<String, ToolSpec>,
     /// Every other registered tool, with why it is left out.
     withheld: BTreeMap<String, Withheld>,
+    /// What the model sees of `tools`, once asked for.
+    pub(super) definitions:
+        std::sync::OnceLock<Vec<Arc<crate::provider::protocol::ToolDefinition>>>,
 }
 
 impl ToolSurface {
@@ -227,10 +223,11 @@ impl ToolSurface {
         }
     }
 
+    /// Every registered tool, with its spec or why it is withheld.
     #[cfg(test)]
-    pub(crate) fn result_schemas(&self) -> impl Iterator<Item = (&str, &Value)> {
-        (self.tools.values())
-            .filter_map(|tool| Some((tool.name.as_str(), tool.result_schema.as_ref()?.schema())))
+    pub(crate) fn every(&self) -> impl Iterator<Item = (&str, Result<&ToolSpec, &Withheld>)> {
+        let offered = (self.tools.iter()).map(|(name, spec)| (name.as_str(), Ok(spec)));
+        offered.chain((self.withheld.iter()).map(|(name, why)| (name.as_str(), Err(why))))
     }
 
     pub(crate) fn script_manifests(&self) -> Vec<ScriptManifest> {
@@ -319,6 +316,8 @@ impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::tool::{ToolOptions, ToolRegistryBuilder};
 
@@ -340,9 +339,16 @@ mod tests {
     /// A computed root follows the agent's capabilities: no permitted actions
     /// withdraws the tool, a host capability selects more of the typed actions, and
     /// admission holds arguments to the surfaced schema. A form that does not compile
-    /// is told apart from a withdrawal.
+    /// is told apart from a withdrawal, and a host's typed schema that does not compile
+    /// is refused as it registers.
     #[test]
     fn computed_roots_withdraw_tools_and_bound_admission() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Unmatchable {
+            #[schemars(regex(pattern = "("))]
+            #[serde(rename = "value")]
+            _value: String,
+        }
         let write: Capability = "host.write".parse().unwrap();
         let broken: Capability = "host.broken".parse().unwrap();
         let (host, breaks) = (write.clone(), broken.clone());
@@ -367,19 +373,45 @@ mod tests {
                 }),
                 |_, _| async { Ok(String::new()) },
             )
+            .unwrap()
+            // A computed property is as unproven as a computed root.
+            .register::<Act, String, _, _>(
+                "property",
+                "Capability-gated property",
+                ToolOptions::default().computed_input("extra", move |_| {
+                    Some(serde_json::json!({"type": "string", "pattern": "("}))
+                }),
+                |_, _| async { Ok(String::new()) },
+            )
             .unwrap();
-        let tool = builder.build().get("actions").unwrap();
+        let refused = builder.register::<Unmatchable, String, _, _>(
+            "typed",
+            "Uncompilable typed input",
+            ToolOptions::default(),
+            |_, _| async { Ok(String::new()) },
+        );
         assert!(matches!(
+            refused,
+            Err(crate::tool::RegistryError::Schema(_))
+        ));
+        let registry = builder.build();
+        assert!(registry.get("typed").is_none());
+        assert_matches!(
+            (registry.get("property").unwrap()).spec(&CapabilitySet::empty(), AgentLevel::Root),
+            Err(Withheld::Invalid(_))
+        );
+        let tool = registry.get("actions").unwrap();
+        assert_matches!(
             tool.spec(&CapabilitySet::empty(), AgentLevel::Root),
             Err(Withheld::Withdrawn)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             tool.spec(
                 &[Capability::Read, breaks].into_iter().collect(),
                 AgentLevel::Root
             ),
             Err(Withheld::Invalid(_))
-        ));
+        );
         let spec = tool
             .spec(&[Capability::Read].into_iter().collect(), AgentLevel::Root)
             .unwrap();
@@ -401,9 +433,6 @@ mod tests {
         let refused = |arguments| admit(arguments).unwrap_err().to_string();
         assert!(refused(serde_json::json!({"action":"write"})).contains("expected one of"));
         let extra = refused(serde_json::json!({"action":"read","extra":1}));
-        assert!(
-            extra.contains("additional properties are not allowed") && !extra.contains("extra"),
-            "{extra}"
-        );
+        assert!(extra.contains("property `extra` is not allowed"), "{extra}");
     }
 }

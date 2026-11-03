@@ -6,7 +6,7 @@ use skyhook::{
     agent::{HarnessBuilder, SessionHandle},
     config::{Config, ConfigReport},
     identity::{HostName, SessionId},
-    session::Extension,
+    session::Schema,
     tool::policy::HostCapabilityDeclaration,
 };
 use std::{future::Future, path::Path, pin::Pin, sync::Arc};
@@ -21,9 +21,9 @@ pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Sen
 pub struct Identity {
     /// Tags the sessions this product creates; other hosts' sessions open view-only.
     pub host: HostName,
-    /// Tables this product keeps in every session it creates. One of its sessions
-    /// without them at their format is neither listed nor resumed.
-    pub tables: Option<Extension>,
+    /// The schema of every session this product creates, with any tables of its own.
+    /// One of its sessions without them at their format is neither listed nor resumed.
+    pub schema: Schema,
     pub display_name: &'static str,
     pub about: &'static str,
     /// Shown in an empty conversation before the first message.
@@ -44,9 +44,9 @@ impl Identity {
         self.host.as_str()
     }
 
-    /// The host and tables a session this product created must have to be its own.
-    pub fn owner(&self) -> Option<(&HostName, Extension)> {
-        self.tables.map(|tables| (&self.host, tables))
+    /// The host and schema a session this product created must have to be its own.
+    pub fn owner(&self) -> (&HostName, Schema) {
+        (&self.host, self.schema)
     }
 }
 
@@ -117,7 +117,7 @@ impl Product for Skyhook {
     fn identity(&self) -> Identity {
         Identity {
             host: "skyhook".parse().expect("the host name is nonblank"),
-            tables: None,
+            schema: Schema::JOURNAL,
             display_name: "Skyhook",
             about: "Programmable coding-agent harness",
             placeholder: "Start a conversation, or /sessions to open one.",
@@ -164,7 +164,7 @@ pub enum RootMode {
 /// Shared process configuration, preparing a separate extension for each session.
 ///
 /// A resumed session's resources are its own: tables the product keeps in its sessions
-/// (see [`Identity::tables`]) reach tools through their context and the extension through
+/// (see [`Identity::schema`]) reach tools through their context and the extension through
 /// the session it is handed. The host prepares only this product's own sessions; another
 /// host's session opens view-only with no extension.
 pub trait SessionFactory: Send + Sync + 'static {

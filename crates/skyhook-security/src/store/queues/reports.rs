@@ -22,19 +22,22 @@ macro_rules! finding_pending {
     };
 }
 
-/// Root `$f`'s finding reports its scenarios as they stand: none changed after what its last
-/// write stands on. Only a report write publishes it; evidence on the finding leaves its prose
-/// as old.
+/// Root `$f`'s finding reports its scenarios as they stand: its last write covered the
+/// scenarios its group reports now, and none changed after what that write stands on, its task's
+/// basis or, written outside one, its own event, but for tasks offered other scenarios. Only a
+/// report write publishes it; evidence on the finding leaves its prose as old.
 macro_rules! reported {
     ($f:expr) => {
         concat!(
-            "ifnull((SELECT ",
+            "ifnull((SELECT coalesce(",
             $crate::store::bearing::stamp!("report", "fd.reported", $f),
+            ",fd.reported)>=",
+            $crate::store::bearing::basis!(rested "report", $f),
+            " AND ",
+            $crate::store::bearing::reported_as!("fd.reported", "fd.root"),
             " FROM finding fd WHERE fd.root=",
             $f,
-            ")>=",
-            $crate::store::bearing::basis!("report", $f),
-            ",0)"
+            "),0)"
         )
     };
 }
@@ -55,13 +58,16 @@ macro_rules! current_finding {
 }
 pub(in crate::store) use current_finding;
 
-/// Owed while some scenario of the root's group is reportable and its finding does not report
-/// them as they stand; ready once no member owes finding work that is not exhausted.
+/// Owed while some scenario of the root's group starting within the scope is reportable and its
+/// finding does not report them as they stand; ready once no member owes finding work that is
+/// not exhausted.
 pub(super) const REPORT: Sql = phase_sql!(
     "report",
     "flaw",
     concat!(
-        "EXISTS (SELECT 1 FROM finding_scenario WHERE root=n.id) AND NOT ",
+        "EXISTS (SELECT 1 FROM finding_scenario fx WHERE fx.root=n.id AND NOT ",
+        crate::store::scope::candidate_outside!("fx.candidate"),
+        ") AND NOT ",
         reported!("n.id")
     ),
     concat!(
@@ -71,6 +77,7 @@ pub(super) const REPORT: Sql = phase_sql!(
         ")"
     ),
     "NULL",
+    "NULL",
     "NULL"
 );
 
@@ -79,7 +86,8 @@ mod tests {
     use super::{
         super::{
             super::tests::{
-                HIGH, assess, begun, candidate, fixture, flaw, test, text, validated, verdict,
+                HIGH, assess, begun, candidate, end_job, fixture, flaw, revalidate, test, text,
+                validated, verdict,
             },
             tests::{exhaust, queued},
         },
@@ -112,7 +120,7 @@ mod tests {
             .unwrap();
         let findings = || store.coverage().unwrap().findings;
         assert!(!owed() && current(&store, finding) && findings() == 1);
-        verdict(&store, &actor, id, Verdict::Validated);
+        revalidate(&store, id);
         assert!(
             !owed() && !current(&store, finding) && findings() == 0,
             "a new verdict makes it stale and waits on a test of its own"
@@ -143,8 +151,8 @@ mod tests {
 
         let joined = candidate(&store, &actor, scenario.path, &[root]);
         for member in [id, joined] {
-            assess(&store, &actor, member, HIGH);
-            verdict(&store, &actor, member, Verdict::Validated);
+            assess(&store, member, HIGH);
+            verdict(&store, member, Verdict::Validated);
         }
         test(&store, &actor, joined, TestResult::Confirmed);
         assert!(owed(), "a member joined");
@@ -153,7 +161,7 @@ mod tests {
         assert!(!owed(), "a begin on a member changes nothing");
 
         let (reporter, _, _) = begun(&store, &Begin::Report(vec![root]));
-        verdict(&store, &actor, id, Verdict::Validated);
+        revalidate(&store, id);
         let finding = store
             .report(&reporter, root, &text("overflow"), &text("report"))
             .unwrap();
@@ -161,6 +169,41 @@ mod tests {
             !current(&store, finding),
             "a report stands on the basis its task began at"
         );
+    }
+
+    /// A report covers the scenarios its group reported as it was written: a member whose
+    /// review restates its verdict, reportable again, owes the report a rewrite, with fresh
+    /// tries though nothing its report rests on moved.
+    #[test]
+    fn a_report_is_owed_when_its_reportable_members_change() {
+        let (_session, store, actor) = fixture();
+        let reported = validated(&store, &actor, "decoder");
+        let root = reported.flaw;
+        test(&store, &actor, reported.candidate, TestResult::Confirmed);
+        let member = candidate(&store, &actor, reported.path, &[root]);
+        assess(&store, member, HIGH);
+        verdict(&store, member, Verdict::Validated);
+        let local = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N";
+        assess(&store, member, local);
+        for _ in 0..2 {
+            let (_, job, _) = begun(&store, &Begin::Review(vec![member]));
+            end_job(&store, job);
+        }
+        let offered = || queued(&store, Phase::Report) == [NodeId::from(root)];
+        assert!(offered(), "the report waits on no exhausted review");
+        let (_, job, _) = begun(&store, &Begin::Report(vec![root]));
+        end_job(&store, job);
+        let (reporter, job, _) = begun(&store, &Begin::Report(vec![root]));
+        let finding = store
+            .report(&reporter, root, &text("overflow"), &text("report"))
+            .unwrap();
+        end_job(&store, job);
+        assert!(current(&store, finding), "it covers the one reportable");
+        let proposed = text("proposed");
+        (store.verdict(&actor, member, Verdict::Disproved, &proposed)).unwrap();
+        verdict(&store, member, Verdict::Validated);
+        assert!(!current(&store, finding));
+        assert!(offered(), "a member reportable again gives it fresh tries");
     }
 
     /// A root's report goes stale when a chain takes the root role from it, by a flaw put
@@ -206,13 +249,13 @@ mod tests {
             validated(&store, &actor, "parser"),
         );
         let sibling = candidate(&store, &actor, here.path, &[here.flaw]);
-        assess(&store, &actor, sibling, HIGH);
-        verdict(&store, &actor, sibling, Verdict::Validated);
+        assess(&store, sibling, HIGH);
+        verdict(&store, sibling, Verdict::Validated);
         let finding = report(here.flaw);
         assert!(current(&store, finding));
-        let merge = Merge::Candidate {
-            candidate: here.candidate,
-            into: there.candidate,
+        let merge = Merge {
+            node: here.candidate.into(),
+            into: there.candidate.into(),
             note: text("same"),
         };
         store.merge(&actor, &merge).unwrap();

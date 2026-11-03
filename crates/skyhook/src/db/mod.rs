@@ -12,6 +12,8 @@ use libsql::{Builder, Connection, OpenFlags, Row, Statement, Value};
 use crate::{media::BlobDigest, named_enum::NamedEnum};
 
 pub(crate) mod live;
+#[cfg(test)]
+mod memory;
 mod reads;
 #[cfg(test)]
 pub(crate) use reads::CONNECTIONS;
@@ -174,18 +176,19 @@ pub use params;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenMode {
+    #[cfg(test)]
     Create,
     Open,
     ReadOnly,
-    Memory,
 }
 
-/// What a database holds: its schema, the identity stamped into it, and the
-/// dictionaries [`Db::open`] fills at create and checks at open.
-pub(crate) struct Schema {
-    pub sql: &'static str,
-    pub application_id: i64,
-    pub user_version: i64,
+/// Where [`Db::create`] puts a new database.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Place<'a> {
+    File(&'a Path),
+    /// Held in memory for its process; nothing of it survives.
+    #[cfg(test)]
+    Memory,
 }
 
 /// Whether dictionaries are being filled into a new database or checked in an
@@ -287,7 +290,7 @@ impl Dictionaries<'_> {
 pub struct Db {
     /// Statements of static SQL, prepared once and kept reset between uses. They come
     /// first so that they are finalized before the connection closes.
-    statements: RefCell<HashMap<&'static str, Statement>>,
+    statements: RefCell<HashMap<Kept, Statement>>,
     conn: Connection,
     _database: libsql::Database,
     /// Last, so the file counts as held until the connection has closed it.
@@ -316,6 +319,17 @@ impl From<&'static str> for SqlText {
 impl From<String> for SqlText {
     fn from(sql: String) -> Self {
         Self::Built(sql)
+    }
+}
+
+/// Static SQL by where its text lies, which hashing need not read: the same text at
+/// two places is kept twice, never two texts as one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Kept(usize, usize);
+
+impl Kept {
+    fn of(sql: &'static str) -> Self {
+        Self(sql.as_ptr() as usize, sql.len())
     }
 }
 
@@ -352,29 +366,32 @@ impl Drop for Prepared<'_> {
         if let (Some(sql), Some(statement)) = (self.kept, statement) {
             // A statement stepped but not run to its end holds its snapshot until reset.
             statement.reset();
-            self.db.statements.borrow_mut().insert(sql, statement);
+            self.db
+                .statements
+                .borrow_mut()
+                .insert(Kept::of(sql), statement);
         }
     }
 }
 
-/// Turn off SQLite's allocation statistics for the whole process. Counting every
-/// allocation takes one global mutex, which serialises connections that otherwise read
-/// in parallel; Skyhook reads none of the counts. This also disables SQLite's memory
-/// accounting and its soft and hard heap limits for every other SQLite user in the
-/// process, so it is the host's choice: the library never calls it on its own. SQLite refuses it once
-/// initialised, so call it before the first connection.
-///
-/// # Safety
-/// No other thread may use SQLite while this runs, including any library or embedding
-/// application sharing the same SQLite build: call it at startup, before other threads.
-pub unsafe fn configure_process() {
-    // SAFETY: the caller guarantees that no other thread uses SQLite meanwhile.
-    unsafe {
-        libsql::ffi::sqlite3_config(
-            libsql::ffi::SQLITE_CONFIG_MEMSTATUS,
-            0 as std::os::raw::c_int,
-        );
-    }
+/// Turn off SQLite's allocation statistics for the whole process, before its first
+/// connection. Counting every allocation takes one global mutex, which serialises
+/// connections that otherwise read in parallel; Skyhook reads none of the counts. This
+/// also disables SQLite's memory accounting and heap limits for every other SQLite user
+/// in the process. SQLite refuses it once initialised, which libsql does as it opens the
+/// first database.
+fn configure_process() {
+    static CONFIGURED: std::sync::Once = std::sync::Once::new();
+    CONFIGURED.call_once(|| {
+        // SAFETY: every connection opens through `Db::at`, which this blocks until it
+        // returns, so nothing else uses SQLite meanwhile.
+        unsafe {
+            libsql::ffi::sqlite3_config(
+                libsql::ffi::SQLITE_CONFIG_MEMSTATUS,
+                0 as std::os::raw::c_int,
+            );
+        }
+    });
 }
 
 impl Db {
@@ -382,18 +399,19 @@ impl Db {
     pub(crate) fn connect(path: &Path, mode: OpenMode) -> DbResult<Self> {
         // Registered before SQLite opens the file, so it never becomes live under a
         // handle another in-process opener holds.
-        let held = match mode {
-            OpenMode::Memory => None,
-            _ => Some(live::Held::new(path, BUSY_TIMEOUT)?),
+        let held = live::Held::new(path, BUSY_TIMEOUT)?;
+        let flags = match mode {
+            OpenMode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+            #[cfg(test)]
+            OpenMode::Create => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            OpenMode::Open => OpenFlags::SQLITE_OPEN_READ_WRITE,
         };
-        let builder = match mode {
-            OpenMode::Memory => Builder::new_local(":memory:"),
-            OpenMode::ReadOnly => Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_ONLY),
-            OpenMode::Create => Builder::new_local(path)
-                .flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE),
-            OpenMode::Open => Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_WRITE),
-        };
-        let database = ready(builder.build())?;
+        Self::at(path, flags, Some(held))
+    }
+
+    fn at(path: &Path, flags: OpenFlags, held: Option<live::Held>) -> DbResult<Self> {
+        configure_process();
+        let database = ready(Builder::new_local(path).flags(flags).build())?;
         let conn = database.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(Self {
@@ -404,50 +422,35 @@ impl Db {
         })
     }
 
-    /// Open a database of `schema`. Creating one installs the schema, runs `init`
-    /// with [`Seeding::Fill`] in the same transaction and stamps the identity;
-    /// opening one checks the identity, then runs `init` with [`Seeding::Check`].
-    pub(crate) fn open(
-        path: &Path,
-        mode: OpenMode,
-        schema: &Schema,
-        init: impl FnOnce(&Self, Seeding) -> DbResult<()>,
+    /// A new database at `place` holding `image`, a serialized database, on which
+    /// `init` then runs in one transaction.
+    pub(crate) fn create(
+        place: Place<'_>,
+        image: &'static [u8],
+        init: impl FnOnce(&Self) -> DbResult<()>,
     ) -> DbResult<Self> {
-        let db = Self::connect(path, mode)?;
-        match mode {
-            OpenMode::Create | OpenMode::Memory => {
+        let db = match place {
+            Place::File(path) => {
+                let held = live::Held::new(path, BUSY_TIMEOUT)?;
+                // The mode SQLite creates a database with; `create_new` alone would ask 0666.
+                let mut file = std::os::unix::fs::OpenOptionsExt::mode(
+                    std::fs::OpenOptions::new().write(true).create_new(true),
+                    0o644,
+                )
+                .open(path)?;
+                std::io::Write::write_all(&mut file, image)?;
+                file.sync_all()?;
+                drop(file);
+                let db = Self::at(path, OpenFlags::SQLITE_OPEN_READ_WRITE, Some(held))?;
                 // WAL cannot change inside a transaction; it persists in the file.
                 db.query_row("PRAGMA journal_mode = WAL", Vec::new(), |_| Ok(()))?;
-                db.atomic(|| {
-                    db.batch(schema.sql)?;
-                    init(&db, Seeding::Fill)?;
-                    db.batch(&format!(
-                        "PRAGMA application_id = {}; PRAGMA user_version = {};",
-                        schema.application_id, schema.user_version
-                    ))
-                })?;
+                db
             }
-            OpenMode::Open | OpenMode::ReadOnly => {
-                db.check_version(schema)?;
-                init(&db, Seeding::Check)?;
-            }
-        }
-        Ok(db)
-    }
-
-    pub(crate) fn check_version(&self, schema: &Schema) -> DbResult<()> {
-        let pragma = |name| {
-            self.query_row(format!("PRAGMA {name}"), Vec::new(), |row| {
-                Ok(row.get::<i64>(0)?)
-            })
-            .map(Option::unwrap_or_default)
+            #[cfg(test)]
+            Place::Memory => memory::filled(image)?,
         };
-        let application = pragma("application_id")?;
-        let version = pragma("user_version")?;
-        if application != schema.application_id || version != schema.user_version {
-            return Err(DbError::Unsupported(version));
-        }
-        Ok(())
+        db.atomic(|| init(&db))?;
+        Ok(db)
     }
 
     /// Settings for a connection that writes: foreign keys enforced, temporary tables
@@ -474,7 +477,7 @@ impl Db {
     fn prepare(&self, sql: impl Into<SqlText>) -> DbResult<Prepared<'_>> {
         let (kept, statement) = match sql.into() {
             SqlText::Static(sql) => {
-                let statement = self.statements.borrow_mut().remove(sql);
+                let statement = self.statements.borrow_mut().remove(&Kept::of(sql));
                 let statement = match statement {
                     Some(statement) => statement,
                     None => ready(self.conn.prepare(sql))?,
@@ -524,12 +527,26 @@ impl Db {
         &self,
         sql: impl Into<SqlText>,
         params: Vec<Value>,
+        map: impl FnMut(&Row) -> Result<T, E>,
+    ) -> Result<Vec<T>, E> {
+        self.query_up_to(sql, params, usize::MAX, map)
+    }
+
+    /// The first `limit` rows of `sql`. A page's size is never bound into its SQL as a
+    /// `LIMIT` or `OFFSET`: SQLite recompiles a statement whenever such a value changes.
+    pub fn query_up_to<T, E: From<DbError>>(
+        &self,
+        sql: impl Into<SqlText>,
+        params: Vec<Value>,
+        limit: usize,
         mut map: impl FnMut(&Row) -> Result<T, E>,
     ) -> Result<Vec<T>, E> {
         let statement = self.prepare(sql)?;
         let mut rows = ready(statement.query(params))?;
         let mut values = Vec::new();
-        while let Some(row) = ready(rows.next())? {
+        while values.len() < limit
+            && let Some(row) = ready(rows.next())?
+        {
             values.push(map(&row)?);
         }
         Ok(values)

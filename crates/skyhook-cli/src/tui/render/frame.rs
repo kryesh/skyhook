@@ -945,7 +945,7 @@ mod tests {
     async fn request_headers_stay_outside_the_scrolling_rows() {
         let (_root, mut app, mut model, session) = played_fixture().await;
         let _asked = ask(&session, "question");
-        for index in 0..29 {
+        for index in 0..8 {
             let failing = failing_call(&format!("call-{index}"));
             model.turn().await.end(vec![failing]);
         }
@@ -956,12 +956,12 @@ mod tests {
         for (width, header) in [(140, true), (40, false)] {
             for scroll in [0, 5] {
                 app.scroll_to(Some(scroll));
-                let buffer = draw_sized_buffer(&mut app, width, 25);
+                let buffer = draw_sized_buffer(&mut app, width, 10);
                 let line: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
                 assert_eq!(line.contains("Input (uncached)"), header);
                 assert_eq!(
                     (app.render.content_rect.y, app.render.rows.len()),
-                    (1 + u16::from(header), 30)
+                    (1 + u16::from(header), 9)
                 );
                 let first = app.render.hits.iter().find_map(|(rect, hit)| match hit {
                     Hit::Entry(index, _) => Some((rect.y, *index)),

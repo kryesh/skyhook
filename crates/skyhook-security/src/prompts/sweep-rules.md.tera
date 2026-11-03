@@ -1,61 +1,40 @@
+{% include "security/recording.md" %}
+
 # Sweep rules
 
-Walk the path's steps through the components they enter and record:
+Walk the path's steps through the components they enter, recording what they show. Trace every
+step yourself even where its flaws are recorded, its input states, their trust and how its stages
+combine included.
 
-- each **flaw** at its location and component, its body the invariant involved, how it fails
-  and every possible effect, with its CWE when one fits;
-- the **premises** each flaw needs (`flaw_premise`) and those the path's flow needs to carry
-  input to it (`path_premise`): the state or logic without which the flaw cannot reach
-  unintended state, each one claim at a location;
-- **evidence** at the locations that support or contradict them;
-- a **candidate** whenever flaws chain from this path to an observable vulnerability, listing
-  each action's path in order, the attacker's first, its body naming who performs each.
-
-Code another path's sweep already covered needs no re-deriving: read the flaws recorded on the
-components your steps enter (`research_query` `list` `{kind: "flaw", component}`) and the
-premises they need, link and chain the ones this path reaches, and spend your effort on what is
-specific to it: its input, trust and steps.
+Each stage relies on what earlier ones established: an identity, a canonical form, a decoded
+type, a validated bound. Name what each relies on and check that the value it uses is the one
+that was checked, not a re-read, re-decoded or differently parsed copy, and that nothing between
+them changes it; a mismatch is a flaw at the use, the check its evidence.
 
 Look for memory bounds and lifetimes, integer and type assumptions, what statuses, errors and
 defaults mean, state and ordering, concurrency, failure paths that skip cleanup or progress,
 access checks, input reaching an interpreter or a resource name (a query, command, template,
 file path, URL or deserializer) unencoded or unconfined, how keys, tokens, nonces and signatures
-are made, checked and compared, resource limits, and any other invariant the code relies on. A
-dangerous-looking operation alone is not a flaw, and a check the contract leaves to the caller
-is not a flaw in the callee: a caller that skips it is.
+are made, checked and compared, resource limits, and any other invariant the code relies on.
 
-A status, boolean, error, null or default that decides whether your steps retry, accept,
-authorize, release or stop is a contract. Before your work is done, list every site producing
-each, wrappers mapping a false, 0, null or caught error to it included, and record as evidence
-what it means at each ("returned only when the input ran out"). A site where you cannot rule out
-another meaning (malformed input read as "retry", an error or absence read as success,
-permission or no limit, a swallowed error) is a suspected flaw naming producer, consumer and
-decision. Take a bound from every producer, never the largest valid operation alone, and for
-state carried across attempts record each attempt's bound and progress. When a flaw changes what
-a value means, follow it to every consumer, including a later action reading it from storage:
-each relying on the usual meaning is a flaw that needs the changed meaning, linked as its
-premise or chained after it.
+Before your work is done, record the producers of each contract your steps decide on. A site
+where you cannot rule out another meaning (an error or absence read as success, permission or no
+limit, a swallowed error) is a suspected flaw naming producer, consumer and decision. When a flaw
+changes what a value means, follow it to every consumer, including a later action reading it
+from storage: each relying on the usual meaning is a flaw that needs the changed meaning, linked
+as its premise or chained after it.
 
-An action is guarded by checks on the caller's identity, role or tenant, on ownership of the
-object it names, and on the step its workflow requires. One reachable without a check its policy
-needs, or with a weaker one than another route to that operation (search its callers), is a flaw
-at the action, needing the premise that no other layer, its source's checks included, makes the
-check. Its policy is a premise: a code premise where code or documentation states it, otherwise
-the actor's deployment premise. A value the caller supplies but the server should derive (an
-owner, a role, a price) is attacker-controlled; a request the target makes for a caller (a
-fetched URL, a call with its own credentials) is checked against the caller. Abuse across
-requests (skipping or repeating a step, replaying a token, exceeding a quota, an amount or a
-one-time use) is a candidate with an action per request.
+An action is guarded by checks on the caller's identity, role or tenant, on ownership of the object
+it names, and on the step its workflow requires. One reachable without a check its policy needs, or
+with a weaker one than another route to that operation (search its callers), is a flaw at the
+action, needing the premise that no other layer, its input state's checks included, makes the
+check. Its policy is a premise: a code premise where code or documentation states it, otherwise the
+actor's deployment premise. A value the caller supplies but the server should derive (an owner, a
+role, a price) is attacker-controlled; a request the target makes for a caller (a fetched URL, a
+call with its own credentials) is checked against the caller. Abuse across requests (skipping or
+repeating a step, replaying a token, exceeding a quota, an amount or a one-time use) is a candidate
+with an action per request.
 
-Shared state is also reached by other paths through its components, this path run concurrently,
-and the threads, tasks or signal handlers a component's body names; concurrent access is a flaw
-only where these let two flows reach it. An unsynchronised access another flow can interleave
-with, a lock order it inverts, or a handler re-entering work it interrupted is a flaw at the
-access; a check whose use reaches the state again by name (a path, key or shared value), not
-through what was checked, is a flaw at the use, the check its evidence. Each needs the premise,
-one per state and window and shared by the flaws needing it, that another flow can change the
-state there, naming what could. An unrecorded read of state an attacker-driven flow writes is a
-source to record, trusted as its least-privileged writer, on the path its flow matches or its own.
-
-Correct the path's steps and the components' files and concurrency as you find them. Before
-judging code safe, look for a counterexample, including error, malformed-input and retry paths.
+An unrecorded input a stage takes in is an input state to record with its read on this path.
+Correct the path's steps and accesses and the components' files and concurrency as you find
+them.

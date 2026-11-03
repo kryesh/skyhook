@@ -33,7 +33,8 @@ pub struct ModelRequest {
     /// Whether later requests in this context extend this one.
     #[serde(default)]
     pub history_lifetime: HistoryLifetime,
-    pub tools: Vec<ToolDefinition>,
+    /// Shared with the surface that generated them and the context that recorded them.
+    pub tools: Vec<std::sync::Arc<ToolDefinition>>,
     /// Optional JSON Schema for the final answer; reasoning remains a separate stream.
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: Option<String>,

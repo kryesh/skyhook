@@ -248,23 +248,6 @@ mod tests {
         assert_eq!(input[2]["content"][1]["image_url"], image_url);
     }
 
-    #[test]
-    fn reasoning_from_other_providers_or_models_is_not_replayed() {
-        for (format, model) in [
-            (ReplayFormat::Messages, "gpt-5"),
-            (ReplayFormat::Responses, "other-model"),
-        ] {
-            let mut req = request("gpt-5");
-            let replay = envelope(format, model, reasoning_item(), Binding::Free);
-            let reasoning = AssistantItem::reasoning("r", 0, "private", Some(replay));
-            req.context = entries(vec![Message::Assistant(vec![reasoning])]);
-            assert_eq!(
-                encode(&req, Default::default(), &Dialect::stateless()).unwrap(),
-                Vec::<Value>::new()
-            );
-        }
-    }
-
     /// Unencrypted reasoning goes back until the model encrypts reasoning in the
     /// context, and never where the dialect takes only encrypted reasoning.
     #[test]
@@ -296,38 +279,6 @@ mod tests {
             let input = encode(&req, Default::default(), &dialect).unwrap();
             assert_eq!(input.iter().collect::<Vec<_>>(), expected);
         }
-    }
-
-    #[test]
-    fn encrypted_reasoning_replays_only_to_its_model_beside_tools() {
-        let mut req = request("gpt-5");
-        // No display summary is required for native reasoning to be replayable.
-        let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
-            "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
-            "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
-        let output = vec![completed(vec![native.clone(), call_item()])];
-        let reduced = assemble_with(decoder_for("gpt-5"), output).unwrap();
-        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
-        let items = reduced.items().to_vec();
-        assert_eq!(
-            items[0].reasoning_text().as_deref(),
-            Some("native reasoning text")
-        );
-        req.context = entries(vec![
-            Message::Assistant(items),
-            tool_result("call_1", "search", json!({"found":true}), vec![], false),
-        ]);
-        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
-        assert_eq!(input[0], native);
-        assert_eq!(
-            (&input[1]["type"], &input[2]["type"]),
-            (&json!("function_call"), &json!("function_call_output"))
-        );
-        assert_eq!(input[1]["call_id"], input[2]["call_id"]);
-        // Another model's reasoning stays behind; the call and its output do not.
-        req.model = "gpt-6".parse().unwrap();
-        let wire = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
-        assert_eq!(wire, vec![input[1].clone(), input[2].clone()]);
     }
 
     #[test]
@@ -376,6 +327,36 @@ mod tests {
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");
         assert_eq!(replayed[6]["content"][0]["text"], "thanks");
+        // Encrypted reasoning without a display summary replays only to its model,
+        // beside the call and its output.
+        req = request("gpt-5");
+        // No display summary is required for native reasoning to be replayable.
+        let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
+            "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
+            "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
+        let output = vec![completed(vec![native.clone(), call_item()])];
+        let reduced = assemble_with(decoder_for("gpt-5"), output).unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let items = reduced.items().to_vec();
+        assert_eq!(
+            items[0].reasoning_text().as_deref(),
+            Some("native reasoning text")
+        );
+        req.context = entries(vec![
+            Message::Assistant(items),
+            tool_result("call_1", "search", json!({"found":true}), vec![], false),
+        ]);
+        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
+        assert_eq!(input[0], native);
+        assert_eq!(
+            (&input[1]["type"], &input[2]["type"]),
+            (&json!("function_call"), &json!("function_call_output"))
+        );
+        assert_eq!(input[1]["call_id"], input[2]["call_id"]);
+        // Another model's reasoning stays behind; the call and its output do not.
+        req.model = "gpt-6".parse().unwrap();
+        let wire = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
+        assert_eq!(wire, vec![input[1].clone(), input[2].clone()]);
     }
 
     /// A state in the system role is a developer message; in the user role it joins a
@@ -438,40 +419,6 @@ mod tests {
             Value::Array(array) => array.iter().any(has_checkpoint),
             _ => false,
         }
-    }
-
-    #[test]
-    fn automatic_cache_keeps_the_existing_wire_shape() {
-        use crate::provider::protocol::{StateLifetime::*, state};
-        let mut req = request("gpt-5");
-        req.context = vec![
-            user("stable").into(),
-            state("old", Persisted),
-            answer("checking"),
-            tool_result(
-                "call_1",
-                "search",
-                json!({"failure":"details"}),
-                vec![],
-                true,
-            )
-            .into(),
-            state("now", Current),
-        ];
-        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
-        assert!(!has_checkpoint(&json!(input)));
-        assert_eq!(
-            input[0]["content"],
-            json!([
-                {"type":"input_text", "text":"stable"},
-                {"type":"input_text", "text":"old"}
-            ])
-        );
-        assert_eq!(
-            input[2]["output"],
-            json!(r#"{"result":{"failure":"details"},"is_error":true}"#)
-        );
-        assert_eq!(input[3]["content"][0]["text"], "now");
     }
 
     #[test]
@@ -671,7 +618,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_nonmarkable_and_detached_inputs_have_no_checkpoints() {
+    async fn empty_nonmarkable_detached_and_automatic_inputs_have_no_checkpoints() {
+        use crate::provider::protocol::{StateLifetime::*, state};
         let dialect = explicit(StateRole::User);
         let mut req = request("gpt-5");
         let contexts = [
@@ -701,6 +649,36 @@ mod tests {
         let input = encode(&req, Default::default(), &dialect).unwrap();
         assert!(!has_checkpoint(&json!(input)));
         assert!(input[2]["output"].is_array());
+        // Automatic caching keeps the wire shape it always had.
+        req.history_lifetime = HistoryLifetime::Extends;
+        req.context = vec![
+            user("stable").into(),
+            state("old", Persisted),
+            answer("checking"),
+            tool_result(
+                "call_1",
+                "search",
+                json!({"failure":"details"}),
+                vec![],
+                true,
+            )
+            .into(),
+            state("now", Current),
+        ];
+        let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
+        assert!(!has_checkpoint(&json!(input)));
+        assert_eq!(
+            input[0]["content"],
+            json!([
+                {"type":"input_text", "text":"stable"},
+                {"type":"input_text", "text":"old"}
+            ])
+        );
+        assert_eq!(
+            input[2]["output"],
+            json!(r#"{"result":{"failure":"details"},"is_error":true}"#)
+        );
+        assert_eq!(input[3]["content"][0]["text"], "now");
     }
 
     #[test]

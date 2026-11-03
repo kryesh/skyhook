@@ -426,7 +426,7 @@ mod tests {
     /// blank text block, and the calls. That turn answered nothing, so it must
     /// project no visible text and stay distinct from a real reply.
     #[test]
-    fn whitespace_only_response_projects_no_visible_text() {
+    fn visible_text_is_verbatim_and_blank_text_projects_nothing() {
         for blank in ["", "\n\n", " ", "\t\n ", "\r\n"] {
             let items = vec![
                 AssistantItem::reasoning("thought", 0, "private", None),
@@ -437,12 +437,8 @@ mod tests {
             // The call makes the turn; blank text and reasoning alone would not.
             assert!(!crate::session::Message::Assistant(items).is_content_free());
         }
-    }
-
-    /// Real text is projected byte for byte, including surrounding whitespace and
-    /// block boundaries, so a child reply keeps matching the committed assistant text.
-    #[test]
-    fn substantive_text_is_projected_verbatim_across_blocks() {
+        // Real text is projected byte for byte, including surrounding whitespace and
+        // block boundaries, so a child reply keeps matching the committed assistant text.
         let block = |id: &str, position, text: &str| TextBlock {
             id: BlockId::try_from(id.to_owned()).unwrap(),
             position: Position(position),

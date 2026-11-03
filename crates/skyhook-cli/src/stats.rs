@@ -14,27 +14,26 @@ use skyhook::{
     },
     tool::diagnostic::escape_controls,
 };
-use std::{
-    fmt::Write as _,
-    io::{self, Write},
-    path::Path,
-};
+use std::{fmt::Write as _, io::Write, path::Path};
 
 type Error = Box<dyn std::error::Error>;
 
 /// Sessions a listing summarises at once.
 const CONCURRENT_READS: usize = 4;
 
-pub(super) async fn run(request: StatsRequest, identity: &super::Identity) -> Result<(), Error> {
+pub(super) async fn run(
+    request: StatsRequest,
+    identity: &super::Identity,
+    output: &mut impl Write,
+) -> Result<(), Error> {
     let workspace = tokio::fs::canonicalize(&request.workspace)
         .await
         .map_err(|error| format!("workspace {}: {error}", request.workspace.display()))?;
     let sessions = skyhook::config::workspace_session_root(&workspace);
-    let mut stdout = io::stdout().lock();
     let (session, format) = match request.target {
         StatsTarget::List => {
             let listed = list(&sessions, identity.name()).await?;
-            return Ok(stdout.write_all(listing(&listed).as_bytes())?);
+            return Ok(output.write_all(listing(&listed).as_bytes())?);
         }
         StatsTarget::Session(session, format) => (session, format),
     };
@@ -47,12 +46,12 @@ pub(super) async fn run(request: StatsRequest, identity: &super::Identity) -> Re
             error => error.to_string(),
         })?;
     match format {
-        None => stdout.write_all(tables(&stats, false).as_bytes())?,
-        Some(StatsFormat::Markdown) => stdout.write_all(tables(&stats, true).as_bytes())?,
-        Some(StatsFormat::Tree) => stdout.write_all(tree(&stats).as_bytes())?,
+        None => output.write_all(tables(&stats, false).as_bytes())?,
+        Some(StatsFormat::Markdown) => output.write_all(tables(&stats, true).as_bytes())?,
+        Some(StatsFormat::Tree) => output.write_all(tree(&stats).as_bytes())?,
         Some(StatsFormat::Json) => {
-            serde_json::to_writer(&mut stdout, &stats)?;
-            stdout.write_all(b"\n")?;
+            serde_json::to_writer(&mut *output, &stats)?;
+            output.write_all(b"\n")?;
         }
     }
     Ok(())
@@ -396,5 +395,47 @@ mod tests {
                 "    └── b1",
             ]
         );
+    }
+
+    /// A saved session is reported in every format and listed; a missing one is not found.
+    #[tokio::test]
+    async fn sessions_are_reported_in_every_format_and_listed() {
+        let workspace =
+            crate::headless::tests::Workspace::new(crate::interaction::tests::test_config());
+        let script = workspace.write("run.js", "return 7;");
+        let (result, id) = workspace.batch(&["-s", &script]).await;
+        result.unwrap();
+        let id = id.unwrap();
+        let report = async |target| {
+            let request = StatsRequest {
+                target,
+                workspace: workspace.path(""),
+            };
+            let mut output = Vec::new();
+            let identity = crate::Product::identity(&crate::Skyhook);
+            let result = run(request, &identity, &mut output).await;
+            result.map(|()| String::from_utf8(output).unwrap())
+        };
+        let session = |format| StatsTarget::Session(id, format);
+        let json = report(session(Some(StatsFormat::Json))).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["session"], id.to_string());
+        assert_eq!(json["agents"][0]["model"], "test/first");
+        for (format, heading) in [
+            (None, format!("Session {id}\n")),
+            (Some(StatsFormat::Markdown), format!("# Session {id}\n")),
+            (
+                Some(StatsFormat::Tree),
+                format!("{id} · skyhook\n/ [test/first]"),
+            ),
+        ] {
+            let text = report(session(format)).await.unwrap();
+            assert!(text.starts_with(&heading), "{text}");
+        }
+        let listed = report(StatsTarget::List).await.unwrap();
+        assert!(listed.lines().any(|line| line.starts_with(&id.to_string())));
+        let missing = StatsTarget::Session(SessionId::from_bytes([1; 16]), None);
+        let error = report(missing).await.unwrap_err().to_string();
+        assert!(error.contains("not found"), "{error}");
     }
 }

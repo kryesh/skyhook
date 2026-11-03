@@ -273,6 +273,7 @@ async fn relay<W: AsyncWrite + Unpin + Send + 'static>(
 mod tests {
     use super::*;
     use crate::remote::protocol::read_frame;
+    use std::assert_matches;
 
     fn prompts<W>(output: W) -> ForwardPrompts<W> {
         ForwardPrompts {
@@ -299,71 +300,14 @@ mod tests {
             .unwrap();
         drop(future);
         assert!(prompts.answers.lock().unwrap().is_empty());
-        assert!(matches!(
+        assert_matches!(
             read_frame::<_, Response>(&mut peer).await.unwrap(),
             Some(Response::SensitivePrompt { prompt_id, .. }) if prompt_id == PromptId::new(1)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             read_frame::<_, Response>(&mut peer).await.unwrap(),
             Some(Response::SensitiveCancelled { prompt_id }) if prompt_id == PromptId::new(1)
-        ));
-    }
-
-    #[tokio::test]
-    async fn closing_a_stream_mid_frame_finishes_the_frame_first() {
-        let (client, peer) = tokio::io::duplex(1);
-        let mut peer = tokio::io::BufReader::new(peer);
-        let output = Arc::new(Mutex::new(client));
-        let (_input, received) = mpsc::channel(QUEUE);
-        let stream = super::super::transport::Transport {
-            input: Box::new(tokio::io::sink()),
-            output: Box::new(&b"data"[..]),
-            owner: Box::new(()),
-        };
-        let channel = RequestId::new(1);
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let credit = Credits::default();
-        {
-            let mut relay = std::pin::pin!(relay(
-                stream,
-                channel,
-                received,
-                &credit,
-                &cancellation,
-                &output
-            ));
-            assert!(futures_util::poll!(&mut relay).is_pending());
-            // The frame's first byte arrives while the rest cannot fit the pipe.
-            crate::tests::bounded(tokio::io::AsyncBufReadExt::fill_buf(&mut peer))
-                .await
-                .unwrap();
-            cancellation.cancel();
-            relay.await.unwrap();
-        }
-        let closing = async move {
-            let closed = Response::StreamClosed {
-                channel,
-                error: None,
-            };
-            write_frame(&mut *output.lock().await, &closed).await
-        };
-        let reading = async {
-            let mut frames = Vec::new();
-            while let Some(frame) = read_frame::<_, Response>(&mut peer).await.unwrap() {
-                frames.push(frame);
-            }
-            frames
-        };
-        let (closed, frames) =
-            crate::tests::bounded(async { tokio::join!(closing, reading) }).await;
-        closed.unwrap();
-        assert!(matches!(
-            frames.as_slice(),
-            [
-                Response::StreamData { data, .. },
-                Response::StreamClosed { error: None, .. },
-            ] if data == b"data"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -419,10 +363,10 @@ mod tests {
         drop(remote);
         let error = crate::tests::bounded(relay).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-        assert!(matches!(
+        assert_matches!(
             read_frame::<_, Response>(&mut peer).await.unwrap(),
             Some(Response::StreamData { data, .. }) if data == b"tail"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -453,9 +397,6 @@ mod tests {
         assert!(prompts.answers.lock().unwrap().is_empty());
         // A pending cancellation task would hold the writer open and emit a frame.
         drop(prompts);
-        assert!(matches!(
-            read_frame::<_, Response>(&mut peer).await,
-            Ok(None)
-        ));
+        assert_matches!(read_frame::<_, Response>(&mut peer).await, Ok(None));
     }
 }

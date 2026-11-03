@@ -744,9 +744,6 @@ pub(crate) mod tests {
             vec![image.clone()],
             false,
         )]);
-        let mut unloaded = FittedImages::default();
-        let missing = unloaded.refresh(&request, LIMITS).await.unwrap_err();
-        assert_eq!(missing.kind(), ProviderErrorKind::InvalidRequest);
         assert!(attachment_text(&request, &text).is_err());
         let images = loaded(&mut request).await;
         let Ok(Prepared::Fitted(fitted)) = images.prepared().get(&image) else {

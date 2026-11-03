@@ -1,8 +1,7 @@
 //! What the orchestrator's scheduler starts next: the offered queue entries in pipeline
 //! order, leaving out what is running, what running work holds back, later-stage work a ready
-//! earlier-stage premise or flaw holds back, and the tests it may not start yet, a page at a
-//! time. Premises and flaws come with the ready entries of their phase sharing a node with
-//! them, which go to one agent.
+//! earlier-stage bundled entry holds back, and the tests it may not start yet, a page at a
+//! time. A bundled entry comes with the ready entries of its bundle, which go to one agent.
 
 use std::collections::BTreeSet;
 
@@ -134,8 +133,8 @@ impl Store {
     /// queues offer (no live task, not exhausted, counting `spent` work exhausted while owed at
     /// its basis), none of `running` (launched, perhaps not yet begun) or held back by it or by
     /// live tasks, nothing a ready earlier-stage bundled entry touches, and no test beyond what
-    /// `live` admits. A premise or flaw carries every other such entry of its phase sharing a
-    /// node with it, and what one page starts holds back the rest of it as running work would.
+    /// `live` admits. A bundled entry carries every other such entry of its bundle, and what one
+    /// page starts holds back the rest of it as running work would.
     /// Reading reserves nothing.
     pub fn startable(
         &self,
@@ -154,11 +153,18 @@ impl Store {
         let wanted = u64::from(limit) as usize;
         let spent = &queues::Spent::of(spent)?;
         self.read(|db| {
+            let mut owing = Vec::new();
+            for &phase in &phases {
+                if queues::owes(db, phase, spent)? {
+                    owing.push(phase);
+                }
+            }
             let policy = runs::run(db)?.live;
             let mut busy = Work::running(db, &queues::live_subjects(db)?, running)?;
             let (mut items, mut held) = (Vec::new(), false);
-            for &phase in phases.iter().skip(first.unwrap_or(phases.len())) {
-                let earlier: Vec<Phase> = (phases.iter().copied())
+            let passed = &phases[..first.unwrap_or(phases.len())];
+            for &phase in owing.iter().filter(|phase| !passed.contains(phase)) {
+                let earlier: Vec<Phase> = (owing.iter().copied())
                     .filter(|earlier| earlier.bundled() && earlier.stage() < phase.stage())
                     .collect();
                 // Tests are paged whole: the ones `live` admits may lie far behind the rest.
@@ -174,12 +180,10 @@ impl Store {
                 );
                 loop {
                     let listing = queues::page(db, phase, page, spent)?;
-                    let touched = touched(db, &listing, &earlier, spent)?;
+                    let touched = touched(db, &listing.items, &earlier, spent)?;
                     for entry in listing.items {
                         let key = entry.key();
-                        if busy.iter().any(|work| work.holds(phase, &entry))
-                            || entry.about.iter().any(|about| touched.contains(about))
-                        {
+                        if waits(phase, &entry, &busy, &touched) {
                             continue;
                         }
                         if phase == Phase::Test && !live.admits(policy, &entry) {
@@ -187,7 +191,7 @@ impl Store {
                             continue;
                         }
                         let bundle = match phase.bundled() {
-                            true => partners(db, phase, &entry, &busy, spent)?,
+                            true => partners(db, phase, &entry, &busy, &earlier, spent)?,
                             false => Vec::new(),
                         };
                         busy.push(Work::of(phase, &entry));
@@ -220,15 +224,21 @@ impl Store {
     }
 }
 
-/// The nodes of `listing`'s entries that a ready entry of the `earlier` bundled phases is
-/// about.
+/// Whether `entry` of `phase` waits: running work holds it, or a ready earlier-stage bundled
+/// entry is about a node it is about, one of `touched`.
+fn waits(phase: Phase, entry: &QueueEntry, busy: &[Work], touched: &BTreeSet<NodeId>) -> bool {
+    busy.iter().any(|work| work.holds(phase, entry))
+        || entry.about.iter().any(|about| touched.contains(about))
+}
+
+/// The nodes of `entries` that a ready entry of the `earlier` bundled phases is about.
 fn touched(
     db: &Db,
-    listing: &Listing<QueueEntry>,
+    entries: &[QueueEntry],
     earlier: &[Phase],
     spent: &queues::Spent,
 ) -> Result<BTreeSet<NodeId>> {
-    let nodes: BTreeSet<NodeId> = (listing.items.iter())
+    let nodes: BTreeSet<NodeId> = (entries.iter())
         .flat_map(|entry| entry.about.iter().copied())
         .collect();
     let mut touched = BTreeSet::new();
@@ -249,19 +259,19 @@ fn touched(
     Ok(touched)
 }
 
-/// The other ready entries of `phase` sharing a node with `head` that nothing holds back, in
-/// key order.
+/// The other ready entries of `head`'s bundle that nothing holds back, in key order.
 fn partners(
     db: &Db,
     phase: Phase,
     head: &QueueEntry,
     busy: &[Work],
+    earlier: &[Phase],
     spent: &queues::Spent,
 ) -> Result<Vec<QueueEntry>> {
-    Ok((queues::naming(db, phase, &head.about, spent)?.into_iter())
-        .filter(|entry| {
-            entry.node != head.node && !busy.iter().any(|work| work.holds(phase, entry))
-        })
+    let bundle = queues::bundle(db, phase, head.node, spent)?;
+    let touched = touched(db, &bundle, earlier, spent)?;
+    Ok((bundle.into_iter())
+        .filter(|entry| entry.node != head.node && !waits(phase, entry, busy, &touched))
         .collect())
 }
 
@@ -271,8 +281,9 @@ mod tests {
         super::{
             queues::tests::queued,
             tests::{
-                HIGH, assess, begun, component, fixture, operation, path_from, premise, scenario,
-                serve, sweep, test, text, validated, verdict,
+                HIGH, access, assess, begun, candidate, check, component, decide, end_job, fixture,
+                fixture_under, flaw, location, operation, path, path_from, premise, revalidate,
+                scenario, serve, state, sweep, test, text, validated, verdict,
             },
         },
         *,
@@ -286,7 +297,7 @@ mod tests {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         sweep(&store, scenario.path);
-        assess(&store, &actor, scenario.candidate, HIGH);
+        assess(&store, scenario.candidate, HIGH);
         let premises = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
         let links = premises.map(|premise| Link::FlawPremise {
             flaw: scenario.flaw,
@@ -308,16 +319,222 @@ mod tests {
         assert_eq!(started(&[]), [(first, vec![second])]);
         assert!(started(&[first]).is_empty());
         for premise in premises {
-            let holds = StatusChange::Premise(premise, PremiseStatus::Holds);
-            store.set_status(&actor, holds, &text("checked")).unwrap();
+            decide(&store, premise, PremiseStatus::Holds);
         }
         assert_eq!(started(&[]), [(scenario.candidate.into(), Vec::new())]);
     }
 
-    /// A live task's subject merged away is still worked, as the node it was merged into: that
-    /// node is not offered, and it holds back what shares a node with it.
+    /// The heads `startable` offers in `phase`, each with its bundle.
+    fn bundles(store: &Store, phase: Phase) -> Vec<(NodeId, Vec<NodeId>)> {
+        let page = store
+            .startable(&[], &[], &Live::default(), None, Bounded::new::<10>())
+            .unwrap();
+        (page.items.into_iter())
+            .filter(|item| item.phase == phase)
+            .map(|item| {
+                let bundle = item.bundle.iter().map(|entry| entry.node).collect();
+                (item.entry.node, bundle)
+            })
+            .collect()
+    }
+
+    /// Flaws go to chaining and premises to settling with the rest of their first path's: a
+    /// flaw on a stage two paths share goes with the lower path, and the other path's own work
+    /// starts on its own. A premise's sub-claims, at any remove, go with it, by its first path.
     #[test]
-    fn a_live_task_works_the_node_its_subject_was_merged_into() {
+    fn premises_and_flaws_bundle_by_their_first_path() {
+        let (_session, store, actor) = fixture();
+        let [a, b, c] = ["a", "b", "c"].map(|name| component(&store, &actor, name));
+        let (first, second) = (
+            path(&store, &actor, "p1", &[a, b]),
+            path(&store, &actor, "p2", &[b, c]),
+        );
+        for path in [first, second] {
+            sweep(&store, path);
+        }
+        let [on_a, shared, on_c] = [a, b, c].map(|component| flaw(&store, &actor, component));
+        let [sub, relied, needed, later, deeper] =
+            [(); 5].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let links = [
+            Link::PathPremise {
+                path: first,
+                premise: relied,
+            },
+            Link::FlawPremise {
+                flaw: on_a,
+                premise: needed,
+            },
+            Link::FlawPremise {
+                flaw: on_c,
+                premise: later,
+            },
+            Link::PremiseBasis {
+                premise: relied,
+                rests_on: sub,
+            },
+            Link::PremiseBasis {
+                premise: sub,
+                rests_on: deeper,
+            },
+        ];
+        store.link(&actor, &links).unwrap();
+        assert_eq!(
+            bundles(&store, Phase::Settle),
+            [
+                (
+                    sub.into(),
+                    vec![relied.into(), needed.into(), deeper.into()]
+                ),
+                (later.into(), Vec::new())
+            ]
+        );
+        for premise in [sub, relied, needed, later, deeper] {
+            decide(&store, premise, PremiseStatus::Holds);
+        }
+        assert_eq!(
+            bundles(&store, Phase::Chain),
+            [
+                (on_a.into(), vec![shared.into()]),
+                (on_c.into(), Vec::new())
+            ]
+        );
+    }
+
+    /// Paths go to sweeping with every other keyed on the state each keys on, the handed state
+    /// it accesses that the most paths access, else such an instance state: a path accessing a
+    /// lower instance state, or a lower handed state only it accesses, goes with the other
+    /// readers of the shared handed state it reads, never joined through the instance state. A
+    /// path accessing none goes alone. Checks are offered alone, once the sweeps are done.
+    #[test]
+    fn sweeps_bundle_by_their_key_state() {
+        let (_session, store, actor) = fixture();
+        let decoder = component(&store, &actor, "decoder");
+        let [first, shared, second, apart] = ["first", "shared", "second", "apart"]
+            .map(|name| path(&store, &actor, name, &[decoder]));
+        let [window, token, carry, ring] = [
+            NewState::Instance,
+            NewState::Handed,
+            NewState::Handed,
+            NewState::Instance,
+        ]
+        .map(|scope| state(&store, &actor, scope));
+        let at = location("decoder/lib.c", 9);
+        let accesses = [
+            access(first, window, Access::Write, at.clone()),
+            access(shared, window, Access::Read, at.clone()),
+            access(shared, token, Access::Read, at.clone()),
+            access(shared, carry, Access::Read, at.clone()),
+            access(second, carry, Access::Read, at.clone()),
+            access(second, ring, Access::Write, at.clone()),
+            access(shared, ring, Access::Read, at),
+        ];
+        store.link(&actor, &accesses).unwrap();
+        let started = || {
+            let page = store
+                .startable(&[], &[], &Live::default(), None, Bounded::new::<10>())
+                .unwrap();
+            (page.items.into_iter())
+                .map(|item| {
+                    let bundle = item.bundle.iter().map(|entry| entry.node).collect();
+                    (item.phase, item.entry.node, bundle)
+                })
+                .collect::<Vec<(Phase, NodeId, Vec<NodeId>)>>()
+        };
+        let [first, shared, second, apart] = [first, shared, second, apart].map(NodeId::from);
+        let [window, token, carry, ring] = [window, token, carry, ring].map(NodeId::from);
+        assert_eq!(
+            started(),
+            [
+                (Phase::Sweep, first, vec![]),
+                (Phase::Sweep, shared, vec![second]),
+                (Phase::Sweep, apart, vec![]),
+            ]
+        );
+        for path in [first, shared, second, apart] {
+            sweep(&store, PathId(path.0));
+        }
+        assert_eq!(
+            started(),
+            [
+                (Phase::Check, window, vec![]),
+                (Phase::Check, token, vec![]),
+                (Phase::Check, carry, vec![]),
+                (Phase::Check, ring, vec![]),
+            ]
+        );
+    }
+
+    /// Candidates go to review with the rest of their root group, not with another root's
+    /// candidate that only shares a flaw, which waits for the group it shares it with. A
+    /// candidate whose flaw owes a ready chain waits for it as its group's partner too, from any
+    /// page: its group's review starts without it.
+    #[test]
+    fn reviews_bundle_by_root_group() {
+        let (_session, store, actor) = fixture();
+        let (first, other) = (
+            scenario(&store, &actor, "decoder"),
+            scenario(&store, &actor, "parser"),
+        );
+        let next = flaw(&store, &actor, first.component);
+        let variant = candidate(&store, &actor, first.path, &[first.flaw, next]);
+        let crossing = candidate(&store, &actor, other.path, &[other.flaw, first.flaw]);
+        let window = state(&store, &actor, NewState::Instance);
+        let write = access(
+            first.path,
+            window,
+            Access::Write,
+            location("decoder/lib.c", 3),
+        );
+        store.link(&actor, &[write]).unwrap();
+        for path in [first.path, other.path] {
+            sweep(&store, path);
+        }
+        check(&store, window);
+        for candidate in [first.candidate, other.candidate, variant, crossing] {
+            assess(&store, candidate, HIGH);
+        }
+        assert_eq!(
+            bundles(&store, Phase::Review),
+            [
+                (first.candidate.into(), vec![variant.into()]),
+                (other.candidate.into(), Vec::new())
+            ]
+        );
+        let wrong = Link::FlawState {
+            flaw: next,
+            state: window,
+        };
+        store.link(&actor, &[wrong]).unwrap();
+        let started = |after| {
+            let page = store
+                .startable(&[], &[], &Live::default(), after, Bounded::new::<10>())
+                .unwrap();
+            (page.items.into_iter())
+                .map(|item| {
+                    let bundle = item.bundle.iter().map(|entry| entry.node).collect();
+                    (item.phase, item.entry.node, bundle)
+                })
+                .collect::<Vec<(Phase, NodeId, Vec<NodeId>)>>()
+        };
+        let reviews = [first.candidate, other.candidate]
+            .map(|candidate| (Phase::Review, candidate.into(), Vec::new()));
+        let chain = (Phase::Chain, next.into(), Vec::new());
+        assert_eq!(
+            started(None),
+            [chain, reviews[0].clone(), reviews[1].clone()]
+        );
+        let after = Cursor {
+            phase: Phase::Review,
+            after: 0,
+        };
+        assert_eq!(started(Some(after)), reviews);
+    }
+
+    /// Work on a subject merged away is worked as the node it was merged into: a live task's
+    /// leaves that node unoffered and holds back what shares a node with it, and so does work
+    /// the scheduler launched before its child began.
+    #[test]
+    fn running_work_holds_the_node_its_subject_was_merged_into() {
         let (_session, store, actor) = fixture();
         let (merged, kept) = (scenario(&store, &actor, "a"), scenario(&store, &actor, "b"));
         for path in [merged.path, kept.path] {
@@ -329,107 +546,152 @@ mod tests {
             premise: code,
         };
         store.link(&actor, &[link]).unwrap();
-        begun(&store, &Begin::Assess(vec![merged.candidate]));
-        let merge = Merge::Candidate {
-            candidate: merged.candidate,
-            into: kept.candidate,
+        let (_, job, _) = begun(&store, &Begin::Assess(vec![merged.candidate]));
+        let merge = Merge {
+            node: merged.candidate.into(),
+            into: kept.candidate.into(),
             note: text("same"),
         };
         store.merge(&actor, &merge).unwrap();
         assert!(queued(&store, Phase::Assess).is_empty());
-        let page =
-            (store.startable(&[], &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
-        assert_eq!(
+        let started = |running: &[NodeId]| {
+            let page =
+                (store.startable(running, &[], &Live::default(), None, Bounded::new::<10>()))
+                    .unwrap();
             (page.items.iter())
                 .map(|item| (item.phase, item.entry.node))
-                .collect::<Vec<_>>(),
-            [(Phase::Chain, merged.flaw.into())],
+                .collect::<Vec<_>>()
+        };
+        let unchained = [(Phase::Chain, merged.flaw.into())];
+        assert_eq!(
+            started(&[]),
+            unchained,
             "only the flaw the merge left unchained starts"
         );
+        end_job(&store, job);
+        assert_eq!(started(&[merged.candidate.into()]), unchained, "launched");
     }
 
-    /// Work the scheduler launched on a node merged away before its child began holds the node
-    /// it was merged into.
+    /// A test starts as the launch's live policy admits it. Under `ask` it waits, held, for the
+    /// user's approval, and the store passes over the held tests to an approved one. An unblock
+    /// admits only the pending test it names: a resumption that records another pending test
+    /// waits for an answer of its own, and a pending test of a replaced verdict is not resumed:
+    /// the new verdict owes a test of its own. A probe starts beside admitted tests.
     #[test]
-    fn launched_work_holds_the_node_its_subject_was_merged_into() {
-        let (_session, store, actor) = fixture();
-        let (merged, kept) = (scenario(&store, &actor, "a"), scenario(&store, &actor, "b"));
-        for path in [merged.path, kept.path] {
-            sweep(&store, path);
-        }
-        let merge = Merge::Candidate {
-            candidate: merged.candidate,
-            into: kept.candidate,
-            note: text("same"),
-        };
-        store.merge(&actor, &merge).unwrap();
-        let running = [merged.candidate.into()];
-        let page =
-            (store.startable(&running, &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
-        assert!(
-            !(page.items.iter()).any(|item| item.entry.node == kept.candidate.into()),
-            "{:?}",
-            page.items
-        );
-    }
-
-    /// An unblock admits only the pending test it names: a resumption that records another
-    /// pending test waits for an answer of its own. A pending test of a replaced verdict is not
-    /// resumed: the new verdict owes a test of its own.
-    #[test]
-    fn an_unblock_admits_only_the_pending_test_it_answers() {
-        let (_session, store, actor) = fixture();
+    fn tests_start_as_the_live_policy_admits_them() {
+        let (_session, store, actor) = fixture_under(LivePolicy::Ask);
         let scenario = validated(&store, &actor, "decoder");
         sweep(&store, scenario.path);
         let id = scenario.candidate;
-        let first = test(&store, &actor, id, TestResult::Pending);
-        let started = |unblocked: &[TestId]| {
-            let tests = Live {
-                approved: Vec::new(),
+        let started = |approved: &[CandidateId], unblocked: &[TestId], limit| {
+            let live = Live {
+                approved: approved.to_vec(),
                 unblocked: unblocked.to_vec(),
             };
-            let page = (store.startable(&[], &[], &tests, None, Bounded::new::<10>())).unwrap();
-            let entries = page
-                .items
-                .iter()
-                .map(|item| (item.entry.node, item.entry.pending));
+            let page = (store.startable(&[], &[], &live, None, limit)).unwrap();
+            let entries =
+                (page.items.iter()).map(|item| (item.phase, item.entry.node, item.entry.pending));
             (entries.collect::<Vec<_>>(), page.held)
         };
-        assert_eq!(started(&[]), (Vec::new(), true));
-        assert_eq!(started(&[first]), (vec![(id.into(), Some(first))], false));
+        let one = Bounded::new::<1>();
+        assert_eq!(started(&[], &[], one), (Vec::new(), true));
+        let first = test(&store, &actor, id, TestResult::Pending);
+        assert_eq!(started(&[id], &[], one), (Vec::new(), true));
+        assert_eq!(
+            started(&[], &[first], one),
+            (vec![(Phase::Test, id.into(), Some(first))], false)
+        );
         test(&store, &actor, id, TestResult::Pending);
         assert_eq!(
-            started(&[first]),
+            started(&[], &[first], one),
             (Vec::new(), true),
             "a new pending test waits"
         );
-        verdict(&store, &actor, id, Verdict::Validated);
-        assert_eq!(started(&[]), (vec![(id.into(), None)], false));
-    }
+        revalidate(&store, id);
+        let owed = (Phase::Test, id.into(), None);
+        assert_eq!(started(&[id], &[], one), (vec![owed], false));
 
-    /// A probe and a test the launch's policy admits start together, with nothing held.
-    #[test]
-    fn probes_and_admitted_tests_start_without_waiting() {
-        let (_session, store, actor) = fixture();
-        let scenario = validated(&store, &actor, "decoder");
-        sweep(&store, scenario.path);
+        let [held, approved] = ["parser", "lexer"].map(|name| validated(&store, &actor, name));
+        for scenario in [held, approved] {
+            sweep(&store, scenario.path);
+        }
+        let approved = approved.candidate;
+        assert_eq!(
+            started(&[approved], &[], one),
+            (vec![(Phase::Test, approved.into(), None)], true)
+        );
+
         let gateway = component(&store, &actor, "gateway");
         let probe = path_from(&store, &actor, "api", &[gateway], operation("gateway-api"));
         serve(&store, &actor, &["gateway-api"]).unwrap();
-        let page =
-            (store.startable(&[], &[], &Live::default(), None, Bounded::new::<10>())).unwrap();
-        let items: Vec<_> = (page.items.iter())
-            .map(|item| (item.phase, item.entry.node))
-            .collect();
         assert_eq!(
-            (items, page.held),
+            started(&[id, held.candidate, approved], &[], Bounded::new::<10>()),
             (
                 vec![
-                    (Phase::Probe, probe.into()),
-                    (Phase::Test, scenario.candidate.into())
+                    (Phase::Probe, probe.into(), None),
+                    owed,
+                    (Phase::Test, held.candidate.into(), None),
+                    (Phase::Test, approved.into(), None),
                 ],
                 false
             )
         );
+    }
+
+    /// A test spent on children that never began is exhausted for the run though no task of it
+    /// exists, and holds back nothing: its root group's next test starts, beside another root's,
+    /// and each root's report once its group's tests are spent.
+    #[test]
+    fn a_spent_test_releases_its_root_group() {
+        let (_session, store, actor) = fixture();
+        let first = validated(&store, &actor, "decoder");
+        let sibling = candidate(&store, &actor, first.path, &[first.flaw]);
+        assess(&store, sibling, HIGH);
+        verdict(&store, sibling, Verdict::Validated);
+        let other = validated(&store, &actor, "parser");
+        for path in [first.path, other.path] {
+            sweep(&store, path);
+        }
+        let started = |spent: &[SpentWork]| {
+            let page = (store.startable(&[], spent, &Live::default(), None, Bounded::new::<10>()))
+                .unwrap();
+            assert!(!page.held);
+            (page.items.into_iter())
+                .map(|item| SpentWork {
+                    phase: item.phase,
+                    node: item.entry.node,
+                    basis: item.entry.basis,
+                })
+                .collect::<Vec<_>>()
+        };
+        let nodes = |work: &[SpentWork]| -> Vec<(Phase, NodeId)> {
+            work.iter().map(|work| (work.phase, work.node)).collect()
+        };
+        let [lead, beside] = started(&[])[..] else {
+            panic!("each root group's lead test starts")
+        };
+        assert_eq!(
+            nodes(&[lead, beside]),
+            [first.candidate, other.candidate].map(|test| (Phase::Test, test.into()))
+        );
+        let [next, _] = started(&[lead])[..] else {
+            panic!("the spent lead releases its group's next test")
+        };
+        assert_eq!(nodes(&[next]), [(Phase::Test, sibling.into())]);
+        let spent = [lead, next, beside];
+        assert_eq!(
+            nodes(&started(&spent)),
+            [first.flaw, other.flaw].map(|flaw| (Phase::Report, flaw.into()))
+        );
+        let exhausted = store.synthesis(&spent).unwrap().exhausted;
+        let mut exhausted: Vec<_> = (exhausted.iter())
+            .map(|entry| (entry.phase, entry.node, entry.tasks.len()))
+            .collect();
+        exhausted.sort();
+        let mut expected: Vec<_> = (spent.iter())
+            .map(|work| (work.phase, work.node, 0))
+            .collect();
+        expected.sort();
+        assert_eq!(exhausted, expected);
     }
 }

@@ -133,6 +133,7 @@ pub struct Detail {
 pub struct Cell {
     pub text: String,
     pub tone: Tone,
+    pub weight: Weight,
 }
 
 impl Cell {
@@ -140,6 +141,16 @@ impl Cell {
         Self {
             text: text.into(),
             tone,
+            weight: Weight::Regular,
+        }
+    }
+
+    /// The same cell, drawn strong.
+    #[must_use]
+    pub fn strong(self) -> Self {
+        Self {
+            weight: Weight::Strong,
+            ..self
         }
     }
 }
@@ -159,7 +170,17 @@ pub enum Tone {
     Accent,
     Success,
     Warning,
+    /// Between a warning and an error.
+    Caution,
     Error,
+}
+
+/// How heavily a cell is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Weight {
+    #[default]
+    Regular,
+    Strong,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

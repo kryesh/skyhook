@@ -24,11 +24,8 @@ pub use projection::{
 };
 pub use requests::RequestRow;
 pub use transcript::shown;
-#[cfg(test)]
-pub use window::KEPT;
 pub use window::{
-    CHILD_PAGE, ChildPage, Direction, Edge, Focus, LIST_PAGE, Loaded, Near, PAGE, Read, Want,
-    Window,
+    Budget, CHILD_PAGE, ChildPage, Direction, Edge, Focus, Loaded, Near, Read, Want, Window,
 };
 
 use super::tool_view::{Document, Run};

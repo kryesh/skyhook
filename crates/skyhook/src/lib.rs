@@ -1,6 +1,9 @@
 //! Skyhook is a provider-neutral coding-agent harness whose registered tools are
 //! available both as model tool calls and inside a sandboxed JavaScript runtime.
 
+// `skyhook_schema::image!` names its output under `::skyhook`, here too.
+extern crate self as skyhook;
+
 pub mod agent;
 pub mod config;
 pub mod db;
@@ -23,6 +26,8 @@ pub mod target;
 pub mod tool;
 pub mod yaml;
 
+#[doc(hidden)]
+pub use newtype::described;
 pub use {
     newtype::{Blank, Bounded, Prose},
     yaml::YamlError,
@@ -280,9 +285,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let sessions = root.path().join("sessions");
             let store = if durable {
-                SessionStore::create(&sessions, "test".parse().unwrap(), None).await
+                SessionStore::create(
+                    &sessions,
+                    "test".parse().unwrap(),
+                    crate::session::Schema::JOURNAL,
+                )
+                .await
             } else {
-                SessionStore::create_ephemeral(&sessions, None).await
+                SessionStore::create_ephemeral(&sessions, crate::session::Schema::JOURNAL).await
             }
             .unwrap();
             Self {
@@ -405,5 +415,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(request.blobs.get(&blob).unwrap(), image_png());
+    }
+
+    /// Every value of `wanted` in a raw request head, in wire order.
+    pub(crate) fn header_values(head: &str, wanted: &str) -> Vec<String> {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(header, _)| header.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.trim().to_owned())
+            .collect()
+    }
+
+    pub(crate) fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+    pub(crate) async fn read_request(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0u8; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+            if let Some(end) = bytes.array_windows().position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|s| s.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// One scripted connection. Connections beyond the script never answer.
+    pub(crate) struct Plan {
+        wire: Option<Vec<u8>>,
+        /// Hold the connection open after writing instead of closing it.
+        stall_body: bool,
+    }
+
+    impl Plan {
+        pub(crate) fn reply(wire: impl Into<Vec<u8>>) -> Self {
+            Self {
+                wire: Some(wire.into()),
+                stall_body: false,
+            }
+        }
+
+        /// Write `wire`, then hold the connection open.
+        pub(crate) fn stalled(wire: &[u8]) -> Self {
+            Self {
+                wire: Some(wire.to_vec()),
+                stall_body: true,
+            }
+        }
+
+        pub(crate) fn stalled_headers() -> Self {
+            Self {
+                wire: None,
+                stall_body: true,
+            }
+        }
+    }
+
+    /// Scripted HTTP fixture which keeps accepting, so replays are observed.
+    pub(crate) struct Server {
+        pub(crate) url: String,
+        address: std::net::SocketAddr,
+        requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+        /// Connections accepted, against requests taken by the test.
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        taken: usize,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Server {
+        pub(crate) async fn start(plans: Vec<Plan>) -> Self {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}/responses");
+            let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
+            let task = tokio::spawn(async move {
+                let plans = std::sync::Arc::new(std::sync::Mutex::new(plans.into_iter()));
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (tx, plans) = (tx.clone(), plans.clone());
+                    connections.spawn(async move {
+                        let request = read_request(&mut socket).await;
+                        // A connection without a request (the probe below) uses no plan.
+                        let plan = (!request.is_empty()).then(|| plans.lock().unwrap().next());
+                        let plan = plan.flatten().unwrap_or_else(Plan::stalled_headers);
+                        tx.send(request).unwrap();
+                        if let Some(wire) = plan.wire {
+                            // Timed-out attempts may close the connection before writing.
+                            let _ = socket.write_all(&wire).await;
+                        }
+                        if plan.stall_body {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                }
+            });
+            Self {
+                url,
+                address,
+                requests,
+                accepted,
+                taken: 0,
+                task,
+            }
+        }
+
+        /// The server's root URL, without the endpoint path.
+        pub(crate) fn root(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        pub(crate) async fn request(&mut self) -> String {
+            self.taken += 1;
+            crate::tests::bounded(self.requests.recv()).await.unwrap()
+        }
+
+        /// Requests not yet taken, once the client's calls have returned. An empty
+        /// probe connection flushes the accept queue, so every connection the client
+        /// opened is counted, even a replay that never completed its request.
+        pub(crate) async fn unclaimed(&mut self) -> Vec<String> {
+            drop(tokio::net::TcpStream::connect(self.address).await.unwrap());
+            let mut requests = Vec::new();
+            loop {
+                match self.request().await {
+                    probe if probe.is_empty() => break,
+                    request => requests.push(request),
+                }
+            }
+            let accepted = self.accepted.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(accepted, self.taken, "unexpected connection");
+            requests
+        }
+
+        pub(crate) async fn finish(mut self) -> Vec<String> {
+            self.unclaimed().await
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            // Aborting the accept task drops its JoinSet and all held sockets.
+            self.task.abort();
+        }
+    }
+
+    /// A FIFO at `path`.
+    pub(crate) fn fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
 }

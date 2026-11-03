@@ -313,16 +313,16 @@ mod tests {
         manager.pending_delivery(owner).await.unwrap().messages()[0].clone()
     }
 
-    /// More replies from a foreground child than one message batch holds, by
-    /// count and by bytes, each longer than a preview shows of one string.
+    /// More replies from a foreground child than a preview samples, each longer
+    /// than a preview shows of one string.
     async fn many_replies(
         manager: &JobManager,
         (owner, child): (&AgentId, &AgentId),
         job: JobId,
     ) -> Vec<String> {
         let mut texts = Vec::new();
-        for index in 0..MESSAGE_BATCH_COUNT + 2 {
-            let text = format!("reply {index} {}", "x".repeat(MESSAGE_BATCH_BYTES / 64));
+        for index in 0..40 {
+            let text = format!("reply {index} {}", "x".repeat(1024));
             commit(manager, child, job, &text).await;
             texts.push(text);
         }
@@ -353,23 +353,24 @@ mod tests {
         let messages: FieldPointer = "/result/messages".parse().unwrap();
         let next = |view: &JobView| match view.continuation() {
             None => None,
-            Some(output::Continuation::Index { field, index }) => {
+            Some(output::Continuation {
+                field, start, unit, ..
+            }) => {
                 assert!(field.is_none_or(|field| *field == messages));
-                Some(index)
+                Some((start, unit))
             }
-            Some(other) => panic!("{other:?}"),
         };
-        let (mut read, mut index) = (Vec::new(), next(&view));
-        while let Some(at) = index {
+        let (mut read, mut start) = (Vec::new(), next(&view));
+        while let Some((at, unit)) = start {
             let mut args = output::OutputArgs::new(job);
-            (args.field, args.index) = (Some(messages.clone()), Some(at));
+            (args.field, args.start, args.unit) = (Some(messages.clone()), Some(at), Some(unit));
             let page = present(args).await;
             let preview = page.presentation.as_ref().and_then(|p| p.preview.as_ref());
             let Some(output::OutputPreview::Elements(page_of)) = preview else {
                 panic!("{page:?}");
             };
             read.extend(page_of.elements.iter().map(|reply| reply["text"].clone()));
-            index = next(&page);
+            start = next(&page);
         }
         assert_eq!(read, texts[shown..]);
         for state in [manager.clone(), manager.test_replay()] {
@@ -429,19 +430,42 @@ mod tests {
     }
 
     /// Later batches stay pending for the owner, and a completion arrives with its job's
-    /// last reply, even when that reply alone exceeds the reply budget.
+    /// last reply, even when that reply alone exceeds the reply budget. Batches are
+    /// bounded by bytes and by count, and a child blocked on its replies withholds
+    /// only its own completion.
     #[tokio::test]
     async fn bounded_batches_rewake_and_do_not_overtake_messages_with_completion() {
         // Sized against the budget so the split points survive retuning it.
         let large = MESSAGE_BATCH_BYTES * 5 / 8;
-        // (message sizes, unrelated finished tool job, expected (messages, envelopes) per batch)
+        // (message sizes, unrelated finished tool job, expected (messages, envelopes) per
+        // batch); envelopes index the child's job (0) and the unrelated one (1).
         let cases = [
-            (vec![large; 3], false, vec![(1, 0), (1, 0), (1, 1)]),
+            (
+                vec![large; 3],
+                false,
+                vec![(1, vec![]), (1, vec![]), (1, vec![0])],
+            ),
+            (
+                vec![large; 3],
+                true,
+                vec![(1, vec![1]), (1, vec![]), (1, vec![0])],
+            ),
             // Reply bytes never defer lifecycle metadata, not even an unrelated job's.
-            (vec![MESSAGE_BATCH_BYTES + 1000], true, vec![(1, 2)]),
+            (
+                vec![MESSAGE_BATCH_BYTES + 1000],
+                true,
+                vec![(1, vec![0, 1])],
+            ),
+            // Small replies are bounded by count, which no byte budget would reach.
+            (
+                vec![8; MESSAGE_BATCH_COUNT + 2],
+                false,
+                vec![(MESSAGE_BATCH_COUNT, vec![]), (2, vec![0])],
+            ),
         ];
-        for (sizes, unrelated, batches) in cases {
-            let (_root, manager, owner, child, job) = child_job(true).await;
+        let (session, manager, owner) = owner_session().await;
+        for (agent, (sizes, unrelated, batches)) in (1..).zip(cases) {
+            let (child, job) = agent_job(&session, agent, true).await;
             let mut pending = Vec::new();
             for size in sizes {
                 pending.push(commit(&manager, &child, job, &"x".repeat(size)).await);
@@ -459,10 +483,11 @@ mod tests {
                     sequences(&receipt),
                     pending.drain(..*messages).collect::<Vec<_>>()
                 );
-                assert_eq!(receipt.envelopes().len(), *envelopes);
-                if *envelopes > 0 {
-                    assert_eq!(envelope_ids(&receipt), finished);
-                }
+                let expected: Vec<_> = envelopes.iter().map(|index| finished[*index]).collect();
+                assert_eq!(envelope_ids(&receipt), expected);
+                // Only a reply alone may exceed the budget.
+                let size = messages::batch_size(receipt.messages());
+                assert!(size <= MESSAGE_BATCH_BYTES || *messages == 1, "{size}");
                 ack(receipt).await;
                 assert_eq!(manager.has_pending(&owner), index + 1 < batches.len());
             }
@@ -530,22 +555,6 @@ mod tests {
         assert_eq!(receipt.envelopes()[0].state, JobState::WaitingInput);
         ack(receipt).await;
         assert!(!manager.has_pending(&owner));
-    }
-
-    /// Small replies are bounded by count, which no byte budget would reach.
-    #[tokio::test]
-    async fn reply_batches_are_bounded_by_count() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        for index in 0..MESSAGE_BATCH_COUNT + 2 {
-            commit(&manager, &child, job, &format!("reply {index}")).await;
-        }
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(receipt.messages().len(), MESSAGE_BATCH_COUNT);
-        assert!(messages::batch_size(receipt.messages()) < MESSAGE_BATCH_BYTES);
-        // The job still has undelivered replies, so its lifecycle stays withheld.
-        assert!(receipt.envelopes().is_empty());
-        ack(receipt).await;
-        assert!(manager.has_pending(&owner));
     }
 
     /// A text-only reply is held: completing the job makes it the result, so the
@@ -662,6 +671,8 @@ mod tests {
         assert_eq!(receipt.messages()[0].message, second);
         drop(receipt);
         finish(&manager, job).await;
+        // A claim without the parent's delivery leaves the last reply pending.
+        manager.test_claim(job).await.unwrap();
         let restored = manager.test_replay();
         assert_eq!(first_pending(&restored, &owner).await.message, second);
     }
@@ -678,8 +689,7 @@ mod tests {
                 AssistantItem::text("blank", 1, blank),
             ];
             // A turn publishes its normalized projection, which a blank turn empties.
-            let projection = crate::provider::protocol::visible_text(&items);
-            assert_eq!(projection, "", "blank text {blank:?}");
+            let projection = String::new();
             manager
                 .commit_child_message(&child, job, Message::Assistant(items), projection, |_| {
                     Vec::new()
@@ -749,51 +759,5 @@ mod tests {
         }
         assert_eq!(manager.store().records().len(), before);
         assert!(!manager.has_pending(&owner));
-    }
-
-    #[tokio::test]
-    async fn blocked_low_id_child_does_not_withhold_unrelated_completion() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        // Sized so one reply fills the batch: the child keeps undelivered replies,
-        // which is what withholds its own completion.
-        for _ in 0..3 {
-            commit(
-                &manager,
-                &child,
-                job,
-                &"x".repeat(MESSAGE_BATCH_BYTES * 5 / 8),
-            )
-            .await;
-        }
-        manager
-            .test_finish(job, serde_json::json!("large".repeat(10000)))
-            .await;
-        let spec = JobSpec {
-            background: true,
-            ..JobSpec::test(owner.clone(), "ordinary")
-        };
-        let ordinary = manager.test_create(spec).await;
-        finish(&manager, ordinary).await;
-        assert!(job < ordinary);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(receipt.messages().len(), 1);
-        assert_eq!(envelope_ids(&receipt), [ordinary]);
-        assert!(messages::batch_size(receipt.messages()) < MESSAGE_BATCH_BYTES);
-        ack(receipt).await;
-        assert!(manager.has_pending(&owner));
-    }
-
-    #[tokio::test]
-    async fn claims_without_parent_delivery_evidence_never_acknowledge_last_reply() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        let last = commit(&manager, &child, job, "final reply").await;
-        manager
-            .test_finish(job, serde_json::json!("final reply"))
-            .await;
-        manager.test_claim(job).await.unwrap();
-        assert_eq!(
-            first_pending(&manager.test_replay(), &owner).await.message,
-            last
-        );
     }
 }

@@ -5,24 +5,58 @@ input moves through it to understand it, then record conclusions, not everything
 traced. The research store is one graph of nodes, each with a title and a body:
 
 - A **component** is implementation, by the files and named interfaces it owns.
-- A **source** is one entry point an actor drives, with its location and trust.
-- A **path** is an ordered flow of steps through components from the sources that share it,
-  each step a location and a note; it is swept once.
+- A **state** is the storage one invariant relates; per-call temporaries are not states. Its
+  scope says where it lives: `input`, data an actor writes that the target takes in (a request
+  field, a buffer passed in, an argument, an environment variable, configuration), with its
+  trust and the read defining it; `handed`, written by the target and carried by the caller into
+  later calls (a status, a cursor, a token), read by the paths the caller drives in response;
+  `instance`, one object's fields across its calls (a parser's position, a connection, a cache); or
+  `stored`, outliving the caller's interaction and read by other flows (a session, a row, a
+  file, a queue), each read trusted as its least-privileged writer path's input.
+- A **path** is one scenario: an entry on the target's public interface followed through every
+  stage that handles it, as ordered steps through components, each a location and a note, with
+  each read and write of a state at its location; it is swept once.
 - A **premise** is a prerequisite: internal state or logic a flaw needs to reach unintended
   state, or a path's flow needs to carry input there ("`len` can exceed the buffer at the
-  copy"), never user-observable behaviour. A failing premise contradicts the candidates resting
-  on it. It is code-scoped, about the target's own logic, or deployment-scoped, decided by the
-  user.
-- A **flaw** is a local defect at a location in a component, with the premises it depends on.
-  It is suspected, confirmed (real, with no chain to an observable consequence found yet) or
-  refuted.
+  copy"), never user-observable behaviour. It states the condition a flaw, path or chain needs,
+  never the code's safety guarantee: a guarantee the code does not enforce is a flaw. A failing
+  premise contradicts the candidates resting on it. It is code-scoped, about the target's own
+  logic, or deployment-scoped, decided by the user.
+- A **flaw** is a local defect at a location in a component, with the premises it depends on and
+  the states it leaves wrong; a status reported wrongly is a flaw leaving that handed state
+  wrong. An invariant the target relies on but enforces only by an assertion or an internal
+  convention is a flaw too, its premise that something can violate it, chained and tested like
+  any other. It is suspected, confirmed (real, with no chain to an observable consequence found yet)
+  or refuted.
 - A **candidate** is an ordered chain of flaws to an observable vulnerability, its root first,
   through the paths its actions perform in order, the attacker's first. It is assessed, reviewed
   and tested; candidates sharing a root flaw are that root's group, reported as one finding.
 - A **finding** is a root flaw's report.
 
 **Evidence** is a location with a stance on one node: supports, contradicts or context.
-Contradicting evidence disputes a decided premise or a refuted flaw and reopens its work.
+Contradicting evidence disputes a decided premise or a refuted flaw and reopens its work. A
+premise's status is decided by its settle (a deployment premise's by the user), a flaw's by its
+chain, and a candidate's assessment and verdict by their own work; set anywhere else, each is a
+proposal, which disputes what is recorded when it differs and reopens that work.
+
+A status, boolean, error, null or default that decides whether code retries, accepts,
+authorizes, releases or stops is a contract. Its producers are every site returning or setting
+it, wrappers mapping a false, 0, null or caught error to it included; record as evidence what it
+means at each, under every condition that yields it ("null only when the key is absent").
+
+**Deciding a premise** about a value's meaning, a bound or a check covers every site producing
+or enforcing it, each recorded as evidence: `holds` names a site that meets it, and `fails`
+shows, site by site, why each cannot.
+A premise that another flow can change state between a check and its use, or while a flow
+relies on it, covers every writer: `holds` names one, the flow that runs it (a path, thread,
+task, signal or later action) and who drives it, citing by id a writer that is a recorded flaw;
+`fails` shows each writer kept out of the window (a lock, an ordering, a single thread,
+ownership or permission), or that the use acts on what was checked. Every decision, `holds` or
+`fails`, records each general claim it rests on that the cited sites do not show (what other
+exits, callers or callees do) as a code premise, `link` `premise_basis` `{premise, rests_on}`,
+left unsettled. Before a decision that contradicts a candidate or leaves a flaw unreachable,
+look for an input or state that breaks each claim it relies on. "Looks safe" settles
+nothing. A premise's body states its condition; arguments for or against it go in evidence.
 
 Work is derived from the graph: a change to what a result rests on owes that result again, and
 restating what is recorded changes nothing. Merge a duplicate node into the one it repeats rather
@@ -50,8 +84,9 @@ memory, and its completeness is decided by reconciling against the store — eve
 outcome, and what the store shows is the result — not by children's replies. Each mode's
 templates are starting points: adapt the inputs and briefs, keep the structure.
 
-Read in the workspace you were given; run, build and write only in the working directory your
-brief names, giving each child that does one of its own beneath yours. Never work in other
+Read the target where your brief places it, else in the workspace you were given; run, build and
+write only in the working directory your brief names, giving each child that does one of its own
+beneath yours. Never work in other
 checkouts, home configuration or system locations unless the user's scope names them.
 
 Running the target or its services, sending it requests, fuzzing, permutation or brute-force

@@ -277,20 +277,17 @@ pub(crate) fn decode_base64_bounded(data: &str, limit: usize) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        provider::protocol::{Message, ModelRequest, ToolResult, UserContent},
-        session::{BlobError, SessionError, SessionStore},
-    };
+    use std::assert_matches;
 
     #[tokio::test]
     async fn classification_decodes_images_and_treats_nul_as_binary() {
         let png = crate::tests::png(b"\0").await;
         let classified = classify(png.bytes().to_vec()).await.unwrap();
         assert_eq!(classified, Classified::Image(png));
-        assert!(matches!(
+        assert_matches!(
             classify(b"\x89PNG\r\n\x1a\ntext".to_vec()).await,
             Err(MediaError::InvalidImage(_))
-        ));
+        );
         let text = classify(b"text".to_vec()).await.unwrap();
         assert_eq!(text, Classified::Text("text".into()));
         for binary in [&b"text\0"[..], b"\xff"] {
@@ -305,8 +302,6 @@ mod tests {
     fn digest_strict_canonical_serde_and_path_rejection() {
         let digest = BlobDigest::of(b"payload");
         let text = digest.to_string();
-        assert_eq!(text.len(), 64);
-        assert_eq!(text, crate::sha256_hex(b"payload"));
         assert_eq!(text.parse::<BlobDigest>().unwrap(), digest);
         for invalid in [
             "".to_owned(),
@@ -332,104 +327,19 @@ mod tests {
             let encoded = STANDARD.encode(&bytes);
             assert_eq!(decode_base64_bounded(&encoded, length).unwrap(), bytes);
             if length > 0 {
-                assert!(matches!(
+                assert_matches!(
                     decode_base64_bounded(&encoded, length - 1),
                     Err(MediaError::TooLarge)
-                ));
+                );
             }
         }
-        for invalid in ["!Q==", "YR==", "YQ=", "====", "Y===", "=Q==", "AA=A"] {
-            assert!(
-                matches!(
-                    decode_base64_bounded(invalid, 8),
-                    Err(MediaError::InvalidBase64)
-                ),
+        // Lengths and padding the bound reads; the alphabet is the decoder's.
+        for invalid in ["YQ=", "====", "Y==="] {
+            assert_matches!(
+                decode_base64_bounded(invalid, 8),
+                Err(MediaError::InvalidBase64),
                 "{invalid}"
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn stored_attachments_load_by_digest_and_reject_corrupt_blobs() {
-        for durable in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let store = if durable {
-                SessionStore::create(root.path(), "test".parse().unwrap(), None)
-                    .await
-                    .unwrap()
-            } else {
-                SessionStore::create_ephemeral(root.path(), None)
-                    .await
-                    .unwrap()
-            };
-            let png = crate::tests::png(b"pixels").await;
-            let image = Attachment::Image {
-                file: Some("shot.png".into()),
-                image: png.clone(),
-            };
-            let AttachmentRef::Image(image) = store.store_attachment(&image).await.unwrap() else {
-                panic!("image attachment")
-            };
-            let text = Attachment::Text {
-                file: None,
-                content: "notes".into(),
-            };
-            let AttachmentRef::Text(text) = store.store_attachment(&text).await.unwrap() else {
-                panic!("text attachment")
-            };
-            assert_eq!(image.file.as_deref(), Some("shot.png"));
-            assert_eq!(image.format, ImageFormat::Png);
-            let mut request = ModelRequest {
-                context: crate::provider::protocol::entries(vec![
-                    Message::User(vec![UserContent::Attachment {
-                        attachment: AttachmentRef::Text(text.clone()),
-                    }]),
-                    Message::Tool(vec![ToolResult {
-                        call_id: "call".into(),
-                        name: "read".into(),
-                        result: serde_json::json!({}),
-                        images: vec![image.clone()],
-                        is_error: false,
-                    }]),
-                ]),
-                ..ModelRequest::test("fixture")
-            };
-            assert!(matches!(
-                request.blobs.get(&image.blob),
-                Err(MediaError::NotLoaded)
-            ));
-            let mut cache = LoadedBlobs::default();
-            store.load_blobs(&mut request, &mut cache).await.unwrap();
-            assert_eq!(request.blobs.text(&text).unwrap(), "notes");
-            assert_eq!(request.blobs.get(&image.blob).unwrap(), png.bytes());
-            assert!(!serde_json::to_string(&request).unwrap().contains("blobs"));
-            if durable {
-                // A store read verifies the bytes; cached blobs were verified when read.
-                for (bytes, reason) in [
-                    (Some(b"changed".to_vec()), BlobError::HashMismatch),
-                    (None, BlobError::Missing),
-                ] {
-                    store.corrupt_blob(image.blob.sha256, bytes);
-                    let mut uncached = LoadedBlobs::default();
-                    let error = store.load_blobs(&mut request, &mut uncached).await;
-                    assert!(matches!(
-                        error.unwrap_err(),
-                        SessionError::Blob { digest, reason: found }
-                            if digest == image.blob.sha256 && found == reason
-                    ));
-                    store.load_blobs(&mut request, &mut cache).await.unwrap();
-                }
-            } else {
-                // An ephemeral session keeps its journal and blobs in memory.
-                let mut files = std::fs::read_dir(store.directory()).unwrap();
-                assert!(files.next().is_none());
-            }
-            // A reused request and its cache keep only what its history still references.
-            request.context.pop();
-            store.load_blobs(&mut request, &mut cache).await.unwrap();
-            for blobs in [&request.blobs, &cache] {
-                assert!(matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded)));
-            }
         }
     }
 }

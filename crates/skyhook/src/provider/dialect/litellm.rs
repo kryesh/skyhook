@@ -221,17 +221,13 @@ impl DialectConfig for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
+    use crate::provider::dialect::tests::{head, replay_scope};
 
     #[test]
     fn replay_identity_tracks_upstream_and_routing_tags() {
-        let scope_for = |yaml, codec| {
-            let config = crate::yaml::parse::<Config>(yaml).unwrap();
-            config.admit(codec).unwrap().scope
-        };
-        let scope = |yaml| scope_for(yaml, CodecName::ChatCompletions);
+        let scope = |yaml| replay_scope::<Config>(yaml, CodecName::ChatCompletions);
         // Anthropic's conventions behind Messages are a conversation of their own.
-        let messages = scope_for("upstream: anthropic", CodecName::Messages);
+        let messages = replay_scope::<Config>("upstream: anthropic", CodecName::Messages);
         assert_ne!(messages, Upstream::Anthropic.scope());
         let tagged = scope("upstream: anthropic\ntags: [deployment-a]");
         for other in [
@@ -248,15 +244,12 @@ mod tests {
         let config: Config =
             crate::yaml::parse("{upstream: bedrock, tags: [team-a, prod]}").unwrap();
         let chat = head(&config, CodecName::ChatCompletions, "sk-virtual").await;
-        assert_eq!(header_values(&chat, "authorization"), ["Bearer sk-virtual"]);
-        assert_eq!(header_values(&chat, "x-litellm-session-id"), ["ctx"]);
-        assert_eq!(header_values(&chat, "x-litellm-tags"), ["team-a,prod"]);
+        assert_eq!(chat.header("authorization"), ["Bearer sk-virtual"]);
+        assert_eq!(chat.header("x-litellm-session-id"), ["ctx"]);
+        assert_eq!(chat.header("x-litellm-tags"), ["team-a,prod"]);
         let messages = head(&config, CodecName::Messages, "sk-virtual").await;
-        assert_eq!(
-            header_values(&messages, "authorization"),
-            ["Bearer sk-virtual"]
-        );
-        assert!(header_values(&messages, "x-api-key").is_empty());
+        assert_eq!(messages.header("authorization"), ["Bearer sk-virtual"]);
+        assert!(messages.header("x-api-key").is_empty());
         // Affinity rides the session header behind every upstream.
         let openai = Config {
             upstream: Upstream::Openai,
@@ -264,16 +257,23 @@ mod tests {
             state_role: None,
         };
         let responses = head(&openai, CodecName::Responses, "k").await;
-        assert_eq!(header_values(&responses, "x-litellm-session-id"), ["ctx"]);
+        assert_eq!(responses.header("x-litellm-session-id"), ["ctx"]);
         assert_eq!(Upstream::Bedrock.scope(), "litellm:bedrock");
         assert!(crate::yaml::parse::<Config>("{upstream: openai, tags: ['a,b']}").is_err());
     }
 
-    /// Bedrock serves both families, so its codec decides: OpenAI's conventions on Chat and
-    /// Responses, where Anthropic keeps its own, with Chat still replaying thinking blocks.
-    /// Unsigned thinking goes back behind Bedrock, but not behind Anthropic.
+    /// Chat and Responses behind OpenAI or Bedrock carry the identity in the body for the
+    /// service as well as in the session header for the proxy; Messages and Anthropic
+    /// carry the header alone. Bedrock serves both families, so its codec decides:
+    /// OpenAI's conventions on Chat and Responses, where Anthropic keeps its own, with
+    /// Chat still replaying thinking blocks. Unsigned thinking goes back behind Bedrock,
+    /// but not behind Anthropic.
     #[test]
-    fn bedrock_takes_openai_conventions_and_replays_thinking_on_chat() {
+    fn upstreams_select_identity_and_replay_conventions_per_codec() {
+        let session = Locations::one(header("x-litellm-session-id"));
+        let both = session
+            .clone()
+            .with(CacheKey::Body(path("prompt_cache_key")));
         let codec = |upstream, codec| {
             let config = Config {
                 upstream,
@@ -282,11 +282,30 @@ mod tests {
             };
             config.admit(codec).unwrap().codec
         };
+        use CodecName::{ChatCompletions, Messages, Responses};
+        for (upstream, name, expected) in [
+            (Upstream::Openai, ChatCompletions, &both),
+            (Upstream::Openai, Responses, &both),
+            (Upstream::Openai, Messages, &session),
+            (Upstream::Bedrock, ChatCompletions, &both),
+            (Upstream::Bedrock, Responses, &both),
+            (Upstream::Bedrock, Messages, &session),
+            (Upstream::Anthropic, ChatCompletions, &session),
+            (Upstream::Anthropic, Responses, &session),
+            (Upstream::Anthropic, Messages, &session),
+        ] {
+            let admitted = codec(upstream, name);
+            assert_eq!(
+                &admitted.identity().cache_key,
+                expected,
+                "{upstream} {name}"
+            );
+        }
         assert_eq!(
-            codec(Upstream::Bedrock, CodecName::Responses),
-            codec(Upstream::Openai, CodecName::Responses)
+            codec(Upstream::Bedrock, Responses),
+            codec(Upstream::Openai, Responses)
         );
-        let chat = |upstream| match codec(upstream, CodecName::ChatCompletions) {
+        let chat = |upstream| match codec(upstream, ChatCompletions) {
             Codec::ChatCompletions(dialect) => dialect,
             other => panic!("Chat conventions: {other:?}"),
         };
@@ -301,7 +320,7 @@ mod tests {
             UnsignedReasoning::Replayed(Locations::NONE)
         );
         assert_eq!(unsigned(&anthropic), UnsignedReasoning::Dropped);
-        let Codec::Messages(messages) = codec(Upstream::Bedrock, CodecName::Messages) else {
+        let Codec::Messages(messages) = codec(Upstream::Bedrock, Messages) else {
             panic!("Messages conventions")
         };
         assert_eq!(messages.unsigned, UnsignedReasoning::Replayed(()));
@@ -316,41 +335,6 @@ mod tests {
         );
     }
 
-    /// Chat and Responses behind OpenAI or Bedrock carry the identity in the body for the
-    /// service as well as in the session header for the proxy; Messages and Anthropic
-    /// carry the header alone.
-    #[test]
-    fn the_service_gets_the_identity_behind_openai_and_bedrock() {
-        let session = Locations::one(header("x-litellm-session-id"));
-        let both = session
-            .clone()
-            .with(CacheKey::Body(path("prompt_cache_key")));
-        use CodecName::{ChatCompletions, Messages, Responses};
-        for (upstream, codec, expected) in [
-            (Upstream::Openai, ChatCompletions, &both),
-            (Upstream::Openai, Responses, &both),
-            (Upstream::Openai, Messages, &session),
-            (Upstream::Bedrock, ChatCompletions, &both),
-            (Upstream::Bedrock, Responses, &both),
-            (Upstream::Bedrock, Messages, &session),
-            (Upstream::Anthropic, ChatCompletions, &session),
-            (Upstream::Anthropic, Responses, &session),
-            (Upstream::Anthropic, Messages, &session),
-        ] {
-            let config = Config {
-                upstream,
-                tags: Vec::new(),
-                state_role: None,
-            };
-            let admitted = config.admit(codec).unwrap().codec;
-            assert_eq!(
-                &admitted.identity().cache_key,
-                expected,
-                "{upstream} {codec}"
-            );
-        }
-    }
-
     /// Anthropic behind Messages takes the anthropic dialect's conventions: turn-scoped system
     /// state, thinking dropped on a binding mismatch, and the betas both need. Every
     /// other upstream and codec keeps user-role state and announces no beta.
@@ -358,7 +342,8 @@ mod tests {
     async fn anthropic_behind_messages_takes_the_anthropic_dialects_conventions() {
         let config = |yaml| crate::yaml::parse::<Config>(yaml).unwrap();
         let betas = async |config: &Config, codec| {
-            header_values(&head(config, codec, "k").await, "anthropic-beta")
+            let sent = head(config, codec, "k").await;
+            sent.header("anthropic-beta").join(",")
         };
         let anthropic = config("upstream: anthropic");
         let mut expected = Codec::Messages(messages::Dialect {
@@ -372,7 +357,7 @@ mod tests {
         );
         assert_eq!(
             betas(&anthropic, CodecName::Messages).await,
-            ["thinking-binding-controls-2026-08-01, mid-conversation-system-clear-at-2026-08-21"]
+            "thinking-binding-controls-2026-08-01, mid-conversation-system-clear-at-2026-08-21"
         );
         for (config, codec) in [
             (config("upstream: bedrock"), CodecName::Messages),
@@ -381,7 +366,7 @@ mod tests {
         ] {
             let mut admitted = config.admit(codec).unwrap().codec;
             assert_eq!(*admitted.state_role_mut(), StateRole::User, "{codec}");
-            assert!(betas(&config, codec).await.is_empty(), "{codec}");
+            assert_eq!(betas(&config, codec).await, "", "{codec}");
         }
     }
 

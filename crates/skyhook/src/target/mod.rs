@@ -168,24 +168,23 @@ impl fmt::Display for TargetRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn names_are_validated_and_root_is_reserved() {
         assert_eq!("root".parse::<TargetRef>().unwrap(), TargetRef::Root);
         let named = "build.host-1_a".parse::<TargetRef>().unwrap();
         assert_eq!(named.as_str(), "build.host-1_a");
-        assert!(matches!(
-            "root".parse::<TargetName>(),
-            Err(TargetError::ReservedName)
-        ));
+        assert_matches!("root".parse::<TargetName>(), Err(TargetError::ReservedName));
         for invalid in [
             "",
             "has space",
             "ünïcode",
             &"x".repeat(MAX_TARGET_NAME_BYTES + 1),
         ] {
-            assert!(
-                matches!(invalid.parse::<TargetName>(), Err(TargetError::InvalidName)),
+            assert_matches!(
+                invalid.parse::<TargetName>(),
+                Err(TargetError::InvalidName),
                 "{invalid:?}"
             );
             assert!(invalid.parse::<TargetRef>().is_err(), "{invalid:?}");

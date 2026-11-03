@@ -405,6 +405,7 @@ impl LiveResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::assert_matches;
 
     fn call(id: &str) -> ToolCall {
         ToolCall::new(id, "run", json!({})).unwrap()
@@ -469,10 +470,10 @@ mod tests {
             AssistantItem::text("i", 0, "a"),
             AssistantItem::text("i", 1, "b"),
         ];
-        assert!(matches!(
+        assert_matches!(
             Completion::answer(same_id).unwrap_err(),
             CompletionError::DuplicateItem(_)
-        ));
+        );
         let same_position = vec![
             AssistantItem::text("a", 0, "a"),
             AssistantItem::text("b", 0, "b"),
@@ -494,10 +495,10 @@ mod tests {
             position: 0.into(),
             blocks: Vec::new(),
         };
-        assert!(matches!(
+        assert_matches!(
             Completion::answer(vec![blockless]).unwrap_err(),
             CompletionError::BlocklessText(_)
-        ));
+        );
         // Reasoning may be replay-only; a blank text block is content.
         let replay_only = AssistantItem::Reasoning {
             id: ItemId::try_from("r".to_owned()).unwrap(),

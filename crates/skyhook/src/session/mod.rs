@@ -22,6 +22,7 @@ pub(crate) mod ledger;
 mod pages;
 mod projection;
 mod request;
+mod schema;
 pub mod stats;
 
 pub use content::{
@@ -45,7 +46,7 @@ pub use event::{
     ModelPurpose, ProfileSnapshot, RecordSeq, Refused, RequestSeq, RetryDelay, SessionEvent,
     TitleSource, Truncation,
 };
-pub use extension::{AgentJobTexts, Extension, ExtensionDb, Unconfirmed};
+pub use extension::{AgentJobTexts, ExtensionDb, Unconfirmed};
 pub use ledger::{
     Fact, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
 };
@@ -57,6 +58,7 @@ pub(crate) use projection::render_history;
 pub(crate) use projection::{CompletedRequest, OpenedHistory, Requested};
 use request::Referenced;
 pub use request::{CheckpointError, ReplayError};
+pub use schema::{ProductImage, Schema};
 
 const DATABASE_FILE: &str = "session.db";
 const LOCK_FILE: &str = "lock";
@@ -90,14 +92,14 @@ fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionE
     Ok(SessionLock(lock))
 }
 
-/// How a store opens its session, with the extension tables it installs or checks.
+/// How a store opens its session, with the schema it creates or checks.
 enum Opening {
-    Create(HostName, Option<Extension>),
+    Create(HostName, Schema),
     /// Held in memory for its process; nothing of it survives.
     #[cfg(test)]
-    Ephemeral(HostName, Option<Extension>),
-    /// A saved session, with a host's tables when that host created it.
-    Existing(Option<(HostName, Extension)>),
+    Ephemeral(HostName, Schema),
+    /// A saved session, with a host's schema when that host created it.
+    Existing(Option<(HostName, Schema)>),
 }
 
 struct StoreInner {
@@ -231,7 +233,7 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
         let inherit = |writer: &mut core::Writer| {
-            (writer.owner.as_ref()).and_then(|owner| owner.lock.0.try_clone().ok())
+            (writer.owner.as_ref()).and_then(|lock| lock.0.try_clone().ok())
         };
         self.inner.core.call(inherit).await.unwrap()
     }
@@ -315,17 +317,17 @@ impl SessionStore {
     }
 
     /// A session list row, without decoding the session or taking its lock. Given
-    /// `tables`, one that host created is refused when [`open`](Self::open) would refuse it.
+    /// `owner`, one that host created is refused when [`open`](Self::open) would refuse it.
     pub async fn summary(
         root: &Path,
         id: SessionId,
-        tables: Option<(&HostName, Extension)>,
+        owner: Option<(&HostName, Schema)>,
     ) -> Result<SessionSummary, SessionError> {
-        let tables = tables.map(|(host, tables)| (host.clone(), tables));
+        let owner = owner.map(|(host, schema)| (host.clone(), schema));
         Self::read_only(root, id, move |db| {
             let summary = db::summary(db)?;
-            if let Some((_, tables)) = tables.filter(|(host, _)| summary.host == *host) {
-                tables.check(db)?;
+            if let Some((_, schema)) = owner.filter(|(host, _)| summary.host == *host) {
+                schema.check(db)?;
             }
             Ok(summary)
         })
@@ -352,22 +354,22 @@ impl SessionStore {
         .await
     }
 
-    /// A new session of `host`, with `extension`'s tables when the host keeps any.
+    /// A new session of `host`, holding `schema`.
     pub(crate) async fn create(
         root: &Path,
         host: HostName,
-        extension: Option<Extension>,
+        schema: Schema,
     ) -> Result<Self, SessionError> {
-        Self::create_as(root, Opening::Create(host, extension)).await
+        Self::create_as(root, Opening::Create(host, schema)).await
     }
 
     #[cfg(test)]
     pub(crate) async fn create_ephemeral(
         root: &Path,
-        extension: Option<Extension>,
+        schema: Schema,
     ) -> Result<Self, SessionError> {
         let host = "test".parse().unwrap();
-        Self::create_as(root, Opening::Ephemeral(host, extension)).await
+        Self::create_as(root, Opening::Ephemeral(host, schema)).await
     }
 
     async fn create_as(root: &Path, opening: Opening) -> Result<Self, SessionError> {
@@ -384,60 +386,46 @@ impl SessionStore {
         blocking(create).await
     }
 
-    /// Open a saved session. Given `tables`, one that host created opens with its tables,
-    /// checked; another host's session, or any without `tables`, opens without them.
+    /// Open a saved session. Given `owner`, one that host created opens with its schema,
+    /// checked; another host's session, or any without `owner`, opens with the journal's.
     pub async fn open(
         root: &Path,
         id: SessionId,
-        tables: Option<(&HostName, Extension)>,
+        owner: Option<(&HostName, Schema)>,
     ) -> Result<Self, SessionError> {
         let directory = root.join(id.to_string());
-        let tables = tables.map(|(host, tables)| (host.clone(), tables));
-        blocking(move || Self::start(id, directory, Opening::Existing(tables))).await
+        let owner = owner.map(|(host, schema)| (host.clone(), schema));
+        blocking(move || Self::start(id, directory, Opening::Existing(owner))).await
     }
 
     fn start(id: SessionId, directory: PathBuf, opening: Opening) -> Result<Self, SessionError> {
         let existing = matches!(opening, Opening::Existing(_));
         let path = directory.join(DATABASE_FILE);
-        let mode = match opening {
+        let place = match opening {
             Opening::Existing(_) if !path.is_file() => return Err(SessionError::NotFound(id)),
-            Opening::Existing(_) => db::OpenMode::Open,
-            Opening::Create(..) => db::OpenMode::Create,
             #[cfg(test)]
-            Opening::Ephemeral(..) => db::OpenMode::Memory,
+            Opening::Ephemeral(..) => crate::db::Place::Memory,
+            _ => crate::db::Place::File(&path),
         };
-        let durable = mode != db::OpenMode::Memory;
+        let durable = matches!(place, crate::db::Place::File(_));
         // Acquire ownership before opening a potentially active database.
         let lock = durable.then(|| lock_session(&directory, id)).transpose()?;
         let log = durable.then(|| Arc::new(db::Log::of(&path)));
-        let db = db::open(&path, mode)?;
-        let install = |host, extension: Option<Extension>| -> Result<_, SessionError> {
-            if let Some(extension) = &extension {
-                extension.install(&db)?;
-            }
-            Ok((host, extension))
-        };
-        let (host, extension) = match opening {
-            Opening::Create(host, extension) => install(host, extension)?,
+        let (db, host, schema) = match opening {
+            Opening::Create(host, schema) => (schema.create(place)?, host, schema),
             #[cfg(test)]
-            Opening::Ephemeral(host, extension) => install(host, extension)?,
-            Opening::Existing(tables) => {
+            Opening::Ephemeral(host, schema) => (schema.create(place)?, host, schema),
+            Opening::Existing(owner) => {
+                let db = db::open(&path, db::OpenMode::Open)?;
                 let host = db::host(&db)?;
-                let extension = tables
+                let schema = owner
                     .filter(|(keeper, _)| *keeper == host)
-                    .map(|(_, extension)| extension);
-                if let Some(extension) = &extension {
-                    extension.check(&db)?;
-                }
-                (host, extension)
+                    .map_or(Schema::JOURNAL, |(_, schema)| schema);
+                schema.check(&db)?;
+                (db, host, schema)
             }
         };
-        let db = SharedDb::new(db, log.clone());
-        let owner = lock.zip(log).map(|(lock, log)| {
-            let checkpointer = db::Checkpointer::start(&path, log, db.clone())?;
-            Ok::<_, SessionError>(core::Owner { lock, checkpointer })
-        });
-        let owner = owner.transpose()?;
+        let db = SharedDb::new(db, log);
         // The core reads on a connection of its own, so that it never waits behind
         // other reads.
         let (reads, core_reads) = match durable {
@@ -466,12 +454,12 @@ impl SessionStore {
             session: id,
             reads: core_reads,
         };
-        let extension = extension
-            .is_some()
+        let extension = schema
+            .has_product_tables()
             .then(|| ExtensionDb::new(id, directory.clone(), db.clone(), reads.clone()));
         let journal = Journal { session: id, reads };
         let connections = (db.clone(), core_journal);
-        let (shared, core) = core::Core::start(id, directory, state, connections, owner)?;
+        let (shared, core) = core::Core::start(id, directory, state, connections, lock)?;
         let inner = Arc::new(StoreInner {
             host,
             shared,
@@ -1111,6 +1099,7 @@ pub(crate) mod tests {
         tool::policy::Capability,
     };
     use serde_json::json;
+    use std::assert_matches;
 
     /// Refuses, while held, every write `rule` matches, as a failing journal does.
     /// `rule` is a trigger's timing and event, such as `BEFORE INSERT ON job_finish`.
@@ -1460,11 +1449,11 @@ pub(crate) mod tests {
                     text: system.into(),
                     cache: true,
                 }],
-                tools: vec![ToolDefinition {
+                tools: vec![std::sync::Arc::new(ToolDefinition {
                     name: "read".into(),
                     description: "original description".into(),
                     input_schema: json!({"type":"object"}),
-                }],
+                })],
                 response_schema: Some(crate::provider::protocol::ResponseSchema::new("answer", json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false})).unwrap()),
             },
         }
@@ -1513,46 +1502,18 @@ pub(crate) mod tests {
             .unwrap()
             .block_on(SessionStore::open(&sessions, id, None));
         let last = replay.unwrap().records().pop().unwrap();
-        assert!(matches!(last.event, SessionEvent::AgentInterrupted));
-    }
-
-    #[tokio::test]
-    async fn accepted_append_survives_lost_waiter_and_close_drains() {
-        let (root, store, id, agent) = fresh().await;
-        let sessions = root.path().join("sessions");
-        let mut events = store.observe().updates;
-        let sequence = RecordSeq::from(store.records().len() as u64 + 1);
-        let held = hold_connection(&store);
-        let mut appending = Box::pin(store.append(agent.clone(), SessionEvent::AgentInterrupted));
-        assert!(futures_util::poll!(&mut appending).is_pending());
-        drop(appending);
-        // Queued behind the append, so closing drains it first.
-        let mut closing = Box::pin(store.close());
-        assert!(futures_util::poll!(&mut closing).is_pending());
-        drop(held);
-        crate::tests::bounded(closing).await.unwrap();
-        let crate::agent::RuntimeEvent::Record(record) = events.recv().await.unwrap().event else {
-            panic!("only records were published");
-        };
-        assert_eq!(record.sequence, sequence);
-        assert_eq!(store.records().last(), Some(&record));
-        let closed = store.append(agent, SessionEvent::AgentCompleted).await;
-        assert!(matches!(
-            closed,
-            Err(SessionError::Refused(SessionPhase::Closed))
-        ));
-        drop(store);
-        let replay = SessionStore::open(&sessions, id, None)
-            .await
-            .unwrap()
-            .records();
-        assert_eq!(replay.last(), Some(&record));
+        assert_matches!(last.event, SessionEvent::AgentInterrupted);
     }
 
     /// Output writes share the connection, and wait for a commit only up to its COMMIT.
     #[tokio::test]
     async fn the_connection_is_free_while_a_commit_publishes() {
-        let (_root, store, _id, agent) = fresh().await;
+        let TestRuntime {
+            root: _root,
+            store,
+            agent,
+            ..
+        } = TestRuntime::new().await;
         let (reached, publishing) = tokio::sync::oneshot::channel();
         let (resume, resumed) = tokio::sync::oneshot::channel::<()>();
         let entries = vec![(agent, SessionEvent::AgentInterrupted)];
@@ -1614,10 +1575,10 @@ pub(crate) mod tests {
         resume.send(()).unwrap();
         crate::tests::bounded(park).await.unwrap();
         let first = crate::tests::bounded(first).await.unwrap();
-        assert!(matches!(
+        assert_matches!(
             crate::tests::bounded(refused).await,
             Err(SessionError::WrongSession)
-        ));
+        );
         let last = crate::tests::bounded(last).await.unwrap();
         assert_eq!(saw.await.unwrap(), first.sequence.next());
         assert_eq!(last.sequence, first.sequence.next());
@@ -1645,59 +1606,11 @@ pub(crate) mod tests {
         else {
             panic!("the append reported success");
         };
-        assert!(matches!(
-            failure.cause(),
-            SessionError::Unconfirmed(Some(_))
-        ));
+        assert_matches!(failure.cause(), SessionError::Unconfirmed(Some(_)));
         let same =
             |result| matches!(result, Err(SessionError::JournalFailed(later)) if later == failure);
         assert!(same(crate::tests::bounded(drained).await));
         assert!(same(crate::tests::bounded(closed).await));
-    }
-
-    /// Checkpoints run beside the writer and never block it below the restart threshold
-    /// or a reader: a read's snapshot keeps the frames committed after it in the log,
-    /// while every commit meanwhile completes; once it ends, the log is copied and
-    /// starts over.
-    #[tokio::test]
-    async fn checkpoints_keep_the_log_bounded_beside_a_held_reader() {
-        let (_root, store, _id, agent) = fresh().await;
-        let passed = || store.inner.db.test_passed();
-        let append = || store.append(agent.clone(), SessionEvent::AgentInterrupted);
-        let (held, holding) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let reads = store.test_reads();
-        let reader = std::thread::spawn(move || {
-            reads.read(|db| {
-                db.query_row("SELECT count(*) FROM entry", Vec::new(), |_| Ok(()))?;
-                held.send(()).unwrap();
-                let _ = released.recv();
-                Ok::<_, crate::db::DbError>(())
-            })
-        });
-        holding.recv().unwrap();
-        // Checkpoints keep running, and copy none of what the reader may still read.
-        let held_back = |frames: Option<db::Frames>| {
-            frames.is_some_and(|frames| frames.uncopied() > 2 * db::CHECKPOINT_FRAMES)
-        };
-        crate::tests::bounded(async {
-            while !held_back(passed()) {
-                append().await.unwrap();
-            }
-        })
-        .await;
-        release.send(()).unwrap();
-        reader.join().unwrap().unwrap();
-        // The next checkpoint copies the whole log, and a commit after it starts it over.
-        let restarted = |frames: Option<db::Frames>| {
-            frames.is_some_and(|frames| frames.logged < db::CHECKPOINT_FRAMES)
-        };
-        crate::tests::bounded(async {
-            while !restarted(passed()) {
-                append().await.unwrap();
-            }
-        })
-        .await;
     }
 
     /// Every writer failure stops the session: the command that met it reports
@@ -1834,9 +1747,10 @@ pub(crate) mod tests {
             assert!(same(store.append(agent, interrupted()).await.map(drop)));
             drop(reopened);
             if let Some(committed) = first {
-                let first = SessionStore::create(&sessions, "test".parse().unwrap(), None)
-                    .await
-                    .unwrap();
+                let first =
+                    SessionStore::create(&sessions, "test".parse().unwrap(), Schema::JOURNAL)
+                        .await
+                        .unwrap();
                 let refused = (!committed).then(|| refuse(&first, "BEFORE INSERT ON entry"));
                 if committed {
                     first.fail_committed().await;
@@ -1861,7 +1775,12 @@ pub(crate) mod tests {
                 self.0.notify_one();
             }
         }
-        let (_root, store, _, agent) = tests::fresh().await;
+        let TestRuntime {
+            root: _root,
+            store,
+            agent,
+            ..
+        } = TestRuntime::new().await;
         let mut waiting = Box::pin(store.until(Wait::on([], |_| None::<()>)));
         assert!(futures_util::poll!(&mut waiting).is_pending());
         store.drain().await.unwrap();
@@ -1908,6 +1827,7 @@ pub(crate) mod tests {
     async fn close_under_traffic_stops_admission_and_frees_the_lease_for_reopen() {
         let (root, store, id, agent) = fresh().await;
         let sessions = root.path().join("sessions");
+        let mut events = store.observe().updates;
         let traffic = async {
             for _ in 0..3 {
                 // Dropped waiters: one poll queues each commit ahead of `close`.
@@ -1921,17 +1841,19 @@ pub(crate) mod tests {
         let blob = blob.unwrap();
         closed.unwrap();
         let late = store.append(agent, SessionEvent::AgentCompleted).await;
-        assert!(matches!(
-            late,
-            Err(SessionError::Refused(SessionPhase::Closed))
-        ));
+        assert_matches!(late, Err(SessionError::Refused(SessionPhase::Closed)));
         let reopened = reopen(&sessions, id).await;
-        assert_eq!(reopened.records().len(), 5);
+        let records = reopened.records();
+        assert_eq!(records.len(), 5);
+        for committed in &records[2..] {
+            let crate::agent::RuntimeEvent::Record(record) = events.recv().await.unwrap().event
+            else {
+                panic!("only records were published");
+            };
+            assert_eq!(&record, committed);
+        }
         let late = store.store_blob(b"late").await;
-        assert!(matches!(
-            late,
-            Err(SessionError::Refused(SessionPhase::Closed))
-        ));
+        assert_matches!(late, Err(SessionError::Refused(SessionPhase::Closed)));
         let current = reopened.store_blob(b"current").await.unwrap();
         for (blob, bytes) in [
             (blob, b"racing".as_slice()),
@@ -2182,10 +2104,10 @@ pub(crate) mod tests {
                 SessionStore::open(&sessions, id, None).await,
                 Err(SessionError::UnsupportedVersion(_))
             ));
-            assert!(matches!(
+            assert_matches!(
                 SessionStore::read_records(&sessions, id).await,
                 Err(SessionError::UnsupportedVersion(_))
-            ));
+            );
             assert_eq!(std::fs::read(&path).unwrap(), archive);
         }
     }
@@ -2263,6 +2185,91 @@ pub(crate) mod tests {
                 ordinals.iter().copied().eq(0..ordinals.len() as u64),
                 "{ordinals:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_attachments_load_by_digest_and_reject_corrupt_blobs() {
+        use crate::{
+            media::{Attachment, AttachmentRef, ImageFormat, LoadedBlobs, MediaError},
+            provider::protocol::{Message, ToolResult, UserContent},
+        };
+        for durable in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let store = if durable {
+                SessionStore::create(root.path(), "test".parse().unwrap(), Schema::JOURNAL)
+                    .await
+                    .unwrap()
+            } else {
+                SessionStore::create_ephemeral(root.path(), Schema::JOURNAL)
+                    .await
+                    .unwrap()
+            };
+            let png = crate::tests::png(b"pixels").await;
+            let image = Attachment::Image {
+                file: Some("shot.png".into()),
+                image: png.clone(),
+            };
+            let AttachmentRef::Image(image) = store.store_attachment(&image).await.unwrap() else {
+                panic!("image attachment")
+            };
+            let text = Attachment::Text {
+                file: None,
+                content: "notes".into(),
+            };
+            let AttachmentRef::Text(text) = store.store_attachment(&text).await.unwrap() else {
+                panic!("text attachment")
+            };
+            assert_eq!(image.file.as_deref(), Some("shot.png"));
+            assert_eq!(image.format, ImageFormat::Png);
+            let mut request = ModelRequest {
+                context: crate::provider::protocol::entries(vec![
+                    Message::User(vec![UserContent::Attachment {
+                        attachment: AttachmentRef::Text(text.clone()),
+                    }]),
+                    Message::Tool(vec![ToolResult {
+                        call_id: "call".into(),
+                        name: "read".into(),
+                        result: serde_json::json!({}),
+                        images: vec![image.clone()],
+                        is_error: false,
+                    }]),
+                ]),
+                ..ModelRequest::test("fixture")
+            };
+            assert_matches!(request.blobs.get(&image.blob), Err(MediaError::NotLoaded));
+            let mut cache = LoadedBlobs::default();
+            store.load_blobs(&mut request, &mut cache).await.unwrap();
+            assert_eq!(request.blobs.text(&text).unwrap(), "notes");
+            assert_eq!(request.blobs.get(&image.blob).unwrap(), png.bytes());
+            assert!(!serde_json::to_string(&request).unwrap().contains("blobs"));
+            if durable {
+                // A store read verifies the bytes; cached blobs were verified when read.
+                for (bytes, reason) in [
+                    (Some(b"changed".to_vec()), BlobError::HashMismatch),
+                    (None, BlobError::Missing),
+                ] {
+                    store.corrupt_blob(image.blob.sha256, bytes);
+                    let mut uncached = LoadedBlobs::default();
+                    let error = store.load_blobs(&mut request, &mut uncached).await;
+                    assert_matches!(
+                        error.unwrap_err(),
+                        SessionError::Blob { digest, reason: found }
+                            if digest == image.blob.sha256 && found == reason
+                    );
+                    store.load_blobs(&mut request, &mut cache).await.unwrap();
+                }
+            } else {
+                // An ephemeral session keeps its journal and blobs in memory.
+                let mut files = std::fs::read_dir(store.directory()).unwrap();
+                assert!(files.next().is_none());
+            }
+            // A reused request and its cache keep only what its history still references.
+            request.context.pop();
+            store.load_blobs(&mut request, &mut cache).await.unwrap();
+            for blobs in [&request.blobs, &cache] {
+                assert_matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded));
+            }
         }
     }
 }

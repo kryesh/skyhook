@@ -315,6 +315,8 @@ pub(in crate::store) fn located(row: &Row, at: i32) -> Result<Location> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use serde_json::json;
 
     use super::{
@@ -391,9 +393,9 @@ mod tests {
             operation: text("GET /"),
             field: None,
         });
-        assert!(matches!(
+        assert_matches!(
             store.write(|db| location_id(db, &unknown)),
             Err(Error::UnknownInterface(name)) if name.as_str() == "admin-api"
-        ));
+        );
     }
 }

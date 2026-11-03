@@ -5,7 +5,7 @@ use std::path::Path;
 use libsql::{Row, Value};
 
 use crate::{
-    db::{Db, DbError, DbResult, Dictionaries, Schema, Seeding, Sql, SqlText, params},
+    db::{Db, DbError, DbResult, Dictionaries, Place, Seeding, Sql, SqlText, params},
     media::BlobDigest,
     session::{BlobError, MessageSeq, RecordSeq, RequestSeq},
 };
@@ -46,15 +46,8 @@ pub(crate) use resident::AgentRecords;
 pub(super) use resident::{Opening, agent, created_by, opening};
 pub use state::{SessionSummary, SessionTitle};
 pub(super) use state::{counters, host, root_prompt, summary, title};
-#[cfg(test)]
-pub(super) use wal::{CHECKPOINT_FRAMES, Frames};
-pub(super) use wal::{Checkpointer, Log};
+pub(super) use wal::Log;
 
-pub(super) const SCHEMA: Schema = Schema {
-    sql: include_str!("../schema.sql"),
-    application_id: 0x534B_5948,
-    user_version: 29,
-};
 /// Store `bytes` under `digest`, their digest, once.
 pub(super) fn insert_blob(db: &Db, digest: BlobDigest, bytes: &[u8]) -> DbResult<()> {
     db.execute(
@@ -116,60 +109,95 @@ sql_text!(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum OpenMode {
-    Create,
     Open,
     ReadOnly,
     /// Read-only, to a database its store opened: the store's writer checked it.
     Reader,
-    Memory,
-    /// A connection that only checkpoints the write-ahead log.
-    Checkpoint,
 }
 
-/// Tables outside the append-only ledger: blobs, captures, which are written before
-/// the output that references them is saved with its finish, and the jobs', requests'
-/// and agents' current state, which their folds write.
-const MUTABLE_TABLES: [&str; 9] = [
-    "blob",
-    "job_capture",
-    "job_capture_chunk",
-    "job_capture_staged",
-    "job_status",
-    "job_reply",
-    "request_state",
-    "agent_state",
-    "agent_context",
-];
+/// The journal's schema, serialized. The identity its header carries, which its DDL
+/// sets, is the one every session database must have.
+pub(super) const IMAGE: &[u8] = skyhook_schema::image!();
 
-/// Open the journal at `path`, filling or checking its dictionaries.
+/// A database's identity: its application id and user version.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    application: i64,
+    version: i64,
+}
+
+impl Identity {
+    /// The identity a serialized database's header holds.
+    fn of_image(image: &[u8]) -> Self {
+        let field = |offset: usize| {
+            image
+                .get(offset..offset + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, |bytes| i64::from(i32::from_be_bytes(bytes)))
+        };
+        Self {
+            application: field(68),
+            version: field(60),
+        }
+    }
+
+    fn of(db: &Db) -> DbResult<Self> {
+        let pragma = |name| {
+            db.query_row(format!("PRAGMA {name}"), Vec::new(), |row| {
+                Ok(row.get::<i64>(0)?)
+            })
+            .map(Option::unwrap_or_default)
+        };
+        Ok(Self {
+            application: pragma("application_id")?,
+            version: pragma("user_version")?,
+        })
+    }
+
+    /// Whether this build reads it, the journal image's.
+    fn supported(self) -> DbResult<()> {
+        match self == Self::of_image(IMAGE) {
+            true => Ok(()),
+            false => Err(DbError::Unsupported(self.version)),
+        }
+    }
+}
+
+/// A new session database at `place`, copied from `image`, the journal's schema image
+/// or one layered on it, once its identity is checked. Its dictionaries are filled in
+/// the transaction `tables` fills a product's in.
+pub(super) fn create(
+    place: Place<'_>,
+    image: &'static [u8],
+    tables: impl FnOnce(&Db) -> DbResult<()>,
+) -> DbResult<Db> {
+    Identity::of_image(image).supported()?;
+    let db = Db::create(place, image, |db| {
+        initialize(db, Seeding::Fill)?;
+        tables(db)
+    })?;
+    db.configure_writer()?;
+    Ok(db)
+}
+
+/// Open the journal at `path`, checking its identity and, unless `mode` is a
+/// [`Reader`](OpenMode::Reader), its dictionaries.
 pub(super) fn open(path: &Path, mode: OpenMode) -> DbResult<Db> {
     use crate::db::OpenMode as Shared;
-    let db = match mode {
-        OpenMode::Create => Db::open(path, Shared::Create, &SCHEMA, initialize)?,
-        OpenMode::Memory => Db::open(path, Shared::Memory, &SCHEMA, initialize)?,
-        OpenMode::Open => Db::open(path, Shared::Open, &SCHEMA, initialize)?,
-        OpenMode::ReadOnly => Db::open(path, Shared::ReadOnly, &SCHEMA, initialize)?,
-        OpenMode::Reader => {
-            let db = Db::connect(path, Shared::ReadOnly)?;
-            db.check_version(&SCHEMA)?;
-            db
-        }
-        OpenMode::Checkpoint => {
-            let db = Db::connect(path, Shared::Open)?;
-            db.check_version(&SCHEMA)?;
-            return Ok(db);
-        }
+    let shared = match mode {
+        OpenMode::Open => Shared::Open,
+        OpenMode::ReadOnly | OpenMode::Reader => Shared::ReadOnly,
     };
+    let db = Db::connect(path, shared)?;
+    Identity::of(&db)?.supported()?;
+    if mode != OpenMode::Reader {
+        initialize(&db, Seeding::Check)?;
+    }
     match mode {
         OpenMode::ReadOnly | OpenMode::Reader => {
             db.batch("PRAGMA foreign_keys = ON; PRAGMA query_only = 1;")?
         }
-        // The writer does not checkpoint either: the core syncs once per group of
-        // commands, and a thread of its own checkpoints.
-        _ => {
-            db.configure_writer()?;
-            db.batch("PRAGMA wal_autocheckpoint = 0;")?
-        }
+        OpenMode::Open => db.configure_writer()?,
     }
     Ok(db)
 }
@@ -179,29 +207,9 @@ pub(super) fn opener(mode: OpenMode) -> crate::db::Opener {
     std::sync::Arc::new(move |path| open(path, mode))
 }
 
-/// Fill or check the dictionaries; a new journal also gets its append-only triggers.
+/// Fill or check the dictionaries.
 fn initialize(db: &Db, seeding: Seeding) -> DbResult<()> {
-    codes::seed(&Dictionaries(db, seeding))?;
-    if let Seeding::Check = seeding {
-        return Ok(());
-    }
-    let tables = db.query(
-        "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
-        Vec::new(),
-        |row| Ok(row.get::<String>(0)?),
-    )?;
-    for table in tables {
-        if MUTABLE_TABLES.contains(&table.as_str()) {
-            continue;
-        }
-        db.batch(&format!(
-            "CREATE TRIGGER {table}_append_only_update BEFORE UPDATE ON {table} \
-             BEGIN SELECT RAISE(ABORT, '{table}: append-only'); END; \
-             CREATE TRIGGER {table}_append_only_delete BEFORE DELETE ON {table} \
-             BEGIN SELECT RAISE(ABORT, '{table}: append-only'); END;"
-        ))?;
-    }
-    Ok(())
+    codes::seed(&Dictionaries(db, seeding))
 }
 
 /// Freeze the shared connection before relinquishing ownership. SQLite also
@@ -307,13 +315,15 @@ impl SharedDb {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::Arc;
     // Schema-level rejection of inconsistent rows. The fixture also drives the
     // encode -> decode round trips in encode.rs.
     use serde_json::json;
 
     use super::{
-        Db, DbError, Encoder, OpenMode, decode_records, open, params, state::SessionSummary,
+        Db, DbError, Encoder, IMAGE, OpenMode, Place, create, decode_records, open, params,
+        state::SessionSummary,
     };
     use crate::{
         agent::TurnFailure,
@@ -343,7 +353,7 @@ mod tests {
     impl Fixture {
         pub(super) fn new() -> Self {
             Self {
-                db: open(std::path::Path::new(""), OpenMode::Memory).unwrap(),
+                db: create(Place::Memory, IMAGE, |_| Ok(())).unwrap(),
                 encoder: Encoder::default(),
                 records: Vec::new(),
                 session: SessionId::from_bytes([3; 16]),
@@ -441,20 +451,45 @@ mod tests {
             rows: &[&'static str],
             params: Vec<libsql::Value>,
         ) -> Result<(), DbError> {
-            self.db.atomic(|| {
-                self.db.execute(
-                    "INSERT INTO entry (seq, public_id, agent, agent_ordinal, created_millis, kind) \
-                     SELECT ?1, randomblob(16), a.id, \
-                       (SELECT count(*) FROM entry WHERE agent = a.id), 0, ?2 \
-                     FROM (SELECT min(id) AS id FROM agent) a",
-                    params![seq, kind],
-                )?;
-                for row in rows {
-                    let params = params![seq].into_iter().chain(params.iter().cloned());
-                    self.db.execute(*row, params.collect())?;
-                }
-                Ok(())
-            })
+            self.db.atomic(|| self.entry_rows(seq, kind, rows, params))
+        }
+
+        /// `file`'s rows, which `check` sees before they are rolled back.
+        fn filed<T>(
+            &self,
+            seq: u64,
+            kind: EntryKind,
+            rows: &[&'static str],
+            check: impl FnOnce() -> T,
+        ) -> T {
+            let filed = self
+                .db
+                .transaction(|| self.entry_rows(seq, kind, rows, Vec::new()));
+            filed.unwrap();
+            let seen = check();
+            self.db.rollback().unwrap();
+            seen
+        }
+
+        fn entry_rows(
+            &self,
+            seq: u64,
+            kind: EntryKind,
+            rows: &[&'static str],
+            params: Vec<libsql::Value>,
+        ) -> Result<(), DbError> {
+            self.db.execute(
+                "INSERT INTO entry (seq, public_id, agent, agent_ordinal, created_millis, kind) \
+                 SELECT ?1, randomblob(16), a.id, \
+                   (SELECT count(*) FROM entry WHERE agent = a.id), 0, ?2 \
+                 FROM (SELECT min(id) AS id FROM agent) a",
+                params![seq, kind],
+            )?;
+            for row in rows {
+                let params = params![seq].into_iter().chain(params.iter().cloned());
+                self.db.execute(*row, params.collect())?;
+            }
+            Ok(())
         }
 
         pub(super) fn decode(&self) -> Result<Vec<Arc<EventRecord>>, DbError> {
@@ -552,16 +587,65 @@ mod tests {
         ]);
         assert!(batch.is_err());
         fixture.assert_round_trip();
-        let foreign_keys = fixture
-            .db
-            .query("PRAGMA foreign_key_check", Vec::new(), |_| Ok(()))
-            .unwrap();
-        assert!(foreign_keys.is_empty());
+    }
+
+    /// A session created from the journal's image holds what its DDL creates, and only
+    /// an image of the journal's identity creates one.
+    #[test]
+    fn the_schema_image_holds_what_its_ddl_creates() {
+        let root = tempfile::tempdir().unwrap();
+        let ddl = Db::connect(&root.path().join("ddl.db"), crate::db::OpenMode::Create).unwrap();
+        ddl.atomic(|| {
+            ddl.batch(include_str!("../../../../skyhook-schema/src/session.sql"))?;
+            super::initialize(&ddl, crate::db::Seeding::Fill)
+        })
+        .unwrap();
+        let contents = |db: &Db| {
+            let rows = |sql: String| {
+                db.query(sql, Vec::new(), |row| {
+                    (0..row.column_count())
+                        .map(|column| Ok(row.get_value(column)?))
+                        .collect::<Result<Vec<_>, DbError>>()
+                })
+                .unwrap()
+            };
+            let schema = rows(
+                "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema \
+                               ORDER BY name"
+                    .into(),
+            );
+            let tables = schema
+                .iter()
+                .filter(|row| row[0] == libsql::Value::Text("table".into()))
+                .map(|row| match &row[1] {
+                    libsql::Value::Text(name) => {
+                        (name.clone(), rows(format!("SELECT * FROM {name}")))
+                    }
+                    other => panic!("{other:?} is not a name"),
+                })
+                .collect::<Vec<_>>();
+            let page_size = rows("PRAGMA page_size".into());
+            (schema, tables, page_size)
+        };
+        let path = root.path().join("session.db");
+        // Created as SQLite creates one, whatever more the umask would allow.
+        let umask = unsafe { libc::umask(0o002) };
+        let durable = create(Place::File(&path), IMAGE, |_| Ok(())).unwrap();
+        unsafe { libc::umask(umask) };
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mode = std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777;
+        assert_eq!(mode, 0o644, "{mode:o}");
+        let memory = create(Place::Memory, IMAGE, |_| Ok(())).unwrap();
+        assert!(contents(&ddl) == contents(&durable));
+        assert!(contents(&ddl) == contents(&memory));
+        // An image of another identity creates nothing.
+        let foreign = create(Place::Memory, &[0; 100], |_| Ok(()));
+        assert!(matches!(foreign, Err(DbError::Unsupported(0))));
     }
 
     #[test]
     fn an_opened_journal_must_hold_this_builds_dictionaries() {
-        // An extra row, a missing row, a changed flag and an unparsable capability.
+        // An extra row, a changed flag and an unparsable capability.
         for (table, tamper) in [
             (
                 "todo_status",
@@ -572,19 +656,13 @@ mod tests {
                 "INSERT INTO capability (name) VALUES ('not a name')",
             ),
             (
-                "todo_status",
-                "DROP TRIGGER todo_status_append_only_delete; \
-                 DELETE FROM todo_status WHERE name = 'pending'",
-            ),
-            (
                 "entry_kind",
-                "DROP TRIGGER entry_kind_append_only_update; \
-                 UPDATE entry_kind SET activity = 1 - activity WHERE name = 'agent_interrupted'",
+                "UPDATE entry_kind SET activity = 1 - activity WHERE name = 'agent_interrupted'",
             ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("session.db");
-            open(&path, OpenMode::Create)
+            create(Place::File(&path), IMAGE, |_| Ok(()))
                 .unwrap()
                 .batch(tamper)
                 .unwrap();
@@ -593,20 +671,6 @@ mod tests {
                 assert!(matches!(opened, Err(DbError::Dictionary(name)) if name == table));
             }
         }
-    }
-
-    #[test]
-    fn ledger_rows_are_append_only() {
-        let mut fixture = Fixture::new();
-        fixture.start("/w");
-        for sql in [
-            "UPDATE entry SET created_millis = 0",
-            "DELETE FROM agent_capability",
-            "UPDATE model_profile SET name = 'other'",
-        ] {
-            assert!(fixture.db.execute(sql, Vec::new()).is_err(), "{sql}");
-        }
-        fixture.assert_round_trip();
     }
 
     /// A row filed under an entry of another kind never decodes, and the session list
@@ -725,48 +789,45 @@ mod tests {
                 ],
             ),
         ];
+        // An interrupted turn with a mode and a model, and no title.
+        let mut fixture = Fixture::new();
+        let root = fixture.start("/w");
+        let look = ModeSelection {
+            name: "look".parse().unwrap(),
+            definition: Some(Mode {
+                capabilities: crate::tool::policy::CapabilitySet::empty()
+                    .try_into()
+                    .unwrap(),
+                instructions: None,
+                hint: None,
+            }),
+        };
+        fixture.one(
+            root.clone(),
+            SessionEvent::ModeChanged {
+                mode: look,
+                capabilities: crate::tool::policy::CapabilitySet::empty(),
+            },
+        );
+        let context = ModelContext::test(ModelPurpose::Agent, profile());
+        let context = fixture.one(root.clone(), SessionEvent::ModelContext { context });
+        let request = fixture.one(root.clone(), requested(context)).request();
+        fixture.one(root.clone(), attempt(request, 1));
+        let answer = Message::Assistant(vec![AssistantItem::text("answer", 0, "text")]);
+        fixture.one(root, SessionEvent::MessageCommitted { message: answer });
+        let summary = || super::state::summary(&fixture.db).unwrap();
+        let before = summary();
+        assert_eq!(before.stopped, Some(TurnFailure::Interrupted));
+        let shown = |summary: &SessionSummary| (summary.title.clone(), summary.mode.clone());
         for (kind, rows) in cases {
-            // An interrupted turn with a mode and a model, and no title.
-            let mut fixture = Fixture::new();
-            let root = fixture.start("/w");
-            let look = ModeSelection {
-                name: "look".parse().unwrap(),
-                definition: Some(Mode {
-                    capabilities: crate::tool::policy::CapabilitySet::empty()
-                        .try_into()
-                        .unwrap(),
-                    instructions: None,
-                    hint: None,
-                }),
-            };
-            fixture.one(
-                root.clone(),
-                SessionEvent::ModeChanged {
-                    mode: look,
-                    capabilities: crate::tool::policy::CapabilitySet::empty(),
-                },
-            );
-            let context = ModelContext::test(ModelPurpose::Agent, profile());
-            let context = fixture.one(root.clone(), SessionEvent::ModelContext { context });
-            let request = fixture.one(root.clone(), requested(context)).request();
-            fixture.one(root.clone(), attempt(request, 1));
-            let answer = Message::Assistant(vec![AssistantItem::text("answer", 0, "text")]);
-            fixture.one(root, SessionEvent::MessageCommitted { message: answer });
-            let summary = || super::state::summary(&fixture.db).unwrap();
-            let before = summary();
-            assert_eq!(before.stopped, Some(TurnFailure::Interrupted));
-            fixture.file(100, kind, rows, Vec::new()).unwrap();
-            assert!(
-                matches!(fixture.decode(), Err(DbError::Corrupt(_))),
-                "{rows:?}"
-            );
-            let after = summary();
-            let shown = |summary: &SessionSummary| (summary.title.clone(), summary.mode.clone());
+            let (decoded, after) = fixture.filed(100, kind, rows, || (fixture.decode(), summary()));
+            assert_matches!(decoded, Err(DbError::Corrupt(_)), "{rows:?}");
             assert_eq!(shown(&after), shown(&before), "{rows:?}");
             if kind != EntryKind::AgentFailed {
                 assert_eq!(after.stopped, before.stopped, "{rows:?}");
             }
         }
+        fixture.assert_round_trip();
     }
 
     /// Closing a session, which interrupts its agents, leaves its last activity

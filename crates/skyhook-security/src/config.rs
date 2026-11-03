@@ -226,9 +226,10 @@ impl SecurityConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use serde_json::json;
-    use skyhook::mcp::config::RawMcpServerConfig;
 
     fn shared() -> Config {
         Config::from_yaml(
@@ -311,7 +312,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn explicit_file_records_model_source_normalizes_mcp_and_replaces_named_modes() {
+    async fn explicit_file_records_model_source_and_replaces_named_modes() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("selected.yaml");
         std::fs::write(
@@ -320,42 +321,57 @@ providers:
 models:
   test/missing:
     roles: [validator]
-mcp:
-  research:
-    transport: stdio
-    start_command: [research-server]
-    cwd: ../server
 modes:
   report:
     capabilities: [read, targets]
+mcp:
+  security:
+    transport: stdio
+    start_command: [/bin/true]
 "#,
         )
         .unwrap();
-        let security = SecurityConfig::resolve(Path::new("/workspace-is-not-read"), Some(&path))
-            .await
-            .unwrap()
-            .config;
-        let raw = RawMcpServerConfig::from(security.mcp["research"].clone());
-        assert_eq!(raw.cwd, Some(root.path().join("../server")));
-        let report = &security.modes["report"];
+        let mut security =
+            SecurityConfig::resolve(Path::new("/workspace-is-not-read"), Some(&path))
+                .await
+                .unwrap()
+                .config;
+        let modes = presets::configured(&security.modes);
         assert_eq!(
-            report.capabilities.iter().cloned().collect::<Vec<_>>(),
+            modes["report"]
+                .capabilities
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             [
                 skyhook::tool::policy::Capability::Read,
                 skyhook::tool::policy::Capability::Targets
             ]
         );
-        assert!(presets::configured(&security.modes).contains_key("orchestrate"));
+        assert!(modes.contains_key("orchestrate"));
         let mut config = shared();
         let before = serde_json::to_value(&config).unwrap();
         let error = security.apply(&mut config).unwrap_err();
-        assert!(matches!(&error, Error::ModelAssignment { source, .. } if source == &path));
-        assert_eq!(serde_json::to_value(config).unwrap(), before);
+        assert_matches!(&error, Error::ModelAssignment { source, .. } if source == &path);
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        security.models.clear();
+        security.apply(&mut config).unwrap();
+        assert!(config.mcp.contains_key("security"));
     }
 
     #[test]
     fn policy_defaults_and_cli_precedence() {
         let mut config = SecurityConfig::default();
+        assert_eq!(config.run_options(None, None), RunOptions::default());
+        config.shortlist = Some(Severity::High);
+        config.workers = NonZeroU16::new(3);
+        let options = |shortlist, workers| {
+            let options = config.run_options(shortlist, workers);
+            (options.threshold, options.workers.get())
+        };
+        assert_eq!(options(None, None), (Severity::High, 3));
+        let flags = options(Some(Severity::Medium), NonZeroU16::new(2));
+        assert_eq!(flags, (Severity::Medium, 2));
         assert_eq!(config.live_policy(None, false), LivePolicy::Ask);
         assert_eq!(config.live_policy(None, true), LivePolicy::No);
         config.live = Some(LivePolicy::Ask);

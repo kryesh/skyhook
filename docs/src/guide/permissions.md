@@ -25,8 +25,8 @@ does not exist, the operation is refused without a prompt, exactly as if the use
 unless the approval policy would allow the operation without asking; then it fails as not found.
 A missing path inside the workspace fails before approval. On the session host, a child agent's
 `workspace` is checked like a path when the child starts: outside the workspace, it follows the
-rules above; inside, it need not exist yet, and a write that creates parent directories can create
-it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
+rules above; inside, a missing one is created before the child starts, which needs the
+launching agent's `write` capability and is authorized as a write to it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
 `workspace` resolves to, and its relative paths resolve from there. On the session host, its job
 shows the `workspace` joined to the agent's workspace, with any `..` kept. `remove` refuses the root workspace, the agent's workspace, and any directory
 containing either.

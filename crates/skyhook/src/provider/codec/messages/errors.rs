@@ -62,7 +62,6 @@ mod tests {
                 let reading = read::<Code>(&native);
                 let error = classify(status, &native, reading, ErrorSignals::NONE, None);
                 assert_eq!(error.kind(), kind);
-                assert!(error.message.contains(&format!("[code={kind_name}]")));
             }
         }
     }

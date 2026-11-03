@@ -9,6 +9,8 @@ CREATE TABLE task_phase(
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE location_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE trust_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE state_scope(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE state_access(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE premise_scope(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE premise_status(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE flaw_status(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -22,6 +24,7 @@ CREATE TABLE artifact_role(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE event_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE event_effect(name TEXT PRIMARY KEY, rank INTEGER NOT NULL UNIQUE) STRICT, WITHOUT ROWID;
 CREATE TABLE live_policy_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE bearing_role(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 -- The session is the run: one row, written as the session opens, with the live policy it keeps.
 CREATE TABLE run(
@@ -115,8 +118,19 @@ CREATE TABLE event_node(
 -- down a node's effects never visits its tests. It holds the kind so that it alone answers one.
 CREATE INDEX event_node_effect ON event_node(node,effect,event,kind) WHERE kind!='tested';
 CREATE INDEX event_node_event ON event_node(event,node);
+-- Each node a merge retargets: the one it retires and each one merged into that before, which it
+-- repoints, with the node each is merged into from then.
+CREATE TABLE node_merge(
+    node INTEGER NOT NULL,
+    event INTEGER NOT NULL REFERENCES event(id),
+    kind TEXT NOT NULL,
+    survivor INTEGER NOT NULL,
+    PRIMARY KEY(node,event),
+    FOREIGN KEY(node,kind) REFERENCES node(id,kind),
+    FOREIGN KEY(survivor,kind) REFERENCES node(id,kind)
+) STRICT, WITHOUT ROWID;
 
--- Sources, paths and components recorded in error are retracted, and stand in nothing derived.
+-- States, paths and components recorded in error are retracted, and stand in nothing derived.
 CREATE TABLE component(
     node INTEGER PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'component' CHECK(kind='component'),
@@ -135,15 +149,30 @@ CREATE TABLE component_interface(
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX component_interface_component ON component_interface(component,interface);
 
--- One source per location. A merged source keeps its node but not this row, so its location is
--- free for a live source.
-CREATE TABLE source(
+-- The storage one invariant relates, by where it lives.
+CREATE TABLE state(
     node INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL DEFAULT 'source' CHECK(kind='source'),
+    kind TEXT NOT NULL DEFAULT 'state' CHECK(kind='state'),
+    scope TEXT NOT NULL REFERENCES state_scope(name),
+    status TEXT NOT NULL DEFAULT 'recorded' REFERENCES inventory_status(name),
+    UNIQUE(node,scope),
+    FOREIGN KEY(node,kind) REFERENCES node(id,kind)
+) STRICT;
+-- An input state's trust and the read defining it, one input state per location. A merged one
+-- keeps its node but not this row, so its location is free for a live one.
+CREATE TABLE input_state(
+    state INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL DEFAULT 'input' CHECK(scope='input'),
     location INTEGER NOT NULL UNIQUE REFERENCES location(id),
     trust TEXT NOT NULL REFERENCES trust_kind(name),
-    status TEXT NOT NULL DEFAULT 'recorded' REFERENCES inventory_status(name),
-    FOREIGN KEY(node,kind) REFERENCES node(id,kind)
+    FOREIGN KEY(state,scope) REFERENCES state(node,scope)
+) STRICT;
+-- The event that last recorded an instance or handed state's check across calls done.
+CREATE TABLE state_check(
+    state INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK(scope IN ('instance','handed')),
+    event INTEGER NOT NULL REFERENCES event(id),
+    FOREIGN KEY(state,scope) REFERENCES state(node,scope)
 ) STRICT;
 
 -- The swept unit.
@@ -165,12 +194,15 @@ CREATE TABLE path_step(
     PRIMARY KEY(path,position)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX path_step_component ON path_step(component,path);
-CREATE TABLE path_source(
+-- Where a path's flow reads or writes a state.
+CREATE TABLE path_state(
     path INTEGER NOT NULL REFERENCES path(node),
-    source INTEGER NOT NULL REFERENCES source(node),
-    PRIMARY KEY(path,source)
+    state INTEGER NOT NULL REFERENCES state(node),
+    access TEXT NOT NULL REFERENCES state_access(name),
+    location INTEGER NOT NULL REFERENCES location(id),
+    PRIMARY KEY(path,state,access,location)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX path_source_source ON path_source(source,path);
+CREATE INDEX path_state_state ON path_state(state,path);
 -- The logic a path's flow relies on.
 CREATE TABLE path_premise(
     path INTEGER NOT NULL REFERENCES path(node),
@@ -179,51 +211,86 @@ CREATE TABLE path_premise(
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX path_premise_premise ON path_premise(premise,path);
 
--- `decided` is the latest event setting its status, a restatement included.
 CREATE TABLE premise(
     node INTEGER PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'premise' CHECK(kind='premise'),
     scope TEXT NOT NULL REFERENCES premise_scope(name),
     location INTEGER REFERENCES location(id),
-    status TEXT NOT NULL DEFAULT 'undecided' REFERENCES premise_status(name),
-    decided INTEGER REFERENCES event(id),
     FOREIGN KEY(node,kind) REFERENCES node(id,kind)
 ) STRICT;
+-- Every status set on a premise, by the event setting it, a restatement included, and whether
+-- the work owning it set it: a code premise's settle, a deployment premise's answer outside
+-- every task. Each result table below records its owner the same way, decided at the write.
+CREATE TABLE premise_decision(
+    event INTEGER PRIMARY KEY REFERENCES event(id),
+    premise INTEGER NOT NULL REFERENCES premise(node),
+    status TEXT NOT NULL REFERENCES premise_status(name),
+    owned INTEGER NOT NULL CHECK(owned IN (0,1))
+) STRICT;
+CREATE INDEX premise_decision_premise ON premise_decision(premise,event);
+-- A premise that holds only if `rests_on` does: a general claim its settling relied on.
+CREATE TABLE premise_basis(
+    premise INTEGER NOT NULL REFERENCES premise(node),
+    rests_on INTEGER NOT NULL REFERENCES premise(node),
+    PRIMARY KEY(premise,rests_on),
+    CHECK(premise!=rests_on)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX premise_basis_rests_on ON premise_basis(rests_on,premise);
 
--- `judged` is the latest event setting its status, a restatement included.
 CREATE TABLE flaw(
     node INTEGER PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'flaw' CHECK(kind='flaw'),
     component INTEGER NOT NULL REFERENCES component(node),
     location INTEGER NOT NULL REFERENCES location(id),
     cwe INTEGER CHECK(cwe BETWEEN 1 AND 4294967295),
-    status TEXT NOT NULL DEFAULT 'suspected' REFERENCES flaw_status(name),
-    judged INTEGER REFERENCES event(id),
     FOREIGN KEY(node,kind) REFERENCES node(id,kind)
 ) STRICT;
 CREATE INDEX flaw_component ON flaw(component,node);
+-- Every status set on a flaw, by the event setting it, a restatement included.
+CREATE TABLE flaw_judgement(
+    event INTEGER PRIMARY KEY REFERENCES event(id),
+    flaw INTEGER NOT NULL REFERENCES flaw(node),
+    status TEXT NOT NULL REFERENCES flaw_status(name),
+    owned INTEGER NOT NULL CHECK(owned IN (0,1))
+) STRICT;
+CREATE INDEX flaw_judgement_flaw ON flaw_judgement(flaw,event);
 CREATE TABLE flaw_premise(
     flaw INTEGER NOT NULL REFERENCES flaw(node),
     premise INTEGER NOT NULL REFERENCES premise(node),
     PRIMARY KEY(flaw,premise)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX flaw_premise_premise ON flaw_premise(premise,flaw);
+-- The states a flaw leaves wrong.
+CREATE TABLE flaw_state(
+    flaw INTEGER NOT NULL REFERENCES flaw(node),
+    state INTEGER NOT NULL REFERENCES state(node),
+    PRIMARY KEY(flaw,state)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX flaw_state_state ON flaw_state(state,flaw);
 
--- An ordered flaw chain through the actions of one scenario, with its assessment and verdict in
--- place. Each result names the event that recorded it; its rationale is that event's note.
+-- An ordered flaw chain through the actions of one scenario.
 CREATE TABLE candidate(
     node INTEGER PRIMARY KEY,
     kind TEXT NOT NULL DEFAULT 'candidate' CHECK(kind='candidate'),
-    vector TEXT,
-    severity TEXT REFERENCES severity_kind(name),
-    assessed INTEGER REFERENCES event(id),
-    verdict TEXT REFERENCES verdict_kind(name),
-    reviewed INTEGER REFERENCES event(id),
-    CHECK((vector IS NULL)=(severity IS NULL) AND (vector IS NULL)=(assessed IS NULL)),
-    CHECK((verdict IS NULL)=(reviewed IS NULL)),
     FOREIGN KEY(node,kind) REFERENCES node(id,kind)
 ) STRICT;
-CREATE INDEX candidate_validated ON candidate(node) WHERE verdict='validated';
+-- Every assessment and verdict of a candidate, by the event recording it, whose note is its
+-- rationale.
+CREATE TABLE candidate_assessment(
+    event INTEGER PRIMARY KEY REFERENCES event(id),
+    candidate INTEGER NOT NULL REFERENCES candidate(node),
+    vector TEXT NOT NULL,
+    severity TEXT NOT NULL REFERENCES severity_kind(name),
+    owned INTEGER NOT NULL CHECK(owned IN (0,1))
+) STRICT;
+CREATE INDEX candidate_assessment_candidate ON candidate_assessment(candidate,event);
+CREATE TABLE candidate_verdict(
+    event INTEGER PRIMARY KEY REFERENCES event(id),
+    candidate INTEGER NOT NULL REFERENCES candidate(node),
+    verdict TEXT NOT NULL REFERENCES verdict_kind(name),
+    owned INTEGER NOT NULL CHECK(owned IN (0,1))
+) STRICT;
+CREATE INDEX candidate_verdict_candidate ON candidate_verdict(candidate,event);
 -- The paths a candidate's scenario performs, in order, at least one: the first is where the
 -- attacker starts. A path may repeat, as in a race with itself.
 CREATE TABLE candidate_action(
@@ -252,6 +319,14 @@ CREATE TABLE finding(
     reported INTEGER NOT NULL REFERENCES event(id),
     FOREIGN KEY(node,kind) REFERENCES node(id,kind)
 ) STRICT;
+-- A root group's reportable members as an event of its report work left them: the scenarios a
+-- report write covered, or a report task was offered as it began.
+CREATE TABLE report_scenario(
+    event INTEGER NOT NULL REFERENCES event(id),
+    root INTEGER NOT NULL REFERENCES flaw(node),
+    candidate INTEGER NOT NULL REFERENCES candidate(node),
+    PRIMARY KEY(event,root,candidate)
+) STRICT, WITHOUT ROWID;
 
 -- Evidence naming an environment is an observation made there.
 CREATE TABLE evidence(
@@ -284,20 +359,17 @@ CREATE TABLE environment_interface(
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX environment_interface_interface ON environment_interface(interface,environment);
 
--- A test's account is its event's note. `verdict` is the candidate's verdict it tested: the
--- test stands only while that verdict is the candidate's latest.
+-- A test's account is its event's note.
 CREATE TABLE test(
     id INTEGER PRIMARY KEY,
     candidate INTEGER NOT NULL REFERENCES candidate(node),
     environment INTEGER REFERENCES environment(id),
     result TEXT NOT NULL REFERENCES test_result(name),
-    verdict INTEGER REFERENCES event(id),
     event INTEGER NOT NULL UNIQUE REFERENCES event(id)
 ) STRICT;
 CREATE INDEX test_candidate ON test(candidate,id);
--- The tests that settle or decline, newest per candidate and per verdict tested.
+-- The tests that settle or decline, newest per candidate.
 CREATE INDEX test_settled ON test(candidate,id) WHERE result!='pending';
-CREATE INDEX test_verdict ON test(candidate,verdict,id) WHERE result!='pending';
 -- A file below the run's artifacts directory, its digest taken when the test was recorded.
 CREATE TABLE test_artifact(
     test INTEGER NOT NULL REFERENCES test(id),
@@ -331,12 +403,39 @@ CREATE TABLE task_node(
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX task_node_subject ON task_node(phase,node,basis);
 CREATE INDEX task_node_node ON task_node(node,task);
--- The tasks an event's agent and the agents above it held when it was recorded: the work it is
--- part of.
+-- The tasks of the outermost agent, the event's own or one above it, holding any when the event
+-- was recorded: the work it is part of. A task begun beneath another belongs to the enclosing one.
 CREATE TABLE event_task(
     event INTEGER NOT NULL REFERENCES event(id),
     task INTEGER NOT NULL REFERENCES task(id),
     PRIMARY KEY(event,task)
+) STRICT, WITHOUT ROWID;
+-- The work each event was recorded within, fixed as it is recorded: each subject of the tasks it
+-- is part of, in their phase, with the latest basis they began on. A task on a node merged away
+-- by then is on the node it lived on at the event too: the one the latest merge retargeting it
+-- before then pointed it at. A merge is within none: it retires one node into another, which
+-- work on the survivor rests on whoever made it.
+CREATE TABLE event_work(
+    event INTEGER NOT NULL REFERENCES event(id),
+    phase TEXT NOT NULL,
+    node INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    basis INTEGER NOT NULL REFERENCES event(id),
+    PRIMARY KEY(event,phase,node),
+    FOREIGN KEY(node,kind) REFERENCES node(id,kind),
+    FOREIGN KEY(phase,kind) REFERENCES task_phase(name,subject)
+) STRICT, WITHOUT ROWID;
+-- The events of each phase's bearing on a subject that its own effects decide, fixed as each is
+-- recorded, but those recorded within that phase's work on it: see `bearing`.
+CREATE TABLE event_bearing(
+    node INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    event INTEGER NOT NULL REFERENCES event(id),
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL REFERENCES bearing_role(name),
+    PRIMARY KEY(node,phase,event),
+    FOREIGN KEY(node,kind) REFERENCES node(id,kind),
+    FOREIGN KEY(phase,kind) REFERENCES task_phase(name,subject)
 ) STRICT, WITHOUT ROWID;
 
 CREATE VIEW candidate_root AS

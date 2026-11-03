@@ -13,8 +13,12 @@ pub(crate) const DEFAULT_LIMIT: PageLimit = PageLimit::new::<100>();
 pub(crate) const MAX_LIMIT: usize = 1000;
 /// The most context lines a match carries.
 pub(crate) const MAX_CONTEXT: usize = 20;
+/// Why a query did not parse, with the filter syntax models most often mistake.
+const QUERY_SYNTAX: &str = "query is not a JSONPath (RFC 9535) query. Filters are written \
+    $[?search(@.title, '[Ee]ncoder')]: match() tests a whole string and search() any part of it, \
+    and comparisons read @.count > 2 or @.state == 'open', joined with && and ||.";
 /// Bounds what compiling an untrusted pattern may allocate.
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+pub const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// How many lines, values, matches or listed jobs one page returns.
 pub type PageLimit = Bounded<1, { MAX_LIMIT as u64 }>;
@@ -31,7 +35,6 @@ impl PageLimit {
 pub(crate) struct Selectors {
     pub(crate) start: Option<usize>,
     pub(crate) offset: Option<usize>,
-    pub(crate) index: Option<usize>,
     pub(crate) context: Option<usize>,
 }
 
@@ -40,20 +43,18 @@ impl Selectors {
         let Paging {
             start,
             offset,
-            index,
             context,
         } = self.into();
-        start.or(offset).or(index).or(context).is_some()
+        start.or(offset).or(context).is_some()
     }
 }
 
 /// The selectors that differ from their defaults. One restating its default
-/// selects nothing, so a model that fills in schema defaults can page either
-/// kind of field, or list jobs.
+/// selects nothing, so a model that fills in schema defaults can query JSON, or
+/// list jobs.
 struct Paging {
     start: Option<usize>,
     offset: Option<usize>,
-    index: Option<usize>,
     context: Option<usize>,
 }
 
@@ -63,9 +64,30 @@ impl From<Selectors> for Paging {
         Self {
             start: chosen(selectors.start, 1),
             offset: chosen(selectors.offset, 0),
-            index: chosen(selectors.index, 0),
             context: chosen(selectors.context, 0),
         }
+    }
+}
+
+/// What `start` counts: the values a page names, as the page a position
+/// continues named them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PageUnit {
+    Lines,
+    Elements,
+    Members,
+    Matches,
+}
+
+impl std::fmt::Display for PageUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lines => "lines",
+            Self::Elements => "elements",
+            Self::Members => "members",
+            Self::Matches => "matches",
+        })
     }
 }
 
@@ -74,12 +96,12 @@ pub struct OutputArgs {
     pub job: JobId,
     pub field: Option<FieldPointer>,
     pub start: Option<usize>,
+    /// The unit of the page `start` continues; JSON pages past the first need it.
+    pub unit: Option<PageUnit>,
     pub limit: Option<PageLimit>,
     pub pattern: Option<String>,
     pub context: Option<usize>,
     pub offset: Option<usize>,
-    /// Zero-based first element or member of a JSON field, or first match.
-    pub index: Option<usize>,
     /// JSONPath (RFC 9535) query over a JSON field, rooted at it.
     pub query: Option<String>,
 }
@@ -90,11 +112,11 @@ impl OutputArgs {
             job,
             field: None,
             start: None,
+            unit: None,
             limit: None,
             pattern: None,
             context: None,
             offset: None,
-            index: None,
             query: None,
         }
     }
@@ -105,10 +127,10 @@ impl OutputArgs {
     pub fn selection(&self) -> OutputSelection {
         if self.field.is_some()
             || self.start.is_some()
+            || self.unit.is_some()
             || self.limit.is_some()
             || self.pattern.is_some()
             || self.offset.is_some()
-            || self.index.is_some()
             || self.query.is_some()
         {
             OutputSelection::Explicit
@@ -124,7 +146,6 @@ impl OutputArgs {
         let paging = Paging::from(Selectors {
             start: self.start,
             offset: self.offset,
-            index: self.index,
             context: self.context,
         });
         if paging.start == Some(0) || paging.context.is_some_and(|context| context > MAX_CONTEXT) {
@@ -135,37 +156,39 @@ impl OutputArgs {
         if paging.context.is_some() && self.pattern.is_none() {
             return Err(ToolError::invalid_arguments("context requires pattern"));
         }
-        let lines = Lines {
-            matcher: self.pattern.as_deref().map(pattern_matcher).transpose()?,
-            context: paging.context.unwrap_or(0),
-            start: paging.start.unwrap_or(1),
-            offset: paging.offset.unwrap_or(0),
-        };
-        let text = lines.matcher.is_some() || paging.start.is_some() || paging.offset.is_some();
-        let position = match (&self.query, paging.index) {
-            (Some(_), _) | (None, Some(_)) if text => {
+        let start = paging.start.unwrap_or(1);
+        let position = match &self.query {
+            Some(_)
+                if self.pattern.is_some()
+                    || paging.offset.is_some()
+                    || paging.context.is_some() =>
+            {
                 return Err(ToolError::invalid_arguments(
-                    "index and query select JSON; start, offset, pattern and context page text",
+                    "query selects JSON matches: page them with start and limit, not pattern, offset or context",
                 ));
             }
-            (Some(query), index) => {
+            Some(query) => {
                 let path = serde_json_path::JsonPath::parse(query).map_err(|_| {
-                    ToolError::invalid_arguments("query is not a JSONPath (RFC 9535) query")
+                    ToolError::invalid_arguments(QUERY_SYNTAX)
                         .operation(Operation::Validate, Subject::argument(["query"]))
                 })?;
                 Position::Query {
                     path: Arc::new(path),
-                    index: index.unwrap_or(0),
+                    start,
                 }
             }
-            (None, Some(index)) => Position::Index(index),
-            (None, None) if text => Position::Lines(lines),
-            (None, None) => Position::Unspecified,
+            None => Position::Page(Page {
+                matcher: self.pattern.as_deref().map(pattern_matcher).transpose()?,
+                context: paging.context.unwrap_or(0),
+                start,
+                offset: paging.offset.unwrap_or(0),
+            }),
         };
         Ok(Query {
             field: self.field.clone().unwrap_or_else(FieldPointer::result),
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).get(),
             position,
+            unit: self.unit,
         })
     }
 }
@@ -176,31 +199,30 @@ pub(super) struct Query {
     pub(super) field: FieldPointer,
     pub(super) limit: usize,
     pub(super) position: Position,
+    unit: Option<PageUnit>,
 }
 
 #[derive(Clone)]
 pub(super) enum Position {
-    /// The field's first page, in whichever unit it has.
-    Unspecified,
-    Lines(Lines),
-    Index(usize),
-    /// A page of a JSONPath query's matches.
+    Page(Page),
+    /// A page of a JSONPath query's matches, from the one-based `start`.
     Query {
         path: Arc<serde_json_path::JsonPath>,
-        index: usize,
+        start: usize,
     },
 }
 
-/// A position within text: a line and byte offset, optionally searching.
+/// A one-based first line of text, or element or member of JSON, optionally
+/// filtered by `matcher`. `context` and `offset` apply to text only.
 #[derive(Clone)]
-pub(super) struct Lines {
+pub(super) struct Page {
     pub(super) matcher: Option<Arc<RegexMatcher>>,
     pub(super) context: usize,
     pub(super) start: usize,
     pub(super) offset: usize,
 }
 
-impl Default for Lines {
+impl Default for Page {
     fn default() -> Self {
         Self {
             matcher: None,
@@ -212,40 +234,44 @@ impl Default for Lines {
 }
 
 impl Query {
-    /// The text page selected, unless the query selects JSON by index or query.
-    pub(super) fn lines(&self) -> Option<Selection> {
-        match &self.position {
-            Position::Index(_) | Position::Query { .. } => None,
-            Position::Lines(lines) => Some(self.selection(lines)),
-            Position::Unspecified => Some(self.text()),
+    /// Whether a page counting `unit` may start where the query asks. A position
+    /// past the first continues a page, and holds only in that page's unit: a
+    /// field read as lines while its job ran can be JSON once it finished, so a
+    /// JSON page needs the unit named, and a named unit must match.
+    pub(super) fn starts_in(&self, unit: PageUnit) -> Result<(), ToolError> {
+        let start = match &self.position {
+            Position::Page(page) => page.start,
+            Position::Query { start, .. } => *start,
+        };
+        let restart = "a field read as lines while its job ran can be JSON once it finished, \
+            and no line position applies to it: read it from start 1";
+        match self.unit {
+            _ if start == 1 => Ok(()),
+            Some(given) if given == unit => Ok(()),
+            None if unit == PageUnit::Lines => Ok(()),
+            Some(given) => Err(ToolError::invalid_arguments(format!(
+                "start continues {given}, but this field pages {unit}: {restart}"
+            ))),
+            None => Err(ToolError::invalid_arguments(format!(
+                "start past 1 on a JSON field continues a page: pass the unit it named ({unit} here); {restart}"
+            ))),
         }
     }
 
-    /// The first text page, for fields that have no page of either unit yet.
+    /// The text page selected: a JSONPath query's reads text from its first line.
     pub(super) fn text(&self) -> Selection {
-        match &self.position {
-            Position::Lines(lines) => self.selection(lines),
-            _ => self.selection(&Lines::default()),
-        }
-    }
-
-    fn selection(&self, lines: &Lines) -> Selection {
+        let first = Page::default();
+        let page = match &self.position {
+            Position::Page(page) => page,
+            Position::Query { .. } => &first,
+        };
         Selection {
             field: self.field.clone(),
-            matcher: lines.matcher.clone(),
-            context: lines.context,
-            start: lines.start,
-            offset: lines.offset,
+            matcher: page.matcher.clone(),
+            context: page.context,
+            start: page.start,
+            offset: page.offset,
             limit: self.limit,
-        }
-    }
-
-    /// The first element or member selected, unless the query selects text or matches.
-    pub(super) fn index(&self) -> Option<usize> {
-        match self.position {
-            Position::Index(index) => Some(index),
-            Position::Unspecified => Some(0),
-            Position::Lines(_) | Position::Query { .. } => None,
         }
     }
 }

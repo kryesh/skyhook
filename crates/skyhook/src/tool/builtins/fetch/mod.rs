@@ -70,8 +70,11 @@ struct FetchArgs {
     auth: Option<Auth>,
     #[serde(default)]
     response_format: ResponseFormat,
+    /// Offered only with the write capability.
+    #[schemars(skip)]
     save_to: Option<String>,
     #[serde(default)]
+    #[schemars(skip)]
     overwrite: bool,
     /// Seconds.
     #[serde(default = "default_timeout")]
@@ -207,6 +210,8 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 }
                 paths
             })
+            .conditional_input("save_to", Capability::Write, serde_json::json!({"type": ["string", "null"]}))
+            .conditional_input("overwrite", Capability::Write, serde_json::json!({"type": "boolean", "default": false}))
             .placement(ToolPlacement::TargetedWorkspace).background().named(),
         |args: FetchArgs| FetchPlan::try_from(args),
         |plan| Invocation::new(|context| fetch(context, plan)),
@@ -232,7 +237,7 @@ async fn fetch(context: LocalContext, plan: FetchPlan) -> Result<ProducedOutput,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::http::transport::tests::{Plan, Server, reply};
+    use crate::tests::{Plan, Server, reply};
     use crate::tool::ToolRegistryBuilder;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
@@ -266,6 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_bodies_are_read_as_values_unless_text_is_requested() {
+        const UNREADABLE: &str = "<html><body><div id='app'></div></body></html>";
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
         let (json, html) = (
@@ -297,6 +303,12 @@ mod tests {
                 json,
                 "{\"a\": [1, 2]}\n",
                 json!({"kind":"text","text":"{\"a\": [1, 2]}\n"}),
+            ),
+            (
+                "auto",
+                html,
+                UNREADABLE,
+                json!({"kind":"unreadable", "reason":"no_text", "text":UNREADABLE}),
             ),
         ] {
             let (url, task) = server(vec![reply("200 OK", headers, body)]).await;

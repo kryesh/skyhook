@@ -3,6 +3,7 @@
 use super::*;
 use crate::page::{
     Block, Cell, Detail, Disclosed, Fact, Page, Panel, Section, Stage, StageState, Toggle, Tone,
+    Weight,
 };
 
 /// One laid-out row, what clicking it opens, and which of its spans are spinners: the
@@ -32,12 +33,21 @@ fn style(tone: Tone) -> Style {
         Tone::Accent => ui.accent,
         Tone::Success => ui.success,
         Tone::Warning => ui.warning,
+        Tone::Caution => ui.caution,
         Tone::Error => ui.error,
     })
 }
 
+/// A cell's tone, drawn bold when it is strong.
+fn cell_style(cell: &Cell) -> Style {
+    match cell.weight {
+        Weight::Regular => style(cell.tone),
+        Weight::Strong => style(cell.tone).add_modifier(Modifier::BOLD),
+    }
+}
+
 fn span(cell: &Cell) -> Span<'static> {
-    Span::styled(model::clean(&cell.text), style(cell.tone))
+    Span::styled(model::clean(&cell.text), cell_style(cell))
 }
 
 fn muted(text: impl Into<String>) -> Span<'static> {
@@ -282,7 +292,7 @@ fn panel_box(panel: &Panel, width: usize) -> Vec<Line<'static>> {
             }
             spans.push(row.values.get(column).map_or_else(
                 || Span::raw(" ".repeat(*width)),
-                |cell| Span::styled(right_aligned(&cell.text, *width), style(cell.tone)),
+                |cell| Span::styled(right_aligned(&cell.text, *width), cell_style(cell)),
             ));
         }
         lines.push(boxed(Line::from(spans), width));
@@ -477,7 +487,7 @@ fn hard_rows(cells: &[Cell]) -> Vec<Line<'static>> {
             if part > 0 {
                 rows.push(Line::default());
             }
-            let text = Span::styled(model::clean(text), style(cell.tone));
+            let text = Span::styled(model::clean(text), cell_style(cell));
             rows.last_mut().expect("a row").spans.push(text);
         }
     }

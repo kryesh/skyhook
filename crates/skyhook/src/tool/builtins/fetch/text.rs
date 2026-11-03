@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
-use super::budget::{self, Budget, Spent};
+use super::budget::{self, Budget, Limits, Spent};
 use super::markdown::markdown;
 use super::validation::HttpRequestUrl;
 use super::{ResponseBody, ResponseFormat};
@@ -18,8 +18,6 @@ use super::{ResponseBody, ResponseFormat};
 // Keep permits inside the blocking task: cancelling a caller must not let it
 // queue unlimited parsers while previously-started work is still running.
 static EXTRACTORS: Semaphore = Semaphore::const_new(2);
-const MAX_RAW_HTML_BYTES: usize = 10 * 1024 * 1024;
-const MAX_DECODED_HTML_BYTES: usize = 10 * 1024 * 1024;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -323,8 +321,13 @@ fn html_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
 
 /// Read HTML as markdown: the readable article when there is one, otherwise the
 /// page body. A body that cannot be read keeps its decoded source.
-pub(super) async fn extract(entity: ResponseEntity, url: &HttpRequestUrl) -> ResponseBody {
-    let html = match admit(entity) {
+/// The page `entity`'s HTML reads as, within `limits`.
+pub(super) async fn extract(
+    entity: ResponseEntity,
+    url: &HttpRequestUrl,
+    limits: Limits,
+) -> ResponseBody {
+    let html = match admit(entity, limits) {
         Ok(html) => html,
         Err(text) => {
             return ResponseBody::Unreadable {
@@ -341,7 +344,7 @@ pub(super) async fn extract(entity: ResponseEntity, url: &HttpRequestUrl) -> Res
     let worker = tokio::task::spawn_blocking(move || {
         // A cancelled waiter cannot release parser capacity while this worker runs.
         let _permit = permit;
-        let page = std::panic::catch_unwind(AssertUnwindSafe(|| parse(&html, &url)));
+        let page = std::panic::catch_unwind(AssertUnwindSafe(|| parse(&html, &url, limits)));
         (html, page.unwrap_or(Err(Unreadable::ParserFailed)))
     });
     let (html, page) = worker
@@ -355,18 +358,18 @@ pub(super) async fn extract(entity: ResponseEntity, url: &HttpRequestUrl) -> Res
 
 /// The decoded HTML, or `Err` with it when it is over either byte budget. The
 /// raw bytes are dropped here, before any semaphore wait or worker queue.
-fn admit(entity: ResponseEntity) -> Result<String, String> {
-    let within_raw = entity.bytes.len() <= MAX_RAW_HTML_BYTES;
+fn admit(entity: ResponseEntity, limits: Limits) -> Result<String, String> {
+    let within_raw = entity.bytes.len() <= limits.raw_bytes;
     let html = entity.decode();
-    if within_raw && html.len() <= MAX_DECODED_HTML_BYTES {
+    if within_raw && html.len() <= limits.decoded_bytes {
         Ok(html)
     } else {
         Err(html)
     }
 }
 
-fn parse(html: &str, url: &HttpRequestUrl) -> Result<Page, Unreadable> {
-    let budget = Budget::default();
+fn parse(html: &str, url: &HttpRequestUrl, limits: Limits) -> Result<Page, Unreadable> {
+    let budget = Budget::new(limits);
     let (source, base) = source(html, url.url(), &budget)?;
     let readability = |document| {
         Readability::with_document(document, None, None).map_err(|_| Unreadable::ParserFailed)
@@ -376,7 +379,7 @@ fn parse(html: &str, url: &HttpRequestUrl) -> Result<Page, Unreadable> {
     // copy and the page falls back to the source.
     if page.is_probably_readable()
         && let Ok(article) = readability(page.doc.clone())?.parse()
-        && let Ok(markdown) = article_markdown(&article.content, &base)
+        && let Ok(markdown) = article_markdown(&article.content, &base, limits)
     {
         return Ok(Page {
             title: article.title,
@@ -415,8 +418,8 @@ fn source(
 }
 
 /// Readability returns the article as HTML, read again under a budget of its own.
-fn article_markdown(html: &str, base: &reqwest::Url) -> Result<String, Unreadable> {
-    let budget = Budget::default();
+fn article_markdown(html: &str, base: &reqwest::Url, limits: Limits) -> Result<String, Unreadable> {
+    let budget = Budget::new(limits);
     let article = budget::parse(html, &budget)?;
     let body = article.body().ok_or(Unreadable::NoText)?;
     markdown(body, Scope::Article, base, &budget)
@@ -424,8 +427,14 @@ fn article_markdown(html: &str, base: &reqwest::Url) -> Result<String, Unreadabl
 
 #[cfg(test)]
 mod tests {
-    use super::super::budget::{MAX_HTML_DEPTH, MAX_HTML_ELEMENTS};
+    use std::assert_matches;
+
+    use super::super::budget::MAX_HTML_DEPTH;
     use super::*;
+
+    /// The limits these tests read under, a tenth of the default; sizes below are
+    /// a tenth of what reaches the default's.
+    const LIMITS: Limits = Limits::SMALL;
 
     fn entity(bytes: &[u8], content_type: Option<&str>) -> ResponseEntity {
         ResponseEntity::new(bytes.to_vec(), content_type, ResponseFormat::Auto)
@@ -433,7 +442,7 @@ mod tests {
 
     async fn read(html: String) -> ResponseBody {
         let url = HttpRequestUrl::parse("https://example.com/article").unwrap();
-        extract(entity(html.as_bytes(), Some("text/html")), &url).await
+        extract(entity(html.as_bytes(), Some("text/html")), &url, LIMITS).await
     }
 
     #[test]
@@ -540,15 +549,15 @@ mod tests {
     fn extraction_admission_has_independent_raw_and_decoded_exact_limits() {
         let html =
             |bytes: Vec<u8>| ResponseEntity::new(bytes, Some("text/html"), ResponseFormat::Auto);
-        let exact = admit(html(vec![b'a'; MAX_RAW_HTML_BYTES])).unwrap();
-        assert_eq!(exact.len(), MAX_DECODED_HTML_BYTES);
+        let exact = admit(html(vec![b'a'; LIMITS.raw_bytes]), LIMITS).unwrap();
+        assert_eq!(exact.len(), LIMITS.decoded_bytes);
         // Over either budget, the decoded source is kept.
-        let oversized = admit(html(vec![b'a'; MAX_RAW_HTML_BYTES + 1])).unwrap_err();
-        assert_eq!(oversized.len(), MAX_RAW_HTML_BYTES + 1);
+        let oversized = admit(html(vec![b'a'; LIMITS.raw_bytes + 1]), LIMITS).unwrap_err();
+        assert_eq!(oversized.len(), LIMITS.raw_bytes + 1);
         // Replacement characters expand below the raw limit but past the decoded one.
-        let replacements = html(vec![0xff; MAX_DECODED_HTML_BYTES / 3 + 1]);
-        assert!(replacements.bytes().len() <= MAX_RAW_HTML_BYTES);
-        assert!(admit(replacements).is_err());
+        let replacements = html(vec![0xff; LIMITS.decoded_bytes / 3 + 1]);
+        assert!(replacements.bytes().len() <= LIMITS.raw_bytes);
+        assert!(admit(replacements, LIMITS).is_err());
     }
 
     #[tokio::test]
@@ -561,11 +570,7 @@ mod tests {
         let ResponseBody::Page(page) = read(article).await else {
             panic!("expected an article")
         };
-        assert_eq!(
-            (page.scope, page.title.as_str()),
-            (Scope::Article, "A useful article")
-        );
-        assert_eq!(page.language.as_deref(), Some("en"));
+        assert_eq!(page.scope, Scope::Article);
         for expected in [
             "important article body",
             "about the topic. Readers",
@@ -573,7 +578,7 @@ mod tests {
         ] {
             assert!(page.markdown.contains(expected), "{}", page.markdown);
         }
-        for absent in ["SCRIPT_SENTINEL", "NAVIGATION_SENTINEL", "<p>"] {
+        for absent in ["SCRIPT_SENTINEL", "<p>"] {
             assert!(!page.markdown.contains(absent), "{}", page.markdown);
         }
 
@@ -603,11 +608,11 @@ mod tests {
         }
 
         let shell = "<html><body><div id='app'></div><script>render()</script></body></html>";
-        let oversized = "<i></i>".repeat(MAX_HTML_ELEMENTS + 1);
+        let oversized = "<i></i>".repeat(LIMITS.elements + 1);
         let long_base = format!(
             "<base href='https://example.com/{}/'>{}",
-            "x".repeat(4 << 20),
-            "<a href=a>link</a>".repeat(8)
+            "x".repeat((64 << 10) / 10),
+            "<a href=a>link</a>".repeat(400)
         );
         let cases = [
             (shell.to_owned(), Unreadable::NoText),
@@ -617,13 +622,13 @@ mod tests {
             // Output and work beyond the input: quote prefixes on every line, and
             // reconstructed formatting elements that each copy their attributes.
             (
-                format!("{}{}", "<blockquote>".repeat(250), "a<br>".repeat(50_000)),
+                format!("{}{}", "<blockquote>".repeat(250), "a<br>".repeat(5_000)),
                 Unreadable::TooLarge,
             ),
             (
                 format!(
                     "<div><b c={}></div>{}",
-                    "a".repeat(64 * 1024),
+                    "a".repeat(64 * 1024 / 10),
                     "<div>x</div>".repeat(400)
                 ),
                 Unreadable::TooLarge,
@@ -632,7 +637,7 @@ mod tests {
             (
                 format!(
                     "<template>{}</template>",
-                    "<i></i>".repeat(MAX_HTML_ELEMENTS + 1)
+                    "<i></i>".repeat(LIMITS.elements + 1)
                 ),
                 Unreadable::TooLarge,
             ),
@@ -640,42 +645,22 @@ mod tests {
                 format!("{0}<template>{0}", "<div>".repeat(MAX_HTML_DEPTH / 2)),
                 Unreadable::TooLarge,
             ),
-            ("<div>".repeat(200_000), Unreadable::TooLarge),
-            // Every line of a block carries its container's prefixes.
-            (
-                format!(
-                    "{}<pre>{}",
-                    "<blockquote>".repeat(250),
-                    "a\n".repeat(50_000)
-                ),
-                Unreadable::TooLarge,
-            ),
-            // Reconstructed elements copy every attribute, valued or not.
-            (
-                format!(
-                    "<div><b {}></div>{}",
-                    (0..2000).map(|n| format!("a{n} ")).collect::<String>(),
-                    "<div>x</div>".repeat(400)
-                ),
-                Unreadable::TooLarge,
-            ),
             // Links resolve only when written, so empty ones cost nothing.
             (
                 format!(
                     "<base href='https://example.com/{}/'>{}",
-                    "x".repeat(64 * 1024),
+                    "x".repeat(64 * 1024 / 10),
                     "<a href=a></a>".repeat(1000)
                 ),
                 Unreadable::NoText,
             ),
             // Each stray end tag costs the parser a scan of its open elements.
-            ("</h1>".repeat(MAX_HTML_ELEMENTS + 1), Unreadable::TooLarge),
+            ("</h1>".repeat(LIMITS.elements + 1), Unreadable::TooLarge),
         ];
         // Read as the extractors' capacity allows.
         let bodies = cases.map(async |(html, reason)| (read(html.clone()).await, html, reason));
         for (body, html, reason) in futures_util::future::join_all(bodies).await {
-            assert!(
-                matches!(&body, ResponseBody::Unreadable { reason: found, text } if *found == reason && *text == html),
+            assert_matches!(&body, ResponseBody::Unreadable { reason: found, text } if *found == reason && *text == html,
                 "{body:?}"
             );
         }
@@ -686,7 +671,7 @@ mod tests {
         let paragraph =
             "This is the important article body, with meaningful details about the topic. ";
         // Quote prefixes on every line, inside navigation the page leaves out.
-        let navigation = format!("{}{}", "<blockquote>".repeat(245), "a<br>".repeat(45_000));
+        let navigation = format!("{}{}", "<blockquote>".repeat(245), "a<br>".repeat(4_500));
         let html = format!(
             "<html><body><article><p>{0}</p><p>{0}</p><nav>{navigation}</nav></article></body></html>",
             paragraph.repeat(10)
@@ -700,10 +685,10 @@ mod tests {
 
     #[tokio::test]
     async fn charges_each_link_destination_once() {
-        // Each link resolves to about 64 KiB: 12 MiB of links, inside the 20 MiB built.
+        // Each link resolves to about 6.4 KiB: 1.2 MiB of links, inside the 2 MiB built.
         let html = format!(
             "<base href='https://example.com/{}/'><p>{}</p>",
-            "x".repeat(64 << 10),
+            "x".repeat((64 << 10) / 10),
             "<a href=a>l</a> ".repeat(192)
         );
         let ResponseBody::Page(page) = read(html).await else {

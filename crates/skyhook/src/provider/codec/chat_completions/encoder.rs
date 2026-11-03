@@ -471,8 +471,8 @@ pub(super) mod tests {
         );
     }
 
-    #[test]
-    fn thinking_blocks_replay_and_cache_breakpoints_take_the_parts_form() {
+    #[tokio::test]
+    async fn thinking_blocks_replay_and_cache_breakpoints_take_the_parts_form() {
         use crate::provider::protocol::HistoryLifetime;
         let thinking_blocks = Dialect {
             cache_control: CacheControl::Sent { ttl: None },
@@ -581,6 +581,49 @@ pub(super) mod tests {
             assert_eq!(part["prompt_cache_breakpoint"], mark);
         }
         assert_eq!(body["messages"][4]["content"], "<state>");
+        // The system prompt and each earlier request's prefix end are marked within
+        // the strictest upstream cap, so an upstream that reads only at marked
+        // boundaries reuses the previous request's cache; the oldest seams give way.
+        let budgeted = Dialect {
+            cache: Cache::Explicit,
+            cache_control: CacheControl::Sent { ttl: None },
+            ..Dialect::compatible()
+        };
+        let mut request = crate::provider::codec::common::tests::request("test-model");
+        request.system = vec![SystemSegment {
+            text: "stable".into(),
+            cache: true,
+        }];
+        let marked = |request: &ModelRequest| -> Vec<bool> {
+            let body = encode(request, Default::default(), &budgeted).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            let marked = |message: &Value| message.to_string().contains("cache_control");
+            messages.iter().map(marked).collect()
+        };
+        assert_eq!(marked(&request), [true, true]);
+        let exchange = |request: &mut ModelRequest, turn| {
+            let answer = AssistantItem::text("a", 0, "answer");
+            (request.context).extend(entries([Message::Assistant(vec![answer]), user(turn)]));
+        };
+        exchange(&mut request, "two");
+        assert_eq!(marked(&request), [true, true, false, true]);
+        exchange(&mut request, "three");
+        exchange(&mut request, "four");
+        // The system prompt and the three newest prefix ends fill the budget.
+        assert_eq!(
+            marked(&request),
+            [true, false, false, true, false, true, false, true]
+        );
+        // A history without text adds no breakpoint of its own, so a system prompt
+        // filling the budget still fits.
+        request.system = vec![request.system[0].clone(); 4];
+        request.context = entries([Message::User(vec![UserContent::Attachment {
+            attachment: AttachmentRef::Image(image()),
+        }])]);
+        let images = loaded(&mut request).await;
+        let body = encode(&request, images.prepared(), &budgeted).unwrap();
+        let markers = Value::Object(body).to_string();
+        assert_eq!(markers.matches("cache_control").count(), 4);
     }
 
     #[test]
@@ -769,11 +812,11 @@ pub(super) mod tests {
         }];
         request.reasoning = Some("high".into());
         let schema = json!({"type":"object", "properties":{"value":{}, "choice":{"oneOf":[{"const":true},{"type":"array"}]}}});
-        request.tools = vec![ToolDefinition {
+        request.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "inspect".into(),
             description: "Inspect".into(),
             input_schema: schema.clone(),
-        }];
+        })];
         let attach = |attachment| UserContent::Attachment { attachment };
         request.context = entries(vec![
             Message::User(vec![
@@ -831,11 +874,11 @@ pub(super) mod tests {
                 cache: false,
             })
             .to_vec();
-        minimal.tools = vec![ToolDefinition {
+        minimal.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "inspect".into(),
             description: String::new(),
             input_schema: json!({"type":"object"}),
-        }];
+        })];
         let body = encode(&minimal, Default::default(), &unsupported()).unwrap();
         assert_eq!(
             body["messages"][0],
@@ -937,10 +980,7 @@ pub(super) mod tests {
                 json!([{"role":"assistant","content":"ok"}])
             );
         }
-    }
-
-    #[test]
-    fn replay_uses_payload_not_visible_blocks_and_keeps_text_and_tools() {
+        // The payload replays, not the visible text, beside the text and tools.
         let envelope = |text| {
             reasoning_envelope(
                 ReplayFormat::ChatText,

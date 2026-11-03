@@ -290,7 +290,7 @@ impl Core {
         directory: std::path::PathBuf,
         (mut state, observed): (CoreState, Observed),
         (db, journal): (db::SharedDb, super::Journal),
-        owner: Option<Owner>,
+        owner: Option<SessionLock>,
     ) -> Result<(Arc<Shared>, Self), SessionError> {
         state.seed_activity();
         let shared = Arc::new(Shared {
@@ -416,20 +416,13 @@ impl Drop for Core {
     }
 }
 
-/// What the one store that owns a durable session holds: its lock, and the
-/// checkpointer of its log.
-pub(super) struct Owner {
-    pub(super) lock: SessionLock,
-    pub(super) checkpointer: db::Checkpointer,
-}
-
 /// The only read-write connection, owned by the core thread.
 pub(super) struct Writer {
     db: db::SharedDb,
     /// What the journal committed, read without the connection output writers share.
     journal: super::Journal,
-    /// Until it releases the session, if it owns it.
-    pub(super) owner: Option<Owner>,
+    /// The session's lock, until it releases the session, if it owns it.
+    pub(super) owner: Option<SessionLock>,
     pub(super) shared: Arc<Shared>,
     encoder: db::Encoder,
     /// Whether the running command committed, until it has applied it.
@@ -789,21 +782,16 @@ impl Writer {
     }
 
     /// Take no more writes and release the session for another open, once what it
-    /// committed is durable and, owning the session, in the database file, then
-    /// report the failure that stopped it, if one did. Its owner removes a session
-    /// that journaled nothing.
+    /// committed is durable, then report the failure that stopped it, if one did. Its
+    /// owner removes a session that journaled nothing.
     fn release(&mut self) -> Result<(), SessionError> {
         self.flush();
-        let lock = (self.owner.take()).map(|Owner { lock, checkpointer }| {
-            checkpointer.close(&self.db);
-            lock
-        });
+        let lock = self.owner.take();
         // Taking the connection rolls back a transaction a panicked command left
         // open, which would otherwise keep the next owner from writing. Only the
         // database knows whether an append whose outcome was lost committed.
         let frozen = super::db::close_writes(&self.db.lock());
-        // What another writer committed since the flush, which a checkpoint a reader
-        // held back left in the log.
+        // What another writer committed since the flush.
         self.flush();
         let entry =
             (self.db.lock()).query_row("SELECT 1 FROM entry LIMIT 1", Vec::new(), |_| Ok(()));

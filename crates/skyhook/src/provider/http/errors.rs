@@ -128,6 +128,7 @@ fn excerpt(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::assert_matches;
 
     #[test]
     fn statuses_set_recovery_and_diagnostics_carry_the_code_and_server_text() {
@@ -161,7 +162,7 @@ mod tests {
             &json!({"error":{"message":"upstream\n\tbusy"}}),
             repeated,
         );
-        assert!(matches!(error.kind(), ProviderErrorKind::RateLimited));
+        assert_matches!(error.kind(), ProviderErrorKind::RateLimited);
         assert_eq!(
             error.message,
             "provider HTTP 429 error [code=server_error]: upstream busy"

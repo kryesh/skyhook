@@ -438,12 +438,7 @@ mod tests {
                 completed(vec![terminal]),
             ]);
             assert_eq!(result.is_ok(), valid, "{conflicting}");
-        }
-    }
-
-    #[test]
-    fn codex_omitted_output_uses_done_plaintext_without_accepting_conflicts() {
-        // Codex may omit terminal output entirely. Done text supersedes deltas,
+        } // A server may omit terminal output entirely: done text supersedes deltas,
         // but two final texts must agree.
         for (content, done_text, valid) in [
             (None, "native", true),

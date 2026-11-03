@@ -353,6 +353,7 @@ pub(super) fn store_fingerprint(stored: &Stored) -> Vec<u8> {
 pub(super) mod tests {
     use super::super::{manager_at, manager_for, now};
     use super::*;
+    use std::assert_matches;
 
     pub(in super::super) fn stored(issuer: &Issuer, expiry: u64) -> Stored {
         Stored {
@@ -398,19 +399,13 @@ pub(super) mod tests {
             manager.credentials().await.unwrap().access_token.as_str(),
             "old-access"
         );
-        assert!(matches!(
-            manager.status().await.unwrap(),
-            AuthStatus::LoggedIn { .. }
-        ));
+        assert_matches!(manager.status().await.unwrap(), AuthStatus::LoggedIn { .. });
         assert!(!format!("{:?}", manager.credentials().await.unwrap()).contains("old-access"));
         assert_eq!(other.status().await.unwrap(), status(&other));
         assert!(!directory.join("other.lock").exists());
         // A restore that skips the lock file still reads as signed in.
         fs::remove_file(directory.join("test.lock")).unwrap();
-        assert!(matches!(
-            manager.status().await.unwrap(),
-            AuthStatus::LoggedIn { .. }
-        ));
+        assert_matches!(manager.status().await.unwrap(), AuthStatus::LoggedIn { .. });
         fs::remove_file(&path).unwrap();
         assert_eq!(manager.status().await.unwrap(), status(&manager));
     }

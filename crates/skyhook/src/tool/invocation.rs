@@ -497,6 +497,15 @@ impl PathPreflight {
 
 use crate::tool::path::{Resolution, resolve_for_authorization};
 
+/// Whether a job's local workspace exists, as admitting its call found it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum JobWorkspace {
+    #[default]
+    Exists,
+    /// Missing inside the root: its call creates it.
+    Missing,
+}
+
 /// Resolve each path argument where the invocation runs and replace it with its
 /// resolved spelling.
 pub(crate) async fn preflight_path_arguments(
@@ -504,9 +513,25 @@ pub(crate) async fn preflight_path_arguments(
     location: &ExecutionLocation,
     authorization_root: &Path,
 ) -> Result<PathPreflight, AdmissionError> {
-    let ExecutionLocation { target, workspace } = location;
     let mut preflight = PathPreflight::deferred();
     for argument in arguments {
+        preflight
+            .admit(argument, location, authorization_root)
+            .await?;
+    }
+    Ok(preflight)
+}
+
+impl PathPreflight {
+    /// Resolve `argument` where the invocation runs, replace it with its resolved
+    /// spelling and add what it needs; whether it names a job's missing workspace.
+    pub(crate) async fn admit(
+        &mut self,
+        argument: PathArgument<'_>,
+        location: &ExecutionLocation,
+        authorization_root: &Path,
+    ) -> Result<JobWorkspace, AdmissionError> {
+        let ExecutionLocation { target, workspace } = location;
         let input = argument.path.clone();
         // Preflight adds what it knows to the resolver's facts; nothing is
         // resolved here, so the tool's own fallback still fills the rest.
@@ -526,27 +551,28 @@ pub(crate) async fn preflight_path_arguments(
         };
         let resolution =
             resolve_for_authorization(workspace, authorization_root, &input, argument.kind);
-        let resolved = match resolution.await.map_err(annotate)? {
-            Resolution::Resolved(resolved) => resolved,
+        let (resolved, found) = match resolution.await.map_err(annotate)? {
+            Resolution::Resolved(resolved) => (resolved, JobWorkspace::Exists),
+            Resolution::MissingWorkspace(resolved) => (resolved, JobWorkspace::Missing),
             // Later paths resolve as they would had this one existed.
             Resolution::Unresolved(resolved, error) => {
-                preflight.unresolved.get_or_insert_with(|| annotate(error));
-                resolved
+                self.unresolved.get_or_insert_with(|| annotate(error));
+                (resolved, JobWorkspace::Exists)
             }
         };
         resolved.path.as_str().clone_into(argument.path);
-        preflight.paths.push(PathFact {
+        self.paths.push(PathFact {
             role: PathRole::Requested,
             path: input.into(),
         });
-        preflight.paths.push(PathFact {
+        self.paths.push(PathFact {
             role: PathRole::Resolved,
             path: resolved.path.as_path().to_owned(),
         });
         let capability = argument.access.capability();
-        (preflight.permissions).extend(resolved.permission(capability, argument.scope, target));
+        (self.permissions).extend(resolved.permission(capability, argument.scope, target));
+        Ok(found)
     }
-    Ok(preflight)
 }
 
 /// Scope capabilities to `resource`, or else the workspace, which is spelled
@@ -571,6 +597,8 @@ pub(crate) fn scope_capabilities(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::assert_matches;
+
     use super::super::output::{CaptureEvent, CaptureId, OutputEvent, OutputSink};
     use super::*;
     use std::collections::BTreeMap;
@@ -693,13 +721,13 @@ pub(crate) mod tests {
             .await
             .unwrap_err()
             .diagnostic();
-        assert!(matches!(
+        assert_matches!(
             missing.cause,
             Cause::Io {
                 kind: crate::tool::diagnostic::IoKind::NotFound,
                 ..
             }
-        ));
+        );
         // Preflight adds only what it knows: the site and the requested path. The
         // resolver's own facts stand, and nothing claims effects it cannot see.
         let facts = missing.context;

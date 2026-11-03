@@ -138,7 +138,7 @@ pub(in crate::session) fn requests(
         page,
         paged_sql!(
             request_rows!(""),
-            "e.agent = ?3 AND e.kind = ?4",
+            "e.agent = ?2 AND e.kind = ?3",
             "e.seq",
             "?1"
         ),
@@ -618,6 +618,7 @@ mod tests {
         db::tests::Fixture,
         tests::{attempt, profile, requested},
     };
+    use std::assert_matches;
 
     #[test]
     fn compaction_failures_name_their_own_attempt_and_a_fault_matching_its_detail() {
@@ -655,6 +656,6 @@ mod tests {
         fixture.decode().unwrap();
         // A fault missing its detail is stored, but never decodes.
         failed(103, own, None).unwrap();
-        assert!(matches!(fixture.decode(), Err(DbError::Corrupt(_))));
+        assert_matches!(fixture.decode(), Err(DbError::Corrupt(_)));
     }
 }

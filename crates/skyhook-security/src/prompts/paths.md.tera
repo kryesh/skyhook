@@ -1,19 +1,30 @@
-# Sources grouped into paths
+# Entries recorded as paths
 
-Within the component map, record the entry points an actor can drive and group them into paths,
-so each distinct flow of input is swept once.
+Within the component map, record each entry an actor can drive as a path and the states its
+stages read and write, so each scenario is swept once with every stage that handles it.
 
-A source is one concrete entry point — one route, event, message or signal handler, timer,
-background job, read site, callback — recorded at its definition, not a declaration, and not a trust
-class or ingress family: recording "all authenticated requests" as one source hides every path
-behind it. Consider network input, stdin or another process's output, files, environment variables,
-IPC, arguments, plugins, deserialization, queues, configuration read at startup, CI jobs others can
-trigger and reads of state an attacker-driven flow writes; a trusted-looking file or upstream
-service is not necessarily a trusted origin. Do not filter sources because they look low impact.
+A path is one scenario on the target's public interface: one route, operation, event, message
+or signal handler, timer, background job, exported function, callback, configuration load or
+CI job. It runs from the target's first code that touches the input (its own normalisation,
+framing or routing included) through every stage that handles it (authentication, decoding,
+validation, the logic behind them) until nothing the input influences is used further: the
+response, side effects, and state written for later readers. A stage an entry calls, such as
+an auth check, a decoder or a helper, is a step of that entry's path, not an entry of its own,
+unless an actor reaches it directly too. Never record a trust class or ingress family as one
+path: "all authenticated requests" hides every scenario behind it.
 
-Sweep every file of the components the map says receive external input with one `sources` child
-each, which records its sources, each on the existing path its flow matches or on a path of its
-own whose first step is its handoff.
+An input state is one input an actor controls, defined at the stage that takes it in, trusted as
+the least-privileged actor able to supply it there: a credential read by authentication, a body
+read by a decoder, a parameter read by a handler. It is read on every path whose flow reaches
+that stage. Consider network input, stdin or another process's output, files, environment
+variables, IPC, arguments, plugins, queues, configuration read at startup and CI jobs others can
+trigger; a trusted-looking file or upstream service is not necessarily a trusted origin. State
+an attacker-driven flow writes for other flows to read is a stored state, not an input. Do not
+filter entries or states because they look low impact.
+
+Sweep every file of the components the map says receive external input with one `entries` child
+each, which records the entries defined there as paths, the input states taken in there, and the
+instance, handed and stored states its code reads or writes, with each path's accesses.
 {%- if live %}
 Each interface of theirs an environment serves gets a child too.
 {%- endif %}
@@ -22,19 +33,27 @@ Each interface of theirs an environment serves gets a child too.
 {% if live %}{% include "security/scripts/paths.live.js" %}{% else %}{% include "security/scripts/paths.no-live.js" %}{% endif %}
 ```
 
-Once every child has finished, reconcile each handoff group into the paths it is: only sources
-interpreted identically up to the handoff (thin wrappers or aliases of one entry, say) — the
-same parsing, the same state touched, the same call into the same component — share one path, so
-`merge` each other path of the group into the one you keep, which takes its sources, premises and
-place in candidates' actions. Distinct flows, differing in trust or handling before the handoff,
-keep their own paths; when in doubt, keep them apart.
-Join groups that are one handoff described differently. Then extend each path past its handoff
-with `link` `path_step`: each component the handoff's component hands the input to, in order,
-with its location and how. Place each unmatched path's handoff yourself. Every source belongs to
-a path, and every input has an outcome. Retract a source or path recorded in error, such as an
-internal helper taken for an entry point, with `set_status` `retracted`.
+Once every child has finished, reconcile what they recorded into scenarios. The paths of an
+entry group share their entry's definition: they are one entry recorded more than once (an alias
+or a thin wrapper of one route, say) only when the handling ahead of it is the same too, the same
+routing, checks and input states at the same trust. `merge` each such path into the one you
+keep, which takes its accesses, premises and place in candidates' actions. Routes that reach one
+definition through different handling are distinct entries: keep them apart, and when in doubt
+that the handling matches, keep them apart. A function recorded as an entry that only other
+entries reach is a stage: retract its path and link its accesses to theirs, since a stage swept
+without its scenario loses the chains that cross it. Then complete each path with `link`
+`path_step`: insert ahead of its entry the target's code that reaches it, and extend it past the
+entry through each component the input is handed to, in order, with its location and how.
 
-Return the path IDs, the inputs that had no entry points, the unserved interfaces, and what you
-could not resolve, such as dynamic registration or generated dispatch, also recorded as context
+Children recording one file each record the same storage more than once: `merge` each state
+into the one it duplicates, one state per storage one invariant relates. A state relating
+several invariants is several states: record one per invariant, move its accesses to them and
+retract it. Link each unlinked
+input state with `path_state` to every path whose steps reach the stage reading it, and record a
+path for an entry no child placed. Every input state is read on a path, and every input has an
+outcome. Retract a state or path recorded in error with `set_status` `retracted`.
+
+Return the path IDs, the inputs that had no entries, the unserved interfaces, and what you could
+not resolve, such as dynamic registration or generated dispatch, also recorded as context
 evidence on its component.
 An enumerated inventory is not proven exhaustive coverage.

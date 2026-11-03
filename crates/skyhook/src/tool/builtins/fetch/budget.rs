@@ -12,10 +12,37 @@ use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeBuilderOpts, TreeSink};
 use html5ever::{Attribute, ParseOpts, QualName};
 
-pub(super) const MAX_HTML_ELEMENTS: usize = 50_000;
 pub(super) const MAX_HTML_DEPTH: usize = 256;
-/// What the parsed document holds and the markdown built from it.
-const MAX_BUILT_BYTES: usize = 20 * 1024 * 1024;
+
+/// What one HTML extraction may admit and build.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Limits {
+    /// The response's bytes, and the HTML they decode to.
+    pub(super) raw_bytes: usize,
+    pub(super) decoded_bytes: usize,
+    /// Elements a parse may build.
+    pub(super) elements: usize,
+    /// What the parsed document holds and the markdown built from it.
+    pub(super) built_bytes: usize,
+}
+
+impl Limits {
+    pub(super) const DEFAULT: Self = Self {
+        raw_bytes: 10 * 1024 * 1024,
+        decoded_bytes: 10 * 1024 * 1024,
+        elements: 50_000,
+        built_bytes: 20 * 1024 * 1024,
+    };
+
+    /// A tenth of the default, so tests reach the limits with small documents.
+    #[cfg(test)]
+    pub(super) const SMALL: Self = Self {
+        raw_bytes: Self::DEFAULT.raw_bytes / 10,
+        decoded_bytes: Self::DEFAULT.decoded_bytes / 10,
+        elements: Self::DEFAULT.elements / 10,
+        built_bytes: Self::DEFAULT.built_bytes / 10,
+    };
+}
 /// The tree builder's work per token grows with its open elements, so input is
 /// fed in chunks small enough that a chunk past the depth limit stays cheap.
 const CHUNK_BYTES: usize = 4096;
@@ -29,25 +56,34 @@ pub(super) struct Spent;
 
 /// Shared by the parse and the conversion of one document. Once spent it stays
 /// spent.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct Budget(Rc<Meter>);
 
-#[derive(Default)]
 struct Meter {
+    limits: Limits,
     elements: Cell<usize>,
     bytes: Cell<usize>,
     spent: Cell<bool>,
 }
 
 impl Budget {
+    pub(super) fn new(limits: Limits) -> Self {
+        Self(Rc::new(Meter {
+            limits,
+            elements: Cell::default(),
+            bytes: Cell::default(),
+            spent: Cell::default(),
+        }))
+    }
+
     /// Charges `bytes` about to be built.
     pub(super) fn charge(&self, bytes: usize) -> Result<(), Spent> {
-        self.add(&self.0.bytes, bytes, MAX_BUILT_BYTES)
+        self.add(&self.0.bytes, bytes, self.0.limits.built_bytes)
     }
 
     /// Charges one element and the bytes it holds.
     fn element(&self, bytes: usize) -> Result<(), Spent> {
-        self.add(&self.0.elements, 1, MAX_HTML_ELEMENTS)?;
+        self.add(&self.0.elements, 1, self.0.limits.elements)?;
         self.charge(bytes)
     }
 
@@ -88,11 +124,7 @@ pub(super) fn parse(html: &str, budget: &Budget) -> Result<Document, Spent> {
     let mut parser = html5ever::parse_document(sink, options);
     let mut rest = html;
     while !rest.is_empty() && !budget.spent() {
-        let mut end = rest.len().min(CHUNK_BYTES);
-        while !rest.is_char_boundary(end) {
-            end += 1;
-        }
-        let (chunk, tail) = rest.split_at(end);
+        let (chunk, tail) = rest.split_at(rest.ceil_char_boundary(CHUNK_BYTES));
         parser.process(StrTendril::from_slice(chunk));
         rest = tail;
     }
@@ -185,10 +217,8 @@ impl Metered {
             }
             match self.document.tree.parent_of(&at) {
                 Some(parent) => at = parent.id,
-                None => match self.hosts.borrow().get(&at) {
-                    Some(host) => at = *host,
-                    None => break steps,
-                },
+                None if let Some(host) = self.hosts.borrow().get(&at) => at = *host,
+                None => break steps,
             }
             steps += 1;
         };
@@ -298,12 +328,16 @@ mod tests {
     use super::*;
 
     /// Each character reference appends text of its own, which the document joins
-    /// to the text before it, appended or foster-parented before a table.
+    /// to the text before it, appended or foster-parented before a table: more of
+    /// them than the budget left holds nodes fit.
     #[test]
     fn text_joined_to_text_is_charged_only_for_its_bytes() {
-        let references = "&amp;".repeat(MAX_BUILT_BYTES / NODE + 1);
+        let left = 16 * NODE;
+        let references = "&amp;".repeat(left / NODE + 1);
         for html in [format!("<p>{references}"), format!("<table>{references}")] {
-            assert!(parse(&html, &Budget::default()).is_ok());
+            let budget = Budget::new(Limits::SMALL);
+            budget.charge(Limits::SMALL.built_bytes - left).unwrap();
+            assert!(parse(&html, &budget).is_ok());
         }
     }
 }

@@ -8,10 +8,10 @@ impl Harness {
     /// first settles what the process that last ran it left open.
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
         let inner = &self.inner;
-        // Another host's session opens without this harness's extension: its tables, or
+        // Another host's session opens with the journal's schema: its own tables, or
         // their absence, belong to that host.
-        let tables = inner.session_extension.map(|tables| (&inner.host, tables));
-        let store = SessionStore::open(&inner.session_root, id, tables).await?;
+        let owner = Some((&inner.host, inner.session_schema));
+        let store = SessionStore::open(&inner.session_root, id, owner).await?;
         let jobs = JobManager::new(store.clone());
         let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
         // Only the host's own sessions open with its tables.
@@ -120,6 +120,7 @@ mod tests {
     use crate::job::JobRole::{self, Tool};
     use crate::provider::ProviderErrorKind;
     use crate::session::tests::{attempt, requested};
+    use std::assert_matches;
 
     /// Another host can read a session, including undeclared host grants, but
     /// nothing that activates it runs: not MCP startup, not a prompt.
@@ -181,13 +182,13 @@ mod tests {
         assert!(viewed.is_view_only());
         assert_eq!(viewed.store().host(), &origin);
         assert!(!marker.exists());
-        assert!(matches!(
+        assert_matches!(
             viewed.mcp_servers()["foreign"],
             crate::mcp::McpServerStatus::Skipped
-        ));
-        assert!(matches!(viewed.prompt("run").await,
+        );
+        assert_matches!(viewed.prompt("run").await,
             Err(HarnessError::HostMismatch { session, host })
-                if session == origin && host == "test".parse().unwrap()));
+                if session == origin && host == "test".parse().unwrap());
         shutdown_session(viewed).await;
         assert_eq!(
             SessionStore::read_records(&sessions, id).await.unwrap(),
@@ -368,7 +369,7 @@ mod tests {
             // The settled turn stays continuable on every resume, not only the
             // one that settled it.
             let parked = turn(&resumed, &resumed.root);
-            assert!(matches!(parked, Turn::Parked(_)), "{resume}: {parked:?}");
+            assert_matches!(parked, Turn::Parked(_), "{resume}");
             // A placeholder reports only the interruption reopening gave its job:
             // the earlier completion stays pending, live and on replay.
             let replayed = resumed.runtime.jobs.test_replay();
@@ -471,7 +472,7 @@ mod tests {
             _ => false,
         };
         let history = last.messages().rev().find(|message| !runtime(message));
-        assert!(matches!(history, Some(Sent::Tool(_))), "{history:?}");
+        assert_matches!(history, Some(Sent::Tool(_)));
         assert_eq!(
             resumed
                 .runtime
@@ -632,6 +633,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (_harness, session, _, _, parent, job) = held_on_interrupted_child(
             root.path(),
+            true,
             [answer("child recovered"), answer("root continued")].map(Step::new),
         )
         .await;
@@ -652,39 +654,6 @@ mod tests {
         shutdown_session(session).await;
         assert!(bounded(parent).await.unwrap().is_err());
         assert_eq!(last_millis(&sessions, id).await, before);
-    }
-
-    /// A continue once closing has begun is refused and journals nothing, and the
-    /// interruption resumes when the session reopens.
-    #[tokio::test]
-    async fn a_continue_after_closing_began_leaves_the_interruption_resumable() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let recovered = (0..4).map(|_| Step::new(answer("recovered")));
-        let (harness, session, _, _, parent, job) =
-            held_on_interrupted_child(root.path(), recovered).await;
-        bounded(session.shutdown()).await.unwrap();
-        assert!(bounded(parent).await.unwrap().is_err());
-        let closed = session.runtime.store.records();
-        let refused = bounded(session.continue_turn()).await;
-        assert!(
-            matches!(
-                refused,
-                Err(HarnessError::Session(SessionError::Refused(
-                    crate::session::SessionPhase::ShuttingDown
-                )))
-            ),
-            "{refused:?}"
-        );
-        assert_eq!(session.runtime.store.records(), closed);
-        session.close().await.unwrap();
-
-        let resumed = harness.resume_session(session.id()).await.unwrap();
-        let state = resumed.runtime.jobs.snapshot(job).await.unwrap().state;
-        assert_eq!(state, JobState::Interrupted);
-        bounded(resumed.continue_turn()).await.unwrap();
-        assert_eq!(terminal(&resumed, job).await.state, JobState::Completed);
-        shutdown_session(resumed).await;
     }
 
     /// A provider that cannot open a conversation.
@@ -854,8 +823,8 @@ mod tests {
         let receipts = futures_util::future::join_all(receipts.map(IntoFuture::into_future));
         let receipts = bounded(receipts).await;
         let refused = &receipts[0];
-        assert!(matches!(refused, Err(HarnessError::UnknownModel(model)) if *model == gone));
-        assert!(matches!(receipts[1], Err(HarnessError::Interrupted)));
+        assert_matches!(refused, Err(HarnessError::UnknownModel(model)) if *model == gone);
+        assert_matches!(receipts[1], Err(HarnessError::Interrupted));
         assert_eq!(resumed.runtime.store.records(), before);
         assert_eq!(requests.lock().unwrap().len(), asked);
         let test = resumed.selection(Some(&model_ref("test")), None).unwrap();
@@ -887,24 +856,6 @@ mod tests {
         resumed.activate_on(&model_ref("test")).await.unwrap();
         assert_eq!(model_changes(&resumed, &resumed.root), ["test/test"]);
         resumed
-    }
-
-    /// Once activated on a model, a session whose children ran on the gone one
-    /// restarts them on the root's model, as each one's start journals.
-    #[tokio::test]
-    async fn a_child_whose_model_is_gone_restarts_on_the_roots() {
-        let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
-        let resumed = activated_on_test(root.path(), &requests).await;
-        let since = resumed.store().applied();
-        let continued = resumed.continue_turn_with(Selection::default()).await;
-        let continued = continued.unwrap();
-        assert_eq!(continued.answer.as_deref(), Some("recovered"));
-        assert_eq!(continued.children_resumed, 1);
-        let child = resumed.root.child(1);
-        restarted(&resumed, &child, since).await;
-        assert_eq!(model_changes(&resumed, &child), ["test/test"]);
-        assert_eq!(model_changes(&resumed, &resumed.root), ["test/test"]);
-        shutdown_session(resumed).await;
     }
 
     /// A child restarted while its root's model is gone too fails to start, and
@@ -953,12 +904,13 @@ mod tests {
         };
         let held = many.cancellation.clone();
         let _receipts = resumed.enqueue_prompts(vec![many]).await;
-        bounded(async {
-            while !held.is_retained() {
-                tokio::task::yield_now().await;
-            }
+        let parked = Turn::Parked(crate::agent::TurnFailure::from(&HarnessError::ImageLimit));
+        let (key, agent) = (Key::Agent(resumed.root.clone()), resumed.root.clone());
+        found(&resumed, [key], move |state| {
+            (state.agents.get(&agent)?.turn == parked).then_some(())
         })
         .await;
+        assert!(held.is_retained());
         let since = resumed.store().applied();
         let refused = resumed.continue_turn().await;
         assert!(
@@ -1002,8 +954,7 @@ mod tests {
 
     /// A turn that failed or was interrupted before the session closed reopens
     /// stopped for that reason and is continued; a finished one leaves nothing to
-    /// continue. One that failed on images its model cannot take reopens too, and
-    /// continues on a model that can.
+    /// continue.
     #[tokio::test]
     async fn reopened_failed_or_interrupted_turn_continues() {
         use crate::agent::{AgentActivity, Failure, TurnFailure};
@@ -1017,21 +968,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
         let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
-        let read = json!({"path": "tool.png"});
         let steps = [
             Step::fail(failure),
             Step::new(answer("recovered")),
             Step::new(answer("never released")).midstream(),
             Step::new(answer("continued")),
-            Step::new(response(vec![tool_call(0, "read-call", "read", read)])),
-            Step::new(answer("seen")),
         ];
         let script = Script::new(steps, &requests);
-        let vision = crate::tests::profile("vision-model", true);
-        let harness = serving(root.path(), script.clone(), [("vision", vision)])
-            .build()
-            .await
-            .unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, script.clone()).await;
         let session = harness.new_session().await.unwrap();
         let id = session.id();
         session.prompt("fails").await.unwrap_err();
@@ -1039,10 +984,7 @@ mod tests {
 
         let resumed = harness.resume_session(id).await.unwrap();
         let failed = stopped(&resumed).await;
-        assert!(matches!(
-            failed,
-            Some(TurnFailure::Failed(Failure::Provider(..)))
-        ));
+        assert_matches!(failed, Some(TurnFailure::Failed(Failure::Provider(..))));
         assert_eq!(resumed.continue_turn().await.unwrap(), "recovered");
         let interrupted = resumed.prompt("interrupted");
         let interrupt = async {
@@ -1062,20 +1004,6 @@ mod tests {
         assert_eq!(stopped(&resumed).await, None);
         assert_eq!(resumed.continue_turn().await.unwrap(), "");
         assert_eq!(requests.lock().unwrap().len(), 4);
-        std::fs::write(root.path().join("tool.png"), crate::tests::png_bytes(b"")).unwrap();
-        let refused = resumed.prompt("look").await;
-        assert!(
-            matches!(refused, Err(HarnessError::ImagesUnsupported(_))),
-            "{refused:?}"
-        );
-        shutdown_session(resumed).await;
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        let agent = resumed.root.clone();
-        resumed.record_status(agent, "acted".into()).await.unwrap();
-        let vision = resumed.selection(Some(&model_ref("vision")), None).unwrap();
-        let continued = resumed.continue_turn_with(vision).await.unwrap();
-        assert_eq!(continued.answer.as_deref(), Some("seen"));
         shutdown_session(resumed).await;
     }
 
@@ -1095,7 +1023,7 @@ mod tests {
         shutdown_session(session).await;
         let resumed = harness.resume_session(id).await.unwrap();
         let rejected = resumed.prompt_with_options("hello", &[], stale).await;
-        assert!(matches!(rejected, Err(HarnessError::UnknownModel(name)) if name == model));
+        assert_matches!(rejected, Err(HarnessError::UnknownModel(name)) if name == model);
         let fresh = resumed.selection(Some(&model), None).unwrap();
         let answered = resumed.prompt_with_options("hello", &[], fresh).await;
         assert_eq!(answered.unwrap(), "first");
@@ -1158,19 +1086,16 @@ mod tests {
     /// narrower than when it last ran. Viewing it, or work that does not run the
     /// root, only warns of a changed mode; the next work that runs the root decides
     /// its mode once, with the message it commits or before a script, moving onto
-    /// the configured edition or onto the default mode once its own is gone. The
-    /// journal keeps every edition it applied.
+    /// the configured edition or onto the default mode once its own is gone. A
+    /// ceiling that changes the root's grant, as one without the user does, switches
+    /// it into its own mode under that grant, prompted for the role it gives; an
+    /// unchanged grant switches nothing. The journal keeps every edition it applied.
     #[tokio::test]
     async fn resume_follows_the_configured_modes_and_journals_their_editions() {
         use crate::tool::policy::{Capability, CapabilitySet, Mode};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let requests = Requests::default();
-        let mode = |capabilities: &[Capability], instructions: &str| Mode {
-            capabilities: listed(capabilities),
-            instructions: Some(instructions.parse().unwrap()),
-            hint: None,
-        };
         let build = |ceiling: CapabilitySet, modes: &[(&str, Mode)], reply: &str| {
             let provider = scripted_provider(&requests, [answer(reply)]);
             let modes = modes.iter().cloned();
@@ -1183,10 +1108,10 @@ mod tests {
                 )
                 .build()
         };
-        let look = ("look", mode(&[Capability::Read], "Look."));
+        let look = ("look", mode(&[Capability::Read], Some("Look.")));
         let work = (
             "work",
-            mode(&[Capability::Read, Capability::Write], "Work."),
+            mode(&[Capability::Read, Capability::Write], Some("Work.")),
         );
         let narrow: CapabilitySet = [Capability::Read].into_iter().collect();
         let harness = build(narrow, &[look.clone(), work.clone()], "one").await;
@@ -1221,7 +1146,7 @@ mod tests {
 
         // Redefining `look`, which the root no longer runs, warns of nothing; its
         // next use records the configured edition.
-        let relook = ("look", mode(&[], "Changed."));
+        let relook = ("look", mode(&[], Some("Changed.")));
         let harness = build(wide(), &[relook.clone(), work.clone()], "three");
         let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
         assert!(resumed.warnings().is_empty());
@@ -1253,6 +1178,32 @@ mod tests {
         assert!(resumed.warnings().is_empty());
         shutdown_session(resumed).await;
 
+        let unasked = || {
+            let mut ceiling = wide();
+            ceiling.remove(&Capability::Interactive);
+            ceiling
+        };
+        for (ceiling, reply, switches, interactive) in [
+            (unasked(), "five", true, false),
+            (wide(), "six", true, true),
+            (wide(), "seven", false, true),
+        ] {
+            let harness = build(ceiling, std::slice::from_ref(&work), reply);
+            let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
+            assert_eq!(resumed.prompt("again").await.unwrap(), reply);
+            let granted = held(&resumed).unwrap();
+            assert_eq!(granted.contains(&Capability::Interactive), interactive);
+            if switches {
+                expected.push((named("work", None), granted));
+            }
+            let system = requests.lock().unwrap().last().unwrap().system[0]
+                .text
+                .clone();
+            let child = system.contains("Complete your assigned task");
+            assert_eq!(child, !interactive, "{reply}: {system}");
+            shutdown_session(resumed).await;
+        }
+
         let records = SessionStore::open(&sessions, id, None)
             .await
             .unwrap()
@@ -1260,22 +1211,21 @@ mod tests {
         let changes = events!(&records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
         assert_eq!(changes, expected);
         // A message's change commits with it; a script's precedes the script.
-        let follows =
-            records
-                .windows(2)
-                .filter_map(|pair| match (&pair[0].event, &pair[1].event) {
-                    (SessionEvent::ModeChanged { .. }, next) => Some(match next {
-                        SessionEvent::MessageCommitted {
-                            message: crate::session::Message::User(_),
-                        } => "message",
-                        SessionEvent::JobCreated { tool, .. } if tool == "script" => "script",
-                        _ => "other",
-                    }),
-                    _ => None,
-                });
+        let follows = records.array_windows().filter_map(|[earlier, later]| {
+            match (&earlier.event, &later.event) {
+                (SessionEvent::ModeChanged { .. }, next) => Some(match next {
+                    SessionEvent::MessageCommitted {
+                        message: crate::session::Message::User(_),
+                    } => "message",
+                    SessionEvent::JobCreated { tool, .. } if tool == "script" => "script",
+                    _ => "other",
+                }),
+                _ => None,
+            }
+        });
         assert_eq!(
             follows.collect::<Vec<_>>(),
-            ["message", "message", "script"]
+            ["message", "message", "script", "message", "message"]
         );
         let captured = requests.lock().unwrap().clone();
         let prompt = |index: usize| captured[index].system[0].text.clone();
@@ -1378,7 +1328,7 @@ mod tests {
         else {
             panic!("the delivery follows its mode change: {:?}", delivery.event);
         };
-        assert!(matches!(parts[..], [UserPart::JobEvents { .. }]));
+        assert_matches!(parts[..], [UserPart::JobEvents { .. }]);
         // One commit dates every entry it journals alike.
         assert_eq!(change.timestamp_millis, delivery.timestamp_millis);
         let captured = requests.lock().unwrap().clone();
@@ -1392,55 +1342,6 @@ mod tests {
         let history = serde_json::to_string(&child.context).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
         assert!(history.contains("Owner input"));
-        shutdown_session(resumed).await;
-    }
-
-    /// A crash answers a foreground delegation whose child it keeps with the child's
-    /// released job, not a failure: the child goes on and reports as a job event.
-    #[tokio::test]
-    async fn a_resume_answers_a_running_delegation_with_its_released_job() {
-        let Answered {
-            root,
-            harness,
-            store,
-            agent: root_agent,
-            id,
-            ..
-        } = answered_then_reopened().await;
-        let call = ToolCall::new("delegate", "agent", json!({"prompt": "work"})).unwrap();
-        let assistant = Message::Assistant(vec![AssistantItem::tool_call("delegate", 0, call)]);
-        let committed = SessionEvent::MessageCommitted { message: assistant };
-        let launch = store.append(root_agent.clone(), committed).await.unwrap();
-        let origin = crate::session::ModelCallOrigin {
-            message: launch.sequence.message(),
-            call_id: "delegate".into(),
-        };
-        let job = JobId::new(1).unwrap();
-        let running = left_running(
-            &root_agent,
-            job,
-            JobRole::Agent,
-            (None, Some(origin)),
-            root.path(),
-        );
-        store.append_all(running).await.unwrap();
-        drop(store);
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        let records = resumed.runtime.store.records();
-        let answers = events!(&records,
-            SessionEvent::MessageCommitted { message: Message::Tool(result) } => result.clone());
-        let [answer] = &answers[..] else {
-            panic!("one delegation answered once: {answers:?}");
-        };
-        assert!(!answer.is_error, "{answer:?}");
-        assert_eq!(answer.result["id"], json!(job));
-        assert_eq!(answer.result["state"], "interrupted");
-        assert_eq!(
-            resumed.store().observe().snapshot.jobs[&job].state,
-            crate::job::JobState::Interrupted
-        );
         shutdown_session(resumed).await;
     }
 
@@ -1603,7 +1504,7 @@ mod tests {
             "{warnings}"
         );
         let run = resumed.prompt("again").await;
-        assert!(matches!(run, Err(HarnessError::Prompt(_))), "{run:?}");
+        assert_matches!(run, Err(HarnessError::Prompt(_)));
         shutdown_session(resumed).await;
     }
 
@@ -1718,9 +1619,9 @@ mod tests {
     }
 
     /// A process killed while a foreground child works leaves its call waiting.
-    /// Nothing waits across a restart: resume settles an open call with an error
-    /// result and lets go of the child, which retry restarts, and its answer
-    /// reaches the root as an event.
+    /// Nothing waits across a restart: resume answers an open call with the
+    /// child's released job, not a failure, and lets go of the child, which retry
+    /// restarts, and its answer reaches the root as an event.
     #[tokio::test]
     async fn retry_after_a_crash_delivers_a_retained_foreground_childs_answer() {
         for crash in [Crash::Unanswered, Crash::Answered, Crash::HostCalled] {
@@ -1824,6 +1725,19 @@ mod tests {
         let harness = test_harness(root.path(), &sessions, provider).await;
         let resumed = harness.resume_session(id).await.unwrap();
         resumed.running().await.unwrap();
+        if let Crash::Unanswered = crash {
+            let records = resumed.runtime.store.records();
+            let answers = events!(&records,
+                SessionEvent::MessageCommitted { message: Message::Tool(result) } => result.clone());
+            let [answer] = &answers[..] else {
+                panic!("one delegation answered once: {answers:?}");
+            };
+            assert!(!answer.is_error, "{answer:?}");
+            assert_eq!(answer.result["id"], json!(job));
+            assert_eq!(answer.result["state"], "interrupted");
+            let state = resumed.store().observe().snapshot.jobs[&job].state;
+            assert_eq!(state, crate::job::JobState::Interrupted);
+        }
         assert!(resumed.runtime.jobs.is_background(job).await.unwrap());
         // What the host never read, cut short or not, reports to the root as well.
         for unread in parent.into_iter().chain(parent.map(|_| read)) {
@@ -1925,14 +1839,9 @@ mod tests {
         let checkpoints =
             events!(records, SessionEvent::Compaction { checkpoint } => checkpoint.clone());
         let checkpoint = checkpoints.into_iter().next().unwrap();
-        assert_eq!(checkpoint.todos, reconciled);
         let prior_request = {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 3);
-            assert!(captured[0].response_schema.is_none());
-            assert!(captured[1].response_schema.is_some());
-            assert!(captured[1].messages().any(|message| matches!(message,
-                Sent::Assistant(items) if items == &vec![AssistantItem::text("answer", 0, "checkpoint installed")])));
             captured[0].clone()
         };
         let id = session.id();

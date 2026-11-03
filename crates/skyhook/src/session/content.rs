@@ -436,15 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_state_contains_only_date() {
+    fn todos_group_only_consecutive_statuses_and_escape_text() {
         assert_eq!(
             state(vec![], vec![], location()),
             "<skyhook_state>\ndate:2026-09-10\n</skyhook_state>"
         );
-    }
-
-    #[test]
-    fn todos_group_only_consecutive_statuses_and_escape_text() {
         let todos = [
             (TodoStatus::InProgress, "Design"),
             (TodoStatus::InProgress, "Measure"),

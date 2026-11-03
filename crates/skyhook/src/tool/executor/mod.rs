@@ -54,12 +54,16 @@ struct InvocationPlan {
     job_location: ExecutionLocation,
     /// Where it runs: `job_location`, with a local workspace resolved.
     job_runs_in: ExecutionLocation,
+    /// Whether its call creates the local workspace it runs in.
+    creates: crate::tool::invocation::JobWorkspace,
     permissions: Vec<PermissionUse>,
     path_facts: Vec<PathFact>,
     parent: Option<JobId>,
     launch: JobLaunch,
     /// Admitted on the host even when a remote destination runs the call.
     result_policy: super::ToolResultPolicy,
+    /// How much of a finished result the call's reads present: a script holds results whole.
+    fit: crate::job::output::Fit,
     /// The schema the job's stored result follows.
     output_schema: Option<Value>,
     dispatch: InvocationDispatch<PlannedRemote>,

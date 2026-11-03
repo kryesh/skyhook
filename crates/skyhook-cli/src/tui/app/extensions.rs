@@ -48,9 +48,17 @@ impl App {
         self.extension().map_or(&[], |extension| extension.views())
     }
 
+    /// Show extension view `view`; a page view, which shows no conversation, views the root
+    /// agent again, so the status beside it is the session's own.
     pub fn select_extension(&mut self, view: usize) {
-        if view >= self.extension_views().len() {
+        let Some(frame) = self.extension_views().get(view).map(|view| view.frame) else {
             return;
+        };
+        if matches!(frame, ViewFrame::Page { .. }) {
+            let root = AgentId::root(self.selected.session());
+            if self.selected != root {
+                self.select(root);
+            }
         }
         self.panel = Panel::Extension(view);
         self.selection = None;
@@ -451,22 +459,32 @@ mod tests {
     }
 
     /// A page view takes the frame below the tab strip: no sidebar, live agents or
-    /// composer, and focus stays on the page; a view inside the session's chrome and
+    /// composer, focus stays on the page, neither Esc nor a paste reaches the hidden
+    /// draft, and the root agent is viewed again; a view inside the session's chrome and
     /// the conversation keep them.
     #[tokio::test]
     async fn page_views_take_the_frame_and_session_views_keep_the_chrome() {
         let (_root, mut app) = fixture().await;
+        app.editor.set("saved draft".into());
         install(&mut app);
         app.saved.sidebar = true;
         draw_sized(&mut app, 120, 30);
         let conversation = (app.render.content_rect, app.render.composer_rect);
         assert!(conversation.0.width < 120 && conversation.1.height > 0);
+        let root = app.selected.clone();
+        app.selected = root.child(0);
         app.select_extension(0);
+        assert_eq!(app.selected, root, "a page view views the root again");
         app.focus = Focus::Composer;
         draw_sized(&mut app, 120, 30);
         assert_eq!(app.render.content_rect.width, 120);
         assert_eq!(app.render.composer_rect.height, 0);
         assert_eq!(app.focus, Focus::Content);
+        assert!(!app.busy());
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(app.focus == Focus::Content);
+        app.event(crossterm::event::Event::Paste("unexpected paste".into()));
+        assert_eq!(app.editor.text(), "saved draft");
         app.select_extension(1);
         draw_sized(&mut app, 120, 30);
         assert_eq!(app.render.content_rect, conversation.0);
@@ -571,11 +589,12 @@ mod tests {
     /// A page that keeps the live agents has them in a column beside it on a wide
     /// terminal, headed by a line per mode with its name at the left and its count at the
     /// right (folded into one line when the column is short), and in the band below it on a
-    /// narrow one; one that hides them shows neither.
+    /// narrow one; one that hides them shows neither. Beside a page the agents keep their
+    /// column while the session works, so the page keeps its width when the children end.
     #[tokio::test]
     async fn page_agents_sit_beside_wide_pages_and_below_narrow_ones() {
         let (_root, mut app, mut model, _session) = played_fixture().await;
-        let (children, _turns) = spawn_children(&mut app, &mut model, 3).await;
+        let (children, turns) = spawn_children(&mut app, &mut model, 3).await;
         for (child, mode) in children.iter().zip(["component", "question", "validate"]) {
             let agent = (app.projection.agents.iter_mut())
                 .find(|agent| &agent.id == child)
@@ -588,6 +607,7 @@ mod tests {
         let (tree, content) = (app.render.tree_rect, app.render.content_rect);
         assert_eq!((tree.y, tree.right()), (1, 110));
         assert_eq!(content.width, tree.x);
+        let wide = content;
         assert!(screen.contains("Agents 4"), "{screen}");
         // Each mode's name starts at the column's left edge and its count ends at the right.
         let (left, right) = (usize::from(tree.x) + 2, usize::from(tree.right()) - 3);
@@ -612,6 +632,13 @@ mod tests {
         let (tree, content) = (app.render.tree_rect, app.render.content_rect);
         assert_eq!((tree.x, tree.width, content.width), (0, 70, 70));
         assert!(tree.y >= content.bottom());
+        for turn in turns {
+            turn.answer("done");
+        }
+        observe_until(&mut app, |app| !app.projection.has_active_children()).await;
+        draw_sized(&mut app, 110, 40);
+        assert!(app.busy());
+        assert_eq!(app.render.content_rect, wide);
         install_with(&mut app, AgentPane::Hidden);
         draw_sized(&mut app, 110, 40);
         assert!(app.render.tree_rect.is_empty());
@@ -619,17 +646,30 @@ mod tests {
     }
 
     /// Tab moves between a page and its agents, and stepping through them stays on the
-    /// page; an agent chosen there or in the Agents palette opens its conversation.
+    /// page; an agent chosen there or in the Agents palette opens its conversation. A page
+    /// shows no conversation, so its column marks no agent as viewed: only the cursor
+    /// highlights, and only while the column has the keys.
     #[tokio::test]
     async fn agents_chosen_on_a_page_open_their_conversation() {
         let (_root, mut app, mut model, _session) = played_fixture().await;
         let (children, _turns) = spawn_children(&mut app, &mut model, 2).await;
         install(&mut app);
+        app.open_agent(children[0].clone());
         app.select_extension(0);
-        draw_sized(&mut app, 110, 40);
+        let highlighted = |app: &mut App| {
+            let buffer = draw_sized_buffer(app, 110, 40);
+            (app.render.hits.iter())
+                .filter(|(rect, hit)| {
+                    matches!(hit, Hit::Agent(_))
+                        && buffer[(rect.x, rect.y)].bg == crate::tui::theme::theme().ui.selected
+                })
+                .count()
+        };
+        assert_eq!(highlighted(&mut app), 0);
         let viewed = app.selected.clone();
         key(&mut app, KeyCode::Tab, M::NONE);
         assert!(app.focus == Focus::Tree);
+        assert_eq!(highlighted(&mut app), 1);
         // Arrows move the column's cursor, not the conversation to come back to.
         key(&mut app, KeyCode::Down, M::NONE);
         assert!(matches!(app.panel, Panel::Extension(0)));
@@ -659,6 +699,7 @@ mod tests {
         );
         key(&mut app, KeyCode::Tab, M::NONE);
         assert!(app.focus == Focus::Content);
+        assert_eq!(highlighted(&mut app), 0);
 
         draw_sized(&mut app, 110, 40);
         let row = (app.render.hits.iter())
@@ -679,51 +720,6 @@ mod tests {
         assert_eq!(app.selected, children[0]);
     }
 
-    /// A page shows no conversation, so its agents column marks no agent as viewed: only
-    /// the cursor highlights, and only while the column has the keys.
-    #[tokio::test]
-    async fn a_page_column_highlights_only_its_focused_cursor() {
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let (children, _turns) = spawn_children(&mut app, &mut model, 2).await;
-        install(&mut app);
-        app.open_agent(children[0].clone());
-        app.select_extension(0);
-        let highlighted = |app: &mut App| {
-            let buffer = draw_sized_buffer(app, 110, 40);
-            (app.render.hits.iter())
-                .filter(|(rect, hit)| {
-                    matches!(hit, Hit::Agent(_))
-                        && buffer[(rect.x, rect.y)].bg == crate::tui::theme::theme().ui.selected
-                })
-                .count()
-        };
-        assert_eq!(highlighted(&mut app), 0);
-        key(&mut app, KeyCode::Tab, M::NONE);
-        assert_eq!(highlighted(&mut app), 1);
-        key(&mut app, KeyCode::Tab, M::NONE);
-        assert_eq!(highlighted(&mut app), 0);
-    }
-
-    /// Beside a page the agents keep their column while the session works, so the page
-    /// keeps its width when the children end.
-    #[tokio::test]
-    async fn a_page_keeps_its_agents_column_while_the_session_works() {
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let (_children, turns) = spawn_children(&mut app, &mut model, 2).await;
-        install(&mut app);
-        app.select_extension(0);
-        draw_sized(&mut app, 110, 40);
-        let content = app.render.content_rect;
-        assert!(content.width < 110);
-        for turn in turns {
-            turn.answer("done");
-        }
-        observe_until(&mut app, |app| !app.projection.has_active_children()).await;
-        draw_sized(&mut app, 110, 40);
-        assert!(app.busy());
-        assert_eq!(app.render.content_rect, content);
-    }
-
     /// The host applies only a toggle its page still shows.
     #[tokio::test]
     async fn a_toggle_the_page_no_longer_shows_opens_nothing() {
@@ -735,20 +731,5 @@ mod tests {
         app.extensions.selected.insert(0, record);
         app.toggle_page(None);
         assert_eq!(app.extensions.open.get(&0), None);
-    }
-
-    /// A page hides the composer, so neither Esc nor a paste reaches its draft.
-    #[tokio::test]
-    async fn a_page_keeps_keys_and_pastes_off_the_hidden_composer() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("saved draft".into());
-        install(&mut app);
-        app.select_extension(0);
-        draw(&mut app);
-        assert!(!app.busy());
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert!(app.focus == Focus::Content);
-        app.event(crossterm::event::Event::Paste("unexpected paste".into()));
-        assert_eq!(app.editor.text(), "saved draft");
     }
 }

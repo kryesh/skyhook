@@ -45,23 +45,30 @@ impl ModeChange {
 }
 
 impl SessionRuntime {
-    /// What sending `agent`, which runs `current` with `capabilities`, into the
-    /// configured `name` changes; `None` when it already runs the edition it renders
-    /// now with what it grants now.
+    /// What sending `agent`, which runs `current`, into the configured `name` changes;
+    /// `None` when it already runs the edition it renders now with what it grants now.
+    /// Its prompt was rendered for the grant last journaled, so a live ceiling that
+    /// narrows or widens that grant, as a host without the user does, changes it too.
     pub(super) fn mode_change(
         &self,
         agent: &AgentId,
         current: Option<&AppliedMode>,
-        capabilities: &CapabilitySet,
         name: &ModeName,
     ) -> Result<Option<ModeChange>, HarnessError> {
-        let held = self.held(agent, |contract, depth, _| {
-            (contract.location.clone(), depth)
+        let held = self.store.read(|state| {
+            let location = state.agents.journaled(agent)?.contract.location.clone();
+            let (depth, _) = self.granted(state, agent)?;
+            Some((
+                location,
+                depth,
+                state.agent_states.get(agent)?.capabilities.clone(),
+            ))
         });
-        let (location, depth) = held.ok_or_else(|| HarnessError::NoRecordedModel(agent.clone()))?;
+        let (location, depth, rendered) =
+            held.ok_or_else(|| HarnessError::NoRecordedModel(agent.clone()))?;
         let (mode, granted) =
             self.applied(name, agent.depth(), &location, depth, &self.capabilities)?;
-        let unchanged = current == Some(&mode) && *capabilities == granted;
+        let unchanged = current == Some(&mode) && rendered == granted;
         Ok((!unchanged).then_some(ModeChange {
             mode,
             depth,
@@ -89,16 +96,16 @@ impl SessionRuntime {
     /// the next work that runs it adopts, or a model it no longer has, which
     /// refuses that work.
     pub(super) fn root_outdated(&self, root: &AgentId) -> bool {
-        let held = self.held(root, |contract, _, granted| {
+        let held = self.held(root, |contract, _, _| {
             let gone = !self.harness.models.contains_key(&contract.profile.name);
-            (contract.mode.clone(), granted, gone)
+            (contract.mode.clone(), gone)
         });
-        let Some((current, capabilities, gone)) = held else {
+        let Some((current, gone)) = held else {
             return false;
         };
         let current = current.as_ref();
         gone || self.root_mode(current, None).is_some_and(|name| {
-            let change = self.mode_change(root, current, &capabilities, &name);
+            let change = self.mode_change(root, current, &name);
             !matches!(change, Ok(None))
         })
     }
@@ -109,14 +116,10 @@ impl SessionRuntime {
     /// the next work that runs the root adopts; or its mode no longer renders for it,
     /// which fails that work. A selection the root has replaced warns no more.
     pub(super) fn drift_warnings(&self, root: &AgentId) -> Vec<String> {
-        let held = self.held(root, |contract, _, granted| {
-            (
-                contract.profile.name.clone(),
-                contract.mode.clone(),
-                granted,
-            )
+        let held = self.held(root, |contract, _, _| {
+            (contract.profile.name.clone(), contract.mode.clone())
         });
-        let Some((model, running, capabilities)) = held else {
+        let Some((model, running)) = held else {
             return Vec::new();
         };
         let model = (!self.harness.models.contains_key(&model)).then(|| {
@@ -130,7 +133,7 @@ impl SessionRuntime {
         };
         let name = &running.name;
         let mode = match (self.harness.modes.contains_key(name), &self.harness.mode) {
-            (true, _) => match self.mode_change(root, Some(&running), &capabilities, name) {
+            (true, _) => match self.mode_change(root, Some(&running), name) {
                 Ok(change) => change
                     .is_some_and(|change| change.mode != running)
                     .then(|| {

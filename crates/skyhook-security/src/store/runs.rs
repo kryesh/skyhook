@@ -5,17 +5,19 @@ use serde::Serialize;
 use skyhook::{
     db::{Db, DbResult, Dictionaries, Seeding, bytes, enum_column, params},
     identity::SessionId,
-    session::{Extension, ExtensionDb, SessionError},
+    session::{ExtensionDb, ProductImage, Schema, SessionError},
 };
 
 use super::*;
 
 /// The research tables every security session keeps beside its journal.
-pub const EXTENSION: Extension = Extension {
-    sql: concat!(include_str!("schema.sql"), bearing::derived_views!()),
-    format: 13,
+pub const SCHEMA: Schema = Schema::extended(
+    ProductImage::layered(
+        concat!(include_str!("schema.sql"), bearing::derived_views!()),
+        25,
+    ),
     seed,
-};
+);
 
 fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     let dictionaries = Dictionaries(db, seeding);
@@ -28,6 +30,8 @@ fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     })?;
     dictionaries.names("location_kind", &LocationKind::ALL)?;
     dictionaries.names("trust_kind", &Trust::ALL)?;
+    dictionaries.names("state_scope", &StateScope::ALL)?;
+    dictionaries.names("state_access", &Access::ALL)?;
     dictionaries.names("premise_scope", &PremiseScope::ALL)?;
     dictionaries.names("premise_status", &PremiseStatus::ALL)?;
     dictionaries.names("flaw_status", &FlawStatus::ALL)?;
@@ -40,6 +44,7 @@ fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     dictionaries.names("artifact_role", &ArtifactRole::ALL)?;
     dictionaries.names("event_kind", &EventKind::ALL)?;
     dictionaries.ranked("event_effect", &EventEffect::ALL)?;
+    dictionaries.names("bearing_role", &BearingRole::ALL)?;
     dictionaries.names("live_policy_kind", &LivePolicy::ALL)
 }
 
@@ -83,14 +88,14 @@ pub(super) fn run(db: &Db) -> Result<Run> {
 
 impl Store {
     /// The research tables of an open session, which its harness opened with
-    /// [`EXTENSION`].
+    /// [`SCHEMA`].
     pub fn of(db: &ExtensionDb) -> Self {
         Self(db.clone())
     }
 
     /// A security session's research, read-only, whether or not it is open elsewhere.
     pub async fn inspect(root: &Path, id: SessionId) -> std::result::Result<Self, SessionError> {
-        Ok(Self(ExtensionDb::inspect(root, id, EXTENSION).await?))
+        Ok(Self(ExtensionDb::inspect(root, id, SCHEMA).await?))
     }
 
     /// The session, which is the run.

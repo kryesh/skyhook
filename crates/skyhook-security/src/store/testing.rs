@@ -70,9 +70,9 @@ pub(super) fn known_environment(db: &Db, id: EnvironmentId) -> Result<()> {
 }
 
 impl Store {
-    /// Record a test of a candidate at the verdict it tested: the latest at what the test's task
-    /// rests on, or its current one outside a task. A pending test waits on the user or the
-    /// environment and settles nothing.
+    /// Record a test of a candidate, of what it stood on when the test's task began, or when it
+    /// is recorded outside a task. A pending test waits on the user or the environment and
+    /// settles nothing.
     pub fn record_test(&self, actor: &AgentId, test: &NewTest) -> Result<TestId> {
         let mut digested = Vec::with_capacity(test.artifacts.len());
         for mut open in admit(&self.artifact_root(), &test.artifacts)? {
@@ -85,14 +85,7 @@ impl Store {
             }
             audit(db, actor, EventKind::Tested, Some(&test.note), |event| {
                 let id = TestId(db.insert(
-                    concat!(
-                        "INSERT INTO test(candidate,environment,result,verdict,event) VALUES \
-                         (?1,?2,?3,(SELECT en.event FROM event_node en WHERE en.node=?1 AND \
-                         en.kind!='tested' AND en.effect='standing' AND en.kind='verdict' AND \
-                         en.event<=",
-                        crate::store::bearing::stamp!("test", "?4", "?1"),
-                        " ORDER BY en.event DESC LIMIT 1),?4)"
-                    ),
+                    "INSERT INTO test(candidate,environment,result,event) VALUES (?1,?2,?3,?4)",
                     params![candidate, test.environment, test.result, event],
                 )?);
                 for (digest, artifact) in &digested {
@@ -158,6 +151,8 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use skyhook::job::JobState;
 
     use super::{
@@ -186,13 +181,13 @@ mod tests {
             environment: None,
             artifacts,
         };
-        assert!(matches!(
+        assert_matches!(
             store.record_test(
                 &actor,
                 &test(vec![attack.clone(), control.clone(), missing])
             ),
             Err(Error::Inadmissible(Inadmissible::Fault { .. }))
-        ));
+        );
         let recorded = store
             .record_test(&actor, &test(vec![attack, control]))
             .unwrap();
@@ -228,9 +223,9 @@ mod tests {
         );
         let (prover, _, _) = begun(&store, &Begin::Test(vec![merged]));
         let (preparer, _) = child_of(&store, &prover, JobState::Running);
-        let merge = Merge::Candidate {
-            candidate: merged,
-            into: kept,
+        let merge = Merge {
+            node: merged.into(),
+            into: kept.into(),
             note: text("one root cause"),
         };
         store.merge(&actor, &merge).unwrap();
@@ -266,20 +261,33 @@ mod tests {
     fn an_environment_serves_recorded_interfaces_and_evidence_names_it() {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "gateway");
-        for address in ["tcp://10.0.0.5:7000", "https://staging.example.test/v1"] {
+        let served = [
+            "tcp://10.0.0.5:7000",
+            "https://staging.example.test/v1",
+            "file:///srv/h",
+        ];
+        for address in served {
             assert!(address.parse::<ServiceAddress>().is_ok(), "{address}");
         }
-        for address in ["staging.example.test", "/v1/files", "https://"] {
+        let refused = [
+            "staging.example.test",
+            "/v1/files",
+            "https://",
+            "file:///",
+            "file:///srv/h\0",
+            "file:///srv/%zz",
+        ];
+        for address in refused {
             assert!(address.parse::<ServiceAddress>().is_err(), "{address}");
         }
         let unknown = serve(&store, &actor, &["admin-api"]);
-        assert!(matches!(unknown, Err(Error::UnknownInterface(_))));
+        assert_matches!(unknown, Err(Error::UnknownInterface(_)));
         let served = Served {
             interface: "gateway-api".parse().unwrap(),
             address: "https://staging.example.test".parse().unwrap(),
         };
         let twice = Serves::try_from(vec![served.clone(), served]);
-        assert!(matches!(twice, Err(Error::ServedTwice(_))));
+        assert_matches!(twice, Err(Error::ServedTwice(_)));
         let environment = serve(&store, &actor, &["gateway-api"]).unwrap();
         let listed = store.environments(Page::default()).unwrap();
         assert_eq!(

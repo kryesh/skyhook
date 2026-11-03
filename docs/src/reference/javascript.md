@@ -63,6 +63,10 @@ their own allowance.
 
 ## Saved output and serialization
 
+A result field that holds JSON, such as a command's JSON `stdout`, arrives as the decoded value.
+`JSON.parse` given an already-decoded object or array returns a copy of it, so parsing such a
+field works whether it arrived as text or as the value.
+
 Read or search saved command output with `tool.jobs({job: commandJobId, field: "/result/stdout"})`.
 A `jobs` read returns the existing JobView for that job; it does not add another wrapper.
 Field-selected output is a job view, not a raw string: the page is in `presentation.preview`,
@@ -86,7 +90,7 @@ presentation?: Presentation
 Tool results omit absent fields and empty lists at every level. Scripts read a field the
 response's schema declares but it lacks as `null`: `r.id`, `r.state` and `r.meta` are `null` on an
 ordinary completed call, and an absent `stdout` is `null`. The model's views stay sparse. Fields
-inside a previewed or paged `jobs({job})` result are not filled, since a preview may omit them.
+inside a paged `jobs({job})` result are not filled, since a page may omit them.
 
 A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits `id` and `state`. `result` is the native tool payload. It is present exactly when the job
@@ -111,9 +115,11 @@ background so that agent can answer (see
 Truncation entries keep their source paths rooted at `/result/...`.
 
 JavaScript receives complete data; model views may shorten fields as described in
-[saved job output](job-output.md#automatic-previews). A returned tool response keeps its complete
-fields whole in the script's own preview; a value taken out of it, such as `response.result`, is
-shortened like any other returned value.
+[saved job output](job-output.md#automatic-previews). A returned tool response keeps its own
+fields whole in the script's own preview, and its result is previewed as a direct read of that
+result would be; a page a `jobs` read returns is a presentation already and stays whole.
+A value taken out of a response, such as `response.result`, is shortened like any other returned
+value.
 Tool descriptions give a call's response as `JobView<T>`: the envelope, with the native result
 `T` at `.result`. A successful
 `jobs({job})` read of a failed target is still a successful tool invocation returning that failed
@@ -133,8 +139,10 @@ or `null` when the job has no result, and throws for failed or pending responses
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 `receive()` values are not decorated, and there is no built-in `tool.unwrap` helper.
 
-`jobs({job})` reads already return views, so inspect their `presentation.preview`,
-`presentation.captures`, or pagination rather than unwrapping them. Operational tool failures are
+`jobs({job})` reads already return views, so read their `result`, `presentation.preview`,
+`presentation.captures`, or pagination rather than unwrapping them. A script's whole-output
+`jobs({job})` read holds the target's complete result, never a preview: previews apply only to
+what reaches the model, such as the script's own returned value. Operational tool failures are
 failed views rather than JavaScript throws; programmer, serialization, `receive`, and sleep errors
 still throw.
 

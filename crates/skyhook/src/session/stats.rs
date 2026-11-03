@@ -343,6 +343,7 @@ mod tests {
         },
     };
     use serde_json::json;
+    use std::assert_matches;
 
     /// Journal job `index`, a delegation named `worker`, and start the root's child
     /// `index` under it.
@@ -474,9 +475,9 @@ mod tests {
         let stats = store.read_stats().await;
         let outcome = |index: usize| stats.agents[index].outcome.clone();
         let boom = Failure::Other("boom".into());
-        assert!(matches!(outcome(0), AgentOutcome::Failed { failure, .. } if failure == boom));
-        assert!(matches!(outcome(1), AgentOutcome::Interrupted { .. }));
-        assert!(matches!(outcome(2), AgentOutcome::Completed { .. }));
+        assert_matches!(outcome(0), AgentOutcome::Failed { failure, .. } if failure == boom);
+        assert_matches!(outcome(1), AgentOutcome::Interrupted { .. });
+        assert_matches!(outcome(2), AgentOutcome::Completed { .. });
         assert!(
             stats
                 .agents
@@ -636,9 +637,10 @@ mod tests {
         let (current, big): (ModelRef, ModelRef) =
             ("test/test".parse().unwrap(), "test/big".parse().unwrap());
         assert_eq!(root_stats.model.as_ref(), Some(&current));
-        assert!(matches!(root_stats.outcome, AgentOutcome::Completed { .. }));
-        assert!(
-            matches!(child_stats.outcome, AgentOutcome::Interrupted { at } if at >= completed_at)
+        assert_matches!(root_stats.outcome, AgentOutcome::Completed { .. });
+        assert_matches!(
+            child_stats.outcome,
+            AgentOutcome::Interrupted { at } if at >= completed_at
         );
         assert!(child_stats.started >= stats.started && stats.finished >= root_stats.started);
         assert_eq!(

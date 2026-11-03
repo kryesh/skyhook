@@ -202,7 +202,7 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                crate::provider::http::transport::tests::read_request(&mut stream).await;
+                crate::tests::read_request(&mut stream).await;
                 let body = r#"{"plan_type":"plus"}"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",

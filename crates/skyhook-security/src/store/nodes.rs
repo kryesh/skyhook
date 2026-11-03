@@ -44,13 +44,30 @@ pub struct ComponentEdit {
     pub interfaces: Vec<InterfaceName>,
 }
 
+/// A state by its scope: an input state with its trust and the read defining it, or one the
+/// target keeps.
 #[derive(Clone, Debug)]
-pub struct NewSource {
-    pub location: Location,
-    pub trust: Trust,
+pub enum NewState {
+    Input { location: Location, trust: Trust },
+    Handed,
+    Instance,
+    Stored,
 }
+
+impl NewState {
+    fn scope(&self) -> StateScope {
+        match self {
+            Self::Input { .. } => StateScope::Input,
+            Self::Handed => StateScope::Handed,
+            Self::Instance => StateScope::Instance,
+            Self::Stored => StateScope::Stored,
+        }
+    }
+}
+
+/// An input state's edit; a state keeps its scope.
 #[derive(Clone, Debug, Default)]
-pub struct SourceEdit {
+pub struct StateEdit {
     pub location: Option<Location>,
     pub trust: Option<Trust>,
 }
@@ -117,19 +134,80 @@ impl<I: KindId> TryFrom<Vec<I>> for Sequence<I> {
 pub enum Upsert {
     Component(Change<ComponentId, NewComponent, ComponentEdit>),
     Path(Change<PathId, (), ()>),
-    Source(Change<SourceId, NewSource, SourceEdit>),
+    State(Change<StateId, NewState, StateEdit>),
     Premise(Change<PremiseId, NewPremise, PremiseEdit>),
     Flaw(Change<FlawId, NewFlaw, FlawEdit>),
     Candidate(Change<CandidateId, NewCandidate, CandidateEdit>),
 }
 
-/// A node as a request names it: with an `id` it is an edit of the fields given, without one a
-/// new node, which needs the fields of its kind.
+/// A new node: title, body and the fields of its kind.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum UpsertInput {
+pub enum NewRecord {
     Component {
-        id: Option<ComponentId>,
+        title: Text,
+        body: Text,
+        #[serde(default)]
+        files: Vec<Text>,
+        #[serde(default)]
+        interfaces: Vec<InterfaceName>,
+    },
+    Path {
+        title: Text,
+        body: Text,
+    },
+    /// By its `scope`, fixed at creation.
+    State(NewStateRecord),
+    Premise {
+        title: Text,
+        body: Text,
+        /// `code`, or `deployment` (the user answers it).
+        scope: PremiseScope,
+        location: Option<Location>,
+    },
+    Flaw {
+        title: Text,
+        body: Text,
+        component: ComponentId,
+        location: Location,
+        cwe: Option<NonZeroU32>,
+    },
+    Candidate {
+        title: Text,
+        body: Text,
+        /// The paths its scenario performs, in order, the first where the attacker starts.
+        paths: Vec<PathId>,
+        /// Its flaws, its root first.
+        flaws: Vec<FlawId>,
+    },
+}
+
+/// A new state by its scope.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NewStateRecord {
+    /// Actor-written data the target takes in, with the `location` of its defining read; one
+    /// recorded at a location already recorded returns the one there.
+    Input {
+        title: Text,
+        body: Text,
+        location: Location,
+        trust: Trust,
+    },
+    /// Target-written, carried by the caller into later calls.
+    Handed { title: Text, body: Text },
+    /// One object's fields across its calls.
+    Instance { title: Text, body: Text },
+    /// Outlives the caller's interaction, read by other flows.
+    Stored { title: Text, body: Text },
+}
+
+/// An edit of node `id` of its kind: the fields given; the rest stay as they are.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EditRecord {
+    Component {
+        id: ComponentId,
         title: Option<Text>,
         body: Option<Text>,
         #[serde(default)]
@@ -138,26 +216,27 @@ pub enum UpsertInput {
         interfaces: Vec<InterfaceName>,
     },
     Path {
-        id: Option<PathId>,
+        id: PathId,
         title: Option<Text>,
         body: Option<Text>,
     },
-    Source {
-        id: Option<SourceId>,
+    /// A state keeps its scope; only an input state has a `location` and `trust`.
+    State {
+        id: StateId,
         title: Option<Text>,
         body: Option<Text>,
         location: Option<Location>,
         trust: Option<Trust>,
     },
     Premise {
-        id: Option<PremiseId>,
+        id: PremiseId,
         title: Option<Text>,
         body: Option<Text>,
         scope: Option<PremiseScope>,
         location: Option<Location>,
     },
     Flaw {
-        id: Option<FlawId>,
+        id: FlawId,
         title: Option<Text>,
         body: Option<Text>,
         component: Option<ComponentId>,
@@ -165,79 +244,178 @@ pub enum UpsertInput {
         cwe: Option<NonZeroU32>,
     },
     Candidate {
-        id: Option<CandidateId>,
+        id: CandidateId,
         title: Option<Text>,
         body: Option<Text>,
-        /// The paths its scenario performs, in order, the first where the attacker starts.
+        /// Its whole list of paths, in order.
         paths: Option<Vec<PathId>>,
+        /// Its whole chain, in order.
         flaws: Option<Vec<FlawId>>,
     },
 }
 
-/// The fields of `named` that are absent.
-fn missing<const N: usize>(kind: NodeKind, named: [(&'static str, bool); N]) -> Error {
-    let fields = (named.into_iter())
-        .filter(|(_, present)| !present)
-        .map(|(name, _)| name)
-        .collect();
-    Error::Missing {
-        kind,
-        fields: Fields(fields),
+impl<I, N, E> Change<I, N, E> {
+    fn created(title: Text, body: Text, detail: N) -> Self {
+        Self::Create(New {
+            title,
+            body,
+            detail,
+        })
+    }
+
+    fn edited(id: I, title: Option<Text>, body: Option<Text>, detail: E) -> Self {
+        Self::Edit(
+            id,
+            Edit {
+                title,
+                body,
+                detail,
+            },
+        )
     }
 }
 
-/// Each kind's input as its change: with an `id` an edit of the fields given, without one a
-/// create needing title, body and the kind's `[required]` fields; `[optional]` fields pass to
-/// both. `$new` and `$edit` build the kind's detail from them.
-macro_rules! upserts {
-    ($input:expr, $(
-        $kind:ident [$($required:ident),*] [$($optional:ident),*] => $new:expr, $edit:expr;
-    )+) => {
-        match $input {
-            $(
-                UpsertInput::$kind { id: Some(id), title, body, $($required,)* $($optional,)* } => {
-                    Upsert::$kind(Change::Edit(id, Edit { title, body, detail: $edit }))
-                }
-                UpsertInput::$kind { id: None, title, body, $($required,)* $($optional,)* } => {
-                    match (title, body, $($required),*) {
-                        (Some(title), Some(body), $(Some($required)),*) => {
-                            Upsert::$kind(Change::Create(New { title, body, detail: $new }))
-                        }
-                        (title, body, $($required),*) => {
-                            let named = [
-                                ("title", title.is_some()),
-                                ("body", body.is_some()),
-                                $((stringify!($required), $required.is_some())),*
-                            ];
-                            return Err(missing(NodeKind::$kind, named));
-                        }
-                    }
-                }
-            )+
-        }
-    };
+impl TryFrom<NewRecord> for Upsert {
+    type Error = Error;
+    fn try_from(record: NewRecord) -> Result<Self> {
+        Ok(match record {
+            NewRecord::Component {
+                title,
+                body,
+                files,
+                interfaces,
+            } => Self::Component(Change::created(
+                title,
+                body,
+                NewComponent { files, interfaces },
+            )),
+            NewRecord::Path { title, body } => Self::Path(Change::created(title, body, ())),
+            NewRecord::State(state) => {
+                let (title, body, state) = match state {
+                    NewStateRecord::Input {
+                        title,
+                        body,
+                        location,
+                        trust,
+                    } => (title, body, NewState::Input { location, trust }),
+                    NewStateRecord::Handed { title, body } => (title, body, NewState::Handed),
+                    NewStateRecord::Instance { title, body } => (title, body, NewState::Instance),
+                    NewStateRecord::Stored { title, body } => (title, body, NewState::Stored),
+                };
+                Self::State(Change::created(title, body, state))
+            }
+            NewRecord::Premise {
+                title,
+                body,
+                scope,
+                location,
+            } => Self::Premise(Change::created(title, body, NewPremise { scope, location })),
+            NewRecord::Flaw {
+                title,
+                body,
+                component,
+                location,
+                cwe,
+            } => Self::Flaw(Change::created(
+                title,
+                body,
+                NewFlaw {
+                    component,
+                    location,
+                    cwe,
+                },
+            )),
+            NewRecord::Candidate {
+                title,
+                body,
+                paths,
+                flaws,
+            } => Self::Candidate(Change::created(
+                title,
+                body,
+                NewCandidate {
+                    actions: paths.try_into()?,
+                    chain: flaws.try_into()?,
+                },
+            )),
+        })
+    }
 }
 
-impl TryFrom<UpsertInput> for Upsert {
+impl TryFrom<EditRecord> for Upsert {
     type Error = Error;
-    fn try_from(input: UpsertInput) -> Result<Self> {
-        Ok(upserts!(input,
-            Component [] [files, interfaces] =>
-                NewComponent { files, interfaces }, ComponentEdit { files, interfaces };
-            Path [] [] => (), ();
-            Source [location, trust] [] =>
-                NewSource { location, trust }, SourceEdit { location, trust };
-            Premise [scope] [location] =>
-                NewPremise { scope, location }, PremiseEdit { scope, location };
-            Flaw [component, location] [cwe] =>
-                NewFlaw { component, location, cwe }, FlawEdit { component, location, cwe };
-            Candidate [paths, flaws] [] =>
-                NewCandidate { actions: paths.try_into()?, chain: flaws.try_into()? },
+    fn try_from(record: EditRecord) -> Result<Self> {
+        Ok(match record {
+            EditRecord::Component {
+                id,
+                title,
+                body,
+                files,
+                interfaces,
+            } => Self::Component(Change::edited(
+                id,
+                title,
+                body,
+                ComponentEdit { files, interfaces },
+            )),
+            EditRecord::Path { id, title, body } => Self::Path(Change::edited(id, title, body, ())),
+            EditRecord::State {
+                id,
+                title,
+                body,
+                location,
+                trust,
+            } => Self::State(Change::edited(
+                id,
+                title,
+                body,
+                StateEdit { location, trust },
+            )),
+            EditRecord::Premise {
+                id,
+                title,
+                body,
+                scope,
+                location,
+            } => Self::Premise(Change::edited(
+                id,
+                title,
+                body,
+                PremiseEdit { scope, location },
+            )),
+            EditRecord::Flaw {
+                id,
+                title,
+                body,
+                component,
+                location,
+                cwe,
+            } => Self::Flaw(Change::edited(
+                id,
+                title,
+                body,
+                FlawEdit {
+                    component,
+                    location,
+                    cwe,
+                },
+            )),
+            EditRecord::Candidate {
+                id,
+                title,
+                body,
+                paths,
+                flaws,
+            } => Self::Candidate(Change::edited(
+                id,
+                title,
+                body,
                 CandidateEdit {
                     actions: paths.map(Actions::try_from).transpose()?,
                     chain: flaws.map(Chain::try_from).transpose()?,
-                };
-        ))
+                },
+            )),
+        })
     }
 }
 
@@ -350,43 +528,63 @@ impl DetailEdit for () {
     }
 }
 
-/// The source recorded at `location`: only a live source holds one.
-fn source_at(db: &Db, location: LocationId) -> Result<Option<SourceId>> {
+/// The input state read at `location`: only a live input state holds one.
+fn input_at(db: &Db, location: LocationId) -> Result<Option<StateId>> {
     optional(
         db,
-        "SELECT node FROM source WHERE location=?1",
+        "SELECT state FROM input_state WHERE location=?1",
         params![location],
-        |row| Ok(SourceId(row.get(0)?)),
+        |row| Ok(StateId(row.get(0)?)),
     )
 }
 
-impl Detail for NewSource {
-    const KIND: NodeKind = NodeKind::Source;
+impl Detail for NewState {
+    const KIND: NodeKind = NodeKind::State;
     fn recorded(&self, db: &Db) -> Result<Option<NodeId>> {
-        Ok(source_at(db, location_id(db, &self.location)?)?.map(NodeId::from))
+        match self {
+            Self::Input { location, .. } => {
+                Ok(input_at(db, location_id(db, location)?)?.map(NodeId::from))
+            }
+            Self::Handed | Self::Instance | Self::Stored => Ok(None),
+        }
     }
     fn create(&self, db: &Db, node: NodeId, _: &mut Marks) -> Result<()> {
         db.execute(
-            "INSERT INTO source(node,location,trust) VALUES (?1,?2,?3)",
-            params![node, location_id(db, &self.location)?, self.trust],
+            "INSERT INTO state(node,scope) VALUES (?1,?2)",
+            params![node, self.scope()],
         )?;
+        if let Self::Input { location, trust } = self {
+            db.execute(
+                "INSERT INTO input_state(state,location,trust) VALUES (?1,?2,?3)",
+                params![node, location_id(db, location)?, *trust],
+            )?;
+        }
         Ok(())
     }
 }
-impl DetailEdit for SourceEdit {
+impl DetailEdit for StateEdit {
     fn edit(&self, db: &Db, node: NodeId, _: &mut Marks) -> Result<bool> {
+        if self.location.is_none() && self.trust.is_none() {
+            return Ok(false);
+        }
+        if !exists(
+            db,
+            "SELECT 1 FROM input_state WHERE state=?1",
+            params![node],
+        )? {
+            return Err(Error::NotInput);
+        }
         let mut changed = false;
         if let Some(location) = &self.location {
             let location = location_id(db, location)?;
-            match source_at(db, location)? {
-                Some(source) if NodeId::from(source) != node => {
-                    return Err(Error::SourceAt(source));
-                }
-                _ => {}
+            if let Some(state) = input_at(db, location)?
+                && NodeId::from(state) != node
+            {
+                return Err(Error::StateAt(state));
             }
             changed |= set(
                 db,
-                "UPDATE source SET location=?2 WHERE node=?1 AND location!=?2",
+                "UPDATE input_state SET location=?2 WHERE state=?1 AND location!=?2",
                 node,
                 location.sql(),
             )?;
@@ -394,7 +592,7 @@ impl DetailEdit for SourceEdit {
         if let Some(trust) = self.trust {
             changed |= set(
                 db,
-                "UPDATE source SET trust=?2 WHERE node=?1 AND trust!=?2",
+                "UPDATE input_state SET trust=?2 WHERE state=?1 AND trust!=?2",
                 node,
                 trust.sql(),
             )?;
@@ -678,116 +876,141 @@ fn apply<I: KindId, N: Detail, E: DetailEdit>(
     }
 }
 
-/// A status set: a premise decided, a flaw judged, a path marked swept or unswept, or a source,
-/// path or component retracted or restored.
+/// A code premise is decided within its settle; a deployment premise, the user's to answer,
+/// outside every task.
+const PREMISE: Standing = standing_of!(
+    "premise_standing",
+    "node",
+    "status",
+    "proposed",
+    concat!(
+        "CASE (SELECT scope FROM premise WHERE node=?1) WHEN 'code' THEN ",
+        crate::store::bearing::owns!("settle", "?2", "?1"),
+        " ELSE NOT EXISTS (SELECT 1 FROM event_task WHERE event=?2) END"
+    ),
+    Changed
+);
+const FLAW: Standing = standing_of!(
+    "flaw_standing",
+    "node",
+    "status",
+    "proposed",
+    crate::store::bearing::owns!("chain", "?2", "?1"),
+    Changed
+);
+
+/// A status set: a premise decided, a flaw judged, a path marked swept or unswept, a state
+/// checked, or a state, path or component retracted or restored.
 #[derive(Clone, Copy, Debug)]
 pub enum StatusChange {
     Premise(PremiseId, PremiseStatus),
     Flaw(FlawId, FlawStatus),
     Path(PathId, PathStatus),
-    Source(SourceId, InventoryStatus),
+    State(StateId, StateMark),
     Component(ComponentId, InventoryStatus),
 }
 
-/// A status as a request sets it, with the actor's reason.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum StatusInput {
+/// What marking a state records: its check across calls done, or its inventory status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateMark {
+    Checked,
+    Inventory(InventoryStatus),
+}
+
+impl From<StateStatus> for StateMark {
+    fn from(status: StateStatus) -> Self {
+        match status {
+            StateStatus::Checked => Self::Checked,
+            StateStatus::Recorded => Self::Inventory(InventoryStatus::Recorded),
+            StateStatus::Retracted => Self::Inventory(InventoryStatus::Retracted),
+        }
+    }
+}
+
+/// A node of its kind and the status it takes.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StatusRecord {
     Premise {
-        premise: PremiseId,
+        id: PremiseId,
         status: PremiseStatus,
-        note: Text,
     },
     Flaw {
-        flaw: FlawId,
+        id: FlawId,
         status: FlawStatus,
-        note: Text,
     },
     Path {
-        path: PathId,
+        id: PathId,
         status: PathStatus,
-        note: Text,
     },
-    Source {
-        source: SourceId,
-        status: InventoryStatus,
-        note: Text,
+    State {
+        id: StateId,
+        status: StateStatus,
     },
     Component {
-        component: ComponentId,
+        id: ComponentId,
         status: InventoryStatus,
-        note: Text,
     },
 }
 
-impl StatusInput {
-    pub fn change(&self) -> (StatusChange, &Text) {
-        match self {
-            Self::Premise {
-                premise,
-                status,
-                note,
-            } => (StatusChange::Premise(*premise, *status), note),
-            Self::Flaw { flaw, status, note } => (StatusChange::Flaw(*flaw, *status), note),
-            Self::Path { path, status, note } => (StatusChange::Path(*path, *status), note),
-            Self::Source {
-                source,
-                status,
-                note,
-            } => (StatusChange::Source(*source, *status), note),
-            Self::Component {
-                component,
-                status,
-                note,
-            } => (StatusChange::Component(*component, *status), note),
+impl From<StatusRecord> for StatusChange {
+    fn from(record: StatusRecord) -> Self {
+        match record {
+            StatusRecord::Premise { id, status } => Self::Premise(id, status),
+            StatusRecord::Flaw { id, status } => Self::Flaw(id, status),
+            StatusRecord::Path { id, status } => Self::Path(id, status),
+            StatusRecord::State { id, status } => Self::State(id, status.into()),
+            StatusRecord::Component { id, status } => Self::Component(id, status),
         }
     }
 }
 
 impl Store {
+    /// The kind of node `id`.
+    pub fn kind(&self, id: NodeId) -> Result<NodeKind> {
+        self.read(|db| live_node(db, id).map(|(_, kind)| kind))
+    }
+
     /// Create a node or edit one, returning its id: a merged node's edit goes to the node it
-    /// was merged into, and a source at a location already recorded is the source there.
+    /// was merged into, and an input state at a location already recorded is the one there.
     pub fn upsert(&self, actor: &AgentId, upsert: &Upsert) -> Result<NodeId> {
         self.write(|db| match upsert {
             Upsert::Component(change) => apply(db, actor, change),
             Upsert::Path(change) => apply(db, actor, change),
-            Upsert::Source(change) => apply(db, actor, change),
+            Upsert::State(change) => apply(db, actor, change),
             Upsert::Premise(change) => apply(db, actor, change),
             Upsert::Flaw(change) => apply(db, actor, change),
             Upsert::Candidate(change) => apply(db, actor, change),
         })
     }
 
-    /// Set a status, with the actor's reason. A premise's or flaw's new value changes it, and
-    /// restating the status it reads with only concerns it; either stamps it as decided or
-    /// judged by this event. Marking a path, source or component moves its own standing alone,
-    /// and a source's that of the paths it enters, so an unswept or restored path is offered
-    /// its sweep again. A path retracted or restored also moves the standing of the candidates
-    /// performing it, whose chains gain or lose the premises it relies on.
+    /// Set a status, with the actor's reason. A premise's or flaw's status set by the work owning
+    /// it changes it when it differs from the standing, and only concerns it otherwise. Set
+    /// anywhere else it is a proposal: one differing from the standing disputes it, moving that
+    /// work alone, and one agreeing only concerns it. Marking a path, state or component moves
+    /// its own standing alone, and a state's that of the paths accessing it, so an unswept or
+    /// restored path is offered its sweep again. A path retracted or restored also moves the standing of the candidates
+    /// performing it, whose chains gain or lose the premises it relies on, and the checks of the
+    /// states it accesses, which gain or lose its accesses. A state marked checked records this
+    /// event as its check, kept only by an instance or handed state.
     pub fn set_status(&self, actor: &AgentId, change: StatusChange, note: &Text) -> Result<()> {
         self.write(|db| {
             audit(db, actor, EventKind::Status, Some(note), |event| {
                 let mut marks = Marks::default();
-                let decided = |changed| match changed {
-                    true => EventEffect::Changed,
-                    false => EventEffect::Concerns,
-                };
                 match change {
                     StatusChange::Premise(id, status) => {
                         let node = live(db, id)?;
-                        let sql = "SELECT 1 FROM premise_state WHERE node=?1 AND status!=?2";
-                        let changed = exists(db, sql, params![node, status])?;
-                        let sql = "UPDATE premise SET status=?2,decided=?3 WHERE node=?1";
-                        db.execute(sql, params![node, status, event])?;
-                        marks.mark(node, decided(changed));
+                        let sql = "INSERT INTO premise_decision(event,premise,status,owned) \
+                                   VALUES (?1,?2,?3,?4)";
+                        let row = params![event, node, status];
+                        marks.mark(node, PREMISE.record(db, node, event, status, sql, row)?);
                     }
                     StatusChange::Flaw(id, status) => {
                         let node = live(db, id)?;
-                        let sql = "SELECT 1 FROM flaw_state WHERE node=?1 AND status!=?2";
-                        let changed = exists(db, sql, params![node, status])?;
-                        let sql = "UPDATE flaw SET status=?2,judged=?3 WHERE node=?1";
-                        db.execute(sql, params![node, status, event])?;
-                        marks.mark(node, decided(changed));
+                        let sql = "INSERT INTO flaw_judgement(event,flaw,status,owned) VALUES \
+                                   (?1,?2,?3,?4)";
+                        let row = params![event, node, status];
+                        marks.mark(node, FLAW.record(db, node, event, status, sql, row)?);
                     }
                     StatusChange::Path(id, status) => {
                         let node = live(db, id)?;
@@ -798,15 +1021,26 @@ impl Store {
                         db.execute(sql, params![node, status])?;
                         let retracted = PathStatus::Retracted;
                         match (held == retracted) != (status == retracted) {
-                            true => marks.mark(node, EventEffect::Standing),
+                            true => {
+                                marks.mark(node, EventEffect::Standing);
+                                marks.accesses(db, node)?;
+                            }
                             false => marks.alone(node),
                         }
                     }
-                    StatusChange::Source(id, status) => {
+                    StatusChange::State(id, StateMark::Checked) => {
                         let node = live(db, id)?;
-                        let sql = "UPDATE source SET status=?2 WHERE node=?1";
+                        let sql = "INSERT INTO state_check(state,scope,event) SELECT node,scope,?2 FROM state \
+                                   WHERE node=?1 AND scope IN ('instance','handed') ON \
+                                   CONFLICT(state) DO UPDATE SET event=excluded.event";
+                        db.execute(sql, params![node, event])?;
+                        marks.alone(node);
+                    }
+                    StatusChange::State(id, StateMark::Inventory(status)) => {
+                        let node = live(db, id)?;
+                        let sql = "UPDATE state SET status=?2 WHERE node=?1";
                         db.execute(sql, params![node, status])?;
-                        let sql = "SELECT path FROM path_source WHERE source=?1";
+                        let sql = "SELECT DISTINCT path FROM path_state WHERE state=?1";
                         for path in rows(db, sql, params![node], |row| Ok(NodeId(row.get(0)?)))? {
                             marks.alone(path);
                         }
@@ -827,27 +1061,32 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use serde_json::json;
     use skyhook::job::JobState;
 
     use super::{
-        super::tests::{
-            HIGH, assess, child_agent, fixture, last_event, marks, premise, scenario, text, verdict,
-        },
+        super::tests::{child_agent, fixture, last_event, marks, scenario, text},
         *,
     };
 
+    /// A record as `upsert` reads one: an edit with an `id`, else a new node.
+    fn read(value: serde_json::Value) -> serde_json::Result<Result<Upsert>> {
+        Ok(match value.get("id") {
+            Some(_) => serde_json::from_value::<EditRecord>(value)?.try_into(),
+            None => serde_json::from_value::<NewRecord>(value)?.try_into(),
+        })
+    }
+
     fn parse(value: serde_json::Value) -> Result<Upsert> {
-        serde_json::from_value::<UpsertInput>(value)
-            .unwrap()
-            .try_into()
+        read(value).unwrap()
     }
 
     /// Each kind is created with its fields and edited in place, a candidate's chain included:
     /// an edit of anything but the title changes the node, while a title or a restatement only
     /// concerns it. A create
-    /// lacking its kind's fields is refused naming them, and a detail row holds only a node of
-    /// its kind.
+    /// lacking its kind's fields is refused, and a detail row holds only a node of its kind.
     #[test]
     fn nodes_are_created_and_edited_in_place() {
         let (_session, store, actor) = fixture();
@@ -861,24 +1100,39 @@ mod tests {
             json!({"kind": "component", "title": "tables", "body": "huffman",
             "files": ["tables.c"]}),
         );
-        let source = upsert(json!({"kind": "source", "title": "socket", "body": "reads",
-            "location": at, "trust": "untrusted"}));
+        let input = upsert(json!({"kind": "state", "title": "socket", "body": "reads",
+            "scope": "input", "location": at, "trust": "untrusted"}));
         let recorded = last_event(&store);
         assert_eq!(
-            upsert(json!({"kind": "source", "title": "again", "body": "reads",
-                "location": at, "trust": "local"})),
-            source,
-            "a source at a recorded location is the source there"
+            upsert(json!({"kind": "state", "title": "again", "body": "reads",
+                "scope": "input", "location": at, "trust": "local"})),
+            input,
+            "an input state read at a recorded location is the one there"
         );
         assert_eq!(last_event(&store), recorded);
-        let elsewhere = upsert(json!({"kind": "source", "title": "pipe", "body": "reads",
-            "location": {"code": {"file": "pipe.c", "start_line": 1, "end_line": 1}},
-            "trust": "local"}));
-        let moved = parse(json!({"kind": "source", "id": elsewhere, "location": at})).unwrap();
-        assert!(matches!(
+        let elsewhere = upsert(json!({"kind": "state", "title": "pipe", "body": "reads",
+            "scope": "input", "location": {"code": {"file": "pipe.c", "start_line": 1,
+            "end_line": 1}}, "trust": "local"}));
+        let moved = parse(json!({"kind": "state", "id": elsewhere, "location": at})).unwrap();
+        assert_matches!(
             store.upsert(&actor, &moved),
-            Err(Error::SourceAt(at)) if NodeId::from(at) == source
-        ));
+            Err(Error::StateAt(at)) if NodeId::from(at) == input
+        );
+        let window = upsert(
+            json!({"kind": "state", "title": "window", "body": "ring buffer",
+            "scope": "instance"}),
+        );
+        let trusted = parse(json!({"kind": "state", "id": window, "trust": "local"})).unwrap();
+        assert_matches!(store.upsert(&actor, &trusted), Err(Error::NotInput));
+        for refused in [
+            json!({"kind": "state", "title": "t", "body": "b", "scope": "stored",
+                "trust": "local"}),
+            json!({"kind": "state", "id": window, "scope": "stored"}),
+            json!({"kind": "state", "title": "t", "body": "b", "scope": "input",
+                "location": at}),
+        ] {
+            assert!(read(refused.clone()).is_err(), "{refused}");
+        }
         let path = upsert(json!({"kind": "path", "title": "stream", "body": "socket to inflate"}));
         let premise = upsert(
             json!({"kind": "premise", "title": "len checked", "body": "before \
@@ -890,10 +1144,10 @@ mod tests {
             json!({"kind": "candidate", "title": "overflow", "body": "heap",
             "paths": [path], "flaws": [flaw]}),
         );
-        let kinds = [decoder, source, path, premise, flaw, candidate].map(|id| {
+        let kinds = [decoder, input, path, premise, flaw, candidate].map(|id| {
             match store.node(id).unwrap() {
                 NodeView::Component(_) => NodeKind::Component,
-                NodeView::Source(_) => NodeKind::Source,
+                NodeView::State(_) => NodeKind::State,
                 NodeView::Path(_) => NodeKind::Path,
                 NodeView::Premise(_) => NodeKind::Premise,
                 NodeView::Flaw(_) => NodeKind::Flaw,
@@ -905,31 +1159,28 @@ mod tests {
             kinds,
             [
                 NodeKind::Component,
-                NodeKind::Source,
+                NodeKind::State,
                 NodeKind::Path,
                 NodeKind::Premise,
                 NodeKind::Flaw,
                 NodeKind::Candidate
             ]
         );
-        assert!(matches!(
-            parse(json!({"kind": "flaw", "title": "copy"})),
-            Err(Error::Missing { kind: NodeKind::Flaw, fields }) if fields.0 == ["body", "component", "location"]
-        ));
+        assert!(read(json!({"kind": "flaw", "title": "copy"})).is_err());
         let empty = |paths, flaws| {
             parse(
                 json!({"kind": "candidate", "title": "t", "body": "b", "paths": paths,
                 "flaws": flaws}),
             )
         };
-        assert!(matches!(
+        assert_matches!(
             empty(json!([path]), json!([])),
             Err(Error::Empty(NodeKind::Flaw))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             empty(json!([]), json!([flaw])),
             Err(Error::Empty(NodeKind::Path))
-        ));
+        );
 
         let effects = || marks(&store, last_event(&store));
         let concerns = |node| vec![(node, EventEffect::Concerns)];
@@ -1005,16 +1256,21 @@ mod tests {
 
     /// Any agent marks a path swept, retracted or unswept: its view and listing show the
     /// status. Marking it swept or unswept moves the path alone; retracting or restoring it
-    /// also moves the candidates performing it.
+    /// also moves the candidates performing it and the states it accesses.
     #[test]
     fn any_agent_marks_a_paths_status() {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         let (path, candidate) = (scenario.path, scenario.candidate);
+        let NodeView::Path(view) = store.node(path.into()).unwrap() else {
+            panic!("a path")
+        };
+        let state = view.states[0].id;
         let (stranger, _) = child_agent(&store, JobState::Running);
         let alone = vec![(path.into(), EventEffect::Standing)];
         let carried = vec![
             (path.into(), EventEffect::Standing),
+            (state.into(), EventEffect::Standing),
             (candidate.into(), EventEffect::Standing),
         ];
         for (status, moved) in [
@@ -1036,42 +1292,5 @@ mod tests {
             );
             assert_eq!(marks(&store, last_event(&store)), moved);
         }
-    }
-
-    /// Restoring a retracted path brings the premises it relies on back into its candidates'
-    /// chains, so a verdict and report made while it was retracted no longer stand.
-    #[test]
-    fn a_restored_path_reowes_its_candidates_verdict_and_report() {
-        let (_session, store, actor) = fixture();
-        let scenario = scenario(&store, &actor, "decoder");
-        let held = premise(&store, &actor, PremiseScope::Code);
-        let relies = Link::PathPremise {
-            path: scenario.path,
-            premise: held,
-        };
-        store.link(&actor, &[relies]).unwrap();
-        let mark = |status| {
-            let change = StatusChange::Path(scenario.path, status);
-            store.set_status(&actor, change, &text("marked")).unwrap();
-        };
-        mark(PathStatus::Retracted);
-        assess(&store, &actor, scenario.candidate, HIGH);
-        verdict(&store, &actor, scenario.candidate, Verdict::Validated);
-        let finding = store
-            .report(&actor, scenario.flaw, &text("overflow"), &text("report"))
-            .unwrap();
-        let current = || {
-            let NodeView::Candidate(candidate) = store.node(scenario.candidate.into()).unwrap()
-            else {
-                panic!("a candidate")
-            };
-            let NodeView::Finding(report) = store.node(finding.into()).unwrap() else {
-                panic!("a finding")
-            };
-            (candidate.verdict.unwrap().current, report.current)
-        };
-        assert_eq!(current(), (true, true));
-        mark(PathStatus::Unswept);
-        assert_eq!(current(), (false, false));
     }
 }

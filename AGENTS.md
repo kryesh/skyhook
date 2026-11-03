@@ -53,7 +53,7 @@ Architecture: `docs/src/development/architecture.md`.
   ```
 - Tests belong in a `tests` module at the bottom of the file containing the logic they
   test; tests of a module's functionality go in that module's top-level file. Avoid
-  dedicated test files, except binary integration tests under `tests/`.
+  dedicated test files. The unit suite never spawns the built binaries.
 
 ## Verify
 
@@ -63,5 +63,5 @@ just lint
 just test
 ```
 
-For direct Cargo verification, use `--workspace --all-targets` so every crate and its
-integration tests are included.
+For direct Cargo verification, use `--workspace --all-targets` so every crate's tests are
+included.

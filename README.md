@@ -24,7 +24,7 @@ workflows, or embed its Rust core in your own application.
 
 ## Install
 
-Requires **Rust 1.89 or newer** and [just](https://github.com/casey/just). SSH support
+Requires **Rust 1.99 or newer** and [just](https://github.com/casey/just). SSH support
 embeds static Linux shims for x86_64 and aarch64, which are cross-compiled with
 [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
 

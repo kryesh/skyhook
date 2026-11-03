@@ -1,6 +1,8 @@
 //! What an agent is told of others' changes to the work its job began: for each subject of
 //! its job's tasks, as the node it was merged into if it was, the events of its phase's
-//! bearing on it since the task began, past the agent's cursor. The bearing leaves out what the
+//! bearing on it since the task began, past the agent's cursor, but no links, which owe the
+//! work again after the task instead; and, as a task begins, every one of those since the basis
+//! of the subject's previous task in its phase. The bearing leaves out what the
 //! agent or one beneath it recorded, as it does for every task of that work. Nothing is stored:
 //! the subscription is the task log, and the relation is the one a basis is the latest of.
 
@@ -33,6 +35,7 @@ const fn notices(phase: Phase) -> &'static str {
     match phase {
         Phase::Sweep => notices!("sweep"),
         Phase::Probe => notices!("probe"),
+        Phase::Check => notices!("check"),
         Phase::Settle => notices!("settle"),
         Phase::Chain => notices!("chain"),
         Phase::Assess => notices!("assess"),
@@ -42,24 +45,39 @@ const fn notices(phase: Phase) -> &'static str {
     }
 }
 
-/// An event that moved what a subject's work rests on, with the nodes it moved most.
+/// An event that moved what a subject's work rests on, with its actor's note and the nodes it
+/// moved most.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Notice {
     pub id: EventId,
     pub kind: EventKind,
-    pub nodes: Vec<Mark>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub nodes: Vec<Touched>,
 }
 
-/// The changes to one subject's work: how many events, the latest, the kinds seen, and the
-/// most recent few, oldest first.
+/// A node an event moved, by its title.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct Touched {
+    pub node: NodeId,
+    pub title: String,
+    pub effect: EventEffect,
+}
+
+/// The changes to one subject's work: how many events, the latest, the kinds seen, the most
+/// recent few, oldest first, and every node the older ones moved.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct SubjectChanges {
     pub phase: Phase,
     pub node: NodeId,
+    pub title: String,
     pub count: u64,
     pub latest: EventId,
     pub kinds: BTreeSet<EventKind>,
     pub recent: Vec<Notice>,
+    /// Each node the events before `recent` moved, once, by the most it moved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<Touched>,
 }
 
 /// Others' changes to what an agent's begun work rests on, one digest per changed subject.
@@ -74,15 +92,15 @@ fn changes(
     since: Option<EventId>,
 ) -> Result<Option<(EventId, ResearchChanges)>> {
     let agent = agent_row(db, actor)?;
-    // A subject merged away is told of the node it was merged into from the merge retiring it
-    // on: the latest merge changing it, as it changed none after.
+    // A subject merged away is told of the node it was merged into from its retirement on.
     let subjects = rows(
         db,
-        "SELECT tn.phase,coalesce(n.merged_into,n.id),t.began,CASE WHEN n.merged_into IS NOT NULL \
-         THEN (SELECT max(en.event) FROM event_node en WHERE en.node=n.id AND en.kind!='tested' \
-         AND en.effect='changed' AND en.kind='merged') ELSE 0 END FROM agent a JOIN \
-         task t ON t.job=a.owner_job JOIN task_node tn ON tn.task=t.id JOIN node n ON \
-         n.id=tn.node WHERE a.id=?1 ORDER BY t.id,tn.node",
+        concat!(
+            "SELECT tn.phase,coalesce(n.merged_into,n.id),t.began,ifnull(",
+            crate::store::bearing::retirement!("n.id"),
+            ",0) FROM agent a JOIN task t ON t.job=a.owner_job JOIN task_node tn ON tn.task=t.id \
+             JOIN node n ON n.id=tn.node WHERE a.id=?1 ORDER BY t.id,tn.node"
+        ),
         params![agent],
         |row| {
             Ok((
@@ -99,9 +117,8 @@ fn changes(
     let mut found = BTreeMap::<(Phase, NodeId), BTreeMap<EventId, EventKind>>::new();
     for (phase, node, began, merged) in subjects {
         let after = (since.map_or(began, |since| since.max(began)).0).max(merged - 1);
-        let events = rows(db, notices(phase), params![node, after], |row| {
-            Ok((EventId(row.get(0)?), enum_column::<EventKind>(row, 1)?))
-        })?;
+        let mut events = noticed(db, phase, node, EventId(after))?;
+        events.retain(|&(_, kind)| !matches!(kind, EventKind::Linked | EventKind::Unlinked));
         if !events.is_empty() {
             found.entry((phase, node)).or_default().extend(events);
         }
@@ -114,36 +131,91 @@ fn changes(
     })?;
     let mut research_changes = Vec::with_capacity(found.len());
     for ((phase, node), events) in found {
-        let Some((&latest, _)) = events.last_key_value() else {
-            continue;
-        };
-        let mut recent = Vec::with_capacity(RECENT);
-        for (&id, &kind) in events.iter().rev().take(RECENT).rev() {
-            let nodes = rows(
-                db,
-                "SELECT en.node,en.effect FROM event_node en JOIN event_effect k ON \
-                 k.name=en.effect WHERE en.event=?1 AND en.effect IN ('standing','changed') \
-                 ORDER BY k.rank DESC,en.node LIMIT ?2",
-                params![id, NODES],
-                |row| {
-                    Ok(Mark {
-                        node: NodeId(row.get(0)?),
-                        effect: enum_column(row, 1)?,
-                    })
-                },
-            )?;
-            recent.push(Notice { id, kind, nodes });
-        }
-        research_changes.push(SubjectChanges {
-            phase,
-            node,
-            count: events.len() as u64,
-            latest,
-            kinds: events.values().copied().collect(),
-            recent,
-        });
+        research_changes.extend(digest(db, phase, node, &events)?);
     }
     Ok(Some((through, ResearchChanges { research_changes })))
+}
+
+/// The events of `phase`'s bearing on `node` after `after`, oldest first.
+pub(super) fn noticed(
+    db: &Db,
+    phase: Phase,
+    node: NodeId,
+    after: EventId,
+) -> Result<Vec<(EventId, EventKind)>> {
+    rows(db, notices(phase), params![node, after], |row| {
+        Ok((EventId(row.get(0)?), enum_column::<EventKind>(row, 1)?))
+    })
+}
+
+/// The digest of `events` on `phase`'s work on `node`; none when there are none.
+pub(super) fn digest(
+    db: &Db,
+    phase: Phase,
+    node: NodeId,
+    events: &BTreeMap<EventId, EventKind>,
+) -> Result<Option<SubjectChanges>> {
+    let Some((&latest, _)) = events.last_key_value() else {
+        return Ok(None);
+    };
+    let older: Vec<EventId> = events.keys().rev().skip(RECENT).copied().collect();
+    let earlier = rows(
+        db,
+        "SELECT en.node,n.title,en.effect,max(k.rank) FROM json_each(?1) j JOIN event_node en ON \
+         en.event=j.value JOIN event_effect k ON k.name=en.effect JOIN node n ON n.id=en.node \
+         WHERE en.effect!='concerns' GROUP BY en.node ORDER BY max(k.rank) DESC,en.node",
+        params![json_list(&older)?],
+        touched,
+    )?;
+    let mut recent = Vec::with_capacity(RECENT);
+    for (&id, &kind) in events.iter().rev().take(RECENT).rev() {
+        let nodes = first_rows(
+            db,
+            "SELECT en.node,n.title,en.effect FROM event_node en JOIN event_effect k ON \
+             k.name=en.effect JOIN node n ON n.id=en.node WHERE en.event=?1 AND \
+             en.effect!='concerns' ORDER BY k.rank DESC,en.node",
+            params![id],
+            NODES,
+            touched,
+        )?;
+        let note = stored(
+            db,
+            "SELECT note FROM event WHERE id=?1",
+            params![id],
+            |row| Ok(row.get::<Option<String>>(0)?),
+        )?;
+        recent.push(Notice {
+            id,
+            kind,
+            note,
+            nodes,
+        });
+    }
+    let title = stored(
+        db,
+        "SELECT title FROM node WHERE id=?1",
+        params![node],
+        |row| Ok(row.get::<String>(0)?),
+    )?;
+    Ok(Some(SubjectChanges {
+        phase,
+        node,
+        title,
+        count: events.len() as u64,
+        latest,
+        kinds: events.values().copied().collect(),
+        recent,
+        earlier,
+    }))
+}
+
+/// A node an event moved, as a row of its id, title and effect.
+fn touched(row: &libsql::Row) -> Result<Touched> {
+    Ok(Touched {
+        node: NodeId(row.get(0)?),
+        title: row.get(1)?,
+        effect: enum_column(row, 2)?,
+    })
 }
 
 impl Store {
@@ -164,7 +236,8 @@ mod tests {
 
     use super::{
         super::tests::{
-            HIGH, assess, begun, child_of, fixture, last_event, premise, scenario, text, validated,
+            HIGH, assess, begun, child_of, decide, fixture, last_event, premise, scenario, text,
+            validated,
         },
         *,
     };
@@ -193,15 +266,18 @@ mod tests {
             premise: code,
         };
         store.link(&root, &[link]).unwrap();
-        assess(&store, &root, candidate, HIGH);
+        assess(&store, candidate, HIGH);
         let (reviewer, _, _) = begun(&store, &Begin::Review(vec![candidate]));
         assert_eq!(store.changes(&reviewer, None).unwrap(), None);
 
-        let decided = StatusChange::Premise(code, PremiseStatus::Holds);
-        store.set_status(&root, decided, &text("checked")).unwrap();
+        decide(&store, code, PremiseStatus::Holds);
         let decision = last_event(&store);
         let (through, told) = store.changes(&reviewer, None).unwrap().unwrap();
-        let mark = |node: NodeId, effect| Mark { node, effect };
+        let mark = |node: NodeId, title: &str, effect| Touched {
+            node,
+            title: title.to_owned(),
+            effect,
+        };
         assert_eq!(
             (through, told),
             (
@@ -210,18 +286,21 @@ mod tests {
                     research_changes: vec![SubjectChanges {
                         phase: Phase::Review,
                         node: candidate.into(),
+                        title: "overflow".to_owned(),
                         count: 1,
                         latest: decision,
                         kinds: BTreeSet::from([EventKind::Status]),
                         recent: vec![Notice {
                             id: decision,
                             kind: EventKind::Status,
+                            note: Some("settled".to_owned()),
                             nodes: vec![
-                                mark(code.into(), EventEffect::Changed),
-                                mark(flaw.into(), EventEffect::Standing),
-                                mark(candidate.into(), EventEffect::Standing),
+                                mark(code.into(), "the length is checked", EventEffect::Changed),
+                                mark(flaw.into(), "unbounded copy", EventEffect::Standing),
+                                mark(candidate.into(), "overflow", EventEffect::Standing),
                             ],
                         }],
+                        earlier: Vec::new(),
                     }],
                 }
             )
@@ -241,6 +320,38 @@ mod tests {
         );
     }
 
+    /// Running work is not told of a link on what it rests on, which owes it again after the
+    /// task, but is told of an edit.
+    #[test]
+    fn running_work_is_told_of_decisions_not_links() {
+        let (_session, store, root) = fixture();
+        let decoder = scenario(&store, &root, "decoder");
+        let (sweeper, _, _) = begun(&store, &Begin::Sweep(vec![decoder.path]));
+        let step = Link::PathStep {
+            path: decoder.path,
+            component: decoder.component,
+            location: None,
+            note: text("returns"),
+            position: None,
+        };
+        store.link(&root, &[step]).unwrap();
+        assert_eq!(store.changes(&sweeper, None).unwrap(), None);
+        let edit = Upsert::Path(Change::Edit(
+            decoder.path,
+            Edit {
+                title: None,
+                body: Some(text("socket to inflate")),
+                detail: (),
+            },
+        ));
+        store.upsert(&root, &edit).unwrap();
+        let told = store.changes(&sweeper, None).unwrap().unwrap().1;
+        let kinds: Vec<_> = (told.research_changes.iter())
+            .map(|s| s.kinds.clone())
+            .collect();
+        assert_eq!(kinds, [BTreeSet::from([EventKind::Edited])]);
+    }
+
     /// A subject merged away after its task began is told of changes to the node it was
     /// merged into from the merge on, however its chain's history is marked after.
     #[test]
@@ -253,18 +364,18 @@ mod tests {
         let (merged, merged_flaw) = (merged.candidate, merged.flaw);
         let (reviewer, _, _) = begun(&store, &Begin::Review(vec![merged]));
         evidence(&store, &root, kept, Stance::Contradicts);
-        let merge = Merge::Candidate {
-            candidate: merged,
-            into: kept,
+        let merge = Merge {
+            node: merged.into(),
+            into: kept.into(),
             note: text("same"),
         };
         store.merge(&root, &merge).unwrap();
         let merged_at = last_event(&store);
         evidence(&store, &root, kept, Stance::Contradicts);
         let disputed = last_event(&store);
-        let rechained = Merge::Flaw {
-            flaw: merged_flaw,
-            into: scenario(&store, &root, "c").flaw,
+        let rechained = Merge {
+            node: merged_flaw.into(),
+            into: scenario(&store, &root, "c").flaw.into(),
             note: text("same"),
         };
         store.merge(&root, &rechained).unwrap();
@@ -279,7 +390,7 @@ mod tests {
 
     /// Each subject is told what its own phase rests on: a settling look of a dispute, a test
     /// of a new environment. Every changed subject has a digest: its count, latest event and
-    /// kinds, with its newest few events.
+    /// kinds, with its newest few events and every node the older ones moved.
     #[test]
     fn notices_follow_each_phases_bearing_as_a_digest_per_subject() {
         let (_session, store, root) = fixture();
@@ -326,6 +437,15 @@ mod tests {
         );
         assert_eq!(busy.recent.len(), RECENT);
         assert_eq!(busy.recent.last().unwrap().id, busy.latest);
-        assert_eq!((other.node, other.count), (NodeId::from(quiet), 1));
+        let earlier: Vec<NodeId> = busy.earlier.iter().map(|touched| touched.node).collect();
+        assert_eq!(
+            earlier,
+            [NodeId::from(code)],
+            "the older events' nodes, once"
+        );
+        assert_eq!(
+            (other.node, other.count, other.earlier.len()),
+            (NodeId::from(quiet), 1, 0)
+        );
     }
 }
