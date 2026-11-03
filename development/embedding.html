@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+            window.path_to_searchindex_js = "../searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -260,9 +260,8 @@ own arguments. Session history is always <code>.skyhook/sessions</code>. The hos
     // SAFETY: no threads or runtime have been started.
     unsafe { skyhook_cli::main(MyProduct) }
 }</code></pre>
-<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> and configures SQLite for
-the process before starting Tokio, so the process must still be single-threaded; help and version
-need no <code>.env</code> or configuration.</p>
+<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> before starting Tokio, so
+the process must still be single-threaded; help and version need no <code>.env</code> or configuration.</p>
 <p>The extension points are:</p>
 <ul>
 <li><code>Product::configure(&amp;self, &amp;mut Config, Args, SessionContext&lt;'_&gt;)</code> returns <code>Configured</code>: the
@@ -293,10 +292,18 @@ work (see <a href="#interruption-continuation-and-shutdown">Interruption, contin
 </ul>
 <p>Hooks before <code>opened</code> create no sessions and write nothing to stdout; a batch run prints the
 session ID first. A product that keeps its own data in each session declares it as
-<code>Identity::tables</code>, an <code>Extension { sql, format, seed }</code> the host passes to
-<code>HarnessBuilder::session_extension</code>: the harness creates those tables in every session it creates
-and checks their format on every one of its own it reopens. <code>SessionStore::summary</code>, given the
-host and its tables, refuses one of the host’s own sessions that check would refuse, so the
+<code>Identity::schema</code>, a <code>session::Schema</code> the host passes to <code>HarnessBuilder::session_schema</code>: the
+harness creates every session from it and checks the tables’ format on every one of its own it
+reopens. <code>Schema::extended(image, seed)</code> takes the tables as a <code>ProductImage</code> and a function that
+fills their dictionaries in a new session (<code>Seeding::Fill</code>) and checks them on an open
+(<code>Seeding::Check</code>). <code>skyhook_schema::image!(format = N, file = "src/schema.sql")</code> builds the
+image at compile time: the journal’s schema with the product’s DDL layered on it and the format
+recorded, from <code>sql = "…"</code> literals and <code>file = "…"</code> paths relative to the crate’s manifest, in
+order. A changed file rebuilds the crate. The macro sees its arguments unexpanded, so they must
+be literals or file paths, not <code>concat!</code>, <code>include_str!</code> or another macro’s output; DDL only
+available that way goes through <code>ProductImage::layered(ddl, format)</code>, which runs it over the
+journal’s image as each session is created. A plain host passes <code>Schema::JOURNAL</code>.
+<code>SessionStore::summary</code>, given the host and its schema, refuses one of the host’s own sessions that check would refuse, so the
 session switcher leaves it out and <code>--resume</code> refuses it before <code>prepare</code>, as for an earlier
 session format; other hosts’ sessions are still listed, view-only. The harness hands host state
 and the resume hook the tables as an <code>ExtensionDb</code> on the session’s own writer and read pool;
@@ -315,7 +322,8 @@ columns wide, the usual band below it on a narrower one. <code>AgentPane::Hidden
 off the UI thread, as the extension’s own session sees it. A <code>Page</code> is a list of typed blocks:
 <code>Facts</code> (label and value pairs), a <code>Pipeline</code> of stages, <code>Panels</code> of labelled values and
 meters, and <code>Section</code>s, collapsible tables of records that each open to their detail. Cells
-carry a <code>Tone</code>, not a colour. The host lays the page out with its own theme, reflowing panels
+carry a <code>Tone</code> and a <code>Weight</code>, not a colour or a font. The host lays the page out with its own
+theme, reflowing panels
 and dropping section columns by priority as the width shrinks, and owns disclosure and
 scrolling, so a product needs no terminal code. <code>Disclosed</code> says which sections are open, how
 many of their records to supply (<code>Disclosed::PAGE</code> at a time), and which records are open,
@@ -418,7 +426,7 @@ rendering as false. Names nested in a value (<code>capabilities.agents</code>) a
 agent’s runtime state. The harness asks for the section before each request and before a
 compaction summary, places it inside the state block beside the date, live jobs and todos, and
 journals it with the state. It is asked with the host’s tables in the session (its
-<code>session_extension</code>, so only the host’s own sessions have a section) and the agent, so it can
+<code>session_schema</code>, so only the host’s own sessions have a section) and the agent, so it can
 read what the host keeps in the session and answer per agent. The host renders the text itself;
 <code>None</code> adds nothing to that request. Use it for facts an agent needs current, such as a
 workflow’s identity, policy and progress, rather than prefixing them to the user’s first
@@ -667,11 +675,10 @@ aggregates over the whole journal, its requests read a page at a time, so its me
 with the session.</p>
 <p>The SQLite layout is versioned. Opening a database validates its identity and version; there is no
 migration or compatibility layer for earlier layouts.</p>
-<p>An embedder that runs the library without <code>skyhook_cli::main</code> may call
-<code>skyhook::db::configure_process()</code> once at startup, before any other thread or SQLite use. It turns
-off SQLite’s allocation statistics, whose global mutex serialises parallel readers, but it also
-disables SQLite memory accounting for everything else in the process, so the library never calls
-it on its own.</p>
+<p>Before its first connection the library turns off SQLite’s allocation statistics for the
+process, whose global mutex serialises parallel readers. That also disables SQLite memory
+accounting and heap limits for any other SQLite user sharing the process; such a user must not
+start SQLite before the library’s first connection opens.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
 <p>The journal records inputs at the shared <code>Provider</code> boundary, not codec-specific request bodies
 or authentication headers:</p>

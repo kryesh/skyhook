@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+            window.path_to_searchindex_js = "../searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -271,10 +271,15 @@ keep their first members in source order the same way; smaller objects keep all 
 when that does not fit, none. When even a single sample does not fit, strings get shorter, then
 deeper levels are left empty. Values holding complete fields keep the path to them.</li>
 </ul>
-<p>Fields a tool declares complete are never shortened and are not counted: skill instructions,
-child agent answers, and the job views <code>jobs</code> reads return. Errors and child questions sit
-outside <code>result</code> and are also complete, including those of tool responses a script returns. A
-response can therefore exceed the budget; it does not limit response size.</p>
+<p>Fields a tool declares complete are never shortened and are not counted: skill instructions and
+child agent answers. Errors and child questions sit outside <code>result</code> and are also complete,
+including those of tool responses a script returns. A response can therefore exceed the budget;
+it does not limit response size.</p>
+<p>A presentation is never shortened again: a <code>jobs</code> listing, or a <code>jobs</code> read’s preview or page,
+reads the same however it is presented later. A script’s <code>jobs</code> read holds the whole result
+instead, so wherever that view is presented again, returned from the script or read as the
+<code>jobs</code> call’s own saved output, its result is previewed as a direct read of it would be, while
+the view’s own fields stay whole.</p>
 <p><code>presentation</code> precedes <code>result</code>. When arrays or objects were cut, <code>presentation.shape</code> describes
 the whole result: objects list each member’s shape under its own name, and a member only some
 objects have includes <code>absent</code>, as in <code>"boolean|absent"</code>; arrays are <code>[count, element]</code>, with <code>"min..max"</code> when lengths vary and <code>[0]</code> when always empty;
@@ -293,7 +298,8 @@ lines <code>next_start</code> up to, but not including, <code>tail_start</code> 
 </ul>
 <p><code>kept</code> lists the index ranges shown, as <code>[[first, last], ...]</code>, when a complete field inside an
 array or object keeps an element beyond the leading ones; such records are always listed. Reading
-a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
+a cut array or object continues at its first value not shown: <code>start</code> is one-based, so without
+<code>kept</code> that is <code>shown + 1</code>, with <code>unit</code> <code>elements</code> or <code>members</code>. Finished jobs with incomplete captures
 include an <code>Output incomplete; captured fields remain readable with jobs({job, field}).</code> notice. These rules also apply after session resume and to
 completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
@@ -313,20 +319,28 @@ selected field, in that field’s own unit:</p>
 </thead>
 <tbody>
 <tr><td>Text: a string, a number, boolean or null, or a capture that is live or unfinished</td><td><code>start</code>, <code>offset</code>, <code>limit</code>, <code>pattern</code>, <code>context</code></td><td><code>lines</code>, <code>total_lines</code>, <code>next_start</code>, <code>next_offset</code></td></tr>
-<tr><td>A JSON object or array</td><td><code>index</code>, <code>limit</code></td><td><code>elements</code> or <code>members</code>, <code>total_elements</code> or <code>total_members</code>, <code>next_index</code></td></tr>
-<tr><td>A JSON object or array, queried</td><td><code>query</code>, <code>index</code>, <code>limit</code></td><td><code>matches</code>, <code>total_matches</code>, <code>next_index</code></td></tr>
+<tr><td>A JSON object or array</td><td><code>start</code>, <code>unit</code>, <code>limit</code></td><td><code>elements</code> or <code>members</code>, <code>total_elements</code> or <code>total_members</code>, <code>next_start</code></td></tr>
+<tr><td>A JSON object or array, filtered by <code>pattern</code> or <code>query</code></td><td><code>start</code>, <code>unit</code>, <code>limit</code>, and <code>pattern</code> or <code>query</code></td><td><code>matches</code>, <code>total_matches</code>, <code>next_start</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Using another unit’s selectors is rejected with an error naming the field’s kind; selectors that
-only restate their defaults (<code>start: 1</code>, <code>offset: 0</code>, <code>context: 0</code>, and <code>index: 0</code> without
-<code>query</code>) select nothing, so they are accepted with either kind of field. Job metadata is never truncated.</p>
+<p><code>start</code> and <code>limit</code> page lines of text or values of JSON, and <code>pattern</code> filters either. <code>unit</code>
+names what <code>start</code> counts, as the page it continues names its values: <code>lines</code>, <code>elements</code>,
+<code>members</code> or <code>matches</code>. A <code>start</code> past 1 on JSON requires it, and any <code>unit</code> must match the field’s
+pages: a capture read as lines while its job ran can be JSON once it finished, and a line position
+does not apply to it, so such a read is rejected and the field is read again from <code>start: 1</code>.
+<code>offset</code> and <code>context</code> apply only to text, and <code>query</code> only to JSON; using them with the other kind
+of field is rejected with an error naming the field’s kind. Selectors that only restate their defaults
+(<code>start: 1</code>, <code>offset: 0</code>, <code>context: 0</code>) select nothing, so they are accepted with either kind of
+field. Job metadata is never truncated.</p>
 <pre><code class="language-js">// Read part of a text field, search it, and continue a long line.
 jobs({job:42, field:"/result/stdout", start:300, limit:80})
 jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 // Page a JSON array, then continue at the returned position.
-jobs({job:42, field:"/result/stdout/items", index:200, limit:50})
+jobs({job:42, field:"/result/stdout/items", start:201, unit:"elements", limit:50})
+// Keep the elements whose JSON mentions a name.
+jobs({job:42, field:"/result/stdout/items", pattern:"\"api-[0-9]+\""})
 // Select within JSON.
 jobs({job:42, field:"/result/stdout", query:"$.items[?@.status.phase == 'Failed'].metadata.name"})
 </code></pre>
@@ -359,20 +373,28 @@ a search; overlapping match context is reconstructed from saved text. Live searc
 lines and context windows until more output arrives or capture closes. A wait timeout never stops
 the original job.</p>
 <h3 id="json-pages"><a class="header" href="#json-pages">JSON pages</a></h3>
-<p><code>index</code> is the zero-based first element or member (default 0). A page holds whole consecutive
-values in source order within 32 KiB, member names and text included, so it may return fewer than
-<code>limit</code>: continue at <code>next_index</code>, which is absent at the end. A first value that is not whole
-within the page is sampled as a preview is, within the page budget, with the page’s <code>shape</code> and
-<code>truncated</code> records at that value’s own pointers, for scripts and the model alike; select those
-pointers to read further into it. A member name longer than the page budget is still shown whole.</p>
+<p><code>start</code> is the one-based first element or member (default 1), so element <code>/items/0</code> is <code>start: 1</code>;
+past 1, <code>unit</code> is <code>elements</code> or <code>members</code>, or <code>matches</code> on a page filtered by <code>pattern</code>.
+A page holds whole consecutive values in source order within 32 KiB, member names and text
+included, so it may return fewer than <code>limit</code>: continue at <code>next_start</code>, which is absent at the
+end. A first value that is not whole within the page is sampled as a preview is, within the page
+budget, with the page’s <code>shape</code> and <code>truncated</code> records at that value’s own pointers, for scripts
+and the model alike; select those pointers to read further into it. A member name longer than the page budget is still shown whole.</p>
+<p><code>pattern</code> keeps the elements or members whose compact JSON text matches, with text’s regex rules:
+a member’s text is its name, a colon and its value, and strings appear JSON-escaped. The kept
+values are <code>{at, value}</code> matches like a query’s, with <code>total_matches</code> counting all of them in the
+field; <code>start</code> and <code>next_start</code> are positions among the field’s elements or members, so a search
+continues as a text search does. Like a query, a pattern reads the field into memory, up to 64 MiB
+of JSON text.</p>
 <h3 id="queries"><a class="header" href="#queries">Queries</a></h3>
 <p><code>query</code> is a JSONPath (RFC 9535) query over the selected JSON field: <code>$</code> is that field. Filters can
 use <code>length()</code>, <code>count()</code>, <code>value()</code>, and regular expressions with <code>match()</code> (the whole string) and
-<code>search()</code> (any part). Matches are <code>{at, value}</code> in document order, duplicates included, where <code>at</code>
-is the match’s pointer in the saved output, ready to use as <code>field</code>. They page by <code>index</code> like
-elements, with <code>total_matches</code> counting all of them. Numeric comparisons use double precision.
-When nothing matches, the page carries the queried field’s <code>shape</code>, which shows the member names
-a query can use.</p>
+<code>search()</code> (any part), as in <code>$[?search(@.title, '[Ee]ncoder')]</code>. A query that does not parse is rejected with this filter form. Matches
+are <code>{at, value}</code> in document order, duplicates included, where <code>at</code> is the match’s pointer in the
+saved output, ready to use as <code>field</code>. They page by <code>start</code> with <code>unit: "matches"</code>, counting matches from 1,
+with <code>total_matches</code> counting all of them. Numeric comparisons use double precision. When nothing
+matches, the page carries the filtered field’s <code>shape</code>, which shows the member names a query or
+pattern can use.</p>
 <p>A query reads the selected field’s JSON into memory, up to 64 MiB of JSON text; a larger field is
 rejected, so query a field within it. This limits a query’s input, not its evaluation: once it
 starts, a query runs to completion, and queries that repeat selectors can produce many duplicate

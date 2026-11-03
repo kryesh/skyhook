@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+            window.path_to_searchindex_js = "../searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -265,7 +265,8 @@ that answer other requests with an empty page or a non-HTML variant return their
 that serve no HTML still return JSON; <code>readable</code> sends
 <code>text/html,application/xhtml+xml;q=0.9,*/*;q=0.8</code>.
 <code>save_to</code> saves the response to a file on success instead of embedding the payload, creating
-missing parent directories, and ignores <code>response_format</code>. Errors or cancellation do not replace
+missing parent directories, and ignores <code>response_format</code>. It and <code>overwrite</code> are offered only to
+agents with the <code>write</code> capability. Errors or cancellation do not replace
 an existing destination.</p>
 <p>HTML is returned as <code>{kind: "page", title, byline?, site_name?, language?, scope, markdown}</code>.
 <code>scope</code> is <code>article</code> when the page has a readable main article, and <code>markdown</code> holds only that

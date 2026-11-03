@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+            window.path_to_searchindex_js = "../searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -211,7 +211,7 @@ reply in <code>.result.reply</code>; earlier replies are not concatenated into i
 earlier visible replies are not message events: its result saves them in <code>messages</code>, oldest
 first, each <code>{text, at}</code> with <code>at</code> the RFC 3339 UTC time it was made. Like any large result, a
 long <code>messages</code> is shortened in the call’s view and listed in <code>presentation.truncated</code>; read the
-rest with <code>jobs({job, field: "/result/messages", index})</code>. Replies a session restart cuts off
+rest with <code>jobs({job, field: "/result/messages", start, unit: "elements"})</code>. Replies a session restart cuts off
 from a call whose child still ran arrive as message events. <code>messages</code> is absent when there are
 none. The parent cannot make another model request until its foreground calls return.</p>
 <p>When a child asks, the model’s own foreground call blocked on it moves to the background, so the

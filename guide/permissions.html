@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4550e578.js";
+            window.path_to_searchindex_js = "../searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -203,8 +203,8 @@ does not exist, the operation is refused without a prompt, exactly as if the use
 unless the approval policy would allow the operation without asking; then it fails as not found.
 A missing path inside the workspace fails before approval. On the session host, a child agent’s
 <code>workspace</code> is checked like a path when the child starts: outside the workspace, it follows the
-rules above; inside, it need not exist yet, and a write that creates parent directories can create
-it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
+rules above; inside, a missing one is created before the child starts, which needs the
+launching agent’s <code>write</code> capability and is authorized as a write to it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
 <code>workspace</code> resolves to, and its relative paths resolve from there. On the session host, its job
 shows the <code>workspace</code> joined to the agent’s workspace, with any <code>..</code> kept. <code>remove</code> refuses the root workspace, the agent’s workspace, and any directory
 containing either.</p>

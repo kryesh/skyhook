@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-4550e578.js";
+            window.path_to_searchindex_js = "searchindex-2efac103.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26aae551.js"></script>
@@ -205,7 +205,7 @@ Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/L
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
 <p>Skyhook runs on Unix and is built from a source checkout with <a href="https://github.com/casey/just">just</a>.
-Rust 1.89 or newer is required. SSH support needs static Linux shims, which are cross-compiled with
+Rust 1.99 or newer is required. SSH support needs static Linux shims, which are cross-compiled with
 <a href="https://ziglang.org/download/">Zig</a>; install Zig yourself and make <code>zig</code> available on <code>PATH</code> (or
 set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the remaining Rust-side tooling
 (<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, mdBook) and both musl targets.</p>
@@ -603,7 +603,9 @@ work it needs completed; outstanding jobs are cancelled, and child agents interr
 shutdown. Interrupt and termination signals also trigger cleanup and journaled status rather than
 a terminal prompt.</p>
 <p>A batch job never has human interaction. Root <code>ask</code> is unavailable (also inside scripts and with <code>bg:true</code>). Child agents
-can still ask their owning parent agent. Operations requiring human approval fail immediately;
+can still ask their owning parent agent. The root is instructed as a delegated agent: it completes the
+prompt’s task and returns the result, answering its children’s questions itself rather than ending
+its turn to ask. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
@@ -770,8 +772,8 @@ does not exist, the operation is refused without a prompt, exactly as if the use
 unless the approval policy would allow the operation without asking; then it fails as not found.
 A missing path inside the workspace fails before approval. On the session host, a child agent’s
 <code>workspace</code> is checked like a path when the child starts: outside the workspace, it follows the
-rules above; inside, it need not exist yet, and a write that creates parent directories can create
-it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
+rules above; inside, a missing one is created before the child starts, which needs the
+launching agent’s <code>write</code> capability and is authorized as a write to it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
 <code>workspace</code> resolves to, and its relative paths resolve from there. On the session host, its job
 shows the <code>workspace</code> joined to the agent’s workspace, with any <code>..</code> kept. <code>remove</code> refuses the root workspace, the agent’s workspace, and any directory
 containing either.</p>
@@ -1095,7 +1097,7 @@ await tool.write({
 });
 </code></pre>
 <p>An agent on the session host can omit <code>target</code>.</p>
-<p>A <a href="https://github.com/kryesh/skyhook/tree/main/tests/fixtures/skill-workspace">mixed-file test workspace</a> includes its hidden
+<p>A <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/tool/builtins/testdata/skill-workspace">mixed-file test workspace</a> includes its hidden
 <code>.agents/skills/mixed-assets/</code> directory. Its tests exercise native calls, explicit nulls,
 asset discovery, UTF-8 and binary files, image attachments, and path containment.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -1159,7 +1161,7 @@ child mode needs, which is why <code>orchestrate</code> holds <code>exec</code> 
 usual approvals, and <code>targets</code> is granted by none. The companion declares five
 capabilities, which follow the same ceiling and delegation rules as built-ins:</p>
 <ul>
-<li><code>security.research</code> permits recording research: components, sources, paths, premises,
+<li><code>security.research</code> permits recording research: components, states, paths, premises,
 flaws, candidates and their links, evidence, merges, statuses, assessments, and environments.</li>
 <li><code>security.verdict</code> permits writing reports; together with <code>security.research</code>, review
 verdicts.</li>
@@ -1180,8 +1182,8 @@ the modes it launches, and <code>orchestrate</code>, which launches them, hold i
 <tr><td><code>target</code></td><td><code>security.research</code></td><td><code>network</code></td></tr>
 <tr><td><code>question</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>sweep-part</code></td><td><code>security.research</code></td><td>none</td></tr>
-<tr><td><code>paths</code>, <code>sources</code></td><td><code>security.research</code></td><td><code>exec</code>, <code>network</code></td></tr>
-<tr><td><code>sweep</code>, <code>assess</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td>none</td></tr>
+<tr><td><code>paths</code>, <code>entries</code></td><td><code>security.research</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>sweep</code>, <code>check</code>, <code>assess</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td>none</td></tr>
 <tr><td><code>probe</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>validate</code></td><td><code>security.research</code>, <code>security.scheduled</code>, <code>security.verdict</code></td><td><code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>environment</code></td><td><code>security.research</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
@@ -1190,13 +1192,14 @@ the modes it launches, and <code>orchestrate</code>, which launches them, hold i
 </tbody>
 </table>
 </div>
-<p><code>sources</code> holds <code>exec</code> and <code>network</code> for binary images and live enumeration, which most
-<code>sources</code> agents, reading one code file, never use; <code>paths</code> holds them to launch <code>sources</code>. A <code>question</code> agent settling a premise the code alone
+<p><code>entries</code> holds <code>exec</code> and <code>network</code> for binary images and live enumeration, which most
+<code>entries</code> agents, reading one code file, never use; <code>paths</code> holds them to launch <code>entries</code>. A
+<code>question</code> agent settling a premise the code alone
 cannot decide may, under a live policy, run a bounded experiment or measurement in a recorded
 environment, or have a child run it, and decide the premise from what it observed against its
 control.</p>
 <p>How far a child may delegate is set by its launch’s depth. The embedded templates launch
-coordinators (<code>sweep</code>, <code>probe</code>, <code>validate</code>, <code>poc</code>) with depth 2 and every other mode with depth
+coordinators (<code>sweep</code>, <code>check</code>, <code>probe</code>, <code>validate</code>, <code>poc</code>) with depth 2 and every other mode with depth
 1, so any agent can delegate part of its work or a focused check when it is more than it can
 cover well; agents may choose otherwise.</p>
 <h2 id="research-pipeline"><a class="header" href="#research-pipeline">Research pipeline</a></h2>
@@ -1208,16 +1211,37 @@ request settles, each actor’s intended capabilities among them, and each inter
 under a short name; when your scope includes dependencies, it records each locked version a
 published advisory affects as a flaw at its manifest entry. Under a live policy, when the map
 records interfaces, the orchestrator arranges an environment serving them before <code>paths</code>, under
-<code>ask</code> once you approve its scope. <code>paths</code> has a <code>sources</code> child record the entry points of each
-file and of each interface an environment serves, each on the path its flow matches or one of
-its own up to its handoff, then relinks the sources, path premises and candidate actions of paths
-sharing a handoff onto one path and extends each through the components it reaches.</p>
+<code>ask</code> once you approve its scope. <code>paths</code> has an <code>entries</code> child record the entries of each file
+and of each interface an environment serves as paths, the input states taken in there, and the
+other states its code reads or writes, with each path’s accesses. It then merges paths recording
+one entry and states recording one storage, links the input states no child placed, and
+completes each path from the target’s first code the input reaches through every stage that
+handles it.</p>
+<p>The components recorded outside scheduled work, by <code>target</code> and <code>paths</code> with its <code>entries</code>
+children, are the run’s <strong>scope</strong>. A path is in scope while its entry step lies in one of them,
+by the step’s component or the component owning its file. <code>target</code> records the exclusions in
+your request as failing deployment premises and maps none of the excluded code, and a check
+records no path for a caller it finds outside the scope, such as a language binding. What later
+work records beyond the scope anyway stays recorded but owes nothing, and neither does what only
+such paths reach: a state only they access, a flaw only they step through that no candidate
+starting in scope holds, a premise only such work relies on, and a candidate whose first action
+is one. A state an in-scope path
+accesses too is checked as before. The synthesis and the Research page count the paths and
+candidates outside the scope.</p>
 <p>After <code>paths</code>, one scheduler runs every phase together within <code>workers</code>: each subject starts as
 soon as its own prerequisites are met rather than when a whole phase ends. Ready work starts in
-pipeline order — sweeps and probes, settles and chains, assessments, reviews, tests, reports —
-and later work waits only on earlier-stage work, ready or running, that touches it; unrelated
-later work fills the remaining slots. Settles and chains go out in bundles: one child takes every ready
-entry of its phase that shares a node with the first. Work on a node that running work is about
+pipeline order — sweeps, probes and checks, settles and chains, assessments, reviews, tests,
+reports — and later work waits only on earlier-stage work, ready or running, that touches it;
+unrelated later work fills the remaining slots. Sweeps, settles, chains and reviews go out in
+bundles, one child each: the sweeps of the paths keyed on the same state, a path’s key being the handed state it reads
+or writes that the most paths access (the instance handle its caller supplies or receives), else
+the instance state the most paths access, ties going to the lowest-numbered, so every call on one
+instance goes together (a path accessing neither is swept alone, and paths sharing only another
+state stay in their own bundles); a path’s settles (its own premises, those of the
+flaws on it, and what each rests on) or chains, where work on a stage several paths share goes
+with the lowest-numbered one and a premise goes with the path of the premises resting on it; and
+the reviews of one root flaw’s candidates. Work on a node that running
+work is about
 waits for it, so one agent works a node at a time and the next starts with its findings in view.</p>
 <div class="table-wrapper">
 <table>
@@ -1225,13 +1249,14 @@ waits for it, so one agent works a node at a time and the next starts with its f
 <tr><th>Phase</th><th>Subject</th><th>Owed while</th><th>Mode</th></tr>
 </thead>
 <tbody>
-<tr><td>Sweep</td><td>path</td><td>it is unswept and a recorded source entering it sits in code; a path is swept once, and a later correction of its steps owes nothing; marking it unswept offers its sweep again</td><td><code>sweep</code> (long paths in <code>sweep-part</code> stretches)</td></tr>
-<tr><td>Probe</td><td>path</td><td>it is unswept, no recorded source entering it sits in code, and the launch does live work and an environment for any candidate serves each interface its sources sit on, or they sit only in binaries; a new environment for any candidate serving one of those interfaces (any one, for binaries only), unless recorded within a probe, gives an unswept probe fresh tries</td><td><code>probe</code></td></tr>
-<tr><td>Settle</td><td>code premise</td><td>it is undecided, or disputed since its decision, and a live flaw or unretracted path relies on it</td><td><code>question</code></td></tr>
-<tr><td>Chain</td><td>flaw</td><td>it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate holds it; ready once no path’s sweep or probe is pending</td><td><code>question</code></td></tr>
-<tr><td>Assess</td><td>candidate</td><td>no assessment stands at what it rests on: its own, its chain’s, its flaws’ or its paths’ material changes</td><td><code>assess</code></td></tr>
-<tr><td>Review</td><td>candidate</td><td>it is assessed at or above the shortlist and no verdict stands; ready once no premise of its chain is undecided while its settle is pending or the user is asked it</td><td><code>validate</code></td></tr>
-<tr><td>Test</td><td>candidate</td><td>it is validated, not noted, untested or reopened, and leads its root group; or its latest test is pending</td><td><code>poc</code></td></tr>
+<tr><td>Sweep</td><td>path</td><td>it is unswept and one of its reads of a recorded input or handed state (what its caller supplies, such as an instance handle) sits in code; a path is swept once, and a later correction of its steps owes nothing; marking it unswept offers its sweep again</td><td><code>sweep</code> (long paths in <code>sweep-part</code> stretches)</td></tr>
+<tr><td>Probe</td><td>path</td><td>it is unswept, it reads a recorded input or handed state but none in code, and the launch does live work and an environment for any candidate serves each interface it reads one on, or it reads them only in binaries; a new environment for any candidate serving one of those interfaces (any one, for binaries only), unless recorded within a probe, gives an unswept probe fresh tries</td><td><code>probe</code></td></tr>
+<tr><td>Check</td><td>instance or handed state</td><td>no check is recorded, its latest was recorded outside a check of it, or an access, edit or merge came after it outside that check; ready once no path recorded before the state’s latest access, edit or merge outside its checks owes a pending sweep, whether or not it accesses the state; a path recorded since does not hold it back, as the accesses its sweep records owe the check again</td><td><code>check</code></td></tr>
+<tr><td>Settle</td><td>code premise</td><td>it is undecided, disputed since its decision (by a differing proposal or contradicting evidence), or decided while a premise it rests on has been decided, either way, or disputed since that decision; and a live flaw or unretracted path relies on it or on a premise resting on it</td><td><code>question</code></td></tr>
+<tr><td>Chain</td><td>flaw</td><td>it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate holds it or it carries a proposal; or it is not refuted, it leaves a recorded state wrong, and no chain of it began since what its chain rests on last changed, an access of that state included, so a reader recorded since owes it one more look whatever its candidates; ready once no path stepping through its component or reading a state it leaves wrong owes a pending sweep or probe, and no such state a pending check</td><td><code>question</code></td></tr>
+<tr><td>Assess</td><td>candidate</td><td>no assessment stands at what it rests on (its own, its chain’s, its flaws’ or its paths’ material changes), or one recorded outside it proposes another</td><td><code>assess</code></td></tr>
+<tr><td>Review</td><td>candidate</td><td>it is assessed at or above the shortlist and no verdict stands, or one recorded outside it proposes another; ready once its assessment is not pending and no premise of its chain is undecided while its settle is pending or the user is asked it</td><td><code>validate</code></td></tr>
+<tr><td>Test</td><td>candidate</td><td>it is validated, not noted, untested or reopened, and leads its root group; or it is unproven, untested or reopened, and an undecided code premise of its chain whose settle is exhausted has no more severe unproven candidate resting on it, or as severe and older, whose test is not exhausted; or its latest test is pending</td><td><code>poc</code></td></tr>
 <tr><td>Report</td><td>root flaw</td><td>its group has a reportable scenario its finding does not report as it stands; ready once no member owes an assessment, review or test</td><td><code>report</code></td></tr>
 </tbody>
 </table>
@@ -1248,31 +1273,50 @@ waiting on an approval or an unblock comes back held, and the orchestrator asks 
 it again with your answers. Every scheduling fact is in the store, so running the
 scheduler again, after a stop, a crash or a resume, continues where the last run stopped. The
 orchestrator runs one at a time.</p>
-<p>A child working a task is told, with its next request, of what other agents changed of what
-its work rests on since it began: each change once, as a digest per changed subject (how many
-changes, the latest, their kinds, and the newest few with the nodes each moved most), so it can
-re-read them before deciding. Its own changes and its helpers’ are left out,
-and the root, which works no task, is told nothing.</p>
+<p>A child beginning a task is told what changed of each subject’s work since the subject’s
+previous task in that phase, if any, and while it works, with its next request, of what other
+agents changed of what its work rests on since it began: each change once, as a digest per
+changed subject (how many changes, the latest, their kinds, the newest few with their notes
+and the nodes each moved most, and every node the older ones moved), so it can re-read them
+before deciding. A check of a state checked before examines only the accesses changed since, and
+the whole state again after an edit or a merge into it. Its own changes and its helpers’ are left out,
+and the root, which works no task, is told nothing. A task also names, for each subject, the
+result of its phase proposed outside it (below), for it to decide, and a check the decided
+premises of the flaws leaving its state wrong, each with the task deciding it and how much
+evidence it carries, for what it finds to contradict.</p>
 <p>The research graph holds nodes of a few kinds, each with a title and a body:</p>
 <ul>
 <li>A <strong>component</strong> is implementation, by the files and named interfaces it owns; its body notes its
 concurrency: what runs its code, the state it shares, and what serialises access to it.</li>
-<li>A <strong>source</strong> is one entry point an actor drives, with its location and trust (untrusted,
-authenticated, local or privileged); a location has one source, so recording another there
-returns the one recorded, and merging a source frees its location for the source it merged
-into. A read of state an attacker-driven flow writes, such as a
-stored record or session, is a source too, trusted as its least-privileged writer;
-configuration read at startup is trusted as the operator, and a CI job others can trigger as
-whoever can trigger it.</li>
-<li>A <strong>path</strong> is an ordered flow of steps through components, each at a location with a note,
-from the sources that share it.</li>
+<li>A <strong>state</strong> is the storage one invariant relates, by its scope; per-call temporaries are not
+states. An <strong>input</strong> state is data an actor writes that the target takes in, with its trust
+(untrusted, authenticated, local or privileged) and the read defining it: a location defines
+one input state, so recording another there returns the one recorded, and merging one frees
+its location for the state it merged into. Configuration read at startup is trusted as the
+operator, and a CI job others can trigger as whoever can trigger it. A <strong>handed</strong> state is
+written by the target and carried by the caller into later calls, such as a status or a
+cursor; an <strong>instance</strong> state is one object’s fields across its calls; a <strong>stored</strong> state
+outlives the caller’s interaction and is read by other flows, such as a session or a record,
+each read of it trusted as its least-privileged writer path’s input. A state’s scope is fixed
+when it is recorded.</li>
+<li>A <strong>path</strong> is one scenario: an entry on the target’s public interface (a route, handler, job,
+exported function) followed through every stage that handles it, as ordered steps through
+components, each at a location with a note, and its <strong>accesses</strong>: each read or write of a
+state, at its location. One state can be accessed by many paths.</li>
 <li>A <strong>premise</strong> is a prerequisite: internal state or logic a flaw needs to reach unintended
-state, or a path needs to carry input there. A failing premise contradicts the candidates
-resting on it. It is code-scoped, about the target’s own logic and decided by reading or
-observing it, or deployment-scoped, decided by you, and holds, fails, or is undecided.</li>
+state, or a path needs to carry input there, stated as that need and never as the code’s
+safety guarantee (a guarantee the code does not enforce is a flaw). A failing premise
+contradicts the candidates resting on it. It is code-scoped, about the target’s own logic and
+decided by reading or observing it, or deployment-scoped, decided by you, and holds, fails, or
+is undecided. A premise may <strong>rest on</strong> others: the general claims its decision, either way,
+relied on, each a premise of its own, settled apart.</li>
 <li>A <strong>flaw</strong> is a local defect at a location in a component, with an optional CWE, the
-premises it depends on, and a status: suspected, confirmed (a verified defect with no chain
-to an observable consequence found so far) or refuted.</li>
+premises it depends on, the states it leaves wrong (a status reported wrongly leaves its
+handed state wrong), and a status: suspected, confirmed (a verified defect with no chain to
+an observable consequence found so far) or refuted. An invariant the target relies on but enforces only by an assertion
+or an internal convention (a bound, a progress guarantee, a status meaning, a lifetime) is a
+suspected flaw, its premise that something can violate it, worked like any other; a documented
+caller obligation is a flaw only in a caller that skips it.</li>
 <li>A <strong>candidate</strong> is an ordered chain of flaws to an observable vulnerability, its first flaw
 its root, through its <strong>actions</strong>: the paths its scenario performs, in order, the first where
 the attacker starts. A path may repeat, as in a race with itself. Candidates sharing a root
@@ -1286,12 +1330,21 @@ interface’s own terms (a route template, a method, a message type), at one of 
 narrower. A location names an interface, never an address, so it stays the same across
 deployments. <strong>Evidence</strong> is a location with a stance on one node: it supports, contradicts or
 gives context; one made in an environment names it.
-Contradicting evidence after a premise’s decision or a flaw’s refutation disputes it and owes its
-settle or chain again; an edit of its substance since reads it as undecided or suspected until it is
-decided or judged again. Any agent may raise a candidate, a flaw or a premise at any time, left unsettled for the work that
+Each result is decided by the work owning it: a code premise’s status by its settle, a
+deployment premise’s by you, recorded outside every scheduled task, a flaw’s by its chain, and a
+candidate’s assessment and verdict by its assessment and review. Work belongs to the outermost
+task it was recorded within, so a helper’s records count as its parent’s. Recorded anywhere else,
+a status, assessment or verdict is a <strong>proposal</strong>: the decided one keeps standing, a proposal that
+differs from it disputes it and owes its owner’s work again, and one that agrees changes nothing,
+nor does one repeating a proposal its owner’s work answered, until an edit, a merge, a dispute
+or another change that work rests on asks it again.
+Node views and the Research tab show a pending proposal beside the result, with the event, task
+and agent that recorded it. Contradicting evidence after a premise’s decision or a flaw’s
+judgement disputes it too, and owes its settle or chain again; an edit of its substance since
+reads it as undecided or suspected until it is decided or judged again. Any agent may raise a candidate, a flaw or a premise at any time, left unsettled for the work that
 checks it (except a deployment premise your request settles), and merge
 a duplicate of any kind but a finding into the node it repeats, which takes its edges; restating
-what is recorded changes nothing. A source, path or component recorded in error is retracted with
+what is recorded changes nothing. A state, path or component recorded in error is retracted with
 <code>set_status</code> and a note: it shows as retracted but owes no work, holds none back and leaves every
 count, and the premises a retracted path relies on stand in no candidate’s chain, until marked
 <code>recorded</code> (a path <code>unswept</code>) again. Retracting or restoring a path owes the reviews and reports
@@ -1308,30 +1361,36 @@ chain with that condition as a premise, so the root’s report leads with whiche
 review records <strong>validated</strong> (every
 premise holds), <strong>disproved</strong> (a chain flaw is refuted or a code premise fails), <strong>excluded</strong> (a
 deployment premise fails, so the deployment keeps a real finding out of reports) or <strong>unproven</strong>
-(a premise stays undecided). A verdict counts while nothing it judged changed after it, and an
-unproven one only while a premise of its chain is undecided: a premise decision or dispute owes
-the review again, and a material change of the candidate, its chain, a path it performs or a
-source entering one owes the assessment again too. A candidate’s confidence is <strong>conjectured</strong>
+(a premise stays undecided). A verdict counts while nothing it judged changed after it and the
+statuses it claims stand: none of its chain’s premises undecided or failing and no chain flaw
+refuted for validated, a code premise failing or a chain flaw refuted for disproved, a deployment
+premise failing for excluded, and a premise undecided for unproven. A premise decision or
+contradicting evidence owes the review again, and a material change of the candidate, its chain, a path it performs or a
+state that path accesses owes the assessment again too; another path’s access recorded on a
+state its paths share owes neither. A candidate’s confidence is <strong>conjectured</strong>
 while a premise of its chain is undecided or contradicts it, <strong>established</strong> otherwise,
 <strong>confirmed</strong> while a positive verdict stands, and <strong>demonstrated</strong> once its settling test (its
-latest test that is not pending, recorded at its latest verdict) is confirmed and its chain
+latest test that is not pending, recorded at its standing verdict) is confirmed and its chain
 uncontradicted. A validated candidate no more severe than a demonstrated one of its group is
 <strong>noted</strong> rather than tested.</p>
 <p><strong>Deployment premises</strong> stand for what only you can answer. <code>target</code> records the ones your
 request settles as holding or failing. One raised later and left undecided is never settled by
-an agent: it holds back the reviews resting on it and is listed in the synthesis as asked. When
+an agent: it holds back the reviews resting on it and is listed in the synthesis as asked. A
+status an agent sets on one within scheduled work only proposes it, and is asked too. When
 the scheduler returns, the orchestrator puts the asked premises, and those an unproven candidate
 rests on, to you as one question, records each answer as the premise holding or failing, which
-sends their candidates back to review, and runs the scheduler again.</p>
+sends their candidates back to review, and runs the scheduler again. A batch run has no one to
+ask: the orchestrator answers its agents’ scope questions from your request, and the premises it
+leaves undecided stay asked and are listed in its final summary.</p>
 <p>The synthesis a scheduler run ends with lists the work each phase owes and has running, each
 exhausted subject with its last agent’s reply, the deployment premises asked of you, the
-candidates left unproven with their undecided premises, the components no path reaches, and the
+candidates left unproven with their undecided premises, the components no path reaches, the
 interfaces paths without code wait on an environment for (under <code>live: no</code>, every interface such
-a path enters on). After each return the orchestrator also has a <code>question</code> agent review the loose
-ends it lists, the premises of exhausted settles and those an unproven candidate rests on: each is
-settled, given what would settle it, or reopened. Exhausted work is terminal: the orchestrator
-closes the run once a pass changes nothing, with nothing owed or held, everything asked put to
-you, and that review moving nothing. It then always writes the current reports out and lists
+a path enters on), and how many paths and candidates lie outside the scope. After each return the orchestrator also has a <code>question</code> agent review the loose
+ends it lists, the premises of exhausted settles and those an unproven candidate rests on: each
+gets a proposed status, what would settle it, or what reopens it. Exhausted work is terminal: the orchestrator
+closes the run once a pass changes nothing, with nothing owed or held, every answer you gave
+recorded, and that review moving nothing. It then always writes the current reports out and lists
 exhausted work as incomplete and each root flaw without a current report as having none. Every agent that records a conclusion (a premise decided, a flaw
 judged, a verdict, a test result) checks the code around it for flaws or candidates it implies.
 All of this is agent-discovered evidence and analytical conclusion, not a symbolic proof or a
@@ -1365,21 +1424,31 @@ change a choice, digits edit the workers. The first message sends the panel’s 
 no instructions the session starts with “Analyze the workspace.” Once the run has started the
 panel stays in view, frozen; a session that fails to start leaves it editable for the next try.</p>
 <p>The Research tab (<code>]</code> from Jobs, or click its header) takes the whole screen below the tab
-strip. It opens on a dashboard of the run: its threshold, live policy and workers, the synthesis,
+strip and views the root agent again, so the status beside it is the session’s own. It opens on a dashboard of the run: its threshold, live policy and workers, the synthesis,
 a pipeline showing where each phase stands (what it owes, has running and has exhausted), and
-panels for coverage (sources, paths swept and unswept, uncovered interfaces, components reached
-or mapped only,
+panels for coverage (states, paths swept and unswept, uncovered interfaces, paths outside the
+scope, components reached or mapped only,
 premises undecided, asked and disputed, flaws by status), candidates by status, and the tasks
 running and exhausted in each phase. Below it, sections list the candidates, findings, paths,
-tasks, flaws, premises, components and sources as the session records them; unswept paths come
-first, and each path, premise, flaw and candidate shows what it owes and its last task, and
-opens to its latest tasks. Tasks are listed newest first with their phase, subjects, state (as
-their agent’s job stands), and when they began and ended; a task opens to its brief, its agent’s
+tasks, flaws, premises, components and states, each most relevant first: candidates by standing
+(demonstrated, validated, shortlisted, unproven, unassessed, then the rest); findings by their best
+score; paths unswept first; flaws confirmed first; premises awaiting your answer first; states
+checked across calls (instance and handed) first. Within each group, rows with work running come
+first, then work owed, then work exhausted, then none; candidates and flaws then by score. Each
+path, state, premise, flaw and
+candidate shows what it owes and its last task, and opens to its latest tasks. Tasks are listed
+running first, then queued, failed and cancelled ones, each newest first, with their phase,
+subjects, state (as their agent’s job stands), and when they began and ended; a task opens to its brief, its agent’s
 reply and the records the agent wrote. Click a section’s header, or choose it with <code>↑</code>/<code>↓</code> and
 press <code>Enter</code>, to open it; a record opens the same way to its detail, a candidate to its whole
 scenario: actions, chain, premises, assessment, verdict, tests and evidence, with an assessment
-or verdict that no longer stands marked stale. A candidate whose demonstration is under way
-shows as proving, and as test abandoned once the agent running it ended without recording an
+or verdict that no longer stands marked stale. A candidate whose assessment or verdict no longer
+stands keeps the group it last reached, marked stale (shortlisted (stale), say), until it is
+assessed or reviewed again. A candidate another one takes precedence over shows whom it waits
+behind as <code>↑</code> and that candidate’s id: <code>noted ↑545</code> when a demonstrated member of its root group
+reports the root, <code>test ↑545</code> under what it owes while its group’s test, or the test of a premise
+blocking it, goes to the more severe one first; its detail lists its root group and what it waits
+on. A candidate whose demonstration is under way shows as proving, and as test abandoned once the agent running it ended without recording an
 outcome. An open section lists its first 50 records, most relevant first; its last row loads 50
 more. The page scrolls as one, updates while agents work, and keeps what you opened. While
 agents run, they stay in view beside the page on a wide terminal, or below it on a narrow one;
@@ -1422,8 +1491,14 @@ environment.</p>
 not noted owes one until a test settles it, its root group’s most severe first; with <code>ask</code>, an
 interactive run asks after analytical review which findings to demonstrate, and each one
 declined is recorded as such. Declining does <strong>not</strong> reject a finding: its report remains
-confirmed and empirically untested, with the reason. A PoC agent makes an environment change the
-scenario’s premises admit itself, through an environment agent when the change is reusable; an
+confirmed and empirically untested, with the reason. A code premise two settling looks left
+undecided is tested too, through the most severe unproven scenario resting on it, the others
+waiting on what that test decides: the PoC agent runs the review’s demonstration plan or a
+bounded one of its own and proposes the premise’s status from what it observes, which its settle
+decides, sending its candidates back to review, or records what it tried as context and the test
+as unavailable, leaving them unproven. Such a test settles premises only: once a review validates its
+candidate, the scenario owes a demonstration of its own. A PoC agent makes an environment change
+the scenario’s premises admit itself, through an environment agent when the change is reusable; an
 environment recorded within its work is prepared for its candidate, without making its test owed
 again. A test waiting on you is recorded as pending and stays owed until you resolve what it
 waits for, which lets it resume; one the environment cannot run is recorded as unavailable and
@@ -1432,9 +1507,10 @@ its approach, delegating helpers as it needs, until it confirms or disproves the
 test is recorded as failed only with evidence that the scenario does not work as formulated,
 which goes on the chain flaw or premise it bears on: that evidence sends the candidate back to
 review, and the scenario is reported, or withdrawn, by the verdict review then records. A test
-other than a declined one stands only while the verdict it tested, the latest when its work
-began, is its candidate’s latest: a new verdict, such as a re-validation after its actions or
-chain changed, owes a test of its own, even one recorded while the test ran. An unavailable or
+other than a declined one stands only while what it demonstrated is unchanged since its work
+began: a verdict of another value, even one recorded while the test ran, unsettles it, and a
+re-validation after its chain or actions change owes a test of its own; a restated verdict with
+nothing it rests on changed keeps its test. An unavailable or
 failed test is owed again once a later environment is recorded for its candidate or for none in
 particular; a declined one stands, across new verdicts too, until you ask for it. A confirmed
 test stands while its chain is uncontradicted. A race, a check apart from its use or a measured
@@ -1450,7 +1526,8 @@ authorized environment.</p>
 <p>A root flaw is reported once its group owes no assessment, review or test, by a <code>report</code> agent
 who writes one markdown report: summary, analysis, impact, remediation, reproduction citing
 test ids and artifacts, and a section per other scenario. The report is owed again whenever
-what its scenarios rest on changes after it was written. <code>reports/</code> holds only the current
+what its scenarios rest on changes after it was written, or its group’s reportable scenarios
+are no longer the ones it covered. <code>reports/</code> holds only the current
 reports, rendered from the run’s store; each root flaw with one has a folder,
 <code>reports/&lt;root&gt;/</code>:</p>
 <ul>
@@ -1479,12 +1556,17 @@ is reported.</p>
 <h2 id="native-research-tools"><a class="header" href="#native-research-tools">Native research tools</a></h2>
 <p>Research tools are bound to the session’s run. Each call names an <code>action</code> and passes that
 action’s arguments beside it; the schema’s description of <code>action</code> lists each action’s
-arguments, marking optional ones with <code>?</code>:</p>
-<pre><code class="language-js">await tool.research({action: "upsert", kind: "premise", title: "32-bit builds",
-  body: "the library is built for 32-bit platforms", scope: "deployment"});
+arguments, marking optional ones with <code>?</code>. <code>upsert</code>, <code>set_status</code> and <code>list</code>, whose arguments
+depend on the kind of record, take them inside <code>record</code>, tagged by its <code>kind</code>; an <code>upsert</code> edit
+names the node’s <code>id</code> and may leave its kind out:</p>
+<pre><code class="language-js">await tool.research({action: "upsert", record: {kind: "premise", title: "32-bit builds",
+  body: "the library is built for 32-bit platforms", scope: "deployment"}});
+await tool.research({action: "upsert", record: {id: 7, title: "64-bit builds"}});
+await tool.research({action: "set_status", record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
 await tool.research({action: "begin", phase: "sweep", subjects: [3]});
-await tool.research_query({action: "list", kind: "candidate", state: "validated", page: {after: 0, limit: 50}});
+await tool.research_query({action: "list", record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
 await tool.research_query({action: "node", id: 7});
+await tool.research_query({action: "search", file: "c/dec/*.c", line: 1189, kinds: ["state", "flaw"]});
 await tool.research_query({action: "synthesis"});
 </code></pre>
 <p>A tool offers only the actions the agent’s capabilities allow. Lists are cursor pages: follow
@@ -1496,8 +1578,8 @@ computes the CVSS-B score and severity.</p>
 <tr><th>Tool</th><th>Actions</th><th>Capabilities</th></tr>
 </thead>
 <tbody>
-<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind, <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate node, <code>set_status</code> of a premise, flaw, path, source or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
-<tr><td><code>research_query</code></td><td>Read a <code>node</code> with its neighbourhood and latest tasks, a <code>task</code> with its child’s brief, reply and records, <code>list</code> nodes of a kind (or environments and tasks), the event <code>history</code> of the run or a node, and the <code>synthesis</code> of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is <code>startable</code> next.</td><td><code>read</code>; <code>security.coordinate</code> for what can start next</td></tr>
+<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind (an edit by <code>id</code> takes its node’s kind), <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate <code>node</code> into a node of its kind (one already merged into it is left as it is), <code>set_status</code> of a premise, flaw, path, state (<code>checked</code> too) or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
+<tr><td><code>research_query</code></td><td>Read a <code>node</code> with its neighbourhood and latest tasks, a <code>task</code> with its child’s brief, reply and records, <code>list</code> nodes of a kind (states by scope; or environments and tasks), <code>search</code> live nodes by a regex over their own text (not their events’ notes) or a code location’s file glob, line and function, each with where it matched, the event <code>history</code> of the run or a node, and the <code>synthesis</code> of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is <code>startable</code> next.</td><td><code>read</code>; <code>security.coordinate</code> for what can start next</td></tr>
 </tbody>
 </table>
 </div>
@@ -2583,7 +2665,7 @@ reply in <code>.result.reply</code>; earlier replies are not concatenated into i
 earlier visible replies are not message events: its result saves them in <code>messages</code>, oldest
 first, each <code>{text, at}</code> with <code>at</code> the RFC 3339 UTC time it was made. Like any large result, a
 long <code>messages</code> is shortened in the call’s view and listed in <code>presentation.truncated</code>; read the
-rest with <code>jobs({job, field: "/result/messages", index})</code>. Replies a session restart cuts off
+rest with <code>jobs({job, field: "/result/messages", start, unit: "elements"})</code>. Replies a session restart cuts off
 from a call whose child still ran arrive as message events. <code>messages</code> is absent when there are
 none. The parent cannot make another model request until its foreground calls return.</p>
 <p>When a child asks, the model’s own foreground call blocked on it moves to the background, so the
@@ -2920,6 +3002,9 @@ conversion and serialization.</p>
 other native allocations are outside the budget, and concurrent script calls each have
 their own allowance.</p>
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
+<p>A result field that holds JSON, such as a command’s JSON <code>stdout</code>, arrives as the decoded value.
+<code>JSON.parse</code> given an already-decoded object or array returns a copy of it, so parsing such a
+field works whether it arrived as text or as the value.</p>
 <p>Read or search saved command output with <code>tool.jobs({job: commandJobId, field: "/result/stdout"})</code>.
 A <code>jobs</code> read returns the existing JobView for that job; it does not add another wrapper.
 Field-selected output is a job view, not a raw string: the page is in <code>presentation.preview</code>,
@@ -2938,7 +3023,7 @@ presentation?: Presentation
 <p>Tool results omit absent fields and empty lists at every level. Scripts read a field the
 response’s schema declares but it lacks as <code>null</code>: <code>r.id</code>, <code>r.state</code> and <code>r.meta</code> are <code>null</code> on an
 ordinary completed call, and an absent <code>stdout</code> is <code>null</code>. The model’s views stay sparse. Fields
-inside a previewed or paged <code>jobs({job})</code> result are not filled, since a preview may omit them.</p>
+inside a paged <code>jobs({job})</code> result are not filled, since a page may omit them.</p>
 <p>A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits <code>id</code> and <code>state</code>. <code>result</code> is the native tool payload. It is present exactly when the job
 has a result, and a loaded literal <code>null</code> result stays <code>result: null</code>. A tool with nothing to
@@ -2960,9 +3045,11 @@ background so that agent can answer (see
 <a href="#delegation-and-child-input">delegation</a>).
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
-<a href="#automatic-previews">saved job output</a>. A returned tool response keeps its complete
-fields whole in the script’s own preview; a value taken out of it, such as <code>response.result</code>, is
-shortened like any other returned value.
+<a href="#automatic-previews">saved job output</a>. A returned tool response keeps its own
+fields whole in the script’s own preview, and its result is previewed as a direct read of that
+result would be; a page a <code>jobs</code> read returns is a presentation already and stays whole.
+A value taken out of a response, such as <code>response.result</code>, is shortened like any other returned
+value.
 Tool descriptions give a call’s response as <code>JobView&lt;T&gt;</code>: the envelope, with the native result
 <code>T</code> at <code>.result</code>. A successful
 <code>jobs({job})</code> read of a failed target is still a successful tool invocation returning that failed
@@ -2976,8 +3063,10 @@ or <code>null</code> when the job has no result, and throws for failed or pendin
 <code>.result</code>, plus <code>error.job</code> and <code>error.code</code> when the response has an <code>id</code> or denial <code>code</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 <code>receive()</code> values are not decorated, and there is no built-in <code>tool.unwrap</code> helper.</p>
-<p><code>jobs({job})</code> reads already return views, so inspect their <code>presentation.preview</code>,
-<code>presentation.captures</code>, or pagination rather than unwrapping them. Operational tool failures are
+<p><code>jobs({job})</code> reads already return views, so read their <code>result</code>, <code>presentation.preview</code>,
+<code>presentation.captures</code>, or pagination rather than unwrapping them. A script’s whole-output
+<code>jobs({job})</code> read holds the target’s complete result, never a preview: previews apply only to
+what reaches the model, such as the script’s own returned value. Operational tool failures are
 failed views rather than JavaScript throws; programmer, serialization, <code>receive</code>, and sleep errors
 still throw.</p>
 <p>Before returning results, convert <code>BigInt</code> values to strings, dates with <code>.toISOString()</code>, and
@@ -3057,7 +3146,8 @@ none were. The listing payload is in the envelope’s <code>.result</code>.
 <code>jobs({job})</code> reads that job’s saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
 <a href="#paging-searching-and-querying">output selections</a> <code>field</code> and <code>limit</code>, with
-<code>start</code>, <code>offset</code>, <code>pattern</code>, and <code>context</code> for text, or <code>index</code> and <code>query</code> for JSON.
+<code>start</code> and <code>pattern</code> for text or JSON, <code>offset</code> and <code>context</code> for text, and <code>unit</code> and <code>query</code>
+for JSON.
 <code>all</code> cannot be combined with <code>job</code>, and the other selections require <code>job</code> unless they restate
 their defaults. Scripts also control jobs with <code>tool.job(id).send({value})</code> and <code>.cancel()</code>.</p>
 <p>Use <code>wait({timeout?: seconds})</code> (or <code>await tool.wait(...)</code> in scripts) to yield until an agent
@@ -3191,7 +3281,8 @@ that answer other requests with an empty page or a non-HTML variant return their
 that serve no HTML still return JSON; <code>readable</code> sends
 <code>text/html,application/xhtml+xml;q=0.9,*/*;q=0.8</code>.
 <code>save_to</code> saves the response to a file on success instead of embedding the payload, creating
-missing parent directories, and ignores <code>response_format</code>. Errors or cancellation do not replace
+missing parent directories, and ignores <code>response_format</code>. It and <code>overwrite</code> are offered only to
+agents with the <code>write</code> capability. Errors or cancellation do not replace
 an existing destination.</p>
 <p>HTML is returned as <code>{kind: "page", title, byline?, site_name?, language?, scope, markdown}</code>.
 <code>scope</code> is <code>article</code> when the page has a readable main article, and <code>markdown</code> holds only that
@@ -3337,10 +3428,15 @@ keep their first members in source order the same way; smaller objects keep all 
 when that does not fit, none. When even a single sample does not fit, strings get shorter, then
 deeper levels are left empty. Values holding complete fields keep the path to them.</li>
 </ul>
-<p>Fields a tool declares complete are never shortened and are not counted: skill instructions,
-child agent answers, and the job views <code>jobs</code> reads return. Errors and child questions sit
-outside <code>result</code> and are also complete, including those of tool responses a script returns. A
-response can therefore exceed the budget; it does not limit response size.</p>
+<p>Fields a tool declares complete are never shortened and are not counted: skill instructions and
+child agent answers. Errors and child questions sit outside <code>result</code> and are also complete,
+including those of tool responses a script returns. A response can therefore exceed the budget;
+it does not limit response size.</p>
+<p>A presentation is never shortened again: a <code>jobs</code> listing, or a <code>jobs</code> read’s preview or page,
+reads the same however it is presented later. A script’s <code>jobs</code> read holds the whole result
+instead, so wherever that view is presented again, returned from the script or read as the
+<code>jobs</code> call’s own saved output, its result is previewed as a direct read of it would be, while
+the view’s own fields stay whole.</p>
 <p><code>presentation</code> precedes <code>result</code>. When arrays or objects were cut, <code>presentation.shape</code> describes
 the whole result: objects list each member’s shape under its own name, and a member only some
 objects have includes <code>absent</code>, as in <code>"boolean|absent"</code>; arrays are <code>[count, element]</code>, with <code>"min..max"</code> when lengths vary and <code>[0]</code> when always empty;
@@ -3359,7 +3455,8 @@ lines <code>next_start</code> up to, but not including, <code>tail_start</code> 
 </ul>
 <p><code>kept</code> lists the index ranges shown, as <code>[[first, last], ...]</code>, when a complete field inside an
 array or object keeps an element beyond the leading ones; such records are always listed. Reading
-a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
+a cut array or object continues at its first value not shown: <code>start</code> is one-based, so without
+<code>kept</code> that is <code>shown + 1</code>, with <code>unit</code> <code>elements</code> or <code>members</code>. Finished jobs with incomplete captures
 include an <code>Output incomplete; captured fields remain readable with jobs({job, field}).</code> notice. These rules also apply after session resume and to
 completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
@@ -3379,20 +3476,28 @@ selected field, in that field’s own unit:</p>
 </thead>
 <tbody>
 <tr><td>Text: a string, a number, boolean or null, or a capture that is live or unfinished</td><td><code>start</code>, <code>offset</code>, <code>limit</code>, <code>pattern</code>, <code>context</code></td><td><code>lines</code>, <code>total_lines</code>, <code>next_start</code>, <code>next_offset</code></td></tr>
-<tr><td>A JSON object or array</td><td><code>index</code>, <code>limit</code></td><td><code>elements</code> or <code>members</code>, <code>total_elements</code> or <code>total_members</code>, <code>next_index</code></td></tr>
-<tr><td>A JSON object or array, queried</td><td><code>query</code>, <code>index</code>, <code>limit</code></td><td><code>matches</code>, <code>total_matches</code>, <code>next_index</code></td></tr>
+<tr><td>A JSON object or array</td><td><code>start</code>, <code>unit</code>, <code>limit</code></td><td><code>elements</code> or <code>members</code>, <code>total_elements</code> or <code>total_members</code>, <code>next_start</code></td></tr>
+<tr><td>A JSON object or array, filtered by <code>pattern</code> or <code>query</code></td><td><code>start</code>, <code>unit</code>, <code>limit</code>, and <code>pattern</code> or <code>query</code></td><td><code>matches</code>, <code>total_matches</code>, <code>next_start</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Using another unit’s selectors is rejected with an error naming the field’s kind; selectors that
-only restate their defaults (<code>start: 1</code>, <code>offset: 0</code>, <code>context: 0</code>, and <code>index: 0</code> without
-<code>query</code>) select nothing, so they are accepted with either kind of field. Job metadata is never truncated.</p>
+<p><code>start</code> and <code>limit</code> page lines of text or values of JSON, and <code>pattern</code> filters either. <code>unit</code>
+names what <code>start</code> counts, as the page it continues names its values: <code>lines</code>, <code>elements</code>,
+<code>members</code> or <code>matches</code>. A <code>start</code> past 1 on JSON requires it, and any <code>unit</code> must match the field’s
+pages: a capture read as lines while its job ran can be JSON once it finished, and a line position
+does not apply to it, so such a read is rejected and the field is read again from <code>start: 1</code>.
+<code>offset</code> and <code>context</code> apply only to text, and <code>query</code> only to JSON; using them with the other kind
+of field is rejected with an error naming the field’s kind. Selectors that only restate their defaults
+(<code>start: 1</code>, <code>offset: 0</code>, <code>context: 0</code>) select nothing, so they are accepted with either kind of
+field. Job metadata is never truncated.</p>
 <pre><code class="language-js">// Read part of a text field, search it, and continue a long line.
 jobs({job:42, field:"/result/stdout", start:300, limit:80})
 jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 // Page a JSON array, then continue at the returned position.
-jobs({job:42, field:"/result/stdout/items", index:200, limit:50})
+jobs({job:42, field:"/result/stdout/items", start:201, unit:"elements", limit:50})
+// Keep the elements whose JSON mentions a name.
+jobs({job:42, field:"/result/stdout/items", pattern:"\"api-[0-9]+\""})
 // Select within JSON.
 jobs({job:42, field:"/result/stdout", query:"$.items[?@.status.phase == 'Failed'].metadata.name"})
 </code></pre>
@@ -3425,20 +3530,28 @@ a search; overlapping match context is reconstructed from saved text. Live searc
 lines and context windows until more output arrives or capture closes. A wait timeout never stops
 the original job.</p>
 <h3 id="json-pages"><a class="header" href="#json-pages">JSON pages</a></h3>
-<p><code>index</code> is the zero-based first element or member (default 0). A page holds whole consecutive
-values in source order within 32 KiB, member names and text included, so it may return fewer than
-<code>limit</code>: continue at <code>next_index</code>, which is absent at the end. A first value that is not whole
-within the page is sampled as a preview is, within the page budget, with the page’s <code>shape</code> and
-<code>truncated</code> records at that value’s own pointers, for scripts and the model alike; select those
-pointers to read further into it. A member name longer than the page budget is still shown whole.</p>
+<p><code>start</code> is the one-based first element or member (default 1), so element <code>/items/0</code> is <code>start: 1</code>;
+past 1, <code>unit</code> is <code>elements</code> or <code>members</code>, or <code>matches</code> on a page filtered by <code>pattern</code>.
+A page holds whole consecutive values in source order within 32 KiB, member names and text
+included, so it may return fewer than <code>limit</code>: continue at <code>next_start</code>, which is absent at the
+end. A first value that is not whole within the page is sampled as a preview is, within the page
+budget, with the page’s <code>shape</code> and <code>truncated</code> records at that value’s own pointers, for scripts
+and the model alike; select those pointers to read further into it. A member name longer than the page budget is still shown whole.</p>
+<p><code>pattern</code> keeps the elements or members whose compact JSON text matches, with text’s regex rules:
+a member’s text is its name, a colon and its value, and strings appear JSON-escaped. The kept
+values are <code>{at, value}</code> matches like a query’s, with <code>total_matches</code> counting all of them in the
+field; <code>start</code> and <code>next_start</code> are positions among the field’s elements or members, so a search
+continues as a text search does. Like a query, a pattern reads the field into memory, up to 64 MiB
+of JSON text.</p>
 <h3 id="queries"><a class="header" href="#queries">Queries</a></h3>
 <p><code>query</code> is a JSONPath (RFC 9535) query over the selected JSON field: <code>$</code> is that field. Filters can
 use <code>length()</code>, <code>count()</code>, <code>value()</code>, and regular expressions with <code>match()</code> (the whole string) and
-<code>search()</code> (any part). Matches are <code>{at, value}</code> in document order, duplicates included, where <code>at</code>
-is the match’s pointer in the saved output, ready to use as <code>field</code>. They page by <code>index</code> like
-elements, with <code>total_matches</code> counting all of them. Numeric comparisons use double precision.
-When nothing matches, the page carries the queried field’s <code>shape</code>, which shows the member names
-a query can use.</p>
+<code>search()</code> (any part), as in <code>$[?search(@.title, '[Ee]ncoder')]</code>. A query that does not parse is rejected with this filter form. Matches
+are <code>{at, value}</code> in document order, duplicates included, where <code>at</code> is the match’s pointer in the
+saved output, ready to use as <code>field</code>. They page by <code>start</code> with <code>unit: "matches"</code>, counting matches from 1,
+with <code>total_matches</code> counting all of them. Numeric comparisons use double precision. When nothing
+matches, the page carries the filtered field’s <code>shape</code>, which shows the member names a query or
+pattern can use.</p>
 <p>A query reads the selected field’s JSON into memory, up to 64 MiB of JSON text; a larger field is
 rejected, so query a field within it. This limits a query’s input, not its evaluation: once it
 starts, a query runs to completion, and queries that repeat selectors can produce many duplicate
@@ -3551,7 +3664,7 @@ active jobs or todos, only the date remains.</p>
 <h1 id="development-setup"><a class="header" href="#development-setup">Development setup</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li>Rust 1.89 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
+<li>Rust 1.99 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
 <li><a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) <strong>only for
 building the SSH shims</strong>.</li>
 <li><code>python3</code> on <code>PATH</code> for the test suite, whose MCP tests run a scripted server.</li>
@@ -3712,75 +3825,111 @@ page share, and the page’s open tests) keys on a journal watermark, the latest
 finish, beside the store’s write generation; what the run holds keys on the generation alone.
 The Research tab renders those facts as a page of typed blocks, which the host lays out once per
 page, disclosure and width and only turns its spinners as it draws.</p>
-<p>The store is one graph. Every object is a <code>node</code> of one kind (component, path, source, premise,
+<p>The store is one graph. Every object is a <code>node</code> of one kind (component, path, state, premise,
 flaw, candidate, finding) with a title and a body; a per-kind detail table shares its id, and a
-composite key to <code>node(id, kind)</code> makes the schema guarantee a detail row’s kind. Edges are
-tables between detail rows: a path’s ordered steps through components and its sources, the
-premises a flaw or a path relies on, and a candidate’s ordered chain of flaws, whose first is
+composite key to <code>node(id, kind)</code> makes the schema guarantee a detail row’s kind. A state’s scope
+is fixed in its row, and only an input state has the detail row holding its trust and defining
+location, keyed to the state and its scope. Edges are tables between detail rows: a path’s ordered
+steps through components and its accesses (a read or write of a state at a location), the
+premises a flaw or a path relies on, the premises a premise rests on (<code>premise_basis</code>, never
+itself, so a merge drops a basis between the pair it merges), the states a flaw leaves wrong,
+and a candidate’s ordered chain of flaws, whose first is
 its root, and its ordered actions, the paths its scenario performs from where the attacker
 starts; a chain’s flaws are not bound to an action. Ordered edges keep positions 0..n-1 through
 the writes that move them. A duplicate of any kind but a finding merges. A merge repoints every
 edge of the merged node to the survivor, but a merged path keeps its steps and a merged
 candidate its chain and actions as history, the survivor appending after its own actions each
-path the merged one performs as often as it does beyond them; a merged source gives up its detail
-row, so only live sources hold locations. <code>merged_into</code> is one hop, so readers never resolve
-merges on edges; an id argument naming a merged node resolves to the survivor at the boundary. Inventory recorded in error is retracted rather than deleted: a
-path’s one status is unswept, swept or retracted, and a source’s or component’s recorded or
+path the merged one performs as often as it does beyond them; a merged input state gives up its
+detail row, so only live input states hold locations, and a merged state its check. <code>merged_into</code> is one hop, so readers never resolve
+merges on edges, and a merge marks each node it repoints as only concerned, so the merges marking a
+retired node name the node it lived on as at any event; an id argument naming a merged node resolves to the survivor at the boundary. Inventory recorded in error is retracted rather than deleted: a
+path’s one status is unswept, swept or retracted, and a state’s or component’s recorded or
 retracted. A retracted node keeps its edges and shows as retracted, but every queue, coverage
-count, synthesis list and derived standing reads only recorded sources and components and
+count, synthesis list and derived standing reads only recorded states and components and
 unretracted paths: a premise a retracted path relies on owes it no settling look and stands in no
 chain of a candidate performing it. A status set back restores it.</p>
 <p>A <code>location</code> is a supertype in the same shape: a kind and a detail row sharing its id, for a code
 region, an address range of a binary image (link-base addresses stored by their bit pattern,
 their span checked in Rust) or an operation and field of a named interface. Each is recorded once
-per key, and sources, flaws, premises, path steps and evidence each hold one location of any
-kind; a location holds one live source, so recording a source where one is already recorded
-returns that one, and a merged source’s location is free for the survivor or a new source. A
+per key, and input states, accesses, flaws, premises, path steps and evidence each hold one
+location of any kind; a location defines one live input state, so recording one where one is
+already recorded returns that one, and a merged one’s location is free for the survivor or a new
+one. A
 component owns its interfaces by name as it owns its files, and an environment records the
 interfaces it serves with their addresses; evidence naming an environment is an observation made
 there.</p>
 <p>Every write is one <code>event</code> in one audit log, by the journal’s agent row, with the actor’s note,
-and <code>event_node</code> names each node it bears on with the strongest of three ordered effects:
-<code>concerns</code>, <code>standing</code> or <code>changed</code>. A write names its direct marks, and one rule carries them
+and <code>event_node</code> names each node it bears on with the strongest of four ordered effects:
+<code>concerns</code>, <code>disputes</code>, <code>standing</code> or <code>changed</code>. A write names its direct marks, and one rule carries them
 along the graph as it stands after the write: a premise moves the standing of the flaws and
-paths relying on it, a source passes its effect to the paths it enters, and a flaw or path
+paths relying on it, a state passes its effect to the paths accessing it, and a flaw or path
 passes its effect to the live candidates chaining or performing it. Some marks stand on their
 node alone: a candidate taking or losing a flaw as its root marks that flaw alone, so its other
-candidates are re-owed only when the flaw itself changes, and a status set on a path, source or
-component marks that node alone, with a source’s paths, so it moves only their sweeps; but a path
+candidates are re-owed only when the flaw itself changes, an access recorded or removed marks
+its state alone, so it moves only the state’s check, and a status set on a path, state or
+component marks that node alone, with a state’s paths, so it moves only their sweeps; but a path
 retracted or restored moves its standing along the graph, since its premises leave or rejoin its
 candidates’ chains. A chain is edited whole through its candidate; a flaw joining or leaving
 it at another place is only concerned, and a chain’s work also rests on the verdicts of the
-candidates holding its flaw and on the chain edits it joins or leaves, so a disproval or a leave
-releases the flaw with fresh tries. Results are recorded in place and stamped with the event
-that recorded them (<code>candidate.assessed</code>, <code>candidate.reviewed</code>, a finding’s <code>reported</code>, and the <code>decided</code> or <code>judged</code> of a premise’s or flaw’s latest status, restated or
-not); nothing counts revisions. An assessment, verdict, report, flaw judgement or test’s verdict
-recorded within a task of its phase on its subject stands on that task’s basis rather than on
-its own event, so another agent’s change after the task began owes the work again.</p>
+candidates holding its flaw, on the chain edits it joins or leaves, so a disproval or a leave
+releases the flaw with fresh tries, and on the accesses recorded or removed of the states it
+leaves wrong. Premise and flaw statuses, assessments and verdicts are histories of rows keyed by
+the event recording each (<code>premise_decision</code>, <code>flaw_judgement</code>, <code>candidate_assessment</code>,
+<code>candidate_verdict</code>); a finding’s <code>reported</code> and a state’s check are recorded in place. A result
+stands on the basis of the task of its phase on its subject it was recorded within, so another
+agent’s change after the task began owes the work again; one recorded outside such a task stands
+on nothing (<code>stamp</code>), and a report or a test’s verdict outside one on its own event. Each row
+records whether its owning work recorded it (<code>owned</code>), decided once at the write: a code
+premise’s settle, a deployment premise’s answer outside every task, a flaw’s chain, a
+candidate’s assessment and review. The standing result is the latest owned one. An owned one
+that restates it, current or not, only concerns its node, so nothing resting on it moves, while
+its task’s basis still makes it current. A later one
+recorded elsewhere that differs from it is a proposal (<code>proposed</code>), which owes its phase and marks
+its node <code>disputes</code>, carried nowhere; one that agrees only concerns its node, as does one repeating
+an earlier proposal while the first owned result after that one stands on the phase’s current
+basis, so anything moving the basis since asks it again. A retired node keeps
+its own results, standing as its retirement left them: a task on a node merged away since is on
+the node it lived on as when each result was recorded, the one the latest merge retargeting it
+(retiring or repointing it, <code>node_merge</code>) pointed it at before then, and the merge retiring a node
+is no edit of it.</p>
 <p>What each phase’s work on a node reads is its phase’s arm of one relation, generated per phase with
 the node bound in every arm so it seeks by node (<code>bearing</code>): standing or changed events for a sweep,
-settle, chain or report (the root’s and each current member’s), those and the environments for
-any candidate serving one of its sources’ interfaces (any such one when they sit on none) for a
-probe, but none recorded within a probe, changed events for an assessment,
-all but test records for a review, and verdicts, assessments, test records and environments for a
-test. <code>event_node</code> holds its event’s kind, and its effects are indexed without test records, which
+check, settle, chain or report (the root’s and each current member’s), with the disputes of its
+result for a settle, chain, assessment or review, and, for a settle, the
+decisions and disputes of the premises it rests on, those and the environments
+for any candidate serving an interface the path reads an input state on (any such one when it
+reads none on an interface) for a probe, but none recorded within a probe, changed events for an assessment,
+all but test records and other results’ disputes for a review, and assessments, test records and environments for a test, with, as its edits, a verdict of
+another value and a change of its candidate’s chain or actions (a standing or changed mark on the
+candidate but evidence changing it, its flaws or its paths). <code>event_node</code> holds its event’s kind, and its effects are indexed without test records, which
 arms read from <code>test</code>, so a walk down a node’s effects never visits its tests. Every arm leaves out what was recorded within a task of that phase on the node: <code>event_task</code>
-names the tasks an event’s agent and the agents above it held when it was recorded, so a phase’s own
-work, its helpers’ included, never moves what it rests on. Two events are never left out: a merge,
+names the tasks of the outermost agent holding any, the event’s own or one above it, when it was
+recorded, so a task begun beneath another belongs to the enclosing one, and a phase’s own work,
+its helpers’ included, never moves what it rests on. Two events are never left out: a merge,
 which work on the survivor rests on whoever made it, and a pending test’s record, which a test
-resumes rather than repeats. A basis is that relation’s latest event, or the node’s latest while the
+resumes rather than repeats. What is fixed when an event is recorded is stored with it, append
+only: the work it was recorded within, with each task’s basis (<code>event_work</code>), and its arms that
+read only its own effects and test records (<code>event_bearing</code>, whose role marks a dispute or a
+material edit). Arms through relations a later event may change (what a premise rests on, a
+flaw’s candidates and states, a root’s members, environments, which a merge moves to its
+survivor) are read when asked, and every aggregate stays derived. A basis is that relation’s latest event, or the node’s latest while the
 relation has none, so owed work always rests on one; work is owed while its result predates its
-basis, or, for an unproven verdict, once no premise of its chain is undecided, and a notice is
-one of its events after a task began. Candidate standing (<code>candidate_state</code>) and confidence are
+basis, disputes aside, which give it fresh tries but leave a standing result current, or, for a verdict, once the standings it claims (<code>candidate_core</code>) no longer hold, and a
+notice is one of its events after a task began. Candidate standing (<code>candidate_state</code>) and confidence are
 derived views over those results, the chain’s flaw and premise statuses, and the
-root group’s demonstrations. A premise’s or flaw’s status counts once set at or after its latest
-material edit or merge into it, but those made within its own settle or chain (<code>premise_state</code>,
-<code>flaw_state</code>); an edit since reads it as undecided or suspected again, so its settle or chain is
-owed again. A test records the verdict it tested, and one settling test per candidate
+root group’s demonstrations. A premise’s or flaw’s standing status counts once set at or after
+its latest material edit or merge into it, but those made within its own settle or chain
+(<code>premise_standing</code>, <code>flaw_standing</code>); an edit since reads it as undecided or suspected again, so its settle or chain is
+owed again. A flaw carrying a proposal owes its chain even while a live candidate holds it. One settling test per candidate
 (<code>settling_test</code>: its latest that is not pending when that is a decline, which stands across
-verdicts, or else its latest recorded at its latest verdict) decides its demonstration, its
+verdicts, or else its latest with no edit of the test’s bearing after its work began) decides its demonstration, its
 testing’s settlement and what its report states; <code>finding_scenario</code> is the validated and noted
-members a root’s finding reports.</p>
+members a root’s finding reports. Each report write records the members it covered, and each
+report task the members it was offered as it began (<code>report_scenario</code>); its finding is current
+only while the covered ones are those <code>finding_scenario</code> lists now: a restated verdict only
+concerns its candidate, yet can make it reportable again. The begin of a report task offered
+other members than its group has now joins the report’s bearing as a dispute does, giving it
+fresh tries however its members changed, without making a current finding stale.</p>
 <p>Scheduling is derived; nothing is planned. Work started is a log: a <code>task</code> belongs to the
 journal job of the agent that began it (an agent without a job cannot begin), and its
 <code>task_node</code> rows name each subject with its basis, several for a bundle; the keys pin a
@@ -3790,25 +3939,55 @@ log’s history; its work is done when its subject is no longer owed. A subject 
 while its phase owes it, no task of it is live, and fewer than two of its tasks began at its
 current basis; <code>startable</code> pages the offered entries in pipeline order, leaving out what running
 work holds and later work an earlier ready bundle touches, and admitting tests by the live
-policy, approvals and unblocked pending tests. A path is
-swept when a recorded source entering it sits in code and probed otherwise, and a probe is owed only while
-the launch does live work and an environment for any candidate serves every interface its
-sources sit on, or its sources sit only in binaries. Test selection reads each root group’s facts once per
-statement, and only for the groups of the subjects a read can list; a page reads the subjects
+policy, approvals and unblocked pending tests. A bundle is the ready sweeps of the paths keyed
+on one state, a path’s key being the recorded handed state it accesses that the most paths
+access, else such an instance state, ties to the lowest, a path with none swept alone; one path’s ready settles with every premise they rest on at any
+remove, or its ready chains, a shared stage’s going with its lowest path and a premise with the
+lowest path of itself and the premises resting on it; or one root group’s ready reviews. A
+check is ready once no path whose first event is no later than its basis owes a pending sweep,
+whatever states the path accesses: the earliest such path is read once per statement, so a path
+recorded since never holds a check back, and its sweep’s accesses owe the check again. A check is
+owed while its state’s basis is later than the basis of the check recorded last (<code>state_check</code>),
+or that check was recorded outside one.
+A settle is owed while a live flaw or unretracted path relies on its premise or, through
+<code>premise_basis</code> at any remove, on a premise resting on it; a decided premise owes it again once
+a premise it rests on is decided or disputed after the stamp of its decision, outside its own
+settle. A flaw that is not refuted and leaves a recorded state wrong owes a chain while its chain
+basis is later than that of its latest chain task, whatever its candidates: one look covers
+every reader, and an access recorded since owes one more. The run’s scope is the components created
+outside every task (<code>scope</code>: the first event naming one has no <code>event_task</code> row); a path is
+outside it when its entry step’s component and the owner of its file through <code>component_file</code>
+are both outside it. Every phase’s owed predicate skips a path outside it, a state, or a flaw by
+the paths through its component and its candidates’ entries, that only such paths reach, a
+premise only such work relies on, and a candidate whose entry is such a path; nothing records
+the scope. A path is swept when one of its reads of a recorded input state
+sits in code and probed otherwise, and a probe is owed only while the launch does live work and
+an environment for any candidate serves every interface it reads one on, or it reads them only
+in binaries. Test selection reads each root group’s facts once per
+statement, and only for the groups of the subjects a read can list; an unproven candidate is
+selected instead by the code premises of its chain left undecided by an exhausted settle, each
+through the most severe unproven candidate resting on it whose test is not exhausted; a page reads the subjects
 past its cursor in windows that double until it fills. The orchestrator’s scheduler keeps only its own run’s
 launch replies: an entry launched twice at one basis is passed back as spent, which the one
 exhaustion predicate every queue and hold shares compares with the phase’s current basis as it
-does a task’s. The synthesis counts owed, running and exhausted work, the undecided deployment
-premises a review waits on, the candidates standing unproven with their undecided premises, the
-components no path reaches, and the interfaces unswept probed paths wait on. An environment recorded beneath
+does a task’s. The synthesis counts owed, running and exhausted work, the deployment premises
+undecided while a review waits on them or carrying a proposal, the candidates standing unproven with their undecided premises, the
+components no path reaches, the interfaces unswept probed paths wait on, and the paths and
+candidates outside the scope. An environment recorded beneath
 a test task is for that test’s candidate unless it names another.</p>
 <p>An agent with tasks is told of others’ changes as a host event: for each subject of its job’s tasks,
 the bearing relation’s events after the task began and after its cursor (for a subject merged away,
 from the merge that retired it on), which leaves out those the agent or one beneath it recorded.
 Each changed subject gets one digest, never omitted: the event count, the latest event and the kinds seen, with
-its few newest events and their strongest marks, so a delivery is bounded by subjects times recent
-events; the latest event read is the cursor. Nothing is stored: the subscription is the task log. An
-agent found with nothing to be told is skipped until research is written again.</p>
+its few newest events, their notes and their strongest marks, and each node the older events moved once, so a
+delivery is bounded by subjects times recent events and the nodes their work rests on; the latest event read is
+the cursor. Nothing is stored: the subscription is the task log. An
+agent found with nothing to be told is skipped until research is written again. Beginning a task
+returns the same digests for its revisits: for each subject a task of that phase worked before,
+the bearing relation’s events after the latest basis such a task began on; a first visit returns
+none. A check’s begin, like its state’s view, also lists the decided premises of the flaws leaving
+the state wrong (<code>flaw_state</code> to <code>flaw_premise</code>), with their deciding event and task and evidence
+count.</p>
 <p><code>reports/</code> is a projection of the findings that report their scenarios as they stand, which the
 orchestrator’s <code>generate</code> renders from the store alone: a folder per root, replaced in one step
 when what renders changed, holding the reporter’s markdown beneath a generated scenario table
@@ -3872,7 +4051,9 @@ identity from its history. A model change prepares its replacement before commit
 and preserves journal history. Reselecting the current model keeps the current context. A mode
 change also replaces the prompt and tool surface and invalidates earlier bound reasoning. A host’s
 persona renders into every agent’s prompt; a resumed agent keeps its recorded prompt until a mode
-change rebuilds it. Resume opens a fresh provider context under the same context identity, or none for a root whose
+change rebuilds it. A root reopened under a ceiling that changes the grant its prompt was rendered
+for, such as a host without the user, changes into its own mode under the new grant as its next
+work starts. Resume opens a fresh provider context under the same context identity, or none for a root whose
 model the configuration no longer has: the session still activates for writes, and only running the root
 fails with <code>UnknownModel</code> until a selection, or <code>activate_on</code>, which journals the switch in the
 activation commit, moves it to a configured model. A child whose own model is gone restarts on the
@@ -3882,7 +4063,8 @@ meanwhile and a refused batch is held again unchanged while the children run on.
 <p>Prompt text is embedded Tera templates (<code>prompts</code>). An agent’s prompt renders when its contract
 is fixed, as it starts or changes mode, from its typed context (role, available depth,
 capabilities, mode and the <code>skyhook_context</code> location), to which a host’s <code>Prompts</code> add the
-fields of its own section. One render path serves both: a mode whose instructions are a host
+fields of its own section. Only a root granted <code>Interactive</code> takes the root role; a root no one
+can ask is instructed as a child, working its task to a result. One render path serves both: a mode whose instructions are a host
 template (<code>Instructions::Template</code>) renders them for the agent entering it into an <code>Edition</code>,
 the text the journal records; the system prompt then places the host’s persona, rendered for the
 agent, that text and the workspace’s instruction files around the library’s parts, and the
@@ -4101,6 +4283,16 @@ finish retries, replaces what it staged before at the same field, and opening a 
 those a finish never committed. JavaScript receives complete results, while the journal retains the exact previews
 delivered to the model. <a href="#saved-job-output">Saved job output</a> documents the user-facing
 limits.</p>
+<p>How a preview shows each field is saved with the result (<code>job/output/projection.rs</code>): what its
+schema declares, complete fields and text keeping both ends, joined with what its producer
+marks. Whether a value is shortened again follows one rule for every tool: a presentation
+already is marked complete at its root; anything else is raw data, previewed by its fields’
+presentations. A <code>jobs</code> listing, and a view fitted for a model or paging a field, are
+presentations. A script’s whole read of a result is raw data: its view carries that result’s
+saved presentations, while its own fields stay whole as the view’s schema declares. Scripts
+receive each response with the presentations its job saved, and these follow the values a
+script returns, so a view returned by a script, or read again as the <code>jobs</code> call’s own saved
+output, shows its result as a direct read would.</p>
 <p>Each script runs in a fresh QuickJS runtime (<code>tool/javascript</code>) with a 512 MiB engine allocation
 limit set before context creation. This does not cap Rust-side bridge or job memory; allocation
 failures use ordinary JavaScript error handling. Its runtime is embedded ES
@@ -4108,8 +4300,7 @@ modules (<code>tool/javascript/js</code>), compiled to bytecode once per process
 script; the submitted body is compiled separately, as its own module, so failure reports
 can keep only its frames. One conversion turns tool arguments and returned values into JSON at
 the host boundary (<code>bridge.rs</code>), and the host fills a response’s declared absent fields with
-<code>null</code> there, from the schema its job stores, which also declares its presentations
-(<code>job/output/projection.rs</code>).</p>
+<code>null</code> there, from the schema its job stores.</p>
 <p>Child messages and job notifications commit to the parent’s history together with their
 acknowledgment, as a model call’s result does with the outcome it reports, so an event that never
 reaches committed history stays pending for delivery
@@ -4145,8 +4336,12 @@ returns otherwise. The helper, its environment and prompt attribution are descri
 <a href="#authentication-and-prompt-isolation">authentication and prompt isolation</a>.</p>
 <h2 id="session-core-and-transaction-boundaries"><a class="header" href="#session-core-and-transaction-boundaries">Session core and transaction boundaries</a></h2>
 <p>Each durable session is one SQLite database, <code>session.db</code>, holding the append-only, normalized
-event ledger beside its blobs, saved job results and captures; <code>session/schema.sql</code> documents the
-tables and the few JSON columns. Closing any descriptor of a file releases every POSIX lock the
+event ledger beside its blobs, saved job results and captures; <code>skyhook-schema/src/session.sql</code>
+documents the tables and the few JSON columns, and sets the format the journal’s identity
+carries. The <code>skyhook-schema</code> proc macro runs that DDL, with any product tables layered on it,
+in an in-memory database at compile time and embeds the serialized result: creating a session
+writes those bytes as its file (or copies them into memory), after checking their identity
+against the journal image’s, and only fills the dictionaries, whose rows come from Rust enums. Closing any descriptor of a file releases every POSIX lock the
 process holds on it, SQLite’s included, so one registry under one lock (<code>db::live</code>) records both
 each database the process has open (its file, <code>-wal</code>, <code>-shm</code> and <code>-journal</code>, by identity and by
 name) and every handle another in-process opener holds (<code>fs::OpenFile</code>, by identity). An opener
@@ -4224,16 +4419,12 @@ again, and its name stays its owner’s. A cancellation requested of a finished 
 reopen forgets one that an interrupt, an abandonment or a close requested of a finished
 descendant.</p>
 <h3 id="log-and-reads"><a class="header" href="#log-and-reads">Log and reads</a></h3>
-<p>The ledger is only appended to: triggers refuse updates and deletes on every ledger and dictionary
-table. A write the journal cannot take stops the session as a crash does. No commit checkpoints
-the log, since a pass would hold the commits behind it while it syncs the database file: a thread
-with its own connection copies the log into the database every so many commits,
-without blocking the writer or a reader, except that once the log has grown well past its bound
-under commits that never pause, one pass holds the writer so the log can start over. A read holds
-its snapshot for that read alone, so the log stays bounded by what commits between passes plus
-what commits during the longest read. Closing a session copies the log into the
-database and empties it without waiting for a reader; frames a reader still holds stay for the
-next open to recover. A writer lock excludes competing session owners, not read-only inspection.</p>
+<p>The ledger is only appended to: the store’s writer offers no update or delete of a ledger or
+dictionary row. A write the journal cannot take stops the session as a crash does. Commits do not
+sync the log; the core syncs it once per group of commands. SQLite’s automatic checkpoint copies
+the log into the database as it grows, and the last connection to close copies and removes it.
+A read holds its snapshot for that read alone, so the log stays bounded by what commits during the
+longest read. A writer lock excludes competing session owners, not read-only inspection.</p>
 <p>Reads that do not belong to the core, such as job output, the blobs a request sends, an agent’s
 history, history pages, request reconstruction, the title, the session list, statistics and
 exports, run on read-only connections, each in one snapshot, so they never wait on the writer’s
@@ -4242,10 +4433,9 @@ keeps a fixed few read connections, each on a thread of its own, and a read wait
 than opening another. Reads are async, and one waiting for
 a connection holds no thread. The core reads on a connection of its own, so its reads never wait
 behind other reads. The pool and the turn it takes are <code>db</code> primitives; the journal and the
-security store each supply how their readers open. The CLI host turns SQLite’s allocation
-statistics off for the process at startup (<code>db::configure_process</code>): counting takes one global
-mutex, which would serialise readers that otherwise run in parallel. The library never changes
-process-wide SQLite state on its own.</p>
+security store each supply how their readers open. The library turns SQLite’s allocation
+statistics off for the process before its first connection: counting takes one global mutex,
+which would serialise readers that otherwise run in parallel.</p>
 <h3 id="observation"><a class="header" href="#observation">Observation</a></h3>
 <p>Observation is a host view of durable records, the jobs the session state folds from them, and
 live state; it is not a second source of conversation history or job state. An observation copies
@@ -4405,9 +4595,8 @@ own arguments. Session history is always <code>.skyhook/sessions</code>. The hos
     // SAFETY: no threads or runtime have been started.
     unsafe { skyhook_cli::main(MyProduct) }
 }</code></pre>
-<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> and configures SQLite for
-the process before starting Tokio, so the process must still be single-threaded; help and version
-need no <code>.env</code> or configuration.</p>
+<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> before starting Tokio, so
+the process must still be single-threaded; help and version need no <code>.env</code> or configuration.</p>
 <p>The extension points are:</p>
 <ul>
 <li><code>Product::configure(&amp;self, &amp;mut Config, Args, SessionContext&lt;'_&gt;)</code> returns <code>Configured</code>: the
@@ -4438,10 +4627,18 @@ work (see <a href="#interruption-continuation-and-shutdown">Interruption, contin
 </ul>
 <p>Hooks before <code>opened</code> create no sessions and write nothing to stdout; a batch run prints the
 session ID first. A product that keeps its own data in each session declares it as
-<code>Identity::tables</code>, an <code>Extension { sql, format, seed }</code> the host passes to
-<code>HarnessBuilder::session_extension</code>: the harness creates those tables in every session it creates
-and checks their format on every one of its own it reopens. <code>SessionStore::summary</code>, given the
-host and its tables, refuses one of the host’s own sessions that check would refuse, so the
+<code>Identity::schema</code>, a <code>session::Schema</code> the host passes to <code>HarnessBuilder::session_schema</code>: the
+harness creates every session from it and checks the tables’ format on every one of its own it
+reopens. <code>Schema::extended(image, seed)</code> takes the tables as a <code>ProductImage</code> and a function that
+fills their dictionaries in a new session (<code>Seeding::Fill</code>) and checks them on an open
+(<code>Seeding::Check</code>). <code>skyhook_schema::image!(format = N, file = "src/schema.sql")</code> builds the
+image at compile time: the journal’s schema with the product’s DDL layered on it and the format
+recorded, from <code>sql = "…"</code> literals and <code>file = "…"</code> paths relative to the crate’s manifest, in
+order. A changed file rebuilds the crate. The macro sees its arguments unexpanded, so they must
+be literals or file paths, not <code>concat!</code>, <code>include_str!</code> or another macro’s output; DDL only
+available that way goes through <code>ProductImage::layered(ddl, format)</code>, which runs it over the
+journal’s image as each session is created. A plain host passes <code>Schema::JOURNAL</code>.
+<code>SessionStore::summary</code>, given the host and its schema, refuses one of the host’s own sessions that check would refuse, so the
 session switcher leaves it out and <code>--resume</code> refuses it before <code>prepare</code>, as for an earlier
 session format; other hosts’ sessions are still listed, view-only. The harness hands host state
 and the resume hook the tables as an <code>ExtensionDb</code> on the session’s own writer and read pool;
@@ -4460,7 +4657,8 @@ columns wide, the usual band below it on a narrower one. <code>AgentPane::Hidden
 off the UI thread, as the extension’s own session sees it. A <code>Page</code> is a list of typed blocks:
 <code>Facts</code> (label and value pairs), a <code>Pipeline</code> of stages, <code>Panels</code> of labelled values and
 meters, and <code>Section</code>s, collapsible tables of records that each open to their detail. Cells
-carry a <code>Tone</code>, not a colour. The host lays the page out with its own theme, reflowing panels
+carry a <code>Tone</code> and a <code>Weight</code>, not a colour or a font. The host lays the page out with its own
+theme, reflowing panels
 and dropping section columns by priority as the width shrinks, and owns disclosure and
 scrolling, so a product needs no terminal code. <code>Disclosed</code> says which sections are open, how
 many of their records to supply (<code>Disclosed::PAGE</code> at a time), and which records are open,
@@ -4563,7 +4761,7 @@ rendering as false. Names nested in a value (<code>capabilities.agents</code>) a
 agent’s runtime state. The harness asks for the section before each request and before a
 compaction summary, places it inside the state block beside the date, live jobs and todos, and
 journals it with the state. It is asked with the host’s tables in the session (its
-<code>session_extension</code>, so only the host’s own sessions have a section) and the agent, so it can
+<code>session_schema</code>, so only the host’s own sessions have a section) and the agent, so it can
 read what the host keeps in the session and answer per agent. The host renders the text itself;
 <code>None</code> adds nothing to that request. Use it for facts an agent needs current, such as a
 workflow’s identity, policy and progress, rather than prefixing them to the user’s first
@@ -4812,11 +5010,10 @@ aggregates over the whole journal, its requests read a page at a time, so its me
 with the session.</p>
 <p>The SQLite layout is versioned. Opening a database validates its identity and version; there is no
 migration or compatibility layer for earlier layouts.</p>
-<p>An embedder that runs the library without <code>skyhook_cli::main</code> may call
-<code>skyhook::db::configure_process()</code> once at startup, before any other thread or SQLite use. It turns
-off SQLite’s allocation statistics, whose global mutex serialises parallel readers, but it also
-disables SQLite memory accounting for everything else in the process, so the library never calls
-it on its own.</p>
+<p>Before its first connection the library turns off SQLite’s allocation statistics for the
+process, whose global mutex serialises parallel readers. That also disables SQLite memory
+accounting and heap limits for any other SQLite user sharing the process; such a user must not
+start SQLite before the library’s first connection opens.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
 <p>The journal records inputs at the shared <code>Provider</code> boundary, not codec-specific request bodies
 or authentication headers:</p>
