@@ -101,22 +101,27 @@ paths relying on it, a state passes its effect to the paths accessing it, and a 
 passes its effect to the live candidates chaining or performing it. Some marks stand on their
 node alone: a candidate taking or losing a flaw as its root marks that flaw alone, so its other
 candidates are re-owed only when the flaw itself changes, an access recorded or removed marks
-its state alone, so it moves only the state's check, and a status set on a path, state or
+its path and its state alone, so it moves only their own work and the arms reading the state's
+accesses, and a status set on a path, state or
 component marks that node alone, with a state's paths, so it moves only their sweeps; but a path
 retracted or restored moves its standing along the graph, since its premises leave or rejoin its
 candidates' chains. A chain is edited whole through its candidate; a flaw joining or leaving
 it at another place is only concerned, and a chain's work also rests on the verdicts of the
-candidates holding its flaw, on the chain edits it joins or leaves, so a disproval or a leave
-releases the flaw with fresh tries, and on the accesses recorded or removed of the states it
-leaves wrong. Premise and flaw statuses, assessments and verdicts are histories of rows keyed by
+candidates holding its flaw, on the chain edits it joins or leaves, so a disproval, an
+exclusion or a leave releases the flaw with fresh tries, and on the accesses recorded or removed
+of the states it leaves wrong. Premise and flaw statuses, assessments and verdicts are histories of rows keyed by
 the event recording each (`premise_decision`, `flaw_judgement`, `candidate_assessment`,
-`candidate_verdict`); a finding's `reported` and a state's check are recorded in place. A result
+`candidate_verdict`); a finding's `reported` and a state's check are recorded in place, the
+check beside the premises its marks named as what its clearing relies on (`state_premise`; a
+`checked` mark parses only with at least one, as `Premises`), whose
+failing decisions and contradictions it rests on with those of the premises merged into each. A result
 stands on the basis of the task of its phase on its subject it was recorded within, so another
 agent's change after the task began owes the work again; one recorded outside such a task stands
 on nothing (`stamp`), and a report or a test's verdict outside one on its own event. Each row
 records whether its owning work recorded it (`owned`), decided once at the write: a code
-premise's settle, a deployment premise's answer outside every task, a flaw's chain, a
-candidate's assessment and review. The standing result is the latest owned one. An owned one
+premise's settle or the review of a candidate whose chain rests on it, a deployment premise's
+answer outside every task, a flaw's chain, a
+candidate's assessment and verdict its review. The standing result is the latest owned one. An owned one
 that restates it, current or not, only concerns its node, so nothing resting on it moves, while
 its task's basis still makes it current. A later one
 recorded elsewhere that differs from it is a proposal (`proposed`), which owes its phase and marks
@@ -131,11 +136,14 @@ is no edit of it.
 What each phase's work on a node reads is its phase's arm of one relation, generated per phase with
 the node bound in every arm so it seeks by node (`bearing`): standing or changed events for a sweep,
 check, settle, chain or report (the root's and each current member's), with the disputes of its
-result for a settle, chain, assessment or review, and, for a settle, the
+result for a settle, chain or review, for a check, the failing decisions of the premises its
+checks rest on and contradicting evidence on them, and, for a settle, the
 decisions and disputes of the premises it rests on, those and the environments
 for any candidate serving an interface the path reads an input state on (any such one when it
-reads none on an interface) for a probe, but none recorded within a probe, changed events for an assessment,
-all but test records and other results' disputes for a review, and assessments, test records and environments for a test, with, as its edits, a verdict of
+reads none on an interface) for a probe, but none recorded within a probe,
+all but test records and other results' disputes for a review, with the accesses recorded or
+removed of the states its flaws touch (those they leave wrong, and those its paths read where
+one sits: in its function, or at its location when it names none), and assessments, test records and environments for a test, with, as its edits, a verdict of
 another value and a change of its candidate's chain or actions (a standing or changed mark on the
 candidate but evidence changing it, its flaws or its paths). `event_node` holds its event's kind, and its effects are indexed without test records, which
 arms read from `test`, so a walk down a node's effects never visits its tests. Every arm leaves out what was recorded within a task of that phase on the node: `event_task`
@@ -150,8 +158,9 @@ material edit). Arms through relations a later event may change (what a premise 
 flaw's candidates and states, a root's members, environments, which a merge moves to its
 survivor) are read when asked, and every aggregate stays derived. A basis is that relation's latest event, or the node's latest while the
 relation has none, so owed work always rests on one; work is owed while its result predates its
-basis, disputes aside, which give it fresh tries but leave a standing result current, or, for a verdict, once the standings it claims (`candidate_core`) no longer hold, and a
-notice is one of its events after a task began. Candidate standing (`candidate_state`) and confidence are
+basis, disputes aside, which give it fresh tries but leave a standing result current, or, for a verdict, once the standings it claims (`candidate_core`) no longer hold; an assessment predates
+only the latest edit or merge of its candidate itself (one changing no flaw or path, the only
+nodes carrying a change to a candidate), so what the candidate rests on moves its verdict alone; and a notice is one of its events after a task began. Candidate standing (`candidate_state`) and confidence are
 derived views over those results, the chain's flaw and premise statuses, and the
 root group's demonstrations. A premise's or flaw's standing status counts once set at or after
 its latest material edit or merge into it, but those made within its own settle or chain
@@ -178,7 +187,10 @@ current basis; `startable` pages the offered entries in pipeline order, leaving 
 work holds and later work an earlier ready bundle touches, and admitting tests by the live
 policy, approvals and unblocked pending tests. A bundle is the ready sweeps of the paths keyed
 on one state, a path's key being the recorded handed state it accesses that the most paths
-access, else such an instance state, ties to the lowest, a path with none swept alone; one path's ready settles with every premise they rest on at any
+access, else such an instance state, ties to the lowest, a path with none swept alone; the
+ready checks of the states keyed on one handed state, a handed state keying itself and an
+instance state keyed as its unretracted writer paths would be by their handed states, else
+itself, so a handed value is checked with what its producers leave in the instance; one path's ready settles with every premise they rest on at any
 remove, or its ready chains, a shared stage's going with its lowest path and a premise with the
 lowest path of itself and the premises resting on it; or one root group's ready reviews. A
 check is ready once no path whose first event is no later than its basis owes a pending sweep,
@@ -186,10 +198,11 @@ whatever states the path accesses: the earliest such path is read once per state
 recorded since never holds a check back, and its sweep's accesses owe the check again. A check is
 owed while its state's basis is later than the basis of the check recorded last (`state_check`),
 or that check was recorded outside one.
-A settle is owed while a live flaw or unretracted path relies on its premise or, through
+A settle is owed while a live flaw, unretracted path or recorded state's check relies on its
+premise or, through
 `premise_basis` at any remove, on a premise resting on it; a decided premise owes it again once
-a premise it rests on is decided or disputed after the stamp of its decision, outside its own
-settle. A flaw that is not refuted and leaves a recorded state wrong owes a chain while its chain
+a premise it rests on is decided or disputed after the stamp of its decision, or after the
+decision itself when a review recorded it, outside its own settle. A flaw that is not refuted and leaves a recorded state wrong owes a chain while its chain
 basis is later than that of its latest chain task, whatever its candidates: one look covers
 every reader, and an access recorded since owes one more. The run's scope is the components created
 outside every task (`scope`: the first event naming one has no `event_task` row); a path is
@@ -197,8 +210,9 @@ outside it when its entry step's component and the owner of its file through `co
 are both outside it. Every phase's owed predicate skips a path outside it, a state, or a flaw by
 the paths through its component and its candidates' entries, that only such paths reach, a
 premise only such work relies on, and a candidate whose entry is such a path; nothing records
-the scope. A path is swept when one of its reads of a recorded input state
-sits in code and probed otherwise, and a probe is owed only while the launch does live work and
+the scope, and every begin returns it as it stands: the live mapped components with their
+interfaces, and the deployment premises by standing, failing ones as excluded. A path is swept
+when one of its reads of a recorded input state sits in code and probed otherwise, and a probe is owed only while the launch does live work and
 an environment for any candidate serves every interface it reads one on, or it reads them only
 in binaries. Test selection reads each root group's facts once per
 statement, and only for the groups of the subjects a read can list; an unproven candidate is

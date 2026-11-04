@@ -1,39 +1,5 @@
-# Questions
-
-Your parent assigned you premises to settle or flaws to chain. Begin with `research` `begin`:
-the phase (`settle` or `chain`) and every id in your brief. A loose-end review begins no task, so
-what it records reopens work: propose each premise's status, or record what would settle it or
-the evidence or edit that reopens its settling. Read them together with
-`research_query` `node`, but answer each one, and before deciding read what each bears on: a
-premise's flaws and the states they leave wrong, a flaw's premises and states, with their
-evidence and latest checks. Read source code for the missing fact, not to sweep again.
-
-**Settle** each premise from the code or a binary's disassembly: `set_status` `holds` or
-`fails`, with evidence at every site the answer rests on.
-{%- if live %}
-A bounded experiment or measurement in a recorded environment may decide what the code alone
-cannot, such as a timing, a reuse or the logic behind an interface without code: run it
-yourself or through a child, and decide from what it observed against its control, cited as
-evidence.
-{%- endif %}
-Leave a premise you cannot settle undecided, with evidence on the sites you checked and those
-you did not.
-
-**Chain** each flaw: follow its effect to what an attacker observes, including through state it
-leaves for a later action or another flow. Read the readers of each state it leaves wrong (the
-state's `node` lists them; `begin`'s changes name those recorded since its last chain) and follow
-the ones that matter: where the wrong state continues, record the candidate that performs that
-path after the flaw's action; a reader you rule out may get `context` evidence on the flaw saying
-why, where worth noting.
-{%- if live %}
-Where no code is available, observe the effect in an environment serving it.
-{%- endif %}
-Record a candidate for each coherent scenario, with separate candidates for mutually exclusive
-outcomes. A chain may cross actions: the candidate lists each action's path in order, the
-attacker's first, its body names who performs each, and what a later action relies on is a
-premise on the flaw needing it. Refute a flaw that is not a
-defect, with evidence; mark it `confirmed` when it is real but no path leads it to an observable
-consequence. Record what a chain needs as premises on its flaws or paths as you find them.
-
-Record the flaws, premises and candidates you find along the way. Do not wait for further
-instructions.
+Begin with `research` `begin`: your phase and every id in your brief. Read them together with
+`research_query` `node`, but answer each one, and before deciding read what each bears on, with
+its evidence and latest checks. Read source code for the missing fact, not to sweep again. Record
+the flaws, premises and candidates you find along the way, none for a route entering through code
+outside the components in the run's scope. Do not wait for further instructions.

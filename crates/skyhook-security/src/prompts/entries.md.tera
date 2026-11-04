@@ -7,7 +7,7 @@ state its code keeps:
   background job, exported function, callback, hook, configuration load or CI job) as a path of
   its own, with one `path_step` at the entry's definition in the component owning it, the note
   naming what it calls. A function reached only through another entry, such as an auth check, a
-  decoder or a helper, is a stage of that entry's path, not an entry, unless an actor reaches it
+  validator or a helper, is a stage of that entry's path, not an entry, unless an actor reaches it
   directly too.
 - each **input** a stage there takes in from an actor as an `input` state: the location where it
   is taken in, its trust, and a body describing the input, who controls it and the checks it has
@@ -17,7 +17,7 @@ state its code keeps:
   fields kept across its calls, a status or cursor the caller carries into later calls, or a
   session, row, file or queue other flows read. One state is the storage one invariant relates,
   its body that invariant and its writers and readers; fields kept to different invariants (a
-  state machine, its input buffering, its error) are different states, and a per-call temporary
+  state machine, its cached results, its error) are different states, and a per-call temporary
   is not a state.
 - each **access**: link with `path_state` each recorded path (`research_query` `list` `{record:
   {kind: "path"}}`) whose flow reads or writes one of these states here, an entry here or one another

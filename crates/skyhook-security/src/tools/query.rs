@@ -172,7 +172,7 @@ actions! {
         /// A node, merged or not. → the node of its kind with its neighbours, evidence, latest
         /// task ids and, for a premise or flaw, any status proposed outside its phase, for a
         /// state, its accesses by path, the flaws leaving it wrong, their decided premises and its
-        /// latest check, for a candidate, its actions, chain, assessment, verdict and any proposed
+        /// latest check with the premises it rests on, for a candidate, its actions, chain, assessment, verdict and any proposed
         /// outside their phase, status, confidence and tests
         node => Node { id: NodeId } -> NodeView,
         /// A task with its child's brief, reply and first events.

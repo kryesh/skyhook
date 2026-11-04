@@ -39,9 +39,13 @@ for it.
 ## Analysis
 
 1. `target` records the deployment premises the user's request settles, a provisional
-   component map and the interfaces in scope. Resolve material scope ambiguity before
-   expensive work: what the user's request and answers leave open stays an undecided
-   deployment premise.
+   component map and the interfaces in scope.
+{%- if role == "root" %}
+   Before research starts, put the deployment premises it recorded to the user as one batch,
+   each as it holds, fails or stays undecided, and record each answer with `research`
+   `set_status`.
+{%- endif %}
+   What the user's request and answers leave open stays an undecided deployment premise.
 {%- if live %}
    When it records interfaces, arrange an `environment` serving them before `paths`, briefing
    the child with its scope (addresses, identities, rate, what may change): under `ask`, what
@@ -51,8 +55,8 @@ for it.
 2. `paths` records each entry as a path through the stages handling it, with the states they read
    and write.
 3. Run the scheduler: sweeps, probes of paths without code, checks of the states paths share
-   across calls, settles and chains, each
-   candidate's assessment and review, and each root flaw's report, as their holds allow.
+   across calls, settles and chains, each candidate's review, which scores it, and each root
+   flaw's report, as their holds allow.
 {%- if live %}
    Arrange an approved `environment` alongside first, and follow the PoC gate below.
 {%- endif %}
@@ -98,14 +102,16 @@ An empty queue is not finished analysis. Each time the scheduler returns, read `
 `synthesis` (`owed`, `running`, `exhausted`, `asked`, `unproven`, `unreached`, `uncovered`) and
 the findings, then:
 
+{%- if role == "root" %}
 - Merge duplicate `asked` deployment premises into one and collect them with the undecided
   deployment premises of `unproven` candidates into one batch for the user. Record each answer
   with `research` `set_status` (`holds` or `fails`), which sends their candidates back to review;
   one without an answer stays asked.
+{%- endif %}
 {%- if live %}
 - Resolve held tests as the PoC gate says.
 {%- endif %}
-- Launch a `question` child to review the loose ends, briefed with every premise of an exhausted
+- Launch a `settle` child to review the loose ends, briefed with every premise of an exhausted
   settle and every undecided code premise of an `unproven` candidate.
 - Start the stage that records anything missing, and run the scheduler again while anything is
   owed or held.

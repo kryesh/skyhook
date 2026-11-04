@@ -100,7 +100,8 @@ mod tests {
         };
         store.link(&actor, &[write(3)]).unwrap();
         sweep(&store, stream);
-        check(&store, window);
+        let basis = premise(&store, &actor, PremiseScope::Code);
+        check(&store, window, &[basis]);
         let current = || {
             let NodeView::State(view) = store.node(window.into()).unwrap() else {
                 panic!("a state")

@@ -1,29 +1,27 @@
 # Analytic validation
 
 Independently review the assigned candidates, the scenarios of one root flaw, beginning with
-`research` `begin` `{phase: "review", subjects: [every candidate in your brief]}`: for each,
-verify the recorded mechanism along its actions and search for the counterexample that breaks
-it. Build on the records instead of sweeping the components
-again. List the gaps mechanically first, so the review answers each one before the verdict:
+`research` `begin` `{phase: "review", subjects: [every candidate in your brief]}`. Score each
+first with `research` `assess`, and again after you edit it: one the result does not mark
+`shortlisted` needs no verdict, and the rest are reviewed in full, from a trace through the source
+and the gaps in the record. List the gaps mechanically first, so the review answers each one
+before the verdict:
 
 ```js
 {% include "security/scripts/validate-gaps.js" %}
 ```
 
-Examine each gap at the cited locations. Check attacker control, reachability, configuration,
-authentication and privileges along each action's steps, and look for what defeats the scenario: a
-guard on another branch, a state in which a premise fails, an input state on a path that is not
-handled like the others, a stored state read at a trust other than its least-privileged
-writer's. For a multi-flaw chain, verify the flaws combine under one compatible
-execution or API lifecycle. For a race or a check apart from its use, verify what runs the other
-flow, that nothing serialises the two across the window, and who can drive it; for a chain
-across actions, each action's actor and that the state an earlier one leaves survives until a
-later one uses it. Propose each gap's code premise status from the code with `set_status` and
-evidence: its settle decides it, and the verdict is unproven while it is undecided. A condition
-only the deployment decides rests on a deployment premise: link the one that states it, or
-record it undecided; only the user decides it. You may complete or correct the record yourself —
-steps, premises, evidence — propose a corrected assessment, which its assessment decides, and
-delegate focused independent checks to children launched without a mode.
+Trace each shortlisted candidate in a child launched with `mode: "trace"`, briefed with the
+candidate, `begin`'s scope and, for one reviewed before, the changes `begin` named.
+
+Examine each gap at the cited locations, and judge from the traces and those checks. For a
+multi-flaw chain, verify the flaws combine under one compatible execution or API lifecycle. For a
+race or a check apart from its use, verify what runs the other flow, that nothing serialises the
+two across the window, and who can drive it; for a chain across actions, each action's actor and
+that the state an earlier one leaves survives until a later one uses it. Decide each code
+premise the verdict needs from the code with `set_status`, with evidence at every site. A
+condition only the deployment decides rests on a deployment premise, which only the user
+decides. You may complete or correct the record yourself: steps, premises, evidence.
 
 Execution serves understanding the code: reading, searching, building or indexing it, short
 deterministic checks of a language or library behaviour a premise depends on (seconds, no
@@ -38,8 +36,8 @@ counterexample. The review establishes the mechanism; the test demonstrates the 
 
 Record each verdict with `research` `verdict`, the note citing what decided it:
 
-- `validated`: the mechanism, its reachable preconditions and the stated consequence survive
-  review, and every premise it rests on holds;
+- `validated`: its trace has no break, the mechanism, its reachable preconditions and the stated
+  consequence survive review, and every premise it rests on holds;
 - `disproved`: a code premise fails or a chain flaw is refuted; where the mechanism does not
   hold, propose the flaw `refuted`, which its chain decides;
 - `excluded`: a deployment premise it rests on fails, so the deployment keeps a real finding
@@ -47,13 +45,12 @@ Record each verdict with `research` `verdict`, the note citing what decided it:
 - `unproven`: a premise stays undecided, recorded on the chain flaw or path it bears on with the
   exact check that would settle it.
 
-A verdict stands only while the statuses it claims do. A duplicate is merged into the candidate
-it repeats, not judged. Each variant of the root is judged on its own: what you found on one is
-evidence for the others, never their verdict. When the scenario fails as formulated but its
-flaws support another reading — a different consequence, another path, a different order —
-record that reading as its own candidate; each verdict covers only its own scenario. This is analytic
-validation, not a demonstration. Record a bounded demonstration plan for each test as context
-evidence on its candidate. Return each verdict, its remaining limitations, the ids of any
-deployment premise left for the user, and the plans.
+A duplicate is merged into the candidate it repeats, not judged. Each variant of the root is
+judged on its own: what you found on one is evidence for the others, never their verdict. When
+the scenario fails as formulated but its flaws support another reading — a different
+consequence, another path, a different order — record that reading as its own candidate; each
+verdict covers only its own scenario. Record a bounded demonstration plan for each test as
+context evidence on its candidate. Return each score and verdict, its remaining limitations, the ids of
+any deployment premise left for the user, and the plans.
 
 {% include "security/cvss.md" %}

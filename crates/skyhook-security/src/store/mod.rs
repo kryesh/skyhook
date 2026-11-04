@@ -49,7 +49,7 @@ pub use reads::*;
 pub use review::*;
 pub use runs::*;
 pub use schedule::*;
-pub use scope::Outside;
+pub use scope::{Assumed, Excluded, Outside, Scope, ScopedInterface};
 pub use synthesis::*;
 pub use tasks::*;
 pub use testing::*;
@@ -150,6 +150,12 @@ pub enum Error {
     FindingMerge,
     #[error("a premise does not rest on itself")]
     SelfBasis,
+    #[error(
+        "a `checked` state names in `rests_on` at least one premise its clearing relies on: a \
+         recorded one (a deployment premise for a documented contract included) or a new code \
+         premise for each general claim the recorded accesses do not show"
+    )]
+    Unrested,
     #[error("input state {0} is read at that location: merge into it")]
     StateAt(StateId),
     #[error("only an input state has a trust and a location")]
@@ -624,17 +630,34 @@ pub(crate) mod tests {
         recorded
     }
 
-    /// Assess `id` at `vector` in an assessment of it.
+    /// Assess `id` at `vector` in a review of it.
     pub(crate) fn assess(store: &Store, id: CandidateId, vector: &str) {
-        within(store, &Begin::Assess(vec![id]), |agent| {
+        within(store, &Begin::Review(vec![id]), |agent| {
             let vector = vector.parse().unwrap();
             store.assess(agent, id, vector, &text("scored")).unwrap();
         });
     }
 
-    /// Judge `id` in a review of it.
+    /// Rewrite candidate `id`'s body as `body`.
+    pub(crate) fn reword(store: &Store, actor: &AgentId, id: CandidateId, body: &str) {
+        let edit = Edit {
+            title: None,
+            body: Some(text(body)),
+            detail: CandidateEdit::default(),
+        };
+        (store.upsert(actor, &Upsert::Candidate(Change::Edit(id, edit)))).unwrap();
+    }
+
+    /// Judge `id` in a review of it, which scores it again at its standing vector first.
     pub(crate) fn verdict(store: &Store, id: CandidateId, verdict: Verdict) {
+        let vector: String = (store.read(|db| {
+            let sql = "SELECT vector FROM candidate_result WHERE candidate=?1";
+            stored(db, sql, params![id], |row| Ok(row.get(0)?))
+        }))
+        .unwrap();
         within(store, &Begin::Review(vec![id]), |agent| {
+            let vector = vector.parse().unwrap();
+            store.assess(agent, id, vector, &text("scored")).unwrap();
             store
                 .verdict(agent, id, verdict, &text("reviewed"))
                 .unwrap();
@@ -664,10 +687,11 @@ pub(crate) mod tests {
         });
     }
 
-    /// Check `state` across calls in a check of it.
-    pub(crate) fn check(store: &Store, state: StateId) {
+    /// Check `state` across calls in a check of it, resting on `rests_on`.
+    pub(crate) fn check(store: &Store, state: StateId, rests_on: &[PremiseId]) {
         within(store, &Begin::Check(vec![state]), |agent| {
-            let checked = StatusChange::State(state, StateMark::Checked);
+            let rests_on = Some(rests_on.to_vec()).try_into().unwrap();
+            let checked = StatusChange::State(state, StateMark::Checked { rests_on });
             store.set_status(agent, checked, &text("checked")).unwrap();
         });
     }

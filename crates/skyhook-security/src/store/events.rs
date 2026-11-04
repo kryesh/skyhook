@@ -3,11 +3,11 @@
 //! along the graph: a premise moves the standing of the flaws and paths relying on it, a state
 //! passes its effect to the paths accessing it, and a flaw or path passes its effect to the live
 //! candidates holding it. Some marks move their node's own work alone: a candidate taking or
-//! losing a flaw as its root leaves the flaw's other candidates unmoved, an access recorded on a
-//! state, or its path retracted, restored or merged away, moves its check alone, and a status set
-//! on a path, state or component moves that node, and a state's paths, but no candidate, unless
-//! it retracts or restores a path. A flaw joining or leaving a chain at another place is only
-//! concerned.
+//! losing a flaw as its root leaves the flaw's other candidates unmoved, an access recorded or
+//! removed moves its path's and its state's own work, a path retracted, restored or merged away
+//! the checks of the states it accesses, and a status set on a path, state or component moves
+//! that node, and a state's paths, but no candidate, unless it retracts or restores a path. A
+//! flaw joining or leaving a chain at another place is only concerned.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -391,8 +391,8 @@ mod tests {
     /// candidates `standing`, a path step or an input state's edit makes the candidates along
     /// the path `changed`, and a test record moves only its own candidate. A candidate taking a
     /// flaw as its root moves that flaw, not its other candidates; a flaw joining or leaving a
-    /// chain at another place is only concerned. An access recorded moves its path's standing
-    /// and its state's check alone.
+    /// chain at another place is only concerned. An access recorded moves its path's and its
+    /// state's own work alone.
     #[test]
     fn effects_propagate_along_the_graph() {
         let (_session, store, actor) = fixture();
@@ -496,11 +496,7 @@ mod tests {
         store.link(&actor, &[write]).unwrap();
         assert_eq!(
             marks(&store, last_event(&store)),
-            [
-                standing(path.into()),
-                standing(candidate.into()),
-                standing(kept.into())
-            ]
+            [standing(path.into()), standing(kept.into())]
         );
 
         let (tester, _) = child_agent(&store, skyhook::job::JobState::Running);
@@ -559,8 +555,9 @@ mod tests {
             sweep(&store, path);
         }
         let owed = || store.run_facts().unwrap().summary.owed(Phase::Check);
+        let basis = premise(&store, &actor, PremiseScope::Code);
         let check = || {
-            check(&store, window);
+            check(&store, window, &[basis]);
             assert_eq!(owed(), 0);
         };
         let mark = |status| {
@@ -585,7 +582,7 @@ mod tests {
 
     /// A candidate rests on every action it performs, not only the first: a premise of a later
     /// action's path is one its chain rests on, and correcting the input state that path reads
-    /// or its steps re-owes the candidate's assessment and verdict and stales its root's
+    /// or its steps re-owes the candidate's verdict, not its assessment, and stales its root's
     /// report.
     #[test]
     fn a_later_actions_correction_reowes_its_candidate() {
@@ -672,7 +669,7 @@ mod tests {
             let finding = settle();
             assert_eq!(standing(finding), (true, true, true));
             correct();
-            assert_eq!(standing(finding), (false, false, false));
+            assert_eq!(standing(finding), (true, false, false));
         }
     }
 
@@ -683,7 +680,7 @@ mod tests {
         let (_session, store, actor) = fixture();
         let decoder = scenario(&store, &actor, "decoder");
         let (candidate, flaw) = (decoder.candidate, decoder.flaw);
-        let (child, _, _) = begun(&store, &Begin::Assess(vec![candidate]));
+        let (child, _, _) = begun(&store, &Begin::Review(vec![candidate]));
         let vector = HIGH.parse().unwrap();
         store
             .assess(&child, candidate, vector, &text("scored"))

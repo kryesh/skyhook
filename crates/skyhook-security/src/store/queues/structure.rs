@@ -119,22 +119,47 @@ macro_rules! key_state {
     ($p:expr) => {
         concat!(
             "coalesce(",
-            key_state!(@ $p, "handed"),
+            key_state!(@ concat!("=", $p), "handed"),
             ",",
-            key_state!(@ $p, "instance"),
+            key_state!(@ concat!("=", $p), "instance"),
             ")"
         )
     };
-    (@ $p:expr, $scope:literal) => {
+    // Of the recorded `$scope` states the paths `ks.path$paths` selects access, the one the most
+    // unretracted paths access, ties to the lowest.
+    (@ $paths:expr, $scope:literal) => {
         concat!(
             "(SELECT ks.state FROM path_state ks JOIN state kt ON kt.node=ks.state AND \
              kt.scope='",
             $scope,
-            "' AND kt.status='recorded' WHERE ks.path=",
-            $p,
+            "' AND kt.status='recorded' WHERE ks.path",
+            $paths,
             " GROUP BY ks.state ORDER BY (SELECT count(DISTINCT kc.path) FROM path_state kc JOIN path \
              kq ON kq.node=kc.path AND kq.status!='retracted' WHERE kc.state=ks.state) DESC,ks.state \
              LIMIT 1)"
+        )
+    };
+}
+
+/// The state keying state `$s`'s check bundle: a handed state itself; an instance state, the
+/// handed state its unretracted writer paths access that the most such paths access, as a path's
+/// sweep is keyed, so the value a call hands back is checked with what its producers leave in the
+/// instance the next call resumes from; else the state itself.
+macro_rules! check_key {
+    ($s:expr) => {
+        concat!(
+            "coalesce((SELECT kh.node FROM state kh WHERE kh.node=",
+            $s,
+            " AND kh.scope='handed'),",
+            key_state!(@ concat!(
+                " IN (SELECT kw.path FROM path_state kw JOIN path kp ON kp.node=kw.path AND \
+                 kp.status!='retracted' WHERE kw.state=",
+                $s,
+                " AND kw.access='write')"
+            ), "handed"),
+            ",",
+            $s,
+            ")"
         )
     };
 }
@@ -177,15 +202,15 @@ macro_rules! check_pending {
     };
 }
 
-/// Candidate `$c` is live: unmerged, and not judged disproved at its current review. An
-/// excluded candidate still holds its flaws.
+/// Candidate `$c` is live: unmerged, and not judged disproved or excluded at its current review.
+/// A flaw only such candidates hold is chained again, for a route resting on other premises.
 macro_rules! live_candidate {
     ($c:expr) => {
         concat!(
             "EXISTS (SELECT 1 FROM candidate_core lc WHERE lc.candidate=",
             $c,
             " AND lc.merged_into IS NULL AND NOT (lc.reviewed_current AND \
-             ifnull(lc.verdict='disproved',0)))"
+             ifnull(lc.verdict IN ('disproved','excluded'),0)))"
         )
     };
 }
@@ -212,8 +237,9 @@ macro_rules! live_flaw {
 }
 pub(super) use live_flaw;
 
-/// A live flaw depends on premise `$p` or an unretracted path relies on it, or on a premise
-/// resting on it at any remove, and that flaw or path is not outside the scope.
+/// A live flaw depends on premise `$p`, or an unretracted path or a recorded state's check
+/// relies on it, or on a premise resting on it at any remove, and that flaw, path or state is not
+/// outside the scope.
 macro_rules! relied {
     ($p:expr) => {
         concat!(
@@ -228,6 +254,9 @@ macro_rules! relied {
             ") OR EXISTS (SELECT 1 FROM path_premise sp JOIN path sq ON sq.node=sp.path AND \
              sq.status!='retracted' WHERE sp.premise=above.node AND NOT ",
             $crate::store::scope::unscoped!("sp.path"),
+            ") OR EXISTS (SELECT 1 FROM state_premise ss JOIN state st ON st.node=ss.state AND \
+             st.status='recorded' WHERE ss.premise=above.node AND NOT ",
+            $crate::store::scope::state_outside!("ss.state"),
             "))"
         )
     };
@@ -235,8 +264,9 @@ macro_rules! relied {
 pub(super) use relied;
 
 /// Premise `$p` owes a settling look: it is about the code, undecided, disputed since its
-/// decision, or decided while a premise it rests on was decided or disputed after that, and
-/// work [`relied`] on it is live. A deployment premise is the user's to answer.
+/// decision, or decided while a premise it rests on was decided or disputed since its settle
+/// began, or since the decision itself when a review recorded it, and work [`relied`] on it is
+/// live. A deployment premise is the user's to answer.
 macro_rules! settle_owed {
     ($p:expr) => {
         concat!(
@@ -246,9 +276,9 @@ macro_rules! settle_owed {
             $crate::store::bearing::disputed!("so", "decided"),
             " OR ifnull((",
             $crate::store::bearing::undermined!("so.node"),
-            ")>",
+            ")>coalesce(",
             $crate::store::bearing::stamp!("settle", "so.decided", "so.node"),
-            ",0))) AND ",
+            ",so.decided),0))) AND ",
             relied!($p),
             ")"
         )
@@ -323,7 +353,9 @@ pub(super) const PROBE: Sql = phase_sql!(
 );
 
 /// Ready once no path recorded by its basis owes a pending sweep, accessing it or not: a path
-/// recorded since links its accesses when swept, which owe the check again.
+/// recorded since links its accesses when swept, which owe the check again. Bundled by state: a
+/// state goes with every ready one sharing the state its check's bundle is keyed on, the instance
+/// states written on the paths accessing a handed state with it.
 pub(super) const CHECK: Sql = phase_sql!(
     "check",
     "state",
@@ -338,7 +370,16 @@ pub(super) const CHECK: Sql = phase_sql!(
     ),
     "NULL",
     "NULL",
-    "NULL"
+    concat!(
+        "SELECT value FROM json_each(?1) UNION SELECT ",
+        check_key!("(SELECT value FROM json_each(?1))"),
+        " UNION SELECT bw.state FROM path_state bh JOIN path_state bw ON bw.path=bh.path AND \
+         bw.access='write' WHERE bh.state=",
+        check_key!("(SELECT value FROM json_each(?1))"),
+        " AND ",
+        check_key!("bw.state"),
+        "=bh.state"
+    )
 );
 
 /// The flaws on path `$p`: those in a component its steps enter.
@@ -725,12 +766,12 @@ mod tests {
         );
     }
 
-    /// A status recorded outside a premise's settle that agrees with its standing restates it,
-    /// concerning it alone and owing nothing; one that disagrees disputes it, moving its settle
-    /// alone, whose next task is told of it and resolves it by deciding. Once a settle decided
-    /// after it, repeating it only concerns the premise while that decision stands on the
-    /// settle's current basis: after an edit, a repeat answered before disputes it again, as
-    /// does a status not yet proposed.
+    /// A status recorded outside the work owning a premise that agrees with its standing
+    /// restates it, concerning it alone and owing nothing; one that disagrees disputes it, moving
+    /// its settle alone, whose next task is told of it and resolves it by deciding. Once a
+    /// settle decided after it, repeating it only concerns the premise while that decision
+    /// stands on the settle's current basis: after an edit, a repeat answered before disputes it
+    /// again, as does a status not yet proposed.
     #[test]
     fn a_proposal_disputes_a_standing_only_when_it_disagrees() {
         let (_session, store, actor) = fixture();
@@ -749,11 +790,11 @@ mod tests {
             };
             view
         };
-        let (reviewer, job, _) = begun(&store, &Begin::Review(vec![scenario.candidate]));
+        let (proposer, job, _) = begun(&store, &Begin::Chain(vec![scenario.flaw]));
         let propose = |status| {
             let change = StatusChange::Premise(code, status);
             store
-                .set_status(&reviewer, change, &text("reviewed"))
+                .set_status(&proposer, change, &text("reviewed"))
                 .unwrap();
             marks(&store, last_event(&store))
         };
@@ -780,7 +821,7 @@ mod tests {
                 proposed.value,
                 &proposed.agent
             ),
-            (PremiseStatus::Holds, true, PremiseStatus::Fails, &reviewer)
+            (PremiseStatus::Holds, true, PremiseStatus::Fails, &proposer)
         );
 
         let (settler, job) = child_agent(&store, JobState::Running);
@@ -870,7 +911,7 @@ mod tests {
             location: None,
             environment: None,
             stance: Stance::Contradicts,
-            note: text("one exit skips the drain"),
+            note: text("one exit skips the check"),
         };
         store.evidence(&actor, sub.into(), &[dispute]).unwrap();
         assert_eq!(
@@ -889,8 +930,8 @@ mod tests {
 
     /// A flaw is owed a chain while no live candidate holds it, once the paths through its
     /// component and the readers and checks of the states it leaves wrong are settled, whatever
-    /// a path elsewhere owes; a flaw only a disproved candidate holds, or one leaving a
-    /// chain, is owed again with fresh tries, one an excluded candidate holds is not, and a
+    /// a path elsewhere owes; a flaw only an excluded or disproved candidate holds, or one leaving
+    /// a chain, is owed again with fresh tries, and a
     /// confirmed one only once something it rests on changes, during its chain included. An
     /// edit within its chain leaves its judgement standing.
     #[test]
@@ -930,7 +971,8 @@ mod tests {
         );
         sweep(&store, consumer);
         assert!(chain().is_empty(), "the state it leaves wrong is unchecked");
-        check(&store, window);
+        let basis = premise(&store, &actor, PremiseScope::Code);
+        check(&store, window, &[basis]);
         assert_eq!(chain(), [NodeId::from(loose)]);
         let unwrong = Unlink::FlawState {
             flaw: loose,
@@ -939,9 +981,23 @@ mod tests {
         store.unlink(&actor, &[unwrong]).unwrap();
         let held = candidate(&store, &actor, scenario.path, &[loose]);
         assert!(chain().is_empty());
+        let deployed = premise(&store, &actor, PremiseScope::Deployment);
+        let needs = Link::FlawPremise {
+            flaw: loose,
+            premise: deployed,
+        };
+        store.link(&actor, &[needs]).unwrap();
+        let answered = StatusChange::Premise(deployed, PremiseStatus::Fails);
+        store
+            .set_status(&actor, answered, &text("not deployed"))
+            .unwrap();
         assess(&store, held, HIGH);
         verdict(&store, held, Verdict::Excluded);
-        assert!(chain().is_empty(), "an excluded candidate holds its flaw");
+        assert_eq!(
+            chain(),
+            [NodeId::from(loose)],
+            "an excluded candidate holds nothing"
+        );
         let gone = premise(&store, &actor, PremiseScope::Code);
         let needs = Link::FlawPremise {
             flaw: loose,
@@ -960,7 +1016,7 @@ mod tests {
         let confirmed = StatusChange::Flaw(apart, FlawStatus::Confirmed);
         let (questioner, job, _) = begun(&store, &Begin::Chain(vec![apart]));
         store
-            .set_status(&questioner, confirmed, &text("no consequence"))
+            .set_status(&questioner, confirmed.clone(), &text("no consequence"))
             .unwrap();
         let edit = Edit {
             title: None,
@@ -1103,9 +1159,16 @@ mod tests {
         assert_eq!(check(), [NodeId::from(window)], "a path recorded since");
         let (checker, job, _) = begun(&store, &Begin::Check(vec![window]));
         store.link(&checker, &write(4)).unwrap();
-        let checked = StatusChange::State(window, StateMark::Checked);
+        let basis = premise(&store, &checker, PremiseScope::Code);
+        let checked = StateMark::Checked {
+            rests_on: Some(vec![basis]).try_into().unwrap(),
+        };
         store
-            .set_status(&checker, checked, &text("every writer meets every reader"))
+            .set_status(
+                &checker,
+                StatusChange::State(window, checked),
+                &text("every writer meets every reader"),
+            )
             .unwrap();
         end_job(&store, job);
         assert!(check().is_empty(), "its own check's accesses");
@@ -1113,6 +1176,89 @@ mod tests {
         assert!(check().is_empty(), "a later access, past the unswept path");
         sweep(&store, later);
         assert_eq!(check(), [NodeId::from(window)]);
+    }
+
+    /// A check rests on the premises its mark names: each is owed its settle while undecided,
+    /// and the check is owed again once one is decided failing or contradicted, but not when one
+    /// holds.
+    #[test]
+    fn a_check_rests_on_the_premises_its_mark_names() {
+        let (_session, store, actor) = fixture();
+        let decoder = component(&store, &actor, "decoder");
+        let stream = path(&store, &actor, "stream", &[decoder]);
+        let window = state(&store, &actor, NewState::Instance);
+        let write = access(stream, window, Access::Write, location("decoder/lib.c", 3));
+        store.link(&actor, &[write]).unwrap();
+        sweep(&store, stream);
+        let [holding, failing] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
+        assert!(queued(&store, Phase::Settle).is_empty());
+        check(&store, window, &[holding, failing]);
+        assert_eq!(
+            queued(&store, Phase::Settle),
+            [NodeId::from(holding), failing.into()]
+        );
+        let rechecked = || queued(&store, Phase::Check);
+        decide(&store, holding, PremiseStatus::Holds);
+        assert!(rechecked().is_empty(), "a premise holding");
+        decide(&store, failing, PremiseStatus::Fails);
+        assert_eq!(rechecked(), [NodeId::from(window)], "a premise failing");
+        check(&store, window, &[holding]);
+        let dispute = NewEvidence {
+            location: None,
+            environment: None,
+            stance: Stance::Contradicts,
+            note: text("one caller skips the check"),
+        };
+        store.evidence(&actor, holding.into(), &[dispute]).unwrap();
+        assert_eq!(
+            rechecked(),
+            [NodeId::from(window)],
+            "a premise contradicted"
+        );
+    }
+
+    /// A check rests on the history of each premise merged into one it names: a holding
+    /// premise merged in owes it nothing, and a contradicted one owes it still once merged away.
+    #[test]
+    fn a_check_rests_on_its_premises_across_merges() {
+        let (_session, store, actor) = fixture();
+        let decoder = component(&store, &actor, "decoder");
+        let stream = path(&store, &actor, "stream", &[decoder]);
+        let window = state(&store, &actor, NewState::Instance);
+        let write = access(stream, window, Access::Write, location("decoder/lib.c", 3));
+        store.link(&actor, &[write]).unwrap();
+        sweep(&store, stream);
+        let [rested, restated, kept] = [(); 3].map(|_| {
+            let premise = premise(&store, &actor, PremiseScope::Code);
+            decide(&store, premise, PremiseStatus::Holds);
+            premise
+        });
+        check(&store, window, &[rested]);
+        let merge = |node: PremiseId, into: PremiseId| {
+            let merge = Merge {
+                node: node.into(),
+                into: into.into(),
+                note: text("the same claim"),
+            };
+            store.merge(&actor, &merge).unwrap();
+        };
+        let rechecked = || queued(&store, Phase::Check);
+        merge(restated, rested);
+        assert!(rechecked().is_empty(), "a holding premise merged in");
+        let dispute = NewEvidence {
+            location: None,
+            environment: None,
+            stance: Stance::Contradicts,
+            note: text("one caller skips the check"),
+        };
+        store.evidence(&actor, rested.into(), &[dispute]).unwrap();
+        assert_eq!(rechecked(), [NodeId::from(window)]);
+        merge(rested, kept);
+        assert_eq!(
+            rechecked(),
+            [NodeId::from(window)],
+            "a contradicted premise merged away"
+        );
     }
 
     /// A flaw leaving a state wrong is owed a chain, even while a live candidate holds it, until
@@ -1136,7 +1282,8 @@ mod tests {
         for path in [writer, first, second, later] {
             sweep(&store, path);
         }
-        check(&store, window);
+        let basis = premise(&store, &actor, PremiseScope::Code);
+        check(&store, window, &[basis]);
         let stale = flaw(&store, &actor, decoder);
         candidate(&store, &actor, writer, &[stale]);
         let chain = || queued(&store, Phase::Chain);
@@ -1152,7 +1299,7 @@ mod tests {
         assert!(chain().is_empty(), "its chain began at its basis");
         let read = access(later, window, Access::Read, at);
         store.link(&actor, &[read]).unwrap();
-        check(&store, window);
+        check(&store, window, &[basis]);
         assert_eq!(chain(), [NodeId::from(stale)], "a reader recorded since");
         judge(&store, stale, FlawStatus::Refuted);
         assert!(chain().is_empty(), "a refuted flaw");

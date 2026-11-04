@@ -4,15 +4,19 @@ const jobs = (await tool.jobs({all: true, limit: 1})).unwrap();
 let launches = jobs.jobs.length + (jobs.older ?? 0);
 const tries = new Map(), spent = new Map(), tried = (phase, e) => `${phase}:${e.node}:${e.basis}`;
 const keys = () => [...spent.values()].map(({replies, ...key}) => key), nodes = ({entries}) => entries.map(e => e.node);
-const MODES = {sweep: ["sweep", 2, "Sweep path"], probe: ["probe", 2, "Probe path", true], check: ["check", 2, "Check state"], settle: ["question", 1, "Settle premise", true], chain: ["question", 1, "Chain flaw", true], assess: ["assess", 1, "Assess candidate"], review: ["validate", 2, "Review candidate", true], report: ["report", 1, "Report root flaw"]};
+const MODES = {sweep: ["sweep", 2, "Sweep path"], probe: ["probe", 2, "Probe path", true], check: ["check", 2, "Check state"], settle: ["settle", 1, "Settle premise", true], chain: ["chain", 1, "Chain flaw", true], review: ["validate", 2, "Review candidate", true], report: ["report", 1, "Report root flaw"]};
+// While the root's question to the user is open, reviews wait and an idle slot watches for it to close.
+const asking = async () => (await tool.jobs({limit: 1000})).unwrap().jobs.some(job => job.meta.tool === "ask");
 const next = async (running, free) => {
   if (stopped) return [];
-  const busy = [...running.values()].flatMap(nodes), ready = [];
-  held = false;
+  const busy = [...running.values()].flatMap(nodes), ready = [], asked = await asking();
+  let deferred = held = false;
   for (let after = null; ready.length < free;) {
-    const page = (await tool.research_query({action: "startable", running: busy, spent: keys(), after, limit: Math.min(free - ready.length, 1000)})).unwrap();
+    const page = (await tool.research_query({action: "startable", running: busy, spent: keys(), after, limit: asked ? 1000 : Math.min(free - ready.length, 1000)})).unwrap();
     held ||= page.held;
     for (const head of page.items) {
+      if (asked && head.phase === "review") { deferred = true; continue; }
+      if (ready.length === free) break;
       const item = {key: head.node, phase: head.phase, entries: [head, ...(head.bundle ?? [])]};
       busy.push(...nodes(item));
       ready.push(item);
@@ -20,9 +24,11 @@ const next = async (running, free) => {
     if (page.next == null) break;
     after = page.next;
   }
+  if (deferred && ready.length < free) ready.push({key: "question", entries: []});
   return ready;
 };
 for await (const r of new WorkPool(workers).feed(next, async ({key, phase, entries}) => {
+  if (key === "question") { while (!stopped && await asking()) await sleep(30000); return; }
   const [mode, depth, brief, runs] = MODES[phase], name = `${mode}-${key}-${++launches}`, workspace = `${artifacts}/${name}`;
   return await tool.agent({mode, depth, name, ...runs && {workspace}, prompt: `${brief}${entries.length > 1 ? "s" : ""} ${nodes({entries}).join(", ")}.${runs ? ` Your workspace is your working directory, ${workspace}; the target is in ${source}.` : ""} Your reply is kept with your task, but agents work from the records: record what you found, ruled out or need answered, a question as an undecided premise.`});
 }, {wake: receive})) {

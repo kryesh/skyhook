@@ -14,23 +14,22 @@ use super::*;
 /// it does, by the arms of the phase's bearing that read only the event's own effects: what
 /// [`record`] stores. Work rests on its subject's standing and changed effects: a check on its
 /// state's accesses, edits and merges, a report on its root's own standing changes, which a
-/// candidate taking or losing it as its root makes. An assessment rests on changes alone. A test
-/// rests on the assessment and its candidate's test records, which name it alone and bear on
-/// nothing else, and is edited by what it demonstrates changing: a verdict of another value, or
-/// the candidate's chain or actions, which evidence moves only on a premise of its chain, carried
-/// as standing; evidence on the candidate, its flaws or its paths changes neither. The proposals
-/// disputing a settle's, chain's, assessment's or review's result give its work fresh tries.
+/// candidate taking or losing it as its root makes. A test rests on the assessment and its
+/// candidate's test records, which name it alone and bear on nothing else, and is edited by what
+/// it demonstrates changing: a verdict of another value, or the candidate's chain or actions,
+/// which evidence moves only on a premise of its chain, carried as standing; evidence on the
+/// candidate, its flaws or its paths changes neither. The proposals disputing a settle's,
+/// chain's or review's result give its work fresh tries.
 fn role(phase: Phase, kind: EventKind, effect: EventEffect) -> Option<BearingRole> {
     use {BearingRole as R, EventEffect as E, EventKind as K, Phase as P};
     match (phase, kind, effect) {
         (P::Test, K::Tested, _) => Some(R::Rests),
         (_, K::Tested, _) => None,
         (P::Settle | P::Chain, K::Status, E::Disputes)
-        | (P::Assess, K::Assessed, E::Disputes)
-        | (P::Review, K::Verdict, E::Disputes) => Some(R::Disputes),
+        | (P::Review, K::Assessed | K::Verdict, E::Disputes) => Some(R::Disputes),
         (_, _, E::Disputes) => None,
         (P::Test, K::Assessed, E::Standing) => Some(R::Rests),
-        (P::Test, K::Evidence, E::Changed) | (P::Assess, _, E::Standing) => None,
+        (P::Test, K::Evidence, E::Changed) => None,
         (P::Test, _, E::Standing | E::Changed) => Some(R::Edits),
         // A chain also rests on the chain edits it joins or leaves.
         (P::Chain, K::Edited, E::Concerns) => Some(R::Rests),
@@ -116,8 +115,21 @@ macro_rules! bearing {
                 " JOIN interface_location pi ON pi.location=ps.location),1)"
             ))
     };
+    // A check also rests on the premises its clearing relies on, each with the premises merged
+    // into it, whose evidence it carries: one decided failing, or contradicting evidence on one,
+    // owes it again; one decided holding, or a merge itself, does not.
     (@arms "check", $n:expr, $then:ident) => {
-        $crate::store::bearing::bearing!(@$then "check", $n)
+        $crate::store::bearing::bearing!(@$then "check", $n;
+            each concat!(
+                "SELECT premise AS node FROM state_premise WHERE state=",
+                $n,
+                " UNION ALL SELECT pm.id FROM state_premise sp JOIN node pm ON \
+                 pm.merged_into=sp.premise WHERE sp.state=",
+                $n
+            ),
+                "en.effect='changed' AND (en.kind='evidence' OR EXISTS (SELECT 1 FROM \
+                 premise_decision ef WHERE ef.event=en.event AND ef.premise=en.node AND \
+                 ef.status='fails'))")
     };
     // A settle also rests on the decisions and disputes of the premises it rests on.
     (@arms "settle", $n:expr, $then:ident) => {
@@ -138,13 +150,29 @@ macro_rules! bearing {
             each concat!("SELECT candidate AS node FROM candidate_flaw WHERE flaw=", $n),
                 "en.effect='standing' AND en.kind='verdict'";
             each concat!("SELECT state AS node FROM flaw_state WHERE flaw=", $n),
-                "en.effect='standing' AND en.kind IN ('linked','unlinked')")
+                $crate::store::bearing::bearing!(@accesses))
     };
-    (@arms "assess", $n:expr, $then:ident) => {
-        $crate::store::bearing::bearing!(@$then "assess", $n)
-    };
+    // A review also rests on the accesses recorded or removed of the states its flaws touch:
+    // those they leave wrong, and those its paths read where one sits, in its function, or at its
+    // location when it names none. An access of any other state on its paths does not bear on it.
     (@arms "review", $n:expr, $then:ident) => {
-        $crate::store::bearing::bearing!(@$then "review", $n)
+        $crate::store::bearing::bearing!(@$then "review", $n;
+            each concat!(
+                "SELECT fs.state AS node FROM candidate_flaw rf JOIN flaw_state fs ON \
+                 fs.flaw=rf.flaw WHERE rf.candidate=",
+                $n,
+                " UNION SELECT ps.state FROM candidate_flaw rf JOIN flaw rl ON rl.node=rf.flaw \
+                 JOIN candidate_action ra ON ra.candidate=rf.candidate JOIN path_state ps ON \
+                 ps.path=ra.path AND ps.access='read' LEFT JOIN code_location fc ON \
+                 fc.location=rl.location LEFT JOIN code_location pc ON pc.location=ps.location \
+                 WHERE rf.candidate=",
+                $n,
+                " AND (ps.location=rl.location OR (pc.file=fc.file AND pc.function=fc.function))"
+            ),
+                $crate::store::bearing::bearing!(@accesses))
+    };
+    (@accesses) => {
+        "en.effect='standing' AND en.kind IN ('linked','unlinked')"
     };
     // A test also rests on the environments for its candidate, which a merge into it moves to
     // it, or for any.
@@ -625,14 +653,24 @@ pub(super) use retirement;
 
 /// The latest material edit of node `$n`, a merge into it included, but those made within a
 /// task of `$phase`, which decides it, and the merge retiring it, which leaves its standing as
-/// it stood.
+/// it stood. `own` keeps a candidate's own edits and merges alone: those changing no flaw or
+/// path, the only nodes that carry a change to a candidate.
 macro_rules! edited {
     ($phase:tt, $n:expr) => {
+        $crate::store::bearing::edited!(@ $phase, $n, "")
+    };
+    (own $phase:tt, $n:expr) => {
+        $crate::store::bearing::edited!(@ $phase, $n,
+            " AND NOT EXISTS (SELECT 1 FROM event_node oc JOIN node ok ON ok.id=oc.node WHERE \
+             oc.event=eb.event AND oc.effect='changed' AND ok.kind IN ('flaw','path'))")
+    };
+    (@ $phase:tt, $n:expr, $own:expr) => {
         concat!(
             "(SELECT eb.event FROM ",
             $crate::store::bearing::bearing!(@stored $phase, $n),
             " AND eb.role='edits' AND eb.event IS NOT ",
             $crate::store::bearing::retirement!($n),
+            $own,
             " ORDER BY eb.event DESC LIMIT 1)"
         )
     };
@@ -755,9 +793,9 @@ SELECT s.*,",
             $crate::store::bearing::owned!("flaw_judgement", "flaw", "f.node"),
             ") s;
 
--- Each candidate's standing assessment and verdict, the latest recorded within assess and
--- review work on it, and the latest of each recorded since elsewhere that differs and that work
--- has not answered: a proposal its phase decides.
+-- Each candidate's standing assessment and verdict, the latest recorded within review work on
+-- it, and the latest of each recorded since elsewhere that differs and that work has not
+-- answered: a proposal its review decides.
 CREATE VIEW candidate_result AS
 SELECT c.node AS candidate,a.event AS assessed,a.vector,a.severity,",
             $crate::store::bearing::proposed!(
@@ -767,7 +805,7 @@ SELECT c.node AS candidate,a.event AS assessed,a.vector,a.severity,",
                 "a.event",
                 "vector",
                 "a.vector",
-                "assess"
+                "review"
             ),
             " AS assessment_proposed,v.event AS reviewed,v.verdict,",
             $crate::store::bearing::proposed!(
@@ -785,11 +823,12 @@ SELECT c.node AS candidate,a.event AS assessed,a.vector,a.severity,",
             $crate::store::bearing::owned!("candidate_verdict", "candidate", "c.node"),
             ";
 
--- Each candidate's results judged against what they rest on. A result is current while no
--- event of its phase's bearing but a proposal disputing it came after what it stands on; a
--- verdict also only while the standings it claims hold: validated, no premise of its chain
--- undecided or failing and no chain flaw refuted; disproved, a code premise failing or a chain
--- flaw refuted; excluded, a deployment premise failing; unproven, a premise undecided.
+-- Each candidate's results judged against what they rest on. An assessment is current while no
+-- edit or merge of the candidate itself came after what it stands on: what it says, not what it
+-- rests on. A verdict is current while no event of its review's bearing but a proposal
+-- disputing it did, and only while the standings it claims hold: validated, no premise of its
+-- chain undecided or failing and no chain flaw refuted; disproved, a code premise failing or a
+-- chain flaw refuted; excluded, a deployment premise failing; unproven, a premise undecided.
 CREATE VIEW candidate_core AS
 SELECT b.*,b.assessed_current AND b.reviewed_current AND ifnull(b.verdict='validated',0) AS upheld
 FROM (SELECT g.*,g.reviewed_at_basis AND CASE g.verdict WHEN 'validated' THEN NOT (g.undecided OR
@@ -801,10 +840,10 @@ SELECT c.candidate,n.merged_into,r.root,c.severity,k.rank,
     k.rank>=(SELECT t.rank FROM run JOIN severity_kind t ON t.name=run.threshold) AS shortlisted,
     c.vector,c.assessed,c.assessment_proposed,
     ifnull(",
-            $crate::store::bearing::stamp!("assess", "c.assessed", "c.candidate"),
-            ">=",
-            $crate::store::bearing::basis!(rested "assess", "c.candidate"),
-            ",0) AS assessed_current,
+            $crate::store::bearing::stamp!("review", "c.assessed", "c.candidate"),
+            ">=ifnull(",
+            $crate::store::bearing::edited!(own "review", "c.candidate"),
+            ",0),0) AS assessed_current,
     c.verdict,c.reviewed,c.verdict_proposed,
     ifnull(",
             $crate::store::bearing::stamp!("review", "c.reviewed", "c.candidate"),
@@ -880,7 +919,6 @@ pub(super) const fn lookup(phase: super::Phase) -> &'static str {
         Phase::Check => lookup!("check"),
         Phase::Settle => lookup!("settle"),
         Phase::Chain => lookup!("chain"),
-        Phase::Assess => lookup!("assess"),
         Phase::Review => lookup!("review"),
         Phase::Test => lookup!("test"),
         Phase::Report => lookup!("report"),

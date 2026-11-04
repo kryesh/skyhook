@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(
             (stale("assessed"), stale("verdict")),
             (false, true),
-            "a premise linked since stales the verdict alone"
+            "a premise linked since stales the review's verdict, not its assessment"
         );
         let flaws = section(&blocks, Shelf::Nodes(NodeKind::Flaw));
         assert_eq!(flaws.total, 2);

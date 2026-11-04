@@ -288,6 +288,12 @@ pub(super) fn state(db: &Db, head: Head) -> Result<StateView> {
             })
         },
     )?;
+    let rests_on = rows(
+        db,
+        premise_refs!("state_premise x", "x.state=?1"),
+        params![id],
+        premise_ref,
+    )?;
     let check = optional(
         db,
         concat!(
@@ -301,6 +307,7 @@ pub(super) fn state(db: &Db, head: Head) -> Result<StateView> {
                 event: EventId(row.get(0)?),
                 note: row.get(1)?,
                 current: row.get(2)?,
+                rests_on,
             })
         },
     )?;
@@ -397,28 +404,31 @@ fn scored(row: &Row) -> Result<Scored> {
     })
 }
 
-/// Node `node`'s proposal of the result `phase` records on it, if it carries one.
+/// Node `node`'s proposals of the results `phase` records on it.
 pub(in crate::store) fn proposed(
     db: &Db,
     session: SessionId,
     phase: Phase,
     node: NodeId,
-) -> Result<Option<Proposal<Proposed>>> {
-    match phase {
-        Phase::Settle => proposal(db, session, PREMISE_PROPOSAL, node, |row| {
+) -> Result<Vec<Proposal<Proposed>>> {
+    let found = match phase {
+        Phase::Settle => vec![proposal(db, session, PREMISE_PROPOSAL, node, |row| {
             Ok(Proposed::Premise(enum_column(row, 3)?))
-        }),
-        Phase::Chain => proposal(db, session, FLAW_PROPOSAL, node, |row| {
+        })?],
+        Phase::Chain => vec![proposal(db, session, FLAW_PROPOSAL, node, |row| {
             Ok(Proposed::Flaw(enum_column(row, 3)?))
-        }),
-        Phase::Assess => proposal(db, session, ASSESSMENT_PROPOSAL, node, |row| {
-            Ok(Proposed::Assessment(scored(row)?))
-        }),
-        Phase::Review => proposal(db, session, VERDICT_PROPOSAL, node, |row| {
-            Ok(Proposed::Verdict(enum_column(row, 3)?))
-        }),
-        Phase::Sweep | Phase::Probe | Phase::Check | Phase::Test | Phase::Report => Ok(None),
-    }
+        })?],
+        Phase::Review => vec![
+            proposal(db, session, ASSESSMENT_PROPOSAL, node, |row| {
+                Ok(Proposed::Assessment(scored(row)?))
+            })?,
+            proposal(db, session, VERDICT_PROPOSAL, node, |row| {
+                Ok(Proposed::Verdict(enum_column(row, 3)?))
+            })?,
+        ],
+        Phase::Sweep | Phase::Probe | Phase::Check | Phase::Test | Phase::Report => Vec::new(),
+    };
+    Ok(found.into_iter().flatten().collect())
 }
 
 pub(super) fn premise(db: &Db, session: SessionId, head: Head) -> Result<PremiseView> {
@@ -462,6 +472,13 @@ pub(super) fn premise(db: &Db, session: SessionId, head: Head) -> Result<Premise
         paths: rows(
             db,
             "SELECT n.id,n.title FROM path_premise x JOIN node n ON n.id=x.path WHERE \
+             x.premise=?1 ORDER BY n.id",
+            params![id],
+            ref_row,
+        )?,
+        states: rows(
+            db,
+            "SELECT n.id,n.title FROM state_premise x JOIN node n ON n.id=x.state WHERE \
              x.premise=?1 ORDER BY n.id",
             params![id],
             ref_row,

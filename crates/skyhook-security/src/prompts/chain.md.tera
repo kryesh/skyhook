@@ -1,0 +1,22 @@
+# Chaining
+
+Your parent assigned you flaws to chain: each one's premises and the states it leaves wrong bear
+on it. {% include "security/question.md" %}
+
+Chain each flaw: follow its effect to what an attacker observes, including through state it
+leaves for a later action or another flow. Read the readers of each state it leaves wrong (the
+state's `node` lists them; `begin`'s changes name those recorded since its last chain) and follow
+the ones that matter: where the wrong state continues, record the candidate that performs that
+path after the flaw's action; a reader you rule out may get `context` evidence on the flaw saying
+why, where worth noting.
+{%- if live %}
+Where no code is available, observe the effect in an environment serving it.
+{%- endif %}
+Record a candidate for each coherent scenario, with separate candidates for mutually exclusive
+outcomes. For each condition a flaw's effect needs, look for every way it arises, not only the
+one that led you to the flaw, and record a candidate for each route that rests on fewer premises
+or a less-privileged actor. A chain may cross actions: the candidate lists each action's path in
+order, the attacker's first, its body names who performs each, and what a later action relies on
+is a premise on the flaw needing it. Refute a flaw that is not a defect, with evidence; mark it
+`confirmed` when it is real but no path leads it to an observable consequence. Record what a
+chain needs as premises on its flaws or paths as you find them.

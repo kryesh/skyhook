@@ -9,13 +9,13 @@ CI job. It runs from the target's first code that touches the input (its own nor
 framing or routing included) through every stage that handles it (authentication, decoding,
 validation, the logic behind them) until nothing the input influences is used further: the
 response, side effects, and state written for later readers. A stage an entry calls, such as
-an auth check, a decoder or a helper, is a step of that entry's path, not an entry of its own,
+an auth check, a validator or a helper, is a step of that entry's path, not an entry of its own,
 unless an actor reaches it directly too. Never record a trust class or ingress family as one
 path: "all authenticated requests" hides every scenario behind it.
 
 An input state is one input an actor controls, defined at the stage that takes it in, trusted as
 the least-privileged actor able to supply it there: a credential read by authentication, a body
-read by a decoder, a parameter read by a handler. It is read on every path whose flow reaches
+read by a deserializer, a parameter read by a handler. It is read on every path whose flow reaches
 that stage. Consider network input, stdin or another process's output, files, environment
 variables, IPC, arguments, plugins, queues, configuration read at startup and CI jobs others can
 trigger; a trusted-looking file or upstream service is not necessarily a trusted origin. State

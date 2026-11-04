@@ -226,12 +226,12 @@ fn basis_ends(db: &Db, premise: PremiseId, rests_on: PremiseId) -> Result<(Premi
     Ok((premise, rests_on))
 }
 
-/// How an access recorded or removed bears on its path and state: the path's standing moves,
-/// and the state's check alone; restated, it only concerns them.
+/// How an access recorded or removed bears on its path and state: it moves their own work
+/// alone, and the work reading the state's accesses; restated, it only concerns them.
 fn accessed(marks: &mut Marks, edited: bool, path: PathId, state: StateId) {
     match edited {
         true => {
-            marks.mark(path, EventEffect::Standing);
+            marks.alone(path);
             marks.alone(state);
         }
         false => {
@@ -446,7 +446,7 @@ fn rechain(db: &Db, event: EventId, from: FlawId, into: FlawId, marks: &mut Mark
 /// Fold live duplicate `from` into survivor `into`, both of `kind`: every edge naming it names
 /// the survivor, marking the nodes at their other ends. A finding is not merged. A merged input
 /// state gives up its trust and location, so its location is free for a live one, and a merged
-/// state its check. A merged path keeps its steps as history, the survivor's standing for the
+/// state its check with the premises it rests on. A merged path keeps its steps as history, the survivor's standing for the
 /// flow, and its states' accesses move to the survivor, moving their checks. A merged candidate
 /// keeps its chain, actions, tests and verdict as history, and leaves its root's group as a
 /// candidate losing its root does; the survivor performs, after its own actions, each of the
@@ -478,6 +478,7 @@ fn fold(
             repoint(db, &edges, from, into, marks)?;
             for sql in [
                 "DELETE FROM input_state WHERE state=?1",
+                "DELETE FROM state_premise WHERE state=?1",
                 "DELETE FROM state_check WHERE state=?1",
             ] {
                 db.execute(sql, params![from])?;
@@ -497,6 +498,7 @@ fn fold(
             let edges = [
                 repoint!("flaw_premise", "premise", "flaw", duplicates),
                 repoint!("path_premise", "premise", "path", duplicates),
+                repoint!("state_premise", "premise", "NULL", duplicates),
                 repoint!("premise_basis", "premise", "rests_on", duplicates),
                 repoint!("premise_basis", "rests_on", "premise", duplicates),
             ];
@@ -963,7 +965,6 @@ mod tests {
 
         let [last, four] = ["three", "four"].map(|name| scenario(&store, &actor, name).candidate);
         let (settler, settle, _) = begun(&store, &Begin::Settle(vec![first]));
-        let (assessor, assessment, _) = begun(&store, &Begin::Assess(vec![two.candidate]));
         let (reviewer, review, _) = begun(&store, &Begin::Review(vec![two.candidate]));
         let merge = |premise: PremiseId,
                      into: PremiseId,
@@ -991,7 +992,7 @@ mod tests {
         store.set_status(&settler, holds, &text("traced")).unwrap();
         let vector = HIGH.parse().unwrap();
         store
-            .assess(&assessor, two.candidate, vector, &text("scored"))
+            .assess(&reviewer, two.candidate, vector, &text("scored"))
             .unwrap();
         store
             .verdict(
@@ -1001,9 +1002,7 @@ mod tests {
                 &text("reviewed"),
             )
             .unwrap();
-        for job in [assessment, review] {
-            end_job(&store, job);
-        }
+        end_job(&store, review);
         merge(kept, survivor, last, four);
         let holds = StatusChange::Premise(first, PremiseStatus::Holds);
         store.set_status(&settler, holds, &text("traced")).unwrap();
@@ -1027,7 +1026,6 @@ mod tests {
             scenario(&store, &actor, "two"),
         );
         let other = flaw(&store, &actor, one.component);
-        let (assessor, _, _) = begun(&store, &Begin::Assess(vec![one.candidate]));
         let (reviewer, _, _) = begun(&store, &Begin::Review(vec![one.candidate]));
         let note = text("duplicate");
         let merges = [
@@ -1047,7 +1045,7 @@ mod tests {
         }
         let vector = HIGH.parse().unwrap();
         store
-            .assess(&assessor, one.candidate, vector, &text("scored"))
+            .assess(&reviewer, one.candidate, vector, &text("scored"))
             .unwrap();
         store
             .verdict(

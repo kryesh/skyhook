@@ -1,5 +1,6 @@
 //! Work each phase owes, derived from the graph: paths owing a sweep or a probe, states a check
-//! across calls, premises a settling look, flaws a chain, candidates an assessment, a review or a test, and root flaws a report.
+//! across calls, premises a settling look, flaws a chain, candidates a review or a test, and root
+//! flaws a report.
 //! A subject is offered while it owes the phase, no task of it is live, and fewer than two of
 //! its tasks began at its current basis, the latest event of the phase's `bearing` on it; once
 //! two did and none is live it is exhausted until the basis moves, as is work the scheduler
@@ -185,7 +186,6 @@ const fn sql(phase: Phase) -> Sql {
         Phase::Check => CHECK,
         Phase::Settle => SETTLE,
         Phase::Chain => CHAIN,
-        Phase::Assess => ASSESS,
         Phase::Review => REVIEW,
         Phase::Test => TEST,
         Phase::Report => REPORT,
@@ -434,7 +434,7 @@ pub(super) mod tests {
     use super::{
         super::tests::{
             HIGH, NONE, Step, assess, begun, child_of, decide, end_job, fixture, last_event, marks,
-            plan, premise, scenario, sweep, test, text, verdict,
+            plan, premise, reword, scenario, sweep, test, text, verdict,
         },
         *,
     };
@@ -483,8 +483,8 @@ pub(super) mod tests {
     }
 
     /// Spent work is exhausted only in its phase and at the basis it was spent on, and holds
-    /// back nothing: a spent sweep releases the assessment waiting on it, a spent assessment is
-    /// offered again once its candidate changes, and once settled releases the review.
+    /// back nothing: a spent sweep releases the review waiting on it, a spent review is offered
+    /// again once its candidate changes, and once settled releases the test.
     #[test]
     fn spent_work_is_exhausted_only_at_its_basis() {
         let (_session, store, actor) = fixture();
@@ -508,39 +508,34 @@ pub(super) mod tests {
             (sweep.phase, sweep.node),
             (Phase::Sweep, scenario.path.into())
         );
-        let [assess] = started(&[sweep])[..] else {
-            panic!("the spent sweep releases the assessment")
+        let [review] = started(&[sweep])[..] else {
+            panic!("the spent sweep releases the review")
         };
         assert_eq!(
-            (assess.phase, assess.node),
-            (Phase::Assess, scenario.candidate.into())
+            (review.phase, review.node),
+            (Phase::Review, scenario.candidate.into())
         );
-        assert!(started(&[sweep, assess]).is_empty());
-        let exhausted = store.synthesis(&[sweep, assess]).unwrap().exhausted;
+        assert!(started(&[sweep, review]).is_empty());
+        let exhausted = store.synthesis(&[sweep, review]).unwrap().exhausted;
         assert_eq!(
             exhausted
                 .iter()
                 .map(|entry| (entry.phase, entry.node))
                 .collect::<Vec<_>>(),
-            [(Phase::Sweep, sweep.node), (Phase::Assess, assess.node)]
+            [(Phase::Sweep, sweep.node), (Phase::Review, review.node)]
         );
-        let edit = Edit {
-            title: None,
-            body: Some(text("narrower than stated")),
-            detail: CandidateEdit::default(),
+        reword(&store, &actor, scenario.candidate, "narrower than stated");
+        let [moved] = started(&[sweep, review])[..] else {
+            panic!("the changed candidate's review is offered")
         };
-        let change = Upsert::Candidate(Change::Edit(scenario.candidate, edit));
-        store.upsert(&actor, &change).unwrap();
-        let [moved] = started(&[sweep, assess])[..] else {
-            panic!("the changed candidate's assessment is offered")
-        };
-        assert_eq!((moved.phase, moved.node), (Phase::Assess, assess.node));
-        assert!(moved.basis > assess.basis);
-        crate::store::tests::assess(&store, scenario.candidate, HIGH);
-        let [review] = started(&[sweep, moved])[..] else {
+        assert_eq!((moved.phase, moved.node), (Phase::Review, review.node));
+        assert!(moved.basis > review.basis);
+        assess(&store, scenario.candidate, HIGH);
+        verdict(&store, scenario.candidate, Verdict::Validated);
+        let [test] = started(&[sweep, moved])[..] else {
             panic!("work settled at the basis it was spent on releases its next phase")
         };
-        assert_eq!((review.phase, review.node), (Phase::Review, assess.node));
+        assert_eq!((test.phase, test.node), (Phase::Test, review.node));
         let exhausted = store.synthesis(&[sweep, moved]).unwrap().exhausted;
         assert_eq!(
             (exhausted.iter())
@@ -551,22 +546,29 @@ pub(super) mod tests {
     }
 
     /// What a review, and a child it launches that begins a review of its own, records of the
-    /// results other phases own only proposes them: a premise it fails reads undecided and owes
-    /// its settle, a flaw it refutes stays suspected on a live candidate, its disproval does not
-    /// stand while what it claims does not, and its reassessment owes an assessment while the
-    /// candidate keeps its standing one. Once a settle fails the premise, the review is owed
-    /// again and its disproval stands. A new differing proposal owes the assessment afresh,
-    /// however many assessments decided earlier ones.
+    /// results other phases own only proposes them, but for the code premises of its
+    /// candidates' chains, which it decides: a premise of its flaw it fails and one of its path
+    /// it holds stand and owe no settle, while one on no chain it reviews reads undecided with
+    /// the proposal; a flaw it refutes stays suspected on a live candidate, and its disproval
+    /// stands on the failing premise. Its own assessment stands: scored below the threshold, the
+    /// candidate keeps the verdict and owes no review, and scored above it its disproval stands.
+    /// An assessment recorded outside a review is a proposal, which owes the review again.
     #[test]
     fn a_reviews_decisions_outside_their_phases_are_proposals() {
         let (_session, store, actor) = fixture();
         let decoder = scenario(&store, &actor, "decoder");
         let (candidate, flaw) = (decoder.candidate, decoder.flaw);
         sweep(&store, decoder.path);
-        let premise = premise(&store, &actor, PremiseScope::Code);
-        store
-            .link(&actor, &[Link::FlawPremise { flaw, premise }])
-            .unwrap();
+        let [premise, on_path, loose] =
+            [(); 3].map(|_| premise(&store, &actor, PremiseScope::Code));
+        let links = [
+            Link::FlawPremise { flaw, premise },
+            Link::PathPremise {
+                path: decoder.path,
+                premise: on_path,
+            },
+        ];
+        store.link(&actor, &links).unwrap();
         assess(&store, candidate, HIGH);
 
         let (reviewer, review, _) = begun(&store, &Begin::Review(vec![candidate]));
@@ -574,10 +576,13 @@ pub(super) mod tests {
         store
             .begin(&child, &Begin::Review(vec![candidate]))
             .unwrap();
-        let fails = StatusChange::Premise(premise, PremiseStatus::Fails);
-        store
-            .set_status(&child, fails, &text("an exhaustive audit"))
-            .unwrap();
+        let decide = |agent: &AgentId, premise, status| {
+            let change = StatusChange::Premise(premise, status);
+            store.set_status(agent, change, &text("read")).unwrap();
+        };
+        decide(&child, premise, PremiseStatus::Fails);
+        decide(&reviewer, on_path, PremiseStatus::Holds);
+        decide(&reviewer, loose, PremiseStatus::Holds);
         let refuted = StatusChange::Flaw(flaw, FlawStatus::Refuted);
         store
             .set_status(&reviewer, refuted, &text("the premise fails"))
@@ -593,42 +598,38 @@ pub(super) mod tests {
             end_job(&store, job);
         }
 
-        let NodeView::Premise(view) = store.node(premise.into()).unwrap() else {
-            panic!("a premise")
+        let decided = |premise: PremiseId| {
+            let NodeView::Premise(view) = store.node(premise.into()).unwrap() else {
+                panic!("a premise")
+            };
+            (view.status, view.proposed.map(|proposed| proposed.agent))
         };
-        let proposed = view.proposed.expect("the child's decision is proposed");
         assert_eq!(
-            (view.status, proposed.value, &proposed.agent),
-            (PremiseStatus::Undecided, PremiseStatus::Fails, &child)
+            [premise, on_path, loose].map(decided),
+            [
+                (PremiseStatus::Fails, None),
+                (PremiseStatus::Holds, None),
+                (PremiseStatus::Undecided, Some(reviewer)),
+            ]
         );
+        assert!(queued(&store, Phase::Settle).is_empty());
         let NodeView::Flaw(view) = store.node(flaw.into()).unwrap() else {
             panic!("a flaw")
         };
         assert_eq!(view.status, FlawStatus::Suspected);
-        assert_eq!(queued(&store, Phase::Settle), [NodeId::from(premise)]);
         assert_eq!(queued(&store, Phase::Chain), [NodeId::from(flaw)]);
         let NodeView::Candidate(view) = store.node(candidate.into()).unwrap() else {
             panic!("a candidate")
         };
+        let assessment = view.assessment.unwrap();
         assert_eq!(
-            (view.status, view.assessment.unwrap().severity),
-            (Status::Shortlisted, Severity::Critical)
+            (view.status, assessment.severity, assessment.current),
+            (Status::BelowThreshold, Severity::None, true)
         );
-        assert_eq!(
-            view.proposed_assessment.unwrap().value.severity,
-            Severity::None
-        );
-        assert_eq!(queued(&store, Phase::Assess), [NodeId::from(candidate)]);
-
-        decide(&store, premise, PremiseStatus::Fails);
-        let NodeView::Premise(view) = store.node(premise.into()).unwrap() else {
-            panic!("a premise")
-        };
-        assert_eq!(view.status, PremiseStatus::Fails);
-        assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 1);
+        assert!(view.verdict.is_some() && view.proposed_assessment.is_none());
+        assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 0);
         assess(&store, candidate, HIGH);
-        assert_eq!(queued(&store, Phase::Review), [NodeId::from(candidate)]);
-        verdict(&store, candidate, Verdict::Disproved);
+        assert!(queued(&store, Phase::Review).is_empty());
         assert_eq!(status(&store, candidate), Status::Disproved);
 
         let lower = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N";
@@ -639,8 +640,12 @@ pub(super) mod tests {
             marks(&store, last_event(&store)),
             [(candidate.into(), EventEffect::Disputes)]
         );
-        assert_eq!(status(&store, candidate), Status::Disproved);
-        assert_eq!(queued(&store, Phase::Assess), [NodeId::from(candidate)]);
+        let NodeView::Candidate(view) = store.node(candidate.into()).unwrap() else {
+            panic!("a candidate")
+        };
+        assert_eq!(view.status, Status::Disproved);
+        assert!(view.proposed_assessment.is_some());
+        assert_eq!(queued(&store, Phase::Review), [NodeId::from(candidate)]);
     }
 
     /// What a phase's tasks on a subject record, by their agents or those beneath them, never

@@ -876,8 +876,8 @@ fn apply<I: KindId, N: Detail, E: DetailEdit>(
     }
 }
 
-/// A code premise is decided within its settle; a deployment premise, the user's to answer,
-/// outside every task.
+/// A code premise is decided within its settle, or within the review of a candidate whose
+/// chain rests on it; a deployment premise, the user's to answer, outside every task.
 const PREMISE: Standing = standing_of!(
     "premise_standing",
     "node",
@@ -886,7 +886,11 @@ const PREMISE: Standing = standing_of!(
     concat!(
         "CASE (SELECT scope FROM premise WHERE node=?1) WHEN 'code' THEN ",
         crate::store::bearing::owns!("settle", "?2", "?1"),
-        " ELSE NOT EXISTS (SELECT 1 FROM event_task WHERE event=?2) END"
+        " OR EXISTS (SELECT 1 FROM (",
+        crate::store::bearing::premise_candidates!("?1"),
+        ") rc WHERE ",
+        crate::store::bearing::owns!("review", "?2", "rc.candidate"),
+        ") ELSE NOT EXISTS (SELECT 1 FROM event_task WHERE event=?2) END"
     ),
     Changed
 );
@@ -901,7 +905,7 @@ const FLAW: Standing = standing_of!(
 
 /// A status set: a premise decided, a flaw judged, a path marked swept or unswept, a state
 /// checked, or a state, path or component retracted or restored.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum StatusChange {
     Premise(PremiseId, PremiseStatus),
     Flaw(FlawId, FlawStatus),
@@ -910,25 +914,42 @@ pub enum StatusChange {
     Component(ComponentId, InventoryStatus),
 }
 
-/// What marking a state records: its check across calls done, or its inventory status.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What marking a state records: its check across calls done, resting on the premises its
+/// clearing relies on, or its inventory status.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateMark {
-    Checked,
+    Checked { rests_on: Premises },
     Inventory(InventoryStatus),
 }
 
-impl From<StateStatus> for StateMark {
-    fn from(status: StateStatus) -> Self {
-        match status {
-            StateStatus::Checked => Self::Checked,
-            StateStatus::Recorded => Self::Inventory(InventoryStatus::Recorded),
-            StateStatus::Retracted => Self::Inventory(InventoryStatus::Retracted),
-        }
+/// The premises a check's clearing rests on: at least one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+// Read through `Option` so that a missing list is refused with the empty one's guidance.
+#[serde(try_from = "Option<Vec<PremiseId>>")]
+#[schemars(extend("minItems" = 1))]
+pub struct Premises(Vec<PremiseId>);
+
+impl TryFrom<Option<Vec<PremiseId>>> for Premises {
+    type Error = Error;
+
+    fn try_from(premises: Option<Vec<PremiseId>>) -> Result<Self> {
+        (premises.filter(|premises| !premises.is_empty()))
+            .map(Self)
+            .ok_or(Error::Unrested)
+    }
+}
+
+impl IntoIterator for Premises {
+    type Item = PremiseId;
+    type IntoIter = std::vec::IntoIter<PremiseId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 
 /// A node of its kind and the status it takes.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StatusRecord {
     Premise {
@@ -943,13 +964,29 @@ pub enum StatusRecord {
         id: PathId,
         status: PathStatus,
     },
-    State {
-        id: StateId,
-        status: StateStatus,
-    },
+    /// By its `status`.
+    State(StateRecord),
     Component {
         id: ComponentId,
         status: InventoryStatus,
+    },
+}
+
+/// A state marked by its `status`.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateRecord {
+    Checked {
+        id: StateId,
+        /// At least one premise its clearing rests on: a recorded one, or a general claim the
+        /// recorded accesses do not show.
+        rests_on: Premises,
+    },
+    Recorded {
+        id: StateId,
+    },
+    Retracted {
+        id: StateId,
     },
 }
 
@@ -959,7 +996,15 @@ impl From<StatusRecord> for StatusChange {
             StatusRecord::Premise { id, status } => Self::Premise(id, status),
             StatusRecord::Flaw { id, status } => Self::Flaw(id, status),
             StatusRecord::Path { id, status } => Self::Path(id, status),
-            StatusRecord::State { id, status } => Self::State(id, status.into()),
+            StatusRecord::State(StateRecord::Checked { id, rests_on }) => {
+                Self::State(id, StateMark::Checked { rests_on })
+            }
+            StatusRecord::State(StateRecord::Recorded { id }) => {
+                Self::State(id, StateMark::Inventory(InventoryStatus::Recorded))
+            }
+            StatusRecord::State(StateRecord::Retracted { id }) => {
+                Self::State(id, StateMark::Inventory(InventoryStatus::Retracted))
+            }
             StatusRecord::Component { id, status } => Self::Component(id, status),
         }
     }
@@ -992,7 +1037,8 @@ impl Store {
     /// restored path is offered its sweep again. A path retracted or restored also moves the standing of the candidates
     /// performing it, whose chains gain or lose the premises it relies on, and the checks of the
     /// states it accesses, which gain or lose its accesses. A state marked checked records this
-    /// event as its check, kept only by an instance or handed state.
+    /// event as its check, kept only by an instance or handed state, beside the premises it rests
+    /// on, which it only concerns.
     pub fn set_status(&self, actor: &AgentId, change: StatusChange, note: &Text) -> Result<()> {
         self.write(|db| {
             audit(db, actor, EventKind::Status, Some(note), |event| {
@@ -1028,12 +1074,19 @@ impl Store {
                             false => marks.alone(node),
                         }
                     }
-                    StatusChange::State(id, StateMark::Checked) => {
+                    StatusChange::State(id, StateMark::Checked { rests_on }) => {
                         let node = live(db, id)?;
                         let sql = "INSERT INTO state_check(state,scope,event) SELECT node,scope,?2 FROM state \
                                    WHERE node=?1 AND scope IN ('instance','handed') ON \
                                    CONFLICT(state) DO UPDATE SET event=excluded.event";
                         db.execute(sql, params![node, event])?;
+                        for premise in rests_on {
+                            let premise = live(db, premise)?;
+                            let sql = "INSERT INTO state_premise(state,premise) SELECT state,?2 \
+                                       FROM state_check WHERE state=?1 ON CONFLICT DO NOTHING";
+                            db.execute(sql, params![node, premise])?;
+                            marks.mark(premise, EventEffect::Concerns);
+                        }
                         marks.alone(node);
                     }
                     StatusChange::State(id, StateMark::Inventory(status)) => {

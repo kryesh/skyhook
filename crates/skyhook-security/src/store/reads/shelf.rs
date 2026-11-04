@@ -529,7 +529,7 @@ mod tests {
             scenario(&store, &actor, "a").candidate,
             scenario(&store, &actor, "b").candidate,
         );
-        let (_, _, task) = begun(&store, &Begin::Assess(vec![merged]));
+        let (_, _, task) = begun(&store, &Begin::Review(vec![merged]));
         let merge = Merge {
             node: merged.into(),
             into: kept.into(),

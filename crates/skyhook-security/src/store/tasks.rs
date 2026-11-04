@@ -31,7 +31,6 @@ pub enum Begin {
     Check(Vec<StateId>),
     Settle(Vec<PremiseId>),
     Chain(Vec<FlawId>),
-    Assess(Vec<CandidateId>),
     Review(Vec<CandidateId>),
     Test(Vec<CandidateId>),
     /// Root flaws.
@@ -46,7 +45,6 @@ impl Begin {
             Self::Check(_) => Phase::Check,
             Self::Settle(_) => Phase::Settle,
             Self::Chain(_) => Phase::Chain,
-            Self::Assess(_) => Phase::Assess,
             Self::Review(_) => Phase::Review,
             Self::Test(_) => Phase::Test,
             Self::Report(_) => Phase::Report,
@@ -62,7 +60,7 @@ impl Begin {
             Self::Check(ids) => nodes(ids),
             Self::Settle(ids) => nodes(ids),
             Self::Chain(ids) | Self::Report(ids) => nodes(ids),
-            Self::Assess(ids) | Self::Review(ids) | Self::Test(ids) => nodes(ids),
+            Self::Review(ids) | Self::Test(ids) => nodes(ids),
         }
     }
 }
@@ -212,11 +210,12 @@ pub(super) fn journal_job(id: i64) -> Result<JobId> {
     JobId::new(id as u64).map_err(|_| corrupt("invalid job id").into())
 }
 
-/// A begun task, with what changed of its subjects' work since each was last worked in its
-/// phase, and the results proposed for it to decide.
+/// A begun task, with the run's scope, what changed of its subjects' work since each was last
+/// worked in its phase, and the results proposed for it to decide.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Begun {
     pub task: TaskId,
+    pub scope: Scope,
     /// For each subject a task of this phase worked before, the events bearing on its work
     /// since that task's basis; nothing on a first visit.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -285,7 +284,7 @@ impl Store {
                         });
                     }
                 }
-                if let Some(proposal) = reads::proposed(db, session, phase, *node)? {
+                for proposal in reads::proposed(db, session, phase, *node)? {
                     proposals.push(SubjectProposal {
                         node: *node,
                         proposal,
@@ -323,6 +322,7 @@ impl Store {
                 Ok((
                     Begun {
                         task,
+                        scope: scope::scope(db)?,
                         changes: changed,
                         proposals,
                         premises,
@@ -426,8 +426,8 @@ mod tests {
 
     use super::{
         super::tests::{
-            HIGH, assess, begun, child_agent, end_job, fixture, last_event, premise, scenario,
-            state, text, within,
+            HIGH, NONE, assess, begun, child_agent, end_job, fixture, last_event, premise,
+            scenario, state, text, verdict, within,
         },
         *,
     };
@@ -449,10 +449,10 @@ mod tests {
         store.merge(&actor, &merge).unwrap();
         let merged = last_event(&store);
         assert_matches!(
-            store.begin(&actor, &Begin::Assess(vec![second.candidate])),
+            store.begin(&actor, &Begin::Review(vec![second.candidate])),
             Err(Error::TaskNeedsJob)
         );
-        let wrong = Begin::Assess(vec![CandidateId(second.flaw.0)]);
+        let wrong = Begin::Review(vec![CandidateId(second.flaw.0)]);
         let (child, _) = child_agent(&store, JobState::Running);
         assert_matches!(
             store.begin(&child, &wrong),
@@ -656,5 +656,28 @@ mod tests {
         let listed = |id: PremiseId| store.node(id.into()).unwrap().head().tasks.clone();
         assert_eq!(listed(c), tasks);
         assert_eq!(listed(b), [tasks[0]]);
+    }
+
+    /// A review begins with every result recorded outside reviews that it decides: an
+    /// assessment and a verdict proposed together are both listed.
+    #[test]
+    fn a_review_begins_with_its_assessment_and_verdict_proposals() {
+        let (_session, store, actor) = fixture();
+        let id = scenario(&store, &actor, "decoder").candidate;
+        assess(&store, id, HIGH);
+        verdict(&store, id, Verdict::Validated);
+        (store.assess(&actor, id, NONE.parse().unwrap(), &text("no impact"))).unwrap();
+        (store.verdict(&actor, id, Verdict::Disproved, &text("refuted"))).unwrap();
+        let (reviewer, _) = child_agent(&store, JobState::Running);
+        let begun = store.begin(&reviewer, &Begin::Review(vec![id])).unwrap();
+        assert_matches!(
+            (begun.proposals.iter())
+                .map(|subject| (subject.node, &subject.proposal.value))
+                .collect::<Vec<_>>()[..],
+            [
+                (a, Proposed::Assessment(Scored { vector, .. })),
+                (b, Proposed::Verdict(Verdict::Disproved)),
+            ] if a == id.into() && b == id.into() && vector == NONE
+        );
     }
 }

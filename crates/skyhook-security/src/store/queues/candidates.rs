@@ -1,33 +1,18 @@
-//! Candidate work: candidates owing an assessment, a review or a test.
+//! Candidate work: candidates owing a review or a test.
 
 use super::*;
 
-/// Candidate `$c` owes an assessment: it starts within the scope, and none stands at what it
-/// rests on, or one recorded since outside its work proposes another.
-macro_rules! assess_owed {
-    ($c:expr) => {
-        concat!(
-            "(NOT ",
-            $crate::store::scope::candidate_outside!($c),
-            " AND (SELECT NOT ak.assessed_current OR ak.assessment_proposed IS NOT NULL FROM \
-             candidate_core ak WHERE ak.candidate=",
-            $c,
-            "))"
-        )
-    };
-}
-pub(super) use assess_owed;
-
-/// Candidate `$c` owes a review: it starts within the scope, assessed at or above the
-/// threshold, with no verdict standing, or one recorded since outside its work proposing
-/// another.
+/// Candidate `$c` owes a review: it starts within the scope, and no assessment stands, or it is
+/// assessed at or above the threshold with no verdict standing; or a result recorded since
+/// outside its review proposes another. One assessed below the threshold needs no verdict.
 macro_rules! review_owed {
     ($c:expr) => {
         concat!(
             "(NOT ",
             $crate::store::scope::candidate_outside!($c),
-            " AND (SELECT vk.assessed_current AND vk.shortlisted AND (NOT vk.reviewed_current OR \
-             vk.verdict_proposed IS NOT NULL) FROM candidate_core vk WHERE vk.candidate=",
+            " AND (SELECT NOT vk.assessed_current OR vk.assessment_proposed IS NOT NULL OR \
+             (vk.shortlisted AND (NOT vk.reviewed_current OR vk.verdict_proposed IS NOT NULL)) \
+             FROM candidate_core vk WHERE vk.candidate=",
             $c,
             "))"
         )
@@ -220,27 +205,15 @@ macro_rules! structure_settled {
     };
 }
 
-pub(super) const ASSESS: Sql = phase_sql!(
-    "assess",
-    "candidate",
-    assess_owed!("n.id"),
-    structure_settled!("n.id"),
-    "NULL",
-    "NULL",
-    "NULL"
-);
-
-/// Ready once its assessment is not pending, and no premise of its chain is undecided while the
-/// user is asked it or a settling look at it is pending. Bundled by root group: a candidate goes
-/// with every ready one sharing its root flaw.
+/// Ready once the sweep or probe of no path it performs is pending, and no premise of its chain
+/// is undecided while the user is asked it or a settling look at it is pending. Bundled by root
+/// group: a candidate goes with every ready one sharing its root flaw.
 pub(super) const REVIEW: Sql = phase_sql!(
     "review",
     "candidate",
     review_owed!("n.id"),
     concat!(
         structure_settled!("n.id"),
-        " AND NOT ",
-        pending!("assess", "n.id", assess_owed!("n.id")),
         " AND NOT EXISTS (SELECT 1 FROM (",
         chain_premises!("n.id"),
         ") vp JOIN premise_standing vq ON vq.node=vp.premise WHERE vq.status='undecided' AND \
@@ -384,9 +357,9 @@ mod tests {
     use super::{
         super::{
             super::tests::{
-                HIGH, access, assess, begun, candidate, child_of, decide, end_job, fixture, judge,
-                location, path, premise, revalidate, scenario, state, sweep, test, text, validated,
-                verdict, within,
+                HIGH, NONE, access, assess, begun, candidate, child_of, decide, end_job, fixture,
+                location, path, premise, revalidate, reword, scenario, state, sweep, test, text,
+                validated, verdict, within,
             },
             tests::{exhaust, queued, status},
         },
@@ -395,15 +368,15 @@ mod tests {
 
     const LOCAL: &str = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N";
 
-    /// An assessment and a review each stand until what they judge changes: a flaw's edit
-    /// owes both, a premise linked to its flaw or decided only the review, and another path's
-    /// access of a state its path shares neither. A review waits on a pending settling look at
-    /// its chain's premises, released once that look is exhausted, and on an undecided
-    /// deployment premise, which the user is asked. Evidence a review records owes the
-    /// assessment again, and an assessment restating the standing one is current and owes no
-    /// review.
+    /// A review stands until what it judges changes: an edit of its flaw, its path or a state
+    /// that path accesses, or a premise linked to its flaw or decided owes it, as does an access
+    /// of a state its flaw leaves wrong or its path reads where the flaw sits, but not another
+    /// access on its path or of a state it shares. Only the candidate's own edit owes its
+    /// assessment; the rest owe its verdict alone. It
+    /// waits on a pending settling look at its chain's premises, released once that look is
+    /// exhausted, and on an undecided deployment premise, which the user is asked.
     #[test]
-    fn assessments_and_reviews_follow_what_they_judge() {
+    fn reviews_follow_what_they_judge() {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         let id = scenario.candidate;
@@ -411,23 +384,49 @@ mod tests {
         let at = location("decoder/lib.c", 3);
         let write = access(scenario.path, window, Access::Write, at.clone());
         store.link(&actor, &[write]).unwrap();
-        let owed = |phase| queued(&store, phase) == [NodeId::from(id)];
-        assert!(!owed(Phase::Assess), "its path's sweep comes first");
+        let owed = || queued(&store, Phase::Review) == [NodeId::from(id)];
+        assert!(!owed(), "its path's sweep comes first");
         sweep(&store, scenario.path);
-        assert!(owed(Phase::Assess));
+        assert!(owed());
         assess(&store, id, HIGH);
-        assert!(owed(Phase::Review));
+        assert!(owed(), "shortlisted, it owes a verdict");
         verdict(&store, id, Verdict::Validated);
-        assert!(!owed(Phase::Review));
+        assert!(!owed());
         let other = path(&store, &actor, "consumer", &[scenario.component]);
-        let read = access(other, window, Access::Read, at);
+        let read = access(other, window, Access::Read, at.clone());
         store.link(&actor, &[read]).unwrap();
-        let summary = store.run_facts().unwrap().summary;
         assert_eq!(
-            (summary.owed(Phase::Assess), summary.owed(Phase::Review)),
-            (0, 0),
+            store.run_facts().unwrap().summary.owed(Phase::Review),
+            0,
             "another path's access of a state it shares"
         );
+        let untouched = state(&store, &actor, NewState::Instance);
+        let read = access(scenario.path, untouched, Access::Read, at.clone());
+        store.link(&actor, &[read]).unwrap();
+        assert!(
+            !owed(),
+            "its path's access of a state its flaw does not touch"
+        );
+        let wrong = Link::FlawState {
+            flaw: scenario.flaw,
+            state: window,
+        };
+        store.link(&actor, &[wrong]).unwrap();
+        assert!(owed(), "its flaw's standing");
+        verdict(&store, id, Verdict::Validated);
+        let write = access(other, window, Access::Write, at);
+        store.link(&actor, &[write]).unwrap();
+        assert_eq!(
+            (owed(), status(&store, id)),
+            (true, Status::Shortlisted),
+            "an access of a state its flaw leaves wrong owes its verdict alone"
+        );
+        verdict(&store, id, Verdict::Validated);
+        let sits = state(&store, &actor, NewState::Instance);
+        let read = access(scenario.path, sits, Access::Read, location("lib.c", 7));
+        store.link(&actor, &[read]).unwrap();
+        assert!(owed(), "its path's read where its flaw sits");
+        verdict(&store, id, Verdict::Validated);
 
         let code = premise(&store, &actor, PremiseScope::Code);
         let rests = |premise| Link::FlawPremise {
@@ -435,32 +434,69 @@ mod tests {
             premise,
         };
         store.link(&actor, &[rests(code)]).unwrap();
-        assert!(!owed(Phase::Review), "the settling look comes first");
+        assert!(!owed(), "the settling look comes first");
         assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 1);
         exhaust(&store, &Begin::Settle(vec![code]));
-        assert!(owed(Phase::Review), "an exhausted look holds nothing");
+        assert!(owed(), "an exhausted look holds nothing");
         verdict(&store, id, Verdict::Validated);
         decide(&store, code, PremiseStatus::Holds);
-        assert!(
-            owed(Phase::Review) && !owed(Phase::Assess),
-            "a decision owes review alone"
+        assert_eq!(
+            (owed(), status(&store, id)),
+            (true, Status::Shortlisted),
+            "a decision"
         );
 
+        let body = Some(text("the copy runs on every retry"));
+        let edits = [
+            Upsert::Flaw(Change::Edit(
+                scenario.flaw,
+                Edit {
+                    title: None,
+                    body: body.clone(),
+                    detail: FlawEdit::default(),
+                },
+            )),
+            Upsert::Path(Change::Edit(
+                scenario.path,
+                Edit {
+                    title: None,
+                    body: body.clone(),
+                    detail: (),
+                },
+            )),
+            Upsert::State(Change::Edit(
+                window,
+                Edit {
+                    title: None,
+                    body,
+                    detail: StateEdit {
+                        location: None,
+                        trust: None,
+                    },
+                },
+            )),
+        ];
+        for edited in edits {
+            verdict(&store, id, Verdict::Validated);
+            store.upsert(&actor, &edited).unwrap();
+            assert_eq!(
+                (owed(), status(&store, id)),
+                (true, Status::Shortlisted),
+                "an edit of what it rests on owes its verdict alone: {edited:?}"
+            );
+        }
         verdict(&store, id, Verdict::Validated);
-        let edit = Edit {
-            title: None,
-            body: Some(text("the copy runs on every retry")),
-            detail: FlawEdit::default(),
-        };
-        let edited = Upsert::Flaw(Change::Edit(scenario.flaw, edit));
-        store.upsert(&actor, &edited).unwrap();
-        assert!(owed(Phase::Assess) && !owed(Phase::Review));
-        assess(&store, id, HIGH);
-        assert!(owed(Phase::Review));
+        reword(&store, &actor, id, "reachable on every retry");
+        assert_eq!(
+            (owed(), status(&store, id)),
+            (true, Status::Identified),
+            "its own edit owes its assessment"
+        );
+        verdict(&store, id, Verdict::Validated);
 
         let deployment = premise(&store, &actor, PremiseScope::Deployment);
         store.link(&actor, &[rests(deployment)]).unwrap();
-        assert!(!owed(Phase::Review), "the user is asked first");
+        assert!(!owed(), "the user is asked first");
         let asked = store.synthesis(&[]).unwrap().asked;
         assert_eq!(
             asked.iter().map(|asked| asked.premise).collect::<Vec<_>>(),
@@ -470,29 +506,61 @@ mod tests {
         store
             .set_status(&actor, answered, &text("the user runs it"))
             .unwrap();
-        assert!(owed(Phase::Review));
+        assert!(owed());
+    }
 
-        judge(&store, scenario.flaw, FlawStatus::Refuted);
-        assess(&store, id, HIGH);
-        within(&store, &Begin::Review(vec![id]), |reviewer| {
-            store
-                .verdict(reviewer, id, Verdict::Disproved, &text("reviewed"))
-                .unwrap();
-            let contradicts = NewEvidence {
-                location: None,
-                environment: None,
-                stance: Stance::Contradicts,
-                note: text("the copy is bounded"),
-            };
-            store.evidence(reviewer, id.into(), &[contradicts]).unwrap();
-        });
-        assert!(owed(Phase::Assess) && !owed(Phase::Review));
-        assess(&store, id, HIGH);
+    /// A review that scores its candidate below the threshold needs no verdict: the assessment
+    /// is its review, and nothing reports it.
+    #[test]
+    fn a_candidate_scored_below_the_threshold_owes_no_verdict() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let id = scenario.candidate;
+        sweep(&store, scenario.path);
+        assess(&store, id, NONE);
+        let NodeView::Candidate(view) = store.node(id.into()).unwrap() else {
+            panic!("a candidate")
+        };
         assert_eq!(
-            (owed(Phase::Review), status(&store, id)),
-            (false, Status::Disproved),
-            "a restated assessment is current and owes no review"
+            (
+                view.status,
+                view.assessment.unwrap().current,
+                view.verdict.is_none()
+            ),
+            (Status::BelowThreshold, true, true)
         );
+        let summary = store.run_facts().unwrap().summary;
+        assert_eq!(
+            (summary.owed(Phase::Review), summary.owed(Phase::Report)),
+            (0, 0)
+        );
+    }
+
+    /// An edit of a candidate owes its review again, scored or judged, but not one its own
+    /// review makes and scores again within it.
+    #[test]
+    fn an_edit_owes_the_review_again() {
+        let (_session, store, actor) = fixture();
+        let scenario = scenario(&store, &actor, "decoder");
+        let id = scenario.candidate;
+        sweep(&store, scenario.path);
+        let owed = || queued(&store, Phase::Review) == [NodeId::from(id)];
+        assess(&store, id, NONE);
+        reword(&store, &actor, id, "narrower than stated");
+        assert!(owed(), "a scored candidate's edit");
+        within(&store, &Begin::Review(vec![id]), |reviewer| {
+            reword(&store, reviewer, id, "reachable on every retry");
+            let vector = HIGH.parse().unwrap();
+            store
+                .assess(reviewer, id, vector, &text("rescored"))
+                .unwrap();
+            store
+                .verdict(reviewer, id, Verdict::Validated, &text("reviewed"))
+                .unwrap();
+        });
+        assert!(!owed(), "its own review's edit");
+        reword(&store, &actor, id, "bounded by its caller");
+        assert!(owed(), "a judged candidate's edit");
     }
 
     /// An assessment or a verdict recorded within a task stands on the basis the task began at:
@@ -503,20 +571,14 @@ mod tests {
         let scenario = scenario(&store, &actor, "decoder");
         let id = scenario.candidate;
         sweep(&store, scenario.path);
-        let (assessor, job, _) = begun(&store, &Begin::Assess(vec![id]));
-        let edit = Edit {
-            title: None,
-            body: Some(text("narrower than stated")),
-            detail: CandidateEdit::default(),
-        };
-        let change = Upsert::Candidate(Change::Edit(id, edit));
-        store.upsert(&actor, &change).unwrap();
-        let vector = HIGH.parse().unwrap();
+        let (assessor, job, _) = begun(&store, &Begin::Review(vec![id]));
+        reword(&store, &actor, id, "narrower than stated");
+        let vector = NONE.parse().unwrap();
         store
             .assess(&assessor, id, vector, &text("scored"))
             .unwrap();
         end_job(&store, job);
-        assert_eq!(queued(&store, Phase::Assess), [NodeId::from(id)]);
+        assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
 
         assess(&store, id, HIGH);
         let (reviewer, job, _) = begun(&store, &Begin::Review(vec![id]));
@@ -535,15 +597,13 @@ mod tests {
     }
 
     /// An unproven verdict stands only while a premise of its chain is undecided: its own
-    /// review's decision only proposes one, and the review is owed again once its settle
-    /// decides it.
+    /// review deciding the premise after it owes that review again, and no settle.
     #[test]
     fn an_unproven_verdict_stands_while_a_premise_is_undecided() {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         let id = scenario.candidate;
         sweep(&store, scenario.path);
-        assess(&store, id, HIGH);
         let code = premise(&store, &actor, PremiseScope::Code);
         let rests = Link::FlawPremise {
             flaw: scenario.flaw,
@@ -552,6 +612,10 @@ mod tests {
         store.link(&actor, &[rests]).unwrap();
         exhaust(&store, &Begin::Settle(vec![code]));
         let (reviewer, job, _) = begun(&store, &Begin::Review(vec![id]));
+        let vector = HIGH.parse().unwrap();
+        store
+            .assess(&reviewer, id, vector, &text("scored"))
+            .unwrap();
         store
             .verdict(&reviewer, id, Verdict::Unproven, &text("reviewed"))
             .unwrap();
@@ -561,9 +625,8 @@ mod tests {
             .set_status(&reviewer, decided, &text("measured"))
             .unwrap();
         end_job(&store, job);
-        assert_eq!(status(&store, id), Status::Unproven);
-        assert_eq!(queued(&store, Phase::Settle), [NodeId::from(code)]);
-        decide(&store, code, PremiseStatus::Holds);
+        assert_eq!(status(&store, id), Status::Shortlisted);
+        assert!(queued(&store, Phase::Settle).is_empty());
         assert_eq!(queued(&store, Phase::Review), [NodeId::from(id)]);
     }
 

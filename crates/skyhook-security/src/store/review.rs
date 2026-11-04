@@ -1,6 +1,7 @@
 //! Assessments and verdicts, each recorded by an event whose note is its rationale. The latest
-//! recorded within its phase's work on the candidate stands, current while nothing its phase
-//! reads changed after it; one recorded elsewhere is a proposal, which that phase decides.
+//! recorded within a review of the candidate stands: an assessment current until the candidate
+//! is edited, a verdict while nothing the review reads changed after it; one recorded elsewhere
+//! is a proposal, which its review decides.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -9,7 +10,7 @@ use skyhook::db::params;
 use super::*;
 use crate::cvss::Cvss40;
 
-/// What an assessment scores, and whether it is sent to review.
+/// What an assessment scores, and whether its review owes a verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Assessment {
     pub severity: Severity,
@@ -22,7 +23,7 @@ const ASSESSMENT: Standing = standing_of!(
     "candidate",
     "vector",
     "assessment_proposed",
-    crate::store::bearing::owns!("assess", "?2", "?1"),
+    crate::store::bearing::owns!("review", "?2", "?1"),
     Standing
 );
 const VERDICT: Standing = standing_of!(

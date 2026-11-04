@@ -177,12 +177,14 @@ pub struct InputView {
 }
 
 /// The event that last recorded a state's check across calls, and whether it stands: no access,
-/// edit or merge came since.
+/// edit or merge came since, and no premise its checks rest on failed or was contradicted.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct CheckView {
     pub event: EventId,
     pub note: Option<String>,
     pub current: bool,
+    /// The premises its checks cleared it on.
+    pub rests_on: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -220,6 +222,8 @@ pub struct PremiseView {
     pub disputed: bool,
     pub flaws: Vec<Ref>,
     pub paths: Vec<Ref>,
+    /// The states whose checks rest on it.
+    pub states: Vec<Ref>,
     /// The premises it holds only if they do.
     pub rests_on: Vec<PremiseRef>,
     /// The premises holding only if it does.
@@ -321,7 +325,7 @@ pub struct CandidateView {
     pub assessment: Option<AssessmentView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<VerdictView>,
-    /// An assessment its assess has yet to decide.
+    /// An assessment its review has yet to decide.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed_assessment: Option<Proposal<Scored>>,
     /// A verdict its review has yet to decide.

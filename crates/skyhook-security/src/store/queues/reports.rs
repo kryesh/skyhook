@@ -2,14 +2,12 @@
 
 use super::*;
 
-/// Candidate `$c` has finding work that is not exhausted: an assessment, a review or a test, or
-/// a live test task recorded no test since it began.
+/// Candidate `$c` has finding work that is not exhausted: a review or a test, or a live test
+/// task recorded no test since it began.
 macro_rules! finding_pending {
     ($c:expr) => {
         concat!(
             "(",
-            pending!("assess", $c, assess_owed!($c)),
-            " OR ",
             pending!("review", $c, review_owed!($c)),
             " OR ",
             pending!("test", $c, test_owed!($c)),
@@ -86,8 +84,8 @@ mod tests {
     use super::{
         super::{
             super::tests::{
-                HIGH, assess, begun, candidate, end_job, fixture, flaw, revalidate, test, text,
-                validated, verdict,
+                HIGH, assess, begun, candidate, end_job, fixture, flaw, revalidate, reword, test,
+                text, validated, verdict,
             },
             tests::{exhaust, queued},
         },
@@ -157,7 +155,7 @@ mod tests {
         test(&store, &actor, joined, TestResult::Confirmed);
         assert!(owed(), "a member joined");
         exhaust(&store, &Begin::Report(vec![root]));
-        begun(&store, &Begin::Assess(vec![id]));
+        begun(&store, &Begin::Review(vec![id]));
         assert!(!owed(), "a begin on a member changes nothing");
 
         let (reporter, _, _) = begun(&store, &Begin::Report(vec![root]));
@@ -183,8 +181,7 @@ mod tests {
         let member = candidate(&store, &actor, reported.path, &[root]);
         assess(&store, member, HIGH);
         verdict(&store, member, Verdict::Validated);
-        let local = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N";
-        assess(&store, member, local);
+        reword(&store, &actor, member, "narrower than stated");
         for _ in 0..2 {
             let (_, job, _) = begun(&store, &Begin::Review(vec![member]));
             end_job(&store, job);

@@ -1,0 +1,17 @@
+# Settling
+
+Your parent assigned you premises to settle: each one's flaws and the states they leave wrong
+bear on it. A loose-end review begins no task, so what it records reopens work: propose each
+premise's status, or record what would settle it or the evidence or edit that reopens its
+settling. {% include "security/question.md" %}
+
+Settle each premise from the code or a binary's disassembly: `set_status` `holds` or `fails`,
+with evidence at every site the answer rests on.
+{%- if live %}
+A bounded experiment or measurement in a recorded environment may decide what the code alone
+cannot, such as a timing, a reuse or the logic behind an interface without code: run it
+yourself or through a child, and decide from what it observed against its control, cited as
+evidence.
+{%- endif %}
+Leave a premise you cannot settle undecided, with evidence on the sites you checked and those
+you did not.

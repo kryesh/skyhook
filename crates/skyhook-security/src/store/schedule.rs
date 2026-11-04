@@ -404,9 +404,11 @@ mod tests {
     /// it accesses that the most paths access, else such an instance state: a path accessing a
     /// lower instance state, or a lower handed state only it accesses, goes with the other
     /// readers of the shared handed state it reads, never joined through the instance state. A
-    /// path accessing none goes alone. Checks are offered alone, once the sweeps are done.
+    /// path accessing none goes alone. Once the sweeps are done, checks go with every other keyed
+    /// on the handed state each keys on: an instance state written on a path accessing a handed
+    /// state goes with it, one only read there, or written where none is accessed, alone.
     #[test]
-    fn sweeps_bundle_by_their_key_state() {
+    fn sweeps_and_checks_bundle_by_their_key_state() {
         let (_session, store, actor) = fixture();
         let decoder = component(&store, &actor, "decoder");
         let [first, shared, second, apart] = ["first", "shared", "second", "apart"]
@@ -458,8 +460,7 @@ mod tests {
             [
                 (Phase::Check, window, vec![]),
                 (Phase::Check, token, vec![]),
-                (Phase::Check, carry, vec![]),
-                (Phase::Check, ring, vec![]),
+                (Phase::Check, carry, vec![ring]),
             ]
         );
     }
@@ -489,7 +490,9 @@ mod tests {
         for path in [first.path, other.path] {
             sweep(&store, path);
         }
-        check(&store, window);
+        let basis = premise(&store, &actor, PremiseScope::Code);
+        decide(&store, basis, PremiseStatus::Holds);
+        check(&store, window, &[basis]);
         for candidate in [first.candidate, other.candidate, variant, crossing] {
             assess(&store, candidate, HIGH);
         }
@@ -546,14 +549,14 @@ mod tests {
             premise: code,
         };
         store.link(&actor, &[link]).unwrap();
-        let (_, job, _) = begun(&store, &Begin::Assess(vec![merged.candidate]));
+        let (_, job, _) = begun(&store, &Begin::Review(vec![merged.candidate]));
         let merge = Merge {
             node: merged.candidate.into(),
             into: kept.candidate.into(),
             note: text("same"),
         };
         store.merge(&actor, &merge).unwrap();
-        assert!(queued(&store, Phase::Assess).is_empty());
+        assert!(queued(&store, Phase::Review).is_empty());
         let started = |running: &[NodeId]| {
             let page =
                 (store.startable(running, &[], &Live::default(), None, Bounded::new::<10>()))

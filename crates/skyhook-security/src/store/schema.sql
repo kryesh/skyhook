@@ -174,6 +174,13 @@ CREATE TABLE state_check(
     event INTEGER NOT NULL REFERENCES event(id),
     FOREIGN KEY(state,scope) REFERENCES state(node,scope)
 ) STRICT;
+-- The premises a state's checks cleared it on: general claims its recorded accesses do not show.
+CREATE TABLE state_premise(
+    state INTEGER NOT NULL REFERENCES state_check(state),
+    premise INTEGER NOT NULL REFERENCES premise(node),
+    PRIMARY KEY(state,premise)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX state_premise_premise ON state_premise(premise,state);
 
 -- The swept unit.
 CREATE TABLE path(

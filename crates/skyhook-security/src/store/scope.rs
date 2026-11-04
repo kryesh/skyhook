@@ -8,7 +8,7 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use skyhook::db::Db;
+use skyhook::db::{Db, enum_column};
 
 use super::*;
 
@@ -114,6 +114,109 @@ pub struct Outside {
     pub candidates: u64,
 }
 
+/// The run's scope as a task begins on it: the live mapped components and their interfaces,
+/// and the deployment premises at their standing, those failing excluding what rests on them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Scope {
+    pub components: Vec<Ref>,
+    pub interfaces: Vec<ScopedInterface>,
+    pub excluded: Vec<Excluded>,
+    pub assumed: Vec<Assumed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ScopedInterface {
+    pub interface: InterfaceName,
+    pub component: ComponentId,
+}
+
+/// A deployment premise standing failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Excluded {
+    pub premise: PremiseId,
+    pub title: String,
+}
+
+/// A deployment premise standing held or undecided.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Assumed {
+    pub premise: PremiseId,
+    pub title: String,
+    pub status: PremiseStatus,
+}
+
+/// The live recorded mapped components, as `c` and their node `n`.
+macro_rules! mapped_components {
+    () => {
+        concat!(
+            " FROM component c JOIN node n ON n.id=c.node WHERE n.merged_into IS NULL AND \
+             c.status='recorded' AND ",
+            mapped!("c.node")
+        )
+    };
+}
+
+pub(super) fn scope(db: &Db) -> Result<Scope> {
+    let mut scope = Scope {
+        components: rows(
+            db,
+            concat!(
+                "SELECT n.id,n.title",
+                mapped_components!(),
+                " ORDER BY n.id"
+            ),
+            Vec::new(),
+            |row| {
+                Ok(Ref {
+                    id: NodeId(row.get(0)?),
+                    title: row.get(1)?,
+                })
+            },
+        )?,
+        interfaces: rows(
+            db,
+            concat!(
+                "SELECT interface,component FROM component_interface WHERE component IN (SELECT \
+                 c.node",
+                mapped_components!(),
+                ") ORDER BY component,interface"
+            ),
+            Vec::new(),
+            |row| {
+                Ok(ScopedInterface {
+                    interface: row.get::<String>(0)?.parse()?,
+                    component: ComponentId(row.get(1)?),
+                })
+            },
+        )?,
+        excluded: Vec::new(),
+        assumed: Vec::new(),
+    };
+    for (premise, title, status) in rows(
+        db,
+        "SELECT p.node,n.title,p.status FROM premise_standing p JOIN node n ON n.id=p.node WHERE \
+         p.scope='deployment' AND n.merged_into IS NULL ORDER BY p.node",
+        Vec::new(),
+        |row| {
+            Ok((
+                PremiseId(row.get(0)?),
+                row.get::<String>(1)?,
+                enum_column::<PremiseStatus>(row, 2)?,
+            ))
+        },
+    )? {
+        match status {
+            PremiseStatus::Fails => scope.excluded.push(Excluded { premise, title }),
+            status => scope.assumed.push(Assumed {
+                premise,
+                title,
+                status,
+            }),
+        }
+    }
+    Ok(scope)
+}
+
 pub(super) fn outside(db: &Db) -> Result<Outside> {
     stored(
         db,
@@ -138,12 +241,14 @@ pub(super) fn outside(db: &Db) -> Result<Outside> {
 
 #[cfg(test)]
 mod tests {
+    use skyhook::job::JobState;
+
     use super::{
         super::{
             queues::{self, Spent},
             tests::{
-                access, begun, candidate, component, end_job, fixture, flaw, location, path,
-                premise, scenario, state, text, within,
+                access, begun, candidate, child_agent, component, end_job, fixture, flaw, location,
+                path, premise, scenario, state, text, within,
             },
         },
         *,
@@ -209,7 +314,7 @@ mod tests {
         assert_eq!(owed(Phase::Check), [NodeId::from(shared)]);
         assert_eq!(owed(Phase::Settle), [NodeId::from(held)]);
         assert!(owed(Phase::Chain).is_empty());
-        assert_eq!(owed(Phase::Assess), [NodeId::from(decoder.candidate)]);
+        assert_eq!(owed(Phase::Review), [NodeId::from(decoder.candidate)]);
         let outside = Outside {
             paths: 1,
             candidates: 1,
@@ -227,5 +332,43 @@ mod tests {
         };
         store.merge(&actor, &merge).unwrap();
         assert_eq!(store.coverage().unwrap().outside, outside);
+    }
+
+    /// A task begins with the run's scope: the mapped components with their interfaces, never
+    /// one a task recorded, and the deployment premises at their standing, a failing one
+    /// excluded and the rest assumed.
+    #[test]
+    fn begin_lists_the_mapped_components_and_the_deployment_premises() {
+        let (_session, store, actor) = fixture();
+        let decoder = component(&store, &actor, "decoder");
+        let [failing, open] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Deployment));
+        let fails = StatusChange::Premise(failing, PremiseStatus::Fails);
+        store.set_status(&actor, fails, &text("excluded")).unwrap();
+        within(&store, &Begin::Settle(vec![open]), |agent| {
+            component(&store, agent, "binding")
+        });
+        let (settler, _) = child_agent(&store, JobState::Running);
+        let begun = store.begin(&settler, &Begin::Settle(vec![open])).unwrap();
+        let title = "the length is checked".to_owned();
+        let scope = Scope {
+            components: vec![Ref {
+                id: decoder.into(),
+                title: "decoder".to_owned(),
+            }],
+            interfaces: vec![ScopedInterface {
+                interface: "decoder-api".parse().unwrap(),
+                component: decoder,
+            }],
+            excluded: vec![Excluded {
+                premise: failing,
+                title: title.clone(),
+            }],
+            assumed: vec![Assumed {
+                premise: open,
+                title,
+                status: PremiseStatus::Undecided,
+            }],
+        };
+        assert_eq!(begun.scope, scope);
     }
 }

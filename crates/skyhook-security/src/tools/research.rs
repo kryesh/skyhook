@@ -30,9 +30,12 @@ actions! {
         /// and its subjects. Its result names what changed for each subject since its last task
         /// in this phase.
         /// Afterwards, job events list changes other agents make to what it rests on; re-read
-        /// those records before you decide on them. → {task, changes?: per subject worked before
-        /// in the phase, what changed since, proposals?: per subject, the result recorded outside
-        /// this phase for it to decide, premises?: per state checked, the decided premises of the
+        /// those records before you decide on them. → {task, scope: the run's scope, {components:
+        /// [{id, title}], interfaces: [{interface, component}], excluded: [{premise, title}]
+        /// (failing deployment premises), assumed: [{premise, title, status}] (the other
+        /// deployment premises)}, changes?: per subject worked before
+        /// in the phase, what changed since, proposals?: per subject, each result recorded
+        /// outside this phase for it to decide, premises?: per state checked, the decided premises of the
         /// flaws leaving it wrong}
         begin => Begin(crate::store::Begin) -> Begun,
         /// Create a node, its fields inside `record`: `{action: "upsert", record: {kind: "path",
@@ -49,7 +52,10 @@ actions! {
         /// Decide a premise, judge a flaw, mark a path swept or unswept, mark a state `checked`
         /// across calls, or retract a state, path or component recorded in error: it then stands
         /// in no work or count until marked `recorded` (a path `unswept`) again.
-        /// `{action: "set_status", record: {kind: "path", id, status: "swept"}, note}`.
+        /// `{action: "set_status", record: {kind: "path", id, status: "swept"}, note}`. A
+        /// `checked` state names in `rests_on` at least one premise its clearing relies on:
+        /// `{record: {kind: "state", id, status: "checked", rests_on: [premise ids]}, note}`; each
+        /// owes a settle while undecided, and one failing or contradicted owes the check again.
         set_status => SetStatus { record: StatusRecord, note: Text } -> (),
         /// The store scores `vector`: record the vector, never compute a score. → {severity,
         /// score, shortlisted}

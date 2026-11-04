@@ -258,7 +258,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         capabilities::SecurityCapability,
-        store::{LivePolicy, NodeId, NodeView, PathId, RunOptions},
+        store::{Error, LivePolicy, NodeId, NodeView, PathId, RunOptions},
     };
 
     pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -304,6 +304,7 @@ pub(crate) mod tests {
                     Capability::Network,
                     Capability::Agents,
                     Capability::Mcp,
+                    Capability::Interactive,
                 ]
                 .into_iter()
                 .chain(SecurityCapability::ALL.map(SecurityCapability::capability)),
@@ -361,12 +362,11 @@ pub(crate) mod tests {
             response["result"].clone()
         }
 
-        /// Assess `candidate` and validate it through an assessing and a reviewing child, each
-        /// [`scripted`] within its work.
+        /// Score and validate `candidate` through a reviewing child, [`scripted`] within its
+        /// work.
         async fn validate(&self, candidate: &Value) {
             self.script(format!(
-                r#"for (const [mode, work] of [["assess", "Assess"], ["validate", "Review"]])
-                    await tool.agent({{mode, depth: 1, name: `${{mode}}-{candidate}`, prompt: `${{work}} candidate {candidate}.`}});"#
+                r#"await tool.agent({{mode: "validate", depth: 1, name: "validate-{candidate}", prompt: "Review candidate {candidate}."}});"#
             ))
             .await;
         }
@@ -547,6 +547,17 @@ pub(crate) mod tests {
         let refused = fixture.call("research", beside).await;
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains("goes inside `record`"), "{error}");
+        // A check names at least one premise it rests on, missing and empty alike.
+        let mut record = json!({"kind":"state","id":1,"status":"checked"});
+        for rests_on in [None, Some(json!([]))] {
+            if let Some(rests_on) = rests_on {
+                record["rests_on"] = rests_on;
+            }
+            let unrested = json!({"action":"set_status","record":record,"note":"n"});
+            let refused = fixture.call("research", unrested).await;
+            let error = refused["error"].as_str().unwrap();
+            assert!(error.contains(&Error::Unrested.to_string()), "{error}");
+        }
         fixture.close().await;
     }
 
@@ -875,26 +886,34 @@ pub(crate) mod tests {
         Fail,
         /// Fails before it begins.
         Unbegun,
-        /// Records the `research` action made of the first subject it began, then replies.
-        Record(fn(&Value) -> Value),
+        /// Records the `research` actions made of the first subject it began, one a response,
+        /// then replies.
+        Record(fn(&Value) -> Vec<Value>),
         /// Runs until it is cancelled.
         Hang,
     }
 
     /// Marks the path it began swept.
-    const SWEEP: Then = Then::Record(
-        |path| json!({"action": "set_status", "record": {"kind": "path", "id": path, "status": "swept"}, "note": "walked it"}),
-    );
+    const SWEEP: Then = Then::Record(|path| {
+        vec![
+            json!({"action": "set_status", "record": {"kind": "path", "id": path, "status": "swept"}, "note": "walked it"}),
+        ]
+    });
 
-    /// The assessment a scripted researcher records of `candidate`.
-    fn assessment(candidate: &Value) -> Value {
-        json!({"action": "assess", "candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"})
-    }
+    /// Confirms the flaw it began.
+    const CONFIRM: Then = Then::Record(|flaw| {
+        vec![
+            json!({"action": "set_status", "record": {"kind": "flaw", "id": flaw, "status": "confirmed"}, "note": "no consequence"}),
+        ]
+    });
 
-    /// The validation a scripted reviewer records of `candidate`.
-    fn validation(candidate: &Value) -> Value {
-        json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"})
-    }
+    /// Scores the candidate it began, then validates it.
+    const VALIDATE: Then = Then::Record(|candidate| {
+        vec![
+            json!({"action": "assess", "candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"}),
+            json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"}),
+        ]
+    });
 
     type Decide = Arc<dyn Fn(&str) -> Then + Send + Sync>;
 
@@ -934,17 +953,6 @@ pub(crate) mod tests {
                     TextBlock, ToolCall, UserContent,
                 },
             };
-            let brief = (request.context.iter())
-                .find_map(|entry| match entry {
-                    Entry::Message(Message::User(content)) => {
-                        content.iter().find_map(|content| match content {
-                            UserContent::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-                .expect("a child is launched with its brief");
             let id = |id: &str| ItemId::try_from(id.to_owned()).unwrap();
             let call = |name: &str, arguments: Value| {
                 let call = ToolCall::new(name, name, arguments).unwrap();
@@ -968,6 +976,19 @@ pub(crate) mod tests {
                 };
                 Ok(Completion::answer(vec![item]).unwrap())
             };
+            let brief = (request.context.iter()).find_map(|entry| match entry {
+                Entry::Message(Message::User(content)) => {
+                    content.iter().find_map(|content| match content {
+                        UserContent::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            });
+            // Only the root runs without a brief: told its background question ended, it is done.
+            let Some(brief) = brief else {
+                return futures_util::stream::iter([answer().map(ResponseEvent::End)]).boxed();
+            };
             let work = begin(&brief);
             let failed = || Err(ProviderErrorKind::Authentication.error("the child failed"));
             self.responses += 1;
@@ -976,7 +997,12 @@ pub(crate) mod tests {
                 (1, _) => call("research", work),
                 (2, Then::Fail) => failed(),
                 (2, Then::Hang) => return futures_util::stream::pending().boxed(),
-                (2, Then::Record(action)) => call("research", action(&work["subjects"][0])),
+                (made, Then::Record(actions)) => {
+                    match actions(&work["subjects"][0]).get(made - 2) {
+                        Some(action) => call("research", action.clone()),
+                        None => answer(),
+                    }
+                }
                 _ => answer(),
             };
             futures_util::stream::iter([completion.map(ResponseEvent::End)]).boxed()
@@ -993,7 +1019,6 @@ pub(crate) mod tests {
             "Check state" => "check",
             "Settle premise" => "settle",
             "Chain flaw" => "chain",
-            "Assess candidate" => "assess",
             "Review candidate" => "review",
             "Test candidate" => "test",
             "Report root flaw" => "report",
@@ -1133,12 +1158,13 @@ pub(crate) mod tests {
         fixture.close().await;
     }
 
-    /// Sweeps, assessments and validations recorded; any other work fails.
+    /// Sweeps, chains confirming their flaws, and reviews scoring and validating their
+    /// candidates recorded; any other work fails.
     fn scripted(brief: &str) -> Then {
         match brief.split(' ').next() {
             Some("Sweep") => SWEEP,
-            Some("Assess") => Then::Record(assessment),
-            Some("Review") => Then::Record(validation),
+            Some("Chain") => CONFIRM,
+            Some("Review") => VALIDATE,
             _ => Then::Fail,
         }
     }
@@ -1149,7 +1175,7 @@ pub(crate) mod tests {
     async fn a_finished_tasks_reply_is_read_by_the_id_its_exhaustion_names() {
         let fixture = Fixture::with_children(LivePolicy::No, |_| {
             Then::Record(|path| {
-                json!({"action": "evidence", "node": path, "items": [{"stance": "context", "note": "looked"}]})
+                vec![json!({"action": "evidence", "node": path, "items": [{"stance": "context", "note": "looked"}]})]
             })
         })
         .await;
@@ -1207,6 +1233,53 @@ pub(crate) mod tests {
         assert_eq!(
             rerun.await,
             json!({"reads": 5, "started": [&test, &test, &report, &report], "held": false})
+        );
+        fixture.close().await;
+    }
+
+    /// While the root's question to the user is open, the scheduler starts other work but no
+    /// review; once the question closes, the same run starts it.
+    #[tokio::test]
+    async fn the_scheduler_holds_reviews_while_the_root_asks() {
+        use crate::store::tests::{scenario, sweep};
+        let fixture = Fixture::with_children(LivePolicy::No, scripted).await;
+        let other = sweeps(&fixture, 0..1).await[0];
+        let store = Store::of(fixture.session.store().extension().unwrap());
+        let agent = fixture.session.root_agent().clone();
+        let scenario = tokio::task::spawn_blocking(move || {
+            let scenario = scenario(&store, &agent, "service");
+            sweep(&store, scenario.path);
+            scenario
+        })
+        .await
+        .unwrap();
+        // The question closes in the scheduler's wait for it once the sweep is done, when only
+        // that wait keeps the run going.
+        let stubs = "let open = true, swept;
+            const done = new Promise(resolve => swept = resolve), started = [], real = globalThis.tool;
+            const question = (await real.ask({id: 'profile', prompt: 'Which deployment?', bg: true})).id;
+            const sleep = async () => { await done; if (open) { open = false; await real.job(question).cancel(); } };
+            const tool = {
+                jobs: real.jobs, research: real.research, research_query: real.research_query,
+                agent: async args => {
+                    started.push([args.prompt.split('. ')[0], open]);
+                    const result = await real.agent(args);
+                    swept();
+                    return result;
+                },
+            };
+            const receive = () => new Promise(() => {});
+            const workers = 2, artifacts = 'artifacts', source = '.';";
+        let result = run_template(&fixture, stubs, &scheduler(LivePolicy::No), "started").await;
+        let (candidate, flaw) = (scenario.candidate, scenario.flaw);
+        assert_eq!(
+            result,
+            json!([
+                [format!("Sweep path {other}"), true],
+                [format!("Review candidate {candidate}"), false],
+                [format!("Report root flaw {flaw}"), false],
+                [format!("Report root flaw {flaw}"), false],
+            ])
         );
         fixture.close().await;
     }

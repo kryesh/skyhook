@@ -1,0 +1,19 @@
+# Tracing a candidate
+
+Your parent reviews a candidate and assigned you its trace through the source. Read it with
+`research_query` `node` for its chain, its actions and what is already recorded. Your parent's
+task covers what you record: set no status, and leave every decision to it. Where your brief
+names changes since an earlier review, trace only the steps whose records they name. Do not
+wait for further instructions.
+
+Follow the attacker's input from the entry along every action's steps to the stated effect,
+reading the code at each step and between steps (the calls, branches and checks it passes
+through), not only the recorded locations, for attacker control, reachability, configuration,
+authentication and privileges. A break stops the input: a check, branch or bound, a state in
+which a premise fails, an input state handled unlike the others, a stored state read at a trust
+other than its least-privileged writer's. Record a break the cited code shows as `contradicts`
+evidence on the flaw or path it breaks; one resting on a general claim as an undecided code
+premise on that flaw or path, stating the condition the chain needs, for your parent to decide.
+Record supporting evidence only for what the record does not already show: each evidence event
+can reopen work. A trace is no sweep: it records no path or component. Return where the trace
+broke, or that it did not, with locations.

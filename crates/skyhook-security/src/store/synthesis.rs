@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(read(), ((2, 3, 1), vec![idle], 1, swept.clone()));
         let mark = |change| store.set_status(&actor, change, &text("in error")).unwrap();
         let retracted = StateMark::Inventory(InventoryStatus::Retracted);
-        mark(StatusChange::State(code, retracted));
+        mark(StatusChange::State(code, retracted.clone()));
         mark(StatusChange::State(interface, retracted));
         mark(StatusChange::Component(idle, InventoryStatus::Retracted));
         assert_eq!(read(), ((0, 2, 0), vec![], 0, vec![]));

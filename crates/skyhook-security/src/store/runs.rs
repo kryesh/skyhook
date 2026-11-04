@@ -14,7 +14,7 @@ use super::*;
 pub const SCHEMA: Schema = Schema::extended(
     ProductImage::layered(
         concat!(include_str!("schema.sql"), bearing::derived_views!()),
-        25,
+        29,
     ),
     seed,
 );

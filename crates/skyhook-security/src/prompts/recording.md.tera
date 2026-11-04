@@ -14,12 +14,14 @@ Record:
 - a **candidate** whenever flaws chain to an observable vulnerability, listing each action's
   path in order, the attacker's first, its body naming who performs each.
 
-Link what is already recorded first: read the flaws recorded on the components the code you
-read belongs to (`research_query` `list` `{record: {kind: "flaw", component}}`) and the premises they need,
-and link and chain the ones your work reaches rather than recording them again.
+Link and chain the recorded flaws your work reaches: read those on the components the code you
+read belongs to (`research_query` `list` `{record: {kind: "flaw", component}}`) and the premises
+they need. A route entering through code outside the components in the run's scope is out of
+scope: record no component, path or candidate for it.
 
 A dangerous-looking operation alone is not a flaw, and a check a documented contract leaves to
-the caller is not a flaw in the callee: a caller that skips it is.
+a trusted caller is not a flaw in the callee (a caller that skips it is); one left to an
+untrusted client or peer is the callee's flaw.
 
 Shared state is also reached by the other paths accessing it (its `node` lists them), a path run
 concurrently with itself, and the threads, tasks or signal handlers a component's body names;

@@ -100,12 +100,6 @@ impl RunState {
                 began(&questions),
             ),
             stage(
-                "assess",
-                summary.owed(Phase::Assess),
-                work(&[Phase::Assess]),
-                began(&[Phase::Assess]),
-            ),
-            stage(
                 "review",
                 summary.owed(Phase::Review),
                 work(&[Phase::Review]),

@@ -7,7 +7,7 @@ use skyhook::prompts::{Prompts, Source, Templates};
 
 use crate::store::LivePolicy;
 
-const SOURCES: [(&str, Source); 29] = skyhook::templates!["security":
+const SOURCES: [(&str, Source); 31] = skyhook::templates!["security":
     Template "persona.md",
     Template "orchestrate.md",
     Template "target.md",
@@ -18,8 +18,10 @@ const SOURCES: [(&str, Source); 29] = skyhook::templates!["security":
     Template "check.md",
     Template "probe.md",
     Template "question.md",
-    Template "assess.md",
+    Template "settle.md",
+    Template "chain.md",
     Template "validate.md",
+    Template "trace.md",
     Template "environment.md",
     Template "poc.md",
     Template "report.md",

@@ -44,7 +44,7 @@ pub struct Args {
     /// findings (interactive: ask; batch: no). A resumed run keeps its own.
     #[arg(long, value_enum)]
     pub live: Option<LivePolicy>,
-    /// Shortlist threshold for a new run: the lowest severity sent to review.
+    /// Shortlist threshold for a new run: the lowest severity a review judges in full.
     #[arg(long, value_enum)]
     pub shortlist: Option<Severity>,
     /// How many agents the orchestrator's scheduler runs at once.

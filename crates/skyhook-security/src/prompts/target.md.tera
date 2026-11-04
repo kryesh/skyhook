@@ -13,15 +13,20 @@ Establish:
 - The assumed deployment: process boundaries, exposed interfaces, outbound reach,
   authentication, privileges, and relevant configuration or feature choices.
 - The deployment premises later reviews rest on, each `upsert` `{record: {kind: "premise",
-  scope: "deployment"}}`, one statement each: every build flag or feature option, actor (each role,
-  tenant or other identity: what it may do and reach), platform (OS, architecture, runtime and
-  its version), caller behaviour (how an embedding application, client or front proxy calls the
-  code, from how many threads at once, and what it limits or checks), concurrency (workers,
-  instances) and input bound (sizes, counts, lengths the deployment allows). Set each one the
-  user's request settles with `set_status`: `holds` when it admits the condition, `fails` when it
-  excludes it. Spell out what a broad request means: "any caller" or "any configuration" admits
-  each behaviour the code permits, stated one by one. Leave undecided only what the user has not
-  said; ask the parent once here rather than leaving it to each reviewer.
+  scope: "deployment"}}`, one statement each: one per option the inventory finds in build and
+  configuration files and per platform the code branches on (OS, architecture, runtime and its
+  version), actor (each role, tenant or other identity: what it may do and reach), caller
+  behaviour (how an embedding application, client or front proxy calls the code and what it
+  limits or checks), concurrency (workers, instances) and input bound (sizes,
+  counts, lengths the deployment allows), and each obligation the target's documentation places
+  on a trusted caller of an interface in scope, such as an embedding application (call order,
+  concurrency, lifetimes, input it must check first, configuration), phrased as the condition a chain would rest on, with evidence at
+  its source. Set each one the user's request settles with `set_status`: `holds` when it admits
+  the condition, `fails` when it excludes it. A broad request ("any caller", "any configuration")
+  admits what the target's documented interface contract permits a trusted caller to do, stated
+  one by one, and anything an untrusted client or peer can send: breaking a trusted caller's
+  documented obligation fails unless the user includes it, and what the documentation leaves
+  unsaid holds. Leave undecided only what the user has not said.
 - The revision and dirty-state context, available dependencies, and any inaccessible or
   generated code that limits inspection.
 
@@ -39,9 +44,9 @@ Excluding one needs the parent's confirmation, recorded as a deployment premise 
 only a region with no reachable code is left out silently. An exclusion the request makes is
 recorded the same way, stating what it excludes, never that the excluded code's calls into
 included code are covered. A documented default is not proof
-of the deployed setting, so a non-default option is a deployment premise. Ask once how
-target-specific policies affect what counts as a reportable finding (say denial of service, or
-which data each actor may see), and record the answer as deployment premises.
+of the deployed setting, so a non-default option is a deployment premise. Record as deployment
+premises how target-specific policies affect what counts as a reportable finding (say denial of
+service, or which data each actor may see).
 
 Then map the in-scope code into components: a module, a subsystem, a parser or a state machine
 each, with code that shares state or a contract kept together. A component's body states its

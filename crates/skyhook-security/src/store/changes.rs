@@ -38,7 +38,6 @@ const fn notices(phase: Phase) -> &'static str {
         Phase::Check => notices!("check"),
         Phase::Settle => notices!("settle"),
         Phase::Chain => notices!("chain"),
-        Phase::Assess => notices!("assess"),
         Phase::Review => notices!("review"),
         Phase::Test => notices!("test"),
         Phase::Report => notices!("report"),
@@ -311,7 +310,7 @@ mod tests {
         evidence(&store, &reviewer, candidate, Stance::Contradicts);
         evidence(&store, &helper, flaw, Stance::Contradicts);
         evidence(&store, &root, candidate, Stance::Supports);
-        begun(&store, &Begin::Assess(vec![candidate]));
+        begun(&store, &Begin::Test(vec![candidate]));
         assert_eq!(store.changes(&reviewer, Some(decision)).unwrap(), None);
         assert_eq!(
             store.changes(&root, None).unwrap(),

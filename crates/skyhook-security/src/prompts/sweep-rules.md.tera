@@ -11,15 +11,14 @@ type, a validated bound. Name what each relies on and check that the value it us
 that was checked, not a re-read, re-decoded or differently parsed copy, and that nothing between
 them changes it; a mismatch is a flaw at the use, the check its evidence.
 
-Look for memory bounds and lifetimes, integer and type assumptions, what statuses, errors and
-defaults mean, state and ordering, concurrency, failure paths that skip cleanup or progress,
-access checks, input reaching an interpreter or a resource name (a query, command, template,
-file path, URL or deserializer) unencoded or unconfined, how keys, tokens, nonces and signatures
+Look for memory bounds and lifetimes, integer and type assumptions, what return values, errors
+and defaults mean, state and ordering, concurrency, failure paths that skip cleanup or progress,
+access checks, input reaching an interpreter or parser, how keys, tokens, nonces and signatures
 are made, checked and compared, resource limits, and any other invariant the code relies on.
 
-Before your work is done, record the producers of each contract your steps decide on. A site
-where you cannot rule out another meaning (an error or absence read as success, permission or no
-limit, a swallowed error) is a suspected flaw naming producer, consumer and decision. When a flaw
+Record each contract your steps decide on with its producers. A site where you cannot rule out
+another meaning (an error or absence read as success, permission or no limit, a swallowed error)
+is a suspected flaw naming producer, consumer and decision. When a flaw
 changes what a value means, follow it to every consumer, including a later action reading it
 from storage: each relying on the usual meaning is a flaw that needs the changed meaning, linked
 as its premise or chained after it.
@@ -34,6 +33,12 @@ role, a price) is attacker-controlled; a request the target makes for a caller (
 call with its own credentials) is checked against the caller. Abuse across requests (skipping or
 repeating a step, replaying a token, exceeding a quota, an amount or a one-time use) is a candidate
 with an action per request.
+
+Input reaching an interpreter, a parser or a size is checked in the form it is used: decoded,
+normalised and resolved (a path, a URL, an encoding) before the check guarding it; encoded or
+bound for what interprets it (a query, command, template or file name); its lengths and counts
+computed without overflow or truncation before they size an allocation, a copy or a loop; its
+type fixed before a deserializer builds objects from it. A use where one fails is a flaw there.
 
 An unrecorded input a stage takes in is an input state to record with its read on this path.
 Correct the path's steps and accesses and the components' files and concurrency as you find

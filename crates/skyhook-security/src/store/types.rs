@@ -88,12 +88,12 @@ named_enum! {
 
 named_enum! {
     /// Work the scheduler derives: paths owing a sweep or a probe, states a check across calls,
-    /// premises a settling look, flaws a chain, candidates an assessment, a review or a test, and
-    /// root flaws a report.
+    /// premises a settling look, flaws a chain, candidates a review or a test, and root flaws a
+    /// report.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     pub enum Phase {
         Sweep = "sweep", Probe = "probe", Check = "check", Settle = "settle", Chain = "chain",
-        Assess = "assess", Review = "review", Test = "test", Report = "report",
+        Review = "review", Test = "test", Report = "report",
     }
 }
 impl Phase {
@@ -104,7 +104,7 @@ impl Phase {
             Self::Check => NodeKind::State,
             Self::Settle => NodeKind::Premise,
             Self::Chain | Self::Report => NodeKind::Flaw,
-            Self::Assess | Self::Review | Self::Test => NodeKind::Candidate,
+            Self::Review | Self::Test => NodeKind::Candidate,
         }
     }
 
@@ -114,19 +114,18 @@ impl Phase {
         match self {
             Self::Sweep | Self::Probe | Self::Check => 0,
             Self::Settle | Self::Chain => 1,
-            Self::Assess => 2,
-            Self::Review => 3,
-            Self::Test => 4,
-            Self::Report => 5,
+            Self::Review => 2,
+            Self::Test => 3,
+            Self::Report => 4,
         }
     }
 
     /// Whether its entries go out in bundles: one agent takes every ready one of an entry's
-    /// bundle, paths by state, premises and flaws by path, candidates by root group.
+    /// bundle, paths and states by state, premises and flaws by path, candidates by root group.
     pub const fn bundled(self) -> bool {
         matches!(
             self,
-            Self::Sweep | Self::Settle | Self::Chain | Self::Review
+            Self::Sweep | Self::Check | Self::Settle | Self::Chain | Self::Review
         )
     }
 }
@@ -179,12 +178,6 @@ named_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
     #[schemars(inline)]
     pub enum InventoryStatus { Recorded = "recorded", Retracted = "retracted" }
-}
-// A state's inventory status, or its check across calls recorded done. Any agent marks it.
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-    #[schemars(inline)]
-    pub enum StateStatus { Checked = "checked", Recorded = "recorded", Retracted = "retracted" }
 }
 named_enum! {
     /// A review's conclusion; its rationale is the verdict event's note.
@@ -414,7 +407,7 @@ named_enum! {
 /// states only the threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RunOptions {
-    /// The lowest conditional severity sent to review.
+    /// The lowest conditional severity a review goes on to judge.
     pub threshold: Severity,
     /// How many agents the orchestrator's scheduler runs at once; not enforced.
     #[serde(skip)]
