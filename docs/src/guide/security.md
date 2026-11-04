@@ -187,7 +187,10 @@ changed subject (how many changes, the latest, their kinds, the newest few with 
 and the nodes each moved most, and every node the older ones moved), so it can re-read them
 before deciding. A check marks its state with at least one premise its clearing relies on: a
 recorded one, such as the deployment premise for a documented contract, or a general claim its
-accesses do not show, settled by another agent; a mark naming none is refused. A check of a state checked before
+accesses do not show, settled by another agent; a mark naming none is refused. A handed
+state's check also rests, for each value a caller acts on, on a premise naming a condition that
+yields it beyond the one its name suggests, since a write site does not show every condition
+upstream that leads there. A check of a state checked before
 examines only the accesses changed since and the pairs cleared on a premise that failed or was
 contradicted, and the whole state again after an edit or a merge into it. Its own changes and its helpers' are left out,
 and the root, which works no task, is told nothing. A task also names, for each subject, the
