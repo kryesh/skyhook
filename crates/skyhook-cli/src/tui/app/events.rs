@@ -49,7 +49,7 @@ pub enum Work {
         result: Result<Attachment, AttachmentError>,
     },
     Started {
-        result: Result<PreparedObservation, LaunchError>,
+        result: Result<Box<PreparedObservation>, LaunchError>,
     },
     /// The session observed again after its updates were lost.
     /// What the resubscription at `revision` read.
@@ -134,7 +134,7 @@ impl App {
             Work::ExtensionView { view, open, result } => self.extension_loaded(view, open, result),
             Work::Started {
                 result: Ok(prepared),
-            } => self.session_started(prepared),
+            } => self.session_started(*prepared),
             Work::Started { result: Err(error) } => self.start_failed(error),
             Work::Observed { revision, result } => self.observed_again(revision, result),
             Work::Page {

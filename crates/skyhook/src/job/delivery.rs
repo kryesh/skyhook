@@ -204,6 +204,14 @@ impl JobManager {
         Ok((envelope, presented))
     }
 
+    /// Job `id`'s envelope once its turn moved its call to the background.
+    pub(crate) async fn until_moved(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        let moved = self
+            .until_job(id, |entry| entry.moved.is_some(), None)
+            .await;
+        moved.map(|(envelope, _)| envelope)
+    }
+
     /// Block until `id` is no longer live, without claiming or hydrating output.
     pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
         self.until_job(id, |entry| !entry.live(), None)

@@ -11,9 +11,23 @@ pub(super) struct PromptLayout {
     title_start: Option<usize>,
     options: Vec<PromptOptionLine>,
     selected_start: usize,
+    /// The focused suggestion's preview beside the options, when the panel is wide
+    /// enough to split; otherwise it follows the suggestion.
+    side: Option<SidePreview>,
     /// Absent for prompts answered by choice alone.
     input: Option<super::super::composer::ComposerLayout>,
     input_label: Vec<String>,
+    /// The height of the batch's tallest question page, which every page keeps so
+    /// switching between them leaves the panel still.
+    floor: u16,
+}
+
+struct SidePreview {
+    lines: Vec<markdown::LayoutLine>,
+    /// The rows of the tallest preview, which every one reserves.
+    rows: usize,
+    /// The columns the suggestions keep.
+    options: u16,
 }
 
 struct PromptAreas {
@@ -25,12 +39,33 @@ struct PromptAreas {
 
 impl PromptLayout {
     pub(super) fn new(app: &App, width: u16) -> Self {
+        let mut layout = Self::page(app, app.question_page(), &app.prompt_text(), width);
+        if let Some(header) = app.question_header() {
+            let pages = app.question_pages().into_iter();
+            let heights = pages.map(|page| Self::page(app, Some(page), &header, width).height());
+            layout.floor = heights.max().unwrap_or_default();
+        }
+        layout
+    }
+
+    /// The layout of `page`, or of the front prompt when it has none, under `body_text`.
+    fn page(
+        app: &App,
+        page: Option<crate::tui::app::Page<'_>>,
+        body_text: &str,
+        width: u16,
+    ) -> Self {
         let width = width.saturating_sub(4);
-        let page = app.question_page();
-        let body_text = model::clean(&app.prompt_text());
+        let (state, takes_text) = match &page {
+            Some(crate::tui::app::Page::Question(_, input, _)) => (*input, true),
+            Some(crate::tui::app::Page::Review(_)) => (app.prompt_input(), false),
+            None => (app.prompt_input(), app.prompt_takes_text()),
+        };
+        let body_text = model::clean(body_text);
         let mut body: Vec<_> = (wrap_plain(&body_text, width as usize).into_iter())
             .map(plain_line)
             .collect();
+        body.extend(tab_lines(&app.question_tabs(), width.into()));
         let page_prompt = page.as_ref().and_then(|page| page.prompt());
         let title_start = page_prompt.map(|_| body.len());
         let mut fences = Document::default();
@@ -43,6 +78,48 @@ impl PromptLayout {
         if let Some(prompt) = page_prompt {
             body.extend(lay_out(&model::clean(prompt), width.into()));
         }
+        // A question with previews shows the focused one's beside its suggestions when the
+        // panel is wide enough, otherwise under it; a suggestion without one says so. Every
+        // preview takes the room of the tallest, its code boxes the whole width, so moving
+        // between suggestions changes neither.
+        let previews = page.as_ref().and_then(|page| page.previews());
+        let side_width = (width >= SIDE_PREVIEW_WIDTH).then_some(width / 2);
+        let preview_width = side_width.map_or(width.saturating_sub(MARKER_WIDTH), |options| {
+            width - options - PREVIEW_GAP
+        });
+        let preview = previews.map(|(previews, focused)| {
+            let mut laid: Vec<_> = (previews.into_iter())
+                .map(|preview| {
+                    let preview = model::clean(preview.unwrap_or("*No preview*"));
+                    let mut lines = lay_out(&preview, preview_width.into());
+                    for line in &mut lines {
+                        line.layout.fill_code(preview_width.into());
+                    }
+                    lines
+                })
+                .collect();
+            let tallest = laid.iter().map(Vec::len).max().unwrap_or_default();
+            let lines = (focused < laid.len()).then(|| laid.swap_remove(focused));
+            (lines.unwrap_or_default(), tallest)
+        });
+        let (stacked, side) = match (preview, side_width) {
+            (Some((lines, rows)), Some(options)) => {
+                let side = SidePreview {
+                    lines,
+                    rows,
+                    options,
+                };
+                (None, Some(side))
+            }
+            (preview, _) => {
+                let padded = preview.map(|(mut lines, rows)| {
+                    lines.resize_with(rows, markdown::LayoutLine::default);
+                    lines
+                });
+                (padded, None)
+            }
+        };
+        let option_width = side.as_ref().map_or(width, |side| side.options);
         let choices = match &page {
             Some(page) if page.prompt().is_some() => page.choices(),
             _ => app
@@ -52,11 +129,11 @@ impl PromptLayout {
                 .collect(),
         };
         let (options, selected_start) =
-            prompt_option_lines(&choices, app.prompt_input().choice, width, &mut lay_out);
+            prompt_option_lines(&choices, state.choice, option_width, stacked, &mut lay_out);
         let prompt = app.prompts.front();
-        let input = if !app.prompt_takes_text() {
+        let input = if !takes_text {
             None
-        } else if prompt.is_some_and(|prompt| prompt.secret()) {
+        } else if page.is_none() && prompt.is_some_and(|prompt| prompt.secret()) {
             // Never give a password to the renderer. Map source graphemes onto
             // mask bytes before using the same layout as a regular input field.
             let editor = &app.prompt_input().editor;
@@ -67,7 +144,7 @@ impl PromptLayout {
             masked.set_selection(anchor, cursor);
             Some(masked.layout(width as usize))
         } else {
-            Some(app.prompt_input().editor.layout(width as usize))
+            Some(state.editor.layout(width as usize))
         };
         let input_label = page
             .as_ref()
@@ -84,15 +161,24 @@ impl PromptLayout {
             title_start,
             options,
             selected_start,
+            side,
             input,
             input_label,
+            floor: 0,
         }
     }
 
+    /// Rows the suggestions want, with a preview beside them as tall as either.
+    fn option_rows(&self) -> usize {
+        let side = self.side.as_ref().map_or(0, |side| side.rows);
+        self.options.len().max(side)
+    }
+
     pub(super) fn height(&self) -> u16 {
-        let sections = self.body.len() + self.options.len() + self.input_rows();
+        let sections = self.body.len() + self.option_rows() + self.input_rows();
         let padding = self.padding().into_iter().sum::<u16>();
-        (sections + usize::from(padding) + 1).min(u16::MAX as usize) as u16
+        let own = (sections + usize::from(padding) + 1).min(u16::MAX as usize) as u16;
+        own.max(self.floor)
     }
 
     /// The top margin, gap above any input, and gap above the shortcut help.
@@ -105,7 +191,7 @@ impl PromptLayout {
     }
 
     fn areas(&self, rect: Rect) -> PromptAreas {
-        let wanted = [self.body.len(), self.options.len(), self.input_rows()];
+        let wanted = [self.body.len(), self.option_rows(), self.input_rows()];
         let help_height = rect.height.min(1);
         let mut remaining = rect.height - help_height;
         // Padding gives way before clipping content or hiding the editable answer.
@@ -193,27 +279,29 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
             style.bg(theme().ui.input),
         );
     }
-    app.render.prompt_option_rows = option_lines.len();
+    let option_rows = layout.option_rows();
+    app.render.prompt_option_rows = option_rows;
     let input = app.prompt_input_mut();
     let reveal = (!input.options_scrolled).then_some(selected_start);
     input.options_scrolled = true;
-    let options_top = (input.options).fit(option_height.into(), option_lines.len(), reveal);
+    let options_top = (input.options).fit(option_height.into(), option_rows, reveal);
     let mut cursor_drawn = false;
+    let option_width = (layout.side.as_ref()).map_or(areas.options.width, |side| side.options);
     for (offset, line) in option_lines
         .iter()
         .skip(options_top)
         .take(option_height as usize)
         .enumerate()
     {
-        let row = r(
-            2,
-            areas.options.y + offset as u16,
-            rect.width.saturating_sub(4),
-            1,
-        );
+        let row = r(2, areas.options.y + offset as u16, option_width, 1);
         let style = line.style(app.prompt_input().choice);
         render_line(&Line::from(line.marker), row, frame.buffer_mut(), style);
-        let text = r(row.x + 2, row.y, row.width.saturating_sub(2), 1);
+        let text = r(
+            row.x + MARKER_WIDTH,
+            row.y,
+            row.width.saturating_sub(MARKER_WIDTH),
+            1,
+        );
         let (text_line, layout) = (&line.text.line, &line.text.layout);
         render_row_line(text_line, layout, text, frame.buffer_mut(), style);
         if line.index == app.prompt_input().choice
@@ -225,6 +313,20 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
             cursor_drawn = true;
         }
         app.render.hits.push((row, Hit::PromptChoice(line.index)));
+    }
+    if let Some(side) = &layout.side {
+        let x = areas.options.x + side.options + PREVIEW_GAP;
+        let width = (areas.options.width).saturating_sub(side.options + PREVIEW_GAP);
+        let style = Style::default().fg(theme().ui.fg).bg(theme().ui.input);
+        // The view scrolls over the suggestions and the tallest preview, so the focused
+        // preview follows it only as far as its own last row.
+        let overflow = side.lines.len().saturating_sub(option_height.into());
+        let shown = side.lines.iter().skip(options_top.min(overflow));
+        let shown = shown.take(option_height.into());
+        for (offset, line) in shown.enumerate() {
+            let row = r(x, areas.options.y + offset as u16, width, 1);
+            render_row_line(&line.line, &line.layout, row, frame.buffer_mut(), style);
+        }
     }
     let label_height = layout
         .input_label
@@ -285,8 +387,10 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
                 "←→ switch · Tab edit".to_owned()
             };
             let (index, count) = (app.page_index() + 1, app.question_count());
-            let hint =
-                format!("{page} {index}/{count} · {keys} · ↑↓ choose · Enter answer · Esc cancel");
+            let tick = tick_hint(app);
+            let hint = format!(
+                "{page} {index}/{count} · {keys} · ↑↓ choose{tick} · Enter answer · Esc cancel"
+            );
             (hint, theme().ui.warning)
         }
         kind => {
@@ -294,8 +398,9 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
                 Some(crate::interaction::PromptKind::Approval { .. }) => "dismiss",
                 _ => "cancel",
             };
+            let tick = tick_hint(app);
             let hint = format!(
-                "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {escape}"
+                "↑↓ choose{tick} · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {escape}"
             );
             (hint, theme().ui.muted)
         }
@@ -487,34 +592,102 @@ fn plain_line(text: String) -> markdown::LayoutLine {
     }
 }
 
-/// Wrap labels and `lay_out` Markdown descriptions independently so
-/// descriptions always start on a new line, and measure exactly the rows that
-/// draw_prompt will paint.
+/// The narrowest panel that shows a preview beside the suggestions rather than under one.
+const SIDE_PREVIEW_WIDTH: u16 = 90;
+/// Columns between the suggestions and the preview beside them.
+const PREVIEW_GAP: u16 = 2;
+/// Columns of a suggestion's `> ` focus marker, which its text and a preview under it follow.
+const MARKER_WIDTH: u16 = 2;
+
+/// A question batch's tabs, wrapped between tabs to `width`: the one in view inverted,
+/// those answered ticked, those open muted.
+fn tab_lines(
+    tabs: &[(String, crate::tui::app::TabState)],
+    width: usize,
+) -> Vec<markdown::LayoutLine> {
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut used = 0;
+    for (header, state) in tabs {
+        let (text, style) = match state {
+            crate::tui::app::TabState::Current => (
+                format!(" {header} "),
+                Style::default()
+                    .fg(theme().ui.input)
+                    .bg(theme().ui.emphasis)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            crate::tui::app::TabState::Answered => (
+                format!("✓ {header}"),
+                Style::default().fg(theme().ui.success),
+            ),
+            crate::tui::app::TabState::Open => {
+                (format!("○ {header}"), Style::default().fg(theme().ui.muted))
+            }
+        };
+        let tab = model::clean(&text);
+        let tab_width = tab.width();
+        match lines.last_mut() {
+            Some(line) if used + 2 + tab_width <= width => {
+                line.push(Span::raw("  "));
+                line.push(Span::styled(tab, style));
+                used += 2 + tab_width;
+            }
+            _ => {
+                lines.push(vec![Span::styled(tab, style)]);
+                used = tab_width;
+            }
+        }
+    }
+    let line = |spans: Vec<Span<'static>>| markdown::LayoutLine {
+        line: Line::from(spans),
+        ..markdown::LayoutLine::default()
+    };
+    lines.into_iter().map(line).collect()
+}
+
+/// Space ticks the focused suggestion of a question taking several, until text is typed.
+fn tick_hint(app: &App) -> &'static str {
+    let tickable = app.question_page().is_some_and(|page| page.tickable());
+    if tickable && app.prompt_input().editor.text().is_empty() {
+        " · Space tick"
+    } else {
+        ""
+    }
+}
+
+/// Each suggestion's label and description, laid out after its marker within `width`, the
+/// selected one followed by `stacked`, its preview, when it is not shown beside them.
 fn prompt_option_lines(
     options: &[(String, String)],
     selected: usize,
     width: u16,
+    mut stacked: Option<Vec<markdown::LayoutLine>>,
     mut lay_out: impl FnMut(&str, usize) -> Vec<markdown::LayoutLine>,
 ) -> (Vec<PromptOptionLine>, usize) {
-    let width = width.saturating_sub(2) as usize;
+    let width = width.saturating_sub(MARKER_WIDTH) as usize;
     let mut option_lines = Vec::new();
     let mut selected_start = 0;
     for (index, (label, description)) in options.iter().enumerate() {
         if index == selected {
             selected_start = option_lines.len();
         }
-        let label = wrap_plain(&model::clean(label), width).into_iter();
-        option_lines.extend(label.enumerate().map(|(offset, line)| PromptOptionLine {
+        let label = lay_out(&model::clean(label), width).into_iter();
+        option_lines.extend(label.enumerate().map(|(offset, text)| PromptOptionLine {
             index,
             marker: if offset == 0 && index == selected {
                 "> "
             } else {
                 "  "
             },
-            text: plain_line(line),
+            text,
             description: false,
         }));
-        let description = lay_out(&model::clean(description), width);
+        let mut description = lay_out(&model::clean(description), width);
+        if index == selected
+            && let Some(preview) = stacked.take()
+        {
+            description.extend(preview);
+        }
         option_lines.extend(description.into_iter().map(|text| PromptOptionLine {
             index,
             marker: "  ",
@@ -531,7 +704,6 @@ mod tests {
     use crate::interaction::{Prompt, PromptKind};
     use crate::tui::app::tests::draft_fixture;
     use crossterm::event::Event;
-    use skyhook::agent::Question;
     use skyhook::remote::SensitivePromptKind;
     use tokio::sync::oneshot;
 
@@ -563,10 +735,10 @@ mod tests {
             assert!(row(cursor.y).contains(answer), "{width}x{height}");
             assert_eq!(cursor.x, areas.input.x + answer.width() as u16);
         }
-        let content_rows = layout.body.len() + layout.options.len() + layout.input_rows();
+        let content_rows = layout.body.len() + layout.option_rows() + layout.input_rows();
         if usize::from(app.render.composer_rect.height) > content_rows {
             assert_eq!(usize::from(areas.body.height), layout.body.len());
-            assert_eq!(usize::from(areas.options.height), layout.options.len());
+            assert_eq!(usize::from(areas.options.height), layout.option_rows());
             assert_eq!(usize::from(areas.input.height), layout.input_rows());
         }
         if app.render.composer_rect.height == layout.height() {
@@ -586,15 +758,165 @@ mod tests {
         }
     }
 
+    /// The focused suggestion's preview stands beside the suggestions in a wide panel and
+    /// under that suggestion in a narrow one, wrapping within the room after its marker;
+    /// a suggestion without one says so.
+    #[tokio::test]
+    async fn previews_stand_beside_wide_suggestions_and_under_narrow_ones() {
+        use crate::tui::app::tests::{asking, fixture, option, titled};
+        let (_root, mut app) = fixture().await;
+        let edge = format!("{} edgemark", "x".repeat(46));
+        let previewed = skyhook::agent::QuestionOption {
+            preview: Some(format!("`shape-a`\n\n{edge}").parse().unwrap()),
+            ..option("a", "First")
+        };
+        let options = vec![previewed, option("b", "Second")];
+        let _asked = asking(
+            &mut app,
+            false,
+            vec![titled("shape", "Which shape?", options)],
+        );
+        let rows = |app: &mut App, width| {
+            let screen = crate::tui::app::tests::draw_sized(app, width, 40);
+            screen.lines().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let wide = rows(&mut app, 120);
+        assert!(
+            wide.iter()
+                .any(|row| row.contains("1: a") && row.contains("shape-a")),
+            "{wide:#?}"
+        );
+        let narrow = rows(&mut app, 60);
+        let label = narrow.iter().position(|row| row.contains("1: a")).unwrap();
+        let preview = narrow
+            .iter()
+            .position(|row| row.contains("shape-a"))
+            .unwrap();
+        assert!(
+            preview > label && !narrow[label].contains("shape-a"),
+            "{narrow:#?}"
+        );
+        assert!(
+            narrow.iter().any(|row| row.contains("edgemark")),
+            "{narrow:#?}"
+        );
+        app.prompt_input_mut().choice = 1;
+        let wide = rows(&mut app, 120);
+        assert!(
+            wide.iter().any(|row| row.contains("No preview")),
+            "{wide:#?}"
+        );
+        assert!(!wide.iter().any(|row| row.contains("shape-a")), "{wide:#?}");
+    }
+
+    /// A preview beside the suggestions taller than the panel scrolls with them; one
+    /// fitting it stays in view however far they scroll, by hand or to reach a
+    /// suggestion.
+    #[tokio::test]
+    async fn side_previews_scroll_only_as_far_as_they_overflow() {
+        use crate::tui::app::tests::{asking, draw_sized, fixture, option, titled};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_root, mut app) = fixture().await;
+        let tall = (0..30)
+            .map(|row| format!("row {row}\n\n"))
+            .collect::<String>();
+        let preview = |index, text: String| skyhook::agent::QuestionOption {
+            preview: Some(text.parse().unwrap()),
+            ..option(&format!("choice {index}"), "Why")
+        };
+        let options = std::iter::once(preview(0, format!("{tall}last-row")))
+            .chain((1..12).map(|index| preview(index, format!("preview-{index}"))))
+            .collect();
+        let _asked = asking(&mut app, false, vec![titled("many", "Which?", options)]);
+        let press = |app: &mut App, key: KeyEvent, times| {
+            for _ in 0..times {
+                draw_sized(app, 120, 20);
+                app.event(Event::Key(key));
+            }
+            draw_sized(app, 120, 20)
+        };
+        let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL);
+        let screen = press(&mut app, page_down, 30);
+        assert!(screen.contains("last-row"), "{screen}");
+        let screen = press(&mut app, KeyEvent::from(KeyCode::Down), 1);
+        assert!(screen.contains("preview-1"), "{screen}");
+        let screen = press(&mut app, KeyEvent::from(KeyCode::Down), 10);
+        assert!(screen.contains("preview-11"), "{screen}");
+    }
+
+    /// Previews of different sizes take the same room, their code boxes the column's
+    /// width, so moving between suggestions moves nothing, beside them or under them.
+    #[tokio::test]
+    async fn every_preview_takes_the_room_of_the_tallest() {
+        use crate::tui::app::tests::{asking, fixture, option, titled};
+        let (_root, mut app) = fixture().await;
+        let previewed = |label, preview: &str| skyhook::agent::QuestionOption {
+            preview: Some(preview.parse().unwrap()),
+            ..option(label, "Why")
+        };
+        let options = vec![
+            previewed("short", "```rust\nlet a = 1;\n```"),
+            previewed(
+                "long",
+                "```rust\nlet b = 2;\nlet c = 3;\nlet longer_name = 4;\n```",
+            ),
+        ];
+        let _asked = asking(&mut app, false, vec![titled("shape", "Which?", options)]);
+        for width in [120, 60] {
+            let shown = |app: &mut App, choice| {
+                app.prompt_input_mut().choice = choice;
+                let layout = PromptLayout::new(app, width);
+                let preview = match &layout.side {
+                    Some(side) => side.lines.clone(),
+                    None => (layout.options.iter())
+                        .filter(|line| line.index == choice && line.description)
+                        .map(|line| line.text.clone())
+                        .collect(),
+                };
+                let boxes: Vec<_> = (preview.iter())
+                    .filter_map(|line| line.layout.code().map(|code| code.width()))
+                    .collect();
+                (
+                    layout.height(),
+                    layout.option_rows(),
+                    boxes.first().copied(),
+                )
+            };
+            let (short, long) = (shown(&mut app, 0), shown(&mut app, 1));
+            assert_eq!((short.0, short.1), (long.0, long.1), "width {width}");
+            assert_eq!(short.2, long.2, "width {width}");
+        }
+    }
+
+    /// A batch keeps the height of its tallest question on every page, review included,
+    /// so switching between them leaves the panel still.
+    #[tokio::test]
+    async fn a_batch_keeps_its_tallest_pages_height() {
+        use crate::tui::app::tests::{asking, fixture, option, titled};
+        let (_root, mut app) = fixture().await;
+        let many = (0..6)
+            .map(|index| option(&format!("choice {index}"), "Why"))
+            .collect();
+        let long = "Which?\n\n- first point\n- second point\n- third point";
+        let batch = vec![titled("short", "Yes?", vec![]), titled("long", long, many)];
+        let _asked = asking(&mut app, false, batch);
+        let heights: Vec<_> = (0..3)
+            .map(|page| {
+                app.select_page(page);
+                PromptLayout::new(&app, 80).height()
+            })
+            .collect();
+        assert!(
+            heights.iter().all(|height| *height == heights[1]),
+            "{heights:?}"
+        );
+    }
+
     #[tokio::test]
     async fn question_answer_and_cursor_survive_collapsed_prompt_padding() {
         let (_root, mut app) = draft_fixture().await;
         let (reply, _answer) = oneshot::channel();
-        let question = Question {
-            id: "answer".into(),
-            prompt: "What should I call you?".into(),
-            options: vec![],
-        };
+        let question = crate::tui::app::tests::titled("answer", "What should I call you?", vec![]);
         app.prompt(Prompt {
             id: 1,
             kind: PromptKind::Questions {
@@ -663,7 +985,7 @@ mod tests {
             let lay_out = |source: &str, width| {
                 markdown::layout_highlighted(source, false, width, None).lines
             };
-            let (rows, selected_start) = prompt_option_lines(&options, 1, width, lay_out);
+            let (rows, selected_start) = prompt_option_lines(&options, 1, width, None, lay_out);
             assert_eq!(rows[selected_start].index, 1);
             assert_eq!(rows[selected_start].marker, "> ");
             assert_eq!(rows.iter().filter(|row| row.marker == "> ").count(), 1);

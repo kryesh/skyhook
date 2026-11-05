@@ -11,7 +11,9 @@ pub(crate) use docs::{DOCUMENTED, ScriptManifest, job_view_type};
 pub(crate) use envelope::{BACKGROUND, split_envelope};
 pub use envelope::{ExecutionEnvelope, JobLaunch, JobName, TARGET};
 pub use options::ToolOptions;
-pub use registration::{CatalogBuilder, input_schema_for, result_schema};
+pub use registration::{
+    CatalogBuilder, input_schema_for, input_settings, reflow_description, result_schema,
+};
 pub(crate) use schema::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 pub(crate) use surface::AgentLevel;
 pub use surface::{Catalog, ToolSpec, ToolSurface};
@@ -315,6 +317,10 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
 
     pub(crate) const fn placement(&self) -> ToolPlacement {
         self.execution.placement
+    }
+
+    pub(crate) const fn supports_background(&self) -> bool {
+        self.definition.supports_background
     }
 
     pub(crate) const fn accepts_input(&self) -> bool {

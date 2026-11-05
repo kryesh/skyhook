@@ -6,7 +6,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap};
 
-use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use skyhook::tool::{
@@ -141,7 +141,7 @@ pub(super) fn schema<A: Action>(capabilities: &CapabilitySet) -> Option<Value> {
 }
 
 fn generator() -> SchemaGenerator {
-    SchemaSettings::default().for_deserialize().into_generator()
+    skyhook::tool::input_settings().into_generator()
 }
 
 /// The object root taking `actions`: `action` names one, and every argument any of them

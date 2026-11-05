@@ -268,7 +268,7 @@ struct JobArgs {
 struct JobSendArgs {
     /// Destination job ID. For child updates or answers, use the agent job; for receive(), use the background script job.
     job: JobId,
-    /// JSON input. For merged child questions, pass an object keyed directly by question ID.
+    /// JSON input. For merged child questions, pass an object keyed directly by question header.
     value: Value,
 }
 

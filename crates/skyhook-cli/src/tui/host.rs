@@ -83,10 +83,11 @@ pub async fn observed(
         if let Some(model) = model {
             session.activate_on(model).await?;
         }
-        Ok::<_, LaunchError>(
-            PreparedObservation::load(session.clone(), extension, super::model::Budget::DEFAULT)
-                .await?,
-        )
+        let scope = extension.scope(&session).await?;
+        let budget = super::model::Budget::DEFAULT;
+        let mut observation = PreparedObservation::load(session.clone(), extension, budget).await?;
+        observation.scope = scope;
+        Ok::<_, LaunchError>(observation)
     }
     .await;
     match result {

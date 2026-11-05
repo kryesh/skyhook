@@ -727,7 +727,6 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use serde_json::json;
     use skyhook::agent::AgentActivity;
-    use skyhook::agent::Question;
     use skyhook::provider::protocol::AssistantItem;
     use skyhook::session::SessionEvent;
     use std::time::Duration;
@@ -1077,10 +1076,9 @@ mod tests {
         let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
         app.render = RenderState::new(app.selected.clone(), notify);
         let source = "let answer = 42;";
-        let question = |id: &str, language: &str| Question {
-            id: id.into(),
-            prompt: format!("```{language}\n{source}\n```"),
-            options: vec![],
+        let question = |header: &str, language: &str| {
+            let prompt = format!("```{language}\n{source}\n```");
+            crate::tui::app::tests::titled(header, &prompt, vec![])
         };
         let (reply, _answer) = tokio::sync::oneshot::channel();
         let questions = vec![question("first", "rust"), question("second", "c")];

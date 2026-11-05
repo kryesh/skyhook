@@ -241,7 +241,7 @@ async fn runs(
 fn run_detail(store: &Store) -> Result<String, crate::store::Error> {
     let state = store.run_state()?;
     let mut out = String::new();
-    (state.page(store, &Disclosed::whole())?).render(&mut out);
+    (state.page(store, &Disclosed::whole(), None)?).render(&mut out);
     Ok(out)
 }
 

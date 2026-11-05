@@ -280,6 +280,13 @@ alone. `Enter` saves the title, and saving it empty returns the session to its a
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.
+A question batch heads its prompt with each question's header as a tab: the one in view
+highlighted, `✓` answered, `○` still open, then Review, which `→` reaches from the last question
+however many are answered and which lists each answer, unanswered ones marked. Options the agent
+recommends are tagged; nothing starts chosen. When options carry previews, the focused option's preview stands beside
+the options in a wide terminal and under the option in a narrow one. Every preview takes the
+room of the tallest, so moving between options keeps the panel still; likewise every page of a
+batch keeps the height of its tallest question.
 In multi-question prompts, `←`/`→` switches questions while navigating choices, preserving
 each question's selected option and unfinished text. Typing enters text-editing mode, where
 `←`/`→` moves the cursor; `Tab` switches between editing and question navigation. `Enter`
@@ -287,7 +294,10 @@ confirms an answer and advances to an unanswered question; switching alone never
 The mouse wheel scrolls the text or choices beneath the pointer. Drafts remain intact while
 answering questions or inspecting details.
 Question choices are suggestions: you can select one, optionally add a comment, or provide
-a free-form answer. For answering agent questions from a script, see
+a free-form answer. A question taking several answers shows a box beside each option;
+`Space` ticks or unticks the focused option until you type.
+Text written on the last choice is another answer, and text written on an option is a comment
+on the ticked ones. For answering agent questions from a script, see
 [jobs and agents](../scripting/jobs-and-agents.md#delegation-and-child-input).
 
 See [sessions and context](sessions-and-context.md) for compaction and persistence,

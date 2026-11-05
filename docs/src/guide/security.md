@@ -366,24 +366,28 @@ instructions in the composer: `Shift+Tab` moves between the fields and the compo
 change a choice, digits edit the workers. The first message sends the panel's values with it; with
 no instructions the session starts with "Analyze the workspace." Once the run has started the
 panel stays in view, frozen; a session that fails to start leaves it editable for the next try.
+A reopened session shows the panel frozen with the values its run runs under, including a
+`--workers` resize that applies once its work resumes.
 
 The Research tab (`]` from Jobs, or click its header) takes the whole screen below the tab
-strip and views the root agent again, so the status beside it is the session's own. It opens on a dashboard of the run: its threshold, live policy and workers, the synthesis,
+strip and views the root agent again, so the status beside it is the session's own. It opens on a dashboard of the run: its threshold, live policy and workers, when this
+window opened the session and how long ago (reopening starts it again), the synthesis,
 a pipeline showing where each phase stands (what it owes, has running and has exhausted), and
 panels for coverage (states, paths swept and unswept, uncovered interfaces, paths outside the
 scope, components reached or mapped only,
 premises undecided, asked and disputed, flaws by status), candidates by status, and the tasks
 running and exhausted in each phase. Below it, sections list the candidates, findings, paths,
-tasks, flaws, premises, components and states, each most relevant first: candidates by standing
+running tasks, task history, flaws, premises, components and states, each most relevant first: candidates by standing
 (demonstrated, validated, shortlisted, unproven, unassessed, then the rest); findings by their best
 score; paths unswept first; flaws confirmed first; premises awaiting your answer first; states
 checked across calls (instance and handed) first. Within each group, rows with work running come
 first, then work owed, then work exhausted, then none; candidates and flaws then by score. Each
 path, state, premise, flaw and
-candidate shows what it owes and its last task, and opens to its latest tasks. Tasks are listed
-running first, then queued, failed and cancelled ones, each newest first, with their phase,
-subjects, state (as their agent's job stands), and when they began and ended; a task opens to its brief, its agent's
-reply and the records the agent wrote. Click a section's header, or choose it with `↑`/`↓` and
+candidate shows what it owes and its last task, and opens to its latest tasks. Running tasks
+(their agent's job still live) and the task history (jobs that ended) are listed apart, each newest
+first, with their phase, state (as their agent's job stands), when they began or ended, subjects
+and the first line of their brief; a task opens to its whole brief, its agent's reply and the
+records the agent wrote. Click a section's header, or choose it with `↑`/`↓` and
 press `Enter`, to open it; a record opens the same way to its detail, a candidate to its whole
 scenario: actions, chain, premises, assessment, verdict, tests and evidence, with an assessment
 or verdict that no longer stands marked stale. A candidate whose assessment or verdict no longer

@@ -180,6 +180,7 @@ impl SessionFactory for ResearchFactory {
                 facts: Cached::default(),
                 coverage: Cached::default(),
                 page: Cached::default(),
+                opened: research_view::Opened::now(),
                 quiet: Default::default(),
             });
             let builder = builder
@@ -207,9 +208,10 @@ pub struct ResearchSession {
     /// What the run holds as the Research page last read it, reused until research is written:
     /// no job's state bears on it.
     coverage: Cached<Generation, Coverage>,
-    /// The last Research page, with what it was read at and for: an unchanged store and
-    /// disclosure read nothing.
-    page: Cached<(Watermark, Disclosed), skyhook_cli::page::Page>,
+    /// The last Research page, with what it was read at and for: an unchanged store,
+    /// disclosure and uptime read nothing.
+    page: Cached<(Watermark, Disclosed, research_view::Uptime), skyhook_cli::page::Page>,
+    opened: research_view::Opened,
     /// Each agent found with nothing to be told at a research generation and cursor: it stays
     /// so until research is written.
     quiet: std::sync::Mutex<std::collections::HashMap<AgentId, (u64, Option<HostCursor>)>>,
@@ -397,7 +399,7 @@ impl SessionExtension for ResearchSession {
     ) -> HookFuture<'_, Arc<skyhook_cli::page::Page>> {
         Box::pin(async move {
             let store = research(session.store())?;
-            let mark = Watermark::of(&store).await?;
+            let (mark, uptime) = (Watermark::of(&store).await?, self.opened.uptime());
             let read = async {
                 let facts = cached(&self.facts, mark, store.clone(), Store::run_facts).await?;
                 let coverage = cached(
@@ -415,11 +417,11 @@ impl SessionExtension for ResearchSession {
                             coverage,
                             open_tests: reader.open_tests()?,
                         };
-                        state.page(&reader, &open).map_err(skyhook_cli::Error::from)
+                        (state.page(&reader, &open, Some(uptime))).map_err(skyhook_cli::Error::from)
                     })
                     .await
             };
-            self.page.get((mark, open.clone()), read).await
+            self.page.get((mark, open.clone(), uptime), read).await
         })
     }
 
@@ -454,6 +456,31 @@ impl SessionExtension for ResearchSession {
                 })
                 .await?;
             Ok(())
+        })
+    }
+
+    fn scope<'a>(&'a self, session: &'a SessionHandle) -> HookFuture<'a, Option<ScopeForm>> {
+        Box::pin(async move {
+            let store = research(session.store())?;
+            let reader = store.clone();
+            let run = store
+                .reading(move || {
+                    let run = match reader.initialized()? {
+                        true => Some(reader.run()?),
+                        false => None,
+                    };
+                    Ok::<_, skyhook_cli::Error>(run)
+                })
+                .await?;
+            // A resize this launch applies once the run's work resumes is shown from the start.
+            let scope = run.map(|run| Scope {
+                options: RunOptions {
+                    workers: self.resize.unwrap_or(run.options.workers),
+                    ..run.options
+                },
+                live: run.live,
+            });
+            Ok(scope.map(|scope| scope.form("Scope".to_owned(), &ScopeField::ALL, String::new())))
         })
     }
 }
@@ -536,6 +563,7 @@ mod tests {
             facts: Cached::default(),
             coverage: Cached::default(),
             page: Cached::default(),
+            opened: research_view::Opened::now(),
             quiet: Default::default(),
         }
     }
@@ -712,9 +740,23 @@ mod tests {
             (run.live, run.options.workers.get())
         };
         let configured = RunOptions::default().workers.get();
+        // The terminal reads the scope as it opens the session, before its work resumes: it
+        // shows the run's own policy, not this launch's, and the resize this launch applies.
+        let scope = || async {
+            let scope = prepared.extension.scope(&viewed).await.unwrap().unwrap();
+            let shown = (scope.fields.iter()).map(|field| match &field.kind {
+                FieldKind::Choice(choice) => choice.options()[choice.selected()].clone(),
+                FieldKind::Integer { value, .. } => value.to_string(),
+            });
+            shown.collect::<Vec<_>>()
+        };
+        let threshold = RunOptions::default().threshold.as_str().to_owned();
+        let expected = [threshold, "no".to_owned(), "4".to_owned()];
+        assert_eq!(scope().await, expected);
         assert_eq!(settings(&store), (LivePolicy::No, configured));
         viewed.resume_work().await.unwrap();
         assert_eq!(settings(&store), (LivePolicy::No, 4));
+        assert_eq!(scope().await, expected);
         assert!(viewed.prompt("continue").await.is_err());
         let system = serde_json::to_string(&requests.0.lock().unwrap()[0].system).unwrap();
         assert!(!system.contains("## PoC gate"), "{system}");

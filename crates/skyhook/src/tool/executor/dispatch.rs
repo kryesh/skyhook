@@ -582,6 +582,57 @@ mod tests {
         router.shutdown().await;
     }
 
+    /// A model's call its turn moves while it is still connecting returns the moved job
+    /// at once; its start goes on, owning the job, and a cancellation still ends it.
+    #[tokio::test]
+    async fn a_call_moved_while_connecting_returns_at_once() {
+        use crate::remote::ShimFactory;
+
+        let runtime = crate::tests::TestRuntime::new().await;
+        let factory = ShimFactory::new();
+        let policy = Arc::new(crate::tool::policy::AllowAll);
+        let router = TargetRouter::test(&runtime.store, build(), policy).await;
+        let router = router.with_connection_factory(factory.clone());
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_product::<Arguments, serde_json::Value, _, _>(
+                "custom_remote",
+                "test",
+                ToolOptions::new(vec![Capability::Exec])
+                    .placement(ToolPlacement::TargetedWorkspace)
+                    .background(),
+                |_, _| async { panic!("remote job must not execute locally") },
+            )
+            .unwrap();
+        let executor = remote_executor(runtime.executor(builder), router.clone());
+        let (calling, agent) = (executor.clone(), runtime.agent.clone());
+        let arguments = serde_json::json!({"target": "build"});
+        let call = tokio::spawn(async move {
+            let model = InvocationKind::Model;
+            calling
+                .execute_as(model, agent, "custom_remote", arguments, None)
+                .await
+        });
+        // The factory never completes a handshake, so the call is still connecting.
+        factory.wait_for_hello().await;
+        let job = runtime.jobs.list(&runtime.agent).await.unwrap()[0].id;
+        runtime
+            .jobs
+            .move_calls(vec![job], crate::job::MoveTrigger::Event)
+            .await
+            .unwrap();
+        let moved = bounded(call).await.unwrap().unwrap();
+        let view = moved.output.value;
+        assert_eq!(view["state"], "running");
+        let notice = crate::job::Notice::MovedOnEvent.to_string();
+        assert_eq!(view["presentation"]["notice"], notice.as_str());
+        runtime.jobs.cancel(job).await.unwrap();
+        bounded(runtime.jobs.wait_settled(job)).await.unwrap();
+        let state = runtime.jobs.snapshot(job).await.unwrap().state;
+        assert_eq!(state, JobState::Cancelled);
+        router.shutdown().await;
+    }
+
     #[tokio::test]
     async fn route_approval_uses_the_job_subject_while_job_awaits_approval() {
         let runtime = crate::tests::TestRuntime::new().await;

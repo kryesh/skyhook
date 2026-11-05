@@ -24,6 +24,7 @@ mod pages;
 mod projection;
 pub use output::OutputStore;
 use output::{LoadedOutput, OutputAttempt};
+pub use prompts::{Page, TabState};
 #[cfg(test)]
 pub(super) mod played;
 mod prompts;
@@ -244,9 +245,11 @@ impl App {
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
         let draft = observation.is_none();
+        let mut scope = None;
         let (phase, snapshot, projection, window, budget) = match observation {
             Some(PreparedObservation {
                 active,
+                scope: opened,
                 budget,
                 shown:
                     observation::Shown {
@@ -256,9 +259,12 @@ impl App {
                         ..
                     },
             }) => (
-                Phase::Open {
-                    observation: active,
-                    attached_draft: None,
+                {
+                    scope = opened.and_then(scope::ScopePanel::sent);
+                    Phase::Open {
+                        observation: active,
+                        attached_draft: None,
+                    }
                 },
                 *snapshot,
                 *projection,
@@ -307,7 +313,7 @@ impl App {
             paused: None,
             operation: false,
             prompts: VecDeque::new(),
-            scope: None,
+            scope,
             menu: None,
             host: None,
             peers: Vec::new(),
@@ -739,27 +745,52 @@ pub(super) mod tests {
     ) -> QuestionReceiver {
         questions(app, false, vec![("answer", &prompt, options)])
     }
-    /// A reply answering each question id with plain text.
+    /// A reply answering each question header with plain text.
     pub(super) fn texts(answers: &[(&str, &str)]) -> QuestionReply {
         let answers = answers.iter();
         let text = |text: &str| QuestionAnswer::Text(text.into());
         answers
-            .map(|(id, answer)| (id.to_string(), text(answer)))
+            .map(|(header, answer)| (header.parse().unwrap(), text(answer)))
             .collect()
+    }
+    /// A suggestion labelled `label`, described by `description`.
+    pub(in crate::tui) fn option(label: &str, description: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.parse().unwrap(),
+            description: description.parse().unwrap(),
+            recommended: false,
+            preview: None,
+        }
+    }
+    /// A question titled `header` asking `prompt`, taking one answer.
+    pub(in crate::tui) fn titled(
+        header: &str,
+        prompt: &str,
+        options: Vec<QuestionOption>,
+    ) -> Question {
+        Question {
+            header: header.parse().unwrap(),
+            prompt: prompt.parse().unwrap(),
+            options,
+            multiple: false,
+        }
     }
     pub(super) fn questions(
         app: &mut App,
         background: bool,
         questions: Vec<(&str, &str, Vec<QuestionOption>)>,
     ) -> QuestionReceiver {
-        let questions: Vec<_> = questions
+        let questions = questions
             .into_iter()
-            .map(|(id, prompt, options)| Question {
-                id: id.into(),
-                prompt: prompt.into(),
-                options,
-            })
-            .collect();
+            .map(|(header, prompt, options)| titled(header, prompt, options));
+        asking(app, background, questions.collect())
+    }
+    /// Have the root ask `questions` as one batch.
+    pub(in crate::tui) fn asking(
+        app: &mut App,
+        background: bool,
+        questions: Vec<Question>,
+    ) -> QuestionReceiver {
         let (reply, receiver) = oneshot::channel();
         app.prompt(Prompt {
             id: 1,

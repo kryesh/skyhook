@@ -14,6 +14,47 @@ use crate::store::{FlawStatus, Phase, PremiseStatus, RunFacts, RunState, Status,
 mod sections;
 use sections::sections;
 
+/// When this process opened the session; a reopen starts it again.
+pub struct Opened {
+    at: chrono::DateTime<chrono::Local>,
+    since: std::time::Instant,
+}
+
+impl Opened {
+    pub fn now() -> Self {
+        Self {
+            at: chrono::Local::now(),
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// How long the session has been open, to the whole minute: the page is read again
+    /// only as often as that changes.
+    pub fn uptime(&self) -> Uptime {
+        Uptime {
+            at: self.at,
+            minutes: self.since.elapsed().as_secs() / 60,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Uptime {
+    at: chrono::DateTime<chrono::Local>,
+    minutes: u64,
+}
+
+impl Display for Uptime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (hours, minutes) = (self.minutes / 60, self.minutes % 60);
+        write!(f, "{} (", self.at.format("%H:%M"))?;
+        match hours {
+            0 => write!(f, "{minutes}m)"),
+            _ => write!(f, "{hours}h {minutes:02}m)"),
+        }
+    }
+}
+
 pub const VIEWS: &[ExtensionView] = &[ExtensionView {
     title: "Research",
     frame: ViewFrame::Page {
@@ -36,18 +77,25 @@ impl RunFacts {
 }
 
 impl RunState {
-    /// The Research tab: the run, where its plan stands, where each phase stands and
-    /// counts that use the width, then the record sections with what `disclosed` shows.
-    pub fn page(&self, store: &Store, disclosed: &Disclosed) -> Result<Page, crate::store::Error> {
+    /// The Research tab: the run, how long it has been open when it is, where its plan
+    /// stands, where each phase stands and counts that use the width, then the record
+    /// sections with what `disclosed` shows.
+    pub fn page(
+        &self,
+        store: &Store,
+        disclosed: &Disclosed,
+        uptime: Option<Uptime>,
+    ) -> Result<Page, crate::store::Error> {
         let facts = &self.facts;
         let summary = &facts.summary;
         let coverage = &self.coverage;
-        let header = vec![
+        let mut header = vec![
             fact("run", facts.run.id.to_string()),
             fact("threshold", facts.run.options.threshold.to_string()),
             fact("live", facts.run.live.to_string()),
             fact("workers", facts.run.options.workers.to_string()),
         ];
+        header.extend(uptime.map(|uptime| fact("opened", uptime.to_string())));
         let plan = Fact {
             label: "plan".to_owned(),
             value: Cell::new(

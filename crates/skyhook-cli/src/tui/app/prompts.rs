@@ -26,13 +26,64 @@ fn summary(answer: &QuestionAnswer) -> String {
     match answer {
         QuestionAnswer::Text(text) => text.clone(),
         QuestionAnswer::Commented { answer, comment } => format!("{answer} — {comment}"),
+        QuestionAnswer::Selected(answers) => answers.join(", "),
+        QuestionAnswer::SelectedCommented { answers, comment } => {
+            format!("{} — {comment}", answers.join(", "))
+        }
     }
 }
 
-#[derive(Default)]
 struct QuestionDraft {
     input: PromptInput,
+    /// Which options a question taking several has ticked, by index.
+    ticked: Vec<bool>,
     answer: Option<QuestionAnswer>,
+}
+
+impl QuestionDraft {
+    /// A page with nothing chosen yet: a recommendation is only tagged.
+    fn new(question: &Question) -> Self {
+        Self {
+            input: PromptInput::default(),
+            ticked: vec![false; question.options.len()],
+            answer: None,
+        }
+    }
+
+    /// The answer the page gives `question` as it stands: the focused suggestion or the
+    /// written text, or for a question taking several the ticked suggestions and any
+    /// written text. Text typed while a suggestion is focused comments on it.
+    fn answer(&self, question: &Question) -> Option<QuestionAnswer> {
+        let text = self.input.editor.text();
+        let written = !text.trim().is_empty();
+        let focused = question.options.get(self.input.choice);
+        if !question.multiple {
+            return Some(match focused {
+                Some(option) if !written => QuestionAnswer::Text(option.label.to_string()),
+                Some(option) => QuestionAnswer::Commented {
+                    answer: option.label.to_string(),
+                    comment: text.to_owned(),
+                },
+                None if !written => return None,
+                None => QuestionAnswer::Text(text.to_owned()),
+            });
+        }
+        let ticked = (question.options.iter().zip(&self.ticked)).filter(|(_, ticked)| **ticked);
+        let mut answers: Vec<_> = ticked.map(|(option, _)| option.label.to_string()).collect();
+        if focused.is_none() && written {
+            answers.push(text.to_owned());
+        }
+        if answers.is_empty() {
+            return None;
+        }
+        Some(match focused {
+            Some(_) if written => QuestionAnswer::SelectedCommented {
+                answers,
+                comment: text.to_owned(),
+            },
+            _ => QuestionAnswer::Selected(answers),
+        })
+    }
 }
 
 /// A question batch's pages: its questions, then review.
@@ -50,7 +101,7 @@ struct Batch {
 }
 impl Batch {
     fn new(questions: &[Question]) -> Self {
-        let drafts: Vec<_> = questions.iter().map(|_| QuestionDraft::default()).collect();
+        let drafts: Vec<_> = questions.iter().map(QuestionDraft::new).collect();
         let page = if drafts.is_empty() {
             BatchPage::Review
         } else {
@@ -108,7 +159,12 @@ impl Batch {
     }
     fn reply(&mut self, questions: Vec<Question>) -> QuestionReply {
         (questions.into_iter().zip(&mut self.drafts))
-            .map(|(question, draft)| (question.id, draft.answer.take().expect("confirmed answer")))
+            .map(|(question, draft)| {
+                (
+                    question.header,
+                    draft.answer.take().expect("confirmed answer"),
+                )
+            })
             .collect()
     }
 }
@@ -195,9 +251,10 @@ impl UiPrompt {
         let (questions, state) = self.batch()?;
         Some(match state.page {
             BatchPage::Question(index) => {
-                Page::Question(&questions[index], &state.drafts[index].input)
+                let draft = &state.drafts[index];
+                Page::Question(&questions[index], &draft.input, &draft.ticked)
             }
-            BatchPage::Review => Page::Review,
+            BatchPage::Review => Page::Review(review(questions, state)),
         })
     }
     /// Whether typed text is part of the answer on the current page: a choice's
@@ -235,40 +292,73 @@ impl Drop for PromptState {
 
 /// A question page as the panel lays it out.
 pub enum Page<'a> {
-    Question(&'a Question, &'a PromptInput),
-    Review,
+    Question(&'a Question, &'a PromptInput, &'a [bool]),
+    /// The summary of every question's answer so far, as Markdown.
+    Review(String),
 }
 impl Page<'_> {
     /// The page's own Markdown, laid out after the prompt's header.
     pub fn prompt(&self) -> Option<&str> {
         match self {
-            Self::Question(question, _) => Some(&question.prompt),
-            Self::Review => None,
+            Self::Question(question, ..) => Some(question.prompt.as_str()),
+            Self::Review(summary) => Some(summary),
         }
     }
-    /// Labelled suggestions with their descriptions, then the written answer.
+    /// Labelled suggestions with their descriptions, then the written answer. A question
+    /// taking several shows each suggestion's box; a recommended one says so.
     pub fn choices(&self) -> Vec<(String, String)> {
-        let Self::Question(question, _) = self else {
-            return Vec::new();
+        let Self::Question(question, _, ticked) = self else {
+            let review = REVIEW_ITEMS
+                .iter()
+                .map(|(_, label)| ((*label).to_owned(), String::new()));
+            return review.collect();
         };
-        (question.options.iter().enumerate())
-            .map(|(index, option)| {
-                (
-                    format!("{}: {}", index + 1, option.label),
-                    option.description.clone(),
-                )
+        (question.options.iter().zip(ticked.iter()).enumerate())
+            .map(|(index, (option, ticked))| {
+                let ticked = match (question.multiple, ticked) {
+                    (false, _) => "",
+                    (true, true) => "[x] ",
+                    (true, false) => "[ ] ",
+                };
+                let recommended = if option.recommended {
+                    " (recommended)"
+                } else {
+                    ""
+                };
+                let label = format!("{ticked}{}: {}{recommended}", index + 1, option.label);
+                (label, option.description.to_string())
             })
             .chain([(WRITE_ANSWER.into(), String::new())])
             .collect()
     }
+    /// Each suggestion's preview, and the focused one's index among them, when the
+    /// question has any.
+    pub fn previews(&self) -> Option<(Vec<Option<&str>>, usize)> {
+        let Self::Question(question, input, _) = self else {
+            return None;
+        };
+        let previews: Vec<_> = (question.options.iter())
+            .map(|option| option.preview.as_ref().map(|preview| preview.as_str()))
+            .collect();
+        previews
+            .iter()
+            .any(Option::is_some)
+            .then_some((previews, input.choice))
+    }
+    /// Whether the focused choice is a suggestion a question taking several ticks.
+    pub fn tickable(&self) -> bool {
+        matches!(self, Self::Question(question, input, _)
+            if question.multiple && input.choice < question.options.len())
+    }
     /// What the editor under the choices collects.
     pub fn input_label(&self) -> &'static str {
         match self {
-            Self::Question(question, input) if input.choice < question.options.len() => {
+            Self::Question(question, input, _) if input.choice < question.options.len() => {
                 "Comment (optional):"
             }
+            Self::Question(question, ..) if question.multiple => "Another answer (optional):",
             Self::Question(..) => "Answer:",
-            Self::Review => "",
+            Self::Review(_) => "",
         }
     }
 }
@@ -487,11 +577,11 @@ impl App {
         match &prompt.kind {
             PromptKind::Approval { request, .. } => labels(approval_items(request)),
             PromptKind::Questions { .. } => match prompt.page() {
-                Some(Page::Question(question, _)) => (question.options.iter())
+                Some(Page::Question(question, ..)) => (question.options.iter())
                     .map(|option| option.label.as_str())
                     .chain([WRITE_ANSWER])
                     .collect(),
-                Some(Page::Review) => labels(REVIEW_ITEMS.to_vec()),
+                Some(Page::Review(_)) => labels(REVIEW_ITEMS.to_vec()),
                 None => unreachable!("a question prompt has a page"),
             },
             PromptKind::Authentication { prompt, .. } if prompt.kind.is_confirmation() => {
@@ -513,29 +603,7 @@ impl App {
                 r.tool,
                 approval_preview(&r.arguments)
             ),
-            PromptKind::Questions {
-                questions, agent, ..
-            } => {
-                let (_, state) = prompt.batch().expect("question batch");
-                let header = format!("Agent {}", crate::tui::format::agent_label(agent));
-                match state.page {
-                    BatchPage::Review => {
-                        let answers = (questions.iter().zip(&state.drafts))
-                            .filter_map(|(question, draft)| {
-                                let answer = draft.answer.as_ref()?;
-                                Some(format!("{}: {}", question.id, summary(answer)))
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        format!("Review answers\n{answers}")
-                    }
-                    _ => format!(
-                        "{header} · question {}/{}",
-                        state.index() + 1,
-                        state.answerable()
-                    ),
-                }
-            }
+            PromptKind::Questions { agent, .. } => question_header(agent),
             PromptKind::Authentication { prompt, .. } => {
                 let target = (prompt.target.as_ref())
                     .map_or_else(String::new, |target| format!(" · {target}"));
@@ -551,11 +619,69 @@ impl App {
             }
         }
     }
+    /// What heads the front question batch's pages.
+    pub fn question_header(&self) -> Option<String> {
+        match &self.prompts.front()?.kind {
+            PromptKind::Questions { agent, .. } => Some(question_header(agent)),
+            _ => None,
+        }
+    }
+    /// The front question batch's question pages, as each would be shown.
+    pub fn question_pages(&self) -> Vec<Page<'_>> {
+        let Some((questions, batch)) = self.prompts.front().and_then(UiPrompt::batch) else {
+            return Vec::new();
+        };
+        (questions.iter().zip(&batch.drafts))
+            .map(|(question, draft)| Page::Question(question, &draft.input, &draft.ticked))
+            .collect()
+    }
+    /// The front question batch's tabs: each question's header, then review when there
+    /// are several, each with where it stands.
+    pub fn question_tabs(&self) -> Vec<(String, TabState)> {
+        let Some((questions, batch)) = self.prompts.front().and_then(UiPrompt::batch) else {
+            return Vec::new();
+        };
+        let state = |page, answered| match (batch.page == page, answered) {
+            (true, _) => TabState::Current,
+            (false, true) => TabState::Answered,
+            (false, false) => TabState::Open,
+        };
+        let pages = (questions.iter().zip(&batch.drafts)).enumerate();
+        let mut tabs: Vec<_> = pages
+            .map(|(index, (question, draft))| {
+                let state = state(BatchPage::Question(index), draft.answer.is_some());
+                (question.header.to_string(), state)
+            })
+            .collect();
+        if questions.len() > 1 {
+            tabs.push(("Review".to_owned(), state(BatchPage::Review, false)));
+        }
+        tabs
+    }
+    /// Tick or untick the focused suggestion of a question taking several; false when
+    /// the focus is on no such suggestion.
+    pub(super) fn toggle_choice(&mut self) -> bool {
+        if !self.question_page().is_some_and(|page| page.tickable()) {
+            return false;
+        }
+        let Some(batch) = self.prompts.front_mut().and_then(UiPrompt::batch_mut) else {
+            return false;
+        };
+        let BatchPage::Question(index) = batch.page else {
+            return false;
+        };
+        let draft = &mut batch.drafts[index];
+        let Some(ticked) = draft.ticked.get_mut(draft.input.choice) else {
+            return false;
+        };
+        *ticked = !*ticked;
+        true
+    }
     /// Whether the front prompt asks questions on pages to switch between.
     pub fn multiple_pages(&self) -> bool {
         self.question_count() > 1
     }
-    pub(super) fn select_page(&mut self, index: usize) {
+    pub(in crate::tui) fn select_page(&mut self, index: usize) {
         if let Some(batch) = self.prompts.front_mut().and_then(UiPrompt::batch_mut) {
             batch.select(index);
         }
@@ -564,13 +690,11 @@ impl App {
         let Some((_, batch)) = self.prompts.front().and_then(UiPrompt::batch) else {
             return;
         };
+        // Review follows the last question, open however many are answered.
         let count = batch.answerable();
         if count > 1 {
             let index = batch.index();
-            if index >= count && delta > 0 {
-                return;
-            }
-            self.select_page(index.saturating_add_signed(delta).min(count - 1));
+            self.select_page(index.saturating_add_signed(delta).min(count));
         }
     }
     /// An edited page must be confirmed again before submission.
@@ -608,17 +732,8 @@ impl App {
                 match state.page {
                     BatchPage::Question(index) => {
                         let draft = &mut state.drafts[index];
-                        let text = draft.input.editor.text();
-                        let answer = match questions[index].options.get(draft.input.choice) {
-                            Some(option) if text.trim().is_empty() => {
-                                QuestionAnswer::Text(option.label.clone())
-                            }
-                            Some(option) => QuestionAnswer::Commented {
-                                answer: option.label.clone(),
-                                comment: text.to_owned(),
-                            },
-                            None if text.trim().is_empty() => return,
-                            None => QuestionAnswer::Text(text.to_owned()),
+                        let Some(answer) = draft.answer(&questions[index]) else {
+                            return;
                         };
                         draft.answer = Some(answer);
                     }
@@ -690,6 +805,30 @@ impl App {
     }
 }
 
+/// Every question's answer so far, unanswered ones marked so.
+fn review(questions: &[Question], batch: &Batch) -> String {
+    let line = |(question, draft): (&Question, &QuestionDraft)| {
+        let answer = (draft.answer.as_ref()).map_or_else(|| "*unanswered*".to_owned(), summary);
+        format!("- **{}**: {answer}", question.header)
+    };
+    let lines: Vec<_> = questions.iter().zip(&batch.drafts).map(line).collect();
+    format!("Review answers\n\n{}", lines.join("\n"))
+}
+
+/// What heads a question batch from `agent`.
+fn question_header(agent: &skyhook::identity::AgentId) -> String {
+    format!("Agent {}", crate::tui::format::agent_label(agent))
+}
+
+/// Where a question batch's tab stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabState {
+    /// The page in view.
+    Current,
+    Answered,
+    Open,
+}
+
 /// Who asked, so a prompt the agent's own command raised stands apart from one
 /// raised by the program it claims to be.
 fn requester_text(requester: &Requester) -> String {
@@ -715,7 +854,7 @@ mod tests {
             return QuestionReply::new();
         };
         (questions.iter().zip(&state.drafts))
-            .filter_map(|(question, draft)| Some((question.id.clone(), draft.answer.clone()?)))
+            .filter_map(|(question, draft)| Some((question.header.clone(), draft.answer.clone()?)))
             .collect()
     }
     fn has_suspended_prompt(app: &App) -> bool {
@@ -723,10 +862,7 @@ mod tests {
     }
     fn suggestions() -> Vec<QuestionOption> {
         ["First", "Second"]
-            .map(|label| QuestionOption {
-                label: label.into(),
-                description: format!("Use {label}"),
-            })
+            .map(|label| option(label, &format!("Use {label}")))
             .into()
     }
     fn paste(app: &mut App, text: &str) {
@@ -753,10 +889,7 @@ mod tests {
 
         for focus in [Focus::Tree, Focus::Content] {
             app.focus = focus;
-            let option = QuestionOption {
-                label: "Continue".into(),
-                description: "Keep working".into(),
-            };
+            let option = option("Continue", "Keep working");
             let answer = question(&mut app, "Choose a direction".into(), vec![option]);
             assert!(app.prompt_shown());
             let screen = draw(&mut app);
@@ -769,6 +902,83 @@ mod tests {
             assert!(app.focus == focus);
             assert_eq!(app.editor.text(), "preserved draft");
         }
+    }
+
+    /// A recommendation is only tagged: nothing starts chosen. Space ticks the focused
+    /// suggestion of a question taking several until text is typed. Text written on the
+    /// last choice is another answer; text written on a suggestion comments on the
+    /// ticked ones.
+    #[tokio::test]
+    async fn nothing_starts_chosen_and_space_ticks_several() {
+        let (_root, mut app) = fixture().await;
+        let recommended = |label, recommended| QuestionOption {
+            recommended,
+            ..option(label, "Why")
+        };
+        let options = || {
+            vec![
+                recommended("a", false),
+                recommended("b", true),
+                recommended("c", true),
+            ]
+        };
+        let one = titled(
+            "one",
+            "Pick one",
+            vec![recommended("a", false), recommended("b", true)],
+        );
+        let answer = asking(&mut app, false, vec![one]);
+        key(&mut app, Enter, M::NONE);
+        assert_eq!(answer.await.unwrap().unwrap(), texts(&[("one", "a")]));
+
+        let several = || Question {
+            multiple: true,
+            ..titled("several", "Pick several", options())
+        };
+        let selected = |answers: &[&str]| answers.iter().map(|answer| answer.to_string()).collect();
+        let reply = |answer| QuestionReply::from([("several".parse().unwrap(), answer)]);
+        // Nothing starts ticked; Space ticks `a` and `b`; written text is another answer.
+        let answer = asking(&mut app, false, vec![several()]);
+        let screen = draw(&mut app);
+        assert!(screen.contains("[ ] 2: b (recommended)"), "{screen}");
+        assert!(screen.contains("Space tick"), "{screen}");
+        // Nothing ticked or written answers nothing.
+        key(&mut app, Enter, M::NONE);
+        assert!(app.prompt_shown());
+        press(&mut app, &[Char(' '), Down, Char(' '), Down, Down]);
+        paste(&mut app, "d e");
+        key(&mut app, Enter, M::NONE);
+        let expected = QuestionAnswer::Selected(selected(&["a", "b", "d e"]));
+        assert_eq!(answer.await.unwrap().unwrap(), reply(expected));
+        // Typed on a suggestion, text is a comment, and Space is part of it.
+        let answer = asking(&mut app, false, vec![several()]);
+        press(&mut app, &[Char(' '), Char('n'), Char(' '), Char('b')]);
+        key(&mut app, Enter, M::NONE);
+        let expected = QuestionAnswer::SelectedCommented {
+            answers: selected(&["a"]),
+            comment: "n b".into(),
+        };
+        assert_eq!(answer.await.unwrap().unwrap(), reply(expected));
+    }
+
+    /// A batch's header names each question as a tab: the one in view, those answered,
+    /// those still open, then review.
+    #[tokio::test]
+    async fn a_batch_shows_its_questions_as_tabs() {
+        let (_root, mut app) = fixture().await;
+        let batch = vec![
+            ("auth", "How?", suggestions()),
+            ("deploy", "Where?", suggestions()),
+        ];
+        let _answer = questions(&mut app, false, batch);
+        let tabs = |states: [TabState; 3]| {
+            let headers = ["auth", "deploy", "Review"].map(str::to_owned);
+            headers.into_iter().zip(states).collect::<Vec<_>>()
+        };
+        use TabState::{Answered, Current, Open};
+        assert_eq!(app.question_tabs(), tabs([Current, Open, Open]));
+        key(&mut app, Enter, M::NONE);
+        assert_eq!(app.question_tabs(), tabs([Answered, Current, Open]));
     }
 
     #[tokio::test]
@@ -808,7 +1018,12 @@ mod tests {
         let input = app.prompt_input_mut();
         assert_eq!((input.body.top, input.options.top), (0, 0));
         paste(&mut app, "draft");
-        press(&mut app, &[Tab, Right, Right]);
+        // Review follows the last question, open with answers missing, and clamps.
+        press(&mut app, &[Tab, Right, Right, Right]);
+        assert_eq!(app.page_index(), 3);
+        let review = app.question_page().unwrap().prompt().unwrap().to_owned();
+        assert!(review.contains("**middle**: *unanswered*"), "{review}");
+        key(&mut app, Left, M::NONE);
         assert_eq!(app.page_index(), 2);
         assert!(app.prompt_input_mut().editor.text().is_empty());
         assert!(confirmed_answers(&app).is_empty());
@@ -1003,7 +1218,8 @@ mod tests {
         assert!(app.prompt_input_mut().editor.text().is_empty());
         paste(&mut app, "freeform");
         key(&mut app, Enter, M::NONE);
-        assert!(app.prompt_text().contains("my comment"));
+        let review = app.question_page().unwrap().prompt().unwrap().to_owned();
+        assert!(review.contains("my comment"), "{review}");
         press(&mut app, &[Down, Enter]); // Review again.
         assert_eq!(app.page_index(), 0);
         let input = app.prompt_input_mut();
@@ -1017,7 +1233,7 @@ mod tests {
             answer: "Second".into(),
             comment: "my comment amended".into(),
         };
-        expected.insert("answer".into(), commented);
+        expected.insert("answer".parse().unwrap(), commented);
         assert_eq!(response.await.unwrap().unwrap(), expected);
         // A blank comment is dropped, free-batch text is untrimmed and
         // whitespace-only free-batch input never confirms.

@@ -67,22 +67,34 @@ termination; send follow-ups to its existing job instead of launching a duplicat
 that created no child holds no name: of two launches taking one name at once, the first to start
 its child keeps it.
 
-Each model-facing `ask` contains one `{id, prompt, options?}` question; independent concurrent calls are merged by the runtime. A child
-question batch changes its stable agent job to `waiting_input`; answer that job with
-`tool.job(id).send({value: answer})` in a script. For a merged batch, use
-`tool.job(id).send({value: {question_id: answer, another_id: answer}})`; the keys are the IDs
-included in the waiting job's `questions` output. Each answer can be a string (a suggestion
-label or free-form text), or `{"answer": "selected label", "comment": "user text"}` for a
-suggestion with a non-whitespace comment. A single question returns that value directly;
-a merged batch keeps each value under its question ID.
+Each model-facing `ask` contains one question: `{header, prompt, options?, multiple?}`.
+- `header` is a short title, up to 24 characters. It is the question's tab in the terminal and
+  the key its answer is filed under, so it must be unique among the questions asked together.
+- `prompt` is Markdown.
+- Each option is `{label, description, recommended?, preview?}`. Labels must be distinct. A
+  question taking one answer may recommend at most one option; one with `multiple: true`
+  needs options and may recommend any number. `preview` is Markdown shown beside the focused
+  option, for comparing concrete artifacts such as code or config.
+
+Independent concurrent calls are merged by the runtime. A child question batch changes its
+stable agent job to `waiting_input`; answer that job with `tool.job(id).send({value: answer})`
+in a script. For a merged batch, use
+`tool.job(id).send({value: {"Auth method": answer, "Deploy": answer}})`; the keys are the
+headers in the waiting job's `questions` output. A lone question also takes its answer keyed
+under its header. An answer to a question taking one answer is a string (a suggestion label or
+free-form text), or `{"answer": "selected label", "comment": "user text"}`. An answer to a
+question with `multiple: true` is a list of labels and free-form text, or
+`{"answers": [...], "comment": "user text"}`. An answer of another shape is refused, and nothing
+of that reply is delivered. A single question returns its answer directly; a merged batch keeps
+each answer under its header.
 Root-agent questions go to the host interface instead of a parent agent.
 `ask` also accepts optional `bg` (boolean, default `false`). With `bg: true`, the call returns
 job metadata immediately so the agent can continue independent work. Use `jobs({job})` to
 inspect the pending question and eventual answer; the ask job also
 accepts `tool.job(id).send({value: answer})`. Omitting `bg` or passing `false` keeps the usual
 foreground wait. Multiple outstanding child question batches are combined on the stable agent
-job; parents may answer a subset keyed by question ID, and unanswered questions remain pending.
-IDs must be unique across that child's outstanding questions. Background questions are still
+job; parents may answer a subset keyed by header, and unanswered questions remain pending.
+Headers must be unique across that child's outstanding questions. Background questions are still
 owned jobs: children must await or cancel them before finishing.
 
 `agent` accepts an optional `depth` delegation budget. It defaults to zero, making the launched
@@ -107,7 +119,7 @@ contract](../reference/javascript.md#jobview-response-contract); a background la
 the job as launched, `running` and without a `result`, even if it has already finished. A loaded
 literal `null` result is `result: null`.
 Cancellation returns target-job metadata in `.result`. A child
-question has `state: "waiting_input"`; `jobs({job})` returns its stable question IDs and text in
+question has `state: "waiting_input"`; `jobs({job})` returns its questions, headers included, in
 `presentation.question`, regardless of its size.
 
 Jobs normally follow `queued → running → completed`, optionally cycling through
@@ -140,6 +152,25 @@ return tool.exec({command: ["cargo", "test"], name: "run-tests", bg: true});
 Names appear in active-job state, job envelopes (including notifications and inspection), and
 durable job records. They survive session resume. Omitted or null names leave jobs unnamed;
 invalid names are rejected before execution. JavaScript builders also support `.name("run-tests")`.
+
+## Long foreground calls
+
+A model's foreground call of a tool that accepts `bg` (`exec`, `script`, `fetch`, MCP tools and
+`agent`, but never `ask`) can move to the background by itself, so a long call does not hold its
+agent indefinitely:
+
+- Once the calls of one model response have run 30 seconds, a pending event moves them: another
+  background job of the agent finishing or asking, or input for the agent (your queued message,
+  or a parent's follow-up to a child). An event that arrives sooner waits until then; a call
+  that ends first returns its result as usual. A child's progress reply is not an event here.
+- After 10 minutes the calls move anyway, except a child agent's, which reports through its own
+  replies and questions.
+
+Every still-running foreground call of the response moves together. Each returns its job ID in
+state `running` with a notice saying why it moved; the job then behaves exactly like one launched
+with `bg: true`: `jobs({job})` reads its output so far, and its result arrives as a job event. Calls
+inside a script are not moved on their own: the script's call moves as a whole, and the calls it
+waits on keep waiting.
 
 ## Waiting for background work
 

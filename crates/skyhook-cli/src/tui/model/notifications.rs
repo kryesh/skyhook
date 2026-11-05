@@ -191,7 +191,7 @@ mod tests {
 
         // A job card is headed by the job's current state over the question it asked.
         let question = json!({"id": job, "state": "waiting_input",
-            "presentation": {"question": {"questions": [{"id": "pick", "prompt": "Which one?"}]}}});
+            "presentation": {"question": {"questions": [{"header": "pick", "prompt": "Which one?"}]}}});
         let question = [JobEvent::Job(serde_json::from_value(question).unwrap())];
         let headed = |snapshot: &ObservationSnapshot, state: &str| {
             let text = events(&question, snapshot, &view, false)[0]

@@ -72,14 +72,26 @@ pub enum JobError {
     ChildOwnerMismatch(JobId),
     #[error("child message text does not match the committed assistant text")]
     ChildTextMismatch,
-    #[error("duplicate question id `{0}`")]
-    DuplicateQuestion(String),
+    #[error("duplicate question header `{0}`")]
+    DuplicateQuestion(crate::agent::QuestionHeader),
     #[error("child question has no owning agent job")]
     UnownedQuestion,
-    #[error("answers to multiple questions must be keyed by question id")]
+    #[error("answers to multiple questions must be keyed by question header")]
     UnkeyedAnswers,
-    #[error("answer contains no pending question ids")]
+    #[error("answer contains no pending question headers")]
     UnmatchedAnswers,
+    #[error(
+        "the answer to `{header}` must be {}",
+        if *multiple {
+            "a list of labels or free-form text, or {\"answers\": [...], \"comment\": \"text\"}"
+        } else {
+            "a label or free-form text, or {\"answer\": \"label\", \"comment\": \"text\"}"
+        }
+    )]
+    MalformedAnswer {
+        header: crate::agent::QuestionHeader,
+        multiple: bool,
+    },
     /// A notification presented a delivery that is no longer pending as it read it.
     #[error("a presented delivery changed before it was committed")]
     Stale,

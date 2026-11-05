@@ -122,6 +122,11 @@ impl CreatedInvocation {
     pub(crate) fn job(&self) -> JobId {
         self.lease.id()
     }
+
+    /// Whether its call blocks on a job its turn may move to the background.
+    pub(crate) fn movable(&self) -> bool {
+        movable(&self.plan)
+    }
 }
 
 #[derive(Clone)]
@@ -368,22 +373,67 @@ impl ToolExecutor {
             let CreatedInvocation { kind, plan, lease } = created;
             let result_policy = plan.result_policy;
             let fallback = prepare_fallback(&plan);
-            let started = match self.start(plan, lease).await {
-                Ok(started) => started,
-                Err(error) => return Err(error.or(fallback)).into(),
-            };
             let purpose = match kind {
                 InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
-                    return self.collect_model_started(started).await;
+                    return self.run_model_call(plan, lease, fallback).await;
                 }
                 InvocationKind::Model | InvocationKind::Script => {
                     results::CollectionPurpose::Public(result_policy)
                 }
                 InvocationKind::Host => results::CollectionPurpose::Native,
             };
+            let started = match self.start(plan, lease).await {
+                Ok(started) => started,
+                Err(error) => return Err(error.or(fallback)).into(),
+            };
             self.collect_result(started, purpose, reader).await
         })
     }
+
+    /// Start and collect the model's call. Its turn may move a movable call to the
+    /// background while it is still starting, connecting to its target included: the
+    /// start then goes on under the supervisor, which owns its lease, and the call
+    /// returns the moved job at once.
+    async fn run_model_call(
+        &self,
+        plan: InvocationPlan,
+        lease: crate::job::JobLease,
+        fallback: PartialContext,
+    ) -> Reported {
+        let started = match movable(&plan) {
+            false => self.start(plan, lease).await,
+            true => {
+                let (job, executor) = (lease.id(), self.clone());
+                let jobs = &self.shared.jobs;
+                let starting = async move { executor.start(plan, lease).await };
+                let mut starting = jobs.supervisor().spawn(starting);
+                tokio::select! {
+                    biased;
+                    started = &mut starting => match started {
+                        Ok(Some(started)) => started,
+                        Ok(None) => Err(ToolError::cancelled_before_start()),
+                        Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
+                    },
+                    moved = jobs.until_moved(job) => return match moved {
+                        Ok(envelope) => Ok(results::released_call(job, &envelope)).into(),
+                        Err(error) => Err(job_error(error)).into(),
+                    },
+                }
+            }
+        };
+        match started {
+            Ok(started) => self.collect_model_started(started).await,
+            Err(error) => Err(error.or(fallback)).into(),
+        }
+    }
+}
+
+/// Whether `plan`'s call blocks on a job its turn may move to the background: a
+/// foreground call of a tool that can run there, but never a question for a person.
+fn movable(plan: &InvocationPlan) -> bool {
+    !plan.launch.background
+        && plan.tool.supports_background()
+        && plan.tool.job_role() != crate::job::JobRole::Question
 }
 
 /// Job state lives on the session host; the caller names the failed stage.

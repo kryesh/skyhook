@@ -91,6 +91,18 @@ pub(crate) fn changed_after(
     agents.get(agent).is_some_and(|state| state.set > frontier)
 }
 
+/// A new list, or new statuses for the current one's items in order.
+pub(crate) enum TodoUpdate {
+    Items(Vec<TodoItem>),
+    Statuses(Vec<TodoStatus>),
+}
+
+impl From<Vec<TodoItem>> for TodoUpdate {
+    fn from(items: Vec<TodoItem>) -> Self {
+        Self::Items(items)
+    }
+}
+
 /// Why a replacement was not applied.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReplaceError {
@@ -100,26 +112,49 @@ pub(crate) enum ReplaceError {
          the current list already accounts for it, so do not retry"
     )]
     Superseded,
+    #[error(
+        "status gives {given} statuses for a list of {listed} items: give one per item, in order"
+    )]
+    Statuses { given: usize, listed: usize },
     #[error(transparent)]
     Session(#[from] SessionError),
 }
 
 impl SessionStore {
     /// Replace `agent`'s list on behalf of the response `issued_by`, if a model call
-    /// issued it. A checkpoint that reconciled that response supersedes it.
+    /// issued it. A checkpoint that reconciled that response supersedes it, so new
+    /// statuses always apply to the list the call's issuer saw.
     pub(crate) async fn replace_todos(
         &self,
         agent: &AgentId,
-        items: Vec<TodoItem>,
+        update: impl Into<TodoUpdate>,
         issued_by: Option<MessageSeq>,
     ) -> Result<(), ReplaceError> {
-        let agent = agent.clone();
+        let (agent, update) = (agent.clone(), update.into());
         self.commit(Command::Journal, move |state| {
-            let reconciled = state.todos.get(&agent).map(|state| state.reconciled);
+            let current = state.todos.get(&agent);
+            let reconciled = current.map(|state| state.reconciled);
             let reconciled = reconciled.unwrap_or_default();
             if issued_by.is_some_and(|message| RecordSeq::from(message) <= reconciled) {
                 return Err(ReplaceError::Superseded);
             }
+            let items = match update {
+                TodoUpdate::Items(items) => items,
+                TodoUpdate::Statuses(statuses) => {
+                    let listed = current.map_or(&[][..], |state| &state.items);
+                    if statuses.len() != listed.len() {
+                        return Err(ReplaceError::Statuses {
+                            given: statuses.len(),
+                            listed: listed.len(),
+                        });
+                    }
+                    let restatus = |(item, status): (&TodoItem, TodoStatus)| TodoItem {
+                        text: item.text.clone(),
+                        status,
+                    };
+                    listed.iter().zip(statuses).map(restatus).collect()
+                }
+            };
             let replaced = SessionEvent::TodosReplaced { items };
             Ok(Plan::journal(vec![(agent, replaced)]))
         })
@@ -187,5 +222,42 @@ mod tests {
             assert_eq!(context.operation, operation);
             assert_eq!(context.subject, Subject::Job(job));
         }
+    }
+
+    #[tokio::test]
+    async fn statuses_restatus_the_list_in_order_and_must_cover_it() {
+        let fixture = crate::tests::TestRuntime::new().await;
+        let (store, agent) = (&fixture.store, &fixture.agent);
+        let item = |text: &str, status| TodoItem {
+            text: text.parse().unwrap(),
+            status,
+        };
+        let listed = vec![
+            item("Inspect", TodoStatus::InProgress),
+            item("Change", TodoStatus::Pending),
+        ];
+        store
+            .replace_todos(agent, listed.clone(), None)
+            .await
+            .unwrap();
+        let short = TodoUpdate::Statuses(vec![TodoStatus::Completed]);
+        let short = store.replace_todos(agent, short, None).await.unwrap_err();
+        assert!(matches!(
+            short,
+            ReplaceError::Statuses {
+                given: 1,
+                listed: 2
+            }
+        ));
+        assert_eq!(store.inspect_todos(agent, None).unwrap(), listed);
+        let statuses = TodoUpdate::Statuses(vec![TodoStatus::Completed, TodoStatus::InProgress]);
+        store.replace_todos(agent, statuses, None).await.unwrap();
+        assert_eq!(
+            store.inspect_todos(agent, None).unwrap(),
+            [
+                item("Inspect", TodoStatus::Completed),
+                item("Change", TodoStatus::InProgress)
+            ]
+        );
     }
 }

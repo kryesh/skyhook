@@ -237,6 +237,20 @@ impl Jobs {
         }
     }
 
+    /// Whether `job` still holds its agent: live, and its own call waits on it.
+    pub(crate) fn blocks(&self, job: JobId) -> bool {
+        self.get(job)
+            .is_some_and(|entry| entry.live() && !entry.background)
+    }
+
+    /// Whether background work of `owner` has an outcome or a question pending for it:
+    /// what a blocked foreground call moves aside for. A child's progress reply is not.
+    pub(crate) fn notified(&self, owner: &AgentId) -> bool {
+        (self.pending(owner)).any(|(id, entry)| {
+            entry.lifecycle_pending().is_some() && effectively_background(self, id)
+        })
+    }
+
     /// Record what a script's `wait` by `caller` was shown, so it is not told twice.
     pub(crate) fn shown(&mut self, caller: JobId, shown: WaitFloor) {
         let Some((host, _)) = script_host(self, caller) else {
@@ -274,6 +288,8 @@ pub struct JobEnvelope {
     pub location: ExecutionLocation,
     /// Input would resume it after it ends.
     pub(crate) resumable: bool,
+    /// What moved its call to the background, when its turn did.
+    pub(crate) moved: Option<MoveTrigger>,
 }
 
 /// The single public wire contract for both model and JavaScript job responses.
@@ -343,6 +359,8 @@ crate::named_enum::named_enum! {
         ChildReleased = "The session restarted while this child agent ran; it is retained under this job ID and resumes when the session continues or when you send it input, and its result then arrives as a job event.",
         ChildAsked = "This child agent asked a question, so it continues in the background under this job ID: its replies and question arrive as job events, and so does its result once you answer.",
         ScriptChildAsked = "A child agent this script started asked a question, so the script continues in the background under this job ID: the child's replies and question arrive as job events, and so does the script's result.",
+        MovedOnEvent = "This call ran past 30 seconds while events arrived for you, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event.",
+        MovedAtLimit = "This call ran for 10 minutes, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event.",
     }
 }
 
@@ -384,11 +402,22 @@ pub(crate) enum ViewKind {
     Inspection,
 }
 
+/// What moved a model's blocked foreground call to the background before its job ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoveTrigger {
+    /// Something arrived for its agent once the call had run long enough to give way.
+    Event,
+    /// It ran as long as a foreground call may.
+    Limit,
+}
+
 /// Why the model's own foreground call let go of its unfinished job.
 #[derive(Clone, Copy)]
 pub(crate) enum Release {
     /// Its child asked, or a script's child did; the job runs on.
     Asked,
+    /// It ran long enough that its agent's turn moved it on; the job runs on.
+    Moved(MoveTrigger),
     /// A restart interrupted it while its child ran: the restart journals the
     /// interrupt in the same commit as the release, so the job ends interrupted.
     Restarted,
@@ -496,6 +525,13 @@ impl JobEnvelope {
                 (self.state.presented(), notice)
             }
             Release::Restarted => (JobState::Interrupted, Some(Notice::ChildReleased)),
+            Release::Moved(trigger) => {
+                let notice = match trigger {
+                    MoveTrigger::Event => Notice::MovedOnEvent,
+                    MoveTrigger::Limit => Notice::MovedAtLimit,
+                };
+                (self.state.presented(), Some(notice))
+            }
         };
         JobView {
             id: Some(self.id),
@@ -736,6 +772,7 @@ mod tests {
             diagnostic: None,
             location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
             resumable: false,
+            moved: None,
         }
     }
 
@@ -1023,7 +1060,7 @@ mod tests {
             );
             let job = job.into_value();
             assert_eq!(
-                job["presentation"]["question"]["questions"][0]["id"],
+                job["presentation"]["question"]["questions"][0]["header"],
                 "choice"
             );
             assert_eq!(job.get("result"), None);

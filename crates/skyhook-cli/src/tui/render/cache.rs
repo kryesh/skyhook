@@ -592,10 +592,7 @@ pub(super) mod tests {
         let (_root, _app, session) = statuses(8).await;
         let (_viewer, mut app) = viewing(&session, Tab::Conversation).await;
         // A question's prompt takes the composer's place and every row above it.
-        let option = skyhook::agent::QuestionOption {
-            label: "Yes".into(),
-            description: "Go ahead".into(),
-        };
+        let option = crate::tui::app::tests::option("Yes", "Go ahead");
         let _asked = crate::tui::app::tests::question(&mut app, "A question".into(), vec![option]);
         app.toast("notice");
         app.scroll_to(Some(0));

@@ -19,6 +19,7 @@ pub struct HarnessBuilder {
     mcp: BTreeMap<String, McpServerConfig>,
     max_child_depth: usize,
     coalescing: wait::Coalescing,
+    foreground: super::foreground::Limits,
     capabilities: CapabilitySet,
     host_capabilities: BTreeSet<HostCapability>,
     targets: TargetsConfig,
@@ -107,6 +108,7 @@ impl HarnessBuilder {
             mcp: BTreeMap::new(),
             max_child_depth: crate::config::DEFAULT_MAX_CHILD_DEPTH,
             coalescing: wait::Coalescing::default(),
+            foreground: super::foreground::Limits::default(),
             capabilities: CapabilitySet::default(),
             host_capabilities: BTreeSet::new(),
             targets: TargetsConfig::default(),
@@ -278,6 +280,12 @@ impl HarnessBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn foreground(mut self, foreground: super::foreground::Limits) -> Self {
+        self.foreground = foreground;
+        self
+    }
+
     #[must_use]
     pub fn capabilities(mut self, capabilities: CapabilitySet) -> Self {
         self.capabilities = capabilities;
@@ -401,6 +409,7 @@ impl HarnessBuilder {
                 warnings,
                 max_child_depth: self.max_child_depth,
                 coalescing: self.coalescing,
+                foreground: self.foreground,
                 capabilities: self.capabilities,
                 modes: catalog.modes,
                 mode: catalog.mode,

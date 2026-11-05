@@ -121,6 +121,12 @@ The extension points are:
   runs before the first input; associate a new session with its product resources here, and
   finish a setup an interruption left undone. A reopened session may only be viewed, so change
   nothing else. Failure shuts the session down.
+- `SessionExtension::scope(&self, &SessionHandle) -> HookFuture<'_, Option<ScopeForm>>` is the
+  scope a session runs under in this launch, as the factory's form holding those values,
+  including what a resume hook changes once its work begins. The terminal
+  reads it after `opened` for a session it opens rather than starts from a draft (a resume, or a
+  switch to another session) and shows it frozen at the top of the root's conversation. The
+  default is none.
 - What this launch changes about a reopened session's work (as the security product applies its
   `--workers`) goes in a `skyhook::agent::ResumeHook` registered on the prepared
   builder with `HarnessBuilder::resume_hook`; the library runs it before that session's first

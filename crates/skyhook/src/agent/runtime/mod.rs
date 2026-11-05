@@ -63,6 +63,7 @@ mod wait;
 use dispatch::CreatedCall;
 use wait::Boundary;
 mod driver;
+mod foreground;
 mod lifecycle;
 mod recovery;
 mod reopen;
@@ -99,6 +100,7 @@ struct HarnessInner {
     warnings: Vec<String>,
     max_child_depth: usize,
     coalescing: wait::Coalescing,
+    foreground: foreground::Limits,
     /// The most a new session can hold.
     capabilities: CapabilitySet,
     modes: indexmap::IndexMap<ModeName, Mode>,
@@ -844,7 +846,7 @@ mod tests {
                 let answer = crate::agent::QuestionAnswer::Text(self.answer.clone());
                 let reply = questions
                     .iter()
-                    .map(|q| (q.id.clone(), answer.clone()))
+                    .map(|q| (q.header.clone(), answer.clone()))
                     .collect();
                 self.batches.lock().unwrap().push(questions);
                 Ok(reply)

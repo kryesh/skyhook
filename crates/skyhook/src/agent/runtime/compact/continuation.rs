@@ -50,10 +50,13 @@ struct Summary {
 }
 
 pub(crate) fn response_schema() -> ResponseSchema {
-    let settings = schemars::generate::SchemaSettings::default().with(|settings| {
-        settings.meta_schema = None;
-        settings.inline_subschemas = true;
-    });
+    let reflow = schemars::transform::RecursiveTransform(crate::tool::registry::reflow_description);
+    let settings = schemars::generate::SchemaSettings::default()
+        .with(|settings| {
+            settings.meta_schema = None;
+            settings.inline_subschemas = true;
+        })
+        .with_transform(reflow);
     let mut schema =
         serde_json::to_value(settings.into_generator().into_root_schema_for::<Summary>())
             .expect("compaction response schema serializes");

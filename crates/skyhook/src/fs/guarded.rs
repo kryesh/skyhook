@@ -127,22 +127,55 @@ impl tokio::io::AsyncRead for AsyncFile {
     }
 }
 
-/// Open what `probe` names with `open`, refusing a live database's file, and register the
-/// handle under the same lock, so no database becomes live between the check and the
-/// registration. Only a database renamed onto the path in between could slip past, which
-/// SQLite never does. The descriptor's metadata, read to register it, comes back with it.
+/// Open what `probe` names with `open`, refusing a live database's file. The file the
+/// probe reached is checked and held under the registry's lock and opened outside it, so
+/// concurrent opens never wait on each other's syscalls, while no database whose file it
+/// is becomes live until the descriptor closes. A descriptor that reached another file is
+/// checked again under the lock as that file. Only a database renamed onto the path in
+/// between could slip past, which SQLite never does. The descriptor's metadata comes back
+/// with it.
 pub(super) fn open_guarded(
     probe: &crate::db::live::Probe,
     open: impl FnOnce() -> Result<fs::File, BeneathError>,
 ) -> Result<(OpenFile, fs::Metadata), BeneathError> {
-    let mut registry = crate::db::live::lock();
-    if registry.holds(probe) {
-        return Err(RegularFileError::Live(LiveDatabase).into());
-    }
+    use crate::db::live::{Probe, Reached, identity, lock};
+    let held = {
+        let mut registry = lock();
+        if registry.holds(probe) {
+            return Err(RegularFileError::Live(LiveDatabase).into());
+        }
+        probe.file.as_ref().map(|file| registry.hold(file.identity))
+    };
     let file = open()?;
-    let metadata = file.metadata().map_err(RegularFileError::Io)?;
-    let hold = registry.hold(crate::db::live::identity(&metadata));
-    drop(registry);
+    let (hold, metadata) = match (held, file.metadata()) {
+        (Some(hold), Ok(metadata)) if hold.file() == identity(&metadata) => (hold, metadata),
+        (stale, metadata) => {
+            drop(stale);
+            let reached = Probe {
+                file: metadata.as_ref().ok().map(|metadata| Reached {
+                    identity: identity(metadata),
+                    aliased: true,
+                }),
+                directory: probe.directory,
+                name: probe.name.clone(),
+            };
+            let mut registry = lock();
+            if registry.holds(&reached) {
+                registry.park(&reached, file);
+                return Err(RegularFileError::Live(LiveDatabase).into());
+            }
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    // Closed under the lock: its file is unknown, so no database may
+                    // become live around it first.
+                    drop(file);
+                    return Err(RegularFileError::Io(error).into());
+                }
+            };
+            (registry.hold(identity(&metadata)), metadata)
+        }
+    };
     let file = OpenFile {
         file,
         _hold: Some(std::sync::Arc::new(hold)),
@@ -284,6 +317,46 @@ mod tests {
         drop((db, opened, nested));
         remove_tree_unless_live(&tree).unwrap();
         assert!(!tree.exists());
+    }
+
+    /// A name that reaches a database opened after it was checked is refused. A descriptor
+    /// of that database's file stays open until the database closes, since closing it
+    /// would release SQLite's locks; one of another file, the name having moved on, is
+    /// closed at once rather than tied to that database. Opening outside the registry's
+    /// lock is what lets the database open in between.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_that_reaches_a_database_opened_meanwhile_is_parked_on_its_owner() {
+        use crate::db::{Db, OpenMode};
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        let descriptors = |path: &Path| {
+            let open = fs::read_dir("/proc/self/fd").unwrap().flatten();
+            open.filter(|fd| fs::read_link(fd.path()).is_ok_and(|target| target == path))
+                .count()
+        };
+        let other = root.join("other");
+        fs::write(&other, b"").unwrap();
+        for (name, reached) in [("own.db", None), ("moved.db", Some(&other))] {
+            let path = root.join(name);
+            fs::write(&path, b"").unwrap();
+            let mut db = None;
+            let opened = open_guarded(&crate::db::live::Probe::path(&path), || {
+                fs::remove_file(&path).unwrap();
+                let opened = Db::connect(&path, OpenMode::Create).unwrap();
+                opened.batch("CREATE TABLE t(x)").unwrap();
+                db = Some((opened, descriptors(&path)));
+                let file = fs::File::open(reached.unwrap_or(&path));
+                Ok(file.map_err(RegularFileError::Io)?)
+            });
+            assert_matches!(opened, Err(BeneathError::File(RegularFileError::Live(_))));
+            let (db, by_sqlite) = db.unwrap();
+            let parked = usize::from(reached.is_none());
+            assert_eq!(descriptors(&path), by_sqlite + parked, "{name}");
+            assert_eq!(descriptors(&other), 0, "{name}");
+            drop(db);
+            assert_eq!(descriptors(&path), 0, "{name}");
+        }
     }
 
     #[tokio::test]

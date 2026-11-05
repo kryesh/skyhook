@@ -572,11 +572,7 @@ mod tests {
             let mut ingest = Ingestion::new(&context).await;
             for event in [
                 open(1, "/result/content"),
-                data(1, b"a unwanted"),
-                PayloadEvent::Capture(CaptureEvent::Truncate {
-                    id: CaptureId::FIRST,
-                    length: 1,
-                }),
+                data(1, b"a"),
                 data(1, b"\xf0\x9f"),
                 data(1, b"\x8c\x8d\n"),
                 finish(1),

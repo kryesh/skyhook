@@ -9,9 +9,9 @@ pub(crate) mod todo;
 pub use error::{CompactionError, CompactionFault, Failure, HarnessError, TurnFailure};
 pub(crate) use error::{FailureKind, FaultKind};
 pub use interaction::{
-    HostEventsFuture, HostState, HostStateFuture, Question, QuestionAnswer, QuestionError,
-    QuestionFuture, QuestionHandler, QuestionOption, QuestionReply, ResumeFuture, ResumeHook,
-    RuntimeEvent,
+    HeaderError, HostEventsFuture, HostState, HostStateFuture, MAX_HEADER, Question,
+    QuestionAnswer, QuestionError, QuestionFuture, QuestionHandler, QuestionHeader, QuestionOption,
+    QuestionReply, ResumeFuture, ResumeHook, RuntimeEvent,
 };
 pub use observation::{
     AgentActivity, Applied, ContextGauge, ContextUsage, Observation, ObservationSnapshot,
@@ -22,7 +22,7 @@ pub use runtime::{
     QueuedPromptCommitted, QueuedPromptReceipt, Selection, SessionHandle, SessionMode,
     SessionModel,
 };
-pub(crate) use todo::ReplaceError;
+pub(crate) use todo::{ReplaceError, TodoUpdate};
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;

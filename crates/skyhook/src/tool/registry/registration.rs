@@ -371,11 +371,18 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
 /// fields remain omissible even when the output type would emit the same fields.
 pub fn input_schema_for<I: JsonSchema + 'static>() -> Value {
     generated::<I>(Contract::Input, || {
-        SchemaSettings::default()
-            .for_deserialize()
+        input_settings()
             .into_generator()
             .into_root_schema_for::<I>()
     })
+}
+
+/// How tool input schemas are generated: by the deserialization contract, each
+/// description reflowed from its doc comment.
+pub fn input_settings() -> SchemaSettings {
+    SchemaSettings::default()
+        .for_deserialize()
+        .with_transform(RecursiveTransform(reflow_description))
 }
 
 /// Results are described by their serialization contract.
@@ -384,9 +391,17 @@ pub fn result_schema<O: JsonSchema + 'static>() -> Value {
         SchemaSettings::default()
             .for_serialize()
             .with_transform(RecursiveTransform(omit_null))
+            .with_transform(RecursiveTransform(reflow_description))
             .into_generator()
             .into_root_schema_for::<O>()
     })
+}
+
+/// A doc comment's wrapped lines joined into the description a model reads.
+pub fn reflow_description(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::String(description)) = schema.get_mut("description") {
+        *description = crate::newtype::reflow(description);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

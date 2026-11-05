@@ -233,6 +233,14 @@ pub trait SessionExtension: Send + Sync + 'static {
     ) -> HookFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    /// The scope `session` runs under in this launch, as the factory's form with those
+    /// values, what this launch changes once the session's work resumes included: shown
+    /// frozen above the conversation of a session the terminal opens that it did not
+    /// start from a draft. Read once, after [`Self::opened`] and before any work resumes.
+    fn scope<'a>(&'a self, _session: &'a SessionHandle) -> HookFuture<'a, Option<ScopeForm>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 impl SessionExtension for () {}
 

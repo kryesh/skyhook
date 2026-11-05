@@ -4,7 +4,8 @@
 
 Every agent has an ordered advisory todo list. `todo()` reads the caller's list;
 `todo({items:[...]})` replaces the whole list and completes without a result; an empty array
-clears it.
+clears it. `todo({status:[...]})` sets every item's status, one per item in list order, keeping
+the text; it must give exactly as many statuses as the list has items.
 Each item has `text` and a `status` of `pending`, `in_progress`, or `completed`. Multiple items may
 be in progress. Unfinished items do not prevent an agent from finishing.
 
@@ -26,7 +27,7 @@ return tool.agent({
 ```
 
 The child owns subsequent edits. Ancestors can inspect a descendant with `todo({job: childJobId})`,
-including after it finishes; `items` and `job` cannot be combined. Inspection is available once
+including after it finishes; `items`, `status` and `job` are exclusive. Inspection is available once
 the child has initialized; a queued launch may not have a list yet. Reads return `{items}`.
 An agent without todos has an empty list. Inside the child, progress can be updated with the
 same tool:
@@ -37,6 +38,12 @@ return tool.todo({items: [
   {text: "Make the change", status: "in_progress"},
   {text: "Run relevant checks", status: "pending"}
 ]});
+```
+
+or, keeping the text, with only the statuses:
+
+```js
+return tool.todo({status: ["completed", "in_progress", "pending"]});
 ```
 
 Lists persist with the session, including completed and interrupted child lists. Resume preserves
@@ -85,8 +92,6 @@ jobs: job parent tool name state age_s turns tool_calls
 8 - agent review running 9 2 3 workspace="/home/user/review"
 9 8 agent - waiting_input 4 1 0
 todos:
-completed:
-  "Inspect the implementation"
 in_progress:
   "Make the change"
 pending:
@@ -94,5 +99,6 @@ pending:
 </skyhook_state>
 ```
 
-Here, job 9 uses the snapshot's current location, not job 8's workspace override. With no
-active jobs or todos, only the date remains.
+Here, job 9 uses the snapshot's current location, not job 8's workspace override. Only
+unfinished todos appear; `todo` reads the whole list. With no active jobs or unfinished todos,
+only the date remains.

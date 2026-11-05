@@ -263,27 +263,6 @@ impl SharedDb {
         Ok(self.write(|db| write_chunks(db, capture, extent, data))?)
     }
 
-    /// Discard bytes from `length` on, returning the remaining extent.
-    pub(crate) fn truncate_capture(
-        &self,
-        capture: i64,
-        length: u64,
-    ) -> Result<CaptureExtent, DbError> {
-        let truncated = self.write(|db| {
-            db.execute(
-                "DELETE FROM job_capture_chunk WHERE capture = ?1 AND byte_offset >= ?2",
-                params![capture, length],
-            )?;
-            db.execute(
-                "UPDATE job_capture_chunk SET data = substr(data, 1, ?2 - byte_offset) \
-                 WHERE capture = ?1 AND byte_offset < ?2 AND byte_offset + length(data) > ?2",
-                params![capture, length],
-            )?;
-            extent(db, capture)
-        });
-        Ok(truncated?)
-    }
-
     #[cfg(test)]
     pub(crate) fn test_batch(&self, sql: &str) {
         self.lock().batch(sql).unwrap();

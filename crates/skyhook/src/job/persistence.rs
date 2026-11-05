@@ -312,6 +312,7 @@ impl JobFacts {
             invocation: Invocation::default(),
             timing: RunTiming::Unstarted,
             cancel: CancelState::Open,
+            moved: None,
         };
         Some((*job, entry))
     }

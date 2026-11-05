@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{ModelEntry, Question, ReplaceError, TodoItem},
+    agent::{ModelEntry, Question, ReplaceError, TodoItem, TodoStatus, TodoUpdate},
     identity::{AgentId, JobId},
     provider::profile::ModelRef,
     session::{CoreState, Message, Plan, SessionEvent, UserPart},
@@ -94,7 +94,7 @@ pub(super) fn register(
     );
     builder.register_checked(
         "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout|cancelled, waited_s} with whole seconds waited. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds, capped at 1800 (30 minutes); omitted/null waits 1800. Returns {reason: event|timeout|cancelled, waited_s} with whole seconds waited. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
         ToolOptions::default().job_role(crate::job::JobRole::Wait).result::<super::wait::WaitOutput>(),
         Ok,
         move |args: super::wait::WaitArgs| {
@@ -106,9 +106,13 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together, each under its own header. Offer the real choices as options with short labels, put each tradeoff in its description, and mark the one you recommend; never add a catch-all option that expects the user to type, since a written answer is always possible. Add `preview` to options only when comparing concrete artifacts (code, config, layouts) beats reading descriptions; skip it for plain preference questions. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
         ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive).result::<Value>(),
-        Ok,
+        |question: Question| match question.refusal() {
+            None => Ok(question),
+            Some(refusal) => Err(AdmissionError::invalid_arguments(refusal)
+                .operation(Operation::Validate, Subject::argument(["options"])).effects(Effects::NotStarted)),
+        },
         move |input: Question| {
             let runtime = ask.get().and_then(Weak::upgrade);
             registry::AdmittedInvocation::new(move |context| async move {
@@ -119,32 +123,36 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "todo",
-        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit. Reads return {items}; replacing returns no result.",
+        "Read your list, replace it with items, set its statuses with status, or inspect a descendant by agent job ID. Only the owner can edit. Reads return {items}; edits return no result.",
         ToolOptions::default().result::<TodoList>(),
-        |TodoArgs { items, job }| match (items, job) {
-            (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments("items and job cannot be combined")
-                .operation(Operation::Validate, Subject::argument(["job"])).effects(Effects::NotStarted)),
-            (Some(items), None) => Ok(TodoRequest::Replace(items)),
-            (None, job) => Ok(TodoRequest::Inspect(job)),
+        |TodoArgs { items, status, job }| match (items, status, job) {
+            (Some(items), None, None) => Ok(TodoRequest::Replace(items)),
+            (None, Some(status), None) => Ok(TodoRequest::Status(status)),
+            (None, None, job) => Ok(TodoRequest::Inspect(job)),
+            (items, _, _) => Err(AdmissionError::invalid_arguments("give at most one of items, status and job")
+                .operation(Operation::Validate, Subject::argument([if items.is_some() { "items" } else { "status" }])).effects(Effects::NotStarted)),
         },
         move |request| {
             let runtime = todo.get().and_then(Weak::upgrade);
-            match request {
-                TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
-                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                    let items = admit_todos("items", items)?;
-                    let issued_by = runtime.jobs.call_origin(context.job()).await;
-                    let subject = Subject::Label(format!("todos for agent {}", context.agent()));
-                    runtime.store.replace_todos(context.agent(), items, issued_by).await.map_err(|error| match error {
-                        ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
-                        ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
-                    })
-                }),
-                TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {
+            let update = match request {
+                TodoRequest::Replace(items) => admit_todos("items", items).map(TodoUpdate::Items),
+                TodoRequest::Status(statuses) => Ok(TodoUpdate::Statuses(statuses)),
+                TodoRequest::Inspect(job) => return registry::AdmittedInvocation::new(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
                     registry::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
                 }),
-            }
+            };
+            registry::AdmittedInvocation::unit(move |context| async move {
+                let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                let update = update?;
+                let issued_by = runtime.jobs.call_origin(context.job()).await;
+                let subject = Subject::Label(format!("todos for agent {}", context.agent()));
+                runtime.store.replace_todos(context.agent(), update, issued_by).await.map_err(|error| match error {
+                    ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
+                    ReplaceError::Statuses { .. } => ToolError::invalid_arguments(error).operation(Operation::Validate, Subject::argument(["status"])).effects(Effects::Unchanged),
+                    ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
+                })
+            })
         },
     )?;
     register_child_agent(builder, runtime_slot, models, modes)
@@ -174,14 +182,18 @@ fn choice_input(summary: &str, choices: &[(&str, String)]) -> Option<Value> {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TodoArgs {
-    /// Replace your entire list. An empty array clears it. Cannot be combined with job.
+    /// Replace your entire list. An empty array clears it. Cannot be combined with status or job.
     items: Option<Vec<TodoItem<String>>>,
+    /// Set the status of every item in your list, one per item in list order, keeping
+    /// their text. Cannot be combined with items or job.
+    status: Option<Vec<TodoStatus>>,
     /// Inspect a descendant's list using its agent job ID. Omit to read your own list.
     job: Option<crate::identity::JobId>,
 }
 
 enum TodoRequest {
     Replace(Vec<TodoItem<String>>),
+    Status(Vec<TodoStatus>),
     Inspect(Option<crate::identity::JobId>),
 }
 
@@ -1226,7 +1238,7 @@ for line in sys.stdin:
                     InvocationKind::Model,
                     InvocationKind::Script,
                 ] {
-                    let args = json!({"id":"root", "prompt":"question", "bg":background});
+                    let args = json!({"header":"root", "prompt":"question", "bg":background});
                     let agent = session.root.clone();
                     let result = bounded(executor.execute_as(kind, agent, "ask", args, None)).await;
                     if enabled {
@@ -1241,7 +1253,8 @@ for line in sys.stdin:
                     }
                 }
                 // Nested root asks cannot escape the gate through script jobs.
-                let source = "return (await tool.ask({id:'nested', prompt:'question'})).unwrap();";
+                let source =
+                    "return (await tool.ask({header:'nested', prompt:'question'})).unwrap();";
                 let arguments = json!({"source":source, "bg":background});
                 let result = executor
                     .execute(session.root.clone(), "script", arguments, None)

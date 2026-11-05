@@ -5,7 +5,8 @@ use crate::tool::output::ProducedOutput;
 use crate::tool::registry::Invocation;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::Path,
+    sync::{Mutex, OnceLock, PoisonError},
 };
 
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -139,7 +140,6 @@ fn walk_builder<'a>(
         .git_global(false)
         .parents(!no_ignore)
         .follow_links(false)
-        .sort_by_file_path(std::cmp::Ord::cmp)
         // Apply globs after normal ignore eligibility, including directory
         // exclusions so excluded subtrees are never traversed.
         .filter_entry(move |entry| {
@@ -214,12 +214,6 @@ fn overrides<'a>(
     })
 }
 
-/// One walked entry: a file to search, or a directory entry the walk could not list.
-enum Walked {
-    File(PathBuf),
-    Unlisted(PathBuf),
-}
-
 fn search_blocking(
     workspace: &Path,
     root: &Path,
@@ -249,118 +243,197 @@ fn search_blocking(
         Operation::Inspect,
         Subject::path(root),
     )))?;
-    let single = metadata.is_file();
-    let files: Box<dyn Iterator<Item = Result<Walked, LocalError>>> = if single {
-        Box::new(std::iter::once(Ok(Walked::File(root.to_owned()))))
+    let walk = if metadata.is_file() {
+        None
     } else if metadata.is_dir() {
-        let walk = walk_builder(
+        let patterns = args.glob.as_slice().iter().enumerate();
+        Some(walk_builder(
             root,
             args.hidden,
             args.no_ignore,
-            args.glob
-                .as_slice()
-                .iter()
-                .enumerate()
-                .map(|(index, pattern)| {
-                    (
-                        pattern.as_str(),
-                        Subject::argument(["glob", &index.to_string()]),
-                    )
-                }),
-        )?;
-        Box::new(walk.build().filter_map(move |entry| match entry {
-            Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
-                Some(Ok(Walked::File(entry.into_path())))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Ok(Walked::Unlisted(
-                error_path(&error).unwrap_or(root).to_owned(),
-            ))),
-        }))
+            patterns.map(|(index, pattern)| {
+                (
+                    pattern.as_str(),
+                    Subject::argument(["glob", &index.to_string()]),
+                )
+            }),
+        )?)
     } else {
         return Err(LocalError::failed("search root is not a file or directory")
             .operation(Operation::Inspect, Subject::path(root)));
     };
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .binary_detection(BinaryDetection::quit(b'\0'))
-        .heap_limit(Some(crate::limits::WHOLE_VALUE_BYTES))
-        .build();
-    let mut matches = CapturedOutput::new(capture, Layout::Grouped { open: None })
-        .map_err(|error| capture_error(error, Operation::WriteCapture))?;
-    let mut skipped = Vec::new();
-    let mut skip = |path: &Path, reason| {
-        skipped.push(Skipped {
-            path: relative_path(workspace, path),
-            reason,
-        });
+    let search = Search {
+        workspace,
+        root,
+        matcher,
+        searcher: {
+            let mut searcher = SearcherBuilder::new();
+            searcher
+                .line_number(true)
+                .binary_detection(BinaryDetection::quit(b'\0'))
+                .heap_limit(Some(crate::limits::WHOLE_VALUE_BYTES));
+            searcher
+        },
+        matches: Mutex::new(
+            CapturedOutput::new(capture, Shape::Object)
+                .map_err(|error| capture_error(error, Operation::WriteCapture))?,
+        ),
+        skipped: Mutex::default(),
+        stop: OnceLock::new(),
+        cancellation,
     };
-    for walked in files {
-        if cancellation.is_cancelled() {
-            return Err(LocalError::cancelled()
-                .operation(Operation::Read, Subject::path(root))
-                .effects(Effects::OutputIncomplete));
+    match walk {
+        None => {
+            search.unless_cancelled()?;
+            search.worker().file(root, true)?
         }
-        let path = match walked? {
-            Walked::File(path) => path,
-            Walked::Unlisted(path) => {
-                skip(&path, SkipReason::Unlisted);
-                continue;
-            }
-        };
-        // A live database's file is never opened: a walk passes over it, and a search
-        // of that one file is refused.
-        let file = match crate::fs::open_regular_blocking(&path, u64::MAX) {
-            Ok(file) => file,
-            Err(crate::fs::RegularFileError::Live(live)) if single => {
-                return Err(LocalError::from(crate::fs::RegularFileError::Live(live))
-                    .operation(Operation::Read, Subject::path(&path)));
-            }
-            Err(crate::fs::RegularFileError::Live(_)) => continue,
-            Err(_) => {
-                skip(&path, SkipReason::Unopened);
-                continue;
-            }
-        };
-        let checkpoint = matches.checkpoint();
-        let mut sink = SearchSink {
-            path: relative_path(workspace, &path),
-            matches: &mut matches,
-            matcher: &matcher,
-            binary: false,
-            cancellation,
-        };
-        let searched = searcher.search_file(&matcher, &file, &mut sink);
-        let binary = sink.binary;
-        // A file that stopped partway keeps none of its matches, like a binary one.
-        let discard = match searched {
-            Ok(()) => binary,
-            Err(SearchStop::Read) => {
-                skip(&path, SkipReason::Unread);
-                true
-            }
-            Err(SearchStop::Cancelled) => {
-                return Err(LocalError::cancelled()
-                    .operation(Operation::Read, Subject::path(&path))
-                    .effects(Effects::OutputIncomplete));
-            }
-            Err(SearchStop::Capture(error)) => {
-                return Err(capture_error(error, Operation::WriteCapture));
-            }
-        };
-        if discard {
-            matches
-                .rollback(checkpoint)
-                .map_err(|error| capture_error(error, Operation::WriteCapture))?;
-        }
+        // Each file is searched whole by one worker, which appends its matches as one
+        // group, so groups land in the order their files finish.
+        Some(walk) => walk.build_parallel().run(|| {
+            let mut worker = search.worker();
+            Box::new(move |entry| worker.visit(entry))
+        }),
     }
-    let matches = matches
+    let Search {
+        matches,
+        skipped,
+        stop,
+        ..
+    } = search;
+    if let Some(stop) = stop.into_inner() {
+        return Err(stop);
+    }
+    let matches = (matches.into_inner().unwrap_or_else(PoisonError::into_inner))
         .finish()
         .map_err(|error| capture_error(error, Operation::FinishCapture))?;
+    let mut skipped = skipped.into_inner().unwrap_or_else(PoisonError::into_inner);
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((matches, skipped))
 }
 
-/// The entry a walk error names, when it names one.
+/// One search, shared by the threads walking it.
+struct Search<'a> {
+    workspace: &'a Path,
+    root: &'a Path,
+    matcher: grep_regex::RegexMatcher,
+    searcher: SearcherBuilder,
+    matches: Mutex<CapturedOutput>,
+    skipped: Mutex<Vec<Skipped>>,
+    /// Why the search ended early, the first time it did.
+    stop: OnceLock<LocalError>,
+    cancellation: &'a tokio_util::sync::CancellationToken,
+}
+
+impl Search<'_> {
+    fn worker(&self) -> Worker<'_> {
+        Worker {
+            search: self,
+            matcher: self.matcher.clone(),
+            searcher: self.searcher.build(),
+            group: Vec::new(),
+        }
+    }
+
+    fn unless_cancelled(&self) -> Result<(), LocalError> {
+        if self.cancellation.is_cancelled() {
+            return Err(LocalError::cancelled()
+                .operation(Operation::Read, Subject::path(self.root))
+                .effects(Effects::OutputIncomplete));
+        }
+        Ok(())
+    }
+
+    fn skip(&self, path: &Path, reason: SkipReason) {
+        let skipped = Skipped {
+            path: relative_path(self.workspace, path),
+            reason,
+        };
+        (self.skipped.lock().unwrap_or_else(PoisonError::into_inner)).push(skipped);
+    }
+}
+
+/// One thread's share of a search, with its own matcher and searcher, as ripgrep keeps.
+struct Worker<'a> {
+    search: &'a Search<'a>,
+    matcher: grep_regex::RegexMatcher,
+    searcher: Searcher,
+    /// The file being searched's matches, rendered as its group's JSON.
+    group: Vec<u8>,
+}
+
+impl Worker<'_> {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        let searched = self.search.unless_cancelled().and_then(|()| match entry {
+            Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
+                self.file(entry.path(), false)
+            }
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let path = error_path(&error).unwrap_or(self.search.root);
+                self.search.skip(path, SkipReason::Unlisted);
+                Ok(())
+            }
+        });
+        match searched {
+            Ok(()) => ignore::WalkState::Continue,
+            Err(stop) => {
+                let _ = self.search.stop.set(stop);
+                ignore::WalkState::Quit
+            }
+        }
+    }
+
+    /// Search `path`, appending its matches once it was read whole; `single` when it is
+    /// the search's root rather than a file the walk found.
+    fn file(&mut self, path: &Path, single: bool) -> Result<(), LocalError> {
+        let search = self.search;
+        // A live database's file is never opened: a walk passes over it, and a search
+        // of that one file is refused.
+        let file = match crate::fs::open_regular_blocking(path, u64::MAX) {
+            Ok(file) => file,
+            Err(crate::fs::RegularFileError::Live(live)) if single => {
+                return Err(LocalError::from(crate::fs::RegularFileError::Live(live))
+                    .operation(Operation::Read, Subject::path(path)));
+            }
+            Err(crate::fs::RegularFileError::Live(_)) => return Ok(()),
+            Err(_) => {
+                search.skip(path, SkipReason::Unopened);
+                return Ok(());
+            }
+        };
+        self.group.clear();
+        let mut sink = SearchSink {
+            path,
+            workspace: search.workspace,
+            group: &mut self.group,
+            matcher: &self.matcher,
+            binary: false,
+            cancellation: search.cancellation,
+        };
+        let searched = self.searcher.search_file(&self.matcher, &file, &mut sink);
+        // A file that stopped partway keeps none of its matches, like a binary one.
+        match searched {
+            Ok(()) if sink.binary || self.group.is_empty() => {}
+            Ok(()) => {
+                self.group.extend_from_slice(b"\n]");
+                (search
+                    .matches
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner))
+                .push_rendered(&self.group)
+                .map_err(|error| capture_error(error, Operation::WriteCapture))?;
+            }
+            Err(SearchStop::Read) => search.skip(path, SkipReason::Unread),
+            Err(SearchStop::Cancelled) => {
+                return Err(LocalError::cancelled()
+                    .operation(Operation::Read, Subject::path(path))
+                    .effects(Effects::OutputIncomplete));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn error_path(error: &ignore::Error) -> Option<&Path> {
     match error {
         ignore::Error::WithPath { path, .. } => Some(path),
@@ -388,13 +461,14 @@ fn glob_blocking(
         return Err(LocalError::failed("glob root is not a directory")
             .operation(Operation::Inspect, Subject::path(root)));
     }
-    let walk = walk_builder(
+    let mut walk = walk_builder(
         root,
         args.hidden,
         args.no_ignore,
         std::iter::once((args.pattern.as_str(), Subject::argument(["pattern"]))),
     )?;
-    let mut paths = CapturedOutput::new(capture, Layout::List { count: 0 })
+    walk.sort_by_file_path(std::cmp::Ord::cmp);
+    let mut paths = CapturedOutput::new(capture, Shape::Array)
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for entry in walk.build() {
         if cancellation.is_cancelled() {
@@ -406,7 +480,7 @@ fn glob_blocking(
         if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
             let path = relative_path(workspace, entry.path());
             paths
-                .push(&path, &path)
+                .push(&path)
                 .map_err(|error| capture_error(error, Operation::WriteCapture))?;
         }
     }
@@ -444,97 +518,74 @@ fn capture_error(error: std::io::Error, operation: Operation) -> LocalError {
         .effects(Effects::OutputIncomplete)
 }
 
-/// Streams the complete result into the owning job's capture. The handler returns
-/// completed ownership evidence; the finalizer publishes the captured field.
+/// Streams the complete result into the owning job's capture, one entry at a time. The
+/// handler returns completed ownership evidence; the finalizer publishes the captured
+/// field.
 struct CapturedOutput {
     file: OutputWriter,
-    layout: Layout,
+    shape: Shape,
+    empty: bool,
 }
 
-/// How pushed values are arranged in the captured JSON.
-#[derive(Clone)]
-enum Layout {
-    /// An array of `count` values so far.
-    List { count: usize },
-    /// An object mapping each path to the values found in it; `open` is the
-    /// path whose array is still being written.
-    Grouped { open: Option<String> },
-}
-
-/// Where a rollback returns the capture to.
-struct Checkpoint {
-    position: u64,
-    layout: Layout,
+#[derive(Clone, Copy)]
+enum Shape {
+    Array,
+    Object,
 }
 
 impl CapturedOutput {
-    fn new(capture: PendingOutput, layout: Layout) -> std::io::Result<Self> {
+    fn new(capture: PendingOutput, shape: Shape) -> std::io::Result<Self> {
         use std::io::Write as _;
         let mut file = capture.open();
-        file.write_all(match layout {
-            Layout::List { .. } => b"[\n",
-            Layout::Grouped { .. } => b"{\n",
+        file.write_all(match shape {
+            Shape::Array => b"[\n",
+            Shape::Object => b"{\n",
         })?;
-        Ok(Self { file, layout })
+        Ok(Self {
+            file,
+            shape,
+            empty: true,
+        })
     }
-    /// Append `value`, found in `path`: to the list, or to `path`'s group.
-    fn push(&mut self, path: &str, value: impl Serialize) -> std::io::Result<()> {
+
+    fn separate(&mut self) -> std::io::Result<()> {
         use std::io::Write as _;
-        match &mut self.layout {
-            Layout::List { count } => {
-                if *count > 0 {
-                    self.file.write_all(b",\n")?;
-                }
-                *count += 1;
-            }
-            Layout::Grouped { open } if open.as_deref() == Some(path) => {
-                self.file.write_all(b",\n")?;
-            }
-            Layout::Grouped { open } => {
-                if open.is_some() {
-                    self.file.write_all(b"\n],\n")?;
-                }
-                serde_json::to_writer(&mut self.file, path)?;
-                self.file.write_all(b": [\n")?;
-                *open = Some(path.to_owned());
-            }
+        if !std::mem::replace(&mut self.empty, false) {
+            self.file.write_all(b",\n")?;
         }
-        serde_json::to_writer(&mut self.file, &value)?;
         Ok(())
     }
-    fn checkpoint(&self) -> Checkpoint {
-        Checkpoint {
-            position: self.file.position(),
-            layout: self.layout.clone(),
-        }
+
+    /// Append `value` to the array.
+    fn push(&mut self, value: impl Serialize) -> std::io::Result<()> {
+        self.separate()?;
+        Ok(serde_json::to_writer(&mut self.file, &value)?)
     }
-    fn rollback(&mut self, checkpoint: Checkpoint) -> std::io::Result<()> {
-        self.layout = checkpoint.layout;
-        self.file.truncate(checkpoint.position)
+
+    /// Append one entry already rendered as JSON, such as an object's `"key": value`.
+    fn push_rendered(&mut self, entry: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        self.separate()?;
+        self.file.write_all(entry)
     }
+
     fn finish(mut self) -> std::io::Result<FinishedOutput> {
         use std::io::Write as _;
-        match self.layout {
-            Layout::List { .. } => self.file.write_all(b"\n]")?,
-            Layout::Grouped { open } => {
-                if open.is_some() {
-                    self.file.write_all(b"\n]")?;
-                }
-                self.file.write_all(b"\n}")?;
-            }
-        }
+        self.file.write_all(match self.shape {
+            Shape::Array => b"\n]",
+            Shape::Object => b"\n}",
+        })?;
         self.file.finish()
     }
 }
 
 /// Why a file's search stopped. Cancellation is never inferred from text or from a
-/// token observed later than an unrelated read failure, and a failed capture write
-/// keeps its cause; a read failure only skips the file.
+/// token observed later than an unrelated read failure; a read failure only skips the
+/// file.
 #[derive(Debug)]
 enum SearchStop {
     Cancelled,
     Read,
-    Capture(std::io::Error),
 }
 
 impl grep_searcher::SinkError for SearchStop {
@@ -546,13 +597,16 @@ impl grep_searcher::SinkError for SearchStop {
     }
 }
 
+/// Renders one file's matches as its group, `"path": ["line: text", ...`, left open.
 struct SearchSink<'a> {
-    path: String,
-    matches: &'a mut CapturedOutput,
+    path: &'a Path,
+    workspace: &'a Path,
+    group: &'a mut Vec<u8>,
     matcher: &'a grep_regex::RegexMatcher,
     binary: bool,
     cancellation: &'a tokio_util::sync::CancellationToken,
 }
+
 impl Sink for SearchSink<'_> {
     type Error = SearchStop;
     fn matched(
@@ -566,25 +620,40 @@ impl Sink for SearchSink<'_> {
         let line = matched.line_number().unwrap_or(1);
         let bytes = matched.bytes();
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-        // The match is found in the line as searched, before its `\r` is dropped for
-        // display, so a match on the `\r` still places the window.
-        let found = grep_matcher::Matcher::find(self.matcher, bytes)
-            .ok()
+        let shown = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        // Only a line cut to a window needs its match placed. The match is found in the
+        // line as searched, before its `\r` is dropped for display, so a match on the
+        // `\r` still places the window.
+        let found = (shown.len() > 4 * MATCH_CONTEXT_BYTES)
+            .then(|| {
+                grep_matcher::Matcher::find(self.matcher, bytes)
+                    .ok()
+                    .flatten()
+            })
             .flatten()
             .map(|found| found.start()..found.end());
-        let shown = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-        (self.matches)
-            .push(
-                &self.path,
-                format_args!("{line}: {}", excerpt(shown, found)),
-            )
-            .map_err(SearchStop::Capture)?;
+        if self.group.is_empty() {
+            let path = relative_path(self.workspace, self.path);
+            render(self.group, &path);
+            self.group.extend_from_slice(b": [\n");
+        } else {
+            self.group.extend_from_slice(b",\n");
+        }
+        render(
+            self.group,
+            &format_args!("{line}: {}", excerpt(shown, found)),
+        );
         Ok(true)
     }
     fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> Result<bool, Self::Error> {
         self.binary = true;
         Ok(false)
     }
+}
+
+/// Append `text` to `out` as a JSON string.
+fn render(out: &mut Vec<u8>, text: &impl Serialize) {
+    serde_json::to_writer(out, text).expect("text serializes into memory");
 }
 
 /// `line` whole when it is short; otherwise the window around `found`, its match,
@@ -939,24 +1008,37 @@ mod tests {
         }
     }
 
+    /// A cancelled search stops before its first file, and before a walk that only meets
+    /// entries it cannot list.
     #[test]
     fn cancellation_before_first_file_is_typed() {
+        use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::tempdir().unwrap();
         let input = root.path().join("input");
         std::fs::write(&input, "needle").unwrap();
+        let closed = root.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o000);
         let args: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let output = CaptureFixture::new();
-        let capture = output.pending();
-        let result = search_blocking(root.path(), &input, &args, capture, &cancellation);
-        let diagnostic = result.unwrap_err().diagnostic();
-        assert_eq!(diagnostic.cause, Cause::Cancelled);
-        assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
+        let results = [&input, &closed].map(|path| {
+            let output = CaptureFixture::new();
+            search_blocking(root.path(), path, &args, output.pending(), &cancellation)
+        });
+        mode(0o700);
+        for result in results {
+            let diagnostic = result.unwrap_err().diagnostic();
+            assert_eq!(diagnostic.cause, Cause::Cancelled);
+            assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
+        }
     }
 
     #[tokio::test]
-    async fn grouped_search_is_captured_and_preserves_whitespace_and_binary_rollback() {
+    async fn grouped_search_is_captured_and_preserves_whitespace_and_drops_binary_files() {
         let runtime = crate::tests::TestRuntime::new().await;
         let directory = runtime.root.path().join("files");
         std::fs::create_dir(&directory).unwrap();

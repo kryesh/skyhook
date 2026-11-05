@@ -23,8 +23,10 @@ their defaults. Scripts also control jobs with `tool.job(id).send({value})` and 
 Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view's `.result` is
 `{reason, waited_s}`: `reason` is `"event"`, `"timeout"` or `"cancelled"`, and `waited_s` counts the
-whole seconds waited. A cancelled wait is a failed view that still carries this result. Omitted or
-null `timeout` waits indefinitely; a supplied timeout must be a positive integer number of seconds.
+whole seconds waited. A cancelled wait is a failed view that still carries this result. A supplied
+timeout must be a positive integer number of seconds; a wait lasts at most 30 minutes (1800), which is
+also how long an omitted or null `timeout` waits, so an agent waiting on work that never reports
+regains control.
 An event does not guarantee a particular job has completed; inspect its current status. See
 [waiting for background work](../scripting/jobs-and-agents.md#waiting-for-background-work) for when
 a wait resolves.

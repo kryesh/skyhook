@@ -648,7 +648,7 @@ mod tests {
     /// highlighted, and blocks with the same source remain distinct lines.
     #[test]
     fn card_markdown_is_indented_highlighted_and_copied_as_rendered() {
-        let question = serde_json::json!({"id": "pick", "prompt": "Pick **one**\n\n```rust\nlet x = 1;\n```",
+        let question = serde_json::json!({"header": "pick", "prompt": "Pick **one**\n\n```rust\nlet x = 1;\n```",
             "options": [{"label": "A", "description": "Same *text*"},
                 {"label": "B", "description": "Same *text*"}]});
         let output = serde_json::json!({"state": "waiting_input",
@@ -670,11 +670,11 @@ mod tests {
             let row = rows.iter().find(|row| row.text() == text).unwrap();
             row.paragraph_x()
         };
-        assert_eq!(x("Pick one"), x("Question") + 2);
-        assert_eq!(x("Same text"), x("Question") + 4);
+        assert_eq!(x("Pick one"), x("Question · pick") + 2);
+        assert_eq!(x("Same text"), x("Question · pick") + 4);
         assert_eq!(
             copy_from(rows, "Output"),
-            "Output\nQuestion\nPick one\n\nlet x = 1;\n• A\nSame text\n• B\nSame text"
+            "Output\nQuestion · pick\nPick one\n\nlet x = 1;\n• A\nSame text\n• B\nSame text"
         );
     }
 

@@ -624,10 +624,6 @@ pub(crate) mod tests {
                     captures.insert(id, Vec::new());
                 }
                 CaptureEvent::Write { id, data } => captures.get_mut(&id).unwrap().extend(data),
-                CaptureEvent::Truncate { id, length } => captures
-                    .get_mut(&id)
-                    .unwrap()
-                    .truncate(usize::try_from(length).unwrap()),
                 CaptureEvent::Discard { id } => {
                     captures.remove(&id);
                 }

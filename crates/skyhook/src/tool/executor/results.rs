@@ -23,11 +23,7 @@ impl ToolExecutor {
             Err(error) => return Err(job_error(error)).into(),
         };
         if !waited.state.is_terminal() {
-            return Ok(released(
-                job,
-                waited.released_view(crate::job::Release::Asked),
-            ))
-            .into();
+            return Ok(released_call(job, &waited)).into();
         }
         let presented = jobs.present_output_with(
             crate::job::output::OutputArgs::new(job),
@@ -160,6 +156,13 @@ impl ToolExecutor {
             Err(failure)
         }
     }
+}
+
+/// The model's call that let go of its unfinished job: moved by its turn, or released
+/// because a child asked.
+pub(super) fn released_call(job: JobId, envelope: &crate::job::JobEnvelope) -> ExecutionResult {
+    let release = (envelope.moved).map_or(crate::job::Release::Asked, crate::job::Release::Moved);
+    released(job, envelope.released_view(release))
 }
 
 /// The result of a foreground call that let go of its unfinished job.

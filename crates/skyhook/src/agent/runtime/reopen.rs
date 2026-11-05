@@ -1867,7 +1867,10 @@ mod tests {
             // do not leak the summary schema
             assert!(first.response_schema.is_none());
             let runtime = request_runtime_state(first);
-            assert!(runtime.contains("Inspect queue") && runtime.contains("completed"));
+            assert!(
+                !runtime.contains("Inspect queue"),
+                "a completed todo is left out"
+            );
             assert!(runtime.contains("Verify queue fix") && runtime.contains("pending"));
         }
         shutdown_session(resumed).await;

@@ -603,7 +603,11 @@ job: while it is pending, it and the replies queued before it are pending for th
 together, and a foreground wait keeps waiting for the outcome. Folding the ask record also
 releases the model-level foreground call blocked on the job, the job's own or that of the
 script whose calls wait on it, which then returns the job unfinished, presenting and
-acknowledging neither (`job/persistence.rs`, `job/delivery.rs`). A child's final answer stays its
+acknowledging neither (`job/persistence.rs`, `job/delivery.rs`). A turn moves its response's
+blocked foreground calls aside the same way (`agent/runtime/foreground.rs`): past the event
+threshold, once its agent has input or a background job's outcome or question pending, or at the
+limit, it journals their release in one commit whose live change marks each job with what moved
+it, which the call's returned view reports (`JobManager::move_calls`). A child's final answer stays its
 job's result until its owner acknowledges that completion; a restart before then supersedes the
 result and queues the answer as a reply (`job/entry.rs`), which a read of the superseded result,
 such as a script's own call, acknowledges in place of the restarted invocation's delivery. A job's
@@ -635,7 +639,10 @@ against the journal image's, and only fills the dictionaries, whose rows come fr
 process holds on it, SQLite's included, so one registry under one lock (`db::live`) records both
 each database the process has open (its file, `-wal`, `-shm` and `-journal`, by identity and by
 name) and every handle another in-process opener holds (`fs::OpenFile`, by identity). An opener
-refuses a live database's file and registers its handle under the lock; a database registers
+refuses a live database's file and holds the file its name reaches under the lock, then opens
+outside it, so concurrent opens never queue on each other's syscalls; a descriptor that reached
+another file by then is decided about under the lock, and one of a live database's is parked on
+that database until its last connection closes. A database registers
 before SQLite opens it, waiting at most the busy timeout for handles on its files to close;
 replacing or removing a file decides and acts under the lock, and removing a tree reserves it
 under the lock, so no database registers inside it, then removes it outside; walks pass over live

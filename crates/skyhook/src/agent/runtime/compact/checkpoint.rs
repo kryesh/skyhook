@@ -592,7 +592,11 @@ mod tests {
     /// even when the model's state mode sends normal requests no runtime state.
     #[tokio::test]
     async fn stateless_summary_still_sees_the_current_todos() {
-        let current = vec![todo("Keep the stateless todo", TodoStatus::InProgress)];
+        // The completed item appears nowhere in history, so only the state shows it.
+        let current = vec![
+            todo("Keep the stateless todo", TodoStatus::InProgress),
+            todo("Seeded and finished", TodoStatus::Completed),
+        ];
         let mut continuation = summary_json();
         continuation["todos"] = json!(current);
         let steps = [Step::new(summary(continuation))];
@@ -610,7 +614,7 @@ mod tests {
         fixture.compact().await.unwrap();
         let request = fixture.script.request(1).await;
         let sent = crate::agent::runtime::tests::rendered(&request);
-        assert!(sent.contains("Keep the stateless todo"));
+        assert!(sent.contains("Keep the stateless todo") && sent.contains("Seeded and finished"));
         let found = runtime.store.inspect_todos(agent, None).unwrap();
         assert_eq!(found, current);
         fixture.session.shutdown().await.unwrap();

@@ -106,6 +106,21 @@ impl Keyed for Task {
     }
 }
 
+/// Which part of the task log a listing reads: tasks whose job is live, or those whose job
+/// ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    Ended,
+}
+
+/// A listed task with the brief its job was launched with.
+#[derive(Clone, Debug)]
+pub struct ListedTask {
+    pub task: Task,
+    pub brief: Option<String>,
+}
+
 /// A task with its brief, its child's reply, and what its child recorded.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct TaskDetail {
@@ -333,24 +348,28 @@ impl Store {
         })
     }
 
-    /// The first `limit` tasks, live ones first, then queued, failed and cancelled ones, each
-    /// newest first.
-    pub fn tasks(&self, limit: usize) -> Result<Vec<Task>> {
-        self.read(|db| {
-            let tasks = first_rows(
-                db,
-                concat!(
-                    task_select!(),
-                    "1 ORDER BY CASE j.state WHEN 'running' THEN 0 WHEN 'waiting_input' THEN 0 \
-                     WHEN 'queued' THEN 1 WHEN 'awaiting_approval' THEN 1 WHEN 'failed' THEN 2 \
-                     WHEN 'interrupted' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END,t.id DESC"
-                ),
-                Vec::new(),
-                limit,
-                task_row,
-            )?;
-            with_subjects(db, tasks)
-        })
+    /// The newest `limit` tasks of `liveness`, each with the brief its job was launched with.
+    pub fn tasks(&self, liveness: Liveness, limit: usize) -> Result<Vec<ListedTask>> {
+        let listed = self.read(|db| {
+            let sql = match liveness {
+                Liveness::Live => concat!(task_select!(), "NOT j.terminal ORDER BY t.id DESC"),
+                Liveness::Ended => concat!(task_select!(), "j.terminal ORDER BY t.id DESC"),
+            };
+            let row = |row: &Row| Ok((task_row(row)?, row.get::<i64>(5)?));
+            let (tasks, jobs): (Vec<_>, Vec<_>) = first_rows(db, sql, Vec::new(), limit, row)?
+                .into_iter()
+                .unzip();
+            Ok(with_subjects(db, tasks)?.into_iter().zip(jobs))
+        })?;
+        let brief = |job| Ok::<_, Error>(self.0.agent_job_brief(journal_job(job)?)?);
+        (listed.into_iter())
+            .map(|(task, job)| {
+                Ok(ListedTask {
+                    task,
+                    brief: brief(job)?,
+                })
+            })
+            .collect()
     }
 
     /// A page of tasks, oldest first.
@@ -367,8 +386,16 @@ impl Store {
         })
     }
 
-    pub fn task_count(&self) -> Result<u64> {
-        self.read(|db| count(db, "SELECT count(*) FROM task", Vec::new()))
+    pub fn task_count(&self, liveness: Liveness) -> Result<u64> {
+        let sql = match liveness {
+            Liveness::Live => {
+                "SELECT count(*) FROM task t JOIN job_status j ON j.job=t.job WHERE NOT j.terminal"
+            }
+            Liveness::Ended => {
+                "SELECT count(*) FROM task t JOIN job_status j ON j.job=t.job WHERE j.terminal"
+            }
+        };
+        self.read(|db| count(db, sql, Vec::new()))
     }
 
     /// The task with its brief, its child's reply, and the first `limit` events its child
@@ -477,14 +504,11 @@ mod tests {
         assert_eq!(bases, [(second.candidate.into(), merged)]);
         assert!(created < merged);
 
-        let tasks = store.tasks(10).unwrap();
+        let tasks = store.tasks(Liveness::Live, 10).unwrap();
+        assert_eq!(tasks[0].brief.as_deref(), Some("brief"));
+        let task0 = &tasks[0].task;
         assert_eq!(
-            (
-                tasks[0].id,
-                tasks[0].phase,
-                &tasks[0].subjects[..],
-                tasks[0].state
-            ),
+            (task0.id, task0.phase, &task0.subjects[..], task0.state),
             (
                 task,
                 Phase::Review,
@@ -576,7 +600,7 @@ mod tests {
         let settle = within(&store, &Begin::Settle(vec![decided]), |settler| {
             let holds = StatusChange::Premise(decided, PremiseStatus::Holds);
             store.set_status(settler, holds, &text("traced")).unwrap();
-            store.tasks(1).unwrap()[0].id
+            store.tasks(Liveness::Live, 1).unwrap()[0].task.id
         });
         let support = NewEvidence {
             location: None,

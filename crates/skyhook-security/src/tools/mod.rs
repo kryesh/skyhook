@@ -1257,7 +1257,7 @@ pub(crate) mod tests {
         // that wait keeps the run going.
         let stubs = "let open = true, swept;
             const done = new Promise(resolve => swept = resolve), started = [], real = globalThis.tool;
-            const question = (await real.ask({id: 'profile', prompt: 'Which deployment?', bg: true})).id;
+            const question = (await real.ask({header: 'profile', prompt: 'Which deployment?', bg: true})).id;
             const sleep = async () => { await done; if (open) { open = false; await real.job(question).cancel(); } };
             const tool = {
                 jobs: real.jobs, research: real.research, research_query: real.research_query,
@@ -1319,9 +1319,14 @@ pub(crate) mod tests {
         let tried = async {
             loop {
                 let store = store.clone();
-                let tasks = tokio::task::spawn_blocking(move || store.tasks(10).unwrap())
-                    .await
-                    .unwrap();
+                let tasks = tokio::task::spawn_blocking(move || {
+                    store
+                        .task_page(crate::store::Page::default())
+                        .unwrap()
+                        .items
+                })
+                .await
+                .unwrap();
                 let state = |path: PathId| {
                     (tasks.iter())
                         .filter(|task| task.subjects == [NodeId::from(path)])

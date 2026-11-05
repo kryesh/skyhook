@@ -13,24 +13,106 @@ use crate::{
     session::EventRecord,
 };
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
-pub struct QuestionOption {
-    /// Short answer label returned as a string, or as `answer` alongside an optional `comment`.
-    pub label: String,
-    /// Explanation of this choice's effect or tradeoff.
-    pub description: String,
+/// The most characters a question's header holds.
+pub const MAX_HEADER: usize = 24;
+
+/// Why a header is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum HeaderError {
+    #[error("a question header must not be blank")]
+    Blank,
+    #[error("a question header holds at most {MAX_HEADER} characters")]
+    Long,
+}
+
+crate::newtype::string_newtype! {
+    /// A question's short title: its tab among the questions asked together, unique
+    /// among them, and the key its answer is filed under.
+    #[derive(PartialOrd, Ord)]
+    pub struct QuestionHeader(HeaderError) = |header| match header {
+        header if header.trim().is_empty() => Err(HeaderError::Blank),
+        header if header.chars().count() > MAX_HEADER => Err(HeaderError::Long),
+        _ => Ok(()),
+    }, schema = schemars::json_schema!({
+        "type": "string", "minLength": 1, "maxLength": MAX_HEADER, "pattern": "\\S",
+    });
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionOption {
+    /// Short answer label, returned as the answer when chosen.
+    pub label: crate::Prose,
+    /// What choosing it means: its effect or tradeoff.
+    pub description: crate::Prose,
+    /// The option you recommend: at most one, unless the question takes several.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
+    /// Markdown shown beside this option while it is focused: a short concrete artifact the
+    /// user compares across options, such as a code or config snippet (fenced, with a
+    /// language), a data shape, or a small ASCII mockup. Show only what differs from the
+    /// other options, in the same framing for each; keep it under about 20 lines and 60
+    /// columns. Give every option a preview or none. The tradeoff belongs in `description`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::Prose>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Question {
-    /// Stable identifier used to associate the answer with this question.
-    pub id: String,
-    /// Complete question shown to the user or owning parent agent.
-    pub prompt: String,
-    /// Suggested mutually exclusive answers; free-form input is always allowed. Selecting a
-    /// suggestion returns its label, or {"answer": "label", "comment": "text"} with a non-blank comment.
+    pub header: QuestionHeader,
+    /// The complete question as Markdown, shown to the user or owning parent agent. Put
+    /// lists and separate points on their own lines.
+    pub prompt: crate::Prose,
+    /// Suggested answers with distinct labels; free-form input is always allowed. A chosen
+    /// suggestion answers with its label, or {"answer": "label", "comment": "text"} with a
+    /// comment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<QuestionOption>,
+    /// Take several suggestions: the answer is then a list of labels and free-form text,
+    /// or {"answers": [...], "comment": "text"} with a comment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiple: bool,
+}
+
+impl Question {
+    /// Why the question cannot be asked: labels repeat, it recommends more than one
+    /// option while taking one, or it takes several with none to choose from.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let mut labels = std::collections::HashSet::new();
+        if !self
+            .options
+            .iter()
+            .all(|option| labels.insert(option.label.as_str()))
+        {
+            return Some("option labels must be distinct");
+        }
+        let recommended = self
+            .options
+            .iter()
+            .filter(|option| option.recommended)
+            .count();
+        if !self.multiple && recommended > 1 {
+            return Some("a question taking one answer recommends at most one option");
+        }
+        if self.multiple && self.options.is_empty() {
+            return Some("a question taking several answers needs options");
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+impl Question {
+    /// A question titled `header` without options.
+    pub(crate) fn test(header: &str) -> Self {
+        Self {
+            header: header.parse().unwrap(),
+            prompt: "Question?".parse().unwrap(),
+            options: Vec::new(),
+            multiple: false,
+        }
+    }
 }
 
 /// A suspended child's question batch, returned in its agent job's output.
@@ -41,18 +123,34 @@ pub(crate) struct QuestionOutput {
     pub questions: Vec<Question>,
 }
 
-/// One question's answer as the host collected it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One question's answer: a suggestion's label or free-form text, or, for a question
+/// taking several, a list of them; either with a comment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum QuestionAnswer {
-    /// Free-form input, or a chosen suggestion's label.
     Text(String),
-    /// A chosen suggestion's label with the user's non-blank comment.
-    Commented { answer: String, comment: String },
+    Commented {
+        answer: String,
+        comment: String,
+    },
+    Selected(Vec<String>),
+    SelectedCommented {
+        answers: Vec<String>,
+        comment: String,
+    },
 }
 
-/// A host's answers to one batch, keyed by `Question::id`.
-pub type QuestionReply = HashMap<String, QuestionAnswer>;
+impl QuestionAnswer {
+    /// `value` as an answer to `question`, when its shape fits the question.
+    pub fn parse(question: &Question, value: serde_json::Value) -> Option<Self> {
+        let answer = serde_json::from_value::<Self>(value).ok()?;
+        let several = matches!(answer, Self::Selected(_) | Self::SelectedCommented { .. });
+        (several == question.multiple).then_some(answer)
+    }
+}
+
+/// A host's answers to one batch, keyed by `Question::header`.
+pub type QuestionReply = HashMap<QuestionHeader, QuestionAnswer>;
 
 pub type QuestionFuture =
     Pin<Box<dyn Future<Output = Result<QuestionReply, QuestionError>> + Send + 'static>>;
@@ -174,4 +272,81 @@ pub enum RuntimeEvent {
     },
     /// The phase the session moved to.
     Phase(crate::session::SessionPhase),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn option(label: &str, recommended: bool) -> QuestionOption {
+        QuestionOption {
+            label: label.parse().unwrap(),
+            description: "Why.".parse().unwrap(),
+            recommended,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn headers_are_short_and_not_blank() {
+        assert_eq!("  ".parse::<QuestionHeader>(), Err(HeaderError::Blank));
+        let longest = "é".repeat(MAX_HEADER);
+        assert!(longest.parse::<QuestionHeader>().is_ok());
+        let long = format!("{longest}x").parse::<QuestionHeader>();
+        assert_eq!(long, Err(HeaderError::Long));
+    }
+
+    /// A question taking one answer recommends at most one option; one taking several
+    /// may recommend any, but needs options; labels never repeat.
+    #[test]
+    fn questions_refuse_what_their_answers_cannot_take() {
+        let with = |multiple, options| Question {
+            multiple,
+            options,
+            ..Question::test("pick")
+        };
+        let both = || vec![option("a", true), option("b", true)];
+        assert!(with(false, both()).refusal().is_some());
+        assert!(with(true, both()).refusal().is_none());
+        assert!(with(true, Vec::new()).refusal().is_some());
+        assert!(
+            with(false, vec![option("a", false), option("a", false)])
+                .refusal()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn answers_take_the_shape_their_question_does() {
+        let one = Question::test("one");
+        let several = Question {
+            multiple: true,
+            options: vec![option("a", false)],
+            ..Question::test("several")
+        };
+        let commented = json!({"answer": "a", "comment": "why"});
+        let listed = json!({"answers": ["a", "free"], "comment": "why"});
+        for (question, fits, misfits) in [
+            (
+                &one,
+                [json!("a"), commented.clone()],
+                [json!(["a"]), listed.clone()],
+            ),
+            (
+                &several,
+                [json!(["a", "free"]), listed],
+                [json!("a"), commented],
+            ),
+        ] {
+            for answer in fits {
+                let parsed = QuestionAnswer::parse(question, answer.clone()).unwrap();
+                assert_eq!(serde_json::to_value(parsed).unwrap(), answer);
+            }
+            for answer in misfits {
+                assert_eq!(QuestionAnswer::parse(question, answer), None);
+            }
+        }
+        assert_eq!(QuestionAnswer::parse(&one, json!(1)), None);
+    }
 }

@@ -189,6 +189,14 @@ impl ScopePanel {
         Ok(reply)
     }
 
+    /// A panel already sent with `form`'s values, as a session the app did not start
+    /// shows the scope it runs under; none when a value is out of its field's range.
+    pub(super) fn sent(form: ScopeForm) -> Option<Self> {
+        let mut panel = Self::new(form);
+        panel.freeze().ok()?;
+        Some(panel)
+    }
+
     /// A session that failed to start takes nothing with it: its values are written
     /// again until the next start.
     pub(super) fn reopen(&mut self) {
@@ -549,6 +557,29 @@ mod tests {
                 message: "Start.".into(),
             })
         }
+    }
+
+    /// A session the app opens rather than starts shows its extension's scope, already
+    /// sent: frozen, with no field to edit.
+    #[tokio::test]
+    async fn an_opened_session_shows_its_scope_frozen() {
+        let (_root, app) = draft_fixture().await;
+        let form = Scoped(0)
+            .form(app.launch.context(Opening::New(None)))
+            .unwrap();
+        let session = app.launch.create(Opening::New(None)).await.unwrap().session;
+        let mut observation = PreparedObservation::load(session, Arc::new(()), app.budget)
+            .await
+            .unwrap();
+        observation.scope = Some(form);
+        let mut opened = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
+        assert!(opened.scope.is_some() && !opened.scope_editable());
+        let screen = draw_sized(&mut opened, 100, 24);
+        let frozen = ["level  low", "depth  2"]
+            .iter()
+            .all(|row| screen.contains(row));
+        assert!(frozen && !screen.contains('◂'), "{screen}");
+        opened.session().unwrap().shutdown().await.unwrap();
     }
 
     /// The panel is edited beside the composer: Shift+Tab walks the fields, a choice

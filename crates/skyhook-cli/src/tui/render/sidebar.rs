@@ -344,23 +344,37 @@ fn wrapped(lines: &[SidebarLine], width: u16) -> Vec<(u16, SidebarLine)> {
     rows.collect()
 }
 
+/// The rows that fit in `capacity`, and how many items the rest hold when they do
+/// not all fit. A row of its own then counts the rest, and an item that would only
+/// partly fit above it is counted rather than cut.
+fn overflow(rows: &[(u16, SidebarLine)], capacity: usize) -> (usize, Option<usize>) {
+    if rows.len() <= capacity {
+        return (rows.len(), None);
+    }
+    let starts = |(indent, _): &&(u16, SidebarLine)| *indent == 0;
+    let mut shown = capacity.saturating_sub(1);
+    while shown > 0 && rows[shown].0 > 0 {
+        shown -= 1;
+    }
+    let items = rows[shown..].iter().filter(starts);
+    let hidden = items.filter(|(_, row)| matches!(row, SidebarLine::Item(..)));
+    (shown, Some(hidden.count()))
+}
+
 fn draw_rows(frame: &mut Frame, rect: Rect, rows: &[(u16, SidebarLine)]) {
     let width = rect.width.saturating_sub(3);
-    let capacity = rect.height as usize;
-    let hidden = rows.len().saturating_sub(capacity);
-    for (y, (indent, row)) in rows.iter().take(capacity).enumerate() {
+    let (shown, hidden) = overflow(rows, rect.height as usize);
+    if let Some(hidden) = hidden.filter(|_| rect.height > 0) {
+        text(
+            frame,
+            r(rect.x + 2, rect.y + shown as u16, width, 1),
+            format!("+{hidden} more"),
+            theme().ui.muted,
+            theme().ui.panel,
+        );
+    }
+    for (y, (indent, row)) in rows[..shown].iter().enumerate() {
         let y = rect.y + y as u16;
-        if hidden > 0 && y + 1 == rect.bottom() {
-            let more = format!("+{} more", hidden + 1);
-            text(
-                frame,
-                r(rect.x + 2, y, width, 1),
-                more,
-                theme().ui.muted,
-                theme().ui.panel,
-            );
-            continue;
-        }
         match row {
             // A title is bold and stands one column left of what it lists.
             SidebarLine::Title(title) => {
@@ -399,6 +413,23 @@ pub(in crate::tui) mod tests {
             let line = SidebarLine::Item(text, Color::Reset, None);
             assert_eq!(wrapped(&[line], 32).len(), 1, "{capability}");
         }
+    }
+
+    #[test]
+    fn overflow_counts_hidden_items_and_never_cuts_one() {
+        let item = |text: &str| SidebarLine::Item(text.into(), Color::Reset, None);
+        let lines = [
+            SidebarLine::Title("Todos".into()),
+            SidebarLine::Blank,
+            item("short"),
+            item(&"wrapping ".repeat(8)),
+            item("last"),
+        ];
+        let rows = wrapped(&lines, 32);
+        assert_eq!(overflow(&rows, rows.len()), (rows.len(), None));
+        // The wrapping item would only partly fit above the count's row.
+        assert_eq!(overflow(&rows, 5), (3, Some(2)));
+        assert_eq!(overflow(&rows, 1), (0, Some(3)));
     }
 
     #[tokio::test]

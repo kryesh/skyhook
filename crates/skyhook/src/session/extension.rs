@@ -156,6 +156,13 @@ impl ExtensionDb {
         }
     }
 
+    /// The brief `job` launched a child agent with; none for another job.
+    pub fn agent_job_brief(&self, job: JobId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .read(|db| db::agent_job(db, job))?
+            .map(|(prompt, _)| prompt))
+    }
+
     /// `job`'s brief and its child's latest reply, read whole, when it launched a child
     /// agent; none for another job. The brief and the reply are each read in a snapshot of
     /// their own, outside any [`read`](Self::read).

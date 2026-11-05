@@ -9,7 +9,7 @@ use crate::{
     session::{CoreState, Key, SessionStore, Wait},
     tool::{
         ToolContext, ToolError, ToolOutput,
-        diagnostic::{Effects, Operation, Subject},
+        diagnostic::{Operation, Subject},
     },
 };
 pub(super) use delivery::Boundary;
@@ -148,8 +148,20 @@ where
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitArgs {
-    /// Maximum seconds to wait, as a positive integer. Omitted/null waits indefinitely.
+    /// Maximum seconds to wait, as a positive integer, at most 1800. Omitted/null waits 1800.
     pub(super) timeout: Option<std::num::NonZeroU64>,
+}
+
+/// The longest a wait lasts, and how long one without a timeout lasts: a bound wait
+/// returns control to an agent stuck on work that will never report.
+const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+
+impl WaitArgs {
+    fn duration(&self) -> Duration {
+        (self.timeout).map_or(MAX_WAIT, |seconds| {
+            Duration::from_secs(seconds.get()).min(MAX_WAIT)
+        })
+    }
 }
 
 #[derive(Serialize, JsonSchema, Debug, PartialEq)]
@@ -219,18 +231,7 @@ impl SessionRuntime {
         args: WaitArgs,
     ) -> Result<WaitOutput, ToolError> {
         let entered = tokio::time::Instant::now();
-        let deadline = args
-            .timeout
-            .map(|seconds| {
-                entered
-                    .checked_add(std::time::Duration::from_secs(seconds.get()))
-                    .ok_or_else(|| {
-                        ToolError::invalid_arguments("timeout is too large")
-                            .operation(Operation::Validate, Subject::argument(["timeout"]))
-                            .effects(Effects::NotStarted)
-                    })
-            })
-            .transpose()?;
+        let deadline = entered + args.duration();
         let (agent, caller) = (context.agent().clone(), context.job());
         if self.agents(|agents| agents.get(&agent).is_none()) {
             return Err(ToolError::failed("calling agent is not active").operation(
@@ -261,12 +262,7 @@ impl SessionRuntime {
             let ready = input != window.observed_inputs && seen_input != Some(input);
             ((unseen || ready) && window.settled()).then_some(Some(WaitFloor { stamp, input }))
         };
-        let timeout = async {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
-        };
+        let timeout = tokio::time::sleep_until(deadline);
         // Parked in the change that first decides, so a concurrent wait that
         // defers to this one is released, and an event ready as it parks is
         // decided before its timeout can pass. An event ready with the timeout is
@@ -319,7 +315,9 @@ pub(super) mod tests {
     };
 
     /// Gated steps, each served to the named model profile's next request.
-    pub(super) fn tracking_all(steps: Vec<(&'static str, Vec<AssistantItem>)>) -> Arc<Script> {
+    pub(in crate::agent::runtime) fn tracking_all(
+        steps: Vec<(&'static str, Vec<AssistantItem>)>,
+    ) -> Arc<Script> {
         let steps = steps
             .into_iter()
             .map(|(model, content)| Step::new(response(content)).model(model).gated());
@@ -336,7 +334,12 @@ pub(super) mod tests {
         call_at(0, id, name, arguments)
     }
 
-    pub(super) fn call_at(position: u32, id: &str, name: &str, arguments: Value) -> AssistantItem {
+    pub(in crate::agent::runtime) fn call_at(
+        position: u32,
+        id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> AssistantItem {
         AssistantItem::tool_call(id, position, ToolCall::new(id, name, arguments).unwrap())
     }
 
@@ -465,7 +468,7 @@ pub(super) mod tests {
     }
 
     /// The view call `id` returned in `request`, and whether the call failed.
-    pub(super) fn call_view(request: &ModelRequest, id: &str) -> (bool, Value) {
+    pub(in crate::agent::runtime) fn call_view(request: &ModelRequest, id: &str) -> (bool, Value) {
         let results = request.messages().flat_map(|message| match message {
             Sent::Tool(results) => results.as_slice(),
             _ => &[],

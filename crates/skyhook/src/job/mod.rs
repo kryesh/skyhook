@@ -64,7 +64,9 @@ pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
 pub(crate) use questions::Asked;
 use questions::Asking;
-pub(crate) use views::{JOB_VIEW_SCHEMAS, JobListing, Release, ViewKind, Waiting, release_records};
+pub(crate) use views::{
+    JOB_VIEW_SCHEMAS, JobListing, MoveTrigger, Release, ViewKind, Waiting, release_records,
+};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod index;
 use index::Lookup;
@@ -468,6 +470,40 @@ impl JobManager {
         self.inner.store.enqueue(settled);
     }
 
+    /// Move those of `calls` still blocking their agent to the background, as `trigger`
+    /// says; the limit leaves a child agent's call waiting, as its child reports on its own.
+    /// Each call then returns its job, saying why.
+    pub(crate) async fn move_calls(
+        &self,
+        calls: Vec<JobId>,
+        trigger: MoveTrigger,
+    ) -> Result<(), SessionError> {
+        let moves = move |state: &CoreState| {
+            let movable = |job: &JobId| {
+                state.jobs.blocks(*job)
+                    && (trigger == MoveTrigger::Event
+                        || state
+                            .jobs
+                            .get(*job)
+                            .is_some_and(|entry| entry.role() != JobRole::Agent))
+            };
+            let moved: Vec<JobId> = calls.into_iter().filter(movable).collect();
+            let released: Vec<_> = (moved.iter())
+                .filter_map(|job| Some((state.jobs.get(*job)?.agent.clone(), *job)))
+                .map(|(agent, job)| (agent, SessionEvent::JobReleased { job }))
+                .collect();
+            let mark = move |state: &mut CoreState, _: &[Arc<crate::session::EventRecord>]| {
+                for job in moved {
+                    state
+                        .jobs
+                        .modify(job, |entry, _| entry.moved = Some(trigger));
+                }
+            };
+            Ok::<_, SessionError>(Plan::new(released, mark))
+        };
+        self.inner.store.commit(Command::Journal, moves).await
+    }
+
     pub(crate) fn supervisor(&self) -> &Supervisor {
         &self.inner.supervisor
     }
@@ -536,14 +572,10 @@ pub(crate) mod tests {
         Message::User(vec![crate::session::UserPart::JobEvents { events }])
     }
 
-    /// A one-question batch identified by `id`.
-    pub(super) fn question(id: &str) -> QuestionOutput {
+    /// A one-question batch titled `header`.
+    pub(super) fn question(header: &str) -> QuestionOutput {
         QuestionOutput {
-            questions: vec![crate::agent::Question {
-                id: id.to_owned(),
-                prompt: "Question?".to_owned(),
-                options: Vec::new(),
-            }],
+            questions: vec![crate::agent::Question::test(header)],
         }
     }
 
@@ -578,7 +610,7 @@ pub(crate) mod tests {
             asking
                 .questions
                 .into_iter()
-                .map(|question| question.id)
+                .map(|question| question.header.to_string())
                 .collect(),
         )
     }

@@ -13,9 +13,9 @@ use super::words;
 use crate::cvss::{Cvss40, Severity};
 use crate::store::{
     Assessed, Behind, CandidateView, ConfidenceTier, Currency, EvidenceView, FlawStatus,
-    GroupMember, InventoryStatus, LastTask, NodeId, NodeKind, NodeStatus, NodeView, OpenTest,
-    Owing, PathStatus, PremiseRef, PremiseStatus, Proposal, RunState, ShelfRow, Status, Store,
-    Task, TaskDetail, TaskId,
+    GroupMember, InventoryStatus, LastTask, ListedTask, Liveness, NodeId, NodeKind, NodeStatus,
+    NodeView, OpenTest, Owing, PathStatus, PremiseRef, PremiseStatus, Proposal, RunState, ShelfRow,
+    Status, Store, TaskDetail, TaskId,
 };
 
 type Result<T> = std::result::Result<T, crate::store::Error>;
@@ -24,14 +24,15 @@ type Result<T> = std::result::Result<T, crate::store::Error>;
 #[derive(Clone, Copy)]
 enum Shelf {
     Nodes(NodeKind),
-    Tasks,
+    Tasks(Liveness),
 }
 
-const SHELVES: [Shelf; 8] = [
+const SHELVES: [Shelf; 9] = [
     Shelf::Nodes(NodeKind::Candidate),
     Shelf::Nodes(NodeKind::Finding),
     Shelf::Nodes(NodeKind::Path),
-    Shelf::Tasks,
+    Shelf::Tasks(Liveness::Live),
+    Shelf::Tasks(Liveness::Ended),
     Shelf::Nodes(NodeKind::Flaw),
     Shelf::Nodes(NodeKind::Premise),
     Shelf::Nodes(NodeKind::Component),
@@ -44,7 +45,8 @@ impl Shelf {
             Self::Nodes(NodeKind::Candidate) => "candidates",
             Self::Nodes(NodeKind::Finding) => "findings",
             Self::Nodes(NodeKind::Path) => "paths",
-            Self::Tasks => "tasks",
+            Self::Tasks(Liveness::Live) => "running",
+            Self::Tasks(Liveness::Ended) => "history",
             Self::Nodes(NodeKind::Flaw) => "flaws",
             Self::Nodes(NodeKind::Premise) => "premises",
             Self::Nodes(NodeKind::Component) => "components",
@@ -57,7 +59,8 @@ impl Shelf {
             Self::Nodes(NodeKind::Candidate) => "Candidates",
             Self::Nodes(NodeKind::Finding) => "Findings",
             Self::Nodes(NodeKind::Path) => "Paths",
-            Self::Tasks => "Tasks",
+            Self::Tasks(Liveness::Live) => "Running tasks",
+            Self::Tasks(Liveness::Ended) => "Task history",
             Self::Nodes(NodeKind::Flaw) => "Flaws",
             Self::Nodes(NodeKind::Premise) => "Premises",
             Self::Nodes(NodeKind::Component) => "Components",
@@ -67,7 +70,7 @@ impl Shelf {
 
     fn columns(self) -> Vec<Column> {
         match self {
-            Self::Tasks => headings(&TASK_FIELDS),
+            Self::Tasks(liveness) => headings(task_fields(liveness)),
             Self::Nodes(kind) => headings(node_fields(kind)),
         }
     }
@@ -90,15 +93,48 @@ fn cells<R>(fields: &[Field<R>], row: &R) -> Vec<Cell> {
     fields.iter().map(|(_, _, cell)| cell(row)).collect()
 }
 
-/// A bundle's subjects run long, so they come last, where the row's remaining width clips them.
-const TASK_FIELDS: [Field<Task>; 6] = [
-    ("id", 0, |task| id(task.id)),
-    ("phase", 0, |task| words(task.phase).into()),
-    ("state", 0, |task| job_state(task.state)),
-    ("began", 1, |task| at(task.began)),
-    ("ended", 2, |task| task.ended.map_or_else(dash, at)),
-    ("subjects", 0, |task| ids(task.subjects.iter()).into()),
-];
+const TASK_ID: Field<ListedTask> = ("id", 0, |listed| id(listed.task.id));
+const TASK_PHASE: Field<ListedTask> = ("phase", 0, |listed| words(listed.task.phase).into());
+const TASK_STATE: Field<ListedTask> = ("state", 0, |listed| job_state(listed.task.state));
+const TASK_SUBJECTS: Field<ListedTask> = ("subjects", 3, |listed| {
+    ids(listed.task.subjects.iter()).into()
+});
+/// The brief's first line; the brief runs long, so it comes last, where the row's remaining
+/// width clips it.
+const TASK_BRIEF: Field<ListedTask> = ("brief", 0, |listed| {
+    let first = |brief: &String| {
+        brief
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+    };
+    listed
+        .brief
+        .as_ref()
+        .and_then(first)
+        .map_or_else(dash, Cell::from)
+});
+
+fn task_fields(liveness: Liveness) -> &'static [Field<ListedTask>] {
+    match liveness {
+        Liveness::Live => &[
+            TASK_ID,
+            TASK_PHASE,
+            TASK_STATE,
+            ("began", 1, |listed| at(listed.task.began)),
+            TASK_SUBJECTS,
+            TASK_BRIEF,
+        ],
+        Liveness::Ended => &[
+            TASK_ID,
+            TASK_PHASE,
+            TASK_STATE,
+            ("ended", 1, |listed| listed.task.ended.map_or_else(dash, at)),
+            TASK_SUBJECTS,
+            TASK_BRIEF,
+        ],
+    }
+}
 
 /// A node's row, with the open test, the assessment and what a candidate waits behind.
 struct NodeRow {
@@ -186,18 +222,17 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
                 coverage.swept,
                 coverage.paths - coverage.swept
             )),
-            Shelf::Tasks => Some(format!(
-                "{} running · {} exhausted",
-                summary.running.values().sum::<u64>(),
+            Shelf::Tasks(Liveness::Live) => Some(format!(
+                "{} exhausted",
                 summary.exhausted.values().sum::<u64>()
             )),
             _ => None,
         };
         let (total, records) = match (shelf, open.limit(key)) {
-            (Shelf::Tasks, limit) => (
-                store.task_count()?,
+            (Shelf::Tasks(liveness), limit) => (
+                store.task_count(liveness)?,
                 limit
-                    .map(|limit| tasks(store, key, limit, open))
+                    .map(|limit| tasks(store, (key, liveness), limit, open))
                     .transpose()?,
             ),
             (Shelf::Nodes(kind), Some(limit)) => {
@@ -274,19 +309,17 @@ fn node_record(
 
 fn tasks(
     store: &Store,
-    section: SectionKey,
+    (section, liveness): (SectionKey, Liveness),
     limit: usize,
     open: &Disclosed,
 ) -> Result<Vec<Record>> {
-    (store.tasks(limit)?.into_iter())
-        .map(|task| {
-            record(
-                section,
-                task.id,
-                cells(&TASK_FIELDS, &task),
-                open,
-                |events| task_detail(store, task.id, events),
-            )
+    (store.tasks(liveness, limit)?.into_iter())
+        .map(|listed| {
+            let task = listed.task.id;
+            let cells = cells(task_fields(liveness), &listed);
+            record(section, task, cells, open, |events| {
+                task_detail(store, task, events)
+            })
         })
         .collect()
 }
@@ -895,7 +928,10 @@ mod tests {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         (store.report(&actor, scenario.flaw, &text("overflow"), &text("report"))).unwrap();
-        begun(&store, &Begin::Sweep(vec![scenario.path]));
+        let sweep = Begin::Sweep(vec![scenario.path]);
+        let (_, ended, _) = begun(&store, &sweep);
+        set_job(&store, ended, JobState::Completed);
+        begun(&store, &sweep);
         for scope in [PremiseScope::Code, PremiseScope::Deployment] {
             premise(&store, &actor, scope);
         }
@@ -923,7 +959,7 @@ mod tests {
             assert_eq!(section.records[0].cells[title].text, "decoder");
         }
         let page = (store.run_state().unwrap())
-            .page(&store, &Disclosed::default())
+            .page(&store, &Disclosed::default(), None)
             .unwrap();
         let undecided = (page.blocks.iter())
             .find_map(|block| match block {
@@ -980,40 +1016,36 @@ mod tests {
         );
     }
 
-    /// Tasks list newest first by their job's state, and an open one shows its subjects in
-    /// full, its brief, its reply and what its child recorded.
+    /// Live and ended tasks list apart, each newest first, and an open one shows its subjects
+    /// in full, its brief, its reply and what its child recorded.
     #[test]
-    fn tasks_list_newest_first_by_their_jobs_state() {
+    fn running_and_ended_tasks_list_apart_newest_first() {
         let (_session, store, actor) = fixture();
         let decoder = component(&store, &actor, "decoder");
         let stream = path(&store, &actor, "stream", &[decoder]);
         let work = Begin::Sweep(vec![stream]);
         let (_, job, failed) = begun(&store, &work);
         set_job(&store, job, JobState::Failed);
+        let (_, job, cancelled) = begun(&store, &work);
+        set_job(&store, job, JobState::Cancelled);
         let (_, _, running) = begun(&store, &work);
+        let (live, ended) = (Shelf::Tasks(Liveness::Live), Shelf::Tasks(Liveness::Ended));
         let mut open = Disclosed::default();
-        open.apply(&Toggle::Section(Shelf::Tasks.key()));
-        open.apply(&Toggle::Record(
-            Shelf::Tasks.key(),
-            RecordKey(failed.to_string()),
-        ));
+        open.apply(&Toggle::Section(live.key()));
+        open.apply(&Toggle::Section(ended.key()));
+        open.apply(&Toggle::Record(ended.key(), RecordKey(failed.to_string())));
         let blocks = opened(&store, &open);
-        let tasks = section(&blocks, Shelf::Tasks);
-        let rows: Vec<(&str, Tone)> = (tasks.records.iter())
-            .map(|record| (record.key.0.as_str(), record.cells[2].tone))
-            .collect();
-        let (running, failed) = (running.to_string(), failed.to_string());
+        let keys = |shelf| -> Vec<String> {
+            (section(&blocks, shelf).records.iter())
+                .map(|record| record.key.0.clone())
+                .collect()
+        };
+        assert_eq!(keys(live), [running.to_string()]);
         assert_eq!(
-            (tasks.total, rows),
-            (
-                2,
-                vec![
-                    (running.as_str(), Tone::Accent),
-                    (failed.as_str(), Tone::Warning)
-                ]
-            )
+            keys(ended),
+            [cancelled, failed].map(|task| task.to_string())
         );
-        let detail = tasks.records[1].detail.as_ref().unwrap();
+        let detail = section(&blocks, ended).records[1].detail.as_ref().unwrap();
         let labels: Vec<_> = (detail.lines.iter())
             .filter_map(|line| line.label.as_deref())
             .collect();

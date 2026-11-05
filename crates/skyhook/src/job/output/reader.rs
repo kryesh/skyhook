@@ -451,8 +451,6 @@ fn observed(
         return beyond(selection, index.total_lines, terminal);
     }
     let (offset, line) = capture.checkpoint(first_line(selection))?;
-    // A producer that truncates and rewrites since the index can move a checkpoint
-    // past it; that page reads nothing, and the next one indexes afresh.
     let observed = index.bytes.saturating_sub(offset);
     let reader = BufReader::with_capacity(IO_BUFFER_BYTES, capture.take(observed));
     let input = Text::new(reader, line, Some(index.total_lines));
@@ -937,11 +935,5 @@ mod tests {
         assert_eq!(live.lines(), ["one", "tw"]);
         assert_eq!((live.total_lines, live.next_start), (Some(2), Some(2)));
         assert_eq!(live.next_offset, Some(2));
-        // A rewrite since the index checkpoints line 2 past the observed extent.
-        output.db.truncate_capture(capture, 0).unwrap();
-        append(&output, capture, &["aaaa", "bbbb", "cccc"]);
-        let rewritten = read(partial, 2, 0).unwrap();
-        assert!(rewritten.lines().is_empty());
-        assert_eq!(rewritten.next_start, Some(2));
     }
 }

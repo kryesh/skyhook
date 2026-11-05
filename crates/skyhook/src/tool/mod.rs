@@ -26,5 +26,5 @@ pub(crate) use registry::{JobLocation, ToolResultPolicy, job_view_type};
 pub use registry::{
     PathArgument, PathKind, RegisteredTool, RegistryError, ScriptBinding, TARGET, ToolExposure,
     ToolOptions, ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface,
-    input_schema_for, result_schema,
+    input_schema_for, input_settings, result_schema,
 };

@@ -166,7 +166,15 @@ impl App {
             // ordinary form draft change detection.
             let mut text_changed = false;
             let old_index = self.page_index();
+            // Space ticks the focused suggestion of a question taking several until text
+            // is typed, after which it is text.
+            let ticks = key.code == KeyCode::Char(' ')
+                && self.prompt_input().editor.text().is_empty()
+                && self.question_page().is_some_and(|page| page.tickable());
             match key.code {
+                _ if ticks => {
+                    text_changed = self.toggle_choice();
+                }
                 KeyCode::Esc => {
                     self.cancel_prompt();
                     return;

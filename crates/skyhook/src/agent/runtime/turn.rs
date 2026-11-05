@@ -246,18 +246,28 @@ impl SessionRuntime {
                 }
                 // Each result commits as its call finishes, so a crash keeps every
                 // completed result; history merges them back into call order.
+                let movable = created.iter().filter_map(CreatedCall::movable).collect();
+                let moving = self.move_blocked(agent, movable, tokio::time::Instant::now());
                 let mut calls: futures_util::stream::FuturesUnordered<_> =
                     created.into_iter().map(CreatedCall::run).collect();
                 // Drain every call even after a failed commit; results that could not
                 // commit are closed when the turn ends.
-                let mut committed = Ok(());
-                while let Some((result, acknowledges)) =
-                    futures_util::StreamExt::next(&mut calls).await
-                {
-                    if committed.is_ok() {
-                        committed = self.commit_result(agent, result, acknowledges).await;
+                let drained = async {
+                    let mut committed = Ok(());
+                    while let Some((result, acknowledges)) =
+                        futures_util::StreamExt::next(&mut calls).await
+                    {
+                        if committed.is_ok() {
+                            committed = self.commit_result(agent, result, acknowledges).await;
+                        }
                     }
-                }
+                    committed
+                };
+                tokio::pin!(drained);
+                let committed = tokio::select! {
+                    committed = &mut drained => committed,
+                    () = moving => drained.await,
+                };
                 committed?;
             }
             provider_attempt = 0;
@@ -306,7 +316,8 @@ impl SessionRuntime {
 type Streamed = Result<(Completion, Usage), (ProviderError, Usage)>;
 
 impl SessionRuntime {
-    /// The runtime-state tail of the next request, when the profile `sends` one.
+    /// The runtime-state tail of the next request, when the profile `sends` one. It shows
+    /// only unfinished todos; a summary, which returns the whole list, sees every one.
     async fn state_tail(
         &self,
         sends: bool,
@@ -315,7 +326,9 @@ impl SessionRuntime {
         if !sends {
             return Ok(None);
         }
-        Ok(Some(Message::State(self.runtime_state(turn).await?)))
+        let mut state = self.runtime_state(turn).await?;
+        (state.todos).retain(|item| item.status != crate::agent::TodoStatus::Completed);
+        Ok(Some(Message::State(state)))
     }
 
     /// A response to the frozen `request` journaled as `sequence`, retrying

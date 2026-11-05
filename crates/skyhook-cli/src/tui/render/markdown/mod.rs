@@ -272,6 +272,17 @@ impl Default for RowLayout {
 }
 
 impl RowLayout {
+    /// Widen a code row's box to fill `container`, so code blocks laid out side by side
+    /// or in turn keep one width whatever their longest line.
+    pub fn fill_code(&mut self, container: usize) {
+        match &mut self.kind {
+            RowKind::Source(source) => {
+                source.code = source.code.map(|code| code.filling(container));
+            }
+            RowKind::CodeDecoration(code) => *code = code.filling(container),
+            RowKind::Spacer => {}
+        }
+    }
     /// The logical line a row of plain text shows, which every row it wraps onto shares.
     pub(super) fn line(&self) -> Option<LineId> {
         match &self.kind {
@@ -411,6 +422,11 @@ impl CodeGeometry {
             width,
             padding,
         }
+    }
+    /// The same box, as wide as `container` allows rather than its longest line.
+    fn filling(self, container: usize) -> Self {
+        let width = container.saturating_sub(self.indent).max(self.width);
+        Self { width, ..self }
     }
     pub fn indent(self) -> usize {
         self.indent

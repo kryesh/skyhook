@@ -94,22 +94,6 @@ impl CaptureTarget for StoredCapture {
         Ok(())
     }
 
-    fn truncate(&mut self, length: u64) -> io::Result<()> {
-        if length > self.extent.bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "capture cannot be extended by truncation",
-            ));
-        }
-        self.extent = self
-            .output
-            .db
-            .truncate_capture(self.completed.capture, length)
-            .map_err(database)?;
-        self.changed();
-        Ok(())
-    }
-
     fn finish(&mut self) -> io::Result<CompletedCapture> {
         Ok(self.completed.clone())
     }
@@ -265,9 +249,6 @@ impl OutputSink for CaptureCollector {
                 )?));
             }
             CaptureEvent::Write { id, data } => writing(&mut captures, id)?.append(&data)?,
-            CaptureEvent::Truncate { id, length } => {
-                writing(&mut captures, id)?.truncate(length)?
-            }
             CaptureEvent::Discard { id } => {
                 writing(&mut captures, id)?.discard()?;
                 captures.insert(id, CollectedCapture::Closed);
@@ -392,9 +373,7 @@ mod tests {
             .await
             .unwrap()
             .open();
-        writer.write_all(b"[1,2").unwrap();
-        writer.truncate(2).unwrap();
-        writer.write_all(b"]").unwrap();
+        writer.write_all(b"[1]").unwrap();
         let selected = writer.finish().unwrap();
         let image = crate::tests::png(b"source").await;
         let reference = context

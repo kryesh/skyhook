@@ -373,6 +373,14 @@ pub(super) enum CreatedCall {
 }
 
 impl CreatedCall {
+    /// The job the call blocks on that its turn may move to the background.
+    pub(super) fn movable(&self) -> Option<crate::identity::JobId> {
+        match self {
+            Self::Created { created, .. } => created.movable().then(|| created.job()),
+            Self::Settled(_) => None,
+        }
+    }
+
     /// The call's result, with the delivery it reports for its commit to
     /// acknowledge. Tool dispatch owns its execution inputs. Erasing this future
     /// separates the driver's Send proof from the nested supervised executor graph.

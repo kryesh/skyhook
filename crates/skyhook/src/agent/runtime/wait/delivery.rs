@@ -289,7 +289,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    const ASK: &str = r#"{"id":"pick", "prompt":"which one?"}"#;
+    const ASK: &str = r#"{"header":"pick", "prompt":"which one?"}"#;
 
     /// A child that replies, then asks.
     fn asking_child() -> (&'static str, Vec<AssistantItem>) {
@@ -334,7 +334,7 @@ mod tests {
             Some("message") => entry["text"].as_str().unwrap().to_owned(),
             _ if entry["state"] == "waiting_input" => {
                 let questions = &entry["presentation"]["question"]["questions"];
-                format!("question {}", questions[0]["id"].as_str().unwrap())
+                format!("question {}", questions[0]["header"].as_str().unwrap())
             }
             _ => entry["state"].as_str().unwrap().to_owned(),
         };
@@ -350,7 +350,7 @@ mod tests {
         }
     }
 
-    /// The question ids of each waiting delivery of job `job` in `request`'s
+    /// The question headers of each waiting delivery of job `job` in `request`'s
     /// history, in order.
     fn asked_batches(request: &ModelRequest, job: JobId) -> Vec<Vec<String>> {
         let entries = envelopes(request).into_iter().flatten();
@@ -362,7 +362,7 @@ mod tests {
                     .as_array()
                     .cloned();
                 let ids = questions.unwrap_or_default().into_iter();
-                ids.map(|question| question["id"].as_str().unwrap().to_owned())
+                ids.map(|question| question["header"].as_str().unwrap().to_owned())
                     .collect()
             })
             .collect()
@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn a_childs_batched_questions_resolve_one_answer_at_a_time() {
         let delegate = json!({"prompt":"work", "model":"wait-test/child"});
-        let question = |id: &str| json!({"id": id, "prompt": format!("which {id}?")});
+        let question = |id: &str| json!({"header": id, "prompt": format!("which {id}?")});
         let tracking = tracking_all(vec![
             ("root", vec![call("kid", "agent", delegate)]),
             (

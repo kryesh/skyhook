@@ -38,6 +38,8 @@ enum Link {
 /// separately by the event loop.
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
+    /// The scope its extension says it runs under, shown frozen when the app opens it.
+    pub(in crate::tui) scope: Option<crate::form::ScopeForm>,
     /// What its windows read and keep.
     pub(super) budget: model::Budget,
     pub(super) shown: Shown,
@@ -72,6 +74,7 @@ impl PreparedObservation {
         };
         Ok(Self {
             active,
+            scope: None,
             budget,
             shown,
         })

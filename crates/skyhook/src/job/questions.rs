@@ -10,9 +10,9 @@ pub(crate) struct Asked {
     pub(crate) question: Question,
 }
 
-/// What a waiting job asks: one question, whose answer is the whole reply, or
-/// questions asked together, each answered under its id, a lone one left either
-/// way. A job read back from the journal is known only to ask, so it asks none.
+/// What a waiting job asks: one question, answered by the whole reply or the value
+/// it keys under the question's header, or questions asked together, each answered
+/// under its header, a lone one left either way. A job read back from the journal is known only to ask, so it asks none.
 #[derive(Clone, Debug)]
 pub(super) enum Asking {
     One(Asked),
@@ -41,12 +41,17 @@ impl Asking {
         }
     }
 
-    /// This, asking `more` after what it asks; refused when a question id repeats.
+    /// This, asking `more` after what it asks; refused when a question header repeats.
     fn with(self, more: Vec<Asked>) -> Result<Self, JobError> {
         let asked: Vec<_> = self.asked().iter().cloned().chain(more).collect();
-        let mut ids = std::collections::HashSet::new();
-        if let Some(repeated) = asked.iter().find(|asked| !ids.insert(&asked.question.id)) {
-            return Err(JobError::DuplicateQuestion(repeated.question.id.clone()));
+        let mut headers = std::collections::HashSet::new();
+        let repeated = asked
+            .iter()
+            .find(|asked| !headers.insert(&asked.question.header));
+        if let Some(repeated) = repeated {
+            return Err(JobError::DuplicateQuestion(
+                repeated.question.header.clone(),
+            ));
         }
         let merged = matches!(&self, Self::Merged(left) if !left.is_empty());
         Ok(match <[Asked; 1]>::try_from(asked) {
@@ -73,27 +78,53 @@ impl Asking {
         self.asked().iter().any(|asked| asked.ask == ask)
     }
 
-    /// The answer `reply` gives each question it answers, by its ask job.
+    /// The answer `reply` gives each question it answers, by its ask job; refused
+    /// whole when an answer's shape does not fit its question.
     fn answers(&self, reply: Value) -> Result<Vec<(JobId, Value)>, JobError> {
         let asked = match self {
-            Self::One(asked) => return Ok(vec![(asked.ask, reply)]),
+            Self::One(asked) => return Ok(vec![lone(asked, reply)?]),
             Self::Merged(asked) => asked,
         };
-        let keyed = reply
-            .as_object()
-            .filter(|values| (asked.iter()).any(|asked| values.contains_key(&asked.question.id)));
+        let keyed = (reply.as_object()).filter(|values| {
+            (asked.iter()).any(|asked| values.contains_key(asked.question.header.as_str()))
+        });
         let values = match (keyed, asked.as_slice()) {
-            (None, [lone]) => return Ok(vec![(lone.ask, reply)]),
+            (None, [one]) => return Ok(vec![lone(one, reply)?]),
             (Some(values), _) => values,
             (None, _) if reply.is_object() => return Err(JobError::UnmatchedAnswers),
             (None, _) => return Err(JobError::UnkeyedAnswers),
         };
         let answered = asked.iter().filter_map(|asked| {
-            let answer = values.get(&asked.question.id)?;
-            Some((asked.ask, answer.clone()))
+            let answer = values.get(asked.question.header.as_str())?;
+            Some(fitted(asked, answer.clone()))
         });
-        Ok(answered.collect())
+        answered.collect()
     }
+}
+
+/// `reply` for `asked`, a question asked alone: the whole reply, or the value it keys
+/// under the question's header and nothing else.
+fn lone(asked: &Asked, reply: Value) -> Result<(JobId, Value), JobError> {
+    let header = asked.question.header.as_str();
+    match reply.as_object() {
+        Some(keyed) if keyed.len() == 1 && keyed.contains_key(header) => {
+            fitted(asked, keyed[header].clone())
+        }
+        _ => fitted(asked, reply),
+    }
+}
+
+/// `answer` for `asked`'s ask job, as the answer its question takes.
+fn fitted(asked: &Asked, answer: Value) -> Result<(JobId, Value), JobError> {
+    let question = &asked.question;
+    let answer = crate::agent::QuestionAnswer::parse(question, answer).ok_or_else(|| {
+        JobError::MalformedAnswer {
+            header: question.header.clone(),
+            multiple: question.multiple,
+        }
+    })?;
+    let answer = serde_json::to_value(answer).expect("answers serialize as JSON");
+    Ok((asked.ask, answer))
 }
 
 /// What routing a reply to the questions a job asks did.
@@ -272,7 +303,7 @@ mod tests {
         let mut both = asked_by(first, "first");
         both.extend(asked_by(second, "second"));
         jobs.request_input(owner, both).await.unwrap();
-        let reply = json!({"first": "yes", "second": 2});
+        let reply = json!({"first": "yes", "second": "two"});
         bounded(async {
             for _ in 0..=JOB_INPUT_CAPACITY {
                 assert!(jobs.answer(owner, reply.clone()).await.unwrap());
@@ -280,11 +311,11 @@ mod tests {
         })
         .await;
         assert_eq!(first_input.try_recv().unwrap(), json!("yes"));
-        assert_eq!(second_input.try_recv().unwrap(), json!(2));
+        assert_eq!(second_input.try_recv().unwrap(), json!("two"));
         assert!(first_input.try_recv().is_err() && second_input.try_recv().is_err());
         for (unanswerable, refusal) in [
-            (json!("unkeyed"), "keyed by question id"),
-            (json!({"other": 1}), "no pending question ids"),
+            (json!("unkeyed"), "keyed by question header"),
+            (json!({"other": 1}), "no pending question headers"),
         ] {
             let error = jobs.answer(owner, unanswerable).await.unwrap_err();
             assert!(error.to_string().contains(refusal), "{error}");
@@ -292,7 +323,7 @@ mod tests {
         first_worker.fail(answered()).await;
         assert_eq!(questions(&jobs, owner), Some(vec!["second".to_owned()]));
         let repeated = jobs.request_input(owner, asked_by(owner, "second")).await;
-        assert_matches!(repeated, Err(JobError::DuplicateQuestion(id)) if id == "second");
+        assert_matches!(repeated, Err(JobError::DuplicateQuestion(header)) if header.as_str() == "second");
         // The lone question left was answered already.
         assert!(jobs.answer(owner, json!("again")).await.unwrap());
         assert!(second_input.try_recv().is_err());
@@ -316,17 +347,28 @@ mod tests {
         assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
     }
 
-    /// One question's answer is the whole reply, even one keyed by its id.
+    /// One question's answer is the whole reply, or the value it keys under the
+    /// question's header; a reply whose shape does not fit the question answers nothing.
     #[tokio::test]
-    async fn a_lone_question_takes_the_whole_reply() {
+    async fn a_lone_question_takes_the_whole_reply_or_its_keyed_answer() {
         let (_root, jobs, owner, mut asks) = asking(1).await;
         let (ask, input, _worker) = &mut asks[0];
         jobs.request_input(owner, asked_by(*ask, "solo"))
             .await
             .unwrap();
-        let reply = json!({"solo": "kept whole"});
-        assert!(jobs.answer(owner, reply.clone()).await.unwrap());
-        assert_eq!(input.try_recv().unwrap(), reply);
+        for malformed in [json!(["listed"]), json!({"solo": 1})] {
+            let error = jobs.answer(owner, malformed).await.unwrap_err();
+            assert_matches!(
+                error,
+                JobError::MalformedAnswer {
+                    multiple: false,
+                    ..
+                }
+            );
+        }
+        assert!(input.try_recv().is_err());
+        assert!(jobs.answer(owner, json!({"solo": "keyed"})).await.unwrap());
+        assert_eq!(input.try_recv().unwrap(), json!("keyed"));
     }
 
     /// An answer to a full mailbox waits for room without answering, so one

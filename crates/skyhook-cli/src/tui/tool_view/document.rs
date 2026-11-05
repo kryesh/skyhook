@@ -220,14 +220,28 @@ impl Document {
     /// A waiting child's question batch stands in for its result.
     fn questions(&mut self, questions: &[Question]) {
         for question in questions {
-            self.line("Question", Role::Label);
-            self.markdown(&question.prompt, 2);
+            let several = if question.multiple {
+                " · choose several"
+            } else {
+                ""
+            };
+            self.line(
+                format!("Question · {}{several}", question.header),
+                Role::Label,
+            );
+            self.markdown(question.prompt.as_str(), 2);
             // As in the prompt panel, a description starts on its own line.
             for option in &question.options {
-                let label = format!("• {}", option.label);
+                let recommended = if option.recommended {
+                    " (recommended)"
+                } else {
+                    ""
+                };
+                let label = format!("• {}{recommended}", option.label);
                 self.indented(2, label, Role::Label, Wrap::Words);
-                if !option.description.is_empty() {
-                    self.markdown(&option.description, 4);
+                self.markdown(option.description.as_str(), 4);
+                if let Some(preview) = &option.preview {
+                    self.markdown(preview.as_str(), 4);
                 }
             }
         }
@@ -722,13 +736,13 @@ mod tests {
 
     #[test]
     fn a_waiting_childs_question_batch_renders_in_place_of_a_result() {
-        let question = json!({"id": "pick", "prompt": "Which one?",
+        let question = json!({"header": "pick", "prompt": "Which one?",
             "options": [{"label": "First", "description": "First step\nSecond step"}]});
         let output = json!({"state": "waiting_input",
             "presentation": {"question": {"questions": [question]}}});
         let expected = [
             "Output",
-            "Question",
+            "Question · pick",
             "  Which one?",
             "  • First",
             "    First step",

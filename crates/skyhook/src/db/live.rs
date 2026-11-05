@@ -4,11 +4,14 @@
 //! take SQLite's first-opener role and truncate the shared-memory index under this one.
 //!
 //! One registry under one lock records both sides: every database a connection holds open
-//! and every file another in-process opener holds a handle to. A file opener checks and
-//! registers its handle under the lock, so it never opens a live database; a database
+//! and every file another in-process opener holds a handle to. A file opener checks the
+//! file its name reaches and holds it under the lock, then opens outside it; a database
 //! registers before SQLite opens it and waits for handles on its files to close, so it
-//! never becomes live under one. Replacing or removing a file decides and acts under the
-//! lock. Removing a tree reserves it under the lock and removes it outside: no database
+//! never becomes live under one. A descriptor that reached another file by the time it
+//! opened is decided about under the lock instead, and one that turns out to be a live
+//! database's is parked on that database until its last connection closes: closing it
+//! sooner would release SQLite's locks. Replacing or removing a file decides and acts
+//! under the lock. Removing a tree reserves it under the lock and removes it outside: no database
 //! registers inside a reserved tree meanwhile. Closing an `O_PATH` descriptor releases no
 //! locks, so lookups need no check.
 //!
@@ -51,11 +54,13 @@ fn parent(path: &Path) -> &Path {
     }
 }
 
-/// One open database: its canonical path, its directory, and how many connections hold it.
+/// One open database: its canonical path, its directory, how many connections hold it,
+/// and the descriptors of its files parked until the last one closes.
 struct Database {
     path: PathBuf,
     directory: Identity,
     connections: usize,
+    parked: Vec<std::fs::File>,
 }
 
 impl Database {
@@ -67,6 +72,11 @@ impl Database {
             companion.push(suffix);
             companion
         }))
+    }
+
+    /// Whether `file` is one of its files now, under any name.
+    fn owns(&self, file: Identity) -> bool {
+        file.0 == self.directory.0 && self.files().any(|held| held == file)
     }
 
     /// The identities of its files that exist now, which catches hard links.
@@ -140,18 +150,20 @@ pub(crate) fn lock() -> Registry {
 }
 
 impl Registry {
-    /// Whether `probe` reaches one of the open databases' files. Only a file that may have
-    /// another name on a database's filesystem is compared with that database's files.
+    /// Whether `probe` reaches one of the open databases' files.
     pub(crate) fn holds(&self, probe: &Probe) -> bool {
-        self.0.databases.iter().any(|database| {
+        self.reached(probe).is_some()
+    }
+
+    /// The open database whose file `probe` reaches. Only a file that may have another
+    /// name on a database's filesystem is compared with that database's files.
+    fn reached(&self, probe: &Probe) -> Option<usize> {
+        self.0.databases.iter().position(|database| {
             probe.directory == Some(database.directory)
                 && (probe.name.as_ref())
                     .is_some_and(|name| database.names().any(|held| held == *name))
-                || probe.file.as_ref().is_some_and(|file| {
-                    file.aliased
-                        && file.identity.0 == database.directory.0
-                        && database.files().any(|held| held == file.identity)
-                })
+                || (probe.file.as_ref())
+                    .is_some_and(|file| file.aliased && database.owns(file.identity))
         })
     }
 
@@ -170,11 +182,33 @@ impl Registry {
         *self.0.handles.entry(file).or_default() += 1;
         Hold(file)
     }
+
+    /// Keep `file`, a descriptor of the file `probe` reaches, open until the database
+    /// whose file it is closes. With the file's identity known, only the database owning
+    /// it qualifies, so one that took the probed name meanwhile never takes over another
+    /// file's lifetime; a descriptor no open database owns is closed now, under the lock.
+    pub(crate) fn park(&mut self, probe: &Probe, file: std::fs::File) {
+        let owner = match &probe.file {
+            Some(reached) => {
+                (self.0.databases.iter()).position(|database| database.owns(reached.identity))
+            }
+            None => self.reached(probe),
+        };
+        if let Some(index) = owner {
+            self.0.databases[index].parked.push(file);
+        }
+    }
 }
 
 /// One open handle to a file; dropping it, outside the lock, ends the hold.
 #[derive(Debug)]
 pub(crate) struct Hold(Identity);
+
+impl Hold {
+    pub(crate) fn file(&self) -> Identity {
+        self.0
+    }
+}
 
 impl Drop for Hold {
     fn drop(&mut self) {
@@ -233,6 +267,7 @@ impl Held {
             directory: identity(&std::fs::metadata(parent(&path))?),
             path: path.clone(),
             connections: 1,
+            parked: Vec::new(),
         };
         let deadline = Instant::now() + timeout;
         let mut registry = lock();

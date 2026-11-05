@@ -302,7 +302,7 @@ pub(in crate::tui) async fn delegate(
 
 /// The call by which a child asks its parent which one.
 pub(in crate::tui) fn asking() -> AssistantItem {
-    let question = json!({"id": "pick", "prompt": "Which one?"});
+    let question = json!({"header": "pick", "prompt": "Which one?"});
     call("question", "ask", question, 0)
 }
 

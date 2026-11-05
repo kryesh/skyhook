@@ -433,6 +433,8 @@ pub(super) struct JobFacts {
     pub(super) timing: RunTiming,
     /// Live only.
     pub(super) cancel: CancelState,
+    /// Live only: what moved its call to the background, when its turn did.
+    pub(super) moved: Option<super::MoveTrigger>,
 }
 
 /// Which invocation of a job is current; each restart of a finished job starts the next.
@@ -836,6 +838,7 @@ impl JobFacts {
             diagnostic,
             location: self.location.clone(),
             resumable: self.restart().is_some(),
+            moved: self.moved,
         }
     }
 }

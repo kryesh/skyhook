@@ -147,6 +147,7 @@ impl UserPart {
 pub struct RuntimeState {
     pub date: String,
     pub jobs: Vec<StateJob>,
+    /// A model request's unfinished todos, or a summary's whole list.
     pub todos: Vec<TodoItem>,
     /// The agent's own location; a job shows a target or workspace only where it differs.
     pub location: ExecutionLocation,
@@ -446,7 +447,7 @@ mod tests {
             (TodoStatus::InProgress, "Measure"),
             (TodoStatus::Pending, "Implement"),
             (TodoStatus::Pending, "Test\n\"quoted\" \\ Unicode: λ"),
-            (TodoStatus::Completed, "Inspect"),
+            (TodoStatus::InProgress, "Inspect"),
             (TodoStatus::Pending, "Document"),
         ]
         .map(|(status, text)| TodoItem {
@@ -459,7 +460,7 @@ mod tests {
                 "<skyhook_state>\ndate:2026-09-10\ntodos:\n",
                 "in_progress:\n  \"Design\"\n  \"Measure\"\n",
                 "pending:\n  \"Implement\"\n  \"Test\\n\\\"quoted\\\" \\\\ Unicode: λ\"\n",
-                "completed:\n  \"Inspect\"\npending:\n  \"Document\"\n",
+                "in_progress:\n  \"Inspect\"\npending:\n  \"Document\"\n",
                 "</skyhook_state>"
             )
         );

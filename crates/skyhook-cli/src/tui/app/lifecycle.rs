@@ -56,7 +56,8 @@ impl App {
             let result = match launch.create(opening).await {
                 Ok(session) => crate::tui::host::observed(session, &launch, opening, None).await,
                 Err(error) => Err(error),
-            };
+            }
+            .map(Box::new);
             if let Err(error) = tx.send(Work::Started { result })
                 && let Work::Started {
                     result: Ok(prepared),
@@ -74,8 +75,10 @@ impl App {
             Phase::Draft { root } => Some(root.clone()),
             Phase::Open { attached_draft, .. } => attached_draft.clone(),
         };
+        // A new session keeps the panel its draft was sent with.
         let PreparedObservation {
             active,
+            scope: _,
             budget,
             shown:
                 super::observation::Shown {
@@ -249,7 +252,7 @@ mod tests {
         else {
             panic!("session creation should succeed");
         };
-        prepared
+        *prepared
     }
 
     async fn fail_creation(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Work>) {

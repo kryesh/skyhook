@@ -17,16 +17,17 @@ Nulls in tool payloads are preserved; fields a tool has no value for are absent.
 Process results contain `exit_code`, or `signal` when a signal killed the process, and the
 `stdout` and `stderr` streams that produced output; scripts read an absent stream as `null`.
 A `stdout` holding JSON is read as that JSON; see [JSON output](#json-output).
-Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{id,prompt,options?}]}`.
+Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{header,prompt,options?,multiple?}]}`, their answers keyed by `header`.
 
 Directory reads return grouped entries with file sizes, for example:
 `{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}`.
 Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names; empty `symlinks` and
 `other` groups are absent, and scripts read them as `null`.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
-An empty search result has `matches: {}`. A matched line longer than 1 KiB comes back as the text
+Files are searched in parallel and come back in no particular order; each file's lines stay in
+order. An empty search result has `matches: {}`. A matched line longer than 1 KiB comes back as the text
 around its match, ending `(line truncated, N bytes)`. A file or directory the search cannot read
-is skipped and listed, as `skipped: [{path, reason}]` with reason `unlisted`, `unopened` or
+is skipped and listed by path, as `skipped: [{path, reason}]` with reason `unlisted`, `unopened` or
 `unread`; the other files' matches stay, and `matches` is then incomplete.
 `targets` returns each target's routing and authentication metadata; fields a target does not set are absent.
 `target_add` completes without a result.

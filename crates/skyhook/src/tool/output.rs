@@ -236,10 +236,6 @@ pub(crate) enum CaptureEvent {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    Truncate {
-        id: CaptureId,
-        length: u64,
-    },
     Discard {
         id: CaptureId,
     },
@@ -513,16 +509,6 @@ impl CaptureTarget for EventCapture {
             }))
     }
 
-    fn truncate(&mut self, length: u64) -> io::Result<()> {
-        self.activity
-            .inner
-            .sink
-            .send(OutputEvent::Capture(CaptureEvent::Truncate {
-                id: self.id,
-                length,
-            }))
-    }
-
     fn finish(&mut self) -> io::Result<Self::Finished> {
         self.activity
             .inner
@@ -581,7 +567,6 @@ impl Drop for Activity {
 pub(crate) trait CaptureTarget: Send + 'static {
     type Finished: Send + 'static;
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
-    fn truncate(&mut self, length: u64) -> io::Result<()>;
     fn finish(&mut self) -> io::Result<Self::Finished>;
     fn discard(&mut self) -> io::Result<()>;
 
@@ -627,7 +612,7 @@ enum ProducerState {
     Closed,
 }
 
-/// Buffered append-only output, with rollback and consuming finalization.
+/// Buffered append-only output with consuming finalization.
 pub(crate) struct Producer<T: CaptureTarget> {
     target: T,
     abandon: Abandon,
@@ -671,26 +656,6 @@ impl<T: CaptureTarget> Producer<T> {
     pub(crate) fn write_text(&mut self, text: &str) -> io::Result<()> {
         self.write_all(text.as_bytes())?;
         self.flush()
-    }
-
-    /// The end of what has been written, buffered or not.
-    pub(crate) fn position(&self) -> u64 {
-        self.position + self.buffer.len() as u64
-    }
-
-    pub(crate) fn truncate(&mut self, length: u64) -> io::Result<()> {
-        self.flush()?;
-        let result = if length > self.position {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "capture cannot be extended by truncation",
-            ))
-        } else {
-            self.target.truncate(length)
-        };
-        self.track(result)?;
-        self.position = length;
-        Ok(())
     }
 
     fn close(&mut self) -> io::Result<T::Finished> {

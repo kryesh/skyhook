@@ -9,7 +9,7 @@ use std::{
 use tokio::sync::{Mutex, oneshot};
 
 use crate::{
-    agent::{Question, QuestionError, QuestionHandler, QuestionReply},
+    agent::{Question, QuestionError, QuestionHandler, QuestionHeader, QuestionReply},
     identity::{AgentId, JobId},
     job::{Asked, JobManager},
     tool::{
@@ -215,9 +215,9 @@ impl QuestionCoordinator {
 
     async fn present_root_questions(&self, agent: AgentId, batch: Vec<PendingAsk>) {
         let questions: Vec<_> = batch.iter().map(|ask| ask.question.clone()).collect();
-        let ids = questions.iter().map(|question| question.id.as_str());
-        if let Some(duplicate) = duplicate_question_id(ids) {
-            let error = crate::job::JobError::DuplicateQuestion(duplicate.to_owned());
+        let headers = questions.iter().map(|question| &question.header);
+        if let Some(duplicate) = duplicate_header(headers) {
+            let error = crate::job::JobError::DuplicateQuestion(duplicate.clone());
             send_question_error(batch, ToolError::from(error).effects(Effects::NotStarted));
             return;
         }
@@ -244,9 +244,9 @@ impl QuestionCoordinator {
                 async move { (index, context.receive().await) }
             })
             .collect::<FuturesUnordered<_>>();
-        let ids = questions
+        let headers = questions
             .iter()
-            .map(|question| question.id.clone())
+            .map(|question| question.header.clone())
             .collect::<Vec<_>>();
         let mut pending = batch.into_iter().map(Some).collect::<Vec<_>>();
         // Retain the normal host UI, but also allow a background ask to be
@@ -282,8 +282,8 @@ impl QuestionCoordinator {
             tokio::select! {
                 answer = &mut answer => {
                     let results = match answer {
-                        Ok(answer) => split_answers(&ids, answer),
-                        Err(error) => ids.iter().map(|_| Err(error.clone())).collect(),
+                        Ok(answer) => split_answers(&headers, answer),
+                        Err(error) => headers.iter().map(|_| Err(error.clone())).collect(),
                     };
                     for (ask, result) in pending.iter_mut().zip(results) {
                         if let Some(ask) = ask.take() {
@@ -325,7 +325,7 @@ impl QuestionCoordinator {
 }
 
 fn question_subject(question: &Question) -> Subject {
-    Subject::Label(format!("question {:?}", question.id))
+    Subject::Label(format!("question {:?}", question.header.as_str()))
 }
 
 fn send_question_error(batch: Vec<PendingAsk>, error: ToolError) {
@@ -338,21 +338,24 @@ fn send_question_error(batch: Vec<PendingAsk>, error: ToolError) {
     }
 }
 
-fn duplicate_question_id<'a>(mut ids: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+fn duplicate_header<'a>(
+    mut headers: impl Iterator<Item = &'a QuestionHeader>,
+) -> Option<&'a QuestionHeader> {
     let mut seen = HashSet::new();
-    ids.find(|id| !seen.insert(*id))
+    headers.find(|header| !seen.insert(*header))
 }
 
 /// Each question's answer from a host reply, as the value its ask returns.
 fn split_answers(
-    ids: &[String],
+    headers: &[QuestionHeader],
     mut reply: QuestionReply,
 ) -> Vec<Result<serde_json::Value, String>> {
-    ids.iter()
-        .map(|id| {
+    headers
+        .iter()
+        .map(|header| {
             let answer = reply
-                .remove(id)
-                .ok_or_else(|| format!("answer is missing question id `{id}`"))?;
+                .remove(header)
+                .ok_or_else(|| format!("answer is missing question `{header}`"))?;
             Ok(serde_json::to_value(answer).expect("answers serialize as JSON strings"))
         })
         .collect()
@@ -384,25 +387,28 @@ mod tests {
             ("choice", QuestionAnswer::Text("Continue".into())),
             ("commented", commented),
         ];
-        let reply = reply.map(|(id, answer)| (id.to_owned(), answer)).into();
-        let ids = ["choice", "commented", "missing"].map(str::to_owned);
-        let found = split_answers(&ids, reply);
+        let reply = reply
+            .map(|(header, answer)| (header.parse().unwrap(), answer))
+            .into();
+        let headers = ["choice", "commented", "missing"].map(|header| header.parse().unwrap());
+        let found = split_answers(&headers, reply);
         let suggestion =
             json!({"answer": "Use the default", "comment": "  Keep the existing settings.\n"});
         assert_eq!(found[..2], [Ok(json!("Continue")), Ok(suggestion)]);
         assert!(found[2].as_ref().unwrap_err().contains("missing"));
     }
 
-    fn question(id: &str) -> Question {
-        Question {
-            id: id.to_owned(),
-            prompt: "Question?".to_owned(),
-            options: Vec::new(),
-        }
+    fn question(header: &str) -> Question {
+        Question::test(header)
     }
 
-    fn ask(id: &str, index: u32) -> AssistantItem {
-        tool_call(index, id, "ask", json!({"id":id, "prompt":"Question?"}))
+    fn ask(header: &str, index: u32) -> AssistantItem {
+        tool_call(
+            index,
+            header,
+            "ask",
+            json!({"header": header, "prompt": "Question?"}),
+        )
     }
 
     /// A running ask job of the root agent and the context its handler receives.
@@ -467,7 +473,10 @@ mod tests {
             let batches = batches.lock().unwrap();
             assert_eq!(batches.len(), 1);
             // Concurrent asks are presented in the order they were called.
-            let ids = batches[0].iter().map(|q| q.id.as_str()).collect::<Vec<_>>();
+            let ids = batches[0]
+                .iter()
+                .map(|q| q.header.as_str())
+                .collect::<Vec<_>>();
             assert_eq!(ids, ["first", "second"]);
             let requests = requests.lock().unwrap();
             let crate::provider::protocol::Message::Tool(results) =
@@ -484,7 +493,7 @@ mod tests {
         // irrevocable on dismissal; neither nesting nor launch mode alone is.
         let asks = async |session: &SessionHandle, script_background, ask_background| {
             let source = format!(
-                "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
+                "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{header:id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
             );
             let arguments = json!({"source": source, "bg": script_background});
             let script = (session.runtime.executor).run_model(&session.root, "script", arguments);
@@ -571,7 +580,12 @@ mod tests {
         assert_eq!(joined(), None);
         let presented = batches.lock().unwrap().clone();
         let ids: Vec<Vec<&str>> = (presented.iter())
-            .map(|batch| batch.iter().map(|question| question.id.as_str()).collect())
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|question| question.header.as_str())
+                    .collect()
+            })
             .collect();
         assert_eq!(ids, [["scripted"], ["first"]]);
         drop((worker, scripted_worker, dropped_worker, script));
@@ -594,7 +608,7 @@ mod tests {
             found(&session, [Key::Job(owner)], asked).await
         };
         for (index, id) in ["first", "second", "second"].into_iter().enumerate() {
-            let arguments = json!({"id":id, "prompt":"Question?", "bg":true});
+            let arguments = json!({"header":id, "prompt":"Question?", "bg":true});
             let child = session.root.child(1);
             let result =
                 executor.execute_as(InvocationKind::Model, child, "ask", arguments, Some(owner));
@@ -618,7 +632,7 @@ mod tests {
             let batches = Batches::default();
             let call = if scripted {
                 let source =
-                    "return (await tool.ask({id:'child', prompt:'parent question'})).result;";
+                    "return (await tool.ask({header:'child', prompt:'parent question'})).result;";
                 tool_call(0, "question", "script", json!({ "source": source }))
             } else {
                 ask("child", 0)
