@@ -1,4 +1,4 @@
-//! Embedded remote shims, named `<os>-<protocol>-<arch>` such as `linux-ssh-x86_64`.
+//! Embedded remote shims, one per platform, named `<os>-<arch>` such as `linux-x86_64`.
 use std::{borrow::Cow, fmt, sync::Arc};
 
 use serde::Serialize;
@@ -19,13 +19,6 @@ named_enum! {
     pub enum Arch {
         X86_64 = "x86_64" | "amd64",
         Aarch64 = "aarch64" | "arm64",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum ShimProtocol {
-        Ssh = "ssh",
     }
 }
 
@@ -57,7 +50,6 @@ impl fmt::Display for Platform {
 #[derive(Clone, Debug)]
 pub struct EmbeddedShim {
     pub platform: Platform,
-    pub protocol: ShimProtocol,
     pub bytes: Cow<'static, [u8]>,
 }
 
@@ -68,7 +60,6 @@ pub type ShimLoader = fn(&str) -> Option<Cow<'static, [u8]>>;
 #[derive(Clone, Debug)]
 struct ShimEntry {
     platform: Platform,
-    protocol: ShimProtocol,
     name: Box<str>,
 }
 
@@ -88,7 +79,7 @@ impl Default for EmbeddedShimCatalog {
 }
 
 impl EmbeddedShimCatalog {
-    /// Builds a catalog from `<os>-<protocol>-<arch>` artifact names that `load` reads.
+    /// Builds a catalog from `<os>-<arch>` artifact names that `load` reads.
     /// Names with an extension, such as stray build outputs, are skipped.
     pub fn from_embedded_assets<N: AsRef<str>>(
         names: impl IntoIterator<Item = N>,
@@ -100,12 +91,11 @@ impl EmbeddedShimCatalog {
             .map(|name| {
                 let name = name.as_ref();
                 let invalid = || ArtifactError::InvalidName(name.to_owned());
-                let [os, protocol, arch] = name.split('-').collect::<Vec<_>>()[..] else {
+                let [os, arch] = name.split('-').collect::<Vec<_>>()[..] else {
                     return Err(invalid());
                 };
                 Ok(ShimEntry {
                     platform: Platform::parse(os, arch).ok_or_else(invalid)?,
-                    protocol: protocol.parse().map_err(|_| invalid())?,
                     name: name.into(),
                 })
             })
@@ -116,43 +106,34 @@ impl EmbeddedShimCatalog {
         })
     }
 
-    pub(crate) fn find(
-        &self,
-        protocol: ShimProtocol,
-        platform: Platform,
-    ) -> Result<EmbeddedShim, DeploymentError> {
+    pub(crate) fn find(&self, platform: Platform) -> Result<EmbeddedShim, DeploymentError> {
         if self.shims.is_empty() {
             return Err(DeploymentError::NoShims);
         }
         let entry = self
             .shims
             .iter()
-            .find(|shim| shim.protocol == protocol && shim.platform == platform)
-            .ok_or(DeploymentError::NoShim { protocol, platform })?;
+            .find(|shim| shim.platform == platform)
+            .ok_or(DeploymentError::NoShim { platform })?;
         let bytes = (self.load)(&entry.name).ok_or_else(|| DeploymentError::Unreadable {
             name: entry.name.clone(),
         })?;
-        Ok(EmbeddedShim {
-            platform,
-            protocol,
-            bytes,
-        })
+        Ok(EmbeddedShim { platform, bytes })
     }
 }
 
 impl EmbeddedShim {
+    /// The shim's file name on the remote host, under a directory named by its hash.
+    pub const INSTALLED_NAME: &str = "shim";
+
     pub fn sha256(&self) -> String {
         crate::sha256_hex(&self.bytes)
-    }
-
-    pub fn installed_name(&self) -> String {
-        format!("{}-{}", self.platform.os, self.protocol)
     }
 }
 
 #[derive(Clone, Debug, Error)]
 pub enum ArtifactError {
-    #[error("invalid shim artifact name `{0}`; expected <os>-<protocol>-<arch> in lowercase")]
+    #[error("invalid shim artifact name `{0}`; expected <os>-<arch> in lowercase")]
     InvalidName(String),
 }
 
@@ -167,19 +148,13 @@ mod tests {
 
     #[test]
     fn finds_shims_by_platform_and_arch_aliases() {
-        let shims = catalog(&[
-            "linux-ssh-x86_64",
-            "linux-ssh-aarch64",
-            "linux-ssh-x86_64.d",
-        ])
-        .unwrap();
+        let shims = catalog(&["linux-x86_64", "linux-aarch64", "linux-x86_64.d"]).unwrap();
         let platform = Platform::parse("linux", "x86_64").unwrap();
-        let shim = shims.find(ShimProtocol::Ssh, platform).unwrap();
+        let shim = shims.find(platform).unwrap();
         assert_eq!(
             (shim.platform.arch, &*shim.bytes),
             (Arch::X86_64, &b"abc"[..])
         );
-        assert_eq!(shim.installed_name(), "linux-ssh");
         let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         assert_eq!(shim.sha256(), sha);
         assert_eq!(platform.to_string(), "linux-x86_64");
@@ -188,27 +163,27 @@ mod tests {
         assert!(Platform::parse("linux", "riscv64").is_none());
         assert!(Platform::parse("darwin", "x86_64").is_none());
         // An alias-named artifact serves the canonical platform.
-        let aliased = catalog(&["linux-ssh-amd64"]).unwrap();
-        assert!(aliased.find(ShimProtocol::Ssh, platform).is_ok());
+        let aliased = catalog(&["linux-amd64"]).unwrap();
+        assert!(aliased.find(platform).is_ok());
     }
 
     #[test]
     fn find_distinguishes_missing_from_unreadable_shims() {
         let platform = Platform::parse("linux", "x86_64").unwrap();
-        let find = |catalog: EmbeddedShimCatalog| catalog.find(ShimProtocol::Ssh, platform);
+        let find = |catalog: EmbeddedShimCatalog| catalog.find(platform);
         assert_matches!(
             find(EmbeddedShimCatalog::default()),
             Err(DeploymentError::NoShims)
         );
         assert_matches!(
-            find(catalog(&["linux-ssh-aarch64"]).unwrap()),
+            find(catalog(&["linux-aarch64"]).unwrap()),
             Err(DeploymentError::NoShim { .. })
         );
         let unreadable =
-            EmbeddedShimCatalog::from_embedded_assets(["linux-ssh-x86_64"], |_| None).unwrap();
+            EmbeddedShimCatalog::from_embedded_assets(["linux-x86_64"], |_| None).unwrap();
         assert_matches!(
             find(unreadable),
-            Err(DeploymentError::Unreadable { name }) if &*name == "linux-ssh-x86_64"
+            Err(DeploymentError::Unreadable { name }) if &*name == "linux-x86_64"
         );
     }
 
@@ -216,14 +191,14 @@ mod tests {
     fn rejects_invalid_names() {
         for name in [
             "",
-            "linux-ssh-x86_64-extra",
-            "linux--x86_64",
-            "Linux-ssh-x86_64",
-            "../linux-ssh-x86_64",
-            "linux-ssh-$(uname)",
-            "linux-ssh-riscv64",
-            "linux-scp-x86_64",
-            "darwin-ssh-x86_64",
+            "linux-x86_64-extra",
+            "linux-ssh-x86_64",
+            "linux-",
+            "Linux-x86_64",
+            "../linux-x86_64",
+            "linux-$(uname)",
+            "linux-riscv64",
+            "darwin-x86_64",
         ] {
             assert_matches!(
                 catalog(&[name]),

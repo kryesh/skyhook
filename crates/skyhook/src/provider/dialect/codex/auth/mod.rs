@@ -140,7 +140,7 @@ impl AuthManager {
         issuer: Issuer,
     ) -> Result<Self, ProviderError> {
         let files = store::Files::new(command.home.credentials()?, &command.provider)?;
-        let client = reqwest::Client::builder()
+        let client = crate::tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)

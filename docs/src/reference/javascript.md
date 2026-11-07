@@ -2,18 +2,39 @@
 
 ## Supported globals and concurrency
 
-The runtime exposes:
+Scripts run in V8 with the standard ECMAScript built-ins, including `Intl`, `Temporal` and
+`Uint8Array.fromBase64`, `.fromHex`, `.toBase64()`, and `.toHex()`. `WebAssembly` and
+`Atomics.waitAsync` are not available. Scripts compute in UTC whatever the host's time zone, so
+local-time `Date` methods and `Intl` and `Temporal` defaults use UTC; an explicit `timeZone`
+still applies. The runtime adds:
 
-- `Date`, `RegExp`, `Map`/`Set`, `Proxy`/`Reflect`, and `BigInt`;
-- `ArrayBuffer`, `DataView`, and typed arrays, including `Uint8Array.fromBase64`,
-  `.fromHex`, `.toBase64()`, and `.toHex()`;
 - `performance.now()` for measuring elapsed milliseconds;
+- `queueMicrotask(callback)`, which ignores the callback's return value;
 - `await sleep(ms)` for asynchronous waits, resolving to `undefined`. The delay must be a number
-  of milliseconds from 0 to 2147483647, as for JavaScript timers; fractional values are accepted,
-  and any other value throws a `TypeError` at the call.
+  of milliseconds from 0 to 1800000 (30 minutes); fractional values are accepted, and any other
+  value throws a `TypeError` at the call.
   Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;
+- `setTimeout`, `setInterval`, `clearTimeout` and `clearInterval`, passing extra arguments to the
+  callback. A missing, negative or `NaN` delay is 0; a delay above 30 minutes throws the same
+  `TypeError` as `sleep` rather than firing early. Timers due at the same time run in the order
+  they were set. Pending timers do not keep the script alive. An exception a timer or
+  `queueMicrotask` callback throws, or a rejection of the promise an async one returns, is
+  written to the console as `Uncaught …` without ending the script;
+- `TextEncoder` and `TextDecoder`, for UTF-8 only: encoding writes an unpaired surrogate as U+FFFD,
+  and a decoder for any other label throws a `RangeError`. `{fatal: true}` makes malformed input a
+  `TypeError`, and `ignoreBOM` keeps a leading byte-order mark; `{stream: true}` is not supported;
+- `atob` and `btoa`, which throw an error named `InvalidCharacterError` for input that is not
+  base64, or for characters above U+00FF, and a `TypeError` without an argument;
+- `structuredClone(value)` for values V8 can serialize, cycles included, such as `Map`, `Set`,
+  `Date`, `RegExp`, errors, `ArrayBuffer` and typed arrays. Functions, symbols, the runtime's own
+  objects (`URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder` and `WorkPool`) and other values
+  it cannot clone throw an error named `DataCloneError`, as does a non-empty `transfer` option, and
+  a copy whose buffers exceed the ArrayBuffer storage limit throws a `RangeError`;
+- `URL`, with `URL.canParse` and `URL.parse`, and `URLSearchParams`, following the WHATWG URL
+  standard: an invalid URL throws a `TypeError`, as does a missing required argument, and a URL's
+  `searchParams` and `search` stay in step;
 - `new WorkPool(concurrency).map(items, worker)` and `.run([fn1, fn2, ...])` as async iterables
-  yielding `{index, value}` results in completion order, or `{index, error}` for a task that
+  yielding `{index, value}` results in completion order, or `{index, error}` with the thrown value for a task that
   threw; remaining items continue. `run` requires exactly one array of functions, each called
   with no arguments—not variadic arguments. Invalid `run` arguments, and a `map` worker that is
   not a function, throw before any task starts. Early iterator closure stops scheduling and
@@ -27,7 +48,7 @@ The runtime exposes:
   runs and raced alongside it: each value it resolves yields `{wake: value}`. A wake still pending
   when the feed ends is released, so the input it would have taken goes to the next `receive()`;
 - `await receive()` waits for the next JSON value sent to the script's own job ID with
-  `tool.job(scriptJobId).send({value})`; the script must be launched with `bg: true`. Values
+  `control({job: scriptJobId, send: value})`; the script must be launched with `bg: true`. Values
   arrive in order. Calling `release()` on a receive you no longer await hands its value, taken or
   not, to the next `receive()`.
   This is script input, not child-agent input: agents receive owner updates automatically.
@@ -48,14 +69,15 @@ return results;
 
 ## Memory limit
 
-Each script call has a **512 MiB (536,870,912-byte) QuickJS allocation limit**. This covers
-runtime-managed memory, including JavaScript objects, strings, and JavaScript-created
-ArrayBuffer and typed-array storage. Freed memory restores capacity; the limit is not a
-cumulative allocation, execution-time, or token budget.
+Each script call has a **512 MiB JavaScript heap limit** for its objects and strings, and
+separately up to 512 MiB of ArrayBuffer and typed-array storage at once. Freed memory restores
+capacity; neither is a cumulative allocation, execution-time, or token budget.
 
-An allocation that exceeds the limit throws an out-of-memory error. Scripts can catch it;
-an uncaught error fails the call. Keep headroom for temporary allocations during result
-conversion and serialization.
+An ArrayBuffer or typed-array allocation beyond its limit throws a `RangeError`, which scripts can
+catch. Exceeding the heap limit ends the script, which cannot catch it, with the error
+"JavaScript heap limit (512 MiB) exceeded",
+and the call fails even if the script went on to return. Keep headroom for temporary allocations
+during result conversion and serialization.
 
 This is not a total process-memory limit. Rust-side tool results, host bookkeeping, and
 other native allocations are outside the budget, and concurrent script calls each have
@@ -95,7 +117,7 @@ inside a paged `jobs({job})` result are not filled, since a page may omit them.
 A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits `id` and `state`. `result` is the native tool payload. It is present exactly when the job
 has a result, and a loaded literal `null` result stays `result: null`. A tool with nothing to
-return, such as `tool.job(id).send`, completes without a result. `meta` is absent on an ordinary
+return, such as `tool.control({job: id, send: value})`, completes without a result. `meta` is absent on an ordinary
 successful foreground call. Background handles, listings, inspections, and failures carry `meta`
 with what the caller does not already know: `tool` and `name` except in the response to the
 caller's own foreground call, `parent`, `target`, and `workspace` only when they differ from the
@@ -146,11 +168,8 @@ what reaches the model, such as the script's own returned value. Operational too
 failed views rather than JavaScript throws; programmer, serialization, `receive`, and sleep errors
 still throw.
 
-Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
-typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`; they fail with their path
-otherwise. The runtime does not provide
-Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. Scripts
-cannot import modules, including the runtime's own.
+The runtime does not provide Node.js APIs or `fetch`. Scripts cannot import modules, including
+the runtime's own.
 
 ## Script results and failures
 
@@ -173,9 +192,9 @@ On a script execution failure, the saved script payload is `{value, console?: <c
 where `value` is `null` unless only the returned value's conversion failed;
 the enclosing JobView is `failed` and carries its `error`: the thrown error's message and stack,
 or the JSON of any other thrown value. The message leads with the error's name unless it is
-plain `Error`. Stack frames are `skyhook-script:line:column` positions in the submitted body, or
-`end of source` for a syntax error where input ended early; frames outside the body are left
-out. Console text belongs to the script result, not job metadata.
+plain `Error`. Stack frames are `line L:C` positions in the submitted body's own
+lines and columns, or `end of source` for a syntax error where input ended early; frames outside
+the body are left out, and the callers an `await` resumed are shown as `at async` frames. Console text belongs to the script result, not job metadata.
 
 `failure` holds a thrown error's other properties: its `cause` and enumerable properties, such as
 the `job` and `code` of an unwrapped failed response, whose full view `tool.jobs({job})` reads.
@@ -184,23 +203,32 @@ whether execution failed. Automatic previews can shorten it.
 
 Returned values convert to JSON:
 
-- As in `JSON.stringify`, an `undefined` member is omitted, and a top-level `undefined` or an
-  `undefined` array element becomes `null`.
+- As in `JSON.stringify`, an `undefined` member is omitted, a top-level `undefined`, an
+  `undefined` array element or a non-finite number becomes `null`, a `toJSON` method's result
+  stands in for its object (a date becomes its ISO string, a `URL` its `href`), and other objects
+  become their own enumerable string-keyed properties.
+- Where `JSON.stringify` would throw or lose data, a value takes its natural form: a `BigInt`
+  becomes its decimal string, a typed array an array of its elements, an `ArrayBuffer`,
+  `SharedArrayBuffer` or `DataView` an array of its bytes, a `Set` an array in insertion order, a
+  `RegExp` its text such as `"/x+/g"`, and a boxed primitive its value. A `Map` becomes an object
+  when its keys are strings or finite numbers that stay distinct as names, and an array of
+  `[key, value]` entries otherwise.
 - Promises, builders and other thenables anywhere in the value are awaited.
 - An `Error` becomes an object of its `name`, `message`, `cause` and other properties.
 - An unpaired surrogate in a string becomes U+FFFD.
-- Anything else that is not JSON is a problem at its path, such as `$.items[2]`: non-finite
-  numbers, `BigInt`s, functions, symbols, cycles, objects other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
-  a member whose getter throws or whose promise rejects, reported with its error's message.
+- Anything else is a problem at its path, such as `$.items[2]`: functions, symbols, `WeakMap`,
+  `WeakSet`, `WeakRef` and `FinalizationRegistry` objects, cycles, unpaired surrogates in keys,
+  nesting deeper than 100, and a member whose getter or `toJSON` throws or whose promise rejects,
+  reported with its error's message.
 
 Conversion runs after the body returns, so the body's own `try`/`catch` cannot catch its problems.
 A value with problems still fails the script, with an error listing them by path, but its saved
 `value` keeps everything else, with `null` in place of each problem; captured console text is
 kept as on any failure.
 
-Tool arguments convert the same way when the builder is made, so a failure throws at the call:
-`undefined` properties are omitted, while `undefined` array elements, promises, builders, `Error`s
-and unpaired surrogates fail.
+Tool arguments convert the same way when the builder is made, so a problem throws at the call:
+`undefined` properties are omitted, while `undefined` array elements, promises, builders and
+unpaired surrogates are problems too. The converted argument must be an object.
 
 ## Builder execution and policy
 

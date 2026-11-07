@@ -181,6 +181,7 @@ pub(crate) enum TextCaptureField {
     Stdout,
     Stderr,
     Content,
+    #[cfg(feature = "script")]
     Console,
 }
 
@@ -190,6 +191,7 @@ impl TextCaptureField {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
             Self::Content => "content",
+            #[cfg(feature = "script")]
             Self::Console => "console",
         })
     }

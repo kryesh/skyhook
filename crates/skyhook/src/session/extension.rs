@@ -286,7 +286,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) const TABLES: Schema = Schema::extended(
-        skyhook_schema::image!(
+        ::schema::image!(
             format = 1,
             sql = "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT;",
             sql = "CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;"

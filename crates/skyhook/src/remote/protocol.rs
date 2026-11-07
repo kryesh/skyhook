@@ -182,7 +182,10 @@ pub(crate) enum Response {
         prompt_id: PromptId,
         prompt: super::SensitivePrompt,
     },
-    Ready,
+    /// The handshake's answer, with the worker machine's time zone when it has one.
+    Ready {
+        zone: Option<crate::target::TimeZone>,
+    },
     Tool {
         request_id: RequestId,
     },

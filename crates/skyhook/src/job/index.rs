@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::*;
 use crate::session::Dirty;
 
+#[cfg(feature = "script")]
+pub(super) mod issuing;
+
 /// The resident jobs, with the live facts the core keeps beside them.
 #[derive(Default)]
 pub(crate) struct Jobs {
@@ -516,20 +519,6 @@ impl Jobs {
     /// What every change since the last take touched.
     pub(crate) fn take_dirty(&mut self) -> Dirty {
         std::mem::take(&mut self.dirty)
-    }
-
-    pub(super) fn issue(&mut self, parent: JobId) {
-        *self.calls.issuing.entry(parent).or_default() += 1;
-    }
-
-    pub(super) fn issued(&mut self, parent: JobId) {
-        if let Some(count) = self.calls.issuing.get_mut(&parent) {
-            *count -= 1;
-            if *count == 0 {
-                self.calls.issuing.remove(&parent);
-                self.dirty.job(parent);
-            }
-        }
     }
 
     /// Whether every call `parent` issued has its job published.

@@ -56,12 +56,13 @@ impl SessionRuntime {
             }
             // Persisted state joins the conversation ahead of the request, which later
             // requests then extend unchanged: signed reasoning is bound to it. A state
-            // the latest one in history already shows is not repeated.
+            // the latest one in history already holds, whatever its time, is not repeated.
             let tail = match tail {
                 Some(Message::State(state))
                     if profile.state_mode == crate::provider::profile::StateMode::Persist =>
                 {
-                    if agent_context.projected.last_state() != Some(&state) {
+                    let last = agent_context.projected.last_state();
+                    if !last.is_some_and(|last| last.same_as(&state)) {
                         let state = SessionEvent::MessageCommitted {
                             message: Message::State(state),
                         };

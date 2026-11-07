@@ -8,7 +8,7 @@ use std::{
 use serde_json::Value;
 
 use super::{
-    Arguments, CatalogEntry, OutputValue, ScriptBinding, ScriptManifest, ToolExposure,
+    Arguments, CatalogEntry, OutputValue, ScriptBinding,
     options::{ComputedSchema, SchemaOrigin},
     schema::{add_background, normalize_result_schema, optional_defaults, sanitize_schema_inner},
 };
@@ -33,7 +33,6 @@ pub struct ToolSpec {
     pub(crate) validator: Arc<ArgumentValidator>,
     /// Handler result, without the background job alternative.
     pub result_schema: Option<Value>,
-    pub exposure: ToolExposure,
     pub script_binding: ScriptBinding,
 }
 
@@ -93,7 +92,6 @@ pub(super) struct GeneratedToolDefinition {
     /// `None` withdraws the tool from that capability set's surface.
     pub(super) input_schema: ComputedSchema,
     pub(super) output_schema: Option<OutputSchema>,
-    pub(super) exposure: ToolExposure,
     pub(super) script_binding: ScriptBinding,
     pub(super) supports_background: bool,
     pub(super) schema_origin: SchemaOrigin,
@@ -192,8 +190,7 @@ impl<C, O: OutputValue> CatalogEntry<C, O> {
             input_schema,
             validator,
             result_schema,
-            exposure: definition.exposure,
-            script_binding: definition.script_binding.clone(),
+            script_binding: definition.script_binding,
         })
     }
 }
@@ -230,12 +227,26 @@ impl ToolSurface {
         offered.chain((self.withheld.iter()).map(|(name, why)| (name.as_str(), Err(why))))
     }
 
+    #[cfg(feature = "script")]
     pub(crate) fn script_manifests(&self) -> Vec<ScriptManifest> {
-        self.tools
-            .values()
-            .filter_map(ScriptManifest::from_tool)
+        (self.tools.values())
+            .filter(|tool| tool.script_binding != ScriptBinding::Unavailable)
+            .map(|tool| ScriptManifest {
+                name: tool.name.clone(),
+                properties: (tool.input_schema["properties"].as_object().into_iter())
+                    .flat_map(|properties| properties.keys().cloned())
+                    .collect(),
+            })
             .collect()
     }
+}
+
+/// A script's `tool.<name>` call and the arguments it accepts.
+#[cfg(feature = "script")]
+#[derive(serde::Serialize)]
+pub(crate) struct ScriptManifest {
+    name: String,
+    properties: Vec<String>,
 }
 
 pub(super) type CatalogTools<C, O> = BTreeMap<String, Arc<CatalogEntry<C, O>>>;

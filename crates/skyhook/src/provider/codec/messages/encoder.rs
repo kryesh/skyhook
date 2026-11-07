@@ -9,7 +9,7 @@ use crate::{
             CodecName, StateRole,
             common::{
                 PreparedImages, check_tool, is_sealed, own_replay, signed_context, tagged,
-                tool_text, user_parts,
+                user_parts,
             },
             placement::{breakpoint, path, push_history},
             set_each,
@@ -173,7 +173,7 @@ fn push_message(
                         InvalidRequest.error("Messages tool results require a nonempty call_id")
                     );
                 }
-                let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
+                let mut content = vec![json!({"type":"text", "text":result.result.to_string()})];
                 for image in &result.images {
                     content.push(images.part(image, "text", image_block)?);
                 }
@@ -409,10 +409,7 @@ mod tests {
         );
         let text: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            text,
-            json!({"result":{"ok":false,"error":null},"is_error":true})
-        );
+        assert_eq!(text, json!({"ok":false,"error":null}));
         assert_eq!(result["content"][1]["type"], "image");
         // The prefix breakpoint precedes the request's own state, which joins that user turn.
         assert_eq!(result["cache_control"], json!({"type":"ephemeral"}));

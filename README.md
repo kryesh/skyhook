@@ -24,15 +24,15 @@ workflows, or embed its Rust core in your own application.
 
 ## Install
 
-Requires **Rust 1.99 or newer** and [just](https://github.com/casey/just). SSH support
-embeds static Linux shims for x86_64 and aarch64, which are cross-compiled with
-[Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
+Requires **Rust 1.99 or newer** and [just](https://github.com/casey/just). Release builds are
+static musl binaries on Linux and embed static SSH shims for x86_64 and aarch64; both are
+cross-compiled with [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
 
 ```sh
 git clone https://github.com/kryesh/skyhook.git && cd skyhook
-just setup                 # cargo-zigbuild, cargo-nextest, mdBook, musl targets
+just setup                 # cargo-zigbuild, cargo-nextest, mdBook, Rust targets
 just build-shims-release   # omit for a local-only build without SSH support
-just build-release         # produces target/release/skyhook
+just build-release         # produces target/<host target>/release/skyhook
 ```
 
 Configure a provider and model, then start a session. If you already have a
@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/kryesh/skyhook/main/config.example.
 # Edit config.yaml: remove unused providers along with the models under them.
 # Set credentials for every remaining provider; for OpenAI:
 export OPENAI_API_KEY=...
-./target/release/skyhook --prompt "inspect this repository"
+./target/"$(just --evaluate host_target)"/release/skyhook --prompt "inspect this repository"
 ```
 
 See the [installation guide](docs/src/getting-started/installation.md),

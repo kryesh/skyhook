@@ -20,7 +20,7 @@ use crate::tool::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_checked(
         crate::tool::builtins::names::WRITE,
-        "Atomically create or replace a workspace file with UTF-8 `content`, or copy the bytes of a `source` file.",
+        "Atomically create or replace a workspace file with UTF-8 `content`, or copy the bytes of a `source` file",
         ToolOptions::new(vec![Capability::Write])
             .result::<WriteOutput>()
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
@@ -37,7 +37,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
     )?;
     builder.register_checked(
         crate::tool::builtins::names::REPLACE,
-        "Replace exact text in a UTF-8 workspace file with an expected match count.",
+        "Replace exact text in a UTF-8 workspace file",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .argument_paths(|args: &mut ReplaceArgs| {
@@ -52,7 +52,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
     )?;
     builder.register_checked(
         "remove",
-        "Remove a workspace file, symlink, or directory.",
+        "Remove a workspace file, symlink, or directory",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .argument_paths(|args: &mut RemoveArgs| {
@@ -168,11 +168,11 @@ fn unchanged(operation: Operation, path: impl AsRef<Path>) -> PartialContext {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteArgs {
-    /// File path.
+    /// File path
     path: String,
-    /// Complete replacement file contents.
+    /// Complete replacement file contents
     content: Option<String>,
-    /// File whose bytes to copy instead of `content`.
+    /// File whose bytes to copy instead of `content`
     source: Option<crate::target::TargetPath>,
 }
 
@@ -235,13 +235,14 @@ struct WriteOutput {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplaceArgs {
-    /// UTF-8 text file to edit.
+    /// UTF-8 text file to edit
     path: String,
-    /// Exact text to find.
+    /// Exact text to find
+    #[schemars(length(min = 1))]
     old: String,
-    /// Replacement text.
+    /// Replacement text
     new: String,
-    /// Required number of matches. The edit fails if the actual count differs.
+    /// Required number of matches. The edit fails if the actual count differs
     #[serde(default = "default_one")]
     count: usize,
 }
@@ -250,17 +251,13 @@ impl ReplaceArgs {
     /// Reject invalid input before authorization, source reads, or allocation.
     fn admit(self) -> Result<Self, AdmissionError> {
         let input = self.old.len().saturating_add(self.new.len());
-        let invalid = if input > MODEL_CONTENT_BYTES {
-            format!(
-                "replace input is {input} bytes, exceeding the {MODEL_CONTENT_BYTES}-byte limit"
-            )
-        } else if self.old.is_empty() {
-            "old cannot be empty".to_owned()
-        } else {
+        if input <= MODEL_CONTENT_BYTES {
             return Ok(self);
-        };
-        Err(AdmissionError::invalid_arguments(invalid)
-            .context(unchanged(Operation::Validate, &self.path)))
+        }
+        Err(AdmissionError::invalid_arguments(format!(
+            "replace input is {input} bytes, exceeding the {MODEL_CONTENT_BYTES}-byte limit"
+        ))
+        .context(unchanged(Operation::Validate, &self.path)))
     }
 
     async fn run(self) -> Result<(), LocalError> {
@@ -297,9 +294,9 @@ impl ReplaceArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RemoveArgs {
-    /// File or directory to remove.
+    /// File or directory to remove
     path: String,
-    /// Required for non-empty directory trees.
+    /// Required for non-empty directory trees
     #[serde(default)]
     recursive: bool,
 }
@@ -439,11 +436,6 @@ mod tests {
                 "write",
                 json!({"path":"missing/file", "content":oversized}),
                 "limit",
-            ),
-            (
-                "replace",
-                json!({"path":"missing/file", "old":"", "new":"y"}),
-                "old cannot be empty",
             ),
             (
                 "replace",

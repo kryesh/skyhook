@@ -27,7 +27,7 @@ pub enum HeaderError {
 
 crate::newtype::string_newtype! {
     /// A question's short title: its tab among the questions asked together, unique
-    /// among them, and the key its answer is filed under.
+    /// among them, and the key its answer is filed under
     #[derive(PartialOrd, Ord)]
     pub struct QuestionHeader(HeaderError) = |header| match header {
         header if header.trim().is_empty() => Err(HeaderError::Blank),
@@ -41,18 +41,18 @@ crate::newtype::string_newtype! {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
-    /// Short answer label, returned as the answer when chosen.
+    /// Short answer label, returned as the answer when chosen
     pub label: crate::Prose,
-    /// What choosing it means: its effect or tradeoff.
+    /// What choosing it means: its effect or tradeoff
     pub description: crate::Prose,
-    /// The option you recommend: at most one, unless the question takes several.
+    /// The option you recommend: at most one, unless the question takes several
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recommended: bool,
     /// Markdown shown beside this option while it is focused: a short concrete artifact the
     /// user compares across options, such as a code or config snippet (fenced, with a
     /// language), a data shape, or a small ASCII mockup. Show only what differs from the
     /// other options, in the same framing for each; keep it under about 20 lines and 60
-    /// columns. Give every option a preview or none. The tradeoff belongs in `description`.
+    /// columns. Give every option a preview or none
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<crate::Prose>,
 }
@@ -62,15 +62,15 @@ pub struct QuestionOption {
 pub struct Question {
     pub header: QuestionHeader,
     /// The complete question as Markdown, shown to the user or owning parent agent. Put
-    /// lists and separate points on their own lines.
+    /// lists and separate points on their own lines
     pub prompt: crate::Prose,
     /// Suggested answers with distinct labels; free-form input is always allowed. A chosen
     /// suggestion answers with its label, or {"answer": "label", "comment": "text"} with a
-    /// comment.
+    /// comment
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<QuestionOption>,
     /// Take several suggestions: the answer is then a list of labels and free-form text,
-    /// or {"answers": [...], "comment": "text"} with a comment.
+    /// or {"answers": [...], "comment": "text"} with a comment
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multiple: bool,
 }
@@ -116,7 +116,7 @@ impl Question {
 }
 
 /// A suspended child's question batch, returned in its agent job's output.
-/// Presentation never shortens it.
+/// Presentation never shortens it
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub(crate) struct QuestionOutput {
     #[schemars(transform = crate::tool::output::complete)]

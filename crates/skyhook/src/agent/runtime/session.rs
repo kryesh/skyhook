@@ -412,7 +412,7 @@ impl SessionHandle {
     /// how many turns and unbegun child invocations that stopped, and calls it
     /// withdrew from waiting on the resume hook. Having stopped any turn or
     /// invocation, the session is paused: deliveries start no turn until
-    /// `continue` or new input. Explicit `job_cancel` remains the non-resumable
+    /// `continue` or new input. Cancelling a job remains the non-resumable
     /// cancellation path.
     pub async fn interrupt(&self) -> usize {
         let (runtime, root) = (self.runtime.clone(), self.root.clone());
@@ -1143,7 +1143,7 @@ mod tests {
         assert_eq!(captured.len(), 2);
         let delivered = |message: &&Sent| {
             matches!(message, Sent::User(blocks) if blocks.iter().any(|block|
-                matches!(block, SentPart::Runtime { text } if text.starts_with("<skyhook_job_events>"))))
+                matches!(block, SentPart::Runtime { text } if crate::session::JOB_EVENTS.body(text).is_some())))
         };
         assert_eq!(captured[1].messages().filter(delivered).count(), 1);
         let continued = captured[1].messages().filter(|message| !delivered(message));

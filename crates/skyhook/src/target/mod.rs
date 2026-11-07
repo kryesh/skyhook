@@ -17,10 +17,70 @@ pub(crate) use router::{Route, TargetRouter, select_location};
 
 pub(crate) const MAX_TARGET_NAME_BYTES: usize = 128;
 
+/// A machine's time zone as it read it: the IANA name of the zone its clock follows,
+/// when it has one, and its offset from UTC in seconds then.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimeZone {
+    pub(crate) name: Option<String>,
+    pub(crate) offset: i32,
+}
+
+/// Where the clock reads a zone `TZ` names, as `chrono::Local` looks for it.
+const ZONE_DIRECTORIES: [&str; 4] = [
+    "/usr/share/zoneinfo",
+    "/share/zoneinfo",
+    "/etc/zoneinfo",
+    "/usr/share/lib/zoneinfo",
+];
+
+impl TimeZone {
+    /// This machine's zone now, named as the clock that gives its offset selects it.
+    pub(crate) fn local() -> Self {
+        let tz = std::env::var("TZ").ok();
+        let name = zone_name(tz.as_deref(), is_zone, || {
+            iana_time_zone::get_timezone().ok()
+        });
+        let offset = chrono::Local::now().offset().local_minus_utc();
+        Self { name, offset }
+    }
+
+    /// The offset as `±hh:mm`.
+    pub(crate) fn offset(&self) -> String {
+        let sign = if self.offset < 0 { '-' } else { '+' };
+        let seconds = self.offset.unsigned_abs();
+        format!("{sign}{:02}:{:02}", seconds / 3600, seconds % 3600 / 60)
+    }
+}
+
+/// The zone `tz`, the `TZ` value, selects: the zone it names, `:` aside; none when it
+/// gives a rule or nothing rather than a name; the `system` zone without it.
+fn zone_name(
+    tz: Option<&str>,
+    is_zone: impl Fn(&str) -> bool,
+    system: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let Some(tz) = tz else {
+        return system();
+    };
+    let name = tz.strip_prefix(':').unwrap_or(tz);
+    is_zone(name).then(|| name.to_owned())
+}
+
+/// Whether `name` is a zone of the tz database the clock reads.
+fn is_zone(name: &str) -> bool {
+    let relative = std::path::Path::new(name);
+    let within = relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    !name.is_empty()
+        && within
+        && ZONE_DIRECTORIES
+            .iter()
+            .any(|directory| std::path::Path::new(directory).join(relative).is_file())
+}
+
 string_newtype! {
-    /// The name of a configured or session-added target: 1 to
-    /// [`MAX_TARGET_NAME_BYTES`] ASCII letters, digits, underscores, hyphens, or
-    /// periods, and never the reserved `root`.
+    /// The name of a configured or session-added target
     #[derive(PartialOrd, Ord)]
     pub struct TargetName(TargetError) = |name| {
         if name == TargetRef::ROOT {
@@ -34,18 +94,21 @@ string_newtype! {
         valid
             .then_some(())
             .ok_or(TargetError::InvalidName)
-    };
+    }, schema = schemars::json_schema!({
+        "type": "string",
+        "pattern": format!("^[A-Za-z0-9_.-]{{1,{MAX_TARGET_NAME_BYTES}}}$"),
+    });
 }
 
-/// A path on an execution target, as tool arguments and results name one. An
-/// omitted target is the caller's own location; a named one resolves with the
-/// same rules as a tool's `target` argument. The `target` property is offered
-/// only with target selection, so schemas add it where that capability applies.
+// A path on an execution target, as tool arguments and results name one. An
+// omitted target is the caller's own location; a named one resolves with the
+// same rules as a tool's `target` argument. The `target` property is offered
+// only with target selection, so schemas add it where that capability applies.
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPath {
-    /// File path.
+    /// File path
     pub path: String,
     #[serde(default)]
     #[schemars(skip)]
@@ -68,7 +131,7 @@ impl TargetPath {
         };
         serde_json::json!({
             "type": types,
-            "description": "Target holding the path; omitted means your own."
+            "description": "Target holding the path; omitted means your own"
         })
     }
 }
@@ -90,7 +153,7 @@ impl TargetRef {
     pub(crate) fn schema() -> serde_json::Value {
         serde_json::json!({
             "type": ["string", "null"],
-            "description": "Execution target."
+            "description": "Execution target"
         })
     }
 
@@ -198,5 +261,28 @@ mod tests {
             serde_json::from_value::<TargetRef>(serde_json::json!("root")).unwrap(),
             TargetRef::Root
         );
+    }
+
+    /// `TZ` selects the zone it names, as the clock does, and only an offset when it
+    /// gives a rule; without it the system's zone is named.
+    #[test]
+    fn tz_names_the_zone_the_clock_follows() {
+        let known = |name: &str| name == "Asia/Tokyo";
+        let system = || Some("Etc/UTC".to_owned());
+        let tokyo = Some("Asia/Tokyo".to_owned());
+        for (tz, expected) in [
+            (Some("Asia/Tokyo"), tokyo.clone()),
+            (Some(":Asia/Tokyo"), tokyo),
+            (Some("JST-9"), None),
+            (Some(""), None),
+            (None, Some("Etc/UTC".to_owned())),
+        ] {
+            assert_eq!(zone_name(tz, known, system), expected, "{tz:?}");
+        }
+        let nameless = TimeZone {
+            name: None,
+            offset: -(9 * 3600 + 30 * 60),
+        };
+        assert_eq!(nameless.offset(), "-09:30");
     }
 }

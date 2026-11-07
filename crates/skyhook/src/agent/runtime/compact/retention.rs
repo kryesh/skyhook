@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn committed_state_is_never_the_retained_exchange() {
         let state = crate::session::RuntimeState {
-            date: "2026-10-11".into(),
+            time: chrono::DateTime::UNIX_EPOCH,
             jobs: vec![],
             todos: vec![],
             location: crate::execution::ExecutionLocation::root("/".into()),

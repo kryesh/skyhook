@@ -2,32 +2,27 @@
 // replace the original failure. Exception stacks keep only frames of the
 // submitted source.
 const DEPTH = 32;
-const FRAME = /^ +at (?:(.+) \()?([^()\s]+):(\d+):(\d+)\)?$/;
-let source;
+const SOURCE_FRAMES = 10;
 
-export function configure(layout) {
-  source = layout;
+// Stacks of the submitted source's own frames, in its own lines and columns. Every
+// frame is the body's, so V8's frame text names the line instead of the file.
+export function configure(filename) {
+  // Runtime frames, such as a nested argument's conversion, must not crowd the body's out.
+  Error.stackTraceLimit = 1000;
+  Error.prepareStackTrace = (_error, sites) => sites
+    .filter(site => site.getFileName() === filename)
+    .slice(0, SOURCE_FRAMES)
+    .map(site => {
+      const frame = String(site), line = site.getLineNumber(), column = site.getColumnNumber();
+      const at = frame.lastIndexOf(`${filename}:${line}:${column}`);
+      return `    at ${frame.slice(0, at)}line ${line}:${column}${frame.slice(at + `${filename}:${line}:${column}`.length)}`;
+    })
+    .join("\n");
 }
 
 export function text(value) {
   try { return String(value).toWellFormed(); }
   catch { return "[Unprintable]"; }
-}
-
-// The body's wrapper opens on its first line, so only that line's columns are
-// offset; QuickJS may place a failure at the body's start, inside the prefix. A
-// line past the body is the wrapper's close, where input ended early.
-function sourceStack(stack) {
-  const frames = [];
-  for (const line of stack.split("\n")) {
-    const [, name, file, row, column] = FRAME.exec(line) ?? [];
-    if (file !== source.filename) continue;
-    const at = Number(row) > source.lines
-      ? "end of source"
-      : `${file}:${row}:${row === "1" ? Math.max(column - source.prefix, 1) : column}`;
-    frames.push(name === undefined ? `    at ${at}` : `    at ${name} (${at})`);
-  }
-  return frames.join("\n");
 }
 
 // An error's own enumerable properties, then the standard ones it inherits or
@@ -45,7 +40,6 @@ export function describeError(error, ancestors = []) {
   ancestors.push(error);
   try {
     if (Array.isArray(error)) return Array.from(error, item => describeError(item, ancestors));
-    const exception = error instanceof Error;
     const description = Object.create(null);
     let keys;
     try { keys = errorKeys(error); } catch { keys = errorKeys({}); }
@@ -54,9 +48,7 @@ export function describeError(error, ancestors = []) {
       try {
         if (!(key in error)) continue;
         const value = error[key];
-        description[text(key)] = exception && key === "stack" && typeof value === "string"
-          ? sourceStack(value)
-          : describeError(value, ancestors);
+        description[text(key)] = describeError(value, ancestors);
       } catch {
         description[text(key)] = "[Uninspectable property]";
       }

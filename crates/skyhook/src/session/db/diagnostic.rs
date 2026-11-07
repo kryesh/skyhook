@@ -111,7 +111,6 @@ stored_enum! {
         Json = "json",
         Unavailable { tool: text } = "unavailable",
         UnknownTool { tool: text } = "unknown_tool",
-        ModelHidden { tool: text } = "model_hidden",
         ScriptUnavailable { tool: text } = "script_unavailable",
         UnknownJob { job: job } = "unknown_job",
         JobAlreadyTerminal { job: job } = "job_already_terminal",

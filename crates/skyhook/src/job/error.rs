@@ -63,7 +63,7 @@ pub enum JobError {
     #[error("the calling turn was interrupted")]
     Interrupted,
     #[error(
-        "child `{name}` already exists as job {job}; message it with tool.job({job}).send({{value: ...}}), or pick another name"
+        "child `{name}` already exists as job {job}; message it with control({{job: {job}, send: ...}}), or pick another name"
     )]
     NameTaken { name: JobName, job: JobId },
     #[error("job {0} did not launch an agent")]

@@ -30,13 +30,13 @@ pub(super) struct Page {
     pub markdown: String,
 }
 
-/// What `markdown` covers.
+/// What `markdown` covers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Scope {
-    /// The main article.
+    /// The main article
     Article,
-    /// The page body without scripts, navigation, form controls, footers and hidden elements.
+    /// The page body without scripts, navigation, form controls, footers and hidden elements
     Page,
 }
 
@@ -106,13 +106,13 @@ fn hidden(element: &NodeRef) -> bool {
     display.1 || visibility.1
 }
 
-/// Why HTML could not be read as markdown.
+/// Why HTML could not be read as markdown
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Unreadable {
-    /// Over the extraction size, element, nesting or output limits.
+    /// Over the extraction size, element, nesting or output limits
     TooLarge,
-    /// No text, as on pages rendered by JavaScript.
+    /// No text, as on pages rendered by JavaScript
     NoText,
     ParserFailed,
 }

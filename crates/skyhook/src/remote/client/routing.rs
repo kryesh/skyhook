@@ -209,7 +209,7 @@ where
                     Ok(None)
                 });
             }
-            Response::Ready => {
+            Response::Ready { .. } => {
                 return Err(
                     ProtocolError::Violation("received a second remote ready response").into(),
                 );

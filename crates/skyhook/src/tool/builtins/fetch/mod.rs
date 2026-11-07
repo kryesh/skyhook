@@ -53,17 +53,17 @@ const fn default_redirects() -> MaxRedirects {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FetchArgs {
-    /// HTTP(S), without URL credentials.
+    /// HTTP(S), without URL credentials
     url: String,
     #[serde(default = "default_method")]
     method: String,
-    /// Appends to the URL query.
+    /// Appends to the URL query
     #[serde(default)]
     query: Vec<(String, String)>,
-    /// Request headers to send.
+    /// Request headers to send
     #[serde(default)]
     headers: BTreeMap<String, OneOrMany<String>>,
-    /// Include response headers in the result.
+    /// Include response headers in the result
     #[serde(default)]
     include_headers: bool,
     body: Option<RequestBody>,
@@ -76,13 +76,13 @@ struct FetchArgs {
     #[serde(default)]
     #[schemars(skip)]
     overwrite: bool,
-    /// Seconds.
+    /// Seconds
     #[serde(default = "default_timeout")]
     timeout: TimeoutSecs,
-    /// Seconds.
+    /// Seconds
     #[serde(default = "default_connect_timeout")]
     connect_timeout: TimeoutSecs,
-    /// Decoded response bytes; excess fails.
+    /// Decoded response bytes; excess fails
     #[serde(default = "default_max_bytes")]
     max_bytes: MaxBytes,
     #[serde(default)]
@@ -90,7 +90,7 @@ struct FetchArgs {
     #[serde(default = "default_redirects")]
     max_redirects: MaxRedirects,
     proxy: Option<String>,
-    /// Skip TLS certificate verification.
+    /// Skip TLS certificate verification
     #[serde(default)]
     insecure: bool,
 }
@@ -109,6 +109,7 @@ pub(super) enum RequestBody {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Auth {
     Basic {
+        #[schemars(regex(pattern = "^[^:]*$"))]
         username: String,
         #[serde(default)]
         password: String,
@@ -121,14 +122,14 @@ pub(super) enum Auth {
 #[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResponseFormat {
-    /// HTML as markdown, JSON as a value, other text as text, binary as base64.
+    /// HTML as markdown, JSON as a value, other text as text, binary as base64
     #[default]
     Auto,
-    /// As auto, preferring HTML from the server and reading HTML served as any type.
+    /// As auto, preferring HTML from the server and reading HTML served as any type
     Readable,
-    /// The decoded body as sent.
+    /// The decoded body as sent
     Text,
-    /// The raw bytes as base64.
+    /// The raw bytes as base64
     Base64,
 }
 
@@ -153,9 +154,9 @@ pub(super) struct FetchOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redirects: Vec<Redirect>,
     body: ResponseBody,
-    /// Decoded entity bytes received (before extraction).
+    /// Decoded entity bytes received (before extraction)
     size: u64,
-    /// Milliseconds.
+    /// Milliseconds
     duration: u64,
 }
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -170,14 +171,14 @@ enum ResponseBody {
     Text {
         text: String,
     },
-    /// HTML read as markdown.
+    /// HTML read as markdown
     Page(text::Page),
-    /// HTML that could not be read as markdown, with its decoded source.
+    /// HTML that could not be read as markdown, with its decoded source
     Unreadable {
         reason: text::Unreadable,
         text: String,
     },
-    /// A textual body that holds JSON, read as it.
+    /// A textual body that holds JSON, read as it
     Json {
         value: serde_json::Value,
     },
@@ -194,7 +195,7 @@ enum ResponseBody {
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_checked(
         "fetch",
-        "HTTP(S) from the selected target. HTTP error statuses are normal results. response_format auto and readable return HTML as readable markdown, or its source and a reason when unreadable; the status is never hidden. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
+        "HTTP(S) from the selected target. HTTP error statuses are normal results. When HTML is unreadable, auto and readable return its source and a reason; the status is never hidden. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries",
         ToolOptions::new(vec![Capability::Network])
             .result::<FetchOutput>()
             .argument_permissions(|location, plan: &FetchPlan| {

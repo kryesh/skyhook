@@ -1040,7 +1040,18 @@ mod tests {
         provider.request(4).await;
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured[3].context_id, ContextId::from(&child));
-        assert_eq!(captured[1], captured[3]);
+        // The retried request is the failed one's, but for the time its state shows.
+        let timeless = |request: &ModelRequest| {
+            let mut request = request.clone();
+            for entry in &mut request.context {
+                if let crate::provider::protocol::Entry::State(state) = entry {
+                    let lines = state.text.lines().filter(|line| !line.starts_with("time:"));
+                    state.text = lines.collect::<Vec<_>>().join("\n");
+                }
+            }
+            request
+        };
+        assert_eq!(timeless(&captured[1]), timeless(&captured[3]));
         until_parked(&session, &child).await;
         // The continue ran only the child: each request the root makes answers input
         // of its own, the last the child's completion, delivered once.
@@ -1123,7 +1134,8 @@ mod tests {
         assert_eq!(failed.state, JobState::Failed);
         let child = session.root.child(1);
         assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
-        let retry = format!("return (await tool.job({job}).send({{value:'try again'}})).unwrap();");
+        let retry =
+            format!("return (await tool.control({{job:{job}, send:'try again'}})).unwrap();");
         let resumed = session.run_script(retry).await.unwrap();
         assert_eq!(resumed.value["value"], serde_json::Value::Null);
         let recovered = wait().await;
@@ -1171,7 +1183,7 @@ mod tests {
         for (instruction, answer) in follow_ups {
             until_parked(&session, &child).await;
             let value = json!(instruction);
-            let send = format!("return tool.job({job}).send({{value:{value}}});");
+            let send = format!("return tool.control({{job:{job}, send:{value}}});");
             session.run_script(send).await.unwrap();
             jobs.wait(job, true).await.unwrap();
             let output = format!("return tool.jobs({{job:{job}}});");

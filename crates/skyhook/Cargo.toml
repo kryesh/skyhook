@@ -7,10 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["script"]
+# The `script` tool and its V8 JavaScript runtime.
+script = ["dep:url", "dep:v8"]
+
 [dependencies]
 base64.workspace = true
 bytes = "1"
 chrono.workspace = true
+iana-time-zone.workspace = true
 dom_query = "0.29"
 dom_smoothie = "0.19"
 encoding_rs = "0.8"
@@ -44,11 +50,12 @@ rmcp = { version = "3.7", default-features = false, features = [
     "client",
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
-    "reqwest",
 ] }
 rmp-serde = "1"
-rquickjs = { version = "0.14", features = ["futures", "loader", "parallel"] }
-rustls = { version = "0.23", default-features = false }
+url = { workspace = true, optional = true }
+v8 = { version = "152", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
 schemars.workspace = true
 serde.workspace = true
 serde_bytes = "0.11"
@@ -57,11 +64,12 @@ serde_json_path = "0.7"
 serde_path_to_error.workspace = true
 serde-saphyr.workspace = true
 serde_with.workspace = true
-skyhook-schema.workspace = true
+schema.workspace = true
 sha2.workspace = true
 # Must match rmcp's sse-stream minor version: its transport API exposes these types.
 sse-stream = "0.2"
 struson = "0.7"
+webpki-roots = "1"
 tempfile.workspace = true
 tera.workspace = true
 thiserror.workspace = true
@@ -70,6 +78,8 @@ tokio-util.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Tests run scripts whatever features the library is built with.
+skyhook = { path = ".", features = ["script"] }
 # The version image decodes PNGs with, to build fixtures image cannot encode.
 png = "0.18"
 rcgen = "0.14"

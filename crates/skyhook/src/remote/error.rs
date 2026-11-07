@@ -1,6 +1,6 @@
 //! Remote transport and authorization errors, with tool-facing conversion.
 use crate::{
-    remote::{Platform, ShimProtocol},
+    remote::Platform,
     target::{TargetError, TargetName},
     tool::{
         AdmissionError, ToolError, ToolOutput,
@@ -54,11 +54,8 @@ pub(crate) enum DeploymentError {
     UnsupportedPlatform { os: String, arch: String },
     #[error("this Skyhook build contains no remote shims (SSH targets are unavailable)")]
     NoShims,
-    #[error("no {protocol} shim is embedded for remote platform {platform}")]
-    NoShim {
-        protocol: ShimProtocol,
-        platform: Platform,
-    },
+    #[error("no shim is embedded for remote platform {platform}")]
+    NoShim { platform: Platform },
     #[error("embedded shim `{name}` could not be read")]
     Unreadable { name: Box<str> },
     #[error("shim installation failed")]

@@ -4,6 +4,7 @@ mod fetch;
 pub(crate) mod filesystem;
 pub(crate) mod jobs;
 mod process;
+#[cfg(feature = "script")]
 mod script;
 pub(crate) mod search;
 mod skills;
@@ -25,6 +26,7 @@ pub mod names {
     pub const SCRIPT: &str = "script";
     pub const WRITE: &str = "write";
 }
+#[cfg(feature = "script")]
 pub(crate) use script::install_script_tool;
 pub use skills::HostSkills;
 
@@ -43,7 +45,7 @@ pub(crate) fn register_coding_tools(
     Ok(())
 }
 
-/// An attached image as a tool result describes it; the image itself is attached.
+/// An attached image as a tool result describes it; the image itself is attached
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct ImageSummary {
     format: crate::media::ImageFormat,

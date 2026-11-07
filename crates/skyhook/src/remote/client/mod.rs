@@ -38,6 +38,8 @@ use routing::route_responses;
 use streams::ClientStream;
 
 pub(crate) struct PooledConnection {
+    /// The worker machine's time zone as its handshake reported it.
+    zone: Option<crate::target::TimeZone>,
     writer: Arc<Mutex<Writer>>,
     ids: Sequence<RequestId>,
     state: Arc<Mutex<ConnectionState>>,
@@ -84,6 +86,10 @@ impl ConnectionState {
 }
 
 impl PooledConnection {
+    pub(crate) fn zone(&self) -> Option<&crate::target::TimeZone> {
+        self.zone.as_ref()
+    }
+
     pub(in crate::remote) async fn is_failed(&self) -> bool {
         self.state.lock().await.failure.is_some()
     }
@@ -134,18 +140,16 @@ impl PooledConnection {
             .await
             .map_err(|error| transport_error(error, Operation::Send))
             .map_err(not_started)?;
-        if !matches!(
-            read_frame::<_, Response>(&mut output)
-                .await
-                .map_err(|error| transport_error(error, Operation::Receive))
-                .map_err(not_started)?,
-            Some(Response::Ready)
-        ) {
+        let answer = read_frame::<_, Response>(&mut output)
+            .await
+            .map_err(|error| transport_error(error, Operation::Receive))
+            .map_err(not_started)?;
+        let Some(Response::Ready { zone }) = answer else {
             return Err(not_started(transport_error(
                 ProtocolError::Violation("invalid shim handshake"),
                 Operation::Receive,
             )));
-        }
+        };
         let state = ConnectionState {
             admitted,
             ..ConnectionState::default()
@@ -168,6 +172,7 @@ impl PooledConnection {
             .await;
         });
         Ok(PooledConnection {
+            zone,
             writer,
             ids: Sequence::default(),
             state,
@@ -436,6 +441,7 @@ pub(in crate::remote) mod tests {
 
     pub(super) fn test_connection() -> PooledConnection {
         PooledConnection {
+            zone: None,
             writer: sink(),
             ids: Sequence::default(),
             state: Arc::new(Mutex::new(ConnectionState::default())),

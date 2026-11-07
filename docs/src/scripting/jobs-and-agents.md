@@ -3,8 +3,8 @@
 ## Delegation and child input
 
 Child agents retain their conversation for follow-up work. Send instructions with
-`tool.job(id).send({value: instructions})`; the returned JobView completes, without a result,
-once the input is accepted. A running child receives the input at its next model-request boundary,
+`control({job: id, send: instructions})`, directly or as `tool.control(...)` in a script; the call
+completes, without a result, once the input is accepted. A running child receives the input at its next model-request boundary,
 without interrupting its current request or tools. Children do not need `receive()` for these
 updates.
 
@@ -77,9 +77,9 @@ Each model-facing `ask` contains one question: `{header, prompt, options?, multi
   option, for comparing concrete artifacts such as code or config.
 
 Independent concurrent calls are merged by the runtime. A child question batch changes its
-stable agent job to `waiting_input`; answer that job with `tool.job(id).send({value: answer})`
-in a script. For a merged batch, use
-`tool.job(id).send({value: {"Auth method": answer, "Deploy": answer}})`; the keys are the
+stable agent job to `waiting_input`; answer that job with `control({job: id, send: answer})`.
+For a merged batch, use
+`control({job: id, send: {"Auth method": answer, "Deploy": answer}})`; the keys are the
 headers in the waiting job's `questions` output. A lone question also takes its answer keyed
 under its header. An answer to a question taking one answer is a string (a suggestion label or
 free-form text), or `{"answer": "selected label", "comment": "user text"}`. An answer to a
@@ -91,7 +91,7 @@ Root-agent questions go to the host interface instead of a parent agent.
 `ask` also accepts optional `bg` (boolean, default `false`). With `bg: true`, the call returns
 job metadata immediately so the agent can continue independent work. Use `jobs({job})` to
 inspect the pending question and eventual answer; the ask job also
-accepts `tool.job(id).send({value: answer})`. Omitting `bg` or passing `false` keeps the usual
+accepts `control({job: id, send: answer})`. Omitting `bg` or passing `false` keeps the usual
 foreground wait. Multiple outstanding child question batches are combined on the stable agent
 job; parents may answer a subset keyed by header, and unanswered questions remain pending.
 Headers must be unique across that child's outstanding questions. Background questions are still
@@ -193,7 +193,7 @@ while (["queued", "running", "waiting_input"].includes(status.state)) {
 return status;
 ```
 
-To request cancellation, use `await tool.job(job.id).cancel()` and inspect the job until its
-state is terminal. Wait events can concern other jobs; they do not prove this job finished.
+To request cancellation, use `await tool.control({job: job.id, cancel: true})`, which completes
+without a result, and inspect the job until its state is terminal. Wait events can concern other jobs; they do not prove this job finished.
 See [saved job output](../reference/job-output.md) for inspection and pagination, and
 [runtime state](../reference/runtime-state.md) for todos and active-job snapshots.

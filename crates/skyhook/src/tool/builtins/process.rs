@@ -33,7 +33,7 @@ pub(super) fn register<F: Future<Output = ()> + Send + 'static>(
 ) -> Result<(), RegistryError> {
     builder.register_checked(
         super::names::EXEC,
-        "Run a command. Stdin is closed.",
+        "Run a command. Stdin is closed. A nonzero exit_code is a normal result",
         ToolOptions::new(vec![Capability::Exec])
             .result::<ProcessOutput>()
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
@@ -288,10 +288,10 @@ where
 #[serde(deny_unknown_fields)]
 struct ExecArgs {
     command: CommandLine,
-    /// Working directory.
+    /// Working directory
     #[serde(default = "super::default_dot")]
     cwd: String,
-    /// Timeout seconds; omitted/null means no deadline.
+    /// Seconds before the command is terminated; omitted/null means no deadline
     timeout: Option<TimeoutSecs>,
 }
 
@@ -299,9 +299,10 @@ struct ExecArgs {
 #[serde(untagged)]
 #[schemars(inline)]
 enum CommandLine {
-    /// Run with /bin/sh -lc.
+    /// Run with /bin/sh -lc
+    #[schemars(extend("minLength" = 1))]
     Shell(String),
-    /// Program and arguments without shell parsing, for example `["cargo","test"]`.
+    /// Program and arguments without shell parsing, for example `["cargo","test"]`
     #[schemars(extend("minItems" = 1))]
     Argv(Vec<String>),
 }
@@ -346,7 +347,7 @@ fn produced(status: ExitStatus, captures: Vec<FinishedOutput>) -> ProducedOutput
         .with_captures(captures)
 }
 
-/// A terminated process has exactly one of an exit code or the signal that killed it.
+/// A terminated process has exactly one of an exit code or the signal that killed it
 #[serde_with::skip_serializing_none]
 #[derive(JsonSchema, Serialize)]
 struct ProcessOutput {
@@ -588,8 +589,9 @@ mod tests {
                 Operation::Validate,
                 "cwd",
             ),
-            (json!({"command":""}), Operation::Validate, "command"),
-            // The schema's minItems refuses an empty argv before the handler sees it.
+            // The schema's minLength and minItems refuse an empty command before the handler
+            // sees it.
+            (json!({"command":""}), Operation::Deserialize, "command"),
             (json!({"command":[]}), Operation::Deserialize, "command"),
             (
                 json!({"command":r#" ["touch", "started"] "#}),

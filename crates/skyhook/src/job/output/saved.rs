@@ -345,11 +345,12 @@ impl Saved {
 /// Install referenced fields into the document.
 pub(super) fn hydrate(saved: &Saved, value: Value) -> Result<Value, ToolError> {
     let root = FieldPointer::root();
-    let text = render::json_text(saved, &root, &value, render::Reading::Whole)?;
-    Ok(serde_json::from_reader(BufReader::with_capacity(
-        IO_BUFFER_BYTES,
-        text,
-    ))?)
+    let mut text = render::json_text(saved, &root, &value, render::Reading::Whole)?;
+    // Parsing bytes in memory is several times faster than through a reader, and
+    // the document is held whole either way.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut text, &mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// The bytes automatic presentation emits for this output, which notification

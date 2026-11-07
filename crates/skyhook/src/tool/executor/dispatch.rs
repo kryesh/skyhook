@@ -87,7 +87,7 @@ impl ToolExecutor {
             cancellation: lease.cancellation_token(),
         };
         let mut replanned = false;
-        let (lease, dispatch, source) = loop {
+        let (lease, dispatch, source, job_connection) = loop {
             // A redefinition before it connects hands back the approving lease.
             let approving = match self.approve(&subject, &plan).await {
                 Ok(()) => {
@@ -96,8 +96,9 @@ impl ToolExecutor {
                     }
                     let running = lease.run().await.map_err(job_error)?;
                     let workspace = &plan.execution_location.workspace;
-                    match connect(plan.dispatch, plan.source, workspace, &subject).await {
-                        Ok((dispatch, source)) => break (running, dispatch, source),
+                    let job = (plan.job_route, plan.job_runs_in.workspace.as_path());
+                    match connect(plan.dispatch, plan.source, job, workspace, &subject).await {
+                        Ok((dispatch, source, job)) => break (running, dispatch, source, job),
                         Err(RemoteError::Authorization(AuthorizationError::TargetRedefined))
                             if !replanned =>
                         {
@@ -137,6 +138,7 @@ impl ToolExecutor {
             self.shared.jobs.clone(),
         )
         .with_job_location(plan.job_runs_in, plan.creates)
+        .with_job_zone(job_connection.and_then(|connection| connection.zone().cloned()))
         .with_fit(plan.fit)
         .with_invocation_authority(
             self.shared.authorization.clone(),
@@ -273,17 +275,19 @@ fn refusal(plan: &InvocationPlan, error: AuthorizationError) -> ToolError {
     .effects(Effects::NotStarted))
 }
 
-/// Connect the call's source, then its own dispatch: a failed source connection
-/// stops before the tool's own connection opens.
+/// Connect the call's source, then where a host call places its job, then its own
+/// dispatch: a failed connection stops before any later one opens.
 async fn connect(
     dispatch: InvocationDispatch<PlannedRemote>,
     source: Option<SourcePlan<PlannedRemote>>,
+    (job, job_workspace): (Option<PlannedRemote>, &std::path::Path),
     workspace: &std::path::Path,
     subject: &AuthorizationSubject,
 ) -> Result<
     (
         InvocationDispatch<PreparedConnection>,
         Option<SourcePlan<PreparedConnection>>,
+        Option<PreparedConnection>,
     ),
     RemoteError,
 > {
@@ -303,6 +307,14 @@ async fn connect(
             path,
         }),
     };
+    let job = match job {
+        Some(job) => Some(
+            job.router
+                .prepare(job.route, job_workspace, subject)
+                .await?,
+        ),
+        None => None,
+    };
     let dispatch = match dispatch {
         InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
         InvocationDispatch::Remote { remote, arguments } => InvocationDispatch::Remote {
@@ -313,7 +325,7 @@ async fn connect(
             arguments,
         },
     };
-    Ok((dispatch, source))
+    Ok((dispatch, source, job))
 }
 
 fn open_source<'a>(
@@ -493,7 +505,7 @@ mod tests {
             .register_unit::<Empty, _, _>(
                 "noop",
                 "Do nothing.",
-                ToolOptions::default().script_only(),
+                ToolOptions::default(),
                 |_, _| async { Ok(()) },
             )
             .unwrap();
@@ -530,6 +542,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.output.value, serde_json::json!({}));
+    }
+
+    /// A host call that places its job on a remote opens that route only once it is
+    /// approved with the call: denied, the call fails before anything connects;
+    /// approved, it runs with the zone the connection's handshake reported.
+    #[tokio::test]
+    async fn a_host_call_connects_where_it_places_its_job_once_approved() {
+        use crate::remote::ShimFactory;
+        use crate::tool::{JobLocation, policy::PolicyDecision};
+        use std::sync::atomic::Ordering;
+
+        for approved in [false, true] {
+            let runtime = crate::tests::TestRuntime::new().await;
+            let policy = crate::tests::RecordingPolicy::deciding(move |request| {
+                let route = |p: &PermissionUse| p.capability == Capability::Targets;
+                match approved || !request.permissions.iter().any(route) {
+                    true => PolicyDecision::allow(),
+                    false => PolicyDecision::refused(),
+                }
+            });
+            let factory = ShimFactory::answering();
+            let router = TargetRouter::test(&runtime.store, build(), policy.clone()).await;
+            let router = router.with_connection_factory(factory.clone());
+            let mut builder = ToolRegistryBuilder::default();
+            let placed = |arguments: &Arguments| JobLocation {
+                target: arguments
+                    .get("target")
+                    .and_then(|t| t.as_str()?.parse().ok()),
+                workspace: None,
+            };
+            builder
+                .register_product::<Arguments, serde_json::Value, _, _>(
+                    "place",
+                    "test",
+                    ToolOptions::default().job_location(placed),
+                    |context, _| async move {
+                        let zone = context.job_zone().and_then(|zone| zone.name);
+                        Ok(ToolOutput::new(serde_json::json!(zone)))
+                    },
+                )
+                .unwrap();
+            let executor = remote_executor(
+                runtime.executor_with_policy(builder, policy),
+                router.clone(),
+            );
+            let arguments = serde_json::json!({"target": "build"});
+            let placed = executor.run_host(&runtime.agent, "place", arguments).await;
+            match approved {
+                false => {
+                    let diagnostic = placed.unwrap_err().diagnostic();
+                    assert!(
+                        matches!(diagnostic.cause, Cause::Denied(_)),
+                        "{diagnostic:?}"
+                    );
+                    assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
+                }
+                true => {
+                    assert_eq!(placed.unwrap().output.value, "Europe/Berlin");
+                    assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+                }
+            }
+            router.shutdown().await;
+        }
     }
 
     #[tokio::test]

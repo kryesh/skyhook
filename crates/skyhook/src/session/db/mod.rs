@@ -117,7 +117,7 @@ pub(super) enum OpenMode {
 
 /// The journal's schema, serialized. The identity its header carries, which its DDL
 /// sets, is the one every session database must have.
-pub(super) const IMAGE: &[u8] = skyhook_schema::image!();
+pub(super) const IMAGE: &[u8] = ::schema::image!();
 
 /// A database's identity: its application id and user version.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -596,7 +596,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ddl = Db::connect(&root.path().join("ddl.db"), crate::db::OpenMode::Create).unwrap();
         ddl.atomic(|| {
-            ddl.batch(include_str!("../../../../skyhook-schema/src/session.sql"))?;
+            ddl.batch(include_str!("../../../../schema/src/session.sql"))?;
             super::initialize(&ddl, crate::db::Seeding::Fill)
         })
         .unwrap();

@@ -53,24 +53,21 @@ pub(super) async fn connect_mcp(
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AgentArgs {
-    /// Task and context for the child.
+    /// Task and context for the child
     pub(super) prompt: String,
-    /// Initial todo items, using the same format as todo.items.
-    pub(super) todos: Option<Vec<TodoItem<String>>>,
-    /// Delegation depth available to the child; must be less than your available_depth.
+    /// Initial checklist for multi-step work
+    pub(super) todos: Option<Vec<TodoItem>>,
+    /// Delegation depth available to the child; must be less than your available_depth
     #[serde(default)]
     pub(super) depth: usize,
-    /// Model override; omitted/null inherits the parent's active model.
     #[schemars(skip)]
     pub(super) model: Option<String>,
-    /// Mode for the child; omitted/null inherits the parent's capabilities.
     #[schemars(skip)]
     pub(super) mode: Option<String>,
-    /// Execution target; defaults to the parent's.
     #[schemars(skip)]
     pub(super) target: Option<crate::target::TargetRef>,
     /// Child workspace override: absolute, or relative to the workspace selected by target;
-    /// on the session host, created if missing.
+    /// on the session host, created if missing
     pub(super) workspace: Option<String>,
 }
 
@@ -94,7 +91,7 @@ pub(super) fn register(
     );
     builder.register_checked(
         "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds, capped at 1800 (30 minutes); omitted/null waits 1800. Returns {reason: event|timeout|cancelled, waited_s} with whole seconds waited. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
+        "Wait for any notification or input relevant to this agent. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation fails the wait with reason `cancelled`. A timeout ends this wait, not background work; wait again if still dependent on it",
         ToolOptions::default().job_role(crate::job::JobRole::Wait).result::<super::wait::WaitOutput>(),
         Ok,
         move |args: super::wait::WaitArgs| {
@@ -106,7 +103,7 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together, each under its own header. Offer the real choices as options with short labels, put each tradeoff in its description, and mark the one you recommend; never add a catch-all option that expects the user to type, since a written answer is always possible. Add `preview` to options only when comparing concrete artifacts (code, config, layouts) beats reading descriptions; skip it for plain preference questions. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together, each under its own header. Offer the real choices as options; never add a catch-all option that expects the user to type. Add `preview` only when comparing concrete artifacts beats reading descriptions. Use bg:true to continue independent work while awaiting an answer",
         ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive).result::<Value>(),
         |question: Question| match question.refusal() {
             None => Ok(question),
@@ -123,7 +120,7 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "todo",
-        "Read your list, replace it with items, set its statuses with status, or inspect a descendant by agent job ID. Only the owner can edit. Reads return {items}; edits return no result.",
+        "Read or edit your list, or read a descendant's. Give at most one of items, status and job; edits return no result",
         ToolOptions::default().result::<TodoList>(),
         |TodoArgs { items, status, job }| match (items, status, job) {
             (Some(items), None, None) => Ok(TodoRequest::Replace(items)),
@@ -135,8 +132,8 @@ pub(super) fn register(
         move |request| {
             let runtime = todo.get().and_then(Weak::upgrade);
             let update = match request {
-                TodoRequest::Replace(items) => admit_todos("items", items).map(TodoUpdate::Items),
-                TodoRequest::Status(statuses) => Ok(TodoUpdate::Statuses(statuses)),
+                TodoRequest::Replace(items) => TodoUpdate::Items(items),
+                TodoRequest::Status(statuses) => TodoUpdate::Statuses(statuses),
                 TodoRequest::Inspect(job) => return registry::AdmittedInvocation::new(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
                     registry::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
@@ -144,7 +141,6 @@ pub(super) fn register(
             };
             registry::AdmittedInvocation::unit(move |context| async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let update = update?;
                 let issued_by = runtime.jobs.call_origin(context.job()).await;
                 let subject = Subject::Label(format!("todos for agent {}", context.agent()));
                 runtime.store.replace_todos(context.agent(), update, issued_by).await.map_err(|error| match error {
@@ -182,17 +178,16 @@ fn choice_input(summary: &str, choices: &[(&str, String)]) -> Option<Value> {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TodoArgs {
-    /// Replace your entire list. An empty array clears it. Cannot be combined with status or job.
-    items: Option<Vec<TodoItem<String>>>,
-    /// Set the status of every item in your list, one per item in list order, keeping
-    /// their text. Cannot be combined with items or job.
+    /// Replace your entire list; an empty array clears it
+    items: Option<Vec<TodoItem>>,
+    /// Set every item's status, one per item in list order, keeping their text
     status: Option<Vec<TodoStatus>>,
-    /// Inspect a descendant's list using its agent job ID. Omit to read your own list.
+    /// A descendant's agent job ID whose list to read; omit for your own
     job: Option<crate::identity::JobId>,
 }
 
 enum TodoRequest {
-    Replace(Vec<TodoItem<String>>),
+    Replace(Vec<TodoItem>),
     Status(Vec<TodoStatus>),
     Inspect(Option<crate::identity::JobId>),
 }
@@ -200,18 +195,6 @@ enum TodoRequest {
 #[derive(Serialize, JsonSchema)]
 struct TodoList {
     items: Vec<TodoItem>,
-}
-
-/// Admit todo items given as `argument`, rejecting blank text at its path.
-fn admit_todos(argument: &str, items: Vec<TodoItem<String>>) -> Result<Vec<TodoItem>, ToolError> {
-    let admit = |(index, TodoItem { text, status }): (usize, TodoItem<String>)| {
-        let path = [argument, &index.to_string(), "text"];
-        let text = text
-            .parse()
-            .map_err(|blank| invalid_argument(path, blank))?;
-        Ok(TodoItem { text, status })
-    };
-    items.into_iter().enumerate().map(admit).collect()
 }
 
 fn register_child_agent(
@@ -228,7 +211,7 @@ fn register_child_agent(
     let modes = modes.clone();
     builder.register_checked(
         crate::tool::builtins::names::AGENT,
-        "Start a child agent. Names are unique among your own installed children, including terminal children (number a script's launches from `jobs.length + older` of `tool.jobs({all:true,limit:1})`); other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Follow-ups arrive automatically at its next model-request boundary. Earlier replies arrive as events, except that a foreground call's result carries them as `messages`, as its saved output, which a truncated view pages with jobs({job, field}); the final reply is the result's `reply`. When a child asks, your own foreground call blocked on it moves to the background, so you can answer: an agent call returns the child's job in state waiting_input, a script call the script's job, still running; its earlier replies and then its question arrive as events. A script's tool.agent call keeps waiting for the child's result. Sending input to a completed child resumes its retained history under the same job ID.",
+        "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers (keyed by question header for merged questions) with control({job: id, send: ...}); they arrive at its next model-request boundary. Earlier replies arrive as events; a foreground call's result carries them in `messages` instead. When a child asks, your own foreground call blocked on it moves to the background, so you can answer: an agent call returns the child's job in state waiting_input, a script call the script's job, still running; its earlier replies and then its question arrive as events. Sending input to a completed, failed or interrupted child resumes its retained history under the same job ID",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
             .result::<crate::job::ChildResult>()
             .named()
@@ -236,7 +219,7 @@ fn register_child_agent(
             .conditional_input(TARGET, Capability::Targets, crate::target::TargetRef::schema())
             .computed_input("model", move |_| {
                 let choices: Vec<_> = models.iter().map(|(name, text)| (name.as_str(), text.clone())).collect();
-                choice_input("Model for the child; omitted inherits yours.", &choices)
+                choice_input("Model for the child; omitted inherits yours", &choices)
             })
             .computed_input("mode", move |capabilities| {
                 let offered = modes.iter().filter(|(_, mode)| offers_mode(mode, capabilities));
@@ -248,7 +231,7 @@ fn register_child_agent(
                         (name.as_str(), format!(" [{granted}]: {hint}"))
                     })
                     .collect();
-                choice_input("Mode limiting what the child can do; omitted inherits what you can.", &choices)
+                choice_input("Mode limiting what the child can do; omitted inherits what you can", &choices)
             })
             .background()
             .input()
@@ -268,7 +251,9 @@ fn register_child_agent(
                 let (model, depth) = delegation.ok_or_else(unstarted)?;
                 let caller = (owner.depth(), context.capabilities(), model, depth);
                 let location = context.job_location().clone();
-                let (launch, prompt) = child_launch(&runtime, input, caller, location)?;
+                // The call connected a remote target, approved with it, before this ran.
+                let zone = context.job_zone();
+                let (launch, prompt) = child_launch(&runtime, input, caller, location, zone)?;
                 let child = runtime.next_child(owner).await.ok_or_else(unstarted)?;
                 let created = context.create_job_workspace().await?;
                 let job = context.job();
@@ -310,9 +295,8 @@ fn child_launch(
     input: AgentArgs,
     (depth, caller, model, available_depth): (usize, &CapabilitySet, ModelRef, usize),
     location: crate::execution::ExecutionLocation,
+    zone: Option<crate::target::TimeZone>,
 ) -> Result<(AgentLaunch, String), ToolError> {
-    let todos = input.todos.map(|items| admit_todos("todos", items));
-    let todos = todos.transpose()?;
     // Only hinted models were offered; anything else is unknown to the caller.
     let model = match input.model {
         Some(name) => {
@@ -339,7 +323,14 @@ fn child_launch(
             };
             // Interaction follows the caller, as the root's follows the host.
             let ceiling = &runtime.capabilities & caller;
-            let applied = runtime.applied(name, depth + 1, &location, input.depth, &ceiling);
+            let applied = runtime.applied(
+                name,
+                depth + 1,
+                &location,
+                input.depth,
+                &ceiling,
+                zone.clone(),
+            );
             let (applied, granted) = applied.map_err(harness_error)?;
             (Some(applied), granted)
         }
@@ -352,11 +343,12 @@ fn child_launch(
     }
     let launch = AgentLaunch::New {
         model,
-        todos,
+        todos: input.todos,
         available_depth: input.depth,
         location,
         mode,
         capabilities,
+        zone,
     };
     Ok((launch, input.prompt))
 }
@@ -916,8 +908,7 @@ for line in sys.stdin:
             diagnostic.context.subject,
             Subject::argument(["items", "1", "text"])
         );
-        let blank = Cause::InvalidArguments("text must not be blank".into());
-        assert_eq!(diagnostic.cause, blank);
+        assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
         shutdown_session(session).await;
     }
 

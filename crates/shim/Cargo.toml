@@ -1,0 +1,20 @@
+[package]
+name = "shim"
+description = "Skyhook remote worker shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "shim"
+path = "src/main.rs"
+test = false
+bench = false
+doc = false
+
+[dependencies]
+skyhook = { path = "../skyhook", default-features = false }
+mimalloc.workspace = true
+tokio.workspace = true

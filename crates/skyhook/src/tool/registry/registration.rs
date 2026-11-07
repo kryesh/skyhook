@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use super::{
     Admitted, AdmittedInput, Arguments, CatalogEntry, Invocation, JobLocation, OutputValue,
-    PathArgument, RegistryError, ScriptBinding, ToolOptions, ToolPlacement,
-    envelope::{JOB, NAME, TARGET, name_schema},
+    PathArgument, RegistryError, ToolOptions, ToolPlacement,
+    envelope::{NAME, TARGET, name_schema},
     options::{ArgumentHooks, SchemaOrigin},
     schema::{
         add_conditional, check_conditional, compile_schema, tags_first, validate_name,
@@ -269,16 +269,12 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         }
         let name = name.into();
         validate_name(&name)?;
-        if matches!(options.script_binding, ScriptBinding::TopLevel) && name == JOB {
-            return Err(RegistryError::ReservedScriptName(name));
-        }
         check_conditional(&widest, &options.conditional_inputs, "input")?;
         let ToolOptions {
             execution,
             hooks,
             supports_background,
             schema_origin,
-            exposure,
             script_binding,
             required,
             root_required,
@@ -334,7 +330,6 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             description: description.into(),
             input_schema: Arc::new(schema),
             output_schema,
-            exposure,
             script_binding,
             supports_background,
             schema_origin,
@@ -574,31 +569,6 @@ mod tests {
     #[derive(serde::Deserialize, JsonSchema)]
     struct Empty {}
 
-    #[test]
-    fn javascript_job_namespace_is_reserved_but_unwrap_is_an_ordinary_tool_name() {
-        let mut builder = ToolRegistryBuilder::default();
-        let registered = builder.register::<Empty, Value, _, _>(
-            "job",
-            "reserved namespace",
-            ToolOptions::default(),
-            |_, _| async { Ok(Value::Null) },
-        );
-        assert!(matches!(
-            registered,
-            Err(RegistryError::ReservedScriptName(_))
-        ));
-        for (name, options) in [
-            ("job", ToolOptions::default().script_unavailable()),
-            ("unwrap", ToolOptions::default()),
-        ] {
-            builder
-                .register::<Empty, Value, _, _>(name, "allowed binding", options, |_, _| async {
-                    Ok(Value::Null)
-                })
-                .unwrap();
-        }
-    }
-
     /// Inputs follow the deserialization contract and results the serialization
     /// one: an always-emitted `Option` is required and nullable, a skipped one is
     /// optional, and every value the type serializes validates.
@@ -703,9 +673,14 @@ mod tests {
                 "Native output product",
                 ToolOptions::default(),
                 |context, input| async move {
-                    let capture =
-                        context.text_capture(crate::tool::output::TextCaptureField::Content);
-                    let mut capture = capture.await?.open();
+                    let output = context.jobs().output(context.job()).await;
+                    let field = crate::tool::output::TextCaptureField::Content.pointer();
+                    let capture = crate::job::output::PendingCapture::create(
+                        &output,
+                        &field,
+                        crate::job::output::CaptureKind::Text,
+                    );
+                    let mut capture = capture?.open();
                     capture.write_all(input.content.as_bytes())?;
                     let completed = capture.finish()?;
                     Ok(ToolOutput::new(serde_json::json!({})).with_captures(vec![completed]))

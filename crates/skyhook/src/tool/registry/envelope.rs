@@ -16,8 +16,6 @@ use crate::{
 pub(crate) const BACKGROUND: &str = "bg";
 pub(super) const NAME: &str = "name";
 pub const TARGET: &str = "target";
-/// The script namespace for job controls.
-pub(super) const JOB: &str = "job";
 
 /// Lowercase kebab-case: the one definition behind the schema a model sees and
 /// [`JobName`]'s check.
@@ -48,7 +46,7 @@ pub(super) fn name_schema() -> Value {
     serde_json::json!({
         "type": ["string", "null"],
         "pattern": NAME_PATTERN,
-        "description": "Lowercase kebab-case name shown in job state and notifications."
+        "description": "Lowercase kebab-case name shown in job state and notifications"
     })
 }
 

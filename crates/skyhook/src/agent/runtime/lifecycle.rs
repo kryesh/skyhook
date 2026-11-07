@@ -36,7 +36,8 @@ impl SessionRuntime {
             harness.skills.clone(),
             router.clone(),
         )?;
-        install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
+        #[cfg(feature = "script")]
+        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(
             &mut builder,
             runtime_slot.clone(),
@@ -146,10 +147,13 @@ impl SessionRuntime {
     pub(super) fn new_root(&self) -> Result<AgentLaunch, HarnessError> {
         let location = crate::execution::ExecutionLocation::root(self.harness.workspace.clone());
         let available_depth = self.harness.max_child_depth;
+        let zone = Some(crate::target::TimeZone::local());
         let (mode, capabilities) = match &self.harness.mode {
             Some(name) => {
                 let ceiling = &self.capabilities;
-                let (mode, granted) = self.applied(name, 0, &location, available_depth, ceiling)?;
+                let applied =
+                    self.applied(name, 0, &location, available_depth, ceiling, zone.clone());
+                let (mode, granted) = applied?;
                 (Some(mode), granted)
             }
             None => (None, self.capabilities.clone()),
@@ -161,6 +165,7 @@ impl SessionRuntime {
             location,
             mode,
             capabilities,
+            zone,
         })
     }
 

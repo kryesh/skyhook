@@ -15,9 +15,9 @@ mod shape;
 use args::Selection;
 pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, Selectors, line_matcher};
 pub use args::{OutputArgs, PageLimit, PageUnit, REGEX_SIZE_LIMIT};
-pub(crate) use captures::{
-    CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
-};
+#[cfg(test)]
+pub(crate) use captures::PendingCapture;
+pub(crate) use captures::{CaptureCollector, CompletedCapture, HostOutput};
 pub use captures::{CaptureDescriptor, CaptureKind};
 pub(crate) use finalization::prepare_completed;
 pub(crate) use json::{Detection, parse_text as parse_json_text};
@@ -25,7 +25,9 @@ pub use products::{
     Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NextChild, NumberedLine,
     OutputFields, OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
-pub(crate) use projection::{Presented, fill_absent, presented_fields};
+pub(crate) use projection::Presented;
+#[cfg(feature = "script")]
+pub(crate) use projection::{fill_absent, presented_fields};
 use reader::Source;
 pub(crate) use saved::{Output, Saved, presented_size};
 use saved::{Stored, hydrate, prepare_document};

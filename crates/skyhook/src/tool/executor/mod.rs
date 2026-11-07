@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-use super::{ScriptBinding, ToolContext, ToolError, ToolExposure, ToolOutput, ToolRegistry};
+use super::{ScriptBinding, ToolContext, ToolError, ToolOutput, ToolRegistry};
 
 #[derive(Clone, Copy)]
 pub(crate) enum InvocationKind {
@@ -68,6 +68,9 @@ struct InvocationPlan {
     output_schema: Option<Value>,
     dispatch: InvocationDispatch<PlannedRemote>,
     source: Option<SourcePlan<PlannedRemote>>,
+    /// The remote a host call's input places its job on, approved with the call and
+    /// connected before it runs.
+    job_route: Option<PlannedRemote>,
     /// How the call fails once authorized, which may not ask anyone, when a
     /// path it names outside the root does not resolve.
     unresolved: Option<ToolError>,
@@ -115,6 +118,7 @@ pub(crate) struct CreatedInvocation {
 }
 
 impl CreatedInvocation {
+    #[cfg(feature = "script")]
     pub(crate) fn result_policy(&self) -> super::ToolResultPolicy {
         self.plan.result_policy
     }

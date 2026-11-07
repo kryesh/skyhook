@@ -6,16 +6,15 @@ use std::{
 };
 
 use super::{CaptureKind, Output};
-pub(crate) use crate::tool::output::TextCaptureField;
 use crate::{
     identity::JobId,
     job::JobManager,
     session::{CaptureExtent, SessionStore},
+    tool::ToolOutput,
     tool::output::{
-        Abandon, Abandonment, CaptureEvent, CaptureId, CaptureTarget, FieldPointer, OutputContext,
-        OutputEvent, OutputSink, PendingProducer, ProducedOutput, Producer,
+        Abandonment, CaptureEvent, CaptureId, CaptureTarget, FieldPointer, OutputContext,
+        OutputEvent, OutputSink, ProducedOutput,
     },
-    tool::{ToolError, ToolOutput},
 };
 
 /// Only successful consuming finalization constructs this evidence. Finalizing a
@@ -46,8 +45,8 @@ fn database(error: crate::db::DbError) -> io::Error {
     io::Error::other(error)
 }
 
-pub(crate) type PendingCapture = PendingProducer<StoredCapture>;
-pub(crate) type CaptureWriter = Producer<StoredCapture>;
+#[cfg(test)]
+pub(crate) type PendingCapture = crate::tool::output::PendingProducer<StoredCapture>;
 
 pub(crate) struct StoredCapture {
     output: Output,
@@ -105,25 +104,6 @@ impl CaptureTarget for StoredCapture {
             .map_err(database)?;
         self.changed();
         Ok(())
-    }
-}
-
-impl JobManager {
-    /// Reserve a capture that is removed if abandoned before it finishes.
-    pub(crate) async fn pending_capture(
-        &self,
-        job: JobId,
-        field: FieldPointer,
-        kind: CaptureKind,
-    ) -> Result<PendingCapture, ToolError> {
-        let output = self.output(job).await;
-        crate::blocking(move || {
-            Ok(PendingCapture::new(
-                StoredCapture::reserve(&output, &field, kind)?,
-                Abandon::Discard,
-            ))
-        })
-        .await
     }
 }
 
@@ -266,6 +246,7 @@ impl OutputSink for CaptureCollector {
 mod tests {
     use super::*;
     use crate::job::output::{Saved, captures::available_captures, tests::fixture};
+    use crate::tool::output::{Abandon, TextCaptureField};
     use std::{
         future::{Future, poll_fn},
         io::Write,
@@ -460,7 +441,7 @@ mod tests {
             .open();
         writer.write_all(b"[\"a\"]").unwrap();
         let completed = writer.finish().unwrap();
-        let empty = text(&output, TextCaptureField::Console)
+        let empty = text(&output, TextCaptureField::Content)
             .open()
             .finish()
             .unwrap();
@@ -492,26 +473,26 @@ mod tests {
         runtime.block_on(async {
             let (_root, manager, job) = fixture(None).await;
             let output = manager.output(job).await;
-            let console = TextCaptureField::Console.pointer();
-            let mut capture = text(&output, TextCaptureField::Console).open();
+            let content = TextCaptureField::Content.pointer();
+            let mut capture = text(&output, TextCaptureField::Content).open();
             capture.write_text("before failure\n").unwrap();
-            let collision = PendingCapture::create(&output, &console, CaptureKind::Text);
+            let collision = PendingCapture::create(&output, &content, CaptureKind::Text);
             assert!(collision.is_err());
             assert_eq!(
-                output.test_bytes(console.as_str()).unwrap(),
+                output.test_bytes(content.as_str()).unwrap(),
                 b"before failure\n",
                 "collision must not truncate or delete a live writer"
             );
             drop(capture);
-            assert!(output.test_bytes(console.as_str()).is_none());
+            assert!(output.test_bytes(content.as_str()).is_none());
 
-            let mut capture = text(&output, TextCaptureField::Console).open();
+            let mut capture = text(&output, TextCaptureField::Content).open();
             // Deterministic storage fault: the capture row disappears under the writer.
-            let capture_id = Saved::load(&output).unwrap().captures[&console].id;
+            let capture_id = Saved::load(&output).unwrap().captures[&content].id;
             output.db.delete_capture(capture_id).unwrap();
             assert!(capture.write_text("cannot write").is_err());
             assert!(capture.finish().is_err(), "an IO error poisons completion");
-            assert!(output.test_bytes(console.as_str()).is_none());
+            assert!(output.test_bytes(content.as_str()).is_none());
             let mut capture = text(&output, TextCaptureField::Stdout).open_async();
             // Several chunks, with characters across their boundaries.
             let payload = "é🦀".repeat(crate::tool::output::OUTPUT_CHUNK_BYTES * 4 / 6);

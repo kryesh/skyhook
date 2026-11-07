@@ -164,6 +164,7 @@ pub(crate) fn json_text_fields(
 
 /// Insert `null` for each member the schema declares but `value` lacks, where the
 /// schema provably applies: a union branch counts only as the one that matches.
+#[cfg(feature = "script")]
 pub(crate) fn fill_absent(value: &mut Value, schema: &Value) {
     fn visit<'a>(value: &mut Value, schemas: &[Node<'a>], root: &'a Value) {
         let applicable = ApplicableSchemas::new(schemas, root, value, Branches::Unique);
@@ -239,6 +240,7 @@ enum Branches {
     /// Every branch the value may match: annotations hold wherever any may apply.
     Matching,
     /// The branch only when it is the one the value matches.
+    #[cfg(feature = "script")]
     Unique,
 }
 
@@ -262,6 +264,7 @@ impl<'a> ApplicableSchemas<'a> {
         Self(applicable)
     }
 
+    #[cfg(feature = "script")]
     fn declared(&self) -> impl Iterator<Item = &'a String> {
         (self.0.iter())
             .filter_map(|node| node.schema.get("properties")?.as_object())

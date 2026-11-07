@@ -1,0 +1,23 @@
+A candidate's review scores it: `research` `assess` records its vector and returns its score and
+severity; never compute or delegate scoring. Score the impact were every premise to hold, the
+note giving the rationale for each metric, the assumed deployment, the attacker's privileges and
+the input states the chain needs. A condition the scenario needs is a premise on a chain flaw or
+on a path, never a lower metric.
+
+Choose a complete CVSS 4.0 base vector. Attack Complexity is the
+defences an attacker must defeat; Attack Requirements are the conditions outside the attacker's
+control that the scenario needs: a build option, configuration or deployment other than the
+default, behaviour of the caller, client or deployment beyond supplying attacker input, or a race
+or timing window the attacker must win, makes AT:P; a window the attacker can hold open at will
+does not. Attack Vector, Privileges Required and the other exploitability
+metrics come from what the attacker must hold or face before the first action, the
+least-privileged actor that can drive every input state the chain needs, at the trust its path
+reads it with (past the checks earlier stages make), a read of a stored state trusted as the
+input of its least-privileged writer path, plus anything a later action
+needs that no earlier action supplied; access or privilege gained during the scenario is never a
+prerequisite. User Interaction is passive or active only when a victim's action is a step in the
+scenario. Vulnerable-system impact is on the component the flaws are in; subsequent-system
+impact applies only where the consequence lands in another system. Score only what the
+candidate's premises establish: when an unlinked condition would raise a metric, keep the lower
+value and record the higher reading as its own candidate, the same chain with that condition
+linked as a premise. Never sum or inherit other candidates' scores.

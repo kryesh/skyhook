@@ -1,6 +1,6 @@
 # Library architecture
 
-The `skyhook` crate is the library. The `skyhook-cli` crate is a host of that library, not a
+The `skyhook` crate is the library. The `cli` crate is a host of that library, not a
 separate agent implementation. Provider protocols, terminal interaction, and
 local or remote execution meet at shared runtime boundaries.
 
@@ -25,7 +25,7 @@ select machines and workspaces; tools still operate on those machines' files.
 
 ## Shared CLI host
 
-`skyhook-cli` is the one terminal and batch host: command admission, `.env` loading, the shared
+`cli` is the one terminal and batch host: command admission, `.env` loading, the shared
 `auth`/`dump`/`stats` commands, batch execution, the terminal UI, UI preferences and embedded
 shims. A product binary supplies a `Product`: an `Identity` (host name, branding, theme, UI-state
 file, whether the root's mode is fixed), its session arguments and optional commands, a
@@ -37,7 +37,7 @@ share `.skyhook/sessions`, the shims and the capability rules; see
 
 ### Security research product
 
-`skyhook-security` owns its layered `security.yaml` (loaded by the shared layered loader),
+`security` owns its layered `security.yaml` (loaded by the shared layered loader),
 embedded research modes replacing presets whole (their instructions and the persona are
 templates rendered for each agent with the run's live policy in its context, so only a run that
 may work against a running target reads the live parts), model-role hints, native
@@ -324,7 +324,8 @@ meanwhile and a refused batch is held again unchanged while the children run on.
 
 Prompt text is embedded Tera templates (`prompts`). An agent's prompt renders when its contract
 is fixed, as it starts or changes mode, from its typed context (role, available depth,
-capabilities, mode and the `skyhook_context` location), to which a host's `Prompts` add the
+capabilities, mode and the `context` lines: workspace, target, and the time zone the
+target's machine reports), to which a host's `Prompts` add the
 fields of its own section. Only a root granted `Interactive` takes the root role; a root no one
 can ask is instructed as a child, working its task to a result. One render path serves both: a mode whose instructions are a host
 template (`Instructions::Template`) renders them for the agent entering it into an `Edition`,
@@ -465,7 +466,8 @@ and selection changes wait for the next request boundary. The failed stream is d
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
 cancellable and continues until success or interruption. A failure is journaled with its retry
 and backoff, so a request never reads failed while it retries, and one a crash leaves retrying
-reopens interrupted.
+reopens interrupted. The request fold keeps its retried failures as runs of consecutive identical
+failures, written with its state, so an endless retry holds only its distinct changes.
 
 A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
@@ -579,14 +581,20 @@ receive each response with the presentations its job saved, and these follow the
 script returns, so a view returned by a script, or read again as the `jobs` call's own saved
 output, shows its result as a direct read would.
 
-Each script runs in a fresh QuickJS runtime (`tool/javascript`) with a 512 MiB engine allocation
-limit set before context creation. This does not cap Rust-side bridge or job memory; allocation
-failures use ordinary JavaScript error handling. Its runtime is embedded ES
-modules (`tool/javascript/js`), compiled to bytecode once per process and instantiated per
-script; the submitted body is compiled separately, as its own module, so failure reports
-can keep only its frames. One conversion turns tool arguments and returned values into JSON at
-the host boundary (`bridge.rs`), and the host fills a response's declared absent fields with
-`null` there, from the schema its job stores.
+The `script` tool and its runtime (`tool/javascript`) build only with the library's default
+`script` feature, which the shim turns off. Each script runs in a fresh V8 isolate on a thread of
+its own, started from a per-process snapshot of the embedded runtime modules
+(`tool/javascript/js`), so one snapshot serves every mode: the runtime's `install` receives the
+mode's tools. The isolate's heap and its ArrayBuffer storage are each limited to 512 MiB; reaching
+the heap limit ends the script, and neither limit caps Rust-side bridge or job memory.
+`engine.rs` owns the V8 platform, the snapshot and the memory limits, `isolate.rs` the script's
+isolate and event loop, and `runtime.rs` supplies its tool calls and console. The web globals rest on host functions: V8's own UTF-8 and serialization for text coding
+and `structuredClone`, and the `url` crate's WHATWG parser and form encoding for `URL` and
+`URLSearchParams`. The submitted body is compiled as its own module, so failure reports keep only
+its frames. Calls the script left unawaited are aborted when it ends; on cancellation, the calls
+in flight are driven to their end first. One conversion turns tool arguments and returned values
+into JSON at the host boundary (`bridge.rs`), where the host fills a response's declared absent
+fields with `null` from the schema its job stores.
 
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
@@ -630,9 +638,9 @@ returns otherwise. The helper, its environment and prompt attribution are descri
 ## Session core and transaction boundaries
 
 Each durable session is one SQLite database, `session.db`, holding the append-only, normalized
-event ledger beside its blobs, saved job results and captures; `skyhook-schema/src/session.sql`
+event ledger beside its blobs, saved job results and captures; `schema/src/session.sql`
 documents the tables and the few JSON columns, and sets the format the journal's identity
-carries. The `skyhook-schema` proc macro runs that DDL, with any product tables layered on it,
+carries. The `schema` proc macro runs that DDL, with any product tables layered on it,
 in an in-memory database at compile time and embeds the serialized result: creating a session
 writes those bytes as its file (or copies them into memory), after checking their identity
 against the journal image's, and only fills the dictionaries, whose rows come from Rust enums. Closing any descriptor of a file releases every POSIX lock the
@@ -831,4 +839,4 @@ Whenever entries are laid out again (new text, a reply settling, a resize), the 
 re-resolved against the new rows. It survives only if its endpoints still exist and the text they
 select is unchanged; otherwise it is dropped rather than moved to other text.
 
-Source: [rendering](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-cli/src/tui/render).
+Source: [rendering](https://github.com/kryesh/skyhook/tree/main/crates/cli/src/tui/render).

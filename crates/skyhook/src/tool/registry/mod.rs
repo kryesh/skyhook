@@ -7,7 +7,7 @@ mod registration;
 mod schema;
 mod surface;
 
-pub(crate) use docs::{DOCUMENTED, ScriptManifest, job_view_type};
+pub(crate) use docs::{DOCUMENTED, job_view_type};
 pub(crate) use envelope::{BACKGROUND, split_envelope};
 pub use envelope::{ExecutionEnvelope, JobLaunch, JobName, TARGET};
 pub use options::ToolOptions;
@@ -16,6 +16,8 @@ pub use registration::{
 };
 pub(crate) use schema::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 pub(crate) use surface::AgentLevel;
+#[cfg(feature = "script")]
+pub(crate) use surface::ScriptManifest;
 pub use surface::{Catalog, ToolSpec, ToolSurface};
 
 use std::{future::Future, sync::Arc};
@@ -187,19 +189,8 @@ pub(crate) struct JobLocation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolExposure {
-    ModelVisible,
-    ScriptOnly,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "binding", rename_all = "snake_case")]
 pub enum ScriptBinding {
     TopLevel,
-    JobMethod {
-        method: &'static str,
-        job_argument: &'static str,
-    },
     Unavailable,
 }
 
@@ -346,10 +337,6 @@ pub enum RegistryError {
     InvalidName(String),
     #[error("duplicate tool `{0}`")]
     Duplicate(String),
-    #[error(
-        "`{0}` is reserved by the JavaScript tool API; use a different name or disable its script binding"
-    )]
-    ReservedScriptName(String),
     #[error("tool schema is invalid: {0}")]
     Schema(String),
     #[error("`bg` is reserved by the harness")]

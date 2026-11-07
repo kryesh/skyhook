@@ -113,6 +113,15 @@ impl RequestPhase {
     }
 }
 
+/// Consecutive attempts of a request, `first` through `last`, that failed alike and
+/// were retried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailureRun {
+    pub failure: ProviderError,
+    pub first: u64,
+    pub last: u64,
+}
+
 /// A request's place among its agent's requests, compaction included, from 1. Every
 /// attempt of a request keeps its number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,10 +156,29 @@ pub struct RequestRecord {
     pub attempts: u64,
     /// Every usage report for the request, over all its attempts.
     pub usage: Usage,
+    /// Its attempts' retried failures, oldest first, a run per change of failure.
+    pub retried: Vec<FailureRun>,
     pub phase: RequestPhase,
     /// The record that moved it to its phase: the request itself, its attempt's start,
     /// or what settled it or failed the attempt it retries, which the phase reads.
     pub(crate) phased: RecordSeq,
+}
+
+impl RequestRecord {
+    /// Count `attempt`, whose failure its phase retries, into its runs.
+    fn retry(&mut self, attempt: u64) {
+        let RequestPhase::Retrying { failure, .. } = &self.phase else {
+            return;
+        };
+        match self.retried.last_mut() {
+            Some(run) if run.failure == *failure && run.last + 1 == attempt => run.last = attempt,
+            _ => self.retried.push(FailureRun {
+                failure: failure.clone(),
+                first: attempt,
+                last: attempt,
+            }),
+        }
+    }
 }
 
 /// Each agent's newest request and what its turn leaves open: the part of the
@@ -269,6 +297,7 @@ impl ResidentLedger {
                         requested_millis: at,
                         attempts: 0,
                         usage: Usage::default(),
+                        retried: Vec::new(),
                         phase: RequestPhase::Requested,
                         phased: record.sequence,
                     },
@@ -326,8 +355,13 @@ impl ResidentLedger {
                         due: at.saturating_add_unsigned(delay.millis()),
                     },
                 });
-                if matches!(failure, AttemptFailure::Final(_)) {
-                    self.failure = Some((by, request));
+                match failure {
+                    AttemptFailure::Final(_) => self.failure = Some((by, request)),
+                    AttemptFailure::Retrying { .. } => {
+                        if let Some(record) = self.requests.get_mut(&request) {
+                            record.retry(attempt);
+                        }
+                    }
                 }
             }
             SessionEvent::ModelAttemptInterrupted(attempt) => {

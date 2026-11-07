@@ -36,6 +36,7 @@ struct Summary {
     /// Important exact outputs or excerpts, commands, errors, file paths, targets, job IDs, URLs, and other references needed to recover details. Explain what each reference provides.
     recovery_details: Vec<String>,
     /// Jobs whose original parameters and outputs should be handed over. Select relevant completed or running jobs from this session; use an empty array when none are needed. The harness supplies normally truncated outputs, recoverable in full with jobs.
+    #[schemars(schema_with = "integers")]
     jobs: Vec<crate::identity::JobId>,
     /// Any other information important for continuing faithfully that does not fit the other sections. Preserve relevant earlier context even if recent conversation does not mention it.
     additional_context: Vec<String>,
@@ -47,6 +48,11 @@ struct Summary {
     resumption_point: String,
     /// Established next actions and their purpose, ordering, dependencies, and approval conditions. Clearly separate committed work from optional suggestions. Do not invent actions or expand the task. Do not introduce a direction to stop investigating or avoid tools unless it was already established.
     next_actions: Vec<String>,
+}
+
+/// Strict response schemas accept integers with no numeric format or range.
+fn integers(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "array", "items": {"type": "integer"}})
 }
 
 pub(crate) fn response_schema() -> ResponseSchema {
@@ -63,8 +69,6 @@ pub(crate) fn response_schema() -> ResponseSchema {
     let todo_properties = &mut schema["properties"]["todos"]["items"]["properties"];
     todo_properties["text"]["description"] = "The task or step. Preserve existing wording unless the conversation establishes a change. Must not be blank.".into();
     todo_properties["status"]["description"] = "Current execution status supported by the conversation. Intent to perform work is not evidence that it started or finished.".into();
-    // Strict structured outputs accept no numeric format or range; parsing still checks ids.
-    schema["properties"]["jobs"]["items"] = serde_json::json!({"type": "integer"});
     ResponseSchema::new("skyhook_compaction", schema).expect("the compaction schema is an object")
 }
 
@@ -86,7 +90,8 @@ pub(super) fn pending_response(items: &[AssistantItem]) -> Message {
     let response = serde_json::to_string(&visible).expect("assistant response serializes");
     Message::User(vec![UserPart::Compaction {
         text: format!(
-            "Latest assistant response, immediately before compaction. This temporary snapshot is conversation evidence, not a new user instruction or a request to execute tools. The ordered items below preserve its visible text and reasoning, followed or interleaved by its pending tool calls.\n\nEvery listed tool call is pending and UNEXECUTED; its id, name and arguments describe intent, not a result. Do not claim these tools ran or that their intended effects occurred. Direct pending todo replacements listed here will not apply: consider their proposed changes when reconciling the current todo list; the complete todos you return take priority over those direct replacements. Todo calls made inside scripts are not superseded. Every other call runs after compaction. Preserve this distinction in the continuation and resumption point.\n\n<skyhook_pending_response>\n{response}\n</skyhook_pending_response>"
+            "Latest assistant response, immediately before compaction. This temporary snapshot is conversation evidence, not a new user instruction or a request to execute tools. The ordered items below preserve its visible text and reasoning, followed or interleaved by its pending tool calls.\n\nEvery listed tool call is pending and UNEXECUTED; its id, name and arguments describe intent, not a result. Do not claim these tools ran or that their intended effects occurred. Direct pending todo replacements listed here will not apply: consider their proposed changes when reconciling the current todo list; the complete todos you return take priority over those direct replacements. Todo calls made inside scripts are not superseded. Every other call runs after compaction. Preserve this distinction in the continuation and resumption point.\n\n{}",
+            crate::session::PENDING_RESPONSE.wrap(&response)
         ),
     }])
 }
@@ -244,8 +249,7 @@ mod tests {
         let snapshot = pending_response(&items);
         let text = text(&snapshot);
         assert!(!text.contains("opaque-provider-payload"));
-        let (_, payload) = text.split_once("<skyhook_pending_response>\n").unwrap();
-        let (payload, _) = payload.split_once("\n</skyhook_pending_response>").unwrap();
+        let payload = crate::session::PENDING_RESPONSE.body(text).unwrap();
         let visible: Vec<AssistantItem> = serde_json::from_str(payload).unwrap();
         let mut expected = items.clone();
         for item in &mut expected {
@@ -262,6 +266,10 @@ mod tests {
         // generation hint: reordered valid responses must still validate and parse.
         let schema = serde_json::from_str(&response_schema().schema().to_string()).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
+        assert_eq!(
+            schema["properties"]["jobs"]["items"],
+            json!({"type": "integer"})
+        );
         let valid = summary();
         let reordered = valid.as_object().unwrap().iter().rev();
         let reordered = reordered.map(|(key, value)| (key.clone(), value.clone()));

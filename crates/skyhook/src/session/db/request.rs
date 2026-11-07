@@ -20,8 +20,8 @@ use crate::{
     provider::protocol::Usage,
     session::{
         AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
-        CompletedOutcome, EntryKind, Page, ProfileSnapshot, RequestNumber, RequestPhase,
-        RequestRecord, RequestSeq, SessionEvent,
+        CompletedOutcome, EntryKind, FailureRun, Page, ProfileSnapshot, RequestNumber,
+        RequestPhase, RequestRecord, RequestSeq, SessionEvent,
     },
 };
 
@@ -133,7 +133,7 @@ pub(in crate::session) fn requests(
         return Ok(Vec::new());
     };
     let profiles = profiles(db)?;
-    paged(
+    let mut requests = paged(
         db,
         page,
         paged_sql!(
@@ -145,7 +145,9 @@ pub(in crate::session) fn requests(
         params![row, EntryKind::ModelRequested],
         limit,
         |row| request_record(row, agent, &profiles),
-    )
+    )?;
+    retried(db, &mut requests)?;
+    Ok(requests)
 }
 
 /// `agent`'s requests at `requests`, as the request fold leaves them.
@@ -159,9 +161,10 @@ pub(super) fn requests_at(
     }
     let profiles = profiles(db)?;
     let sql = request_rows!("WHERE e.seq IN (SELECT value FROM json_each(?1))");
-    let rows = db.query(sql, params![json(&requests)?], |row| {
+    let mut rows = db.query(sql, params![json(&requests)?], |row| {
         request_record(row, agent, &profiles)
     })?;
+    retried(db, &mut rows)?;
     Ok(rows.into_iter().collect())
 }
 
@@ -184,11 +187,51 @@ pub(super) fn named_requests(
         Named::Latest => request_rows!("JOIN agent_state g ON g.request = e.seq"),
         Named::Gauged => request_rows!("JOIN agent_state g ON g.gauged = e.seq"),
     };
-    db.query(sql, Vec::new(), |row| {
+    let mut requests = db.query(sql, Vec::new(), |row| {
         let agent = agents.get(&row.get::<i64>(27)?);
         let agent = agent.ok_or_else(|| corrupt("a request names no agent"))?;
         request_record(row, agent, &profiles)
-    })
+    })?;
+    retried(db, &mut requests)?;
+    Ok(requests)
+}
+
+/// Read each of `records`' retried runs from their rows.
+fn retried(db: &Db, records: &mut [(RequestSeq, RequestRecord)]) -> DbResult<()> {
+    let mut records: HashMap<_, _> = (records.iter_mut())
+        .map(|(request, record)| (*request, record))
+        .collect();
+    if records.is_empty() {
+        return Ok(());
+    }
+    let requests: Vec<_> = records.keys().copied().collect();
+    let runs = db.query(
+        "SELECT r.request, r.first, r.last, f.failure, f.provider, f.detail \
+         FROM retried_run r \
+         JOIN model_attempt a ON a.request = r.request AND a.attempt = r.first \
+         JOIN attempt_outcome o ON o.attempt = a.entry JOIN failure f ON f.entry = o.entry \
+         WHERE r.request IN (SELECT value FROM json_each(?1)) ORDER BY r.request, r.first",
+        params![json(&requests)?],
+        |row| {
+            let Failure::Provider(message, kind) = failure_at(row, 3)? else {
+                return Err(corrupt("only a model's provider failure retries"));
+            };
+            let run = FailureRun {
+                failure: kind.error(message),
+                first: row.get(1)?,
+                last: row.get(2)?,
+            };
+            Ok((sequence(row.get(0)?).request(), run))
+        },
+    )?;
+    for (request, run) in runs {
+        let record = records.get_mut(&request);
+        record
+            .ok_or_else(|| corrupt("a run names no request"))?
+            .retried
+            .push(run);
+    }
+    Ok(())
 }
 
 /// A request of `agent` selected by [`request_rows`].
@@ -251,6 +294,7 @@ fn request_record(
         requested_millis: row.get(1)?,
         attempts: row.get(9)?,
         usage: usage_at(row, 18)?,
+        retried: Vec::new(),
         phase,
         phased: sequence(row.get(7)?),
     };
@@ -657,5 +701,61 @@ mod tests {
         // A fault missing its detail is stored, but never decodes.
         failed(103, own, None).unwrap();
         assert_matches!(fixture.decode(), Err(DbError::Corrupt(_)));
+    }
+
+    /// A request's retried failures read back from its rows in the runs the fold
+    /// leaves, a run per change of failure, whether attempts commit apart or together.
+    #[test]
+    fn retried_failures_read_back_in_the_runs_the_fold_leaves() {
+        use crate::provider::ProviderErrorKind::{RateLimited, Unavailable};
+        let mut fixture = Fixture::new();
+        let root = fixture.start("/w");
+        let context = fixture.one(
+            root.clone(),
+            SessionEvent::ModelContext {
+                context: ModelContext::test(ModelPurpose::Agent, profile()),
+            },
+        );
+        let request = fixture.one(root.clone(), requested(context)).request();
+        let failed = |attempt, kind: crate::provider::ProviderErrorKind, message: &str| {
+            SessionEvent::ModelFailed {
+                attempt: AttemptRef { request, attempt },
+                failure: AttemptFailure::Retrying {
+                    message: message.into(),
+                    kind,
+                    delay: std::time::Duration::from_millis(5).into(),
+                },
+            }
+        };
+        fixture.one(root.clone(), attempt(request, 1));
+        fixture.one(root.clone(), failed(1, Unavailable, "busy"));
+        let together = [
+            attempt(request, 2),
+            failed(2, Unavailable, "busy"),
+            attempt(request, 3),
+            failed(3, RateLimited, "429"),
+        ];
+        let together = together.into_iter().map(|event| (root.clone(), event));
+        fixture.commit(together.collect()).unwrap();
+        fixture.one(root.clone(), attempt(request, 4));
+        fixture.one(root.clone(), failed(4, Unavailable, "busy"));
+        let run = |kind: crate::provider::ProviderErrorKind, message: &str, first, last| {
+            let failure = kind.error(message);
+            FailureRun {
+                failure,
+                first,
+                last,
+            }
+        };
+        let runs = [
+            run(Unavailable, "busy", 1, 2),
+            run(RateLimited, "429", 3, 3),
+            run(Unavailable, "busy", 4, 4),
+        ];
+        let mut folded = crate::session::tests::fold(&fixture.records).requests;
+        let folded = folded.remove(&request).unwrap();
+        assert_eq!(folded.retried, runs);
+        let read = requests(&fixture.db, &root, Page::First, 10).unwrap();
+        assert_eq!(read, [(request, folded)]);
     }
 }

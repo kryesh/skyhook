@@ -24,11 +24,15 @@ use crate::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_checked(
         crate::tool::builtins::names::READ,
-        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot.",
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut ReadArgs| {
-                vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
+                vec![PathArgument::new(
+                    &mut args.path,
+                    PathAccess::Read,
+                    PathKind::Existing,
+                )]
             })
             .result::<ReadOutput>(),
         Ok,
@@ -203,7 +207,7 @@ fn copy_text(
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
-    /// File or directory path.
+    /// File or directory path
     path: String,
 }
 

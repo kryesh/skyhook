@@ -14,9 +14,7 @@ mod ssh;
 mod transport;
 pub mod worker;
 
-pub use artifact::{
-    Arch, ArtifactError, EmbeddedShim, EmbeddedShimCatalog, Os, Platform, ShimProtocol,
-};
+pub use artifact::{Arch, ArtifactError, EmbeddedShim, EmbeddedShimCatalog, Os, Platform};
 #[cfg(test)]
 pub(crate) use backend::ConnectionFactory;
 pub(crate) use error::RemoteError;

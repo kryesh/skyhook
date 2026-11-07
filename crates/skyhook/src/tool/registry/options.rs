@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde_json::Value;
 
 use super::{
-    JobLocation, PathArgument, ScriptBinding, ToolExecution, ToolExposure, ToolPlacement,
-    envelope::TARGET, registration::result_schema, surface::OutputSchema,
+    JobLocation, PathArgument, ScriptBinding, ToolExecution, ToolPlacement, envelope::TARGET,
+    registration::result_schema, surface::OutputSchema,
 };
 use crate::{
     execution::ExecutionLocation,
@@ -60,7 +60,6 @@ pub struct ToolOptions<A = Value> {
     pub(super) hooks: ArgumentHooks<A>,
     pub(super) supports_background: bool,
     pub(super) schema_origin: SchemaOrigin,
-    pub(super) exposure: ToolExposure,
     pub(super) script_binding: ScriptBinding,
     pub(super) required: BTreeSet<Capability>,
     pub(super) root_required: BTreeSet<Capability>,
@@ -131,7 +130,6 @@ impl<A> ToolOptions<A> {
                 location: None,
                 result: None,
             },
-            exposure: ToolExposure::ModelVisible,
             script_binding: ScriptBinding::TopLevel,
             required,
             root_required: BTreeSet::new(),
@@ -167,12 +165,6 @@ impl<A> ToolOptions<A> {
     #[must_use]
     pub const fn input(mut self) -> Self {
         self.execution.accepts_input = true;
-        self
-    }
-
-    #[must_use]
-    pub fn script_only(mut self) -> Self {
-        self.exposure = ToolExposure::ScriptOnly;
         self
     }
 
@@ -248,15 +240,6 @@ impl<A> ToolOptions<A> {
     ) -> Self {
         self.conditional_inputs
             .push((String::new(), name.into(), Arc::new(schema)));
-        self
-    }
-
-    #[must_use]
-    pub fn job_method(mut self, method: &'static str, job_argument: &'static str) -> Self {
-        self.script_binding = ScriptBinding::JobMethod {
-            method,
-            job_argument,
-        };
         self
     }
 

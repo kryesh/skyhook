@@ -6,20 +6,20 @@
 use super::*;
 
 mod stream;
-pub(crate) use stream::{
-    CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
-};
+#[cfg(test)]
+pub(crate) use stream::PendingCapture;
+pub(crate) use stream::{CaptureCollector, CompletedCapture, HostOutput};
 
 pub use crate::tool::output::CaptureKind;
 
 /// Descriptors describe raw captures, not a replacement structured result. In
-/// particular, incomplete JSON is only safe to read through explicit byte paging.
+/// particular, incomplete JSON is only safe to read through explicit byte paging
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct CaptureDescriptor {
     pub field: FieldPointer,
     pub(crate) complete: bool,
-    /// The capture's page, when the host hydrated one.
+    /// The capture's page, when the host hydrated one
     pub output: Option<Box<crate::job::JobView>>,
 }
 

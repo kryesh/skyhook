@@ -26,7 +26,7 @@ use crate::{
         SessionEvent, SessionStore, UserPart, Wait,
     },
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
-    tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
+    tool::builtins::{HostSkills, register_coding_tools},
     tool::policy::{AllowAll, Policy},
     tool::policy::{
         Capability, CapabilitySet, HostCapability, HostCapabilityDeclaration, Mode, ModeName,
@@ -308,6 +308,8 @@ enum AgentLaunch {
         mode: Option<AppliedMode>,
         /// The most this agent may hold: its mode's set, or its parent's current set.
         capabilities: CapabilitySet,
+        /// The time zone of its target's machine, read as it launches.
+        zone: Option<crate::target::TimeZone>,
     },
     /// An agent that started before, under its journaled contract narrowed to the
     /// live configuration, on model `on` where named.
@@ -873,6 +875,7 @@ mod tests {
             location: crate::execution::ExecutionLocation::root(workspace),
             mode: None,
             capabilities: session.runtime.capabilities.clone(),
+            zone: None,
         }
     }
 
@@ -1023,10 +1026,7 @@ mod tests {
         else {
             panic!("expected the request's own state at its end");
         };
-        let (prefix, suffix) = ("<skyhook_state>\n", "\n</skyhook_state>");
-        state
-            .strip_prefix(prefix)
-            .and_then(|state| state.strip_suffix(suffix))
+        (crate::session::STATE.body(state))
             .expect("rendered state is tagged")
             .to_owned()
     }

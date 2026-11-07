@@ -3,9 +3,9 @@
 Cargo workspace under `crates/`:
 
 - `skyhook` — the library.
-- `skyhook-cli` — shared CLI/terminal host library and the `skyhook` binary.
-- `skyhook-security` — flaw-first security research companion binary.
-- `linux-ssh` — SSH shim binary.
+- `cli` — shared CLI/terminal host library and the `skyhook` binary.
+- `security` — flaw-first security research companion binary.
+- `shim` — remote shim binary.
 
 Architecture: `docs/src/development/architecture.md`.
 

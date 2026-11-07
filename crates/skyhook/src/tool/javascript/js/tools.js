@@ -60,39 +60,22 @@ function builder(manifest, input) {
 
 function object(manifest, values) {
   if (values.length > 1) throw new TypeError(`${manifest.call} accepts zero arguments or one argument object`);
-  const input = values.length ? values[0] : {};
+  const input = argument(values.length ? values[0] : {}, `${manifest.call} argument`);
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError(`${manifest.call} argument must be a plain object`);
   }
-  return argument(input, `${manifest.call} argument`);
+  return input;
 }
 
 export function install(manifests, ended, call) {
   host = call;
   terminal = new Set(ended);
-  for (const manifest of manifests) {
-    manifest.setters = manifest.properties.filter(key => IDENTIFIER.test(key) && !RESERVED.has(key));
-  }
   const tool = Object.create(null);
   for (const manifest of manifests) {
-    if (manifest.binding === "top_level") {
-      tool[manifest.name] = (...values) => builder(manifest, object(manifest, values));
-    }
+    manifest.call = `tool.${manifest.name}`;
+    manifest.setters = manifest.properties.filter(key => IDENTIFIER.test(key) && !RESERVED.has(key));
+    tool[manifest.name] = (...values) => builder(manifest, object(manifest, values));
   }
-  tool.job = job => {
-    if (calls.has(job)) throw new TypeError("tool.job received an unresolved tool builder; await the background call and pass its response's id (launch.id)");
-    if (!Number.isSafeInteger(job) || job < 1) throw new TypeError("tool.job requires a positive safe integer job ID");
-    const methods = Object.create(null);
-    for (const manifest of manifests) {
-      if (manifest.binding !== "job_method") continue;
-      methods[manifest.method] = (...values) => {
-        const input = object(manifest, values);
-        if (Object.hasOwn(input, manifest.job_argument)) throw new TypeError(`${manifest.call} cannot override its bound job ID`);
-        return builder(manifest, {...input, [manifest.job_argument]: job});
-      };
-    }
-    return Object.freeze(methods);
-  };
   return {tool: Object.freeze(tool), receive: inbox()};
 }
 

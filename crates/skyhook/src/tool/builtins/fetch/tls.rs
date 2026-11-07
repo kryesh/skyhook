@@ -18,8 +18,8 @@ fn clients() -> MutexGuard<'static, Vec<(ClientIdentity, Client)>> {
 }
 
 /// The client for `identity`, with the connections it keeps open. A miss builds one
-/// off the async workers, since that loads the platform's trusted roots; calls that
-/// miss together each build one, and the first built is kept.
+/// off the async workers, since the first build reads this machine's trusted roots;
+/// calls that miss together each build one, and the first built is kept.
 pub(super) async fn client(identity: &ClientIdentity) -> Result<Client, LocalError> {
     let built = |clients: &[(ClientIdentity, Client)]| {
         let found = clients.iter().find(|(built, _)| built == identity);
@@ -42,14 +42,18 @@ pub(super) async fn client(identity: &ClientIdentity) -> Result<Client, LocalErr
 }
 
 fn build(identity: &ClientIdentity) -> Result<Client, LocalError> {
-    let mut builder = Client::builder()
+    // Insecure verifies nothing, so it needs no trusted roots.
+    let builder = match identity.insecure {
+        true => Client::builder().danger_accept_invalid_certs(true),
+        false => crate::tls::client_builder(),
+    };
+    let mut builder = builder
         .user_agent(concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         // The tool's outer deadline is the only total limit: an equal client
         // timeout would race it and could report the timeout without its limit.
-        .connect_timeout(identity.connect_timeout)
-        .danger_accept_invalid_certs(identity.insecure);
+        .connect_timeout(identity.connect_timeout);
     // Proxy schemes and URL credentials intentionally differ from HttpRequestUrl admission.
     if let Some(proxy) = &identity.proxy {
         builder = builder.proxy(
@@ -90,7 +94,14 @@ mod tests {
         }
     }
 
-    async fn self_signed_server(connections: usize) -> (String, SelfSignedServer) {
+    /// The server's URL, its task, and the certificate it serves.
+    async fn self_signed_server(
+        connections: usize,
+    ) -> (
+        String,
+        SelfSignedServer,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
         // A fresh, currently valid certificate with matching IP/DNS SANs isolates
         // the failure to its untrusted issuer, not expiration or hostname mismatch.
         let certificate =
@@ -126,14 +137,31 @@ mod tests {
             }
             (rejected, requests)
         });
-        (url, SelfSignedServer(task))
+        let served = certificate.cert.der().clone();
+        (url, SelfSignedServer(task), served)
+    }
+
+    /// The shared TLS trusts a test CA only when it is among the roots it is given.
+    #[tokio::test]
+    async fn shared_tls_trusts_a_test_ca_only_when_given_it() {
+        let (url, mut server, certificate) = self_signed_server(2).await;
+        for (extra, trusted) in [(None, false), (Some(certificate), true)] {
+            let config = crate::tls::client_config(crate::tls::roots(extra));
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .use_preconfigured_tls(config);
+            let sent = bounded(client.build().unwrap().get(&url).send()).await;
+            assert_eq!(sent.is_ok(), trusted, "{sent:?}");
+        }
+        let (rejected, requests) = bounded(&mut server.0).await.unwrap();
+        assert_eq!((rejected, requests.len()), (1, 1));
     }
 
     #[tokio::test]
     async fn insecure_is_opt_in_and_does_not_leak_between_registered_fetch_calls() {
         let runtime = TestRuntime::new().await;
         let executor = executor(&runtime);
-        let (url, mut server) = self_signed_server(5).await;
+        let (url, mut server, _) = self_signed_server(5).await;
         // Reuse one executor and one HTTPS origin throughout. Both strict forms are
         // tested before AND after the opt-out, catching a shared permissive client.
         for insecure in [None, Some(false), Some(true), Some(false), None] {

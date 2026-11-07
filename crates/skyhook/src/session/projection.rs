@@ -555,8 +555,9 @@ mod tests {
         let runtime = TestRuntime::new().await;
         let (store, agent) = (&runtime.store, &runtime.agent);
         let answer = Message::Assistant(vec![AssistantItem::text("said", 0, "answer")]);
-        let state = |date: &str| crate::session::RuntimeState {
-            date: date.into(),
+        // Each state is told apart by its time, in seconds.
+        let state = |marker: i64| crate::session::RuntimeState {
+            time: chrono::DateTime::from_timestamp(marker, 0).unwrap(),
             jobs: Vec::new(),
             todos: Vec::new(),
             location: crate::execution::ExecutionLocation::root("/".into()),
@@ -564,22 +565,23 @@ mod tests {
         };
         // The runtime ends a request with its state; a state followed by anything was
         // never sent.
-        let tail = |date: &str| {
-            let state = Message::State(state(date));
-            match date {
-                "stale" => vec![state, text_message("request only")],
+        const STALE: i64 = 3;
+        let tail = |marker: i64| {
+            let state = Message::State(state(marker));
+            match marker {
+                STALE => vec![state, text_message("request only")],
                 _ => vec![text_message("request only"), state],
             }
         };
         let hello = append(&runtime, committed(text_message("hello"))).await;
         let agent_context = context(ModelPurpose::Agent, "provider", "model", "system");
         let agent_context = append(&runtime, agent_context).await;
-        let requested = |through: RecordSeq, date: &str| SessionEvent::ModelRequested {
+        let requested = |through: RecordSeq, marker: i64| SessionEvent::ModelRequested {
             context: agent_context,
             checkpoint: None,
             through: Some(through.message()),
             from: None,
-            tail: tail(date),
+            tail: tail(marker),
             history_lifetime: HistoryLifetime::Extends,
         };
         let attempt = |request: RecordSeq| AttemptRef {
@@ -601,23 +603,23 @@ mod tests {
             append(&runtime, completed).await;
             message
         };
-        let one = append(&runtime, requested(hello, "one")).await;
+        let one = append(&runtime, requested(hello, 1)).await;
         let answered = respond(one, crate::session::CompletedOutcome::Answer).await;
         let more = append(&runtime, committed(text_message("more"))).await;
-        append(&runtime, requested(more, "unanswered")).await;
-        let stale = append(&runtime, requested(more, "stale")).await;
+        append(&runtime, requested(more, 2)).await;
+        let stale = append(&runtime, requested(more, STALE)).await;
         let cut = crate::session::CompletedOutcome::Cut(crate::session::Truncation::MaxTokens);
         let cut = respond(stale, cut).await;
-        let three = append(&runtime, requested(cut, "three")).await;
+        let three = append(&runtime, requested(cut, 4)).await;
         let projection = projected(store, agent).await;
         let sent: Vec<_> = (projection.messages.iter())
-            .map(|projected| projected.sent.as_ref().map(|state| state.date.as_str()))
+            .map(|projected| projected.sent.as_ref().map(|state| state.time.timestamp()))
             .collect();
-        assert_eq!(sent, [None, Some("one"), None, None]);
+        assert_eq!(sent, [None, Some(1), None, None]);
         assert_eq!(get(&[hello, answered, more, cut]), sequences(&projection));
         let request = store.reconstruct_model_request(three.request());
         let (_, request) = request.await.unwrap();
-        assert_eq!(request.context, projection.context(&tail("three")));
+        assert_eq!(request.context, projection.context(&tail(4)));
         let lifetimes: Vec<_> = request.states().map(|state| state.lifetime).collect();
         use crate::provider::protocol::StateLifetime::*;
         assert_eq!(lifetimes, [Superseded, Current]);
@@ -625,11 +627,11 @@ mod tests {
         assert_eq!(only.matches("request only").count(), 1);
         // After a mode switch only later responses carry their request's state.
         append(&runtime, switch_mode()).await;
-        let four = append(&runtime, requested(cut, "four")).await;
+        let four = append(&runtime, requested(cut, 5)).await;
         respond(four, crate::session::CompletedOutcome::Answer).await;
         let switched = projected(store, agent).await;
         let sent: Vec<_> = switched.history().filter_map(|(_, sent)| sent).collect();
-        assert_eq!(sent, [&state("four")]);
+        assert_eq!(sent, [&state(5)]);
     }
 
     /// The trim keeps the opening exchange and resumes at the user or assistant message

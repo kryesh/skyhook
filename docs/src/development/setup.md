@@ -3,8 +3,8 @@
 ## Prerequisites
 
 - Rust 1.99 or newer via rustup, and [just](https://just.systems/) on `PATH`.
-- [Zig](https://ziglang.org/download/) on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) **only for
-  building the SSH shims**.
+- [Zig](https://ziglang.org/download/) 0.15 or newer on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) for release
+  builds and the SSH shims; debug builds and tests do not need it.
 - `python3` on `PATH` for the test suite, whose MCP tests run a scripted server.
 
 ```sh
@@ -13,9 +13,36 @@ cd skyhook
 just setup
 ```
 
-`just setup` adds the `rustfmt` and `clippy` components and both musl targets, and installs
-`cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. See
+`just setup` adds the `rustfmt` and `clippy` components, both musl shim targets, and this machine's
+release target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. See
 [remote transport and shims](remote-transport-and-shims.md) for shim profiles and artifacts.
+
+## Release builds
+
+`just build-release` compiles V8 from source the first time it builds a `v8` version for a
+target, and reuses that build afterwards. It needs, on `PATH`:
+
+- `clang` (with `ld.lld`, `llvm-ar` and the compiler-rt builtins) at least as new as the clang major
+  that V8 version's Chromium build pins, and `llvm-config` for its libclang; the build stops with
+  the required version if the installed one is older;
+- `gn`, `ninja`, `git`, `python3`, and `unshare` (util-linux); `ccache` is used when present;
+- a nightly Rust toolchain as this repository's active toolchain, since V8's own build passes
+  unstable flags to `rustc`.
+
+The first build for a version clones the rusty_v8 source with its submodules and
+fetches crates.io sources, then compiles without network access: nothing else is downloaded, and a
+build step that tries to fails. That first build takes several CPU-hours and a few gigabytes of
+disk under `target/v8`, and more for each further target; later builds of the same version and
+target reuse the archive. To build offline, keep `target/v8` and the cargo registry
+from an earlier build.
+
+To upgrade V8, bump `v8` in `crates/skyhook/Cargo.toml`, run `cargo update -p v8`, and run
+`just build-release` as usual.
+
+Release targets are the musl targets of the architectures `scripts/v8-archive.sh` maps to V8's
+build names, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`; a target of any other
+architecture fails before building. The build host can be any Linux host whose own architecture is
+mapped; only x86_64 hosts have been tested, not aarch64.
 
 ## Common tasks
 
@@ -23,13 +50,13 @@ Run these commands from the repository root:
 
 | Command | Purpose |
 | --- | --- |
-| `just setup` | Install the Rust-side tooling and shim targets. |
+| `just setup` | Install the Rust-side tooling, shim targets, and this machine's release target. |
 | `just build-shims` | Cross-compile debug SSH shims into `target/shims`; requires Zig. |
 | `just build-shims-release` | Cross-compile size-optimised SSH shims into `target/shims`; requires Zig. |
 | `just build` | Debug builds of both applications; they read `target/shims` live at runtime. |
-| `just build-release` | Release builds of both applications, embedding the current contents of `target/shims`. |
-| `just build-full` | Release shims, then release applications that embed them. |
-| `just install` | `build-full`, then install both applications into `~/.local/bin`. |
+| `just build-release [target]` | Release builds of both applications in `target/<target>/release`, embedding the current contents of `target/shims`; `target` defaults to the static musl target of this Linux machine's architecture (`just --evaluate host_target` prints it). |
+| `just build-full [target]` | Release shims, then release applications for `target` that embed them. |
+| `just install` | `build-full` for this machine, then install both applications into `~/.local/bin`. |
 | `just run [args]`, `just run-security [args]` | Run a debug application. |
 | `just test` | Nextest suite over the workspace and all targets. |
 | `just lint` | Clippy over the workspace and all targets with warnings denied. |
@@ -39,8 +66,9 @@ Run these commands from the repository root:
 | `just pages-build` | Build the Pages artifact and add `.nojekyll`. |
 | `just pages-publish [remote] [branch]` | Publish the built book via a temporary worktree, never force-pushing; defaults to `origin` and `pages`. |
 
-There is no build script and no cargo feature. A plain `cargo build` builds the two
-applications; pass `-p linux-ssh` to build the shim.
+There is no build script. The library's one cargo feature, `script` (on by default), provides the
+`script` tool and V8; the shim builds without it. A plain `cargo build` builds the two applications;
+pass `-p shim` to build the shim.
 Shims are only ever built by the `build-shims*` recipes; a CLI built without them reports an
 explicit missing-shim error if asked to use SSH.
 
@@ -68,8 +96,9 @@ when changing Rust documentation examples. For book changes, run `just docs` and
 rendered pages and links. `AGENTS.md` also covers test policy, including stress runs for tests
 that coordinate gated provider steps.
 
-The workspace holds the `skyhook` library, the `skyhook-cli` host with the `skyhook` binary, the
-`skyhook-security` binary and the `linux-ssh` shim under `crates/`. See
+The workspace holds the `skyhook` library, the `cli` host with the `skyhook` binary, the
+`security` crate with the `skyhook-security` binary, the `schema` macro crate and the `shim`
+remote shim under `crates/`. See
 [architecture](architecture.md) and [embedding](embedding.md) for the library boundaries.
 [Documentation and publishing](documentation.md) covers local preview and manual GitHub Pages
 publishing.

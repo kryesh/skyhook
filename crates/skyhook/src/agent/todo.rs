@@ -29,10 +29,9 @@ named_enum! {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TodoItem<Text = Prose> {
-    /// Instruction or step to carry out.
-    #[schemars(with = "String")]
-    pub text: Text,
+pub struct TodoItem {
+    /// Instruction or step to carry out
+    pub text: Prose,
     pub status: TodoStatus,
 }
 

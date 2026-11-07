@@ -49,10 +49,11 @@ After a session interruption it resumes all interrupted children automatically, 
 which agent is selected. Parents with pending waits stay in those waits. On a reopened session
 that has not run anything yet, `/retry` always starts it and continues whatever it left
 unfinished, or reports that there was nothing.
-Automatic model retries display the attempt number, a countdown to the next attempt, and the
-latest diagnostic in one error block. Error blocks expand to the error, its first lines when it
-is long, which copying or exporting the block gives whole: a final failure starts expanded and a
-pending retry collapsed, while `/details` and exports expand them all.
+Automatic model retries display the attempt number, a countdown to the next attempt, and every
+failed attempt's diagnostic, oldest first, in one error block; consecutive attempts that failed
+the same way share one line, such as `attempts 3–17  RateLimited: …`. A final failure starts
+expanded and a pending retry collapsed, while `/details` and exports expand them all. An
+expanded block shows every error whole.
 Partial output from the failed attempt clears when the next
 attempt starts, and partial output a failed or interrupted turn left clears when the agent's next
 turn begins, as reopening the session shows it; successful replies have no retry labels. Retries

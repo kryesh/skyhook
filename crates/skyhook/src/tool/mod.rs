@@ -14,6 +14,7 @@ pub(crate) mod registry;
 pub(crate) mod source;
 
 pub mod builtins;
+#[cfg(feature = "script")]
 pub(crate) mod javascript;
 pub mod policy;
 
@@ -24,7 +25,7 @@ pub use invocation::AdmissionError;
 pub use output::complete;
 pub(crate) use registry::{JobLocation, ToolResultPolicy, job_view_type};
 pub use registry::{
-    PathArgument, PathKind, RegisteredTool, RegistryError, ScriptBinding, TARGET, ToolExposure,
-    ToolOptions, ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface,
-    input_schema_for, input_settings, result_schema,
+    PathArgument, PathKind, RegisteredTool, RegistryError, ScriptBinding, TARGET, ToolOptions,
+    ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface, input_schema_for,
+    input_settings, result_schema,
 };

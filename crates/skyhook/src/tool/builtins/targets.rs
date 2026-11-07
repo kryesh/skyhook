@@ -20,13 +20,13 @@ struct TargetsArgs {}
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TargetAddArgs {
-    /// Session-wide name to add or replace; root is reserved.
-    name: String,
+    /// Session-wide name to add or replace; root is reserved
+    name: crate::target::TargetName,
     #[serde(flatten)]
     config: TargetConfig,
 }
 
-/// local identifies the Skyhook session host; ssh identifies a remote target.
+/// local identifies the Skyhook session host; ssh identifies a remote target
 #[derive(Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TargetKind {
@@ -103,7 +103,7 @@ pub(super) fn register(
     let listed = router.clone();
     builder.register_checked(
         "targets",
-        "List available execution targets and their hostnames without connecting.",
+        "List available execution targets and their hostnames without connecting",
         ToolOptions::default()
             .requires(Capability::Targets)
             .result::<Vec<TargetView>>(),
@@ -125,8 +125,7 @@ pub(super) fn register(
         r#"Add or replace a session target without connecting to it or changing your current target.
 
 Example: `tool.target_add({name:"db", type:"ssh", host:"db.internal", via:"bastion"})`.
-origin (default root) is the target whose shim starts SSH, using its key paths and agents. via jumps through a target with the same origin; both may be set.
-ssh.options can run commands, so it also requires exec."#,
+ssh.options can run commands, so it also requires exec"#,
         ToolOptions::new(vec![Capability::Write])
             .requires(Capability::Targets)
             .permission_resource(ResourceId::session("targets"))
@@ -137,7 +136,7 @@ ssh.options can run commands, so it also requires exec."#,
                 serde_json::json!({
                     "type": "boolean",
                     "default": false,
-                    "description": "Authenticate with, and forward, the agent the origin inherited in SSH_AUTH_SOCK instead of Skyhook's private agent; keys are never added to it. Adding the target and later connecting to it are approved separately."
+                    "description": "Authenticate with, and forward, the agent the origin inherited in SSH_AUTH_SOCK instead of Skyhook's private agent; keys are never added to it. Adding the target and later connecting to it are approved separately"
                 }),
             )
             .argument_permissions(|_, args: &TargetAddArgs| Ok(add_permissions(&args.config.ssh))),
@@ -145,7 +144,7 @@ ssh.options can run commands, so it also requires exec."#,
         move |args: TargetAddArgs| {
             let router = router.clone();
             AdmittedInvocation::unit(move |context| async move {
-                let definition = TargetDefinition::from_config(args.name, args.config)
+                let definition = TargetDefinition::from_config(args.name.into(), args.config)
                     .map_err(|error| {
                         ToolError::from(error.into_admission_error()).effects(Effects::Unchanged)
                     })?;
@@ -202,10 +201,6 @@ mod tests {
         let mut reduced = privileged.clone();
         reduced.remove(&Capability::Targets);
         for (arguments, field) in [
-            (
-                serde_json::json!({"name":"private requested","type":"ssh","host":"host"}),
-                "name",
-            ),
             (
                 serde_json::json!({"name":"private-requested","type":"ssh","host":"host","via":"private-jump"}),
                 "via",

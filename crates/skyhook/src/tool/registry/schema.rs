@@ -155,7 +155,7 @@ pub(super) fn add_background(schema: &mut Value) {
         serde_json::json!({
             "type": "boolean",
             "default": false,
-            "description": "Run in background."
+            "description": "Run in background"
         }),
     );
 }

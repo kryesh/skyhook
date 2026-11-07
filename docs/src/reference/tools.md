@@ -18,15 +18,16 @@ completion. It returns the existing queried view, not another wrapper, and accep
 `start` and `pattern` for text or JSON, `offset` and `context` for text, and `unit` and `query`
 for JSON.
 `all` cannot be combined with `job`, and the other selections require `job` unless they restate
-their defaults. Scripts also control jobs with `tool.job(id).send({value})` and `.cancel()`.
+their defaults. `control({job, send})` delivers JSON input to a job and `control({job, cancel: true})`
+cancels it and its descendants; each completes without a result, and a `null` send counts as
+absent.
 
 Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view's `.result` is
 `{reason, waited_s}`: `reason` is `"event"`, `"timeout"` or `"cancelled"`, and `waited_s` counts the
 whole seconds waited. A cancelled wait is a failed view that still carries this result. A supplied
-timeout must be a positive integer number of seconds; a wait lasts at most 30 minutes (1800), which is
-also how long an omitted or null `timeout` waits, so an agent waiting on work that never reports
-regains control.
+timeout is a whole number of seconds from 1 through 1800 (30 minutes); an omitted or null `timeout`
+waits the full 1800, so an agent waiting on work that never reports regains control.
 An event does not guarantee a particular job has completed; inspect its current status. See
 [waiting for background work](../scripting/jobs-and-agents.md#waiting-for-background-work) for when
 a wait resolves.

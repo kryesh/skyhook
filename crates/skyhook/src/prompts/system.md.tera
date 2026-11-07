@@ -29,6 +29,6 @@
 {{ text }}
 {%- endfor %}
 
-<skyhook_context>
-{{ location | json }}
-</skyhook_context>
+<context>
+{{ context }}
+</context>

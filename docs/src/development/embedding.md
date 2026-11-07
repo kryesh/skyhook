@@ -5,6 +5,10 @@ a workspace, model selection, and interaction handlers rather than depending on 
 state. See [library architecture](architecture.md) for responsibility boundaries and the internal
 request lifecycle.
 
+The default `script` feature provides the `script` tool and its V8 JavaScript runtime. A host that
+does not offer scripts can depend on `skyhook` with `default-features = false` to leave V8 out of
+its binary; the remote shim does so.
+
 ## Layered host configuration and model hints
 
 `Config::resolve(workspace, explicit).await` loads the main `config.yaml` without building
@@ -69,7 +73,7 @@ only, not previously sealed configurations.
 
 ## Sharing the CLI and terminal
 
-The `skyhook-cli` crate is the shared host. A product implements `Product` with an `Args` type
+The `cli` crate is the shared host. A product implements `Product` with an `Args` type
 implementing `clap::Args`, a `Command` implementing `clap::Subcommand` (`NoArgs` and
 `NoCommand` for unused extension points), and an `Identity`: the `HostName` its sessions are
 tagged with, the `tables` it keeps in them (see below), display name, about text, the
@@ -91,7 +95,7 @@ A thin binary retains its own global allocator and starts in this order:
 fn main() {
     skyhook::remote::askpass_main();
     // SAFETY: no threads or runtime have been started.
-    unsafe { skyhook_cli::main(MyProduct) }
+    unsafe { cli::main(MyProduct) }
 }
 ```
 
@@ -138,7 +142,7 @@ session ID first. A product that keeps its own data in each session declares it 
 harness creates every session from it and checks the tables' format on every one of its own it
 reopens. `Schema::extended(image, seed)` takes the tables as a `ProductImage` and a function that
 fills their dictionaries in a new session (`Seeding::Fill`) and checks them on an open
-(`Seeding::Check`). `skyhook_schema::image!(format = N, file = "src/schema.sql")` builds the
+(`Seeding::Check`). `schema::image!(format = N, file = "src/schema.sql")` builds the
 image at compile time: the journal's schema with the product's DDL layered on it and the format
 recorded, from `sql = "…"` literals and `file = "…"` paths relative to the crate's manifest, in
 order. A changed file rebuilds the crate. The macro sees its arguments unexpanded, so they must
@@ -543,10 +547,9 @@ The library's shim catalog is empty by default. Supply `remote::EmbeddedShimCata
 `HarnessBuilder::shim_catalog` to enable remote execution. The CLI supplies its own catalog, but
 library hosts do not inherit the CLI's artifacts.
 
-`EmbeddedShimCatalog::from_embedded_assets` accepts names of the form `platform-protocol-arch`
-(for example, `linux-ssh-aarch64`) and a loader that returns a named artifact's bytes, called only
-for the artifact being deployed. Selection uses the destination's protocol, platform, and
-architecture. A missing matching artifact produces an explicit deployment error.
+`EmbeddedShimCatalog::from_embedded_assets` accepts names of the form `platform-arch` (for
+example, `linux-aarch64`) and a loader that returns a named artifact's bytes, called only for the
+artifact being deployed. Selection uses the destination's platform and architecture. A missing matching artifact produces an explicit deployment error.
 See [remote transport and shims](remote-transport-and-shims.md) for build, packaging, and deployment
 behavior.
 

@@ -1,5 +1,5 @@
-//! The agent's state at a request: date, live jobs, todos and the host's section.
-use chrono::Local;
+//! The agent's state at a request: time, live jobs, todos and the host's section.
+use chrono::{SubsecRound, Utc};
 
 use super::{SessionRuntime, TurnContext};
 use crate::{agent::HarnessError, session::RuntimeState};
@@ -22,9 +22,10 @@ impl SessionRuntime {
             .store
             .inspect_todos(turn.agent, None)
             .expect("own todo list is always readable");
-        let now = Local::now();
+        // The journal keeps milliseconds, so a replayed state is the one sent.
+        let now = Utc::now().trunc_subsecs(3);
         Ok(RuntimeState {
-            date: now.format("%Y-%m-%d").to_string(),
+            time: now,
             jobs: self.jobs.active_states(
                 turn.agent,
                 &turn.settings.capabilities,

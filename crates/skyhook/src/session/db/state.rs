@@ -326,6 +326,14 @@ impl Encoder {
                 Decided::Failed { turn } => {
                     db.execute("INSERT INTO failed_turn (entry) VALUES (?1)", params![turn])?
                 }
+                Decided::Retried {
+                    request,
+                    first,
+                    last,
+                } => db.execute(
+                    "INSERT OR REPLACE INTO retried_run (request, first, last) VALUES (?1, ?2, ?3)",
+                    params![request, first, last],
+                )?,
             };
         }
         Ok(())

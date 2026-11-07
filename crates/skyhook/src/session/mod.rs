@@ -29,6 +29,9 @@ pub use content::{
     HostCursor, HostEvent, HostView, JobEvent, Message, NegativeCursor, RuntimeState, StateJob,
     StateJobKind, UserPart, ViewNamesKind,
 };
+#[cfg(test)]
+pub(crate) use content::{JOB_EVENTS, STATE};
+pub(crate) use content::{PENDING_RESPONSE, cell};
 pub use core::SessionPhase;
 
 use crate::db::DbError;
@@ -48,7 +51,7 @@ pub use event::{
 };
 pub use extension::{AgentJobTexts, ExtensionDb, Unconfirmed};
 pub use ledger::{
-    Fact, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
+    Fact, FailureRun, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
 };
 pub use pages::{AgentSummary, AgentsPage, Answer, Page, PageFacts, TranscriptPage};
 pub(crate) use projection::Projected;

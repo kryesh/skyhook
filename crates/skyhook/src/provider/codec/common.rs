@@ -11,7 +11,7 @@ use crate::{
         protocol::{
             AssistantItem, Binding, BlockRef, Completion, CutReason, ItemKind, Message,
             ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope, State,
-            ToolDefinition, ToolResult, UserContent,
+            ToolDefinition, UserContent,
         },
     },
 };
@@ -217,12 +217,6 @@ pub(crate) fn push_state(
 pub(crate) fn system_text(request: &ModelRequest) -> Option<String> {
     let segments: Vec<_> = request.system.iter().map(|s| s.text.as_str()).collect();
     (!segments.is_empty()).then(|| segments.join("\n\n"))
-}
-
-pub(crate) fn tool_text(tool: &ToolResult) -> String {
-    // Keep the result and failure status distinguishable; a JSON result
-    // that happens to contain similarly named keys must not overwrite metadata.
-    json!({"result":tool.result,"is_error":tool.is_error}).to_string()
 }
 
 pub(crate) fn position(index: usize) -> Result<Position, ProviderError> {
@@ -470,7 +464,8 @@ pub(crate) mod tests {
     use crate::media::{BlobRef, ImageFormat, ImageLimits};
     use crate::provider::http::images::FittedImages;
     use crate::provider::protocol::{
-        AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step, Usage,
+        AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step,
+        ToolResult, Usage,
     };
 
     /// The scope test decoders issue replay under.

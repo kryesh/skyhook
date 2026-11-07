@@ -1,1 +1,1 @@
-Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work
+Prefer direct tools for simple operations and batch independent calls; use script for control flow or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work

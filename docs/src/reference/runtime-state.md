@@ -50,12 +50,27 @@ Lists persist with the session, including completed and interrupted child lists.
 recorded statuses. For Rust host observation, see
 [embedding](../development/embedding.md#host-observation-api).
 
+## Prompt context
+
+Each agent's system prompt ends with a `<context>` block of `key:value` lines: its `workspace`;
+its `target`, with that machine's `host` and any `via` and `origin`, when it may choose targets;
+and `tz`, the time zone of the machine its target names, with the zone's offset from UTC when the
+prompt was built, such as `tz:Europe/Berlin +01:00`. The zone is the one that machine's clock
+follows: the zone its `TZ` names, else its system zone; a `TZ` that gives a rule rather than a
+zone name shows only the offset, such as `tz:+09:00`.
+
+Launching a child on a remote target connects to it first, approved like any tool call on that
+target: a denied or unreachable target fails the `agent` call without starting a child. Every
+timestamp an agent sees, such as the state's `time` and a child reply's time, is in UTC, and scripts
+compute in UTC.
+
 ## Per-request state snapshot
 
 The model profile's [`state_mode`](../configuration/providers-and-models.md#context-and-output-budgets)
-controls whether and how the model receives a fresh `<skyhook_state>` snapshot with each request.
+controls whether and how the model receives a fresh `<state>` snapshot with each request.
 
-The snapshot shows the host's current local date, active jobs, and the caller's todo list.
+The snapshot shows the current time in UTC, to the second, active jobs, and the caller's todo
+list.
 Empty job and todo sections are omitted. This is a compact model-facing view, not the JSON
 returned by job or todo tools; scripts should use those tools to inspect state.
 Dynamic snapshots are still recorded with model requests; this mode is not a data-retention
@@ -85,20 +100,20 @@ Child-agent `turns` and `tool_calls` counters describe that agent alone, not its
 Todos retain their original order, including completed items. For example:
 
 ```text
-<skyhook_state>
-date:2026-09-05
-jobs: job parent tool name state age_s turns tool_calls
+<state>
+time:2026-09-05T09:41:22Z
+in_progress:
+  Make the change
+pending:
+  Run relevant checks
+job parent tool name state age_s turns tool_calls
 7 - exec run-tests running 12 - -
 8 - agent review running 9 2 3 workspace="/home/user/review"
 9 8 agent - waiting_input 4 1 0
-todos:
-in_progress:
-  "Make the change"
-pending:
-  "Run relevant checks"
-</skyhook_state>
+</state>
 ```
 
 Here, job 9 uses the snapshot's current location, not job 8's workspace override. Only
 unfinished todos appear; `todo` reads the whole list. With no active jobs or unfinished todos,
-only the date remains.
+only the time remains. A todo's text is shown as written unless it would break a line or read as
+a heading or the job table's column line, when it is quoted as a JSON string.

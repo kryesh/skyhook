@@ -25,7 +25,7 @@ pub(crate) fn register(
     let admitted = jobs.clone();
     builder.register_checked(
         "jobs",
-        "Without `job`, list this agent's active jobs as {jobs, older}, excluding this call and its containing script; `all` adds finished jobs, and `limit` keeps the newest jobs, counting those left out in `older` when any are. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: start/limit page lines of text or elements of JSON; pattern filters either; query selects JSON matches.",
+        "Without `job`, list this agent's active jobs, excluding this call and its containing script; `older` counts those `limit` leaves out. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images",
         ToolOptions::default()
             .output_schema(crate::job::JOB_VIEW_SCHEMAS.listing.clone())
             .internal_result(|request| {
@@ -62,42 +62,24 @@ pub(crate) fn register(
             }
         },
     )?;
-    let send = jobs.clone();
     builder.register_checked(
-        "job_send",
-        "Send JSON input to a job. For child agents, answer pending questions or deliver follow-up instructions automatically at the next model-request boundary. Sending to a completed, failed, or interrupted child agent appends to its retained conversation and resumes it under the same job ID; cancelled jobs remain non-resumable. Background scripts read input with await receive().",
-        ToolOptions::default()
-            .script_only()
-            .job_method("send", "job"),
-        Ok,
-        move |args: JobSendArgs| {
-            let jobs = send.clone();
-            Invocation::unit(move |_| async move {
-                jobs.send(args.job, args.value)
-                    .await
-                    .map_err(|error| job_failure(error, Operation::Send, args.job))
-            })
-        },
-    )?;
-    let cancel = jobs.clone();
-    builder.register_checked(
-        "job_cancel",
-        "Request cancellation of job/descendants; confirm terminal state with jobs.",
-        ToolOptions::default()
-            .output_schema(crate::job::JOB_VIEW_SCHEMAS.view.clone())
-            .script_only()
-            .job_method("cancel", "job"),
-        Ok,
-        move |args: JobArgs| {
-            let jobs = cancel.clone();
-            Invocation::new(move |context: ToolContext| async move {
-                jobs.cancel(args.job)
-                    .await
-                    .map_err(|error| job_failure(error, Operation::Terminate, args.job))
-                    .map(|job| {
-                        ToolOutput::new(job.metadata_view(context.diagnostic_viewer()).into_value())
-                    })
-            })
+        "control",
+        "Send input to a job or cancel it",
+        ToolOptions::default(),
+        |args: ControlArgs| Control::try_from(args),
+        move |action| {
+            let jobs = jobs.clone();
+            match action {
+                Control::Send { job, value } => Invocation::unit(move |_| async move {
+                    (jobs.send(job, value).await)
+                        .map_err(|error| job_failure(error, Operation::Send, job))
+                }),
+                Control::Cancel { job } => Invocation::unit(move |_| async move {
+                    (jobs.cancel(job).await)
+                        .map(drop)
+                        .map_err(|error| job_failure(error, Operation::Terminate, job))
+                }),
+            }
         },
     )?;
     Ok(())
@@ -171,30 +153,30 @@ async fn list(
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobsArgs {
-    /// Job whose saved output to read; omit to list jobs.
+    /// Job whose saved output to read; omit to list jobs
     job: Option<JobId>,
-    /// Listing only: include finished jobs as well as active ones.
+    /// Listing only: include finished jobs as well as active ones
     #[serde(default)]
     all: bool,
-    /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console.
+    /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console
     field: Option<FieldPointer>,
-    /// One-based first line of text, or element, member or query match of JSON; use returned next_start to continue.
+    /// One-based first line of text, or element, member or query match of JSON; use returned next_start to continue
     #[schemars(range(min = 1), extend("default" = 1))]
     start: Option<usize>,
-    /// What start counts, as the page it continues names its values: lines, elements, members or matches. Required past start 1 on JSON.
+    /// Required past start 1 on JSON
     unit: Option<PageUnit>,
-    /// Maximum returned lines (including match context), values or query matches; without job, the newest jobs listed.
+    /// Maximum returned lines (including match context), values or query matches; without job, the newest jobs listed
     #[schemars(extend("default" = DEFAULT_LIMIT))]
     limit: Option<PageLimit>,
-    /// Case-sensitive regex keeping the lines of text, or the elements and members of JSON whose compact JSON matches; use (?i) for case-insensitive matching.
+    /// Case-sensitive regex keeping the lines of text, or the elements and members of JSON whose compact JSON matches; use (?i) for case-insensitive matching
     pattern: Option<String>,
-    /// Text fields: surrounding lines per pattern match.
+    /// Text fields: surrounding lines per pattern match
     #[schemars(range(min = 0, max = MAX_CONTEXT), extend("default" = 0))]
     context: Option<usize>,
-    /// Text fields: zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
+    /// Text fields: zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue
     #[schemars(range(min = 0), extend("default" = 0))]
     offset: Option<usize>,
-    /// JSONPath (RFC 9535) query over a JSON field, with `$` as the field, e.g. $[?search(@.name, '^api') && @.phase == 'Failed']; returns matches with their pointers. Numeric comparisons use double precision.
+    /// JSONPath (RFC 9535) query over a JSON field, with `$` as the field, e.g. $[?search(@.name, '^api') && @.phase == 'Failed']; returns matches with their pointers. Numeric comparisons use double precision
     query: Option<String>,
 }
 
@@ -259,17 +241,33 @@ impl TryFrom<JobsArgs> for JobsRequest {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobArgs {
+struct ControlArgs {
     job: JobId,
+    /// JSON input
+    send: Option<Value>,
+    /// Cancel the job and its descendants
+    #[serde(default)]
+    cancel: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct JobSendArgs {
-    /// Destination job ID. For child updates or answers, use the agent job; for receive(), use the background script job.
-    job: JobId,
-    /// JSON input. For merged child questions, pass an object keyed directly by question header.
-    value: Value,
+enum Control {
+    Send { job: JobId, value: Value },
+    Cancel { job: JobId },
+}
+
+impl TryFrom<ControlArgs> for Control {
+    type Error = AdmissionError;
+
+    fn try_from(ControlArgs { job, send, cancel }: ControlArgs) -> Result<Self, Self::Error> {
+        match (send, cancel) {
+            (Some(value), false) => Ok(Self::Send { job, value }),
+            (None, true) => Ok(Self::Cancel { job }),
+            (Some(_), true) => Err(AdmissionError::invalid_arguments(
+                "send and cancel are alternatives; pass one",
+            )),
+            (None, false) => Err(AdmissionError::invalid_arguments("pass send or cancel")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +324,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_takes_exactly_one_of_send_or_cancel() {
+        let action = |value: Value| {
+            serde_json::from_value::<ControlArgs>(value)
+                .map_err(AdmissionError::invalid_arguments)
+                .and_then(Control::try_from)
+        };
+        assert!(matches!(
+            action(json!({"job":3, "send":{"a":[1]}})),
+            Ok(Control::Send { job, value }) if job.get() == 3 && value == json!({"a":[1]})
+        ));
+        assert!(matches!(
+            action(json!({"job":3, "cancel":true, "send":null})),
+            Ok(Control::Cancel { job }) if job.get() == 3
+        ));
+        for value in [
+            json!({"job":3}),
+            json!({"job":3, "send":1, "cancel":true}),
+            json!({"send":1}),
+        ] {
+            assert!(action(value.clone()).is_err(), "{value}");
+        }
+    }
+
     #[tokio::test]
     async fn job_output_reads_name_the_requested_job_on_the_host() {
         let runtime = TestRuntime::new().await;
@@ -355,7 +377,11 @@ mod tests {
             assert_eq!(context.site, crate::tool::diagnostic::FailureSite::Host);
         }
         // An unknown job was never touched.
-        let cancel = executor.run_host(&runtime.agent, "job_cancel", json!({"job": unknown}));
+        let cancel = executor.run_host(
+            &runtime.agent,
+            "control",
+            json!({"job": unknown, "cancel": true}),
+        );
         let context = cancel.await.unwrap_err().diagnostic().context;
         assert_eq!(context.effects, Effects::NotStarted);
     }
@@ -533,8 +559,8 @@ mod tests {
         let queued = value(format!(
             r#"
     const accepted = [];
-    for (const value of [{{text:"hello", nested:[1,true]}}, null, false]) {{
-      accepted.push((await tool.job({id}).send({{value}})).unwrap());
+    for (const value of [{{text:"hello", nested:[1,true]}}, 0, false]) {{
+      accepted.push((await tool.control({{job:{id}, send:value}})).unwrap());
     }}
     const pending = await tool.jobs({{job:{id}}});
     return {{accepted, state:pending.state}};
@@ -543,22 +569,21 @@ mod tests {
         .await;
         assert_eq!(queued["accepted"], json!([null, null, null]));
         assert_eq!(queued["state"], "running");
-        value(format!("return tool.job({id}).send({{value:\"last\"}});")).await;
+        value(format!("return tool.control({{job:{id}, send:\"last\"}});")).await;
         runtime.jobs.wait(running, true).await.unwrap();
         let completed = value(format!("return tool.jobs({{job:{id}}});")).await;
         assert_eq!(completed["state"], "completed");
         assert_eq!(
             completed["result"]["value"],
-            json!([{"text":"hello", "nested":[1,true]}, null, false, "last"])
+            json!([{"text":"hello", "nested":[1,true]}, 0, false, "last"])
         );
 
         let waiting = run("return await receive();".into(), true).await.job;
         let id = waiting.get();
-        // The cancel result is the target's view, with no denial code.
         let cancel = format!(
-            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === null;"
+            "await tool.jobs({{job:{id}}}); return (await tool.control({{job:{id}, cancel:true}})).unwrap();"
         );
-        assert_eq!(value(cancel).await, true);
+        assert_eq!(value(cancel).await, Value::Null);
         runtime.jobs.wait(waiting, true).await.unwrap();
         let cancelled = value(format!("return tool.jobs({{job:{id}}});")).await;
         assert_eq!(cancelled["state"], "cancelled");

@@ -5,7 +5,7 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 # The slowest tests start first, so none of them is left running alone at the end of a run.
 # Measured alone: the security scheduler, queue, session and research view tests take 0.4-2.3 s.
 [[profile.default.overrides]]
-filter = 'binary_id(skyhook-security::bin/skyhook-security) & (test(/^tools::tests::/) | test(/^store::/) | test(/^session::tests::/) | test(/^research_view::/))'
+filter = 'binary_id(security::bin/skyhook-security) & (test(/^tools::tests::/) | test(/^store::/) | test(/^session::tests::/) | test(/^research_view::/))'
 priority = 100
 
 # Then the other tests measured at 0.5-1.5 s alone.

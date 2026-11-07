@@ -569,7 +569,7 @@ mod tests {
             children: Vec::new(),
         };
         let state = RuntimeState {
-            date: "2026-09-23".into(),
+            time: "2026-09-23T08:15:30.250Z".parse().unwrap(),
             // A sibling follows a job's children.
             jobs: vec![
                 StateJob {

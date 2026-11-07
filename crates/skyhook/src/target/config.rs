@@ -36,20 +36,20 @@ impl TargetsConfig {
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub r#type: Transport,
-    /// Hostname or IP address.
+    /// Hostname or IP address
     pub host: String,
     #[serde(default)]
     pub ssh: SshOptions,
-    /// Default directory on the destination; defaults to its login directory.
+    /// Default directory on the destination; defaults to its login directory
     #[serde(default = "default_workspace")]
     pub workspace: PathBuf,
-    /// Jump through this target (ProxyJump) within the SSH connection origin starts; the jump must share that origin.
+    /// Jump through this target (ProxyJump) within the SSH connection origin starts; the jump must share that origin
     pub via: Option<String>,
-    /// Target whose Skyhook shim starts the SSH connection, using its key paths and agents; defaults to root.
+    /// Target whose Skyhook shim starts the SSH connection, using its key paths and agents; defaults to root
     pub origin: Option<String>,
 }
 
-/// The transport of a named target; the session host is not a named target.
+/// The transport of a named target; the session host is not a named target
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
@@ -60,11 +60,11 @@ pub enum Transport {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SshOptions {
-    /// Remote user; defaults to the username on the SSH origin.
+    /// Remote user; defaults to the username on the SSH origin
     pub user: Option<String>,
-    /// SSH port; defaults to 22.
+    /// SSH port; defaults to 22
     pub port: Option<NonZeroU16>,
-    /// default offers OpenSSH's default key files; agent offers only keys already in the agent; key offers one private key.
+    /// default offers OpenSSH's default key files; agent offers only keys already in the agent; key offers one private key
     #[serde(default)]
     pub auth: TargetAuth,
     /// Authenticate with, and forward, the agent the origin inherited in SSH_AUTH_SOCK
@@ -73,7 +73,7 @@ pub struct SshOptions {
     #[schemars(skip)]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external_agent: bool,
-    /// Extra ssh_config options written verbatim, e.g. {"ProxyCommand": "sudo -n -u deploy ssh -W %h:%p gateway.internal"}. User, Port and IdentityFile belong in user, port and auth; ProxyJump in the target's via.
+    /// Extra ssh_config options written verbatim, e.g. {"ProxyCommand": "sudo -n -u deploy ssh -W %h:%p gateway.internal"}. User, Port and IdentityFile belong in user, port and auth; ProxyJump in the target's via
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
 }
@@ -85,7 +85,7 @@ pub enum TargetAuth {
     Default,
     Agent,
     Key {
-        /// Private-key path on the SSH origin.
+        /// Private-key path on the SSH origin
         path: PathBuf,
     },
 }

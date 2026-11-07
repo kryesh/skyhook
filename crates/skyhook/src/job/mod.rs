@@ -70,6 +70,8 @@ pub(crate) use views::{
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod index;
 use index::Lookup;
+#[cfg(feature = "script")]
+pub(crate) use index::issuing::Issuing;
 pub(crate) use index::{JobSeeds, Jobs};
 pub(crate) use persistence::{ChildStatus, JobStatus, Settled};
 mod persistence;
@@ -180,7 +182,7 @@ impl From<JobEnd> for JobState {
 
 /// A child agent's result: its final reply, after the visible replies before
 /// it that its foreground call carries, oldest first. Presentation shortens
-/// only the replies.
+/// only the replies
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub struct ChildResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -189,7 +191,7 @@ pub struct ChildResult {
     pub reply: String,
 }
 
-/// A child's visible reply, and when its turn committed it.
+/// A child's visible reply, and when its turn committed it
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub struct ChildReply {
     pub text: String,
@@ -343,16 +345,6 @@ struct JobManagerInner {
     supervisor: Supervisor,
 }
 
-/// A call from its issue until its job is published or refused.
-pub(crate) struct Issuing(SessionStore, JobId);
-
-impl Drop for Issuing {
-    fn drop(&mut self) {
-        let parent = self.1;
-        self.0.enqueue(move |state| state.jobs.issued(parent));
-    }
-}
-
 #[derive(Clone)]
 pub struct JobManager {
     inner: Arc<JobManagerInner>,
@@ -444,14 +436,6 @@ impl JobManager {
             }
             Lookup::Unknown => Err(JobError::Unknown(id)),
         }
-    }
-
-    /// Count a call `parent` issued, synchronously, until its job is published:
-    /// the count is queued ahead of every command its caller issues after it.
-    pub(crate) fn issue(&self, parent: JobId) -> Issuing {
-        let store = self.inner.store.clone();
-        store.enqueue(move |state| state.jobs.issue(parent));
-        Issuing(store, parent)
     }
 
     /// Wait until every call `parent` has issued so far has its job published.

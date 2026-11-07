@@ -174,8 +174,9 @@ pub fn reflow(text: &str) -> String {
 }
 
 string_newtype! {
-    /// Text written for a reader, such as instructions or a hint: never blank.
-    pub struct Prose(Blank) = |text| nonblank("text", text);
+    /// Text written for a reader
+    pub struct Prose(Blank) = |text| nonblank("text", text),
+        schema = schemars::json_schema!({"type": "string", "pattern": "\\S"});
 }
 
 /// An integer argument from `MIN` through `MAX`, a range its schema carries.

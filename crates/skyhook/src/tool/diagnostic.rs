@@ -417,10 +417,6 @@ pub enum Cause {
     UnknownTool {
         tool: String,
     },
-    /// A script-only tool called directly by the model.
-    ModelHidden {
-        tool: String,
-    },
     ScriptUnavailable {
         tool: String,
     },
@@ -617,9 +613,6 @@ impl Diagnostic {
             Cause::UnknownTool { tool } => {
                 text.push_str(&safe_text(&format!("unknown tool `{tool}`")))
             }
-            Cause::ModelHidden { tool } => text.push_str(&safe_text(&format!(
-                "tool `{tool}` is not exposed for direct model calls"
-            ))),
             Cause::ScriptUnavailable { tool } => text.push_str(&safe_text(&format!(
                 "tool `{tool}` is not available in scripts"
             ))),

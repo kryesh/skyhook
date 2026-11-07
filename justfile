@@ -1,38 +1,47 @@
 # Use the installed Rust toolchain, Zig, and just; `just setup` installs the cargo tools.
 set shell := ["bash", "-euo", "pipefail", "-c"]
+# Evaluate host_target only for recipes that use it, so the rest work on an OS it does not map.
+set lazy
 
 # List common development and documentation commands.
 default:
     @just --list
 
-# linux-ssh shim targets; each is staged as target/shims/linux-ssh-<arch>.
-linux_ssh_targets := "x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+# Remote shim targets; each is staged as target/shims/<os>-<arch>.
+shim_targets := "x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
 
-# Install Rust-side tooling and shim targets (Zig must be installed separately).
+# Release builds route C and C++ allocations through mimalloc as well as Rust's.
+release_features := "--features mimalloc/override"
+# Default release target for this machine: releases are static musl builds for Linux.
+host_target := if os() == "linux" { arch() + "-unknown-linux-musl" } else { error("release builds need a Linux host, not " + os()) }
+
+# Install Rust-side tooling, shim targets, and the host release target (Zig must be installed separately).
 setup:
     rustup component add clippy rustfmt
-    rustup target add {{ linux_ssh_targets }}
+    rustup target add {{ shim_targets }} {{ host_target }}
     cargo install --locked cargo-zigbuild cargo-nextest mdbook
 
 # Debug CLI; reads whatever is in target/shims live from disk.
 [positional-arguments]
 run *args:
-    cargo run --locked -p skyhook-cli -- "$@"
+    cargo run --locked -p cli -- "$@"
 
 # Debug security companion; reads whatever is in target/shims live from disk.
 [positional-arguments]
 run-security *args:
-    cargo run --locked -p skyhook-security -- "$@"
+    cargo run --locked -p security -- "$@"
 
 # Debug applications; read whatever is in target/shims live from disk.
 build:
-    cargo build --locked -p skyhook-cli -p skyhook-security
+    cargo build --locked -p cli -p security
 
-# Release applications; embed whatever is in target/shims at compile time.
-build-release:
+# Static release applications for `target`; embed whatever is in target/shims at compile time.
+build-release target=host_target:
     # rust-embed cannot see newly added files; force the embedding module to rebuild.
-    touch crates/skyhook-cli/src/embedded_shims.rs
-    cargo build --locked --release -p skyhook-cli -p skyhook-security
+    touch crates/cli/src/embedded_shims.rs
+    v8=$(scripts/v8-archive.sh {{ quote(target) }}); \
+    RUSTY_V8_ARCHIVE="$v8/librusty_v8.a" RUSTY_V8_SRC_BINDING_PATH="$v8/src_binding.rs" \
+        cargo zigbuild --locked --release -p cli -p security --target {{ quote(target) }} {{ release_features }}
 
 # Debug builds of every shim, staged into target/shims.
 build-shims: (_shims "dev")
@@ -40,13 +49,13 @@ build-shims: (_shims "dev")
 # Size-optimised builds of every shim, staged into target/shims.
 build-shims-release: (_shims "release")
 
-# Release shims, then release applications that embed them.
-build-full: build-shims-release build-release
+# Release shims, then release applications for `target` that embed them.
+build-full target=host_target: build-shims-release (build-release target)
 
-# Build everything for release and install both applications into ~/.local/bin.
+# Build everything for this machine and install both applications into ~/.local/bin.
 install: build-full
-    install -Dm 755 target/release/skyhook ~/.local/bin/skyhook
-    install -Dm 755 target/release/skyhook-security ~/.local/bin/skyhook-security
+    install -Dm 755 target/{{ host_target }}/release/skyhook ~/.local/bin/skyhook
+    install -Dm 755 target/{{ host_target }}/release/skyhook-security ~/.local/bin/skyhook-security
 
 # Run the test suite with nextest.
 test:
@@ -55,6 +64,7 @@ test:
 # Lint all targets.
 lint:
     cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo clippy --locked --workspace --lib --bins --exclude cli --exclude security --no-default-features -- -D warnings
 
 # Format all Rust code.
 fmt:
@@ -76,19 +86,20 @@ pages-build: docs
 pages-publish remote='origin' branch='pages':
     bash scripts/pages-publish.sh {{ quote(remote) }} {{ quote(branch) }}
 
-# Build every shim type in `mode` (dev or release); add new shim recipes here.
+# Build the shims in `mode` (dev or release).
 _shims mode:
     if [ {{ quote(mode) }} = dev ]; then \
-        just _shims_linux_ssh dev debug; \
+        just _shim_targets dev debug; \
     elif [ {{ quote(mode) }} = release ]; then \
-        just _shims_linux_ssh shim-release shim-release; \
+        just _shim_targets shim-release shim-release {{ quote(release_features) }}; \
     else \
         echo "shim mode must be dev or release" >&2; exit 1; \
     fi
 
-# Build the linux-ssh shim for every target in linux_ssh_targets, staged into target/shims.
-_shims_linux_ssh profile dir:
-    for triple in {{ linux_ssh_targets }}; do \
-        cargo zigbuild --locked --profile {{ profile }} -p linux-ssh --target "$triple"; \
-        install -Dm 755 "target/$triple/{{ dir }}/linux-ssh" "target/shims/linux-ssh-${triple%%-*}"; \
+# Build the shim for every target in shim_targets, staged into target/shims.
+_shim_targets profile dir features="":
+    for triple in {{ shim_targets }}; do \
+        os="${triple#*-*-}"; \
+        cargo zigbuild --locked --profile {{ profile }} -p shim --target "$triple" {{ features }}; \
+        install -Dm 755 "target/$triple/{{ dir }}/shim" "target/shims/${os%%-*}-${triple%%-*}"; \
     done

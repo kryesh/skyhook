@@ -106,17 +106,10 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
             ));
         }
         let value = match auth {
-            Auth::Basic { username, password } => {
-                if username.contains(':') {
-                    return Err(AdmissionError::invalid_arguments(
-                        "basic auth username must not contain ':'",
-                    ));
-                }
-                format!(
-                    "Basic {}",
-                    STANDARD.encode(format!("{username}:{password}"))
-                )
-            }
+            Auth::Basic { username, password } => format!(
+                "Basic {}",
+                STANDARD.encode(format!("{username}:{password}"))
+            ),
             Auth::Bearer { token } => format!("Bearer {token}"),
         };
         let mut value = HeaderValue::from_str(&value).map_err(AdmissionError::invalid_arguments)?;

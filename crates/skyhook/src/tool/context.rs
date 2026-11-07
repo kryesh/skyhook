@@ -34,6 +34,8 @@ pub struct ToolContext {
     /// it elsewhere, with a local workspace resolved.
     job_location: ExecutionLocation,
     job_workspace: JobWorkspace,
+    /// The zone the connection approved with the call reported for a remote job.
+    job_zone: Option<crate::target::TimeZone>,
     pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
     authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
@@ -64,6 +66,7 @@ impl ToolContext {
             subject,
             job_location: execution_location.clone(),
             job_workspace: JobWorkspace::Exists,
+            job_zone: None,
             execution_location,
             caller_location,
             process_environment: Default::default(),
@@ -101,6 +104,21 @@ impl ToolContext {
         self.job_location = location;
         self.job_workspace = workspace;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_job_zone(mut self, zone: Option<crate::target::TimeZone>) -> Self {
+        self.job_zone = zone;
+        self
+    }
+
+    /// The time zone of the machine its job runs on: the session host's, or a
+    /// remote's as the connection approved with the call reported it.
+    pub(crate) fn job_zone(&self) -> Option<crate::target::TimeZone> {
+        match self.job_location.is_root() {
+            true => Some(crate::target::TimeZone::local()),
+            false => self.job_zone.clone(),
+        }
     }
 
     #[must_use]
@@ -260,15 +278,6 @@ impl ToolContext {
 
     pub(crate) fn cancellation_token(&self) -> crate::job::CancellationToken {
         self.subject.cancellation.clone()
-    }
-
-    /// Reserve one builtin text capture, removed if abandoned before finishing.
-    pub(crate) async fn text_capture(
-        &self,
-        field: crate::job::output::TextCaptureField,
-    ) -> Result<crate::job::output::PendingCapture, ToolError> {
-        let (field, kind) = (field.pointer(), crate::job::output::CaptureKind::Text);
-        self.jobs.pending_capture(self.job(), field, kind).await
     }
 }
 

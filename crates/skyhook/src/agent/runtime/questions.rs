@@ -662,7 +662,7 @@ mod tests {
             let asked = move |state: &CoreState| crate::job::tests::asked(state, owner);
             let asked = found(&session, [Key::Job(owner)], asked).await;
             assert_eq!(asked, ["child"]);
-            let send = format!("return await tool.job({owner}).send({{value:'parent-answer'}});");
+            let send = format!("return await tool.control({{job:{owner}, send:'parent-answer'}});");
             bounded(session.run_script(send)).await.unwrap();
             let output = terminal(&session, owner).await.output;
             assert_eq!(output, Some(json!({"reply": "done"})));

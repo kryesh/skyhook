@@ -7,7 +7,7 @@ use crate::provider::{
         Cache,
         common::{
             PreparedImages, StateWire, image_url, is_sealed, own_replay, push_state,
-            signed_context, tagged, tool_text, user_parts,
+            signed_context, tagged, user_parts,
         },
         placement::{explicit_breakpoint, push_history},
     },
@@ -158,9 +158,11 @@ impl Input {
                         );
                     }
                     let (output, text) = match dialect.cache {
-                        Cache::Automatic | Cache::Server => (json!(tool_text(result)), None),
+                        Cache::Automatic | Cache::Server => {
+                            (json!(result.result.to_string()), None)
+                        }
                         Cache::Explicit => (
-                            json!([{"type":"input_text", "text":tool_text(result)}]),
+                            json!([{"type":"input_text", "text":result.result.to_string()}]),
                             Some(("output", 0)),
                         ),
                     };
@@ -241,10 +243,7 @@ mod tests {
         );
         assert_eq!(input[1]["call_id"], "call_1");
         let result: Value = serde_json::from_str(input[1]["output"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            result,
-            json!({"result":{"answer":42,"error":null},"is_error":true})
-        );
+        assert_eq!(result, json!({"answer":42,"error":null}));
         assert_eq!(input[2]["content"][1]["image_url"], image_url);
     }
 
@@ -558,7 +557,7 @@ mod tests {
         }
         assert_eq!(
             serde_json::from_str::<Value>(input[2]["output"][0]["text"].as_str().unwrap()).unwrap(),
-            json!({"result":{"failed":true}, "is_error":true})
+            json!({"failed":true})
         );
         assert_eq!(
             input[4]["content"][0]["text"],
@@ -674,10 +673,7 @@ mod tests {
                 {"type":"input_text", "text":"old"}
             ])
         );
-        assert_eq!(
-            input[2]["output"],
-            json!(r#"{"result":{"failure":"details"},"is_error":true}"#)
-        );
+        assert_eq!(input[2]["output"], json!(r#"{"failure":"details"}"#));
         assert_eq!(input[3]["content"][0]["text"], "now");
     }
 

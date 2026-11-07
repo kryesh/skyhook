@@ -1,21 +1,21 @@
-//! Provider-facing definitions, script manifests, and compact schema documentation.
+//! Provider-facing definitions and compact schema documentation.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::LazyLock,
 };
 
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::json_schema::{Node, Resolver};
 use crate::provider::protocol::ToolDefinition as ProviderToolDefinition;
 
-use super::{ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
+use super::ToolSurface;
 
 static JOB_VIEW_TYPE: LazyLock<String> = LazyLock::new(|| {
-    let schema = &crate::job::JOB_VIEW_SCHEMAS.view;
-    schema_type(schema, schema)
+    let (rendered, definitions) =
+        result_type(&crate::job::JOB_VIEW_SCHEMAS.view, Documented::Expanded);
+    format!("{rendered}{definitions}")
 });
 
 /// The schema keyword marking a type the prompt spells out in full, holding the name a result
@@ -23,17 +23,17 @@ static JOB_VIEW_TYPE: LazyLock<String> = LazyLock::new(|| {
 /// name keeps its fields.
 pub(crate) const DOCUMENTED: &str = "x-skyhook-documented";
 
-/// Append the response type to `description` after `lead`, a JobView of the
-/// result type, unless the result is plain JSON.
-fn describe(description: &str, lead: &str, result: Option<&Value>) -> String {
+/// Append the response type to `description` in its own paragraph, as the tool's rather
+/// than its last sentence's: a JobView of the result type, unless the result is plain JSON.
+fn describe(description: &str, result: Option<&Value>) -> String {
     let Some(schema) = result else {
         return description.to_owned();
     };
-    let (rendered, definitions) = result_type(schema);
+    let (rendered, definitions) = result_type(schema, Documented::Named);
     if rendered == "JSON" {
         return description.to_owned();
     }
-    format!("{description}{lead} `JobView<{rendered}>{definitions}`.")
+    format!("{description}\n\nResult: `JobView<{rendered}>{definitions}`")
 }
 
 impl ToolSurface {
@@ -47,40 +47,14 @@ impl ToolSurface {
     fn generate_definitions(&self) -> Vec<std::sync::Arc<ProviderToolDefinition>> {
         self.tools
             .values()
-            .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
             .map(|tool| {
-                let description =
-                    // Its own paragraph: the type is the tool's, not its last sentence's.
-                    describe(&tool.description, "\n\nResult:", tool.result_schema.as_ref());
-                let description = if tool.job_role == crate::job::JobRole::Script {
-                    self.script_description(&description)
-                } else {
-                    description
-                };
                 std::sync::Arc::new(ProviderToolDefinition {
                     name: tool.name.clone(),
-                    description,
+                    description: describe(&tool.description, tool.result_schema.as_ref()),
                     input_schema: tool.input_schema.clone(),
                 })
             })
             .collect()
-    }
-
-    fn script_description(&self, base: &str) -> String {
-        let documented = self
-            .tools
-            .values()
-            .filter(|tool| tool.exposure == ToolExposure::ScriptOnly)
-            .filter_map(|tool| Some(ScriptManifest::from_tool(tool)?.documentation(tool)))
-            .collect::<Vec<_>>();
-        if documented.is_empty() {
-            base.to_owned()
-        } else {
-            format!(
-                "{base}\n\nJob controls and additional script APIs:\n{}",
-                documented.join("\n")
-            )
-        }
     }
 }
 
@@ -88,106 +62,12 @@ pub(crate) fn job_view_type() -> &'static str {
     &JOB_VIEW_TYPE
 }
 
-#[derive(Clone, Serialize)]
-pub(crate) struct ScriptManifest {
-    name: String,
-    /// How a script spells the call: `tool.<name>`, or `tool.job(id).<method>`.
-    call: String,
-    properties: Vec<String>,
-    #[serde(skip)]
-    required: Vec<String>,
-    #[serde(flatten)]
-    binding: ScriptBinding,
-}
-
-impl ScriptManifest {
-    /// The script call for `tool`, whose arguments omit a job method's job.
-    pub(super) fn from_tool(tool: &ToolSpec) -> Option<Self> {
-        let excluded = match &tool.script_binding {
-            ScriptBinding::TopLevel => None,
-            ScriptBinding::JobMethod { job_argument, .. } => Some(*job_argument),
-            ScriptBinding::Unavailable => return None,
-        };
-        let included = |property: &&str| Some(*property) != excluded;
-        let schema = &tool.input_schema;
-        let properties = (schema["properties"].as_object().into_iter())
-            .flat_map(|properties| properties.keys().map(String::as_str))
-            .filter(included)
-            .map(str::to_owned)
-            .collect();
-        let required = (schema["required"].as_array().into_iter().flatten())
-            .filter_map(Value::as_str)
-            .filter(included)
-            .map(str::to_owned)
-            .collect();
-        let call = match &tool.script_binding {
-            ScriptBinding::JobMethod { method, .. } => format!("tool.job(id).{method}"),
-            _ => format!("tool.{}", tool.name),
-        };
-        Some(Self {
-            name: tool.name.clone(),
-            call,
-            properties,
-            required,
-            binding: tool.script_binding.clone(),
-        })
-    }
-
-    fn documentation(&self, tool: &ToolSpec) -> String {
-        let schema = &tool.input_schema;
-        let field = |name: &str| &schema["properties"][name];
-        let fields = (self.properties.iter())
-            .map(|name| {
-                let optional = if self.required.contains(name) {
-                    ""
-                } else {
-                    "?"
-                };
-                let default = (field(name).get("default"))
-                    .map_or_else(String::new, |value| format!("={}", compact_json(value)));
-                format!(
-                    "{name}{optional}: {}{default}",
-                    schema_type(field(name), schema)
-                )
-            })
-            .collect::<Vec<_>>();
-        let arguments = if fields.is_empty() {
-            "()".to_owned()
-        } else {
-            format!("({{{}}})", fields.join(", "))
-        };
-        let call = format!("{}{arguments}", self.call);
-        let field_docs = (self.properties.iter())
-            .filter_map(|name| {
-                let description = field(name).get("description")?;
-                Some(format!(
-                    " `{name}`: {}",
-                    description.as_str().unwrap_or_default()
-                ))
-            })
-            .collect::<String>();
-        let description = describe(&tool.description, " Returns", tool.result_schema.as_ref());
-        format!("- `{call}` — {description}{field_docs}")
-    }
-}
-
-fn schema_type<'a>(field: &'a Value, root: &'a Value) -> String {
-    let renderer = Renderer::new(root, BTreeSet::new(), Documented::Expanded);
-    let node = Node::root(root).child(field);
-    let mut active = if std::ptr::eq(field, root) {
-        vec![node]
-    } else {
-        Vec::new()
-    };
-    renderer.render(node, false, &mut active)
-}
-
 /// Render a result type, defining each definition referenced more than once
 /// a single time after the type instead of expanding it at every use: the type
 /// and those definitions' suffix.
-fn result_type(schema: &Value) -> (String, String) {
+fn result_type(schema: &Value, documented: Documented) -> (String, String) {
     let mut counts = BTreeMap::<&str, usize>::new();
-    count_references(schema, schema, &mut counts);
+    count_references(schema, schema, documented, &mut counts);
     let shared = counts
         .into_iter()
         .filter(|(reference, count)| {
@@ -199,7 +79,7 @@ fn result_type(schema: &Value) -> (String, String) {
         })
         .map(|(reference, _)| reference)
         .collect::<BTreeSet<_>>();
-    let renderer = Renderer::new(schema, shared, Documented::Named);
+    let renderer = Renderer::new(schema, shared, documented);
     let root = Node::root(schema);
     let rendered = renderer.render(root, false, &mut vec![root]);
     let definitions = (renderer.shared.iter())
@@ -220,10 +100,16 @@ fn result_type(schema: &Value) -> (String, String) {
 }
 
 /// Count the references `value` renders, walking each definition it reaches once: a documented
-/// type renders by name, so what it references is left out.
-fn count_references<'a>(root: &'a Value, value: &'a Value, counts: &mut BTreeMap<&'a str, usize>) {
+/// type named by `mode` renders by name, so what it references is left out.
+fn count_references<'a>(
+    root: &'a Value,
+    value: &'a Value,
+    mode: Documented,
+    counts: &mut BTreeMap<&'a str, usize>,
+) {
+    let named = |schema| mode == Documented::Named && documented(schema).is_some();
     match value {
-        Value::Object(object) if documented(value).is_none() => {
+        Value::Object(object) if !named(value) => {
             for (key, value) in object {
                 match (key.as_str(), value) {
                     ("$defs", _) => {}
@@ -231,22 +117,22 @@ fn count_references<'a>(root: &'a Value, value: &'a Value, counts: &mut BTreeMap
                         let target =
                             (reference.strip_prefix('#')).and_then(|pointer| root.pointer(pointer));
                         let Some(target) = target else { continue };
-                        if documented(target).is_some() {
+                        if named(target) {
                             continue;
                         }
                         let count = counts.entry(reference.as_str()).or_default();
                         *count += 1;
                         if *count == 1 && reference != "#" {
-                            count_references(root, target, counts);
+                            count_references(root, target, mode, counts);
                         }
                     }
-                    _ => count_references(root, value, counts),
+                    _ => count_references(root, value, mode, counts),
                 }
             }
         }
         Value::Array(values) => values
             .iter()
-            .for_each(|value| count_references(root, value, counts)),
+            .for_each(|value| count_references(root, value, mode, counts)),
         _ => {}
     }
 }
@@ -326,6 +212,9 @@ impl<'a> Renderer<'a> {
             })
         {
             return format!("({})", self.render(node, false, active));
+        }
+        if let Some(value) = field.get("const") {
+            return compact_json(value);
         }
         if let Some(values) = field.get("enum").and_then(Value::as_array) {
             return values
@@ -427,11 +316,17 @@ mod tests {
                 "next":{"anyOf":[{"$ref":"#/$defs/Node"},{"type":"null"}]}
             },"required":["next"]}}
         });
-        assert_eq!(schema_type(&node, &node), "{next:Node | null}");
+        assert_eq!(
+            result_type(&node, Documented::Expanded),
+            ("Node".into(), "` where `Node = {next:Node | null}".into())
+        );
         let tree = json!({"title":"Tree","type":"object", "properties":{
             "children":{"type":"array","items":{"$ref":"#"}}
         },"required":["children"]});
-        assert_eq!(schema_type(&tree, &tree), "{children:Tree[]}");
+        assert_eq!(
+            result_type(&tree, Documented::Expanded),
+            ("{children:Tree[]}".into(), String::new())
+        );
         let view = job_view_type();
         assert!(view.contains("result?:JSON"));
         assert!(view.contains("JobView"));
@@ -447,20 +342,20 @@ mod tests {
             json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]});
         let schema = json!({
             "anyOf":[
-                {"type":"object","properties":{"body":{"$ref":"#/$defs/Body"}},"required":["body"]},
+                {"type":"object","properties":{"kind":{"type":"string","const":"full"},"body":{"$ref":"#/$defs/Body"}},"required":["kind","body"]},
                 {"type":"object","properties":{"body":{"$ref":"#/$defs/Body"},"once":{"$ref":"#/$defs/Once"}}}
             ],
             "$defs":{"Body":body, "Once":{"type":"integer"}}
         });
         let result = schema;
         assert_eq!(
-            describe("Send.", " Returns", Some(&result)),
-            "Send. Returns `JobView<{body:Body} | {body?:Body, once?:integer}>` where `Body = {text:string}`."
+            describe("Send.", Some(&result)),
+            "Send.\n\nResult: `JobView<{kind:\"full\", body:Body} | {body?:Body, once?:integer}>` where `Body = {text:string}`"
         );
         let listing = &crate::job::JOB_VIEW_SCHEMAS.listing;
         assert_eq!(
-            describe("List.", " Returns", Some(listing)),
-            "List. Returns `JobView<{jobs:JobView[], older?:integer}>`.",
+            describe("List.", Some(listing)),
+            "List.\n\nResult: `JobView<{jobs:JobView[], older?:integer}>`",
             "a documented type renders by name, without what it references"
         );
         let host = json!({
@@ -469,8 +364,8 @@ mod tests {
             "$defs":{"JobView":{"type":"object","properties":{"rows":{"type":"integer"}}}}
         });
         assert_eq!(
-            describe("Count.", " Returns", Some(&host)),
-            "Count. Returns `JobView<{job:{rows?:integer}}>`.",
+            describe("Count.", Some(&host)),
+            "Count.\n\nResult: `JobView<{job:{rows?:integer}}>`",
             "a host type sharing the name keeps its fields"
         );
     }

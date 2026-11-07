@@ -147,8 +147,10 @@ to return the redirect response. `max_redirects` defaults to 5. Changed origins 
 cross-origin requests do not inherit sensitive request headers, and HTTPS-to-HTTP redirects are
 rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
 `proxy` selects an explicit HTTP proxy; otherwise fetch uses the target's proxy environment.
-`insecure` defaults to **false**. Setting it to **true** disables HTTPS certificate validation for
-that invocation only; it does not disable authorization or permit HTTPS downgrade redirects.
+HTTPS, here and for every other connection Skyhook makes, trusts the bundled Mozilla root list
+plus the system's CA store when one is present. `insecure` defaults to **false**. Setting it to
+**true** disables HTTPS certificate validation for that invocation only; it does not disable
+authorization or permit HTTPS downgrade redirects.
 
 All requests require the `network` capability and approval, not just filesystem `read` permission.
 File uploads additionally require `read`, and downloads require `write`, including paths inside

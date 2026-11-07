@@ -148,19 +148,20 @@ where
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitArgs {
-    /// Maximum seconds to wait, as a positive integer, at most 1800. Omitted/null waits 1800.
-    pub(super) timeout: Option<std::num::NonZeroU64>,
+    /// Maximum seconds to wait
+    #[schemars(extend("default" = MAX_WAIT))]
+    pub(super) timeout: Option<WaitSeconds>,
 }
+
+type WaitSeconds = crate::newtype::Bounded<1, 1800>;
 
 /// The longest a wait lasts, and how long one without a timeout lasts: a bound wait
 /// returns control to an agent stuck on work that will never report.
-const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+const MAX_WAIT: WaitSeconds = WaitSeconds::new::<1800>();
 
 impl WaitArgs {
     fn duration(&self) -> Duration {
-        (self.timeout).map_or(MAX_WAIT, |seconds| {
-            Duration::from_secs(seconds.get()).min(MAX_WAIT)
-        })
+        Duration::from_secs(self.timeout.unwrap_or(MAX_WAIT).into())
     }
 }
 
@@ -174,7 +175,7 @@ pub(super) enum WakeReason {
 #[derive(Serialize, JsonSchema, Debug, PartialEq)]
 pub(super) struct WaitOutput {
     pub(super) reason: WakeReason,
-    /// Whole seconds waited.
+    /// Whole seconds waited
     pub(super) waited_s: u64,
 }
 
@@ -443,9 +444,7 @@ pub(super) mod tests {
             _ => &[],
         });
         let entries = blocks.flat_map(|block| match block {
-            SentPart::Runtime { text } => text
-                .strip_prefix("<skyhook_job_events>\n")
-                .and_then(|json| json.strip_suffix("\n</skyhook_job_events>"))
+            SentPart::Runtime { text } => (crate::session::JOB_EVENTS.body(text))
                 .map(|json| serde_json::from_str::<Vec<Value>>(json).unwrap())
                 .unwrap_or_default(),
             _ => Vec::new(),

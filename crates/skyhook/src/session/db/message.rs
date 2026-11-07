@@ -139,11 +139,11 @@ impl Encoder {
     fn state(&mut self, db: &Db, message: i64, state: &RuntimeState) -> DbResult<()> {
         let target = self.target(db, &state.location.target)?;
         db.execute(
-            "INSERT INTO message_state (message, date, location_target, location_workspace, host) \
+            "INSERT INTO message_state (message, time, location_target, location_workspace, host) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 message,
-                &state.date,
+                state.time.timestamp_millis(),
                 target,
                 path_bytes(&state.location.workspace),
                 state.host.as_ref().map(crate::Prose::as_str)
@@ -388,7 +388,14 @@ pub(super) struct Messages {
     roles: HashMap<i64, MessageRole>,
     parts: HashMap<i64, Vec<UserPartRow>>,
     /// date, location and host section, per state message
-    states: HashMap<i64, (String, ExecutionLocation, Option<crate::Prose>)>,
+    states: HashMap<
+        i64,
+        (
+            chrono::DateTime<chrono::Utc>,
+            ExecutionLocation,
+            Option<crate::Prose>,
+        ),
+    >,
     state_jobs: HashMap<i64, Vec<StateJobRow>>,
     state_todos: HashMap<i64, Vec<TodoItem>>,
     job_events: HashMap<i64, Vec<JobEvent>>,
@@ -616,13 +623,15 @@ impl Messages {
             states: keyed(
                 db,
                 scope.query(
-                    "SELECT s.message, s.date, t.name, s.location_workspace, s.host \
+                    "SELECT s.message, s.time, t.name, s.location_workspace, s.host \
                      FROM message_state s JOIN target t ON t.id = s.location_target {scope}",
                     Owner::Message("s.message"),
                 )?,
                 |row| {
+                    let time = chrono::DateTime::from_timestamp_millis(row.get(1)?)
+                        .ok_or_else(|| corrupt("state time is out of range"))?;
                     let host = row.get::<Option<String>>(4)?.map(parsed).transpose()?;
-                    Ok((row.get(1)?, location(row.get(2)?, row.get(3)?)?, host))
+                    Ok((time, location(row.get(2)?, row.get(3)?)?, host))
                 },
             )?,
             state_jobs: grouped(
@@ -778,7 +787,7 @@ impl Messages {
                 Message::User(content)
             }
             MessageRole::State => {
-                let (date, location, host) = self
+                let (time, location, host) = self
                     .states
                     .get(&id)
                     .cloned()
@@ -789,7 +798,7 @@ impl Messages {
                     return Err(corrupt("state jobs are not in pre-order"));
                 }
                 Message::State(RuntimeState {
-                    date,
+                    time,
                     jobs,
                     todos: self.state_todos.get(&id).cloned().unwrap_or_default(),
                     location,

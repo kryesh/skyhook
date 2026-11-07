@@ -29,7 +29,7 @@ const FIT_JPEG_QUALITY: u8 = 85;
 
 named_enum! {
     /// A supported image encoding, identified from the image bytes themselves and
-    /// spelled as its media type.
+    /// spelled as its media type
     #[derive(
         Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema,
     )]

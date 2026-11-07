@@ -33,6 +33,8 @@ pub(super) struct ModeChange {
     pub(super) mode: AppliedMode,
     pub(super) depth: usize,
     pub(super) capabilities: CapabilitySet,
+    /// The zone the mode rendered in, which the root's new prompt is built in too.
+    pub(super) zone: Option<crate::target::TimeZone>,
 }
 
 impl ModeChange {
@@ -66,13 +68,22 @@ impl SessionRuntime {
         });
         let (location, depth, rendered) =
             held.ok_or_else(|| HarnessError::NoRecordedModel(agent.clone()))?;
-        let (mode, granted) =
-            self.applied(name, agent.depth(), &location, depth, &self.capabilities)?;
+        // Only a root changes mode, and a root runs on the session host.
+        let zone = Some(crate::target::TimeZone::local());
+        let (mode, granted) = self.applied(
+            name,
+            agent.depth(),
+            &location,
+            depth,
+            &self.capabilities,
+            zone.clone(),
+        )?;
         let unchanged = current == Some(&mode) && rendered == granted;
         Ok((!unchanged).then_some(ModeChange {
             mode,
             depth,
             capabilities: granted,
+            zone,
         }))
     }
 

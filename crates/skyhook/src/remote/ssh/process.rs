@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     remote::{
-        artifact::{EmbeddedShimCatalog, Platform, ShimProtocol},
+        artifact::{EmbeddedShim, EmbeddedShimCatalog, Platform},
         backend::ProcessEnvironment,
         client::Session,
         error::{DeploymentError, RemoteError, SshError},
@@ -176,9 +176,9 @@ impl SshLauncher {
                 os: os.to_owned(),
                 arch: arch.to_owned(),
             })?;
-        let shim = catalog.find(ShimProtocol::Ssh, platform)?;
+        let shim = catalog.find(platform)?;
         let hash = shim.sha256();
-        let path = format!("{SHIM_DIR}/{hash}/{}", shim.installed_name());
+        let path = format!("{SHIM_DIR}/{hash}/{}", EmbeddedShim::INSTALLED_NAME);
         let check = format!(
             "test -x \"$HOME/{path}\" && \"$HOME/{path}\" {SELF_CHECK} {hash} && echo skyhook-valid"
         );

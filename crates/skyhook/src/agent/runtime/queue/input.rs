@@ -70,8 +70,9 @@ impl SessionRuntime {
             };
             let replacement = if let Some(change) = &mode {
                 let (mode, capabilities) = (Some(&change.mode), &change.capabilities);
+                let (location, zone) = (turn.location, change.zone.clone());
                 let system =
-                    self.system_prompt(agent, turn.location, change.depth, mode, capabilities)?;
+                    self.system_prompt(agent, location, change.depth, mode, capabilities, zone)?;
                 let context = self
                     .open_agent_context(agent, snapshot.clone(), system, capabilities, None)
                     .await?;
@@ -220,7 +221,7 @@ mod tests {
         // Exercise the public script send as well as the underlying job mailbox.
         let first = json!({"instruction": "test:parent-one", "nested": [1, true]});
         let second = json!("test:parent-two");
-        let send = format!("return (await tool.job({job}).send({{value:{first}}})).unwrap();");
+        let send = format!("return (await tool.control({{job:{job}, send:{first}}})).unwrap();");
         let accepted = bounded(session.run_script(send)).await.unwrap();
         assert_eq!(accepted.value["value"], serde_json::Value::Null);
         forwarded(1).await;

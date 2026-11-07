@@ -7,7 +7,6 @@ use serde_json::{Map, Value};
 
 use std::collections::BTreeMap;
 
-use super::source::Layout;
 use crate::{
     job::{FieldPointer, JobState},
     tool::output::FieldPresentation,
@@ -15,11 +14,12 @@ use crate::{
 };
 
 #[derive(Serialize)]
-pub(super) struct Config<'a> {
+pub(super) struct Config {
     pub(super) builders: Vec<ScriptManifest>,
     /// The states a job ends in, which a call's view unwraps to its result or error.
     pub(super) terminal: Vec<JobState>,
-    pub(super) source: &'a Layout,
+    /// The module name of the submitted body's frames.
+    pub(super) filename: &'static str,
 }
 
 #[derive(Deserialize)]

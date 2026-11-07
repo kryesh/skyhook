@@ -115,16 +115,16 @@ files.
 ## Building and packaging artifacts
 
 Shims are built explicitly, never as a side effect of building the CLI. `just build-shims` builds
-every shim type with Cargo's `dev` profile; `just build-shims-release` uses the size-optimised,
-stripped `shim-release` profile. The `linux-ssh` shim is cross-compiled with `cargo zigbuild` for
-every target in the justfile's `linux_ssh_targets` and staged into `target/shims/`, replacing the
-previous variant. New shim types belong in the justfile's `_shims` recipe. `just setup` installs
+every shim with Cargo's `dev` profile; `just build-shims-release` uses the size-optimised,
+stripped `shim-release` profile. One `shim` binary per platform serves every protocol that platform
+uses. It is cross-compiled with `cargo zigbuild` for every target in the justfile's `shim_targets`
+and staged into `target/shims/` as `<os>-<arch>`, replacing the previous variant. `just setup` installs
 `cargo-zigbuild` and the musl targets; Zig itself must be installed separately.
 
-| Platform | Protocol | Architecture | Rust target | Artifact |
-| --- | --- | --- | --- | --- |
-| `linux` | `ssh` | `x86_64` | `x86_64-unknown-linux-musl` | `target/shims/linux-ssh-x86_64` |
-| `linux` | `ssh` | `aarch64` | `aarch64-unknown-linux-musl` | `target/shims/linux-ssh-aarch64` |
+| Platform | Architecture | Rust target | Artifact |
+| --- | --- | --- | --- |
+| `linux` | `x86_64` | `x86_64-unknown-linux-musl` | `target/shims/linux-x86_64` |
+| `linux` | `aarch64` | `aarch64-unknown-linux-musl` | `target/shims/linux-aarch64` |
 
 The CLI discovers staged artifacts through `rust-embed`, without checking which build profile
 produced them. Debug builds (`just build`) read the directory live, so rebuilding shims needs no
@@ -137,17 +137,17 @@ staging directory yields an empty catalog; SSH then reports an explicit missing-
 from an unsupported remote platform. Library hosts inject their own [embedded catalog](embedding.md#embedded-shim-catalog)
 rather than inheriting the CLI catalog.
 
-Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without
-Zig or UI dependencies:
+Git contains source only, not prebuilt shim binaries. To build a native shim without Zig or UI
+dependencies:
 
 ```sh
-cargo build -p linux-ssh
+cargo build -p shim
 ```
 
 This Cargo command builds the binary but does not stage it into `target/shims/`. See
 [development setup](setup.md) for the recipe list, including the combined shim and CLI build.
 
 Source: [remote module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/remote),
-[shim binary](https://github.com/kryesh/skyhook/tree/main/crates/linux-ssh),
-[CLI catalog](https://github.com/kryesh/skyhook/blob/main/crates/skyhook-cli/src/embedded_shims.rs), and
+[shim binary](https://github.com/kryesh/skyhook/tree/main/crates/shim),
+[CLI catalog](https://github.com/kryesh/skyhook/blob/main/crates/cli/src/embedded_shims.rs), and
 [build recipes](https://github.com/kryesh/skyhook/blob/main/justfile).

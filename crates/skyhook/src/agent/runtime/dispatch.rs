@@ -61,7 +61,7 @@ impl PreparedAgentLaunch {
             return Err(HarnessError::ChildDepth);
         }
         let remaining_depth = runtime.harness.max_child_depth.saturating_sub(id.depth());
-        let (contract, (available_depth, capabilities), start) = match launch {
+        let (contract, (available_depth, capabilities), start, zone) = match launch {
             AgentLaunch::New {
                 model,
                 todos,
@@ -69,6 +69,7 @@ impl PreparedAgentLaunch {
                 location,
                 mode,
                 capabilities,
+                zone,
             } => {
                 if available_depth > remaining_depth {
                     return Err(HarnessError::ChildDepth);
@@ -83,7 +84,7 @@ impl PreparedAgentLaunch {
                     context: None,
                 };
                 let grants = (available_depth, capabilities.for_agent(available_depth));
-                (contract, grants, Start::New(todos))
+                (contract, grants, Start::New(todos), Some(zone))
             }
             // Resumed as its journal leaves its last turn.
             AgentLaunch::Resume { on } => {
@@ -102,7 +103,7 @@ impl PreparedAgentLaunch {
                     contract.profile = crate::session::ProfileSnapshot { name, profile };
                 }
                 let start = Start::Resume(resumed, journaled.into(), ended);
-                (contract, grants, start)
+                (contract, grants, start, None)
             }
         };
         let RecordedContract {
@@ -118,13 +119,16 @@ impl PreparedAgentLaunch {
         // the provider that serves it.
         let system = match system {
             Some(system) => system,
-            None => runtime.system_prompt(
-                &id,
-                &location,
-                available_depth,
-                mode.as_ref(),
-                &capabilities,
-            )?,
+            None => {
+                // One resumed without a context has no call that approved a connection,
+                // so a remote zone is known only from the launch that brought it.
+                let zone = zone.unwrap_or_else(|| match location.target {
+                    crate::target::TargetRef::Root => Some(crate::target::TimeZone::local()),
+                    crate::target::TargetRef::Named(_) => None,
+                });
+                let mode = mode.as_ref();
+                runtime.system_prompt(&id, &location, available_depth, mode, &capabilities, zone)?
+            }
         };
         let context =
             (runtime.open_agent_context(&id, profile, system, &capabilities, tools)).await?;
@@ -506,12 +510,13 @@ impl SessionRuntime {
         location: &crate::execution::ExecutionLocation,
         available_depth: usize,
         ceiling: &CapabilitySet,
+        zone: Option<crate::target::TimeZone>,
     ) -> Result<(AppliedMode, CapabilitySet), HarnessError> {
         let definition = self.harness.modes.get(name);
         let definition = definition.ok_or_else(|| HarnessError::UnknownMode(name.clone()))?;
         let capabilities = definition.granted(ceiling).for_agent(available_depth);
         let grants = (available_depth, &capabilities);
-        let agent = self.prompt_agent(depth, location, grants, Some(name))?;
+        let agent = self.prompt_agent(depth, location, grants, Some(name), zone)?;
         let definition = self.harness.prompts.edition(definition, &agent)?.into();
         let name = name.clone();
         Ok((AppliedMode { name, definition }, capabilities))
@@ -525,6 +530,7 @@ impl SessionRuntime {
         location: &'a crate::execution::ExecutionLocation,
         (available_depth, capabilities): (usize, &'a CapabilitySet),
         mode: Option<&'a ModeName>,
+        zone: Option<crate::target::TimeZone>,
     ) -> Result<crate::prompts::Agent<'a>, HarnessError> {
         let definition = match &location.target {
             crate::target::TargetRef::Root => None,
@@ -540,6 +546,7 @@ impl SessionRuntime {
             workspace: &location.workspace,
             target: &location.target,
             definition,
+            zone,
         })
     }
 
@@ -550,10 +557,11 @@ impl SessionRuntime {
         available_depth: usize,
         mode: Option<&AppliedMode>,
         capabilities: &CapabilitySet,
+        zone: Option<crate::target::TimeZone>,
     ) -> Result<Vec<SystemSegment>, HarnessError> {
         let grants = (available_depth, capabilities);
         let name = mode.map(|mode| &mode.name);
-        let agent = self.prompt_agent(agent.depth(), location, grants, name)?;
+        let agent = self.prompt_agent(agent.depth(), location, grants, name, zone)?;
         let instructions = mode.and_then(|mode| mode.definition.instructions.as_ref());
         let prompts = &self.harness.prompts;
         let text = prompts.system(&agent, instructions, &self.harness.instructions)?;
@@ -1006,7 +1014,10 @@ mod tests {
         assert_eq!(requests.len(), 3);
         let child_request = &requests[1];
         let state = request_runtime_state(child_request);
-        assert!(state.contains("\ntodos:\n"), "{state}");
+        assert!(
+            state.contains("\nin_progress:\n  Make the change\n"),
+            "{state}"
+        );
         let seeded: Vec<crate::agent::TodoItem> = serde_json::from_value(todos).unwrap();
         let child = session.root.child(1);
         let journaled = session.runtime.store.inspect_todos(&child, None).unwrap();
@@ -1108,7 +1119,7 @@ mod tests {
             let error = view["error"].as_str().unwrap();
             assert!(error.contains("already exists"), "{error}");
             assert!(
-                error.contains(&format!("tool.job({existing}).send")),
+                error.contains(&format!("control({{job: {existing}, send: ...}})")),
                 "{error}"
             );
         };

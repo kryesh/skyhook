@@ -543,10 +543,10 @@ computes the CVSS-B score and severity.
 
 ## Building
 
-The companion is the `skyhook-security` crate of the workspace:
+The companion is the `security` crate of the workspace:
 
 ```sh
-cargo run -p skyhook-security -- --help
+cargo run -p security -- --help
 ```
 
 The release build includes both applications; stage shims first when SSH execution is needed

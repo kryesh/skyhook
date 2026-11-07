@@ -23,10 +23,12 @@ use crate::{
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SkillArgs {
-    /// Skill to use; omit to list available skills.
+    /// Skill to use; omit to list available skills
+    #[schemars(regex(pattern = r"\S"))]
     name: Option<String>,
-    /// Relative file or directory within the skill; `.` lists its root. Omitted or null loads instructions.
+    /// Relative file or directory within the skill; `.` lists its root. Omitted or null loads instructions
     #[serde(default)]
+    #[schemars(regex(pattern = r"\S"))]
     path: Option<String>,
 }
 
@@ -40,17 +42,6 @@ impl TryFrom<SkillArgs> for SkillRequest {
     type Error = AdmissionError;
 
     fn try_from(args: SkillArgs) -> Result<Self, Self::Error> {
-        // Never trim the retained name or asset: spaces may be meaningful filename bytes.
-        for (name, value) in [
-            ("name", args.name.as_deref()),
-            ("path", args.path.as_deref()),
-        ] {
-            if value.is_some_and(|value| value.trim().is_empty()) {
-                return Err(AdmissionError::invalid_arguments(format!(
-                    "{name} must not be empty"
-                )));
-            }
-        }
         match (args.name, args.path) {
             (None, None) => Ok(Self::List),
             (None, Some(_)) => Err(AdmissionError::invalid_arguments("path requires name")),
@@ -354,7 +345,7 @@ pub(super) fn register(
     }
     builder.register_checked(
         "skill",
-        "List host-owned skills, or with `name` load complete skill instructions and discover assets. Select a relative path to list a directory (use `.` for the root), read text, attach a supported image, or inspect binary metadata; copy binary contents with write's source from the skill location.",
+        "List host-owned skills, or with `name` load complete skill instructions and discover assets. Select a relative path to list a directory, read text, attach a supported image, or inspect binary metadata; copy binary contents with write's source from the skill location",
         ToolOptions::new(vec![Capability::Read])
             .result::<SkillOutput>()
             .conditional_output(
@@ -587,9 +578,9 @@ enum SkillOutput {
         skills: Vec<SkillSummary>,
     },
     Skill {
-        /// The skill directory, for `read` and `write` sources.
+        /// The skill directory, for `read` and `write` sources
         location: Option<crate::target::TargetPath>,
-        /// The skill's instructions, never shortened.
+        /// The skill's instructions, never shortened
         #[schemars(transform = crate::tool::output::complete)]
         content: String,
         assets: Option<String>,

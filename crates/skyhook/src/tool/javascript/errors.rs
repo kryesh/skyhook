@@ -10,6 +10,7 @@ use crate::tool::{
 
 use super::{
     bridge::{Failure, Returned},
+    engine::MIB,
     source::MAX_SOURCE_BYTES,
 };
 
@@ -19,12 +20,14 @@ pub(super) enum JsError {
     SourceTooLarge,
     #[error("{0}")]
     Syntax(String),
-    #[error("QuickJS initialization failed: {0}")]
+    #[error("JavaScript runtime initialization failed: {0}")]
     Initialization(String),
-    #[error("QuickJS execution failed: {0}")]
+    #[error("JavaScript execution failed: {0}")]
     Execution(String),
-    #[error("QuickJS execution was cancelled")]
+    #[error("JavaScript execution was cancelled")]
     Cancelled,
+    #[error("JavaScript heap limit ({} MiB) exceeded", .0 / MIB)]
+    HeapLimit(usize),
     /// With what the script returned, when only its conversion failed.
     #[error("{}", failure.message)]
     Failure {
@@ -47,7 +50,7 @@ pub(super) fn javascript_error(error: JsError) -> ToolError {
             "JavaScript runtime",
             Effects::NotStarted,
         ),
-        JsError::Execution(_) | JsError::Cancelled => {
+        JsError::Execution(_) | JsError::Cancelled | JsError::HeapLimit(_) => {
             (Operation::Execute, "JavaScript source", Effects::Unknown)
         }
         JsError::Failure { .. } => (Operation::Execute, "JavaScript source", Effects::Unknown),
@@ -72,8 +75,4 @@ pub(super) fn javascript_error(error: JsError) -> ToolError {
     error
         .operation(operation, Subject::Label(subject.into()))
         .effects(effects)
-}
-
-pub(super) fn bridge_error(error: &impl ToString) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message("host request", "JavaScript promise", error.to_string())
 }

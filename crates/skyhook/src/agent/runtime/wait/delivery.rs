@@ -121,9 +121,7 @@ mod tests {
         });
         blocks
             .filter_map(|block| match block {
-                SentPart::Runtime { text } => text
-                    .strip_prefix("<skyhook_job_events>\n")
-                    .and_then(|events| events.strip_suffix("\n</skyhook_job_events>")),
+                SentPart::Runtime { text } => crate::session::JOB_EVENTS.body(text),
                 _ => None,
             })
             .map(|events| serde_json::from_str(events).unwrap())
@@ -412,11 +410,11 @@ mod tests {
         // The script's wait wakes once the answered question is retired and the
         // other is asked again.
         let first = format!(
-            "await tool.job({job}).send({{value:{{first:'answer-one'}}}}); \
+            "await tool.control({{job:{job}, send:{{first:'answer-one'}}}}); \
              return (await tool.wait({{timeout:300}})).result.reason;"
         );
         let second =
-            format!("return await tool.job({job}).send({{value:{{second:'answer-two'}}}});");
+            format!("return await tool.control({{job:{job}, send:{{second:'answer-two'}}}});");
         tracking.respond(
             2,
             response(vec![call("one", "script", json!({"source": first}))]),
@@ -642,7 +640,7 @@ mod tests {
             assert!(pending(&session, &child));
         } else {
             let send = format!(
-                "return (await tool.job({job}).send({{value:'please add an addendum'}})).unwrap();"
+                "return (await tool.control({{job:{job}, send:'please add an addendum'}})).unwrap();"
             );
             let sent = bounded(session.run_script(send)).await.unwrap();
             assert_eq!(sent.value["value"], serde_json::Value::Null);
@@ -725,7 +723,7 @@ mod tests {
         tracking.request(2).await;
         tracking.pass(1).await;
         child_completed(&session, job).await;
-        let send = format!("return (await tool.job({job}).send({{value:{INPUT:?}}})).unwrap();");
+        let send = format!("return (await tool.control({{job:{job}, send:{INPUT:?}}})).unwrap();");
         bounded(session.run_script(send)).await.unwrap();
         let resumed = tracking.pass(3).await;
         assert_eq!(rendered(&resumed).matches(INPUT).count(), 1);
@@ -756,7 +754,7 @@ mod tests {
         const FIRST: &str = "child-first-answer";
         const SECOND: &str = "child-answer-to-input";
         let source = "const child = await tool.agent({prompt:'report', model:'wait-test/child', name:'racer'}); \
-            (await tool.job(child.id).send({value:'more'})).unwrap(); \
+            (await tool.control({job:child.id, send:'more'})).unwrap(); \
             return child.result.reply;";
         let tracking = tracking(vec![
             ("root", call("run", "script", json!({"source": source}))),
@@ -806,7 +804,7 @@ mod tests {
         const FIRST: &str = "child-first-answer";
         const SECOND: &str = "child-answer-to-input";
         let source = "const child = await tool.agent({prompt:'report', model:'wait-test/child', name:'racer'}); \
-            (await tool.job(child.id).send({value:'more'})).unwrap(); \
+            (await tool.control({job:child.id, send:'more'})).unwrap(); \
             await receive(); \
             return child.result.reply;";
         let run = json!({"source": source, "bg": true});
@@ -899,7 +897,7 @@ mod tests {
         // Send through the public job API; the child's next request proves delivery.
         let value = "parent-reply-request-marker";
         let send =
-            format!("return (await tool.job({child_job}).send({{value:{value:?}}})).unwrap();");
+            format!("return (await tool.control({{job:{child_job}, send:{value:?}}})).unwrap();");
         let sent = bounded(session.run_script(send)).await.unwrap();
         assert_eq!(sent.value["value"], serde_json::Value::Null);
         let child_request = tracking.pass(3).await;

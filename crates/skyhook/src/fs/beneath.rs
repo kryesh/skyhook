@@ -410,8 +410,10 @@ fn rename_at(directory: &fs::File, from: &OsStr, to: &OsStr, mode: Rename) -> io
     let at = directory.as_raw_fd();
     // SAFETY: both names are NUL-terminated and the descriptor is open for the call.
     let renamed = cfg_select! {
+        // The raw syscall, because static musl builds link a libc without a `renameat2` wrapper.
         any(target_os = "linux", target_os = "android") => unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 at,
                 from.as_ptr(),
                 at,

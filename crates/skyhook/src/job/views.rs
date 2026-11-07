@@ -296,19 +296,19 @@ pub struct JobEnvelope {
 /// Payload JSON is opaque; only these owned presentation groups are constructed.
 ///
 /// Every absent optional is omitted rather than null, across every group. A
-/// completed response with nothing more to read or resume omits `id` and `state`.
+/// completed response with nothing more to read or resume omits `id` and `state`
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[schemars(transform = documented)]
 pub struct JobView {
     /// None when the call settled before a job was published, or completed with
-    /// nothing more to read or resume.
+    /// nothing more to read or resume
     pub id: Option<JobId>,
     pub(crate) state: Option<JobState>,
-    /// Precedes the result, so a reader learns what was left out before reading it.
+    /// Precedes the result, so a reader learns what was left out before reading it
     #[schemars(transform = complete)]
     pub presentation: Option<Presentation>,
-    /// A present `null` is a real result, distinct from no result.
+    /// A present `null` is a real result, distinct from no result
     #[serde(default, deserialize_with = "present")]
     pub result: Option<Value>,
     #[schemars(transform = complete)]
@@ -321,7 +321,7 @@ fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Value>, 
 }
 
 /// Launch facts the viewer does not already know: `parent`, `target` and
-/// `workspace` only when they differ from the viewing agent's own.
+/// `workspace` only when they differ from the viewing agent's own
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct JobMetadata {
@@ -330,7 +330,7 @@ pub struct JobMetadata {
     #[schemars(with = "String")]
     pub(crate) name: Option<JobName>,
     pub(crate) target: Option<String>,
-    /// Display metadata; execution keeps its native PathBuf in JobEnvelope.
+    /// Display metadata; execution keeps its native PathBuf in JobEnvelope
     pub(crate) workspace: Option<String>,
     pub(crate) code: Option<crate::tool::DenialCode>,
 }
@@ -339,12 +339,12 @@ pub struct JobMetadata {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct Presentation {
     pub preview: Option<output::OutputPreview>,
-    /// The whole result's type, with counts, when samples leave parts out.
+    /// The whole result's type, with counts, when samples leave parts out
     pub shape: Option<Value>,
     pub(crate) truncated: Option<Vec<output::OutputTruncation>>,
-    /// Captures a presented result does not already show in full.
+    /// Captures a presented result does not already show in full
     pub(crate) captures: Option<Vec<output::CaptureDescriptor>>,
-    /// A waiting child agent returns a question batch rather than a result.
+    /// A waiting child agent returns a question batch rather than a result
     #[schemars(transform = complete)]
     pub(crate) question: Option<QuestionOutput>,
     // The schema keeps the plain string the system prompt's JobView type shows.
@@ -614,7 +614,7 @@ fn documented(schema: &mut schemars::Schema) {
     schema.insert(crate::tool::registry::DOCUMENTED.into(), name.into());
 }
 
-/// Jobs as a listing shows them: the newest, and how many older ones it leaves out.
+/// Jobs as a listing shows them: the newest, and how many older ones it leaves out
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct JobListing {
@@ -676,6 +676,7 @@ impl JobManager {
     }
 
     /// The schema job `id`'s result follows, when its invocation declares one.
+    #[cfg(feature = "script")]
     pub(crate) async fn output_schema(&self, id: JobId) -> Result<Option<Arc<Value>>, JobError> {
         self.entry(id, |entry| entry.output_schema.clone()).await
     }

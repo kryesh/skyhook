@@ -64,7 +64,10 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     match read_frame::<_, Request>(&mut input).await? {
-        Some(Request::Hello) => write_frame(&mut output, &Response::Ready).await?,
+        Some(Request::Hello) => {
+            let zone = Some(crate::target::TimeZone::local());
+            write_frame(&mut output, &Response::Ready { zone }).await?;
+        }
         Some(request) => return Err(format!("expected hello, received {request:?}").into()),
         None => return Ok(()),
     }
@@ -742,8 +745,9 @@ mod tests {
         let output = GatedOutput(output, gate.clone());
         let worker = tokio::spawn(serve_io_at(input, output, root));
         write_frame(&mut requests, &Request::Hello).await.unwrap();
+        // The handshake reports the worker machine's time zone.
         let ready = read_frame::<_, Response>(&mut responses).await.unwrap();
-        assert_matches!(ready, Some(Response::Ready));
+        assert_matches!(ready, Some(Response::Ready { zone }) if zone == Some(crate::target::TimeZone::local()));
         gate.set(GateState::Held(None));
         let request = Request::Tool {
             request_id: RequestId::new(1),
@@ -776,7 +780,7 @@ mod tests {
         write_frame(&mut requests, &Request::Hello).await.unwrap();
         assert_matches!(
             bounded(read_frame(&mut responses)).await.unwrap(),
-            Some(Response::Ready)
+            Some(Response::Ready { .. })
         );
         let (upload, sibling) = (RequestId::new(1), RequestId::new(2));
         let never_written = root_path.join("never-written");

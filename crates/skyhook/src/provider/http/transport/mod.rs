@@ -20,9 +20,9 @@ const REJECTION_READ: Duration = Duration::from_secs(5);
 /// The media type requested and read.
 pub(crate) const EVENT_STREAM: &str = "text/event-stream";
 
-/// Providers' HTTP client, built at their first request rather than with them: building
-/// one loads the platform's trusted roots, which runs off the async workers. Clones share
-/// it and its connections.
+/// Providers' HTTP client, built at their first request rather than with them: the
+/// first client built reads this machine's trusted roots, which runs off the async
+/// workers. Clones share it and its connections.
 #[derive(Clone, Default)]
 pub(crate) struct LazyClient(std::sync::Arc<tokio::sync::OnceCell<Client>>);
 
@@ -38,7 +38,7 @@ impl LazyClient {
 }
 
 pub(crate) fn client() -> Result<Client, ProviderError> {
-    Client::builder()
+    crate::tls::client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         // The runtime owns retries; disable automatic protocol-nack retries here.

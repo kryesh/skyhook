@@ -8,7 +8,7 @@ use crate::provider::{
         Cache, CacheControl, CodecName, ToolNames,
         common::{
             PreparedImages, StateWire, check_tool, image_url, is_sealed, own_replay, push_state,
-            signed_context, system_text, tool_text, user_parts,
+            signed_context, system_text, user_parts,
         },
         placement::{breakpoint, explicit_breakpoint, push_history},
         set_each,
@@ -252,7 +252,7 @@ fn push_message(
                 if result.call_id.is_empty() {
                     return Err(InvalidRequest.error("Chat tool results require a call ID"));
                 }
-                messages.push(json!({"role": "tool", "tool_call_id": result.call_id, "content": tool_text(result)}));
+                messages.push(json!({"role": "tool", "tool_call_id": result.call_id, "content": result.result.to_string()}));
                 if !result.images.is_empty() {
                     parts.push(json!({"type": "text", "text": format!("Images returned by tool call {}:", result.call_id)}));
                     for image in &result.images {
@@ -541,12 +541,7 @@ pub(super) mod tests {
         let parts = messages[3]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["cache_control"], json!({"type":"ephemeral"}));
-        assert!(
-            parts[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("\"result\":\"ok\"")
-        );
+        assert_eq!(parts[0]["text"], json!(r#""ok""#));
         assert_eq!(messages[4], json!({"role":"user","content":"<state>"}));
         assert_eq!(messages.len(), 5);
         request.history_lifetime = HistoryLifetime::Detached;
@@ -854,10 +849,7 @@ pub(super) mod tests {
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(messages[3]["tool_call_id"], "call-a");
         let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            result,
-            json!({"result":{"ok":false,"error":null},"is_error":true})
-        );
+        assert_eq!(result, json!({"ok":false,"error":null}));
         assert_eq!(messages[4]["content"][1]["image_url"]["url"], image_url);
         assert!(messages[4]["content"].is_array());
         // Tool schemas are preserved without strict response-schema restrictions.

@@ -1,9 +1,10 @@
-import { summary } from "skyhook:errors";
+import { brand } from "skyhook:web";
 
 export class WorkPool {
   #concurrency;
   get concurrency() { return this.#concurrency; }
   constructor(concurrency) {
+    brand(this);
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new RangeError("concurrency must be positive");
     if (arguments.length !== 1) throw new TypeError("WorkPool accepts only a concurrency limit");
     this.#concurrency = concurrency;
@@ -55,7 +56,7 @@ export class WorkPool {
       if (running.has(key)) return;
       const task = Promise.resolve().then(() => worker(item)).then(
         value => settle({key, item, value}),
-        error => settle({key, item, error: summary(error)}),
+        error => settle({key, item, error}),
       );
       running.set(key, {item, task});
     };

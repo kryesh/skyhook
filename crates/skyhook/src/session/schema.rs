@@ -1,6 +1,6 @@
 //! What a session's database holds: the journal's tables, and a product's beside them.
 //! Every session is created from an image whose journal schema is this build's: images
-//! come only from the journal's own or from `skyhook_schema::image!`, which layers a
+//! come only from the journal's own or from `schema::image!`, which layers a
 //! product's tables on it, and each is checked before a session is created from it.
 
 use super::db;
@@ -25,7 +25,7 @@ enum Tables {
 
 /// A product's tables over the journal's schema, under a format of their own: any
 /// change to the tables is a new one, which every open by the product checks. Made by
-/// `skyhook_schema::image!`, or by [`layered`](Self::layered).
+/// `schema::image!`, or by [`layered`](Self::layered).
 #[derive(Clone, Copy, Debug)]
 pub struct ProductImage {
     source: Source,
@@ -41,7 +41,7 @@ enum Source {
 }
 
 impl ProductImage {
-    /// What `skyhook_schema::image!` expands to, which built `image` and recorded
+    /// What `schema::image!` expands to, which built `image` and recorded
     /// `format` in it.
     #[doc(hidden)]
     pub const fn __built(image: &'static [u8], format: i64) -> Self {

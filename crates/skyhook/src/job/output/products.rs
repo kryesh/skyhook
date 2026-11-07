@@ -18,7 +18,7 @@ pub enum OutputSelection {
 }
 
 /// A page of a saved field: text lines, or a JSON container's elements or
-/// members. A model page omits `field` when it is the field that was requested.
+/// members. A model page omits `field` when it is the field that was requested
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum OutputPreview {
@@ -28,17 +28,17 @@ pub enum OutputPreview {
     Matches(MatchPage),
 }
 
-/// Consecutive source lines. At end of output `next_start` is absent.
+/// Consecutive source lines. At end of output `next_start` is absent
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct LinePage {
     pub(crate) field: Option<FieldPointer>,
     pub(crate) lines: PageLines,
-    /// The field's lines so far; none when its output is unavailable.
+    /// The field's lines so far; none when its output is unavailable
     pub total_lines: Option<usize>,
     #[schemars(range(min = 1))]
     pub(crate) next_start: Option<usize>,
-    /// Bytes into the `next_start` line, when a long line was cut.
+    /// Bytes into the `next_start` line, when a long line was cut
     #[schemars(range(min = 1))]
     pub(crate) next_offset: Option<usize>,
 }
@@ -59,7 +59,7 @@ pub struct NextChild {
 }
 
 /// Whole consecutive array elements; one too large for a page is sampled, with
-/// its shape and cuts at their source pointers. `next_start` is absent at the end.
+/// its shape and cuts at their source pointers. `next_start` is absent at the end
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ElementPage {
@@ -72,7 +72,7 @@ pub struct ElementPage {
     pub(crate) truncated: Option<Vec<OutputTruncation>>,
 }
 
-/// Whole consecutive object members in source order, like an `ElementPage`.
+/// Whole consecutive object members in source order, like an `ElementPage`
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MemberPage {
@@ -87,7 +87,7 @@ pub struct MemberPage {
 
 /// A JSONPath query's matches in document order, duplicates included, or the
 /// elements or members a pattern keeps, paged like an `ElementPage`. Each `at`
-/// is the match's pointer in the saved output.
+/// is the match's pointer in the saved output
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MatchPage {
@@ -107,7 +107,7 @@ pub struct Match {
 }
 
 /// A page's source lines: consecutive for a plain read, or each with its
-/// one-based line number for a pattern search.
+/// one-based line number for a pattern search
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum PageLines {
@@ -201,13 +201,13 @@ impl LinePage {
     }
 }
 
-/// What an automatic preview left out of one field, in that field's own unit.
+/// What an automatic preview left out of one field, in that field's own unit
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum OutputTruncation {
     /// A string showing its first and last lines around a marker line: the lines
-    /// from `next_start` up to, but not including, `tail_start` are left out.
+    /// from `next_start` up to, but not including, `tail_start` are left out
     TextGap {
         field: FieldPointer,
         total_lines: usize,
@@ -216,17 +216,17 @@ pub enum OutputTruncation {
         #[schemars(range(min = 2))]
         tail_start: usize,
     },
-    /// A string, continued by line position.
+    /// A string, continued by line position
     Text {
         field: FieldPointer,
         total_lines: usize,
         #[schemars(range(min = 1))]
         next_start: usize,
-        /// Bytes into the `next_start` line, when a long line was cut.
+        /// Bytes into the `next_start` line, when a long line was cut
         #[schemars(range(min = 1))]
         next_offset: Option<usize>,
     },
-    /// An array's leading elements, plus any `kept` ranges holding complete fields.
+    /// An array's leading elements, plus any `kept` ranges holding complete fields
     Elements {
         field: FieldPointer,
         shown: usize,
@@ -234,14 +234,14 @@ pub enum OutputTruncation {
         kept: Option<Vec<[usize; 2]>>,
     },
     /// An object's shown members: a collection's leading ones in source order, or
-    /// none of a record emptied to fit.
+    /// none of a record emptied to fit
     Members {
         field: FieldPointer,
         shown: usize,
         total_members: usize,
         kept: Option<Vec<[usize; 2]>>,
     },
-    /// Further cuts within `field`, too many to list.
+    /// Further cuts within `field`, too many to list
     Summary { field: FieldPointer, cuts: usize },
 }
 

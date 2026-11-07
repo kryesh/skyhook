@@ -28,7 +28,7 @@ use crate::tool::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_checked(
         "search",
-        "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; a long line is cut to a window around its match. Files that could not be searched are listed in `skipped`, and then `matches` is incomplete.",
+        "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; a long line is cut to a window around its match. Files that could not be searched are listed in `skipped`, and then `matches` is incomplete",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut SearchArgs| {
@@ -48,7 +48,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
     )?;
     builder.register_checked(
         "glob",
-        "Find files with ripgrep glob and ignore semantics.",
+        "Find files with ripgrep glob and ignore semantics",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .argument_paths(|args: &mut GlobArgs| {
@@ -711,27 +711,26 @@ enum Case {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
-    /// Rust-regex pattern, using ripgrep syntax. Set `fixed` to match it literally.
+    /// Rust-regex pattern, using ripgrep syntax
     pattern: String,
-    /// File or directory to search.
+    /// File or directory to search
     #[serde(default = "super::default_dot")]
     path: String,
-    /// Ripgrep-style include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones.
+    /// Ripgrep-style include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones
     #[serde(default)]
     glob: super::OneOrMany<String>,
-    /// Treat `pattern` as literal text instead of a regular expression (`rg -F`).
+    /// Treat `pattern` as literal text instead of a regular expression (`rg -F`)
     #[serde(default)]
     fixed: bool,
-    /// Case matching mode.
     #[serde(default)]
     case: Case,
-    /// Require whole-word matches (`rg -w`).
+    /// Require whole-word matches (`rg -w`)
     #[serde(default)]
     word: bool,
-    /// Include hidden files and directories (`rg --hidden`).
+    /// Include hidden files and directories (`rg --hidden`)
     #[serde(default)]
     hidden: bool,
-    /// Ignore .gitignore and related ignore files (`rg --no-ignore`).
+    /// Ignore .gitignore and related ignore files (`rg --no-ignore`)
     #[serde(default)]
     no_ignore: bool,
 }
@@ -739,7 +738,7 @@ struct SearchArgs {
 #[derive(Serialize, JsonSchema)]
 struct SearchOutput {
     matches: BTreeMap<String, Vec<String>>,
-    /// Files the search could not cover; when present, `matches` is incomplete.
+    /// Files the search could not cover; when present, `matches` is incomplete
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<Skipped>,
 }
@@ -753,26 +752,26 @@ struct Skipped {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum SkipReason {
-    /// A directory entry could not be listed.
+    /// A directory entry could not be listed
     Unlisted,
-    /// The file could not be opened.
+    /// The file could not be opened
     Unopened,
-    /// Reading stopped partway, including at a line beyond the memory guard.
+    /// Reading stopped partway, including at a line beyond the memory guard
     Unread,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GlobArgs {
-    /// Ripgrep-style file glob, such as `src/**/*.rs`.
+    /// Ripgrep-style file glob, such as `src/**/*.rs`
     pattern: String,
-    /// Directory to enumerate.
+    /// Directory to enumerate
     #[serde(default = "super::default_dot")]
     path: String,
-    /// Include hidden files and directories.
+    /// Include hidden files and directories
     #[serde(default)]
     hidden: bool,
-    /// Ignore .gitignore and related ignore files.
+    /// Ignore .gitignore and related ignore files
     #[serde(default)]
     no_ignore: bool,
 }

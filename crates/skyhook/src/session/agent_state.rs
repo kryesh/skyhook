@@ -1,8 +1,8 @@
 //! What the journal leaves of each started agent beside its requests: the records its
 //! profile, grants and todos come from, where its last turn stands, how its work last
 //! ended, the occupancy it reported and its usage, and what the fold decided of its
-//! answers and failed turns. The core folds it as records commit and writes each
-//! agent's row in their transaction; hosts fold [`Turns`] alone.
+//! answers, retried failures and failed turns. The core folds it as records commit and
+//! writes each agent's row in their transaction; hosts fold [`Turns`] alone.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
@@ -10,8 +10,8 @@ use crate::{
     identity::AgentId,
     provider::protocol::{Usage, UsageTotals},
     session::{
-        CompletedOutcome, EventRecord, Fact, HostCursor, ModelPurpose, RecordSeq, RequestPhase,
-        RequestRecord, RequestSeq, ResidentLedger, SessionEvent, ledger::Folded,
+        AttemptFailure, CompletedOutcome, EventRecord, Fact, HostCursor, ModelPurpose, RecordSeq,
+        RequestPhase, RequestRecord, RequestSeq, ResidentLedger, SessionEvent, ledger::Folded,
     },
     tool::policy::CapabilitySet,
 };
@@ -162,6 +162,12 @@ pub(crate) enum Decided {
     },
     /// A failed turn, which its request's failure ended.
     Failed { turn: RecordSeq },
+    /// A retried failure, which ends its request's run of alike failures from `first`.
+    Retried {
+        request: RequestSeq,
+        first: u64,
+        last: u64,
+    },
 }
 
 impl AgentStates {
@@ -229,6 +235,19 @@ impl AgentStates {
             }
             SessionEvent::ModelContext { context } => {
                 self.contexts.push((agent.clone(), context.purpose, at));
+                return;
+            }
+            SessionEvent::ModelFailed {
+                attempt,
+                failure: AttemptFailure::Retrying { .. },
+            } => {
+                let request = attempt.request;
+                let run = ledger.get(request).and_then(|record| record.retried.last());
+                self.decided.extend(run.map(|run| Decided::Retried {
+                    request,
+                    first: run.first,
+                    last: run.last,
+                }));
                 return;
             }
             _ if let Some(state) = self.agents.get_mut(agent) => state,

@@ -62,9 +62,9 @@ impl ToolExecutor {
                 .at(FailureSite::Host)
                 .effects(Effects::NotStarted)
         })?;
-        let mut location = selected.location;
+        let (mut location, route) = (selected.location, selected.route);
         let Some(mut workspace) = requested.workspace else {
-            return Ok(LocatedJob::at(location));
+            return Ok(LocatedJob::routed(location, route));
         };
         let refused = |reason: &str| {
             ToolError::invalid_arguments(reason)
@@ -74,9 +74,9 @@ impl ToolExecutor {
         if workspace.is_empty() {
             return Err(refused("workspace cannot be empty"));
         }
-        if selected.route.is_some() {
+        if route.is_some() {
             location.workspace = location.workspace.join(workspace);
-            return Ok(LocatedJob::at(location));
+            return Ok(LocatedJob::routed(location, route));
         }
         let spelled = std::path::absolute(location.workspace.join(&workspace));
         let spelled = spelled.map_err(|error| ToolError::io(error).effects(Effects::NotStarted))?;
@@ -107,6 +107,7 @@ impl ToolExecutor {
             runs_in,
             preflight,
             creates,
+            route: None,
         })
     }
 
@@ -170,6 +171,7 @@ impl ToolExecutor {
             runs_in: job_runs_in,
             preflight: located,
             creates,
+            route: job_route,
         } = match admitted.job_location() {
             Some(requested) => self.locate_job(requested).await?,
             None => LocatedJob::at(selected.location.clone()),
@@ -201,12 +203,16 @@ impl ToolExecutor {
             ..
         } = path;
         let unresolved = unresolved.map(invalid);
-        if let Some(route) = &selected.route {
+        // A host call connects where its input places the job, approved as its own
+        // route would be; a call that runs remotely opens only its own.
+        let job_route = job_route.filter(|_| selected.route.is_none());
+        let route = selected.route.as_ref().or(job_route.as_ref());
+        if let Some(route) = route {
             permissions.extend(route.route.permissions());
         }
         let authorization_arguments = AuthorizationArguments {
             tool: original_arguments.clone(),
-            route: (selected.route.as_ref()).map(|route| route.route.authorization_arguments()),
+            route: route.map(|route| route.route.authorization_arguments()),
             source: None,
         };
         let output_schema =
@@ -245,6 +251,7 @@ impl ToolExecutor {
             output_schema,
             dispatch,
             source: None,
+            job_route,
             unresolved,
         })
     }
@@ -310,21 +317,28 @@ struct SelectedLocation {
     route: Option<PlannedRemote>,
 }
 
-/// Where a job is placed: as it shows it, where it runs, and what that needs.
+/// Where a job is placed: as it shows it, where it runs, what that needs, and the
+/// remote it runs on, if any.
 struct LocatedJob {
     written: ExecutionLocation,
     runs_in: ExecutionLocation,
     preflight: PathPreflight,
     creates: JobWorkspace,
+    route: Option<PlannedRemote>,
 }
 
 impl LocatedJob {
     fn at(location: ExecutionLocation) -> Self {
+        Self::routed(location, None)
+    }
+
+    fn routed(location: ExecutionLocation, route: Option<PlannedRemote>) -> Self {
         Self {
             written: location.clone(),
             runs_in: location,
             preflight: PathPreflight::deferred(),
             creates: JobWorkspace::Exists,
+            route,
         }
     }
 }
@@ -333,16 +347,13 @@ fn validate_invocation(
     tool: &crate::tool::ToolSpec,
     kind: InvocationKind,
 ) -> Result<(), ToolError> {
-    let name = || tool.name.clone();
     match kind {
-        InvocationKind::Host => Ok(()),
-        InvocationKind::Model if tool.exposure == ToolExposure::ScriptOnly => {
-            Err(ToolError::cause(Cause::ModelHidden { tool: name() }))
-        }
         InvocationKind::Script if tool.script_binding == ScriptBinding::Unavailable => {
-            Err(ToolError::cause(Cause::ScriptUnavailable { tool: name() }))
+            Err(ToolError::cause(Cause::ScriptUnavailable {
+                tool: tool.name.clone(),
+            }))
         }
-        InvocationKind::Model | InvocationKind::Script => Ok(()),
+        InvocationKind::Host | InvocationKind::Model | InvocationKind::Script => Ok(()),
     }
 }
 

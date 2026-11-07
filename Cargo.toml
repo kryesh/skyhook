@@ -2,15 +2,15 @@
 resolver = "2"
 members = [
     "crates/skyhook",
-    "crates/skyhook-cli",
-    "crates/skyhook-schema",
-    "crates/skyhook-security",
-    "crates/linux-ssh",
+    "crates/cli",
+    "crates/schema",
+    "crates/security",
+    "crates/shim",
 ]
-default-members = ["crates/skyhook-cli", "crates/skyhook-security"]
+default-members = ["crates/cli", "crates/security"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -18,14 +18,15 @@ repository = "https://github.com/kryesh/skyhook"
 
 [workspace.dependencies]
 skyhook = { path = "crates/skyhook" }
-skyhook-cli = { path = "crates/skyhook-cli" }
-skyhook-schema = { path = "crates/skyhook-schema" }
+cli = { path = "crates/cli" }
+schema = { path = "crates/schema" }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "serde",
 ] }
 clap = { version = "4", features = ["derive", "string"] }
+iana-time-zone = "0.1"
 futures-util = "0.3"
 getrandom = "0.4"
 http = "1"
@@ -38,7 +39,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 indexmap = { version = "2", features = ["serde"] }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
-mimalloc = { version = "0.1", features = ["override"] }
+mimalloc = "0.1"
 jsonschema = { version = "0.60", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 regex = "1"
@@ -75,9 +76,12 @@ zeroize = "1"
 opt-level = 3
 debug = false
 
+[profile.release]
+strip = "symbols"
+trim-paths = "object"
+lto = "fat"
+codegen-units = 1
+
 [profile.shim-release]
 inherits = "release"
-strip = "symbols"
 opt-level = "z"
-codegen-units = 1
-lto = "fat"

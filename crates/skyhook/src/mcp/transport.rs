@@ -480,7 +480,7 @@ pub(crate) async fn connect(
             start_if_unreachable,
         } => {
             let transport = http_config(endpoint, headers).await?;
-            let client = reqwest::Client::builder()
+            let client = crate::tls::client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
                 .connect_timeout(CONNECT_TIMEOUT)

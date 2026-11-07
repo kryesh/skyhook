@@ -56,6 +56,11 @@ pub(crate) struct PreparedConnection {
 }
 
 impl PreparedConnection {
+    /// The time zone the worker reported when this connection opened.
+    pub(crate) fn zone(&self) -> Option<&crate::target::TimeZone> {
+        self.connection.zone()
+    }
+
     pub(crate) async fn execute(
         self,
         name: String,
@@ -365,7 +370,7 @@ pub(crate) mod tests {
         }
 
         /// Shims that answer their handshake at once.
-        fn answering() -> Arc<Self> {
+        pub fn answering() -> Arc<Self> {
             Self::with_ready(Semaphore::MAX_PERMITS)
         }
 
@@ -428,7 +433,11 @@ pub(crate) mod tests {
                     }
                     hello.add_permits(1);
                     ready.acquire().await.unwrap().forget();
-                    if write_frame(&mut shim, &Response::Ready).await.is_ok() {
+                    let zone = Some(berlin());
+                    if write_frame(&mut shim, &Response::Ready { zone })
+                        .await
+                        .is_ok()
+                    {
                         while let Ok(Some(_)) = read_frame::<_, Request>(&mut shim).await {}
                     }
                 });
@@ -460,6 +469,13 @@ pub(crate) mod tests {
 
     fn admitted() -> Result<(), RemoteError> {
         Ok(())
+    }
+
+    fn berlin() -> crate::target::TimeZone {
+        crate::target::TimeZone {
+            name: Some("Europe/Berlin".into()),
+            offset: 3600,
+        }
     }
 
     fn build_route() -> Route {
@@ -521,7 +537,9 @@ pub(crate) mod tests {
                         read_frame::<_, Request>(&mut shim).await.unwrap(),
                         Some(Request::Hello)
                     );
-                    write_frame(&mut shim, &Response::Ready).await.unwrap();
+                    write_frame(&mut shim, &Response::Ready { zone: None })
+                        .await
+                        .unwrap();
                 };
                 let (prepared, ()) = tokio::join!(connecting, handshake);
                 let prepared = prepared.unwrap();
@@ -693,6 +711,8 @@ pub(crate) mod tests {
         let first = connect().await.unwrap();
         let second = connect().await.unwrap();
         assert!(Arc::ptr_eq(&first.connection, &second.connection));
+        // A connection keeps the zone its worker reported in its handshake.
+        assert_eq!(first.zone(), Some(&berlin()));
         assert_eq!(factory.requests.lock().unwrap().len(), 2);
         manager.shutdown().await;
     }

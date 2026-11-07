@@ -5,6 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     marker::PhantomData,
     sync::{Arc, LazyLock},
 };
@@ -13,7 +14,8 @@ use serde::Serialize;
 
 use crate::{
     newtype::{Blank, Prose, nonblank, string_newtype},
-    target::{TargetDefinition, TargetName, TargetRef},
+    session::cell,
+    target::{TargetDefinition, TargetRef, TimeZone},
     tool::policy::{Capability, CapabilitySet, Edition, Instructions, Mode, ModeName},
 };
 
@@ -81,6 +83,7 @@ impl<H: Serialize> Templates<H> {
             workspace: std::path::Path::new(""),
             target: &TargetRef::Root,
             definition: None,
+            zone: None,
         };
         let system = System::new(&agent, None, None, &[]);
         let agent = tera::Context::from_serialize(&system.agent)?;
@@ -249,6 +252,8 @@ pub struct Agent<'a> {
     pub target: &'a TargetRef,
     /// The target's definition; None on the session host.
     pub definition: Option<TargetDefinition>,
+    /// The target's time zone, when it is known.
+    pub zone: Option<TimeZone>,
 }
 
 /// What the system prompt renders from: the agent's context and the parts around it.
@@ -295,8 +300,9 @@ struct PromptContext {
     /// Every built-in capability by name, whether granted.
     capabilities: BTreeMap<&'static str, bool>,
     mode: Option<ModeName>,
-    /// Its `skyhook_context`: the workspace, and the target where it may choose one.
-    location: Location,
+    /// Its `context` lines: the workspace, the target where it may choose one,
+    /// and the session host's time zone when it is known.
+    context: String,
     /// The type every direct tool result follows.
     job_view: &'static str,
 }
@@ -304,14 +310,35 @@ struct PromptContext {
 impl PromptContext {
     fn new(agent: &Agent<'_>) -> Self {
         let definition = agent.definition.as_ref();
-        let target = (agent.capabilities.visible_target(agent.target)).map(|name| TargetContext {
-            name: name.clone(),
-            host: definition
-                .map_or("localhost", |target| &target.host)
-                .to_owned(),
-            via: definition.and_then(|target| target.via.clone()),
-            origin: definition.and_then(|target| target.origin.clone()),
-        });
+        let mut context = format!("workspace:{}", cell(&agent.workspace.to_string_lossy()));
+        if let Some(name) = agent.capabilities.visible_target(agent.target) {
+            let host = definition.map_or("localhost", |target| &target.host);
+            write!(
+                context,
+                "\ntarget:{} host={}",
+                cell(&name.to_string()),
+                cell(host)
+            )
+            .expect("strings take writes");
+            let routes =
+                definition.map(|target| [("via", &target.via), ("origin", &target.origin)]);
+            for (key, route) in routes.into_iter().flatten() {
+                if let Some(route) = route {
+                    write!(context, " {key}={}", cell(route.as_str()))
+                        .expect("strings take writes");
+                }
+            }
+        }
+        if let Some(zone) = &agent.zone {
+            let name = zone.name.as_deref().map(|name| format!("{} ", cell(name)));
+            write!(
+                context,
+                "\ntz:{}{}",
+                name.unwrap_or_default(),
+                zone.offset()
+            )
+            .expect("strings take writes");
+        }
         let granted = |capability: &'static Capability| {
             (capability.as_str(), agent.capabilities.contains(capability))
         };
@@ -323,28 +350,10 @@ impl PromptContext {
             available_depth: agent.available_depth,
             capabilities: Capability::ALL.iter().map(granted).collect(),
             mode: agent.mode.cloned(),
-            location: Location {
-                workspace: agent.workspace.to_string_lossy().into_owned(),
-                target,
-            },
+            context,
             job_view: crate::tool::job_view_type(),
         }
     }
-}
-
-#[derive(Serialize)]
-struct Location {
-    workspace: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<TargetContext>,
-}
-
-#[derive(Serialize)]
-struct TargetContext {
-    name: TargetRef,
-    host: String,
-    via: Option<TargetName>,
-    origin: Option<TargetName>,
 }
 
 #[cfg(test)]
@@ -366,6 +375,7 @@ mod tests {
             workspace: std::path::Path::new("/workspace"),
             target: &TargetRef::Root,
             definition: None,
+            zone: None,
         }
     }
 
@@ -429,6 +439,10 @@ mod tests {
             workspace: std::path::Path::new("/remote/work"),
             target: &TargetRef::Named(target.name.clone()),
             definition: Some(target.clone()),
+            zone: Some(TimeZone {
+                name: Some("Europe/Berlin".into()),
+                offset: 3600,
+            }),
         };
         let edition = prompts.edition(&look, &child).unwrap();
         let files = ["Instruction file.".to_owned()];
@@ -441,6 +455,13 @@ mod tests {
         }
         let positions = inputs.map(|part| text.find(part).unwrap_or_else(|| panic!("{part}")));
         assert!(positions.is_sorted());
+        // The context is plain lines: a visible target's, and its zone when known.
+        let block = |lines: &str| format!("<context>\n{lines}\n</context>");
+        let remote =
+            "workspace:/remote/work\ntarget:box host=box.example via=jump\ntz:Europe/Berlin +01:00";
+        assert!(text.ends_with(&block(remote)));
+        let bare = library.system(&bare, None, &[]).unwrap();
+        assert!(bare.ends_with(&block("workspace:/workspace")));
     }
 
     /// A template may read only the names its context defines, those its includes read

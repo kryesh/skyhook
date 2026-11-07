@@ -145,7 +145,8 @@ impl UserPart {
 /// The agent's current state at a request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RuntimeState {
-    pub date: String,
+    /// When the request was made; the state shows it in UTC, to the second.
+    pub time: chrono::DateTime<chrono::Utc>,
     pub jobs: Vec<StateJob>,
     /// A model request's unfinished todos, or a summary's whole list.
     pub todos: Vec<TodoItem>,
@@ -154,6 +155,16 @@ pub struct RuntimeState {
     /// The host's section, rendered by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<crate::Prose>,
+}
+
+impl RuntimeState {
+    /// Whether `other` holds what this does, whenever each was taken.
+    pub fn same_as(&self, other: &Self) -> bool {
+        Self {
+            time: other.time,
+            ..self.clone()
+        } == *other
+    }
 }
 
 /// A live job in the state, with the active agent jobs it owns beneath it.
@@ -294,36 +305,64 @@ impl Serialize for Sent<'_> {
     }
 }
 
+/// A tag the model reads a runtime section in, each body on lines of its own.
+pub(crate) struct Tag(&'static str);
+
+pub(crate) const STATE: Tag = Tag("state");
+pub(crate) const JOB_EVENTS: Tag = Tag("job_events");
+pub(crate) const PENDING_RESPONSE: Tag = Tag("pending_response");
+
+impl Tag {
+    pub(crate) fn open(&self) -> String {
+        format!("<{}>", self.0)
+    }
+
+    pub(crate) fn close(&self) -> String {
+        format!("</{}>", self.0)
+    }
+
+    pub(crate) fn wrap(&self, body: &str) -> String {
+        format!("{}\n{body}\n{}", self.open(), self.close())
+    }
+
+    /// The body the first section in `text` tagged this way holds.
+    #[cfg(test)]
+    pub(crate) fn body<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let (_, rest) = text.split_once(&format!("{}\n", self.open()))?;
+        Some(rest.split_once(&format!("\n{}", self.close()))?.0)
+    }
+}
+
 /// The text a job-events notification sends the model.
 fn job_events_text(events: &[JobEvent]) -> String {
     let sent: Vec<_> = events.iter().map(Sent).collect();
-    let json = serde_json::to_string(&sent).expect("job events serialize");
-    format!("<skyhook_job_events>\n{json}\n</skyhook_job_events>")
+    JOB_EVENTS.wrap(&serde_json::to_string(&sent).expect("job events serialize"))
 }
+
+/// The line that begins the state's job table.
+const JOB_COLUMNS: &str = "job parent tool name state age_s turns tool_calls";
 
 /// This presentation is independent of the JSON used by tools and the journal.
 impl fmt::Display for RuntimeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<skyhook_state>\ndate:{}\n", self.date)?;
-        if !self.jobs.is_empty() {
-            f.write_str("jobs: job parent tool name state age_s turns tool_calls\n")?;
-            render_jobs(f, &self.jobs, None, &self.location)?;
-        }
-        if !self.todos.is_empty() {
-            f.write_str("todos:\n")?;
-            let mut previous = None;
-            for item in &self.todos {
-                if previous != Some(item.status) {
-                    writeln!(f, "{}:", item.status)?;
-                    previous = Some(item.status);
-                }
-                writeln!(f, "  {}", quoted(item.text.as_str()))?;
+        let time = (self.time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        write!(f, "{}\ntime:{time}\n", STATE.open())?;
+        let mut previous = None;
+        for item in &self.todos {
+            if previous != Some(item.status) {
+                writeln!(f, "{}:", item.status)?;
+                previous = Some(item.status);
             }
+            writeln!(f, "  {}", line(item.text.as_str()))?;
+        }
+        if !self.jobs.is_empty() {
+            writeln!(f, "{JOB_COLUMNS}")?;
+            render_jobs(f, &self.jobs, None, &self.location)?;
         }
         if let Some(host) = &self.host {
             writeln!(f, "host:\n{}", host.as_str())?;
         }
-        f.write_str("</skyhook_state>")
+        f.write_str(&STATE.close())
     }
 }
 
@@ -369,18 +408,35 @@ fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("strings are serializable")
 }
 
-/// Keep common tool/job names bare, but escape anything that could alter a row.
-fn cell(value: &str) -> String {
-    if !value.is_empty()
-        && value != "-"
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-./".contains(&byte))
-    {
+/// `value` as it is where `bare` holds, so nothing reads it as anything else, and
+/// quoted otherwise.
+fn shown(value: &str, bare: bool) -> String {
+    if bare {
         value.to_owned()
     } else {
         quoted(value)
     }
+}
+
+/// Keep common tool/job names bare, but escape anything that could alter a row.
+pub(crate) fn cell(value: &str) -> String {
+    let bare = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_-./".contains(&byte));
+    shown(value, !value.is_empty() && value != "-" && bare)
+}
+
+/// Keep a line's text bare, but escape text that could end the line or the block, read
+/// as a heading, the job table's columns or a quoted value, or hide its edges.
+fn line(value: &str) -> String {
+    let bare = !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('"')
+        && !value.ends_with(':')
+        && value != JOB_COLUMNS
+        && !value.contains(&STATE.close())
+        && !value.chars().any(char::is_control);
+    shown(value, bare)
 }
 
 #[cfg(test)]
@@ -406,7 +462,7 @@ mod tests {
 
     fn state(jobs: Vec<StateJob>, todos: Vec<TodoItem>, location: ExecutionLocation) -> String {
         RuntimeState {
-            date: "2026-09-10".into(),
+            time: "2026-09-10T02:00:00.750Z".parse().unwrap(),
             jobs,
             todos,
             location,
@@ -440,15 +496,17 @@ mod tests {
     fn todos_group_only_consecutive_statuses_and_escape_text() {
         assert_eq!(
             state(vec![], vec![], location()),
-            "<skyhook_state>\ndate:2026-09-10\n</skyhook_state>"
+            "<state>\ntime:2026-09-10T02:00:00Z\n</state>"
         );
         let todos = [
             (TodoStatus::InProgress, "Design"),
-            (TodoStatus::InProgress, "Measure"),
+            (TodoStatus::InProgress, "Run the test suite"),
             (TodoStatus::Pending, "Implement"),
             (TodoStatus::Pending, "Test\n\"quoted\" \\ Unicode: λ"),
             (TodoStatus::InProgress, "Inspect"),
-            (TodoStatus::Pending, "Document"),
+            // Text that reads as a heading is quoted, as is text that breaks a line.
+            (TodoStatus::Pending, "pending:"),
+            (TodoStatus::Pending, JOB_COLUMNS),
         ]
         .map(|(status, text)| TodoItem {
             status,
@@ -457,11 +515,25 @@ mod tests {
         assert_eq!(
             state(vec![], todos.to_vec(), location()),
             concat!(
-                "<skyhook_state>\ndate:2026-09-10\ntodos:\n",
-                "in_progress:\n  \"Design\"\n  \"Measure\"\n",
-                "pending:\n  \"Implement\"\n  \"Test\\n\\\"quoted\\\" \\\\ Unicode: λ\"\n",
-                "in_progress:\n  \"Inspect\"\npending:\n  \"Document\"\n",
-                "</skyhook_state>"
+                "<state>\ntime:2026-09-10T02:00:00Z\n",
+                "in_progress:\n  Design\n  Run the test suite\n",
+                "pending:\n  Implement\n  \"Test\\n\\\"quoted\\\" \\\\ Unicode: λ\"\n",
+                "in_progress:\n  Inspect\npending:\n  \"pending:\"\n",
+                "  \"job parent tool name state age_s turns tool_calls\"\n",
+                "</state>"
+            )
+        );
+        // Todos come before the job table.
+        let both = state(
+            vec![job(3, "exec", "/project")],
+            todos[..1].to_vec(),
+            location(),
+        );
+        assert_eq!(
+            both,
+            format!(
+                "<state>\ntime:2026-09-10T02:00:00Z\nin_progress:\n  Design\n\
+                 {JOB_COLUMNS}\n3 - exec - running 12 - -\n</state>"
             )
         );
     }
@@ -530,9 +602,8 @@ mod tests {
             ),
         ];
         for (context, jobs, rows) in cases {
-            let header = "jobs: job parent tool name state age_s turns tool_calls";
-            let expected =
-                format!("<skyhook_state>\ndate:2026-09-10\n{header}\n{rows}</skyhook_state>");
+            let header = JOB_COLUMNS;
+            let expected = format!("<state>\ntime:2026-09-10T02:00:00Z\n{header}\n{rows}</state>");
             assert_eq!(state(jobs, vec![], context), expected);
         }
         assert_eq!(cell("run-tests"), "run-tests");
