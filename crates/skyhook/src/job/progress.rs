@@ -5,10 +5,8 @@
 //! calls launched inside scripts). Retained resumes keep the same agent identity.
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    identity::JobId,
-    session::{StateJob, StateJobKind},
-};
+use crate::session::{StateJob, StateJobKind};
+use skyhook_worker::job::JobId;
 
 /// A child agent's durable progress: committed turns and jobs it created.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -24,23 +22,20 @@ pub(super) fn active_job(
     jobs: &super::Jobs,
     capabilities: &crate::tool::policy::CapabilitySet,
     now_millis: i64,
-    path: &mut std::collections::HashSet<JobId>,
 ) -> StateJob {
     let entry = jobs.get(id).expect("an active job is held");
     let child = entry.child();
     let launched = child.and_then(|child| child.agent.as_ref());
     let mut children = Vec::new();
-    path.insert(id);
     if let Some(agent) = launched {
         let child_ids = (jobs.unfinished(agent))
-            .filter(|(job, child)| child.child().is_some() && !path.contains(job))
+            .filter(|(_, child)| child.child().is_some())
             .map(|(job, _)| job)
             .collect::<Vec<_>>();
         for child in child_ids {
-            children.push(active_job(child, jobs, capabilities, now_millis, path));
+            children.push(active_job(child, jobs, capabilities, now_millis));
         }
     }
-    path.remove(&id);
     StateJob {
         job: id,
         kind: match child {
@@ -168,7 +163,7 @@ mod tests {
         assert_eq!(grand.job, delegated_again.id());
         assert_eq!(grand.state, JobState::Queued); // Approval stays host-only.
         assert_eq!(progress_of(grand), progress(1, 1));
-        assert_eq!(grand.workspace, std::path::Path::new("/grandchild/work"));
+        assert_eq!(grand.workspace, "/grandchild/work".into());
         let deepest_state = &grand.children[0];
         assert_eq!(deepest_state.job, deepest.id());
         assert_eq!(progress_of(deepest_state), progress(1, 1));
@@ -183,7 +178,10 @@ mod tests {
             assert!(entry.target.is_none());
             let shown = visible.expect("a visible job at every depth");
             assert_eq!(
-                shown.target.as_ref().map(crate::target::TargetRef::as_str),
+                shown
+                    .target
+                    .as_ref()
+                    .map(skyhook_tools::target::TargetRef::as_str),
                 Some(target)
             );
             visible = shown.children.first();

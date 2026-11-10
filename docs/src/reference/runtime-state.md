@@ -54,8 +54,9 @@ recorded statuses. For Rust host observation, see
 
 Each agent's system prompt ends with a `<context>` block of `key:value` lines: its `workspace`;
 its `target`, with that machine's `host` and any `via` and `origin`, when it may choose targets;
-and `tz`, the time zone of the machine its target names, with the zone's offset from UTC when the
-prompt was built, such as `tz:Europe/Berlin +01:00`. The zone is the one that machine's clock
+`os`, the operating system of the machine its target names, with the `shell` its shell commands
+run in, `os:linux shell=sh` or `os:windows shell=powershell-5.1`; and `tz`, that machine's time
+zone, with the zone's offset from UTC when the prompt was built, such as `tz:Europe/Berlin +01:00`. The zone is the one that machine's clock
 follows: the zone its `TZ` names, else its system zone; a `TZ` that gives a rule rather than a
 zone name shows only the offset, such as `tz:+09:00`.
 

@@ -3,12 +3,13 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{
-    media::{AttachmentRef, ImageRef},
-    named_enum::named_enum,
-    newtype::{Blank, nonblank, string_newtype},
-    provider::protocol::BlockRef,
+use crate::provider::protocol::BlockRef;
+use skyhook_base::{
+    enums::{Kinds, NamedEnum},
+    newtype::{Blank, nonblank},
+    string_newtype,
 };
+use skyhook_media::{AttachmentRef, ImageRef};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
@@ -61,7 +62,7 @@ string_newtype! {
     pub struct BlockId(Blank) = |id| nonblank("identity", id);
 }
 
-/// Provider ordering key. Not an index into anything.
+/// Provider ordering key.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Position(u32);
 
@@ -91,8 +92,9 @@ impl TryFrom<usize> for Position {
 }
 
 /// A provider-native item. Its blocks and replay state must remain grouped.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Kinds)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[kinds(name = ItemKind)]
 pub enum AssistantItem {
     Text {
         id: ItemId,
@@ -117,15 +119,6 @@ pub struct TextBlock {
     pub id: BlockId,
     pub position: Position,
     pub text: String,
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum ItemKind {
-        Text = "text",
-        Reasoning = "reasoning",
-        ToolCall = "tool_call",
-    }
 }
 
 /// The visible reply an assistant response projects: its text blocks concatenated,
@@ -164,21 +157,20 @@ pub struct Provenance {
     pub scope: Scope,
 }
 
-named_enum! {
-    /// The native shape of a replay payload, which selects the encoder field it returns in.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum ReplayFormat {
-        /// Chat Completions reasoning text.
-        ChatText = "chat_text",
-        /// One entry of a Chat `thinking_blocks` list.
-        ChatThinkingBlock = "chat_thinking_block",
-        /// One entry of a Chat `reasoning_details` sequence.
-        ChatReasoningDetail = "chat_reasoning_detail",
-        /// A Responses output item.
-        Responses = "responses",
-        /// A Messages content block.
-        Messages = "messages",
-    }
+/// The native shape of a replay payload, which selects the encoder field it returns in.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayFormat {
+    /// Chat Completions reasoning text.
+    ChatText,
+    /// One entry of a Chat `thinking_blocks` list.
+    ChatThinkingBlock,
+    /// One entry of a Chat `reasoning_details` sequence.
+    ChatReasoningDetail,
+    /// A Responses output item.
+    Responses,
+    /// A Messages content block.
+    Messages,
 }
 
 string_newtype! {
@@ -188,16 +180,15 @@ string_newtype! {
     pub struct Scope(Blank) = |scope| nonblank("replay scope", scope);
 }
 
-named_enum! {
-    /// How tightly a replay is bound to the history that produced it.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum Binding {
-        /// Replays under any history with matching provenance.
-        Free = "free",
-        /// Signed against the exact preceding conversation; compaction or a mode switch
-        /// invalidates it.
-        Conversation = "conversation",
-    }
+/// How tightly a replay is bound to the history that produced it.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Binding {
+    /// Replays under any history with matching provenance.
+    Free,
+    /// Signed against the exact preceding conversation; compaction or a mode switch
+    /// invalidates it.
+    Conversation,
 }
 
 impl AssistantItem {
@@ -258,14 +249,6 @@ impl AssistantItem {
             Self::Text { position, .. }
             | Self::Reasoning { position, .. }
             | Self::ToolCall { position, .. } => *position,
-        }
-    }
-
-    pub fn kind(&self) -> ItemKind {
-        match self {
-            Self::Text { .. } => ItemKind::Text,
-            Self::Reasoning { .. } => ItemKind::Reasoning,
-            Self::ToolCall { .. } => ItemKind::ToolCall,
         }
     }
 

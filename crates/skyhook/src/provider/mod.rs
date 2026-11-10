@@ -4,7 +4,7 @@ pub(crate) mod codec;
 pub mod dialect;
 mod error;
 pub(crate) mod http;
-pub mod profile;
+pub mod model;
 pub mod protocol;
 pub(crate) mod settings;
 

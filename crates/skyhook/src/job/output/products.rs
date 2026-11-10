@@ -1,11 +1,9 @@
 //! Canonical output query and presentation products.
 use super::{FieldPointer, PageUnit, Presented, Value};
-use crate::{
-    job::{JobState, JobView},
-    media::ImageRef,
-};
+use crate::job::{JobState, JobView};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use skyhook_media::ImageRef;
 
 /// What a query selects, by which selectors are present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,21 +39,6 @@ pub struct LinePage {
     /// Bytes into the `next_start` line, when a long line was cut
     #[schemars(range(min = 1))]
     pub(crate) next_offset: Option<usize>,
-}
-
-/// Saved-output pointers one level below a field, from some position.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputFields {
-    pub fields: Vec<FieldPointer>,
-    /// The first child after those listed, when there is one.
-    pub next: Option<NextChild>,
-}
-
-/// A JSON field's child by index, with the unit its field's pages count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NextChild {
-    pub index: usize,
-    pub unit: PageUnit,
 }
 
 /// Whole consecutive array elements; one too large for a page is sampled, with
@@ -255,48 +238,18 @@ impl OutputTruncation {
             | Self::Summary { field, .. } => field,
         }
     }
-
-    /// Where reading the cut field continues: its next line, or its first element
-    /// or member not shown. None for a summary of cuts.
-    pub fn continuation(&self) -> Option<Continuation<'_>> {
-        // One-based: one past the last leading index shown.
-        let first_missing = |shown: usize, kept: &Option<Vec<[usize; 2]>>| match kept.as_deref() {
-            Some([[0, last], ..]) => last + 2,
-            Some(_) => 1,
-            None => shown + 1,
-        };
-        let (start, unit, offset) = match self {
-            Self::TextGap { next_start, .. } => (*next_start, PageUnit::Lines, None),
-            Self::Text {
-                next_start,
-                next_offset,
-                ..
-            } => (*next_start, PageUnit::Lines, *next_offset),
-            Self::Elements { shown, kept, .. } => {
-                (first_missing(*shown, kept), PageUnit::Elements, None)
-            }
-            Self::Members { shown, kept, .. } => {
-                (first_missing(*shown, kept), PageUnit::Members, None)
-            }
-            Self::Summary { .. } => return None,
-        };
-        Some(Continuation {
-            field: Some(self.field()),
-            start,
-            unit,
-            offset,
-        })
-    }
 }
 
 /// A manager-produced projection, with attachments from the same job snapshot
 /// as its state and presentation metadata. Captures remain append-only live
-/// reads; this product does not claim an atomic snapshot of them.
+/// reads.
 #[derive(Clone, Debug)]
 pub struct PresentedOutput {
     pub state: JobState,
     pub(crate) view: JobView,
     pub images: Vec<ImageRef>,
+    /// The files holding the job's fields, as host inspection tells its user.
+    pub files: Vec<super::FieldFile>,
     /// How presenting the view again shows its fields: not at all when it is a
     /// presentation already, else as its saved result's fields are shown.
     pub(super) presented: Presented,
@@ -316,8 +269,6 @@ pub(super) struct HydrationTarget {
 }
 
 impl PresentedOutput {
-    /// Only the output owner constructs targets, in the descriptor's original
-    /// order. Concurrent completion never changes that stable order.
     pub(super) fn attach_capture(
         &mut self,
         index: usize,
@@ -351,5 +302,9 @@ impl PresentedOutput {
     }
     pub fn into_job_view(self) -> JobView {
         self.view
+    }
+    /// The view, with the files holding the job's fields.
+    pub fn into_inspection(self) -> (JobView, Vec<super::FieldFile>) {
+        (self.view, self.files)
     }
 }

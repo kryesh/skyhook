@@ -1,12 +1,49 @@
 # Library architecture
 
-The `skyhook` crate is the library. The `cli` crate is a host of that library, not a
-separate agent implementation. Provider protocols, terminal interaction, and
+The `skyhook` crate is the library. The terminal and batch front end is a host of that
+library, not a separate agent implementation. Provider protocols, terminal interaction, and
 local or remote execution meet at shared runtime boundaries.
 
 See [embedding](embedding.md) for host API and replay contracts,
 [remote transport and shims](remote-transport-and-shims.md) for execution transport, and
 [jobs and agents](../scripting/jobs-and-agents.md) for delegation behavior.
+
+## Crate layout
+
+Each crate is `crates/<directory>`, and depends only on crates above it in this list.
+
+- `skyhook-macros` (`macros`) and `skyhook-base` (`base`): generic primitives with no role of
+  their own, each at one path, which every crate and host imports from `base` directly: enums
+  spelled once (`NamedEnum`, and `Kinds`, which names a data enum's variants so a journal
+  dictionary and the data it classifies cannot drift apart), checked newtypes, the size limits
+  tools share, digests, and blocking work run off the async workers.
+- `skyhook-media` (`media`): images, attachments and the content-addressed blob references the
+  journal and providers record. It decodes in memory and touches no files.
+- `skyhook-worker` (`worker`): the code that runs wherever tools execute. It holds the operations
+  a tool call runs on a machine, each one call answering with typed facts, never rendered text;
+  the facts a failure carries; the `Target` trait the host runs every operation through, on the
+  session's own machine or over a connection; the protocol and the loop a shim serves it with;
+  and the origin role, the SSH and WinRM streams a machine opens to further targets. It builds
+  for Linux and Windows, and every platform difference stays inside it.
+- `skyhook-tools` (`tools`): the target tools as specs: each tool's schemas, its admission, the
+  paths it resolves, the one operation it builds and how it renders that operation's events and
+  end into its result, with argument validation, output captures and the one renderer of
+  diagnostics. It starts no operation and touches no machine.
+- `skyhook-schema` (`schema`): the proc macro that builds the session journal's schema image at
+  compile time.
+- `skyhook` (`skyhook`): everything that needs a session: the agent runtime, providers, the
+  journal, the tool catalog, policy and admission, the host-only tools, the target registry, and
+  the protocol client that connects to shims and deploys them.
+- `skyhook-security` (`security`) and `skyhook-apps` (`apps`): a product and the front ends; see
+  [products and hosts](#products-and-hosts).
+- `skyhook-shim` (`shim`): the binary a remote target runs. Of the workspace it links only the
+  worker and `base`, so the compiler keeps host-only code (the session database, providers, the
+  agent runtime, the JavaScript engine, tool schemas and rendering) out of every shim.
+
+A worker wire type that a tool's schema or the configuration's embeds, such as a command line or
+a credential, derives `JsonSchema` in the worker beside its one definition, so its doc comments
+there are model- and config-facing text written for every schema that embeds it; what differs
+per use, such as whose shell runs a command, the embedding field says.
 
 ## Ownership boundaries
 
@@ -23,248 +60,144 @@ See [embedding](embedding.md) for host API and replay contracts,
 A session's isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines' files.
 
-## Shared CLI host
+## Products and hosts
 
-`cli` is the one terminal and batch host: command admission, `.env` loading, the shared
-`auth`/`dump`/`stats` commands, batch execution, the terminal UI, UI preferences and embedded
-shims. A product binary supplies a `Product`: an `Identity` (host name, branding, theme, UI-state
-file, whether the root's mode is fixed), its session arguments and optional commands, a
-configuration edit applied before admission, and a `SessionFactory` that prepares each of its own
-sessions and may ask for a scope form before the first message. Sessions carry the creating host's
-name; another host's session opens view-only, and the library refuses to activate it. All products
-share `.skyhook/sessions`, the shims and the capability rules; see
-[sharing the CLI and terminal](embedding.md#sharing-the-cli-and-terminal).
+Products are libraries; the applications are one package of front ends over them.
+
+```text
+skyhook            core library: the configuration type, the product API (skyhook::product),
+                   launch, approvals and the plain Skyhook product
+  ↑
+skyhook-security   the security product, on the library crates alone
+  ↑
+skyhook-apps       the terminal, command line, configuration files and batch jobs; the
+                   skyhook and skyhook-security binaries
+```
+
+A product implements `skyhook::product::Product`: an `Identity` (host name, session schema,
+display name, capabilities, whether the root's mode is fixed), its own launch options with any
+settings of its own already parsed, a configuration edit applied before admission, and a
+`SessionFactory` that prepares each of its own sessions and may ask for a scope form before the
+first message. Any host can serve it.
+
+Core's `launch` module is what any front end opens sessions with: the product's edit of the
+configuration the front end hands in (`HostConfig`, the library's `Config` with the launch's own
+`approve_all`), root-mode admission, model and mode selection by attendance, the approval policy
+and the prompt channel to whoever attends a session (`interaction`), prompt attachments, and
+session listing through the store. It takes values, never the paths to read them from; the
+front end keeps any remembered choices and supplies the shim catalog.
+
+`skyhook-apps` (`crates/apps`) is the terminal application: the TUI, clap admission, `.env`
+loading, the configuration files, batch jobs, the `auth`, `dump` and `stats` commands, the saved
+UI state, termination signals and the embedded shims. Its two binaries each dispatch their own
+command line, and the security binary adds its options, its `security.yaml`, its `runs` command
+and its look.
+
+Configuration files are the applications' own (`skyhook_apps::config`): discovery of the user
+and workspace files or the one a command line names, their layering, the diagnostics of files
+passed over, and the values that follow a file. Typed `LayeredConfig` schemas share one loader
+for discovery, whole-entry merging and diagnostics: `config.yaml` is `HostConfig`, whose
+admission stamps every provider with its defining file (`ConfigHome`), beside which its
+Skyhook-managed credentials live, and a product's file is a schema its binary declares. Any
+schema holding MCP servers resolves each server's relative `cwd` against the file that declared
+it.
+
+Sessions carry the creating host's name; another host's session opens view-only, and the library
+refuses to activate it. All products share `.skyhook/sessions`, the shims and the capability
+rules; see [products and launching their sessions](embedding.md#products-and-launching-their-sessions).
 
 ### Security research product
 
-`security` owns its layered `security.yaml` (loaded by the shared layered loader),
-embedded research modes replacing presets whole (their instructions and the persona are
-templates rendered for each agent with the run's live policy in its context, so only a run that
-may work against a running target reads the live parts), model-role hints, native
-tools, a report writer, and research tables it keeps in each of its sessions' own `session.db`
-beside the journal as a session [extension](embedding.md#sharing-the-cli-and-terminal). A
-session is the run: it records the run as it opens, with the live policy it keeps, and a resumed
-session continues it. The run's test artifacts and current reports live in
-subdirectories of the session directory. The [security guide](../guide/security.md) describes
-the research behaviour; this section covers how it is held.
+`skyhook-security` (`crates/security`) owns its settings (`SecurityConfig`, which a host parses
+and hands in with the launch options; the terminal layers `security.yaml` into it), embedded
+research modes, each replaced whole by a configured mode of its name, instructions and a persona
+rendered from templates with the run's live policy in their context, model-role hints, the
+research tools, a report writer, and the research tables it keeps in each of its sessions' own
+`session.db` beside the journal as a session
+[extension](embedding.md#products-and-launching-their-sessions). A session is the run: it
+records the run as it opens, with the live policy it keeps, and a resumed session continues it.
+The run's test artifacts and its reports live in the `artifacts/` and `reports/` subdirectories
+of the session directory. The [security guide](../guide/security.md) describes the research
+behaviour. This section says what the store records, what is derived from it and who may write
+it; each table and derivation is documented where it is defined, in `crates/security/src/store`.
 
-The root agent receives the run's facts as host state with each request; the agents below it get
-none, and the facts they need travel in their briefs. The facts summarise the run's work in
-counts; the synthesis with each exhausted subject's tasks and reply is read only on request.
-Running and exhausted work depend on the state of agent jobs, which changes without a research
-write, so every cached read that touches them (the facts, which host state and the Research
-page share, and the page's open tests) keys on a journal watermark, the latest job transition or
-finish, beside the store's write generation; what the run holds keys on the generation alone.
-The Research tab renders those facts as a page of typed blocks, which the host lays out once per
-page, disclosure and width and only turns its spinners as it draws.
+**Recorded.** The store is one graph and one audit log.
 
-The store is one graph. Every object is a `node` of one kind (component, path, state, premise,
-flaw, candidate, finding) with a title and a body; a per-kind detail table shares its id, and a
-composite key to `node(id, kind)` makes the schema guarantee a detail row's kind. A state's scope
-is fixed in its row, and only an input state has the detail row holding its trust and defining
-location, keyed to the state and its scope. Edges are tables between detail rows: a path's ordered
-steps through components and its accesses (a read or write of a state at a location), the
-premises a flaw or a path relies on, the premises a premise rests on (`premise_basis`, never
-itself, so a merge drops a basis between the pair it merges), the states a flaw leaves wrong,
-and a candidate's ordered chain of flaws, whose first is
-its root, and its ordered actions, the paths its scenario performs from where the attacker
-starts; a chain's flaws are not bound to an action. Ordered edges keep positions 0..n-1 through
-the writes that move them. A duplicate of any kind but a finding merges. A merge repoints every
-edge of the merged node to the survivor, but a merged path keeps its steps and a merged
-candidate its chain and actions as history, the survivor appending after its own actions each
-path the merged one performs as often as it does beyond them; a merged input state gives up its
-detail row, so only live input states hold locations, and a merged state its check. `merged_into` is one hop, so readers never resolve
-merges on edges, and a merge marks each node it repoints as only concerned, so the merges marking a
-retired node name the node it lived on as at any event; an id argument naming a merged node resolves to the survivor at the boundary. Inventory recorded in error is retracted rather than deleted: a
-path's one status is unswept, swept or retracted, and a state's or component's recorded or
-retracted. A retracted node keeps its edges and shows as retracted, but every queue, coverage
-count, synthesis list and derived standing reads only recorded states and components and
-unretracted paths: a premise a retracted path relies on owes it no settling look and stands in no
-chain of a candidate performing it. A status set back restores it.
+- Every object is a `node` of one kind (component, path, state, premise, flaw, candidate,
+  finding) with a title, a body and a detail row of its kind sharing its id. A `location` (a
+  code region, an address range of a binary image, or an operation of a named interface) has
+  the same shape. Edges join detail rows. A path's steps, a candidate's chain of flaws, whose
+  first is its root, and a candidate's actions are ordered lists, each set whole.
+- A duplicate of any kind but a finding merges into a live node of its kind. `merged_into` is
+  one hop and a merge repoints the duplicate's edges to the survivor, so readers never resolve
+  merges; a merged path keeps its steps, and a merged candidate its chain and actions, as
+  history. An id argument naming a merged node resolves to the survivor at the boundary.
+- Inventory recorded in error is retracted rather than deleted: a path is unswept, swept or
+  retracted, and a state or component recorded or retracted. Nothing derived reads a retracted
+  node, and setting its status back restores it.
+- Every write is one `event` by the journal's agent row, with the actor's note. `event_node`
+  names each node the event bears on with the strongest of four ordered effects (`concerns`,
+  `disputes`, `standing`, `changed`): a write names its direct marks, and one rule carries them
+  along the graph as it stands after the write.
+- Premise and flaw statuses, assessments and verdicts are histories of rows keyed by the event
+  recording each, and each row records whether the work owning that result recorded it. The
+  standing result is the latest owned one. A different result recorded elsewhere is a proposal:
+  it disputes its node and owes the owning phase its work again, and replaces nothing.
 
-A `location` is a supertype in the same shape: a kind and a detail row sharing its id, for a code
-region, an address range of a binary image (link-base addresses stored by their bit pattern,
-their span checked in Rust) or an operation and field of a named interface. Each is recorded once
-per key, and input states, accesses, flaws, premises, path steps and evidence each hold one
-location of any kind; a location defines one live input state, so recording one where one is
-already recorded returns that one, and a merged one's location is free for the survivor or a new
-one. A
-component owns its interfaces by name as it owns its files, and an environment records the
-interfaces it serves with their addresses; evidence naming an environment is an observation made
-there.
+**Derived.** Scheduling is derived; nothing is planned, and no aggregate is stored.
 
-Every write is one `event` in one audit log, by the journal's agent row, with the actor's note,
-and `event_node` names each node it bears on with the strongest of four ordered effects:
-`concerns`, `disputes`, `standing` or `changed`. A write names its direct marks, and one rule carries them
-along the graph as it stands after the write: a premise moves the standing of the flaws and
-paths relying on it, a state passes its effect to the paths accessing it, and a flaw or path
-passes its effect to the live candidates chaining or performing it. Some marks stand on their
-node alone: a candidate taking or losing a flaw as its root marks that flaw alone, so its other
-candidates are re-owed only when the flaw itself changes, an access recorded or removed marks
-its path and its state alone, so it moves only their own work and the arms reading the state's
-accesses, and a status set on a path, state or
-component marks that node alone, with a state's paths, so it moves only their sweeps; but a path
-retracted or restored moves its standing along the graph, since its premises leave or rejoin its
-candidates' chains. A chain is edited whole through its candidate; a flaw joining or leaving
-it at another place is only concerned, and a chain's work also rests on the verdicts of the
-candidates holding its flaw, on the chain edits it joins or leaves, so a disproval, an
-exclusion or a leave releases the flaw with fresh tries, and on the accesses recorded or removed
-of the states it leaves wrong. Premise and flaw statuses, assessments and verdicts are histories of rows keyed by
-the event recording each (`premise_decision`, `flaw_judgement`, `candidate_assessment`,
-`candidate_verdict`); a finding's `reported` and a state's check are recorded in place, the
-check beside the premises its marks named as what its clearing relies on (`state_premise`; a
-`checked` mark parses only with at least one, as `Premises`), whose
-failing decisions and contradictions it rests on with those of the premises merged into each. A result
-stands on the basis of the task of its phase on its subject it was recorded within, so another
-agent's change after the task began owes the work again; one recorded outside such a task stands
-on nothing (`stamp`), and a report or a test's verdict outside one on its own event. Each row
-records whether its owning work recorded it (`owned`), decided once at the write: a code
-premise's settle or the review of a candidate whose chain rests on it, a deployment premise's
-answer outside every task, a flaw's chain, a
-candidate's assessment and verdict its review. The standing result is the latest owned one. An owned one
-that restates it, current or not, only concerns its node, so nothing resting on it moves, while
-its task's basis still makes it current. A later one
-recorded elsewhere that differs from it is a proposal (`proposed`), which owes its phase and marks
-its node `disputes`, carried nowhere; one that agrees only concerns its node, as does one repeating
-an earlier proposal while the first owned result after that one stands on the phase's current
-basis, so anything moving the basis since asks it again. A retired node keeps
-its own results, standing as its retirement left them: a task on a node merged away since is on
-the node it lived on as when each result was recorded, the one the latest merge retargeting it
-(retiring or repointing it, `node_merge`) pointed it at before then, and the merge retiring a node
-is no edit of it.
+- What a phase's work on a node rests on is that phase's arm of one relation (`bearing`). Its
+  latest event on the node is the work's basis, and the work is owed while its result predates
+  its basis. A phase's own work on a node, its helpers' included, never moves what it rests on.
+- Work started is a log. A `task` belongs to the journal job of the agent that began it, and
+  names each subject with the basis it began on, several subjects for a bundle. A task has no
+  end of its own: it is live while its job is, and its work is done when its subject no longer
+  owes the phase.
+- A subject is offered while its phase owes it, no task of it is live, and fewer than two of
+  its tasks began at its current basis. `startable` pages the offered work in pipeline order,
+  each entry with the ready work its agent takes with it, leaving out what running work or
+  earlier-stage work holds back, and admitting tests by the run's live policy, the user's
+  approvals and the pending tests the user unblocked.
+- The run's scope is the components recorded outside every task. What only paths entering
+  elsewhere reach owes no work, and stays recorded.
+- Candidate standing and confidence, the synthesis and the run's facts are views over the
+  results, the task log and the state of the agents' jobs.
 
-What each phase's work on a node reads is its phase's arm of one relation, generated per phase with
-the node bound in every arm so it seeks by node (`bearing`): standing or changed events for a sweep,
-check, settle, chain or report (the root's and each current member's), with the disputes of its
-result for a settle, chain or review, for a check, the failing decisions of the premises its
-checks rest on and contradicting evidence on them, and, for a settle, the
-decisions and disputes of the premises it rests on, those and the environments
-for any candidate serving an interface the path reads an input state on (any such one when it
-reads none on an interface) for a probe, but none recorded within a probe,
-all but test records and other results' disputes for a review, with the accesses recorded or
-removed of the states its flaws touch (those they leave wrong, and those its paths read where
-one sits: in its function, or at its location when it names none), and assessments, test records and environments for a test, with, as its edits, a verdict of
-another value and a change of its candidate's chain or actions (a standing or changed mark on the
-candidate but evidence changing it, its flaws or its paths). `event_node` holds its event's kind, and its effects are indexed without test records, which
-arms read from `test`, so a walk down a node's effects never visits its tests. Every arm leaves out what was recorded within a task of that phase on the node: `event_task`
-names the tasks of the outermost agent holding any, the event's own or one above it, when it was
-recorded, so a task begun beneath another belongs to the enclosing one, and a phase's own work,
-its helpers' included, never moves what it rests on. Two events are never left out: a merge,
-which work on the survivor rests on whoever made it, and a pending test's record, which a test
-resumes rather than repeats. What is fixed when an event is recorded is stored with it, append
-only: the work it was recorded within, with each task's basis (`event_work`), and its arms that
-read only its own effects and test records (`event_bearing`, whose role marks a dispute or a
-material edit). Arms through relations a later event may change (what a premise rests on, a
-flaw's candidates and states, a root's members, environments, which a merge moves to its
-survivor) are read when asked, and every aggregate stays derived. A basis is that relation's latest event, or the node's latest while the
-relation has none, so owed work always rests on one; work is owed while its result predates its
-basis, disputes aside, which give it fresh tries but leave a standing result current, or, for a verdict, once the standings it claims (`candidate_core`) no longer hold; an assessment predates
-only the latest edit or merge of its candidate itself (one changing no flaw or path, the only
-nodes carrying a change to a candidate), so what the candidate rests on moves its verdict alone; and a notice is one of its events after a task began. Candidate standing (`candidate_state`) and confidence are
-derived views over those results, the chain's flaw and premise statuses, and the
-root group's demonstrations. A premise's or flaw's standing status counts once set at or after
-its latest material edit or merge into it, but those made within its own settle or chain
-(`premise_standing`, `flaw_standing`); an edit since reads it as undecided or suspected again, so its settle or chain is
-owed again. A flaw carrying a proposal owes its chain even while a live candidate holds it. One settling test per candidate
-(`settling_test`: its latest that is not pending when that is a decline, which stands across
-verdicts, or else its latest with no edit of the test's bearing after its work began) decides its demonstration, its
-testing's settlement and what its report states; `finding_scenario` is the validated and noted
-members a root's finding reports. Each report write records the members it covered, and each
-report task the members it was offered as it began (`report_scenario`); its finding is current
-only while the covered ones are those `finding_scenario` lists now: a restated verdict only
-concerns its candidate, yet can make it reportable again. The begin of a report task offered
-other members than its group has now joins the report's bearing as a dispute does, giving it
-fresh tries however its members changed, without making a current finding stale.
+**Told.** The root agent receives the run's facts as host state with each request; the agents
+below it get none, and what they need travels in their briefs. The Research tab renders the
+same facts as a page of typed blocks, which the host lays out. The facts depend on the state of
+agent jobs, which changes without a research write, so a cached read of them is read again when
+a job moves as well as when research is written. An agent with tasks is told of others' changes
+to its subjects as a host event: one bounded digest for each changed subject, of the events of
+the bearing relation after the task began and after the agent's cursor, leaving out those the
+agent or one beneath it recorded. Nothing is stored for this: the subscription is the task log.
+Beginning a task returns the same digests for each subject a task of that phase worked before.
 
-Scheduling is derived; nothing is planned. Work started is a log: a `task` belongs to the
-journal job of the agent that began it (an agent without a job cannot begin), and its
-`task_node` rows name each subject with its basis, several for a bundle; the keys pin a
-subject's kind to its phase's. A task has no end of its own: its state is the job's
-`job_status`, whose index of live jobs is what live work is read from, never the task
-log's history; its work is done when its subject is no longer owed. A subject is offered
-while its phase owes it, no task of it is live, and fewer than two of its tasks began at its
-current basis; `startable` pages the offered entries in pipeline order, leaving out what running
-work holds and later work an earlier ready bundle touches, and admitting tests by the live
-policy, approvals and unblocked pending tests. A bundle is the ready sweeps of the paths keyed
-on one state, a path's key being the recorded handed state it accesses that the most paths
-access, else such an instance state, ties to the lowest, a path with none swept alone; the
-ready checks of the states keyed on one handed state, a handed state keying itself and an
-instance state keyed as its unretracted writer paths would be by their handed states, else
-itself, so a handed value is checked with what its producers leave in the instance; one path's ready settles with every premise they rest on at any
-remove, or its ready chains, a shared stage's going with its lowest path and a premise with the
-lowest path of itself and the premises resting on it; or one root group's ready reviews. A
-check is ready once no path whose first event is no later than its basis owes a pending sweep,
-whatever states the path accesses: the earliest such path is read once per statement, so a path
-recorded since never holds a check back, and its sweep's accesses owe the check again. A check is
-owed while its state's basis is later than the basis of the check recorded last (`state_check`),
-or that check was recorded outside one.
-A settle is owed while a live flaw, unretracted path or recorded state's check relies on its
-premise or, through
-`premise_basis` at any remove, on a premise resting on it; a decided premise owes it again once
-a premise it rests on is decided or disputed after the stamp of its decision, or after the
-decision itself when a review recorded it, outside its own settle. A flaw that is not refuted and leaves a recorded state wrong owes a chain while its chain
-basis is later than that of its latest chain task, whatever its candidates: one look covers
-every reader, and an access recorded since owes one more. The run's scope is the components created
-outside every task (`scope`: the first event naming one has no `event_task` row); a path is
-outside it when its entry step's component and the owner of its file through `component_file`
-are both outside it. Every phase's owed predicate skips a path outside it, a state, or a flaw by
-the paths through its component and its candidates' entries, that only such paths reach, a
-premise only such work relies on, and a candidate whose entry is such a path; nothing records
-the scope, and every begin returns it as it stands: the live mapped components with their
-interfaces, and the deployment premises by standing, failing ones as excluded. A path is swept
-when one of its reads of a recorded input state sits in code and probed otherwise, and a probe is owed only while the launch does live work and
-an environment for any candidate serves every interface it reads one on, or it reads them only
-in binaries. Test selection reads each root group's facts once per
-statement, and only for the groups of the subjects a read can list; an unproven candidate is
-selected instead by the code premises of its chain left undecided by an exhausted settle, each
-through the most severe unproven candidate resting on it whose test is not exhausted; a page reads the subjects
-past its cursor in windows that double until it fills. The orchestrator's scheduler keeps only its own run's
-launch replies: an entry launched twice at one basis is passed back as spent, which the one
-exhaustion predicate every queue and hold shares compares with the phase's current basis as it
-does a task's. The synthesis counts owed, running and exhausted work, the deployment premises
-undecided while a review waits on them or carrying a proposal, the candidates standing unproven with their undecided premises, the
-components no path reaches, the interfaces unswept probed paths wait on, and the paths and
-candidates outside the scope. An environment recorded beneath
-a test task is for that test's candidate unless it names another.
+**Reported.** `reports/` is a projection of the store, which the `generate` action renders from
+the store alone: a folder for each root flaw whose finding reports its scenarios as they stand,
+replaced as a whole when what renders changed, with a folder for each test the report states
+whose artifacts are copied only while they match the digest the test recorded, beside a
+hardening list of the confirmed flaws no finding's scenario holds.
 
-An agent with tasks is told of others' changes as a host event: for each subject of its job's tasks,
-the bearing relation's events after the task began and after its cursor (for a subject merged away,
-from the merge that retired it on), which leaves out those the agent or one beneath it recorded.
-Each changed subject gets one digest, never omitted: the event count, the latest event and the kinds seen, with
-its few newest events, their notes and their strongest marks, and each node the older events moved once, so a
-delivery is bounded by subjects times recent events and the nodes their work rests on; the latest event read is
-the cursor. Nothing is stored: the subscription is the task log. An
-agent found with nothing to be told is skipped until research is written again. Beginning a task
-returns the same digests for its revisits: for each subject a task of that phase worked before,
-the bearing relation's events after the latest basis such a task began on; a first visit returns
-none. A check's begin, like its state's view, also lists the decided premises of the flaws leaving
-the state wrong (`flaw_state` to `flaw_premise`), with their deciding event and task and evidence
-count.
-
-`reports/` is a projection of the findings that report their scenarios as they stand, which the
-orchestrator's `generate` renders from the store alone: a folder per root, replaced in one step
-when what renders changed, holding the reporter's markdown beneath a generated scenario table
-and a folder per stated test whose artifacts are copied only while they match the digest the
-test recorded, beside a hardening list of the confirmed flaws no report covers, read in the same
-snapshot as the findings: each holds no validated chain, or only chains validated below the run's
-threshold.
-The host capabilities `security.research`, `security.verdict` and
-`security.test` gate every research write, `security.scheduled` beginning assigned work, and
-`security.coordinate` scheduling and report generation; the store refuses nothing but boundary
-parsing, unknown ids and integrity, so unwanted work is prevented by not scheduling it. Read-only tool actions, the host state and host
-events run on the session's read pool beside its one writer, whose research callers take turns
-without holding a thread; an action whose work is mostly files (recording a test, generating
-reports) runs outside that turn, its transactions still taking the writer one at a time.
+**Permitted.** The host capabilities gate the research tool's actions: `security.research`
+recording research, with `security.verdict` a verdict; `security.verdict` with Write a report;
+`security.test` a test; `security.scheduled` beginning assigned work; and `security.coordinate`
+scheduling (`startable`) and report generation. The store refuses nothing but boundary parsing,
+unknown ids and integrity, so unwanted work is prevented by not scheduling it. Read-only tool
+actions, the host state and host events read beside the session's one writer; an action whose
+work is mostly files (recording a test, generating reports) takes the session's files turn
+rather than the writer's.
 
 ## Configuration and provider entries
 
-`config` loads and layers configuration, admits it, resolves model selections, and builds the
-model catalog; it does not interpret provider entries. Typed `LayeredConfig` schemas share one
-loader for discovery, whole-entry merging and diagnostics; only the main `Config` schema
-interprets provider and MCP provenance, stamping every provider with its defining file
-(`ConfigHome`), beside which its Skyhook-managed credentials live. `provider::dialect` owns the entries
+`config` is the configuration a host parses from text it holds (`Config::from_yaml`) or builds
+in code (`Config::builder`); it admits it, resolves model selections, and builds the model
+catalog. It does not interpret provider entries. An entry's
+`ConfigHome` is where the host says it was defined, beside which its Skyhook-managed
+credentials live; one a host leaves unfiled keeps them in the user's Skyhook directory.
+`provider::dialect` owns the entries
 (`RawProviderConfig`, `ProviderSettings`, `ProviderModels`): each dialect module declares its
-provider-only `Options` (connection rules and any Skyhook-managed `Login`) and its
+provider-only `Options` (connection rules and any Skyhook-managed `Login`, which refuses an `api_key`) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
 (`provider::settings`) that keep inheritance intent until admission resolves each model into a
 complete, independently validated codec and transport profile. The shared `Request` also carries
@@ -286,7 +219,7 @@ under a typed dialect that names the conventions varying between servers of that
 placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
 codec keeps the correctness rules and reads error bodies with its API's own codes. Vendor modules
 under `provider::dialect` own provider-only settings, the codecs they speak and the dialect
-presets for each, credentials, and the transport conventions (fixed headers, per-turn session
+presets for each, credentials (header values layered on the shared `secret::Credential`), and the transport conventions (fixed headers, per-turn session
 headers, body fields the vendor takes whatever the codec, and typed readers that map their
 servers' own error codes and wording onto error kinds); configured models run through `provider::http::HttpProvider`. Shared request,
 message, and response types live under `provider::protocol`.
@@ -324,8 +257,8 @@ meanwhile and a refused batch is held again unchanged while the children run on.
 
 Prompt text is embedded Tera templates (`prompts`). An agent's prompt renders when its contract
 is fixed, as it starts or changes mode, from its typed context (role, available depth,
-capabilities, mode and the `context` lines: workspace, target, and the time zone the
-target's machine reports), to which a host's `Prompts` add the
+capabilities, mode and the `context` lines: workspace, target, and the operating system, shell
+and time zone the target's machine reports), to which a host's `Prompts` add the
 fields of its own section. Only a root granted `Interactive` takes the root role; a root no one
 can ask is instructed as a child, working its task to a result. One render path serves both: a mode whose instructions are a host
 template (`Instructions::Template`) renders them for the agent entering it into an `Edition`,
@@ -344,7 +277,7 @@ session stores that origin and exposes it through its summary, stats and `Sessio
 host's session can be opened for reading, and the activation boundary refuses to run or change it
 with `HarnessError::HostMismatch`. Host identity does not partition the shared session root.
 
-A host's `ResumeHook` (`agent/runtime/resume.rs`; its contract is in
+A host's `ResumeHook` (`agent/resume.rs`; its contract is in
 [embedding](embedding.md#interruption-continuation-and-shutdown)) is ordered by the core. Each
 call waiting on it joins a set in the core, in the change that also arms what leaves it, so a call
 abandoned as it joins leaves too. An interrupt empties that set in the same change that stops
@@ -447,14 +380,14 @@ a session read lifecycles from those rows rather than deriving them again.
 The core admits every command by the session's `SessionPhase` (viewing, running, shutting down,
 failed, closed) in one table in `session/core/phase.rs`, which also decides when what a command
 journals is dated. A reopened session is only viewed until the first call that changes it
-activates it (`agent/runtime/reopen.rs`), and shutdown stops a session as a crash would
-(`agent/runtime/lifecycle.rs`); the host contract for both is under
+activates it (`agent/activation.rs`), and shutdown stops a session as a crash would
+(`SessionHandle::shutdown`, `agent/handle.rs`); the host contract for both is under
 [interruption, continuation, and shutdown](embedding.md#interruption-continuation-and-shutdown).
 
 Interrupt, continue and new input read three facts the core keeps, and nothing else: the
-session's flow (open or paused), each agent's turn (`Turn` in `agent/runtime/agents.rs`), and
+session's flow (open or paused), each agent's turn (`Turn` in `agent/agents.rs`), and
 whether each child invocation has begun. `stop_turns`, `redirect` and `interrupt_tree` in
-`agent/runtime/lifecycle.rs` decide each agent from them. A busy turn an interrupt stops stays
+`agent/interrupt.rs` decide each agent from them. A busy turn an interrupt stops stays
 stopping until its loop has unwound the work it took: nothing claims it, or what it would hold,
 and `continue` and new input wait for that (`settle_interrupts`), so one agent never runs two
 commands at once. The host's observation is a display, never an input to that decision.
@@ -471,31 +404,31 @@ failures, written with its state, so an endless retry holds only its distinct ch
 
 A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
-transient recovery does not rerun completed tools. An expired command-sourced credential is
+transient recovery does not rerun completed tools. An expired credential from a command or file is
 transient: the provider discards it on a 401 and the retry fetches a fresh one, and so is a
 completed response with no nonblank text or call, unless it is a refusal or an output cut. Other
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
 Context-window recovery and unusable compaction summaries have their own bounded recovery path;
 a checkpoint that breaks a journal invariant is not retried. Which cut or empty responses commit
-is decided in `agent/runtime/turn.rs`.
+is decided in `agent/turn.rs`.
 
 ## Compaction and context accounting
 
 The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a completed response's reported occupancy, at 90% of
-`max_context - max_output`. Skyhook estimates no token counts: every size it uses is one a
-provider reported. Summarization is a separate journaled request with a structured response
+`max_context - max_output`. Every size it uses is one a provider reported. Summarization is a separate journaled request with a structured response
 schema and no callable tools. Its checkpoint installs the replacement history and the reconciled
 todos in one commit, which is refused when it would overwrite newer todo state, and replay uses
 the stored continuation rather than rerunning the summary.
 
-An agent's context (`agent/runtime/context.rs`) opens with its history, read from the journal by
+An agent's context (`agent/context.rs`) opens with its history, read from the journal by
 index: its latest checkpoint with the retained sources, then its records after the frontier
 folded by `Projection::apply`, the fold that goes on to apply the records the core feeds it, and
 reads its history again after a checkpoint. The occupancy it compacts for is the core's. Compaction retains from that history, with indexed reads of the agent's
 requests completed since its checkpoint and of the exchanges its live calls opened, so neither
-reads the whole journal. `agent/runtime/compact/` owns the summary request and how it shrinks
-after an overflow (`mod.rs`), the retained tail (`retention.rs`), and the checkpoint
+reads the whole journal. `agent/compact/` owns the summary request and how it shrinks
+after an overflow (`mod.rs`), the summary's structured continuation, its schema, parser and
+attempt (`summary.rs`), the retained tail (`retention.rs`), and the checkpoint
 (`checkpoint.rs`). The user-visible behavior is under
 [conversation compaction](../guide/sessions-and-context.md#conversation-compaction), and the
 durable reference contract under
@@ -513,7 +446,10 @@ parsed input into the value its handler receives, so its checks run at the bound
 the handler. The admitted value names its path arguments, which are resolved in place, and derives
 its permissions, so an inadmissible call never asks for approval. It may also choose the schema
 its job's result follows, which presentation and scripts read and tool descriptions leave out,
-for a tool whose result shape varies by action. Path admission (`tool::path`)
+for a tool whose result shape varies by action. A target's paths are `op::TargetPath` text
+everywhere the host holds them, in arguments, locations, diagnostics and the journal; their
+components come from the target's resolution, and a path that resolves to one that is not text
+is refused with the target's own bytes, undecoded. Path admission (`skyhook_tools::path`)
 resolves a requested path where the call runs: relative to the workspace, through existing
 symbolic links, as the tool will use it (an existing entry, a write target, or a removal). The
 resolved path, not the spelling the caller gave, is what the call asks permission for, over the
@@ -521,52 +457,92 @@ exact file or a directory's descendants. A relative path continues the workspace
 so every entry looked up on the way counts. A path refused outside the authorization root (one
 that does not resolve, or a removal of the root, the workspace or a directory holding either) is
 asked for as the path it would be, under a decision that may not ask anyone, and fails only once
-allowed, so no prompt or error reveals what lies outside. The host planner and a remote worker assemble an
-invocation's permissions by one rule, and a capability the caller lacks makes the tool unavailable
-rather than denied.
+allowed, so no prompt or error reveals what lies outside. A capability the caller lacks makes the
+tool unavailable rather than denied.
+
+A call's paths (its input's, its source's and its job's workspace) resolve in one step, each on
+the machine holding it, before its permissions are assembled and approved. A call whose paths are
+all on the session host resolves as it is planned, so a path that fails to resolve fails it
+before its job exists, and it is approved once. A call that opens a connection is approved for
+its routes alone before anything connects, and its job runs from then on; once connected, its
+paths resolve, and the rest of its permissions are approved together. Either request is skipped
+when held grants already cover it.
+
+A connected call whose paths would need no permission of their own inside its target's
+authorization root, and that reads no source and places no job, is pre-approved when the request
+it makes once they resolve inside the root is allowed without asking anyone; that request is then
+the call's own, so no later decision can refuse what the pre-approval allowed. A pre-approved call
+builds its operation once and sends it in a contained call, which resolves its paths: when every
+one resolves inside the authorization root, the target performs the operation on their
+resolutions in that call; otherwise it holds the operation and answers with the resolution, the
+call is approved as any other, and the held operation then performs on that resolution, or is
+cancelled. Containment is the one decision a worker makes for the host, read from the resolution
+it already computes, so a link or `..` that leaves the root holds the operation. A call stopped
+while its operation may be performing ends with its effects unknown, unless it may only read.
 
 `Capability::Host(HostCapability)` extends the built-in permission vocabulary with namespaced
 `namespace.name` identifiers a host declares on its builder; ceilings, modes, native tools and
 MCP requirements may only use declared names, and every authorization gate treats them like
 built-ins. The journal records capability names as data, so another host's names read back
-without its declarations. The session database is format 30; formats are clean breaks without
-migration.
+without its declarations. Session database formats are clean breaks without migration.
 
 The executor coordinates host-owned jobs and their persistence. A job's lifecycle (queued,
 awaiting approval, running, waiting for input, finished), its startup lease and its single
 completion owner live in `job/lifecycle.rs` and `job/supervisor.rs`. A tool may declare a source
-argument, a `TargetPath` on any target: the executor selects its location like a tool target,
+argument, a `TargetedPath` on any target: the executor selects its location like a tool target,
 authorizes the read with the call, and opens it for the call's context. A host tool whose input
 places its job elsewhere, such as a child agent's target and workspace, has that location
 selected before the job exists, so every view of the job reports it; a local workspace is resolved
-and authorized there as one of the call's paths, while a remote one is only resolved where its
-worker starts. A job
-shows that workspace as written, `..` kept and no link followed, so no view of it reveals or
-misstates what lies outside;
-the job runs where it resolves. The local invocation layer
-(`tool::invocation`) admits typed arguments and runs operations without requiring a session
-database. The SSH shim reuses that layer for remote built-ins while the host retains job
-ownership, policy decisions, and saved output, so remote workers never become second agent
+and authorized there as one of the call's paths, while a remote one is resolved by its worker as
+the job's connection opens, and refused there when it cannot be used. A job shows that workspace
+as written, `..` kept and no link followed, so no view of it reveals or misstates what lies
+outside; the job runs where it resolves. Workers run operations only: the host keeps tools, job
+ownership, policy decisions and saved output, so remote workers never become second agent
 runtimes. See [remote transport and shims](remote-transport-and-shims.md) for connections,
 streaming and shutdown.
 
 Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, known
 local effects, and, as a separate fact, whether a sent request may have executed, which only the
-sender raises, as it sends. Tools annotate facts; `tool::diagnostic` owns the one renderer. Facts chosen nearest
-the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
-still unset: a failure carries a partial context in process and is resolved once, when it is
-persisted, sent over the wire, or rendered. A worker's reported site is always rebound to the
-destination of the connection it arrived on. Diagnostics are persisted with the job and rendered
+sender raises, as it sends. Operations fail with the worker's facts where they fail, naming
+what only they know; tools annotate the rest, such as which argument failed, and
+`skyhook_tools::diagnostic` owns the one renderer. Facts chosen nearest
+the failure win, and each boundary (planning, dispatch, rendering) only fills what is still unset:
+a failure carries a partial context in process and is resolved once, when it is persisted or
+rendered. A target that could not be reached, or whose connection failed under a call, fails with
+a connection cause that names what kept it: SSH, WinRM, the protocol, deployment, a setting the
+worker refused, a password the configuration no longer gives, or the startup. The remote client
+keeps that fault typed beside the facts its call reports until the call ends. A failure an origin
+reports names the machine it happened on. Diagnostics are persisted with the job and rendered
 per viewer; [saved job output](../reference/job-output.md#diagnostics) describes what a viewer
 sees.
 
 Saved output and model-visible presentation are separate. A finished result is saved once, as a
 compact document with its large parts in captures (`job/output/saved.rs`), and read back through
-bounded streaming readers (`job/output/json.rs`). The large parts are written before the finish,
+bounded streaming readers, which the tools crate's JSON detection builds (`skyhook_tools::output::json`). The large parts are written before the finish,
 staged: no reader lists them until the finish that references them commits, so that transaction
 stays small whatever the result's size. A finish that prepares its output again, as a stale
 finish retries, replaces what it staged before at the same field, and opening a session removes
-those a finish never committed. JavaScript receives complete results, while the journal retains the exact previews
+those a finish never committed. A capture's rows hold at most 4 MiB. Past that the bytes are in a
+file and the capture names it (`session::db::output::CaptureBytes`): one the session moved its
+rows to in the session host's spill directory, one a command's target wrote its whole stream to,
+or a file a read named. The first is read by the same reader as rows, and one that fails its
+reader is that field's loss alone: the snapshot marks the field unreadable and what it was
+showing is made again (`job::output::Saved::reading`). The other two are on the job's target, where `job/output/files.rs` reads them through the read operation: a page from its
+first line, and whole, installed as the field's value, for a read that needs the field whole.
+The call that reads carries its reach to that target (`job::output::Reach`): the executor's
+connects as any call does and authorizes a file a read named as a read of it; a stream the
+target wrote is the session's own, read as its database is. A run that keeps a file on its
+target records the route its connection was admitted along, each target as a row of its
+journaled revision (`job_output_route`), and the spill files that target created for its result
+(`job_output_spill`), in one step of the session core before its output is saved
+(`SessionStore::keep`). A capture's file carries that route (`session::TargetFile`) and is
+reached only along the same one; a spill file is the session's own to read
+(`session::OwnSpills`, which opening a session loads) while its route stands. A saved output is resolved on one of
+the session's readers and a target's file is read only once that reader is let go, so a target
+that is slow to answer delays no other read. Host inspection tells where a field's bytes are
+(`job::FieldFile`). Spill files are outside the session directory. A spill that cannot be
+kept is a typed failure of the call or job that needed it (`skyhook_worker::fs::spill::SpillError`).
+JavaScript receives complete results, while the journal retains the exact previews
 delivered to the model. [Saved job output](../reference/job-output.md) documents the user-facing
 limits.
 
@@ -581,8 +557,7 @@ receive each response with the presentations its job saved, and these follow the
 script returns, so a view returned by a script, or read again as the `jobs` call's own saved
 output, shows its result as a direct read would.
 
-The `script` tool and its runtime (`tool/javascript`) build only with the library's default
-`script` feature, which the shim turns off. Each script runs in a fresh V8 isolate on a thread of
+The `script` tool's runtime lives in `tool/javascript`. Each script runs in a fresh V8 isolate on a thread of
 its own, started from a per-process snapshot of the embedded runtime modules
 (`tool/javascript/js`), so one snapshot serves every mode: the runtime's `install` receives the
 mode's tools. The isolate's heap and its ArrayBuffer storage are each limited to 512 MiB; reaching
@@ -599,7 +574,7 @@ fields with `null` from the schema its job stores.
 Child messages and job notifications commit to the parent's history together with their
 acknowledgment, as a model call's result does with the outcome it reports, so an event that never
 reaches committed history stays pending for delivery
-(`agent/runtime/wait/delivery.rs`, `job/delivery.rs`). A host's events join only the delivery
+(`agent/wait/delivery.rs`, `job/delivery.rs`). A host's events join only the delivery
 before a request, read under the turn's cancellation: the agent's cursor is journal state, a
 pointer from `agent_state` to the message holding its latest host event, moved by that commit,
 and nothing that decides whether an agent has work to take or a wait has resolved reads them. A foreground child's replies stay queued
@@ -612,7 +587,7 @@ together, and a foreground wait keeps waiting for the outcome. Folding the ask r
 releases the model-level foreground call blocked on the job, the job's own or that of the
 script whose calls wait on it, which then returns the job unfinished, presenting and
 acknowledging neither (`job/persistence.rs`, `job/delivery.rs`). A turn moves its response's
-blocked foreground calls aside the same way (`agent/runtime/foreground.rs`): past the event
+blocked foreground calls aside the same way (`agent/foreground.rs`): past the event
 threshold, once its agent has input or a background job's outcome or question pending, or at the
 limit, it journals their release in one commit whose live change marks each job with what moved
 it, which the call's returned view reports (`JobManager::move_calls`). A child's final answer stays its
@@ -628,23 +603,23 @@ on, and a reply is accepted into each ask's mailbox at most once, so a repeated 
 nothing again (`job/questions.rs`).
 
 Process tools leave stdin unconnected, capture stdout and stderr, and detach from the controlling
-terminal (`tool/builtins/process.rs`), so a program that prompts uses the session's askpass helper,
-backed by the host's sensitive prompt handler. Without the `Interactive` capability, a call gets a rejecting
-helper instead. OpenSSH and sudo run a Skyhook binary as that helper, so every binary calls
-`remote::askpass_main()` first: it answers the prompt and exits when started in that role and
-returns otherwise. The helper, its environment and prompt attribution are described under
-[authentication and prompt isolation](remote-transport-and-shims.md#authentication-and-prompt-isolation).
+terminal (the worker's `local/exec.rs`). A program that prompts fails unless the environment
+Skyhook inherited provides a way to answer; only Skyhook's own SSH processes get a terminal,
+which types configured target passwords; see
+[authentication](remote-transport-and-shims.md#authentication).
 
 ## Session core and transaction boundaries
 
 Each durable session is one SQLite database, `session.db`, holding the append-only, normalized
-event ledger beside its blobs, saved job results and captures; `schema/src/session.sql`
+event ledger beside its blobs, saved job results and captures of at most 4 MiB each (a larger
+field is a [spill file](../reference/job-output.md#spill-files), which a session never needs to
+open, resume or replay); `schema/src/session.sql`
 documents the tables and the few JSON columns, and sets the format the journal's identity
-carries. The `schema` proc macro runs that DDL, with any product tables layered on it,
+carries. The `schema` proc macro runs that DDL
 in an in-memory database at compile time and embeds the serialized result: creating a session
-writes those bytes as its file (or copies them into memory), after checking their identity
-against the journal image's, and only fills the dictionaries, whose rows come from Rust enums. Closing any descriptor of a file releases every POSIX lock the
-process holds on it, SQLite's included, so one registry under one lock (`db::live`) records both
+writes those bytes as its file (or copies them into memory), creates any product tables over
+them, and only fills the dictionaries, whose rows come from Rust enums. Closing any descriptor of a file releases every POSIX lock the
+process holds on it, SQLite's included, so one registry under one lock (`skyhook_worker::fs::live`) records both
 each database the process has open (its file, `-wal`, `-shm` and `-journal`, by identity and by
 name) and every handle another in-process opener holds (`fs::OpenFile`, by identity). An opener
 refuses a live database's file and holds the file its name reaches under the lock, then opens
@@ -658,12 +633,11 @@ files. Each open session has one core thread (`session/core/mod.rs`)
 that owns the only writer and the one in-memory fold of what live work reads of the journal (each
 agent's newest request, the resident jobs and agents, todos and targets, the next sequence and the
 last activity, never the records themselves) and, never journaled, each running agent's turn and
-inbox and every registered wait.
+inbox, the question asks each issuer is batching, and every registered wait.
 
 Commands run on that thread in order. Each plans against the current state: a `Plan` names the
 entries it journals, the output it saves with them, and what it changes live. The writer
-journals them in one transaction, validating each record by index against the journal ahead of
-it, so no append reads the whole journal. In that transaction it folds them into the state,
+journals them in one transaction. In that transaction it folds them into the state,
 refusing a transition the state does not admit, and writes the current-state rows of the jobs,
 requests and agents they changed; the ledger stays the only source of history and exports. No
 reader sees the state ahead of the journal or a record the state does not reflect, and a rule a
@@ -696,7 +670,9 @@ A registered wait declares the agents and jobs it reads, and decides from the st
 it takes anything. A change decides again only the waits whose agents or jobs it touched,
 repeating while what they take touches more, and every wait on a session-wide change (phase, flow,
 activation or a resume withdrawal); each agent's activity is likewise read again only when the change touched that
-agent.
+agent. A wait nobody awaits stands until it decides: a question batch is presented by one once
+none of its issuer's other asks is left to join it or end, so dropping any one ask presents the
+rest regardless.
 
 ### Resident set
 
@@ -773,9 +749,10 @@ notifies observers of its response once, then again only after something reads t
 a record of its agent applies, or a new observation copies the views. A burst of writes or deltas
 costs a bounded number of updates, so a token stream alone never makes an observer lag.
 
-Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/agent/runtime),
+Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/agent),
 [providers](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/provider),
-[tools](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/tool), and
+[host tools](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/tool),
+[target tools](https://github.com/kryesh/skyhook/tree/main/crates/tools/src), and
 [sessions](https://github.com/kryesh/skyhook/tree/main/crates/skyhook/src/session).
 
 ## Terminal history window
@@ -809,8 +786,7 @@ lets go of, and a request a newer one replaces, keep the view they were left wit
 window shows them, whatever order that and the pages reading them arrive in. A frame lays out
 only what the window holds, and the sidebar asks the session what the viewed agent holds only
 once an agent's start or mode change, or the chosen agent or mode, changes it, so a frame never
-waits on a commit. A session out of view keeps only its live part, its agents' summaries and the
-job output selections chosen.
+waits on a commit. A session out of view keeps only its live part and its agents' summaries.
 
 ## Terminal transcript selection
 
@@ -839,4 +815,4 @@ Whenever entries are laid out again (new text, a reply settling, a resize), the 
 re-resolved against the new rows. It survives only if its endpoints still exist and the text they
 select is unchanged; otherwise it is dropped rather than moved to other text.
 
-Source: [rendering](https://github.com/kryesh/skyhook/tree/main/crates/cli/src/tui/render).
+Source: [rendering](https://github.com/kryesh/skyhook/tree/main/crates/apps/src/tui/render).

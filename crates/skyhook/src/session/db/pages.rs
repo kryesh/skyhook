@@ -10,13 +10,12 @@ use super::{
     message::Scope,
     *,
 };
-use crate::{
-    identity::{AgentId, JobId, SessionId},
-    session::{
-        AgentSummary, AgentsPage, Answer, EntryKind, EventRecord, Message, Page, PageFacts,
-        RecordSeq, SessionEvent, TranscriptPage,
-    },
+use crate::identity::{AgentId, SessionId};
+use crate::session::{
+    AgentOutline, AgentSummary, AgentsPage, Answer, EntryKind, EventRecord, Message, Page,
+    PageFacts, RecordSeq, SessionEvent, TranscriptPage,
 };
+use skyhook_worker::job::JobId;
 
 /// How many entries `agent`'s transcript holds: the ordinal its next one takes.
 pub(super) fn transcript_length(db: &Db, agent: i64) -> DbResult<u64> {
@@ -48,7 +47,7 @@ pub(super) use paged_sql;
 
 /// Up to `limit` rows `page` reads, in ascending order, by whichever [`paged_sql!`] query
 /// reads its way: each binds the page's bound, then `params`.
-pub(super) fn paged<K: Sql, T>(
+pub(super) fn paged<K: Sql<How>, How, T>(
     db: &Db,
     page: Page<K>,
     [first, after, before, last]: [&'static str; 4],
@@ -162,7 +161,7 @@ fn facts(
             .map(|(_, answer)| RecordSeq::from(answer.request)),
     );
     facts.answers = answers.into_iter().collect();
-    facts.requests = super::request::requests_at(db, agent, &requests)?;
+    facts.requests = super::requests::requests_at(db, agent, &requests)?;
     // A call's result and the job it started name it by its item.
     macro_rules! calls {
         ($join:literal) => {
@@ -320,9 +319,9 @@ pub(in crate::session) fn agent_summaries(db: &Db, session: SessionId) -> DbResu
     let through = counters(db)?.newest;
     let agents = agent_paths(db, session, Scope::All)?;
     let rows = db.query(
-        "SELECT s.agent, e.seq, s.profiled, s.granted, s.todos, s.ended, a.owner_job, \
+        "SELECT s.agent, e.seq, s.profiled, s.granted, s.todos, s.ended, \
            t.created_millis, d.created_millis, b.created_millis \
-         FROM agent_state s JOIN agent a ON a.id = s.agent \
+         FROM agent_state s \
          JOIN entry e ON e.agent = s.agent AND e.kind = ?1 \
          LEFT JOIN entry t ON t.seq = s.finished LEFT JOIN entry d ON d.seq = s.finished_entry \
          LEFT JOIN entry b ON b.seq = s.turn ORDER BY s.agent",
@@ -334,12 +333,11 @@ pub(in crate::session) fn agent_summaries(db: &Db, session: SessionId) -> DbResu
                 .collect::<DbResult<_>>()?;
             records.sort_unstable();
             records.dedup();
-            let owner_job = row.get::<Option<i64>>(6)?.map(job).transpose()?;
-            let since = row.get::<Option<i64>>(7)?;
-            let finished = since.zip(row.get::<Option<i64>>(8)?);
+            let since = row.get::<Option<i64>>(6)?;
+            let finished = since.zip(row.get::<Option<i64>>(7)?);
             let agent = agents.get(&row.get(0)?).cloned();
             let agent = agent.ok_or_else(|| corrupt("an agent's state names no agent"))?;
-            Ok((agent, records, owner_job, finished, row.get(9)?))
+            Ok((agent, records, finished, row.get(8)?))
         },
     )?;
     let mut wanted: Vec<_> = rows
@@ -353,15 +351,17 @@ pub(in crate::session) fn agent_summaries(db: &Db, session: SessionId) -> DbResu
         .map(|record| (record.sequence, record))
         .collect();
     let agents = (rows.into_iter())
-        .map(|(agent, records, owner_job, finished, turn)| AgentSummary {
-            agent,
-            records: (records.iter())
-                .filter_map(|seq| by_seq.get(seq).map(|record| Arc::clone(record)))
-                .collect(),
-            owner_job,
-            finished,
-            turn,
+        .map(|(agent, records, finished, turn)| {
+            let records = records.iter().filter_map(|seq| by_seq.get(seq).copied());
+            let outline = AgentOutline::folded(records.map(|record| &**record));
+            let outline = outline.ok_or_else(|| corrupt("an agent's state reads no start"))?;
+            Ok(AgentSummary {
+                agent,
+                outline,
+                finished,
+                turn,
+            })
         })
-        .collect();
+        .collect::<DbResult<_>>()?;
     Ok(AgentsPage { through, agents })
 }

@@ -1,38 +1,35 @@
 //! Native item shapes and field/argument validation.
 
 use super::*;
-use crate::named_enum::{NamedEnum, named_enum};
 use crate::provider::codec::common::{arguments_field, parse_tool_arguments, tagged};
+use skyhook_base::enums::NamedEnum;
 
-named_enum! {
-    /// The output item types this protocol represents.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) parsed enum ItemType {
-        Message = "message",
-        Reasoning = "reasoning",
-        FunctionCall = "function_call",
-    }
+/// The output item types this protocol represents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ItemType {
+    Message,
+    Reasoning,
+    FunctionCall,
 }
 
-named_enum! {
-    /// An output item's own account of whether it finished.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) parsed enum ItemStatus {
-        Completed = "completed",
-        InProgress = "in_progress",
-        Incomplete = "incomplete",
-    }
+/// An output item's own account of whether it finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ItemStatus {
+    Completed,
+    InProgress,
+    Incomplete,
 }
 
-named_enum! {
-    /// The readable content part types.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) parsed enum PartType {
-        OutputText = "output_text",
-        Refusal = "refusal",
-        ReasoningText = "reasoning_text",
-        SummaryText = "summary_text",
-    }
+/// The readable content part types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PartType {
+    OutputText,
+    Refusal,
+    ReasoningText,
+    SummaryText,
 }
 
 pub(super) fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, ProviderError> {

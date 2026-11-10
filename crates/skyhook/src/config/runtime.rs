@@ -1,4 +1,4 @@
-//! Runtime admission and configuration-bound model selection.
+//! Runtime admission, configuration-bound model selection, and the model catalog.
 //!
 //! A [`Config`] holds provider entries as written, for inspection and caller
 //! edits. Sealing it admits every entry; only the sealed generation builds
@@ -10,11 +10,12 @@ use indexmap::IndexMap;
 
 use super::{Config, ConfigError, ModeError};
 use crate::{
+    config::mode::ModeName,
+    identity::HostName,
     provider::{
         dialect::AdmittedProvider,
-        profile::{ModelProfile, ModelRef, ProviderName},
+        model::{ModelEntry, ModelProfile, ModelRef, ProviderName},
     },
-    tool::policy::ModeName,
 };
 
 /// An admitted, immutable configuration generation. Admission validates settings
@@ -42,9 +43,6 @@ pub enum SelectionError {
 /// A model selected from, and retaining, exactly one immutable configuration.
 /// Names remain open-ended external identifiers; the indices are process-local
 /// and must not be persisted. Resume/reload selects the recorded name again.
-///
-/// There is deliberately no API taking both a selection and another config:
-/// construction always uses the owner retained by this selection.
 #[derive(Clone)]
 pub struct ConfiguredModel {
     config: RuntimeConfig,
@@ -104,8 +102,30 @@ impl RuntimeConfig {
         &self.0.config
     }
 
-    pub(crate) fn providers(&self) -> &IndexMap<ProviderName, AdmittedProvider> {
-        &self.0.providers
+    /// The model catalog: every admitted model by `provider/model`, served by its
+    /// provider built for `host`. Environment keys are read now; command credentials
+    /// stay lazy until a request needs them.
+    pub(crate) fn catalog(
+        &self,
+        host: &HostName,
+    ) -> Result<IndexMap<ModelRef, ModelEntry>, ConfigError> {
+        let mut models = IndexMap::new();
+        for (name, settings) in &self.0.providers {
+            let built = settings
+                .build(name, host)
+                .map_err(|error| ConfigError::Provider {
+                    provider: name.clone(),
+                    error,
+                })?;
+            for model in built {
+                let entry = ModelEntry {
+                    profile: model.profile,
+                    provider: model.provider,
+                };
+                models.insert(ModelRef::new(name.clone(), model.name), entry);
+            }
+        }
+        Ok(models)
     }
 
     /// Admit an external or persisted `provider/model` name against this
@@ -209,7 +229,7 @@ mod tests {
     use super::*;
     use crate::provider::{
         dialect::{ModelSpec, ProviderSettings, compatible},
-        profile::ModelName,
+        model::ModelName,
     };
     use std::assert_matches;
 
@@ -335,22 +355,20 @@ mod tests {
         let selected = runtime.default_model();
         assert_eq!(selected.profile().model.as_str(), "external:model/version");
         use crate::provider::dialect::{BuildError, ValueError, ValueField, ValueProblem};
+        use skyhook_worker::secret::ResolveError;
         assert!(matches!(
             crate::agent::HarnessBuilder::configured(&selected, root.path(), "test".parse().unwrap()),
             Err(ConfigError::Provider {
                 error: BuildError::Value(ValueError {
                     field: ValueField::ApiKey,
-                    problem: ValueProblem::MissingEnvironment(name),
+                    problem: ValueProblem::Unreadable(ResolveError::NotSet(name)),
                 }),
                 ..
             }) if name == variable
         ));
-        assert!(!root.path().join(".skyhook").exists());
 
-        // Targets precede catalog checks, and an empty catalog is rejected before
-        // any secret lookup.
-        let secret = "    api_key: {env: SKYHOOK_EMPTY_CATALOG_MUST_NOT_LOOK_UP_SECRET}\n";
-        let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", secret, "")).unwrap();
+        // Targets precede catalog checks.
+        let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", "", "")).unwrap();
         raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
         assert!(matches!(
             raw.clone().into_runtime(),

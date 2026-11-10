@@ -18,12 +18,14 @@ Headless mode uses only the selected workspace's history, just like the terminal
 Resumed runs print the existing session ID.
 
 Assistant output, script console output/results, startup warnings, and execution diagnostics remain
-in the session logs; they are not printed to stdout or stderr. The process exits successfully when
+in the session logs; they are not printed to stdout or stderr. Warnings about the configuration
+itself, such as a skipped config file, are the exception: they go to stderr, before any error
+that stops startup. The process exits successfully when
 the submitted operation and shutdown succeed. On failure or interruption it exits nonzero and
 prints the error to stderr; stdout still carries only the session ID. A failure before a session
 can be opened produces no session-ID line. If Skyhook cannot write the session journal, the session
 stops as if the process had crashed: the error says so, and no final status is recorded. Explicit `--help` and `--version`
-retain their normal output. Headless mode is not a line-oriented conversation over stdin.
+retain their normal output.
 
 The submitted root turn or workflow defines completion. A workflow must explicitly await background
 work it needs completed; outstanding jobs are cancelled, and child agents interrupted, during
@@ -35,15 +37,11 @@ can still ask their owning parent agent. The root is instructed as a delegated a
 prompt's task and returns the result, answering its children's questions itself rather than ending
 its turn to ask. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all: true`)
-bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
-confirmation prompts. SSH credentials that work without a prompt can still authenticate.
+bypasses tool approvals but does not enable questions.
 
 `exec` never has stdin connected or a controlling terminal, so ordinary `/dev/tty` prompts cannot
-stop the job waiting for terminal input. SSH and `sudo` password prompts are rejected even when
-inherited `SSH_ASKPASS` or `SUDO_ASKPASS` settings request another prompt helper or the `targets`
-capability is disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless
-the configured target-authentication setup replaces them. Remote commands apply the same
-capability restrictions. This is still not an OS sandbox against deliberately programmed
+stop the job waiting for terminal input. An inherited `SSH_AUTH_SOCK` is preserved.
+Remote commands apply the same capability restrictions. This is still not an OS sandbox against deliberately programmed
 subprocesses that establish their own external interaction mechanisms.
 
 See the [CLI reference](../reference/cli.md) for argument combinations and

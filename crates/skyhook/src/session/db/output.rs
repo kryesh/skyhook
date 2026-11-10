@@ -1,17 +1,18 @@
 //! Job output rows per generation. Capture chunks record the newlines before them,
-//! so line seeks are indexed lookups.
+//! so line seeks are indexed lookups. A capture past the saved-field limit is a file,
+//! which its rows name.
+
+use std::{io::Write as _, path::PathBuf};
 
 use super::{
-    Db, DbError, DbResult, Reads, SharedDb, SqlText, corrupt, enum_column, optional_enum_column,
-    params, u64_of as integer,
+    Db, DbError, DbResult, Reads, SharedDb, SqlText, corrupt, decode::parsed, enum_column,
+    optional_enum_column, params, rejected, u64_of as integer,
 };
-use crate::{
-    job::{
-        CaptureKind,
-        output::{Detection, Presented},
-    },
-    tool::output::FieldPointer,
-};
+use crate::target::Revisions;
+use skyhook_tools::output::{CaptureFile, CaptureKind};
+use skyhook_tools::output::{FieldPointer, Presented, json::Detection};
+use skyhook_worker::fs::spill::SpillFile;
+use skyhook_worker::op::{SpilledStream, TargetPath};
 
 /// Largest chunk row written; readers accept any length the schema allows.
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -21,32 +22,39 @@ const STAGED_SYNC_BYTES: usize = 4 * CHUNK_BYTES;
 pub(crate) struct CaptureRow {
     pub id: i64,
     pub pointer: FieldPointer,
-    pub kind: CaptureKind,
     /// The saved terminal document references this capture as a result field.
     pub referenced: bool,
     /// Set once a finished capture its schema declares as JSON is classified.
     pub detection: Option<Detection>,
+    pub bytes: CaptureBytes,
+}
+
+/// Where a capture's bytes are.
+#[derive(Clone, Debug)]
+pub(crate) enum CaptureBytes {
+    /// All in its chunk rows.
+    Rows,
+    /// All in a file the session wrote in its host's spill directory, `extent` long.
+    Spilled {
+        path: PathBuf,
+        extent: CaptureExtent,
+    },
+    /// All in a file on its job's target, which wrote it or whose call named it; its
+    /// chunk rows hold only their first bytes.
+    Target(TargetFile),
+}
+
+/// A file on the machine a run ran on, and the route its connection reached that
+/// machine along: each target on it at the revision it had then, none for the
+/// session host. Only a connection along the same route reads the file.
+#[derive(Clone, Debug)]
+pub(crate) struct TargetFile {
+    pub file: CaptureFile,
+    pub route: Revisions,
 }
 
 /// Committed capture length, newline count, and whether the bytes end a line.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CaptureExtent {
-    pub bytes: u64,
-    pub newlines: u64,
-    pub ends_line: bool,
-}
-
-impl CaptureExtent {
-    /// The extent once `data` follows.
-    fn after(self, data: &[u8]) -> Self {
-        let newlines = data.iter().filter(|&&byte| byte == b'\n').count() as u64;
-        Self {
-            bytes: self.bytes + data.len() as u64,
-            newlines: self.newlines + newlines,
-            ends_line: data.last().map_or(self.ends_line, |&byte| byte == b'\n'),
-        }
-    }
-}
+pub(crate) use skyhook_worker::op::Extent as CaptureExtent;
 
 /// Insert `data` as chunk rows of `capture` from `extent`, returning the extent after.
 fn write_chunks(
@@ -79,6 +87,8 @@ pub(crate) struct OutputRows {
     pub fields: Vec<(i64, Option<Detection>)>,
     /// Parts of the result stored ahead of the finish as captures of their own.
     pub staged: Vec<StagedCapture>,
+    /// Registered captures that hold the first bytes of a file on the job's target.
+    pub files: Vec<(i64, CaptureFile)>,
     pub presented: Presented,
 }
 
@@ -86,6 +96,20 @@ pub(crate) struct OutputRows {
 /// that references it, so the finish's transaction stays small. Until that commits,
 /// the capture is staged: no reader lists it, and opening the session removes it.
 pub(crate) struct StagedCapture(i64);
+
+impl StagedCapture {
+    pub(crate) fn id(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Where the bytes of a capture are as it is staged.
+pub(crate) enum StagedBytes<'a> {
+    /// Here, to write as its chunk rows.
+    Rows(&'a [u8]),
+    /// In the spill file at this path already, this much of them.
+    File(&'a TargetPath, CaptureExtent),
+}
 
 impl OutputRows {
     pub(in crate::session) fn insert(self, db: &Db) -> DbResult<()> {
@@ -95,6 +119,7 @@ impl OutputRows {
             captures_complete,
             fields,
             staged,
+            files,
             presented,
         } = self;
         let (job, generation) = run.key();
@@ -129,6 +154,34 @@ impl OutputRows {
                 params![job, generation, capture],
             )?;
         }
+        for (capture, file) in files {
+            match file {
+                CaptureFile::Written(stream) => db.execute(
+                    "INSERT INTO job_capture_written \
+                       (capture, path, bytes, newlines, ends_line, tail) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        capture,
+                        stream.path.as_str(),
+                        stream.extent.bytes,
+                        stream.extent.newlines,
+                        stream.extent.ends_line,
+                        stream.tail
+                    ],
+                )?,
+                CaptureFile::Named { path, extent } => db.execute(
+                    "INSERT INTO job_capture_named (capture, path, bytes, newlines, ends_line) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        capture,
+                        path.as_str(),
+                        extent.bytes,
+                        extent.newlines,
+                        extent.ends_line
+                    ],
+                )?,
+            };
+        }
         for (pointer, presentation) in presented.fields() {
             db.execute(
                 "INSERT INTO job_field_presentation (job, generation, pointer, presentation) \
@@ -162,6 +215,42 @@ fn pointer(row: &libsql::Row, index: i32) -> DbResult<FieldPointer> {
     FieldPointer::try_from(row.get::<String>(index)?).map_err(|error| corrupt(error.to_string()))
 }
 
+/// The file the session moved `capture` to, and how much of it the capture holds.
+fn spilled(db: &Db, capture: i64) -> DbResult<Option<(PathBuf, CaptureExtent)>> {
+    db.query_row(
+        "SELECT path, bytes, newlines, ends_line FROM job_capture_spill WHERE capture = ?1",
+        params![capture],
+        |row| {
+            let extent = CaptureExtent {
+                bytes: integer(row.get(1)?),
+                newlines: integer(row.get(2)?),
+                ends_line: row.get(3)?,
+            };
+            Ok((PathBuf::from(row.get::<String>(0)?), extent))
+        },
+    )
+}
+
+/// The bytes a reader finds from an offset: the capture's chunk rows there, or the
+/// file that holds them all.
+pub(crate) enum Stored {
+    Rows(Vec<Chunk>),
+    File(PathBuf),
+}
+
+/// What the session holds of `capture`, its spill file or its rows: how much, and
+/// what is stored of the `length` bytes from `offset`.
+fn window(db: &Db, capture: i64, offset: u64, length: usize) -> DbResult<(CaptureExtent, Stored)> {
+    Ok(match spilled(db, capture)? {
+        Some((path, extent)) => (extent, Stored::File(path)),
+        None => (
+            extent(db, capture)?,
+            Stored::Rows(chunks(db, capture, offset, length)?),
+        ),
+    })
+}
+
+/// The extent of the chunk rows `capture` has.
 fn extent(db: &Db, capture: i64) -> DbResult<CaptureExtent> {
     Ok(db
         .query_row(
@@ -213,7 +302,7 @@ impl SharedDb {
         run: crate::job::Run,
         pointer: &FieldPointer,
         (kind, detection): (CaptureKind, Option<Detection>),
-        data: &[u8],
+        bytes: StagedBytes<'_>,
     ) -> Result<StagedCapture, DbError> {
         let (job, generation) = run.key();
         let capture = self.write(|db| {
@@ -231,22 +320,74 @@ impl SharedDb {
                 "INSERT INTO job_capture_staged (capture) VALUES (?1)",
                 params![capture],
             )?;
+            if let StagedBytes::File(path, extent) = bytes {
+                insert_spill(db, capture, path, extent)?;
+            }
             Ok(capture)
         })?;
-        let mut extent = CaptureExtent::default();
-        for synced in data.chunks(STAGED_SYNC_BYTES) {
-            for piece in synced.chunks(CHUNK_BYTES) {
-                extent = self.append_capture(capture, extent, piece)?;
+        if let StagedBytes::Rows(data) = bytes {
+            let mut extent = CaptureExtent::default();
+            for synced in data.chunks(STAGED_SYNC_BYTES) {
+                for piece in synced.chunks(CHUNK_BYTES) {
+                    extent = self.append_capture(capture, extent, piece)?;
+                }
+                self.sync()?;
             }
-            self.sync()?;
         }
         Ok(StagedCapture(capture))
     }
 
-    pub(crate) fn delete_capture(&self, capture: i64) -> Result<(), DbError> {
-        let delete =
-            |db: &Db| db.execute("DELETE FROM job_capture WHERE id = ?1", params![capture]);
-        Ok(self.write(delete).map(drop)?)
+    /// Move `capture`'s chunk rows to `file`, an empty file at `path`, which holds the
+    /// capture from then on. Only the capture's one producer writes its rows, so they
+    /// are copied and synced before the transaction that records the file and removes
+    /// them: every reader finds one or the other, and no write waits on the copy.
+    pub(crate) fn spill_capture(
+        &self,
+        capture: i64,
+        extent: CaptureExtent,
+        (file, path): (&mut std::fs::File, &TargetPath),
+    ) -> std::io::Result<()> {
+        let rows = self.lock().query(
+            "SELECT data FROM job_capture_chunk WHERE capture = ?1 ORDER BY byte_offset",
+            params![capture],
+            |row| Ok(row.get::<Vec<u8>>(0)?),
+        );
+        let rows = rows.map_err(std::io::Error::other)?;
+        let copied =
+            (rows.iter().try_for_each(|data| file.write_all(data))).and_then(|()| file.sync_data());
+        copied.map_err(skyhook_worker::fs::spill::SpillError::At)?;
+        let moved = self.write(|db| {
+            insert_spill(db, capture, path, extent)?;
+            db.execute(
+                "DELETE FROM job_capture_chunk WHERE capture = ?1",
+                params![capture],
+            )
+        });
+        moved
+            .map(drop)
+            .map_err(|error| std::io::Error::other(DbError::from(error)))
+    }
+
+    /// Record that the file holding `capture` now holds `extent`.
+    pub(crate) fn extend_spill(&self, capture: i64, extent: CaptureExtent) -> Result<(), DbError> {
+        let extend = |db: &Db| {
+            db.execute(
+                "UPDATE job_capture_spill SET bytes = ?2, newlines = ?3, ends_line = ?4 \
+                 WHERE capture = ?1",
+                params![capture, extent.bytes, extent.newlines, extent.ends_line],
+            )
+        };
+        Ok(self.write(extend).map(drop)?)
+    }
+
+    /// Remove `capture`; the file the session moved it to, if it did.
+    pub(crate) fn delete_capture(&self, capture: i64) -> Result<Option<PathBuf>, DbError> {
+        let delete = |db: &Db| {
+            let spilled = spilled(db, capture)?;
+            db.execute("DELETE FROM job_capture WHERE id = ?1", params![capture])?;
+            Ok::<_, DbError>(spilled.map(|(path, _)| path))
+        };
+        Ok(self.write(delete)?)
     }
 
     /// Append `data` at `extent`, returning the new extent. Captures are not ledger
@@ -279,23 +420,147 @@ pub(crate) struct SavedRows {
     pub presented: Presented,
 }
 
-fn captures(db: &Db, (job, generation): (u64, i64)) -> DbResult<Vec<CaptureRow>> {
+/// Record where `run` keeps files of its output: on the machine its connection
+/// reached along `route`, which created each of `spilled` in its spill directory.
+/// A route naming a target revision the journal does not hold is refused.
+pub(in crate::session) fn keep(
+    db: &Db,
+    run: crate::job::Run,
+    route: &Revisions,
+    spilled: &[SpillFile],
+) -> DbResult<()> {
+    let (job, generation) = run.key();
+    for (position, (target, revision)) in route.iter().enumerate() {
+        let journaled = db.execute(
+            "INSERT INTO job_output_route (job, generation, position, revision) \
+             SELECT ?1, ?2, ?3, r.id FROM target_revision r \
+               JOIN target t ON t.id = r.target WHERE t.name = ?4 AND r.revision = ?5",
+            params![job, generation, position, target.as_str(), *revision],
+        )?;
+        if journaled != 1 {
+            return Err(rejected(
+                "a route names a target the journal does not define",
+            ));
+        }
+    }
+    let components = (spilled.iter().enumerate()).flat_map(|(file, spilled)| {
+        (spilled.components.iter().enumerate()).map(move |part| (file, part))
+    });
+    for (file, (position, component)) in components {
+        db.execute(
+            "INSERT INTO job_output_spill (job, generation, file, position, component) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![job, generation, file, position, component],
+        )?;
+    }
+    Ok(())
+}
+
+/// The route of the connection `run`'s operation ran over, outermost target first:
+/// none for a run on the session host, or one that keeps no file on its target.
+fn route(db: &Db, (job, generation): (u64, i64)) -> DbResult<Revisions> {
     db.query(
-        "SELECT c.id, c.pointer, c.capture_kind, \
-           EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection \
-         FROM job_capture c WHERE c.job = ?1 AND c.generation = ?2 \
+        "SELECT t.name, r.revision FROM job_output_route o \
+           JOIN target_revision r ON r.id = o.revision JOIN target t ON t.id = r.target \
+         WHERE o.job = ?1 AND o.generation = ?2 ORDER BY o.position",
+        params![job, generation],
+        |row| Ok((parsed(row.get(0)?)?, integer(row.get(1)?))),
+    )
+}
+
+/// The spill files the session's runs had their targets create, each with its
+/// components and the route of the run that had it created.
+pub(in crate::session) fn own_spills(db: &Db) -> DbResult<Vec<(Revisions, Vec<String>)>> {
+    let mut files: Vec<((u64, i64, i64), Vec<String>)> = Vec::new();
+    for (file, component) in db.query(
+        "SELECT job, generation, file, component FROM job_output_spill \
+         ORDER BY job, generation, file, position",
+        Vec::new(),
+        |row| {
+            let file = (integer(row.get(0)?), row.get(1)?, row.get(2)?);
+            Ok((file, row.get::<String>(3)?))
+        },
+    )? {
+        match files.last_mut() {
+            Some((last, components)) if *last == file => components.push(component),
+            _ => files.push((file, vec![component])),
+        }
+    }
+    (files.into_iter())
+        .map(|((job, generation, _), components)| Ok((route(db, (job, generation))?, components)))
+        .collect()
+}
+
+fn captures(db: &Db, key @ (job, generation): (u64, i64)) -> DbResult<Vec<CaptureRow>> {
+    let route = route(db, key)?;
+    let on_target = |file| {
+        CaptureBytes::Target(TargetFile {
+            file,
+            route: route.clone(),
+        })
+    };
+    db.query(
+        "SELECT c.id, c.pointer, \
+           EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection, \
+           s.path, s.bytes, s.newlines, s.ends_line, \
+           w.path, w.bytes, w.newlines, w.ends_line, w.tail, \
+           n.path, n.bytes, n.newlines, n.ends_line \
+         FROM job_capture c \
+           LEFT JOIN job_capture_spill s ON s.capture = c.id \
+           LEFT JOIN job_capture_written w ON w.capture = c.id \
+           LEFT JOIN job_capture_named n ON n.capture = c.id \
+         WHERE c.job = ?1 AND c.generation = ?2 \
            AND NOT EXISTS (SELECT 1 FROM job_capture_staged s WHERE s.capture = c.id) \
          ORDER BY c.pointer",
         params![job, generation],
         |row| {
+            let text = |index| row.get::<Option<String>>(index);
+            let extent = |index| {
+                Ok::<_, DbError>(CaptureExtent {
+                    bytes: integer(row.get(index)?),
+                    newlines: integer(row.get(index + 1)?),
+                    ends_line: row.get(index + 2)?,
+                })
+            };
+            let bytes = match (text(4)?, text(8)?, text(13)?) {
+                (None, None, None) => CaptureBytes::Rows,
+                (Some(path), None, None) => CaptureBytes::Spilled {
+                    path: path.into(),
+                    extent: extent(5)?,
+                },
+                (None, Some(path), None) => on_target(CaptureFile::Written(SpilledStream {
+                    path: TargetPath::new(path),
+                    extent: extent(9)?,
+                    tail: row.get(12)?,
+                })),
+                (None, None, Some(path)) => on_target(CaptureFile::Named {
+                    path: TargetPath::new(path),
+                    extent: extent(14)?,
+                }),
+                _ => return Err(corrupt("a capture is in more than one file")),
+            };
             Ok(CaptureRow {
                 id: row.get(0)?,
                 pointer: pointer(row, 1)?,
-                kind: enum_column(row, 2)?,
-                referenced: row.get::<i64>(3)? != 0,
-                detection: optional_enum_column(row, 4)?,
+                referenced: row.get::<i64>(2)? != 0,
+                detection: optional_enum_column(row, 3)?,
+                bytes,
             })
         },
+    )
+}
+
+fn insert_spill(db: &Db, capture: i64, path: &TargetPath, extent: CaptureExtent) -> DbResult<u64> {
+    db.execute(
+        "INSERT INTO job_capture_spill (capture, path, bytes, newlines, ends_line) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            capture,
+            path.as_str(),
+            extent.bytes,
+            extent.newlines,
+            extent.ends_line
+        ],
     )
 }
 
@@ -363,11 +628,17 @@ impl Reads {
         })
     }
 
+    /// How much of `capture` the session holds, in its spill file or its rows.
     pub(crate) fn capture_extent(&self, capture: i64) -> Result<CaptureExtent, DbError> {
-        self.read(|db| extent(db, capture))
+        self.read(|db| match spilled(db, capture)? {
+            Some((_, extent)) => Ok(extent),
+            None => extent(db, capture),
+        })
     }
 
-    /// The last chunk starting before one-based `line` begins: its offset and line.
+    /// A position at or before the start of one-based `line`, as its offset and line:
+    /// the last chunk row starting before the line begins, or the start of a spill
+    /// file, which has no index.
     pub(crate) fn capture_line(&self, capture: i64, line: u64) -> Result<(u64, u64), DbError> {
         if line <= 1 {
             return Ok((0, 1));
@@ -384,40 +655,32 @@ impl Reads {
         Ok(chunk.unwrap_or((0, 1)))
     }
 
-    /// The consecutive chunks overlapping the `length` bytes from `offset`.
-    pub(crate) fn capture_chunks(
-        &self,
-        capture: i64,
-        offset: u64,
-        length: usize,
-    ) -> Result<Vec<Chunk>, DbError> {
-        self.read(|db| chunks(db, capture, offset, length))
-    }
-
-    /// The capture's extent with the chunks overlapping the `length` bytes from
-    /// `offset`, read together.
+    /// The capture's extent with what is stored of the `length` bytes from `offset`,
+    /// read together.
     pub(crate) fn capture_window(
         &self,
         capture: i64,
         offset: u64,
         length: usize,
-    ) -> Result<(CaptureExtent, Vec<Chunk>), DbError> {
-        self.read(|db| Ok((extent(db, capture)?, chunks(db, capture, offset, length)?)))
+    ) -> Result<(CaptureExtent, Stored), DbError> {
+        self.read(|db| window(db, capture, offset, length))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::AgentId;
+    use crate::job::JobRole;
     use crate::{
-        identity::{AgentId, JobId},
-        job::{JobEnd, JobRole, JobTransition},
+        job::{JobEnd, JobTransition},
         session::{
             Command, CoreState, Plan, SessionError, SessionEvent, SessionStore,
             tests::{job_created, reopen},
         },
         tests::TestRuntime,
     };
+    use skyhook_worker::job::JobId;
     use std::assert_matches;
 
     fn run(job: JobId, generation: u32) -> crate::job::Run {
@@ -439,6 +702,7 @@ mod tests {
             captures_complete: true,
             fields: captures.iter().map(|&capture| (capture, None)).collect(),
             staged: Vec::new(),
+            files: Vec::new(),
             presented: Presented::new(),
         };
         let finished = SessionEvent::JobFinished {
@@ -541,7 +805,7 @@ mod tests {
             let kind = (CaptureKind::Text, None);
             store
                 .outputs()
-                .stage_capture(run(job, 0), &field, kind, &body)
+                .stage_capture(run(job, 0), &field, kind, StagedBytes::Rows(&body))
         };
         stage(&store).unwrap();
         assert!(
@@ -568,6 +832,7 @@ mod tests {
             captures_complete: true,
             fields: Vec::new(),
             staged: vec![stage(&reopened).unwrap()],
+            files: Vec::new(),
             presented: Presented::new(),
         };
         let finished = SessionEvent::JobFinished {

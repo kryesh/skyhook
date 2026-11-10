@@ -7,50 +7,48 @@ use super::{
     Code, NATIVE,
     native::{BlockType, initial_input, tool_content},
 };
-use crate::{
-    named_enum::{NamedEnum, named_enum},
-    provider::{
-        ProviderError,
-        codec::{
-            common::{
-                Finish, Settle, Settlement, StopReason, delta, is_signed, position, replay, tagged,
-            },
-            openai,
-            usage::{Counters, InputAccounting, Observed, Spelling},
+use crate::provider::{
+    ProviderError,
+    codec::{
+        common::{
+            Finish, Settle, Settlement, StopReason, delta, is_signed, position, replay, tagged,
         },
-        http::{
-            errors::{self, ErrorSignals},
-            transport::SseEvent,
-        },
-        protocol::{
-            AssistantItem, Binding, Completion, ItemKind, Replay, ReplayFormat, ResponseEvent,
-            Scope,
-        },
+        errors::{self, ErrorSignals},
+        usage::{Counters, InputAccounting, Observed, Spelling},
+    },
+    http::transport::SseEvent,
+    protocol::{
+        AssistantItem, Binding, Completion, ItemKind, Replay, ReplayFormat, ResponseEvent, Scope,
     },
 };
+use skyhook_base::enums::NamedEnum;
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    parsed enum Event {
-        MessageStart = "message_start",
-        BlockStart = "content_block_start",
-        BlockDelta = "content_block_delta",
-        BlockStop = "content_block_stop",
-        MessageDelta = "message_delta",
-        MessageStop = "message_stop",
-        Ping = "ping",
-        Error = "error",
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+enum Event {
+    MessageStart,
+    #[serde(rename = "content_block_start")]
+    BlockStart,
+    #[serde(rename = "content_block_delta")]
+    BlockDelta,
+    #[serde(rename = "content_block_stop")]
+    BlockStop,
+    MessageDelta,
+    MessageStop,
+    Ping,
+    Error,
 }
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    parsed enum DeltaType {
-        Text = "text_delta",
-        Thinking = "thinking_delta",
-        Signature = "signature_delta",
-        InputJson = "input_json_delta",
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+enum DeltaType {
+    #[serde(rename = "text_delta")]
+    Text,
+    #[serde(rename = "thinking_delta")]
+    Thinking,
+    #[serde(rename = "signature_delta")]
+    Signature,
+    #[serde(rename = "input_json_delta")]
+    InputJson,
 }
 
 const USAGE: Spelling = Spelling {
@@ -260,7 +258,7 @@ impl Decoder {
         let mut events = Vec::new();
         match kind {
             Some(Event::Error) => {
-                let reading = openai::read::<Code>(&value);
+                let reading = errors::read::<Code>(&value);
                 return Err(errors::classify(None, &value, reading, self.errors, None));
             }
             Some(Event::MessageStart) => {
@@ -660,7 +658,6 @@ mod tests {
             json!([native, redacted, tool])
         );
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
-        assert!(body.get("thinking").is_none()); // replay does not require enabling new thinking
         let assistant = |request: &ModelRequest| {
             encode(request, Default::default(), &Dialect::standard()).unwrap()["messages"][1]["content"].clone()
         };

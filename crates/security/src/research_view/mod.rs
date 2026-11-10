@@ -1,27 +1,23 @@
-//! The run as the orchestrator and the Research tab see it: one read, two renderings.
+//! The run as the Research tab sees it.
 use std::fmt::Display;
 
-use cli::{
-    ExtensionView,
-    page::{
-        AgentPane, Block, Cell, Disclosed, Fact, Meter, Page, Panel, PanelRow, Stage, StageState,
-        Tone, ViewFrame,
-    },
+use skyhook::product::page::{
+    Block, Cell, Disclosed, Fact, Meter, Page, Panel, PanelRow, Stage, StageState, Tone,
 };
 
-use crate::store::{FlawStatus, Phase, PremiseStatus, RunFacts, RunState, Status, Store, Summary};
+use crate::store::{FlawStatus, Phase, PremiseStatus, RunState, Status, Store, Summary};
 
 mod sections;
 use sections::sections;
 
 /// When this process opened the session; a reopen starts it again.
-pub struct Opened {
+pub(crate) struct Opened {
     at: chrono::DateTime<chrono::Local>,
     since: std::time::Instant,
 }
 
 impl Opened {
-    pub fn now() -> Self {
+    pub(crate) fn now() -> Self {
         Self {
             at: chrono::Local::now(),
             since: std::time::Instant::now(),
@@ -30,7 +26,7 @@ impl Opened {
 
     /// How long the session has been open, to the whole minute: the page is read again
     /// only as often as that changes.
-    pub fn uptime(&self) -> Uptime {
+    pub(crate) fn uptime(&self) -> Uptime {
         Uptime {
             at: self.at,
             minutes: self.since.elapsed().as_secs() / 60,
@@ -39,7 +35,7 @@ impl Opened {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Uptime {
+pub(crate) struct Uptime {
     at: chrono::DateTime<chrono::Local>,
     minutes: u64,
 }
@@ -55,32 +51,13 @@ impl Display for Uptime {
     }
 }
 
-pub const VIEWS: &[ExtensionView] = &[ExtensionView {
-    title: "Research",
-    frame: ViewFrame::Page {
-        agents: AgentPane::Live,
-    },
-}];
-
-impl RunFacts {
-    /// The orchestrator's section of its runtime state.
-    pub fn state(&self) -> String {
-        format!(
-            "run: {}\nlive: {}\nworkers: {}\nplan: {}\nartifacts: {}\n",
-            self.run.id,
-            self.run.live,
-            self.run.options.workers,
-            self.summary.line(),
-            self.artifacts.display(),
-        )
-    }
-}
+pub(crate) const VIEWS: &[&str] = &["Research"];
 
 impl RunState {
     /// The Research tab: the run, how long it has been open when it is, where its plan
     /// stands, where each phase stands and counts that use the width, then the record
     /// sections with what `disclosed` shows.
-    pub fn page(
+    pub(crate) fn page(
         &self,
         store: &Store,
         disclosed: &Disclosed,
@@ -92,7 +69,7 @@ impl RunState {
         let mut header = vec![
             fact("run", facts.run.id.to_string()),
             fact("threshold", facts.run.options.threshold.to_string()),
-            fact("live", facts.run.live.to_string()),
+            fact("live", facts.run.options.live.to_string()),
             fact("workers", facts.run.options.workers.to_string()),
         ];
         header.extend(uptime.map(|uptime| fact("opened", uptime.to_string())));
@@ -102,14 +79,14 @@ impl RunState {
                 summary.line(),
                 if summary.complete() {
                     Tone::Success
-                } else if Work::of(summary, &Phase::ALL).active {
+                } else if StageWork::of(summary, &Phase::ALL).active {
                     Tone::Accent
                 } else {
                     Tone::Warning
                 },
             ),
         };
-        let work = |phases: &[Phase]| Work::of(summary, phases);
+        let work = |phases: &[Phase]| StageWork::of(summary, phases);
         let began = |phases: &[Phase]| {
             (phases.iter()).any(|phase| coverage.tasks.get(phase).is_some_and(|count| *count > 0))
         };
@@ -123,13 +100,13 @@ impl RunState {
             stage(
                 "target",
                 coverage.components,
-                Work::default(),
+                StageWork::default(),
                 coverage.components > 0,
             ),
             stage(
                 "paths",
                 coverage.paths,
-                Work {
+                StageWork {
                     active: coverage.states > 0 && coverage.paths == 0,
                     exhausted: false,
                 },
@@ -327,12 +304,12 @@ fn row(label: &str, value: Cell, meter: Option<Meter>) -> PanelRow {
 /// Where a stage's phases stand: at work while any of it is owed or running, blocked when
 /// some of it is exhausted (for tests, also while one waits on the user).
 #[derive(Clone, Copy, Default)]
-struct Work {
+struct StageWork {
     active: bool,
     exhausted: bool,
 }
 
-impl Work {
+impl StageWork {
     fn of(summary: &Summary, phases: &[Phase]) -> Self {
         Self {
             active: (phases.iter()).any(|phase| summary.owed(*phase) + summary.running(*phase) > 0),
@@ -354,7 +331,7 @@ impl Work {
     }
 }
 
-fn stage(label: &str, value: impl Display, work: Work, started: bool) -> Stage {
+fn stage(label: &str, value: impl Display, work: StageWork, started: bool) -> Stage {
     Stage {
         label: label.to_owned(),
         value: value.to_string(),

@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Entry, Message, ToolResult, UserContent};
-use crate::{
-    identity::AgentId,
-    media::{AttachmentRef, ImageRef, LoadedBlobs},
-    named_enum::named_enum,
-    newtype::{Blank, nonblank, string_newtype},
+use crate::identity::AgentId;
+use skyhook_base::{
+    enums::NamedEnum,
+    newtype::{Blank, nonblank},
+    string_newtype,
 };
+use skyhook_media::{AttachmentRef, ImageRef, LoadedBlobs};
 
 string_newtype! {
     /// The model identifier a provider's API is sent: free-form, never blank.
@@ -34,11 +35,11 @@ pub struct ModelRequest {
     #[serde(default)]
     pub history_lifetime: HistoryLifetime,
     /// Shared with the surface that generated them and the context that recorded them.
-    pub tools: Vec<std::sync::Arc<ToolDefinition>>,
+    pub tools: Vec<std::sync::Arc<crate::tool::catalog::ToolDefinition>>,
     /// Optional JSON Schema for the final answer; reasoning remains a separate stream.
     pub response_schema: Option<ResponseSchema>,
-    pub reasoning: Option<String>,
-    pub max_output_tokens: Option<std::num::NonZeroU64>,
+    pub reasoning: Option<crate::provider::model::Effort>,
+    pub max_output_tokens: std::num::NonZeroU64,
     /// Blob contents this request references, loaded by the session store for
     /// provider encoding. Never serialized.
     #[serde(skip)]
@@ -46,7 +47,7 @@ pub struct ModelRequest {
 }
 
 impl ModelRequest {
-    /// An empty request for `model`: no history, tools, schema or limits.
+    /// An empty request for `model`: no history, tools or schema.
     #[cfg(test)]
     pub(crate) fn test(model: &str) -> Self {
         Self {
@@ -57,7 +58,7 @@ impl ModelRequest {
             tools: Vec::new(),
             response_schema: None,
             reasoning: None,
-            max_output_tokens: None,
+            max_output_tokens: std::num::NonZeroU64::new(8192).unwrap(),
             blobs: LoadedBlobs::default(),
         }
     }
@@ -106,22 +107,21 @@ impl ModelRequest {
     }
 }
 
-named_enum! {
-    /// Whether later requests in this model context will extend this request's history.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-    pub enum HistoryLifetime {
-        /// Later requests in this context extend this history.
-        #[default]
-        Extends = "extends",
-        /// This history is sent once under settings no other request in the context shares
-        /// (compaction summaries), so there is no cached prefix to read or extend.
-        Detached = "detached",
-    }
+/// Whether later requests in this model context will extend this request's history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryLifetime {
+    /// Later requests in this context extend this history.
+    #[default]
+    Extends,
+    /// This history is sent once under settings no other request in the context shares
+    /// (compaction summaries), so there is no cached prefix to read or extend.
+    Detached,
 }
 
 string_newtype! {
     /// Stable identity of one conversation's provider context. Providers may send it as
-    /// cache-affinity metadata; it never selects history.
+    /// cache-affinity metadata.
     pub struct ContextId(Blank) = |id| nonblank("context identity", id);
 }
 
@@ -182,13 +182,6 @@ impl ResponseSchema {
     pub fn schema(&self) -> &Value {
         &self.schema
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
 }
 
 #[cfg(test)]

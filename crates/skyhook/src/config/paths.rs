@@ -8,14 +8,14 @@ pub fn workspace_directory(workspace: &Path) -> PathBuf {
     workspace.join(".skyhook")
 }
 
-/// A workspace's session history when no session root is configured.
+/// A workspace's session history unless its host places it elsewhere.
 pub fn workspace_session_root(workspace: &Path) -> PathBuf {
     workspace_directory(workspace).join("sessions")
 }
 
 /// Skyhook's user configuration directories, most preferred first:
 /// `$XDG_CONFIG_HOME/skyhook`, then `$HOME/.config/skyhook`.
-pub(crate) fn user_config_directories() -> Vec<PathBuf> {
+pub fn user_config_directories() -> Vec<PathBuf> {
     config_directories(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),

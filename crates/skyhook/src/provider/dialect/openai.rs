@@ -1,10 +1,10 @@
 //! api.openai.com: the `developer` role, `prompt_cache_key` on Chat as well,
 //! no reasoning replay on Chat, strict schemas, and organisation headers.
 
+use crate::provider::codec::errors::{ErrorSignals, error_object};
 use serde::Deserialize;
 
-use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
-use crate::media::ImageLimits;
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Wire};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -14,15 +14,13 @@ use crate::provider::{
         path,
         responses::{self, ReasoningSummary},
     },
-    http::{
-        Transport,
-        errors::{ErrorSignals, error_object},
-        headers::HeaderText,
-    },
+    http::{Transport, headers::HeaderText},
 };
+use skyhook_media::ImageLimits;
 
 /// What the service accepts of an image: 6000 px and 20 MiB.
-pub(super) const IMAGES: ImageLimits = ImageLimits::new(6000, 20 * 1024 * 1024);
+pub(super) const IMAGES: ImageLimits =
+    ImageLimits::new::<6000, { skyhook_media::MAX_IMAGE_BYTES }>();
 
 fn chat() -> chat_completions::Dialect {
     chat_completions::Dialect {
@@ -52,7 +50,9 @@ pub(super) fn responses() -> responses::Dialect {
 /// OpenAI's tool-name alphabet, and response schemas flagged `strict`;
 /// services that front OpenAI's models share them.
 pub(super) fn conventions(codec: &mut Codec) {
-    *codec.tool_names_mut() = ToolNames::OpenAi;
+    if let Codec::ChatCompletions(dialect) = codec {
+        dialect.tool_names = ToolNames::OpenAi;
+    }
     if let Some(schema) = codec.schema_mut() {
         *schema = SchemaConstraint::Strict;
     }
@@ -101,7 +101,7 @@ impl DialectConfig for Config {
         BaseUrl::Default("https://api.openai.com/v1")
     }
 
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError> {
         let mut codec = match codec {
             CodecName::ChatCompletions => Codec::ChatCompletions(chat()),
             CodecName::Responses => Codec::Responses(responses()),
@@ -117,9 +117,9 @@ impl DialectConfig for Config {
             errors: ERRORS,
             ..Transport::plain()
         };
-        let mut profile = Profile::new(codec, transport, Dialect::Openai, IMAGES);
+        let mut wire = Wire::new(codec, transport, Dialect::Openai, IMAGES);
         if self.organization.is_some() || self.project.is_some() {
-            profile.discriminate("account", &(&self.organization, &self.project));
+            wire.discriminate("account", &(&self.organization, &self.project));
         }
         // Identity headers tied to the key.
         for (header, value) in [
@@ -127,10 +127,10 @@ impl DialectConfig for Config {
             ("openai-project", &self.project),
         ] {
             if let Some(value) = value {
-                profile.fixed(header, value.value());
+                wire.fixed(header, value.value());
             }
         }
-        Ok(profile)
+        Ok(wire)
     }
 }
 

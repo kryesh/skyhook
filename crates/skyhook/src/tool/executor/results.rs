@@ -1,4 +1,4 @@
-//! Collect job outcomes, import remote payloads, and present execution failures.
+//! Collect job outcomes and present execution failures.
 
 use super::*;
 
@@ -8,14 +8,17 @@ pub(super) enum CollectionPurpose {
     Native,
     /// The public script contract is the same envelope as model calls, but
     /// with complete captured data rather than an automatic preview.
-    Public(crate::tool::ToolResultPolicy),
+    Public,
 }
+
+use crate::tool::catalog::ToolResultPolicy;
 
 impl ToolExecutor {
     pub(super) async fn collect_model_started(&self, started: StartedExecution) -> Reported {
-        let StartedExecution::Foreground(job) = started else {
-            let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
-            return self.collect_result(started, purpose, None).await;
+        let StartedExecution::Foreground(job, ..) = started else {
+            return self
+                .collect_result(started, CollectionPurpose::Public, None)
+                .await;
         };
         let jobs = &self.shared.jobs;
         let waited = match jobs.wait_foreground(job, None).await {
@@ -33,6 +36,7 @@ impl ToolExecutor {
                 kind: crate::job::ViewKind::Response,
                 reader: None,
                 fit: crate::job::output::Fit::Preview,
+                reach: None,
             },
         );
         let presented = match presented.await {
@@ -53,6 +57,7 @@ impl ToolExecutor {
         Reported {
             outcome: Ok(result),
             acknowledges,
+            policy: ToolResultPolicy::Value,
         }
     }
 
@@ -64,8 +69,8 @@ impl ToolExecutor {
         purpose: CollectionPurpose,
         reader: Option<JobId>,
     ) -> Reported {
-        let job = match started {
-            StartedExecution::Foreground(job) => job,
+        let (job, policy, produced) = match started {
+            StartedExecution::Foreground(job, policy, produced) => (job, policy, produced),
             StartedExecution::Background(launched) => {
                 let value = launched
                     .metadata_view(self.diagnostic_viewer())
@@ -86,20 +91,19 @@ impl ToolExecutor {
         };
         if !envelope.state.is_terminal() {
             let view = match purpose {
-                CollectionPurpose::Public(_) => {
-                    envelope.response_view(self.diagnostic_viewer(), None)
-                }
+                CollectionPurpose::Public => envelope.response_view(self.diagnostic_viewer(), None),
                 CollectionPurpose::Native => envelope.metadata_view(self.diagnostic_viewer()),
             };
             return Ok(released(job, view)).into();
         }
-        let result = match jobs.saved_result(&envelope).await {
+        let result = match jobs.saved_result(&envelope, Some(&produced)).await {
             Ok(result) => result,
             Err(error) => return Err(job_error(error)).into(),
         };
         Reported {
-            outcome: self.finished_result(job, envelope, result, purpose),
+            outcome: self.finished_result(job, envelope, result, purpose, policy),
             acknowledges: delivery,
+            policy,
         }
     }
 
@@ -110,17 +114,20 @@ impl ToolExecutor {
         envelope: crate::job::JobEnvelope,
         result: Option<ToolOutput>,
         purpose: CollectionPurpose,
+        policy: ToolResultPolicy,
     ) -> Result<ExecutionResult, ToolError> {
         let images = envelope.images.clone();
-        if let CollectionPurpose::Public(policy) = purpose {
+        if let CollectionPurpose::Public = purpose {
             // A successful output query already returns the target view. The
             // invocation's state, not the target's, determines is_error.
             let is_error = envelope.state != JobState::Completed;
-            let output = if !is_error && policy == crate::tool::ToolResultPolicy::JobView {
+            let output = if !is_error && policy == ToolResultPolicy::JobView {
                 let output = result.ok_or_else(|| {
                     ToolError::failed("job-output query completed without a response")
                 })?;
-                let presented = output.presented.within(&crate::job::FieldPointer::result());
+                let presented = output
+                    .presented
+                    .within(&skyhook_tools::output::FieldPointer::result());
                 ToolOutput::new(output.value).with_presented(presented)
             } else {
                 // The saved result's fields sit at the same pointers in the envelope.
@@ -181,6 +188,9 @@ fn released(job: JobId, view: crate::job::JobView) -> ExecutionResult {
 pub(crate) struct Reported {
     pub(crate) outcome: Result<ExecutionResult, ToolError>,
     pub(crate) acknowledges: Option<crate::job::Delivery>,
+    /// The result policy of the invocation whose job the outcome reports, or a value
+    /// for an outcome reported before or without one.
+    pub(crate) policy: ToolResultPolicy,
 }
 
 impl From<Result<ExecutionResult, ToolError>> for Reported {
@@ -188,6 +198,7 @@ impl From<Result<ExecutionResult, ToolError>> for Reported {
         Self {
             outcome,
             acknowledges: None,
+            policy: ToolResultPolicy::Value,
         }
     }
 }
@@ -196,8 +207,21 @@ impl From<Result<ExecutionResult, ToolError>> for Reported {
 /// at launch, never its later state: its outcome reaches the owner as a
 /// notification, which reading it here would consume.
 pub(crate) enum StartedExecution {
-    Foreground(JobId),
+    /// A job run in the foreground, by an invocation with this result policy, which
+    /// reads the files its output is kept in on the target it ran on.
+    Foreground(JobId, ToolResultPolicy, crate::job::output::TargetFiles),
     Background(Box<crate::job::JobEnvelope>),
+}
+
+impl StartedExecution {
+    /// The result policy of a foreground job's invocation; a background launch
+    /// answers with its job as launched.
+    pub(super) fn policy(&self) -> ToolResultPolicy {
+        match self {
+            Self::Foreground(_, policy, _) => *policy,
+            Self::Background(_) => ToolResultPolicy::Value,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -212,7 +236,7 @@ pub struct ExecutionResult {
 /// contract. A missing ID means there is no inspectable job handle.
 pub(crate) fn failure_response(
     error: ToolError,
-    viewer: crate::tool::diagnostic::DiagnosticViewer<'_>,
+    viewer: skyhook_tools::diagnostic::DiagnosticViewer<'_>,
 ) -> ToolOutput {
     let (diagnostic, output) = error.into_parts();
     let message = diagnostic.render_for(viewer);
@@ -254,7 +278,7 @@ mod tests {
             .register::<Args, Payload, _, _>(
                 "payload",
                 "test payload",
-                crate::tool::ToolOptions::default(),
+                crate::tool::catalog::ToolOptions::default(),
                 |_, args| async move {
                     if args.fail {
                         Err(ToolError::with_output(
@@ -273,7 +297,7 @@ mod tests {
         crate::tool::builtins::jobs::register(&mut builder, runtime.jobs.clone()).unwrap();
         let executor = runtime.executor(builder);
         for location in [
-            ExecutionLocation::root(runtime.root.path().to_owned()),
+            ExecutionLocation::root(crate::tests::text(runtime.root.path())),
             ExecutionLocation::named("worker".parse().unwrap(), "/remote".into()),
         ] {
             let executor = executor.clone().with_location(location.clone());
@@ -365,8 +389,7 @@ mod tests {
         complete(&runtime, job, payload.clone()).await;
         let started = || StartedExecution::Background(launched.clone());
         let model = executor.collect_model_started(started()).await;
-        let purpose = CollectionPurpose::Public(crate::tool::ToolResultPolicy::Value);
-        let script = executor.collect_result(started(), purpose, None).await;
+        let script = (executor.collect_result(started(), CollectionPurpose::Public, None)).await;
         let (model, script) = (model.outcome.unwrap(), script.outcome.unwrap());
         assert_eq!(model.output.value, script.output.value);
         assert!(model.background && script.background);

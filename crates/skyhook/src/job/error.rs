@@ -19,18 +19,18 @@ impl std::fmt::Display for InputUnavailableReason {
     }
 }
 
-impl<O> From<JobError> for crate::tool::invocation::OperationError<O> {
+impl<O> From<JobError> for skyhook_tools::error::OperationError<O> {
     fn from(error: JobError) -> Self {
         Self::from(&error)
     }
 }
 
 /// By reference, so one refusal of several calls fails each of them alike.
-impl<O> From<&JobError> for crate::tool::invocation::OperationError<O> {
+impl<O> From<&JobError> for skyhook_tools::error::OperationError<O> {
     fn from(error: &JobError) -> Self {
-        use crate::tool::diagnostic::Cause;
+        use skyhook_tools::diagnostic::Cause;
         match error {
-            JobError::Session(error) => Self::session(error),
+            JobError::Session(error) => error.into(),
             JobError::InputClosed(_) => Self::input_closed(),
             JobError::Output(error) => Self::from_facts(error.facts().clone(), None),
             JobError::Unknown(job) => Self::cause(Cause::UnknownJob { job: *job }),
@@ -58,8 +58,6 @@ pub enum JobError {
     InputUnsupported(JobId),
     #[error("job {0} input channel is closed")]
     InputClosed(JobId),
-    #[error("job identifier space is exhausted")]
-    InvalidId,
     #[error("the calling turn was interrupted")]
     Interrupted,
     #[error(
@@ -70,8 +68,6 @@ pub enum JobError {
     NoChild(JobId),
     #[error("child agent does not belong to job {0}")]
     ChildOwnerMismatch(JobId),
-    #[error("child message text does not match the committed assistant text")]
-    ChildTextMismatch,
     #[error("duplicate question header `{0}`")]
     DuplicateQuestion(crate::agent::QuestionHeader),
     #[error("child question has no owning agent job")]

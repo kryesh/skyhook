@@ -3,8 +3,8 @@
 ## Session lifecycle
 
 Startup and `/new` open an empty draft without creating a session or its files. The session is
-created when you send the first message or explicitly run a script; leaving an unused draft
-behind does not create an empty saved session. Resuming an existing session still opens it immediately.
+created when you send the first message or explicitly run a script. Resuming an existing
+session still opens it immediately.
 
 Use `--resume SESSION_ID` to reopen a session. The CLI stores session logs and looks for
 saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` selects the workspace
@@ -14,11 +14,9 @@ written by an incompatible earlier session format cannot be reopened and are lef
 research, an incompatible earlier version wrote.
 
 Skyhook's file tools never open a database this process holds open: searches skip an open
-session's `session.db`, `session.db-wal` and `session.db-shm`, and reading, replacing or removing
-them, or removing a directory that contains them, is refused, since closing any handle to such a
-file would release the database's locks. A session opening while a file tool reads its files
-waits briefly for the read to finish. To inspect a live session from outside, open it read-only
-without its shared memory index changing, for example
+session's `session.db` and its `-wal`, `-shm` and `-journal` files, and reading, replacing or
+removing them, or removing a directory that contains them, is refused. To inspect a live session
+from outside, open it read-only without its shared memory index changing, for example
 `sqlite3 'file:.skyhook/sessions/<id>/session.db?mode=ro&readonly_shm=1'`.
 
 The terminal keeps several sessions open at once. `/new` opens a draft beside the current session,

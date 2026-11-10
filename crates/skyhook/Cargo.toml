@@ -7,84 +7,51 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = ["script"]
-# The `script` tool and its V8 JavaScript runtime.
-script = ["dep:url", "dep:v8"]
-
 [dependencies]
 base64.workspace = true
-bytes = "1"
+bytes.workspace = true
 chrono.workspace = true
-iana-time-zone.workspace = true
-dom_query = "0.29"
-dom_smoothie = "0.19"
-encoding_rs = "0.8"
 futures-util.workspace = true
 getrandom.workspace = true
-grep-matcher = "0.1"
-grep-regex = "0.1"
-grep-searcher = "0.1"
-# The version dom_query builds its tree with.
-html5ever = "0.40"
+grep-matcher.workspace = true
+grep-regex.workspace = true
 http.workspace = true
 httpdate = "1"
-ignore.workspace = true
-image.workspace = true
 indexmap.workspace = true
 jsonschema.workspace = true
-libc = "0.2"
+libc.workspace = true
 libsql.workspace = true
-reqwest = { version = "0.13.4", default-features = false, features = [
-    "rustls",
-    "json",
-    "stream",
-    "charset",
-    "gzip",
-    "brotli",
-    "deflate",
-    "zstd",
-    "http2",
-] }
+reqwest.workspace = true
 rmcp = { version = "3.7", default-features = false, features = [
     "client",
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
 ] }
-rmp-serde = "1"
-url = { workspace = true, optional = true }
-v8 = { version = "152", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rustls-native-certs = "0.8"
 schemars.workspace = true
 serde.workspace = true
-serde_bytes = "0.11"
 serde_json.workspace = true
 serde_json_path = "0.7"
 serde_path_to_error.workspace = true
 serde-saphyr.workspace = true
 serde_with.workspace = true
-schema.workspace = true
+skyhook-schema.workspace = true
+skyhook-tools.workspace = true
+skyhook-worker.workspace = true
+skyhook-base.workspace = true
+skyhook-media.workspace = true
 sha2.workspace = true
 # Must match rmcp's sse-stream minor version: its transport API exposes these types.
 sse-stream = "0.2"
-struson = "0.7"
-webpki-roots = "1"
-tempfile.workspace = true
+struson.workspace = true
 tera.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+url.workspace = true
+v8 = "152"
 zeroize.workspace = true
 
 [dev-dependencies]
-# Tests run scripts whatever features the library is built with.
-skyhook = { path = ".", features = ["script"] }
-# The version image decodes PNGs with, to build fixtures image cannot encode.
-png = "0.18"
-rcgen = "0.14"
-tokio-rustls = { version = "0.26", default-features = false, features = [
-    "ring",
-    "tls12",
-] }
-tokio = { version = "1", features = ["test-util"] }
+image.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

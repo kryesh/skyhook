@@ -19,26 +19,24 @@ workflows, or embed its Rust core in your own application.
 - **Supervised jobs and agents.** Delegate to child agents, follow up on their work,
   and inspect saved results. Sessions retain conversations, job output, and model
   requests for later inspection and resumption.
-- **Local and remote execution.** The same tools work in local workspaces and on SSH
-  targets, with explicit routing and credential ownership.
+- **Local and remote execution.** The same tools work in local workspaces and on Linux and
+  Windows targets reached over SSH or WinRM, with explicit routing and credential ownership.
 
 ## Install
 
 Requires **Rust 1.99 or newer** and [just](https://github.com/casey/just). Release builds are
-static musl binaries on Linux and embed static SSH shims for x86_64 and aarch64; both are
-cross-compiled with [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
+static musl binaries on Linux and embed the remote shims (Linux x86_64 and aarch64, Windows
+x86_64); both are cross-compiled with [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
 
 ```sh
 git clone https://github.com/kryesh/skyhook.git && cd skyhook
 just setup                 # cargo-zigbuild, cargo-nextest, mdBook, Rust targets
-just build-shims-release   # omit for a local-only build without SSH support
+just build-shims-release   # omit for a local-only build without remote targets
 just build-release         # produces target/<host target>/release/skyhook
 ```
 
 Configure a provider and model, then start a session. If you already have a
-configuration, keep it rather than downloading over it. For an old TOML configuration,
-[convert its contents and rename it to `config.yaml`](docs/src/configuration/overview.md#migrating-from-toml)
-first; renaming alone is not enough:
+configuration, keep it rather than downloading over it:
 
 ```sh
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
@@ -58,9 +56,9 @@ For automation, see [headless execution](docs/src/guide/headless.md) and
 [JavaScript workflows](docs/src/scripting/introduction.md).
 
 For codebase security research, `skyhook-security` reuses your model configuration and the same
-terminal and session runtime. It keeps a research ledger inside each session: components swept
-once, flaws and the sources that reach them, candidate scenarios built from those flaws, and the
-work they still owe; then parallel review, optional empirical validation, and reports. See
+terminal and session runtime. It keeps a research ledger inside each session: components and the
+paths through them, the flaws found there and the premises they rest on, candidate scenarios
+built from those flaws, and the work they still owe; then parallel review, optional empirical validation, and reports. See
 [security research](docs/src/guide/security.md) for configuration, runs, and reports.
 
 ## Development

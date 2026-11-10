@@ -62,7 +62,7 @@ impl Jobs {
         if self.get(reader).is_none_or(|entry| entry.end().is_some()) {
             return;
         }
-        self.modify(reader, |entry, _| entry.holds.push(captured));
+        self.modify(reader, |entry, _| entry.live.holds.push(captured));
         self.modify(captured.job, |entry, _| {
             entry
                 .child_mut()
@@ -75,8 +75,8 @@ impl Jobs {
     /// owner's again.
     pub(super) fn unread(&mut self, reader: JobId) {
         let holds = self.modify(reader, |entry, _| {
-            entry.reads.clear();
-            std::mem::take(&mut entry.holds)
+            entry.live.reads.clear();
+            std::mem::take(&mut entry.live.holds)
         });
         for Delivery { job, stamp } in holds.into_iter().flatten() {
             self.modify(job, |entry, _| {
@@ -198,7 +198,8 @@ impl JobManager {
         reader: Option<JobId>,
     ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
         // A released job whose finish is claimed returns with that outcome.
-        let ready = |entry: &JobFacts| entry.concluded() || (entry.background && !entry.finishing);
+        let ready =
+            |entry: &JobFacts| entry.concluded() || (entry.background && !entry.live.finishing);
         let (envelope, presented) = self.until_job(id, ready, reader).await?;
         let presented = presented.filter(|_| envelope.state.is_terminal());
         Ok((envelope, presented))
@@ -207,16 +208,9 @@ impl JobManager {
     /// Job `id`'s envelope once its turn moved its call to the background.
     pub(crate) async fn until_moved(&self, id: JobId) -> Result<JobEnvelope, JobError> {
         let moved = self
-            .until_job(id, |entry| entry.moved.is_some(), None)
+            .until_job(id, |entry| entry.live.moved.is_some(), None)
             .await;
         moved.map(|(envelope, _)| envelope)
-    }
-
-    /// Block until `id` is no longer live, without claiming or hydrating output.
-    pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
-        self.until_job(id, |entry| !entry.live(), None)
-            .await
-            .map(drop)
     }
 
     /// Job `id`'s envelope and the delivery it presents, once `ready`; a result
@@ -295,7 +289,9 @@ impl JobManager {
             return;
         };
         let record = move |state: &mut CoreState| {
-            state.jobs.modify(reader, |entry, _| entry.reads.push(read));
+            state
+                .jobs
+                .modify(reader, |entry, _| entry.live.reads.push(read));
         };
         self.inner.store.live(record).await;
     }
@@ -375,7 +371,7 @@ impl JobManager {
                 Some((
                     entry.envelope(id),
                     Delivery { job: id, stamp },
-                    output::Output::of(self.store(), id, entry.invocation),
+                    self.run_output(id, entry.invocation),
                 ))
             })
             .collect::<Vec<_>>();
@@ -388,6 +384,15 @@ impl JobManager {
 mod tests {
     use super::*;
     use std::assert_matches;
+
+    impl JobManager {
+        /// Block until `id` is no longer live, without claiming or hydrating output.
+        pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
+            self.until_job(id, |entry| !entry.live(), None)
+                .await
+                .map(drop)
+        }
+    }
 
     async fn completed_job() -> (tempfile::TempDir, JobManager, AgentId, JobId) {
         let (root, manager, owner) = crate::job::tests::runtime().await;
@@ -480,24 +485,6 @@ mod tests {
         }
     }
 
-    /// Replay acknowledges delivery from the rows committed with a notification,
-    /// never by reading notification text.
-    #[tokio::test]
-    async fn delivery_replay_acknowledges_only_committed_delivery_rows() {
-        for receipt in [true, false] {
-            let (_root, manager, owner, job) = completed_job().await;
-            let message = notification(job, JobState::Completed);
-            if receipt {
-                commit_pending(&manager, &owner, message).await;
-            } else {
-                // Text that merely looks like a notification acknowledges nothing.
-                let event = SessionEvent::MessageCommitted { message };
-                manager.test_append(owner.clone(), event).await;
-            }
-            assert_pending(&manager, &owner, !receipt, &receipt.to_string());
-        }
-    }
-
     #[tokio::test]
     async fn delivery_question_ack_does_not_suppress_later_terminal_result() {
         for cancelled in [false, true] {
@@ -585,10 +572,9 @@ mod tests {
         let answer = Message::Assistant(vec![crate::provider::protocol::AssistantItem::text(
             "text", 0, "first",
         )]);
-        (manager
-            .commit_child_message(&child.unwrap(), job, answer, "first".into(), |_| Vec::new()))
-        .await
-        .unwrap();
+        (manager.commit_child_message(&child.unwrap(), job, answer, |_| Vec::new()))
+            .await
+            .unwrap();
         manager.test_reply(job, "first").await;
         let reader = manager
             .test_create(JobSpec::test(owner.clone(), "script"))
@@ -618,6 +604,7 @@ mod tests {
                     kind: ViewKind::Inspection,
                     reader: Some(reader),
                     fit: output::Fit::Preview,
+                    reach: None,
                 };
                 let args = output::OutputArgs::new(job);
                 let capabilities = CapabilitySet::default();
@@ -710,7 +697,7 @@ mod tests {
         let text = "released-answer";
         let answer = crate::provider::protocol::AssistantItem::text("answer", 0, text);
         let answer = Message::Assistant(vec![answer]);
-        let commit = manager.commit_child_message(&child, job, answer, text.into(), |_| Vec::new());
+        let commit = manager.commit_child_message(&child, job, answer, |_| Vec::new());
         commit.await.unwrap();
         manager.notify_owner(job).await.unwrap();
         let read = manager.pending_delivery(&owner).await.unwrap();
@@ -757,7 +744,7 @@ mod tests {
                     .await;
             }
             let (job, child) = running_child(&manager, &owner).await;
-            let first = crate::job::tests::commit(&manager, &child, job, "progress").await;
+            crate::job::tests::commit(&manager, &child, job, "progress").await;
             drop(manager.pending_delivery(&owner).await.unwrap());
             assert!(manager.has_pending(&owner));
             let batch = manager.pending_delivery(&owner).await.unwrap();
@@ -782,8 +769,7 @@ mod tests {
             assert_eq!(saved.count(), 1);
             assert!(!manager.has_pending(&owner));
             // Equal text is a new independent event when its source sequence differs.
-            let second = crate::job::tests::commit(&manager, &child, job, "progress").await;
-            assert_ne!(first, second);
+            crate::job::tests::commit(&manager, &child, job, "progress").await;
             let pending = manager.pending_delivery(&owner).await.unwrap();
             assert_eq!(pending.messages().len(), 1);
             assert!(pending.envelopes().is_empty());

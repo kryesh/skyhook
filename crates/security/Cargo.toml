@@ -1,28 +1,23 @@
 [package]
-name = "security"
-description = "Flaw-first security research companion built on Skyhook"
+name = "skyhook-security"
+description = "The flaw-first security research product built on Skyhook"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "skyhook-security"
-path = "src/main.rs"
-doc = false
-
 [dependencies]
 skyhook.workspace = true
-cli.workspace = true
+skyhook-base.workspace = true
+skyhook-media.workspace = true
+skyhook-tools.workspace = true
+skyhook-worker.workspace = true
 chrono.workspace = true
-clap.workspace = true
-getrandom.workspace = true
 http.workspace = true
 ignore.workspace = true
 indexmap.workspace = true
 libsql.workspace = true
-mimalloc.workspace = true
 pulldown-cmark.workspace = true
 regex.workspace = true
 schemars.workspace = true
@@ -30,10 +25,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
-tempfile.workspace = true

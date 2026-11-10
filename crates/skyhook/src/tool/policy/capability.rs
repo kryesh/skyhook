@@ -1,10 +1,11 @@
 //! Built-in and namespaced host permissions, including their stable wire names.
 
+use skyhook_tools::diagnostic::{DiagnosticViewer, TargetView};
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::newtype::string_newtype;
+use skyhook_base::string_newtype;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("host capability must be namespace.name, each component matching [a-z][a-z0-9_]*")]
@@ -45,8 +46,6 @@ pub enum Capability {
     Exec,
     Network,
     Targets,
-    /// Forward an SSH agent Skyhook does not own (`ssh.external_agent`).
-    SshAgent,
     Agents,
     Interactive,
     Mcp,
@@ -55,13 +54,12 @@ pub enum Capability {
 
 impl Capability {
     /// Every built-in capability. Host capabilities are declared separately by each host.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Read,
         Self::Write,
         Self::Exec,
         Self::Network,
         Self::Targets,
-        Self::SshAgent,
         Self::Agents,
         Self::Interactive,
         Self::Mcp,
@@ -74,7 +72,6 @@ impl Capability {
             Self::Exec => "exec",
             Self::Network => "network",
             Self::Targets => "targets",
-            Self::SshAgent => "ssh_agent",
             Self::Agents => "agents",
             Self::Interactive => "interactive",
             Self::Mcp => "mcp",
@@ -91,7 +88,6 @@ impl Capability {
             Self::Exec => "Run commands",
             Self::Network => "Fetch from the network",
             Self::Targets => "Use remote targets",
-            Self::SshAgent => "External SSH agent",
             Self::Agents => "Start child agents",
             Self::Interactive => "Ask you questions",
             Self::Mcp => "Use MCP tools",
@@ -180,54 +176,26 @@ impl CapabilitySet {
 
     /// The target as a viewer holding these capabilities may see it: only one
     /// that can select targets learns which target anything ran on.
-    pub(crate) fn visible_target<'a>(
+    pub fn visible_target<'a>(
         &self,
-        target: &'a crate::target::TargetRef,
-    ) -> Option<&'a crate::target::TargetRef> {
+        target: &'a skyhook_tools::target::TargetRef,
+    ) -> Option<&'a skyhook_tools::target::TargetRef> {
         self.contains(&Capability::Targets).then_some(target)
     }
-}
 
-/// What a mode grants. Interaction follows the host, so a mode never lists it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "CapabilitySet", into = "CapabilitySet")]
-pub struct ModeCapabilities(CapabilitySet);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("interactive is controlled by the runtime host, not the capability allowlist")]
-pub struct InteractiveListed;
-
-impl TryFrom<CapabilitySet> for ModeCapabilities {
-    type Error = InteractiveListed;
-
-    fn try_from(capabilities: CapabilitySet) -> Result<Self, Self::Error> {
-        match capabilities.contains(&Capability::Interactive) {
-            true => Err(InteractiveListed),
-            false => Ok(Self(capabilities)),
+    /// How a viewer holding these capabilities sees targets in a diagnostic.
+    pub fn target_view(&self) -> TargetView {
+        match self.contains(&Capability::Targets) {
+            true => TargetView::Named,
+            false => TargetView::Hidden,
         }
     }
 }
 
-impl From<ModeCapabilities> for CapabilitySet {
-    fn from(capabilities: ModeCapabilities) -> Self {
-        capabilities.0
-    }
-}
-
-impl ModeCapabilities {
-    /// Every default session capability a host does not supply.
-    pub fn general() -> Self {
-        let mut capabilities = CapabilitySet::default();
-        capabilities.remove(&Capability::Interactive);
-        Self(capabilities)
-    }
-
-    pub fn set(&self) -> &CapabilitySet {
-        &self.0
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
-        self.0.iter()
+/// Inspection by capabilities alone is a host view.
+impl From<&CapabilitySet> for DiagnosticViewer<'_> {
+    fn from(capabilities: &CapabilitySet) -> Self {
+        capabilities.target_view().into()
     }
 }
 

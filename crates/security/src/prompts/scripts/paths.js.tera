@@ -1,0 +1,21 @@
+const workers = /* how many inputs to sweep at once */, inputs = [/* ids of the map's components that receive external input */];
+const drain = async (kind, filter) => { const out = []; for (let after = 0;;) { const p = (await tool.research_query({action: "list", record: {kind, ...filter}, page: {after, limit: 100}})).unwrap(); out.push(...p.items); if (p.next_after == null) return out; after = p.next_after; } };
+const briefs = [], interfaces = [], served = new Set();
+for (const id of inputs) { const c = (await tool.research_query({action: "node", id})).unwrap(); briefs.push(...c.files.map(f => `Record the entries and states in ${f}.`)); interfaces.push(...c.interfaces); }
+{% if live %}for (const e of await drain("environment")) if (e.candidate == null) for (const s of e.serves) served.add(s.interface);
+briefs.push(...interfaces.filter(i => served.has(i)).map(i => `Enumerate the operations of interface ${i}.`));
+{% endif %}const jobs = (await tool.jobs({all: true, limit: 1})).unwrap();
+let launches = jobs.jobs.length + (jobs.older ?? 0);
+const outcomes = [];
+for await (const {index, value, error} of new WorkPool(workers).map(briefs, async prompt => {
+  const child = await tool.agent({mode: "entries", depth: 1, name: `entries-${++launches}`, prompt});
+  return {prompt, child: child.id, state: child.state, error: child.error};
+})) outcomes[index] = value ?? {error};
+// A path of one step is an entry a child recorded; its group is the others recorded there.
+const at = s => JSON.stringify([s.component.id, s.location ?? null]), paths = [];
+for (const p of await drain("path")) paths.push({id: p.id, steps: (await tool.research_query({action: "node", id: p.id})).unwrap().steps});
+const entries = {}, unmatched = paths.filter(p => !p.steps.length).map(p => p.id);
+for (const p of paths) if (p.steps.length === 1) (entries[at(p.steps[0])] ??= {component: p.steps[0].component.id, at: p.steps[0].location ?? null, paths: []}).paths.push(p.id);
+const unlinked = [];
+for (const s of await drain("state", {scope: "input"})) if (s.status === "recorded" && !(await tool.research_query({action: "node", id: s.id})).unwrap().accesses.length) unlinked.push(s.id);
+return {inputs: briefs.length, unserved: interfaces.filter(i => !served.has(i)), entries: Object.values(entries), unmatched, unlinked, outcomes};

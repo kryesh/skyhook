@@ -6,7 +6,6 @@ export class WorkPool {
   constructor(concurrency) {
     brand(this);
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new RangeError("concurrency must be positive");
-    if (arguments.length !== 1) throw new TypeError("WorkPool accepts only a concurrency limit");
     this.#concurrency = concurrency;
   }
   map(items, worker) {

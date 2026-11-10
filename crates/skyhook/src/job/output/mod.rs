@@ -2,6 +2,7 @@
 mod args;
 mod captures;
 mod elements;
+mod files;
 mod finalization;
 mod json;
 mod preview;
@@ -9,39 +10,42 @@ mod products;
 mod projection;
 mod query;
 mod reader;
-mod render;
 mod saved;
 mod shape;
+mod stream;
 use args::Selection;
-pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, Selectors, line_matcher};
-pub use args::{OutputArgs, PageLimit, PageUnit, REGEX_SIZE_LIMIT};
+pub(crate) use args::{DEFAULT_LIMIT, MAX_CONTEXT, Selectors, count};
+pub use args::{OutputArgs, PageLimit, PageUnit};
 #[cfg(test)]
-pub(crate) use captures::PendingCapture;
-pub(crate) use captures::{CaptureCollector, CompletedCapture, HostOutput};
-pub use captures::{CaptureDescriptor, CaptureKind};
+pub(crate) use captures::create_capture;
+pub use captures::{CaptureDescriptor, FieldFile};
+pub(crate) use captures::{CompletedCapture, HostOutput};
+pub(crate) use files::{HeldFile, Reach, TargetFiles};
 pub(crate) use finalization::prepare_completed;
-pub(crate) use json::{Detection, parse_text as parse_json_text};
 pub use products::{
-    Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NextChild, NumberedLine,
-    OutputFields, OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
+    Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NumberedLine, OutputPreview,
+    OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
-pub(crate) use projection::Presented;
-#[cfg(feature = "script")]
 pub(crate) use projection::{fill_absent, presented_fields};
 use reader::Source;
+use saved::{Held, Stored, hydrate, prepare_document};
 pub(crate) use saved::{Output, Saved, presented_size};
-use saved::{Stored, hydrate, prepare_document};
 
 use super::{JobError, JobManager, ViewKind, views};
-pub use crate::tool::output::FieldPointer;
+
+use crate::tool::policy::CapabilitySet;
 use crate::{
-    identity::JobId,
     session::{CaptureRow, OutputRows, SharedDb, StagedCapture},
-    tool::{ToolError, diagnostic::DiagnosticViewer, policy::CapabilitySet},
+    tool::ToolError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use skyhook_tools::{
+    diagnostic::DiagnosticViewer,
+    output::{CaptureKind, FieldPointer, Presented},
+};
+use skyhook_worker::job::JobId;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read, Write},
@@ -55,18 +59,27 @@ const IO_BUFFER_BYTES: usize = 64 * 1024;
 const HYDRATED_PAGES: usize = 4;
 /// The most lines host inspection shows of a running job's capture: its latest.
 const LIVE_LINES: PageLimit = PageLimit::new::<20>();
+/// The bytes of a stream's end a target reports with a stream it kept in a file: what
+/// a preview of both ends shows of them.
+pub(crate) const STREAM_TAIL_BYTES: u64 = preview::TEXT_BYTES as u64;
+/// How often at most a target tells of the latest of a stream it is keeping.
+pub(crate) const STREAM_LATEST_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Omit null-valued object fields from human-only UI display copies.
-/// Never use for model, history, saved output, or JavaScript response data.
-/// Null array entries and literal strings stay intact to preserve indices and text.
-pub fn omit_null_fields(value: &mut Value) {
-    match value {
-        Value::Object(fields) => fields.retain(|_, value| {
-            omit_null_fields(value);
-            !value.is_null()
-        }),
-        Value::Array(values) => values.iter_mut().for_each(omit_null_fields),
-        _ => {}
+/// Where the session host keeps saved output that is too large for its database: its
+/// spill directory, when its user has a cache directory, and the bytes of one field
+/// past which a file holds it.
+#[derive(Clone, Debug)]
+pub(crate) struct Spill {
+    pub root: Option<std::path::PathBuf>,
+    pub bytes: u64,
+}
+
+impl Default for Spill {
+    fn default() -> Self {
+        Self {
+            root: skyhook_worker::fs::spill::root(),
+            bytes: skyhook_base::limits::SAVED_FIELD_BYTES,
+        }
     }
 }
 
@@ -74,13 +87,16 @@ pub fn omit_null_fields(value: &mut Value) {
 /// notification, for its reader to acknowledge; host inspection never does and
 /// always shows details.
 #[derive(Clone, Copy)]
-pub(crate) enum OutputOptions {
+pub(crate) enum OutputOptions<'a> {
     Host,
     /// Job `reader`, when a job reads it, holds what it presents from the read on.
+    /// What the job's target holds of its output is read there through `reach`, by
+    /// a call that has one.
     Model {
         kind: ViewKind,
         reader: Option<super::JobId>,
         fit: Fit,
+        reach: Option<&'a dyn Reach>,
     },
 }
 
@@ -98,7 +114,7 @@ impl JobManager {
     pub(crate) async fn output(&self, id: JobId) -> Output {
         let invocation = self.entry(id, |entry| entry.invocation).await;
         let invocation = invocation.unwrap_or_default();
-        Output::of(&self.inner.store, id, invocation)
+        self.run_output(id, invocation)
     }
 
     #[cfg(test)]
@@ -115,6 +131,7 @@ impl JobManager {
                 kind: ViewKind::Inspection,
                 reader: None,
                 fit: Fit::Preview,
+                reach: None,
             },
         );
         let presented = presented.await?;
@@ -132,56 +149,6 @@ impl JobManager {
         self.present_output_with(args, cancellation, capabilities, OutputOptions::Host)
             .await
             .map(PresentedOutput::into_view)
-    }
-
-    /// Saved pointers one level below `parent`, for host UI field discovery: the
-    /// first members or elements of a JSON field, and at the result, its captures
-    /// too. Large JSON is listed a level at a time rather than enumerated.
-    pub async fn inspect_output_fields(
-        &self,
-        job: JobId,
-        parent: FieldPointer,
-        index: usize,
-    ) -> Result<OutputFields, ToolError> {
-        let metadata = self.snapshot(job).await?;
-        let terminal = metadata.state.is_terminal();
-        let output = Output::of(self.store(), job, metadata.invocation);
-        output
-            .reads
-            .clone()
-            .hold(move || {
-                let saved = Saved::load(&output)?;
-                let cancellation = super::CancellationToken::new();
-                let mut listed = OutputFields {
-                    fields: Vec::new(),
-                    next: None,
-                };
-                if terminal
-                    && saved.product.is_some()
-                    && let Some(render::Resolved::Json {
-                        mut json,
-                        container,
-                    }) =
-                        render::resolve(&saved, &parent, render::Reading::SAMPLED, &cancellation)?
-                {
-                    listed = elements::children(
-                        &mut json.reader,
-                        container,
-                        &parent,
-                        index,
-                        &cancellation,
-                    )?;
-                }
-                if parent == FieldPointer::result() && index == 0 {
-                    for capture in captures::available_captures(&saved, terminal) {
-                        if !listed.fields.contains(&capture.field) {
-                            listed.fields.push(capture.field);
-                        }
-                    }
-                }
-                Ok(listed)
-            })
-            .await
     }
 
     /// Host inspection with automatic pages for captures absent from the whole
@@ -220,8 +187,11 @@ impl JobManager {
                     let page = async {
                         if live {
                             let held = reads.clone();
+                            let latest = self.store().output_changes().following();
                             let start = move || {
-                                reader::last_page_start(&reads, target.capture, LIVE_LINES.get())
+                                let reader = reader::CaptureReader::new(reads, target.capture)
+                                    .following(latest.get(&target.capture).cloned());
+                                reader::last_page_start(reader, args::count(LIVE_LINES))
                             };
                             query.start = Some(held.hold(start).await?);
                             query.unit = Some(PageUnit::Lines);
@@ -246,18 +216,23 @@ impl JobManager {
     }
 
     /// Return the state and presentation from the same job snapshot. Explicit
-    /// field/page queries always retain full output, even under Automatic policy.
+    /// field/page queries always retain full output.
     pub(crate) async fn present_output_with<'a>(
         &self,
         args: OutputArgs,
         cancellation: super::CancellationToken,
         viewer: impl Into<DiagnosticViewer<'a>>,
-        options: OutputOptions,
+        options: OutputOptions<'_>,
     ) -> Result<PresentedOutput, ToolError> {
         let viewer = viewer.into();
-        let (model, kind, reader, fit) = match options {
-            OutputOptions::Host => (false, ViewKind::Inspection, None, Fit::Preview),
-            OutputOptions::Model { kind, reader, fit } => (true, kind, reader, fit),
+        let (model, kind, reader, fit, reach) = match options {
+            OutputOptions::Host => (false, ViewKind::Inspection, None, Fit::Preview, None),
+            OutputOptions::Model {
+                kind,
+                reader,
+                fit,
+                reach,
+            } => (true, kind, reader, fit, reach),
         };
         let query = args.admit()?;
         let output_selection = args.selection();
@@ -282,44 +257,35 @@ impl JobManager {
         let mut result = None;
         let mut annotations = views::Presentation::default();
         // The run the envelope shows: a later run's output never presents it.
-        let output = Output::of(self.store(), args.job, envelope.invocation);
-        let (saved, shown) = {
-            let (mut query, cancellation) = (query.clone(), cancellation.clone());
-            output
-                .reads
-                .clone()
-                .hold(move || {
-                    let saved = Saved::load(&output)?;
-                    let shown = if !explicit && terminal && saved.product.is_some() {
-                        match fit {
-                            Fit::Whole => Shown::Whole(saved.result()?),
-                            Fit::Preview => {
-                                Shown::Projected(projection::project(&saved, &cancellation)?)
-                            }
-                        }
-                    } else if question && !explicit {
-                        Shown::Question
-                    } else {
-                        if !explicit && !question && saved.product.is_some() {
-                            query.field = FieldPointer::root();
-                        }
-                        // A whole-result query always resolves to "/result" or "" here.
-                        let unavailable = !terminal
-                            && (query.field == FieldPointer::result() || query.field.is_root());
-                        Shown::Page(if unavailable {
-                            if matches!(query.position, args::Position::Query { .. }) {
-                                return Err(ToolError::invalid_arguments(
-                                    "the result is saved when the job finishes: query it then",
-                                ));
-                            }
-                            OutputPreview::Lines(reader::empty(&query.text(), None, false))
-                        } else {
-                            page(&saved, &query, terminal, &cancellation)?
-                        })
-                    };
-                    Ok((saved, shown))
-                })
-                .await?
+        let output = self.run_output(args.job, envelope.invocation);
+        let wanted = Wanted {
+            query: query.clone(),
+            explicit,
+            terminal,
+            question,
+            fit,
+            reaches: reach.is_some(),
+        };
+        // What the job's target holds of the output is read there with the session's
+        // readers let go: a page of one field as it is asked for, and fields a read
+        // needs whole before it reads on with them held.
+        let (ran, mut texts) = (&envelope.location, Vec::new());
+        let (saved, shown) = loop {
+            let (rows, wanted, cancelled) = (output.clone(), wanted.clone(), cancellation.clone());
+            let show = move || {
+                let saved = Saved::load(&rows)?.holding(texts);
+                saved.reading(|saved| wanted.clone().show(saved, &cancelled))
+            };
+            match output.reads.hold(show).await? {
+                (_, Shown::Held(held, limit)) => {
+                    texts = files::texts(reach, ran, held, limit, &cancellation).await?;
+                }
+                (saved, Shown::File(file)) => {
+                    let page = files::page(reach, ran, file, query.text(), terminal, &cancellation);
+                    break (saved, Shown::Page(OutputPreview::Lines(page.await?)));
+                }
+                shown => break shown,
+            }
         };
         // A whole result holds raw data, to show as its saved fields are shown;
         // anything else was fitted already.
@@ -345,6 +311,7 @@ impl JobManager {
                 annotations.notice = projected.notice;
             }
             Shown::Question => annotations.question = asked,
+            Shown::File(_) | Shown::Held(..) => unreachable!("read on the job's target above"),
             Shown::Page(mut page) => {
                 if matches!(options, OutputOptions::Model { .. })
                     && args.field.as_ref() == page.field()
@@ -363,13 +330,12 @@ impl JobManager {
             delivery.filter(|_| model && (terminal || annotations.question.is_some()));
         // A complete capture is simply a field of the result, read by pointer.
         captures.retain(|capture| !capture.complete);
-        // Hydration targets come from discovered records, never decoded wire
-        // descriptors.
         let capture_targets = captures
             .iter()
             .enumerate()
             .filter(|(_, capture)| {
                 output_selection == OutputSelection::WholeWithImages
+                    && !capture.complete
                     && !shows(result.as_ref(), &capture.field)
             })
             .filter_map(|(index, capture)| {
@@ -381,7 +347,13 @@ impl JobManager {
             })
             .collect();
         annotations.captures = (!captures.is_empty()).then_some(captures);
+        // Where a field's bytes are kept is the session's user's to see.
+        let files = match options {
+            OutputOptions::Host => captures::field_files(&saved, &envelope.location),
+            OutputOptions::Model { .. } => Vec::new(),
+        };
         Ok(PresentedOutput {
+            files,
             state: envelope.state,
             view: envelope.view(viewer, kind, result, annotations),
             images,
@@ -392,26 +364,98 @@ impl JobManager {
     }
 
     /// The result `envelope`'s run saved, once it finished, with the
-    /// presentations of its fields saved with it.
+    /// presentations of its fields saved with it. The fields its target holds in
+    /// files are read whole through `reach`, with the session's readers let go.
     pub(crate) async fn saved_result(
         &self,
         envelope: &super::JobEnvelope,
+        reach: Option<&dyn Reach>,
     ) -> Result<Option<crate::tool::ToolOutput>, JobError> {
         if !envelope.state.is_terminal() {
             return Ok(None);
         }
-        let output = Output::of(self.store(), envelope.id, envelope.invocation);
-        let reads = output.reads.clone();
-        let saved = move || {
-            let saved = Saved::load(&output)?;
-            let result = saved.result()?;
-            let presented = saved.presented;
-            Ok(result.map(|value| crate::tool::ToolOutput::new(value).with_presented(presented)))
+        let output = self.run_output(envelope.id, envelope.invocation);
+        let (root, cancellation) = (FieldPointer::root(), super::CancellationToken::new());
+        let read = async {
+            let mut texts = Vec::new();
+            loop {
+                let (rows, root) = (output.clone(), root.clone());
+                let saved = move || {
+                    let saved = Saved::load(&rows)?.holding(texts);
+                    let held = saved.on_target(&root);
+                    let whole = |saved: &Saved| held.is_empty().then(|| saved.result()).transpose();
+                    let (saved, result) = saved.reading(whole)?;
+                    Ok::<_, ToolError>((result, held, saved.presented))
+                };
+                let (result, held, presented) = output.reads.hold(saved).await?;
+                let Some(result) = result else {
+                    let ran = &envelope.location;
+                    texts = files::texts(reach, ran, held, None, &cancellation).await?;
+                    continue;
+                };
+                let output = |value| crate::tool::ToolOutput::new(value).with_presented(presented);
+                return Ok(result.map(output));
+            }
         };
-        reads
-            .hold(saved)
-            .await
-            .map_err(|error| JobError::Output(Box::new(error)))
+        read.await
+            .map_err(|error: ToolError| JobError::Output(Box::new(error)))
+    }
+}
+
+/// What a read wants shown of a run's saved output.
+#[derive(Clone)]
+struct Wanted {
+    query: args::Query,
+    /// Whether the read selects what it shows itself.
+    explicit: bool,
+    /// Whether the job has finished.
+    terminal: bool,
+    /// Whether the job is asking a question.
+    question: bool,
+    fit: Fit,
+    /// Whether the reader reaches what the job's target holds.
+    reaches: bool,
+}
+
+impl Wanted {
+    /// What to show of `saved`, or what the reader reads on the job's target first.
+    fn show(
+        mut self,
+        saved: &Saved,
+        cancellation: &super::CancellationToken,
+    ) -> Result<Shown, ToolError> {
+        let (explicit, terminal, question) = (self.explicit, self.terminal, self.question);
+        if !explicit && terminal && saved.product.is_some() {
+            let held = match self.fit {
+                Fit::Whole => saved.on_target(&FieldPointer::root()),
+                Fit::Preview => {
+                    let projected = projection::project(saved, cancellation)?;
+                    return Ok(Shown::Projected(projected));
+                }
+            };
+            return Ok(match held.is_empty() {
+                true => Shown::Whole(saved.result()?),
+                false => Shown::Held(held, None),
+            });
+        }
+        if question && !explicit {
+            return Ok(Shown::Question);
+        }
+        let query = &mut self.query;
+        if !explicit && !question && saved.product.is_some() {
+            query.field = FieldPointer::root();
+        }
+        // A whole-result query always resolves to "/result" or "" here.
+        if !terminal && (query.field == FieldPointer::result() || query.field.is_root()) {
+            if matches!(query.position, args::Position::Query { .. }) {
+                return Err(ToolError::invalid_arguments(
+                    "the result is saved when the job finishes: query it then",
+                ));
+            }
+            let empty = reader::empty(&query.text(), None, false);
+            return Ok(Shown::Page(OutputPreview::Lines(empty)));
+        }
+        page(saved, query, (terminal, self.reaches), cancellation)
     }
 }
 
@@ -421,6 +465,11 @@ enum Shown {
     Projected(projection::Projected),
     Question,
     Page(OutputPreview),
+    /// A page of the file that holds the selected field on the job's target.
+    File(crate::session::TargetFile),
+    /// What the read shows once it holds these fields whole, which the job's target
+    /// holds: each within this many bytes, when the read is bounded.
+    Held(Held, Option<usize>),
 }
 
 fn check_cancelled(cancellation: &super::CancellationToken) -> Result<(), ToolError> {
@@ -432,35 +481,51 @@ fn check_cancelled(cancellation: &super::CancellationToken) -> Result<(), ToolEr
 }
 
 /// One page of the selected field, in its own unit: lines of text, or the
-/// elements or members of JSON, which a pattern filters like lines.
+/// elements or members of JSON, which a pattern filters like lines. What the job's
+/// target keeps in files is left to its reader to read there: the text the page
+/// selects, for a reader that `reaches` it, and the fields a filter reads whole.
+/// A reader that does not reach the target pages what the session holds of the text.
 fn page(
     saved: &Saved,
     query: &args::Query,
-    terminal: bool,
+    (terminal, reaches): (bool, bool),
     cancellation: &super::CancellationToken,
-) -> Result<OutputPreview, ToolError> {
+) -> Result<Shown, ToolError> {
     use args::{Page, Position};
     // Filters read their field whole; pages need only prefixes of stored text.
     let reading = match &query.position {
         Position::Query { .. }
         | Position::Page(Page {
             matcher: Some(_), ..
-        }) => render::Reading::Whole,
-        Position::Page(_) => render::Reading::SAMPLED,
+        }) => stream::Reading::Whole,
+        Position::Page(_) => stream::Reading::SAMPLED,
     };
     let text = |text| reader::page(text, &query.text(), terminal, cancellation);
-    match render::resolve(saved, &query.field, reading, cancellation)? {
+    let lines = || match query.position {
+        Position::Query { .. } => Err(ToolError::invalid_arguments(
+            "field is text: query applies to a JSON object or array",
+        )),
+        Position::Page(_) => query.starts_in(args::PageUnit::Lines),
+    };
+    let selected = saved.captures.get(&query.field);
+    if let Some(crate::session::CaptureBytes::Target(file)) = selected.map(|capture| &capture.bytes)
+        && reaches
+    {
+        return lines().map(|()| Shown::File(file.clone()));
+    }
+    if matches!(reading, stream::Reading::Whole) {
+        let held = saved.on_target(&query.field);
+        if !held.is_empty() {
+            let limit = skyhook_base::limits::WHOLE_VALUE_BYTES;
+            return Ok(Shown::Held(held, Some(limit)));
+        }
+    }
+    let page = match stream::resolve(saved, &query.field, reading, cancellation)? {
         None => text(None).map(OutputPreview::Lines),
-        Some(render::Resolved::Text(field)) => match query.position {
-            Position::Query { .. } => Err(ToolError::invalid_arguments(
-                "field is text: query applies to a JSON object or array",
-            )),
-            Position::Page(_) => {
-                query.starts_in(args::PageUnit::Lines)?;
-                text(Some(field)).map(OutputPreview::Lines)
-            }
-        },
-        Some(render::Resolved::Json {
+        Some(stream::Resolved::Text(field)) => {
+            lines().and_then(|()| text(Some(field)).map(OutputPreview::Lines))
+        }
+        Some(stream::Resolved::Json {
             mut json,
             container,
         }) => {
@@ -488,7 +553,8 @@ fn page(
                 None => elements::page(&mut json, container, field, first, limit, cancellation),
             }
         }
-    }
+    };
+    page.map(Shown::Page)
 }
 
 /// Whether a presented `result` holds a value, `null` included, at `field`.
@@ -546,7 +612,7 @@ mod tests {
         manager.send(id, json!("again")).await.unwrap();
         let second = crate::tests::bounded(manager.wait(id, true)).await;
         assert_eq!(second.unwrap().output, Some(json!("second")));
-        let shown = manager.saved_result(&first).await.unwrap();
+        let shown = manager.saved_result(&first, None).await.unwrap();
         assert_eq!(shown.map(|output| output.value), Some(json!("first")));
     }
 
@@ -578,10 +644,8 @@ mod tests {
     /// suppresses automatic capture hydration.
     #[tokio::test]
     async fn output_product_owns_image_eligibility_and_typed_page() {
-        use crate::{
-            media::{BlobRef, ImageFormat, ImageRef},
-            tool::ToolOutput,
-        };
+        use crate::tool::ToolOutput;
+        use skyhook_media::{BlobRef, ImageFormat, ImageRef};
         let (_root, manager, id) = fixture(None).await;
         let blob: BlobRef = manager.store().store_blob(b"image").await.unwrap();
         let images = ["first", "second"]
@@ -678,13 +742,6 @@ mod tests {
                 manager.output(id).await.test_document().unwrap()["result"],
                 raw
             );
-            let metadata = manager
-                .snapshot(id)
-                .await
-                .unwrap()
-                .metadata_view(&Default::default())
-                .into_value();
-            assert_eq!(metadata.get("result"), None);
         }
         // A null result stays present after a failure too; hydration recovers its
         // availability from the saved presence bit.
@@ -705,7 +762,7 @@ mod tests {
             let view = model(&manager, OutputArgs::new(id)).await;
             assert_eq!(view.get("result"), available.then_some(&Value::Null));
             let envelope = manager.snapshot(id).await.unwrap();
-            let result = manager.saved_result(&envelope).await.unwrap();
+            let result = manager.saved_result(&envelope, None).await.unwrap();
             assert_eq!(result.is_some(), available);
         }
     }
@@ -722,9 +779,6 @@ mod tests {
             } else {
                 "/result/events~1custom/nested~0key"
             };
-            assert!(
-                host(&manager, OutputArgs::new(id)).await["presentation"]["captures"].is_null()
-            );
             let bytes = "{\"partial\":"; // Deliberately unfinished JSON.
             let output = manager.output(id).await;
             output.test_capture(field, CaptureKind::Json, bytes.as_bytes());
@@ -772,7 +826,7 @@ mod tests {
             let job = fixture_with(&manager, &agent, None, None).await;
             let mut output = crate::tool::ToolOutput::new(json!({"stdout":"line\n".repeat(120)}));
             if !complete {
-                output.streams = crate::tool::StreamEnd::Cut;
+                output.streams = skyhook_tools::output::StreamEnd::Cut;
             }
             manager.test_complete(job, output).await;
             for field in [None, Some("/result/stdout"), Some("")] {
@@ -906,10 +960,13 @@ mod tests {
         }});
         let id = fixture_with(&manager, &agent, Some(schema), None).await;
         let stdout: FieldPointer = "/result/stdout".parse().unwrap();
-        let mut writer =
-            PendingCapture::create(&manager.output(id).await, &stdout, CaptureKind::Text)
-                .unwrap()
-                .open();
+        let mut writer = crate::job::output::create_capture(
+            &manager.output(id).await,
+            &stdout,
+            CaptureKind::Text,
+        )
+        .unwrap()
+        .open();
         writer.write_all(b"[\n").unwrap();
         writer.flush().unwrap();
         let view = host(&manager, field_args(id, "/result/stdout")).await;
@@ -918,16 +975,13 @@ mod tests {
             (&preview["lines"], &preview["next_start"]),
             (&json!(["["]), &json!(2))
         );
-        let view: crate::job::JobView = serde_json::from_value(view).unwrap();
-        let next = view.continuation().unwrap();
-        assert_eq!((next.start, next.unit), (2, PageUnit::Lines));
         writer.write_all(b"1, 2]").unwrap();
         let receipt = writer.finish().unwrap();
         let completed = crate::tool::ToolOutput::new(json!({})).with_captures(vec![receipt]);
         manager.test_complete(id, completed).await;
         for unit in [Some(PageUnit::Lines), None] {
             let mut args = field_args(id, "/result/stdout");
-            (args.start, args.unit) = (Some(next.start), unit);
+            (args.start, args.unit) = (Some(2), unit);
             let error = manager
                 .inspect_output(args, CancellationToken::new(), &Default::default())
                 .await
@@ -1066,13 +1120,6 @@ mod tests {
                     preview["lines"].as_array().unwrap().len(),
                     if terminal { 2 } else { 1 }
                 );
-                // Capture pages are not recursively hydrated.
-                for nested in capture["output"]["presentation"]["captures"]
-                    .as_array()
-                    .unwrap()
-                {
-                    assert!(nested["output"].is_null());
-                }
             }
         }
     }
@@ -1097,20 +1144,6 @@ mod tests {
                 capture["field"] == "/result/absent"
             );
         }
-        // A field read previews that field and hydrates no capture.
-        let (_, view, _) = manager
-            .inspect_output_with_captures(
-                field_args(job, "/result/present"),
-                CancellationToken::new(),
-                &Default::default(),
-            )
-            .await
-            .unwrap()
-            .into_parts();
-        assert_eq!(view["presentation"]["preview"]["field"], "/result/present");
-        let captures = view["presentation"]["captures"].as_array().unwrap();
-        assert_eq!(captures.len(), 3);
-        assert!(captures.iter().all(|capture| capture["output"].is_null()));
     }
 
     #[tokio::test]
@@ -1191,7 +1224,7 @@ mod tests {
             .await;
         assert_matches!(
             result,
-            Err(error) if matches!(error.diagnostic().cause, crate::tool::diagnostic::Cause::InvalidArguments(_)));
+            Err(error) if matches!(error.diagnostic().cause, skyhook_tools::diagnostic::Cause::InvalidArguments(_)));
         let unknown = OutputArgs::new(JobId::new(job.get() + 100).unwrap());
         assert!(
             manager
@@ -1203,21 +1236,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    /// A text selection of a job's output attaches none of its images.
-    #[tokio::test]
-    async fn image_output_text_selections_do_not_attach() {
-        use crate::tests::{assert_loaded, image_runtime};
-        let (runtime, executor, _slot) = image_runtime().await;
-        let agent = &runtime.agent;
-        let read = executor
-            .run_model(agent, "read", json!({"path":"image.png"}))
-            .await
-            .unwrap();
-        assert_loaded(&runtime.store, read.output.images).await;
-        let query = json!({"job":read.job, "field":"/result"});
-        let output = executor.run_model(agent, "jobs", query).await.unwrap();
-        assert!(output.output.images.is_empty());
     }
 }

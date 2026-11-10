@@ -1,19 +1,18 @@
 //! Encode Responses input history, replay, runtime state, and explicit cache checkpoints.
-use super::{Dialect, ProviderError, native::ItemType, reasoning_parts};
-use crate::media::Image;
+use super::{Dialect, ProviderError};
 use crate::provider::{
-    ProviderErrorKind::InvalidRequest,
     codec::{
         Cache,
         common::{
             PreparedImages, StateWire, image_url, is_sealed, own_replay, push_state,
-            signed_context, tagged, user_parts,
+            signed_context, user_parts,
         },
         placement::{explicit_breakpoint, push_history},
     },
     protocol::{AssistantItem, Entry, Message, ModelRequest, Replay, ReplayFormat},
 };
 use serde_json::{Value, json};
+use skyhook_media::Image;
 
 pub(super) fn encode(
     request: &ModelRequest,
@@ -21,17 +20,13 @@ pub(super) fn encode(
     dialect: &Dialect,
 ) -> Result<Vec<Value>, ProviderError> {
     let mut input = Input::default();
-    let budget = match dialect.cache {
-        Cache::Explicit => Some(dialect.breakpoints),
-        Cache::Automatic | Cache::Server => None,
-    };
     let unsigned =
         dialect.unsigned.replayed().is_some() && !signed_context(request, ReplayFormat::Responses);
     // Current state may coalesce into the prefix tail's wrapper, but not its marked text block.
     push_history(
         &mut input,
         request,
-        budget,
+        matches!(dialect.cache, Cache::Explicit),
         0,
         |input, entry| input.push_entry(request, images, dialect, unsigned, entry),
         |input| input.text,
@@ -120,13 +115,6 @@ impl Input {
                             )
                             .filter(|replay| unsigned || is_sealed(replay))
                             {
-                                if tagged(native) != Some(ItemType::Reasoning)
-                                    || reasoning_parts(native).is_err()
-                                {
-                                    return Err(InvalidRequest.error(
-                                        "Responses reasoning replay is not a readable reasoning item",
-                                    ));
-                                }
                                 self.push(native.clone(), None);
                             }
                         }
@@ -152,11 +140,6 @@ impl Input {
             }
             Message::Tool(results) => {
                 for result in results {
-                    if result.call_id.is_empty() {
-                        return Err(
-                            InvalidRequest.error("Responses tool output requires a call ID")
-                        );
-                    }
                     let (output, text) = match dialect.cache {
                         Cache::Automatic | Cache::Server => {
                             (json!(result.result.to_string()), None)
@@ -195,7 +178,6 @@ mod tests {
         assemble_with, call_item, completed, decoder_for, message, reasoning_item,
     };
     use super::*;
-    use crate::media::AttachmentRef;
     use crate::provider::codec::StateRole;
     use crate::provider::{
         codec::common::tests::{
@@ -203,6 +185,7 @@ mod tests {
         },
         protocol::{Binding, HistoryLifetime, Outcome, UserContent, entries},
     };
+    use skyhook_media::AttachmentRef;
 
     fn assemble(output: Vec<Value>) -> Vec<AssistantItem> {
         let reduced = assemble_with(decoder_for("gpt-5"), vec![completed(output)]).unwrap();
@@ -362,7 +345,7 @@ mod tests {
     /// user message before it, or is its own after a tool output. A superseded state is
     /// omitted either way.
     #[test]
-    fn states_take_the_dialects_role_and_never_join_tool_output() {
+    fn states_take_the_dialects_role() {
         use crate::provider::protocol::{StateLifetime::*, state};
         let text = |text: &str| json!({"type":"input_text","text":text});
         let mut req = request("gpt-5");
@@ -616,27 +599,11 @@ mod tests {
         assert_eq!(&explicit[1..], &automatic[1..]);
     }
 
-    #[tokio::test]
-    async fn empty_nonmarkable_detached_and_automatic_inputs_have_no_checkpoints() {
+    #[test]
+    fn a_detached_history_takes_no_checkpoints() {
         use crate::provider::protocol::{StateLifetime::*, state};
         let dialect = explicit(StateRole::User);
         let mut req = request("gpt-5");
-        let contexts = [
-            vec![],
-            entries(vec![
-                user(""),
-                Message::Assistant(assemble(vec![reasoning_item(), call_item()])),
-            ]),
-            entries(vec![Message::User(vec![UserContent::Attachment {
-                attachment: AttachmentRef::Image(image()),
-            }])]),
-        ];
-        for context in contexts {
-            req.context = context;
-            let images = loaded(&mut req).await;
-            let input = encode(&req, images.prepared(), &dialect).unwrap();
-            assert!(!has_checkpoint(&json!(input)));
-        }
         req.history_lifetime = HistoryLifetime::Detached;
         req.context = vec![
             user("first").into(),
@@ -648,7 +615,6 @@ mod tests {
         let input = encode(&req, Default::default(), &dialect).unwrap();
         assert!(!has_checkpoint(&json!(input)));
         assert!(input[2]["output"].is_array());
-        // Automatic caching keeps the wire shape it always had.
         req.history_lifetime = HistoryLifetime::Extends;
         req.context = vec![
             user("stable").into(),
@@ -665,7 +631,6 @@ mod tests {
             state("now", Current),
         ];
         let input = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
-        assert!(!has_checkpoint(&json!(input)));
         assert_eq!(
             input[0]["content"],
             json!([

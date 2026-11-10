@@ -9,13 +9,11 @@ use std::{borrow::Cow, collections::BTreeMap};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
-use skyhook::tool::{
-    AdmissionError,
-    arguments::deserialize_arguments,
-    diagnostic::{Operation, Subject},
-    input_schema_for,
-    policy::CapabilitySet,
+use skyhook::tool::policy::CapabilitySet;
+use skyhook_tools::{
+    arguments::deserialize_arguments, error::AdmissionError, schema::input_schema_for,
 };
+use skyhook_worker::diagnostic::{Operation, Subject};
 
 use super::{Action, Actions};
 
@@ -141,7 +139,7 @@ pub(super) fn schema<A: Action>(capabilities: &CapabilitySet) -> Option<Value> {
 }
 
 fn generator() -> SchemaGenerator {
-    skyhook::tool::input_settings().into_generator()
+    skyhook_tools::schema::input_settings().into_generator()
 }
 
 /// The object root taking `actions`: `action` names one, and every argument any of them
@@ -221,10 +219,10 @@ fn root<N: Actions>(generator: &mut SchemaGenerator, actions: &[N]) -> Schema {
 struct Arguments {
     /// The arguments type's own doc.
     doc: Option<String>,
-    fields: Vec<Field>,
+    fields: Vec<Argument>,
 }
 
-struct Field {
+struct Argument {
     name: String,
     schema: Value,
     required: bool,
@@ -242,7 +240,7 @@ impl Arguments {
             _ => vec![schema],
         };
         let count = alternatives.len();
-        let mut fields: Vec<(Field, usize)> = Vec::new();
+        let mut fields: Vec<(Argument, usize)> = Vec::new();
         for mut alternative in alternatives {
             let required = alternative["required"].take();
             let Value::Object(properties) = alternative["properties"].take() else {
@@ -265,7 +263,7 @@ impl Arguments {
                         *requiring += usize::from(required);
                     }
                     None => fields.push((
-                        Field {
+                        Argument {
                             name,
                             schema,
                             required: false,
@@ -276,7 +274,7 @@ impl Arguments {
             }
         }
         let fields = (fields.into_iter())
-            .map(|(field, requiring)| Field {
+            .map(|(field, requiring)| Argument {
                 required: requiring == count,
                 ..field
             })

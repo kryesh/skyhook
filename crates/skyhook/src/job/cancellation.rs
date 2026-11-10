@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// How long a cancelled worker may take to stop before it is aborted.
-pub(crate) const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
+/// How long a cancelled call may take to stop before it is abandoned.
+pub(crate) const CANCELLATION_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Which jobs a cancellation ends.
 #[derive(Clone, Copy)]
@@ -49,7 +49,7 @@ impl JobManager {
                 .map(|(job, entry)| {
                     let event = SessionEvent::JobCancelRequested { job };
                     let token =
-                        (entry.handles.as_ref()).map(|handles| handles.cancellation.clone());
+                        (entry.live.handles.as_ref()).map(|handles| handles.cancellation.clone());
                     ((entry.agent.clone(), event), token)
                 })
                 .unzip();
@@ -93,6 +93,7 @@ impl JobManager {
                     },
                 };
                 let token = entry
+                    .live
                     .handles
                     .as_ref()
                     .map(|handles| handles.cancellation.clone());
@@ -195,7 +196,7 @@ impl JobManager {
     /// Abort `run`'s worker and settle its cancellation, if that changes its outcome.
     pub(super) async fn force_cancel(&self, run: Run) {
         let Run(job, invocation) = run;
-        let worker = self.entry(job, |entry| entry.handles.as_ref()?.task_abort.clone());
+        let worker = self.entry(job, |entry| entry.live.handles.as_ref()?.task_abort.clone());
         let worker = worker.await.ok().flatten();
         if let Some((running, task_abort)) = worker
             && running == invocation
@@ -211,7 +212,10 @@ impl JobManager {
 mod tests {
     use super::*;
     use crate::tests::{TestRuntime, bounded};
-    use crate::tool::{ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability};
+    use crate::tool::catalog::ToolOptions;
+    use crate::tool::policy::Capability;
+    use crate::tool::{ToolError, ToolRegistryBuilder};
+    use skyhook_tools::output::CaptureKind;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -232,16 +236,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_preserves_published_results_and_denials() {
-        use crate::{
-            job::output::PendingCapture,
-            media::ImageFormat,
-            tool::{
-                StreamEnd,
-                diagnostic::{
-                    Cause, FailureSite, Operation, PartialContext, RequestEffects, Subject,
-                },
-            },
+        use skyhook_media::ImageFormat;
+        use skyhook_tools::{
+            diagnostic::{Cause, FailureSite, PartialContext, RequestEffects},
+            output::StreamEnd,
         };
+        use skyhook_worker::diagnostic::{Operation, Subject};
         use std::io::Write as _;
 
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
@@ -272,7 +272,7 @@ mod tests {
                 .await;
             let saved = jobs.output(id).await;
             let stdout = "/result/stdout".parse().unwrap();
-            let mut writer = PendingCapture::create(&saved, &stdout, CaptureKind::Text)
+            let mut writer = crate::job::output::create_capture(&saved, &stdout, CaptureKind::Text)
                 .unwrap()
                 .open();
             writer.write_all(text.as_bytes()).unwrap();
@@ -457,7 +457,7 @@ mod tests {
             .unwrap();
         let executor = runtime.executor(builder);
         // Uncooperative handlers are aborted after the cancellation grace.
-        let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
+        let background = serde_json::json!({crate::tool::catalog::BACKGROUND: true});
         let stubborn = executor
             .run_host(agent, "stubborn", background.clone())
             .await

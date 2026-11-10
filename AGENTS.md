@@ -2,9 +2,22 @@
 
 Cargo workspace under `crates/`:
 
-- `skyhook` — the library.
-- `cli` — shared CLI/terminal host library and the `skyhook` binary.
-- `security` — flaw-first security research companion binary.
+- `base` — `skyhook-base`, generic primitives every crate shares (spelled enums, checked
+  newtypes, limits).
+- `macros` — `skyhook-macros`, the derives `base` exports (`NamedEnum`, `Kinds`).
+- `media` — `skyhook-media`, images, attachments and the blob references the journal and
+  providers share.
+- `skyhook` — the library, with the configuration type a host parses or builds, the
+  host-agnostic product API (`skyhook::product`) and the launch, approval and attachment APIs
+  every front end opens sessions with.
+- `worker` — `skyhook-worker`, the operations that run wherever tools execute and the facts
+  they fail with, job identifiers among them; with `base`, the only library the shim links.
+- `tools` — `skyhook-tools`, the target tools as specs: schemas, validation and rendering,
+  and what they name: target references and execution locations.
+- `schema` — `skyhook-schema`, the proc macro that builds the session journal's schema image.
+- `security` — `skyhook-security`, the flaw-first security research product library.
+- `apps` — `skyhook-apps`, the terminal UI, command line, configuration files, batch jobs
+  and the auth, dump and stats commands, and the `skyhook` and `skyhook-security` binaries.
 - `shim` — remote shim binary.
 
 Architecture: `docs/src/development/architecture.md`.

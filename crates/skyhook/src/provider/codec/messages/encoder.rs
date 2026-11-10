@@ -1,25 +1,19 @@
 //! Messages request encoding.
 use super::{Dialect, SystemState, native::BlockType};
-use crate::{
-    media::Image,
-    provider::{
-        ProviderError,
-        ProviderErrorKind::InvalidRequest,
-        codec::{
-            CodecName, StateRole,
-            common::{
-                PreparedImages, check_tool, is_sealed, own_replay, signed_context, tagged,
-                user_parts,
-            },
-            placement::{breakpoint, path, push_history},
-            set_each,
-        },
-        protocol::{
-            AssistantItem, Entry, Message, ModelRequest, ReplayFormat, State, StateLifetime,
-        },
+use crate::provider::model::Effort;
+use crate::provider::{
+    ProviderError,
+    ProviderErrorKind::InvalidRequest,
+    codec::{
+        StateRole,
+        common::{PreparedImages, is_sealed, own_replay, signed_context, tagged, user_parts},
+        placement::{breakpoint, path, push_history},
+        set_each,
     },
+    protocol::{AssistantItem, Entry, Message, ModelRequest, ReplayFormat, State, StateLifetime},
 };
 use serde_json::{Map, Value, json};
+use skyhook_media::Image;
 
 /// The body fields this codec writes.
 pub(crate) const BODY_FIELDS: &[&str] = &[
@@ -37,13 +31,11 @@ pub(crate) fn encode(
     images: PreparedImages<'_>,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
-    let max_tokens = request
-        .max_output_tokens
-        .ok_or_else(|| InvalidRequest.error("Messages requires max_output_tokens"))?;
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("stream".into(), json!(true));
-    set_each(dialect.output_limit.iter(), &mut body, json!(max_tokens))?;
+    let limit = json!(request.max_output_tokens);
+    set_each(dialect.output_limit.iter(), &mut body, limit)?;
     let mut system = Vec::new();
     let breakpoint = || breakpoint(dialect.cache_ttl);
     for segment in &request.system {
@@ -68,11 +60,10 @@ pub(crate) fn encode(
         Entry::Message(message) => push_message(request, images, unsigned, messages, message),
         Entry::State(state) => push_state(dialect, messages, state),
     };
-    let budget = Some(dialect.breakpoints);
     push_history(
         &mut messages,
         request,
-        budget,
+        true,
         cached,
         send,
         |messages| last_cacheable(messages),
@@ -80,14 +71,10 @@ pub(crate) fn encode(
             messages[message]["content"][block]["cache_control"] = breakpoint();
         },
     )?;
-    if messages.is_empty() {
-        return Err(InvalidRequest.error("Messages requires at least one message"));
-    }
     body.insert("messages".into(), Value::Array(messages));
     if !request.tools.is_empty() {
         let mut tools = Vec::new();
         for tool in &request.tools {
-            check_tool(tool, dialect.tool_names, CodecName::Messages)?;
             let mut native = json!({"name":tool.name, "input_schema":tool.input_schema});
             if !tool.description.is_empty() {
                 native["description"] = json!(tool.description);
@@ -97,17 +84,16 @@ pub(crate) fn encode(
         body.insert("tools".into(), Value::Array(tools));
     }
     if let Some(schema) = &request.response_schema {
-        // Messages uses output_config.format, not the retired output_format beta field.
         let format = json!({"type":"json_schema", "schema":schema.schema()});
         const { path("output_config.format") }.set(&mut body, format)?;
     }
     // Summarized thinking is the default only on older models; request it wherever thinking is on.
-    if let Some(reasoning) = &request.reasoning {
-        let thinking = match reasoning.as_str() {
-            "off" => json!({"type":"disabled"}),
+    if let Some(reasoning) = request.reasoning {
+        let thinking = match reasoning {
+            Effort::Off => json!({"type":"disabled"}),
             level => {
-                if level != "adaptive" {
-                    CodecName::Messages.place_effort(&dialect.effort, &mut body, level)?;
+                if level != Effort::Adaptive {
+                    set_each(dialect.effort.iter(), &mut body, json!(level))?;
                 }
                 let mut adaptive = json!({"type":"adaptive", "display":"summarized"});
                 if dialect.thinking_binding == super::ThinkingBinding::DropOnMismatch {
@@ -146,7 +132,6 @@ fn push_message(
                             request.model.as_str(),
                         ) && (unsigned || is_sealed(replay))
                         {
-                            validate_thinking(&replay.payload)?;
                             blocks.push(replay.payload.clone());
                         }
                     }
@@ -168,11 +153,6 @@ fn push_message(
         Message::Tool(results) => {
             let mut blocks = Vec::new();
             for result in results {
-                if result.call_id.is_empty() {
-                    return Err(
-                        InvalidRequest.error("Messages tool results require a nonempty call_id")
-                    );
-                }
                 let mut content = vec![json!({"type":"text", "text":result.result.to_string()})];
                 for image in &result.images {
                     content.push(images.part(image, "text", image_block)?);
@@ -244,27 +224,6 @@ fn image_block(image: &Image) -> Value {
         "media_type":image.format().as_str(), "data":image.base64()}})
 }
 
-/// A replayed thinking block must be one the service issued: signed thinking,
-/// unsigned thinking without a signature, or redacted thinking with its data.
-fn validate_thinking(value: &Value) -> Result<(), ProviderError> {
-    let string = |field| value.get(field).and_then(Value::as_str);
-    let valid = match tagged(value) {
-        Some(BlockType::Thinking) => {
-            string("thinking").is_some()
-                && value
-                    .get("signature")
-                    .is_none_or(|signature| signature.as_str().is_some_and(|s| !s.is_empty()))
-        }
-        Some(BlockType::RedactedThinking) => string("data").is_some_and(|data| !data.is_empty()),
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(InvalidRequest.error("Messages replay is not a valid native thinking block"))
-    }
-}
-
 /// The last block that accepts `cache_control`, by message and block: thinking and
 /// empty text blocks cannot, and a state's system message is never marked.
 fn last_cacheable(messages: &[Value]) -> Option<(usize, usize)> {
@@ -289,14 +248,15 @@ mod tests {
     use crate::provider::codec::common::tests::{envelope, notes, tool_result};
     use crate::provider::codec::{NonEmpty, StateRole};
     use crate::provider::protocol::{Entry, StateLifetime, entries, state};
-    use crate::{
-        media::{AttachmentRef, ImageRef, Prepared},
-        provider::http::images::FittedImages,
-        provider::protocol::{
+    use crate::provider::{
+        http::images::FittedImages,
+        protocol::{
             AssistantItem, Binding, HistoryLifetime, Replay, ResponseSchema, SystemSegment,
-            ToolCall, ToolDefinition, UserContent,
+            ToolCall, UserContent,
         },
     };
+    use crate::tool::catalog::ToolDefinition;
+    use skyhook_media::{AttachmentRef, ImageRef, Prepared};
 
     fn signed_envelope(model: &str, payload: serde_json::Value) -> Replay {
         envelope(
@@ -328,8 +288,8 @@ mod tests {
         let source = crate::tests::noise(::image::ImageFormat::Png, 64, 64);
         let image = ImageRef {
             file: None,
-            format: crate::media::ImageFormat::Png,
-            blob: crate::media::BlobRef::of(&source),
+            format: skyhook_media::ImageFormat::Png,
+            blob: skyhook_media::BlobRef::of(&source),
         };
         let notes = notes();
         let mut request = request();
@@ -344,7 +304,7 @@ mod tests {
         })];
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         request.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
-        request.reasoning = Some("high".into());
+        request.reasoning = Some(Effort::High);
         let attach = |attachment| UserContent::Attachment { attachment };
         let call = ToolCall::new("tool_1", "look", json!({"path":"test.png"})).unwrap();
         request.context = entries(vec![
@@ -368,7 +328,7 @@ mod tests {
         request.blobs.insert(image.blob, source);
         request.blobs.insert(notes.blob, b"notes".to_vec());
         let mut images = FittedImages::default();
-        let limits = crate::media::ImageLimits::new(64, 4000);
+        let limits = skyhook_media::ImageLimits::new::<64, 4000>();
         images.refresh(&request, limits).await.unwrap();
         let body = encode(&request, images.prepared(), &Dialect::standard()).unwrap();
         assert_eq!(body["max_tokens"], 8192);
@@ -452,12 +412,12 @@ mod tests {
         );
         for (reasoning, thinking) in [
             (
-                "adaptive",
+                Effort::Adaptive,
                 json!({"type":"adaptive", "display":"summarized"}),
             ),
-            ("off", json!({"type":"disabled"})),
+            (Effort::Off, json!({"type":"disabled"})),
         ] {
-            request.reasoning = Some(reasoning.into());
+            request.reasoning = Some(reasoning);
             let body = encode(&request, images.prepared(), &Dialect::standard()).unwrap();
             assert_eq!(body["thinking"], thinking);
         }
@@ -601,23 +561,6 @@ mod tests {
             json!([{"type":"text","text":"one"}])
         );
         assert_eq!(messages[3]["content"][0], signed);
-        assert!(!json!(body).to_string().contains("open"));
-        // An empty signature is neither signed nor unsigned: it is a broken block.
-        let broken = json!({"type":"thinking", "thinking":"x", "signature":""});
-        let item = |id: &str, native: &Value| {
-            let replay = envelope(
-                ReplayFormat::Messages,
-                request.model.as_str(),
-                native.clone(),
-                Binding::Free,
-            );
-            AssistantItem::reasoning(id, 0, "", Some(replay))
-        };
-        request.context = entries(vec![Message::Assistant(vec![
-            item("c", &broken),
-            said("x"),
-        ])]);
-        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
     }
 
     #[test]
@@ -666,10 +609,7 @@ mod tests {
             text: "cached".into(),
             cache: true,
         };
-        request.system = vec![cached.clone(); 4];
-        assert!(encode(&request, Default::default(), &Dialect::standard()).is_ok());
         request.context = entries(vec![Message::User(vec![text("hello")])]);
-        assert!(encode(&request, Default::default(), &Dialect::standard()).is_err());
         // A long history marks its newest prefix ends beside the system prompt.
         request.system = vec![cached];
         for turn in ["two", "three", "four", "five"] {

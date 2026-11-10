@@ -5,21 +5,23 @@
 //! writes each agent's row in their transaction; hosts fold [`Turns`] alone.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::identity::AgentId;
+use crate::tool::policy::CapabilitySet;
 use crate::{
-    agent::{Failure, TurnFailure},
-    identity::AgentId,
     provider::protocol::{Usage, UsageTotals},
     session::{
         AttemptFailure, CompletedOutcome, EventRecord, Fact, HostCursor, ModelPurpose, RecordSeq,
-        RequestPhase, RequestRecord, RequestSeq, ResidentLedger, SessionEvent, ledger::Folded,
+        RequestPhase, RequestRecord, RequestSeq, ResidentLedger, SessionEvent, requests::Folded,
     },
-    tool::policy::CapabilitySet,
+    session::{Failure, TurnFailure},
 };
+use skyhook_base::enums::Kinds;
 
 /// Where an agent's journal leaves its last turn: its newest message awaits the model
 /// or answers it, a failure since stopped it, or one was reported with nothing open to
 /// continue.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Kinds)]
+#[kinds(name = LastKind, serde(rename_all = "snake_case"))]
 pub(crate) enum Last {
     Awaiting,
     Answered,
@@ -29,7 +31,8 @@ pub(crate) enum Last {
 
 /// How an agent's work last ended since its latest request: an idle root that was
 /// interrupted completed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Kinds)]
+#[kinds(name = OutcomeKind, serde(rename_all = "snake_case"))]
 pub(crate) enum Outcome {
     Completed,
     Interrupted,
@@ -453,9 +456,9 @@ impl FromIterator<(AgentId, i64)> for Turns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::SessionId;
     use crate::{
-        agent::CompactionFault,
-        identity::SessionId,
+        session::CompactionFault,
         session::{
             AttemptRef, CompactionFailure, ModelContext,
             tests::{self, attempt, profile, record, requested},

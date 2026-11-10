@@ -4,20 +4,23 @@
 
 `--approve-all` or `approve_all: true` bypasses approval prompts. Subject to the granted
 capabilities, the default CLI auto-allows reads and agent operations, as well as writes inside the
-root workspace. Execution, HTTP requests, SSH access, target changes, and writes outside the root
-workspace require approval. When the `interactive` capability is granted, questions and
-authentication prompts (SSH, and `sudo` in commands, locally or on targets) appear in the
+root workspace and inside the workspace of a remote target, whose connection is approved before
+anything reaches it. Execution, HTTP requests, remote connections, target changes, and writes
+outside those workspaces require approval. When the `interactive` capability is granted, questions appear in the
 interface. Otherwise operations needing human input fail immediately; `approve_all` bypasses tool
-approvals but never restores questions or authentication.
+approvals but never restores questions. A command's password prompt (from `ssh` or `sudo`)
+fails unless the environment Skyhook was started with names an askpass helper (`SSH_ASKPASS`,
+`SUDO_ASKPASS`), which commands inherit unchanged. Skyhook's own SSH connections type the
+[target passwords](execution-targets.md#passwords) their targets configure.
 
 Filesystem tools and command `cwd` accept absolute paths or relative paths including `..`.
 The workspace is a base directory, not a security boundary. Filesystem path authorization and
 human approval are distinct: the default CLI read policy auto-allows reads even when their
 canonical paths are outside the workspace. Do not rely on a confirmation prompt to protect
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
-its own approval requirements. Permissions name paths as text, so an operation whose permission
-names a path or workspace that is not valid Unicode is refused rather than approved under an
-approximate name.
+its own approval requirements. Permissions name paths as text, so an operation naming a path that
+resolves to one that is not valid Unicode is refused rather than approved under an approximate
+name, and a session does not start in a workspace whose path is not valid Unicode.
 
 A path counts as outside the workspace when resolving it leaves the workspace: it ends outside, or
 passes through an outside directory or symbolic link on the way, even if it ends back inside. Whether such a path exists is revealed only once its operation is approved. When it
@@ -28,14 +31,17 @@ A missing path inside the workspace fails before approval. On the session host, 
 rules above; inside, a missing one is created before the child starts, which needs the
 launching agent's `write` capability and is authorized as a write to it. On another target the workspace must already exist, and resolves there when the child starts. The child works in the directory its
 `workspace` resolves to, and its relative paths resolve from there. On the session host, its job
-shows the `workspace` joined to the agent's workspace, with any `..` kept. `remove` refuses the root workspace, the agent's workspace, and any directory
+shows the `workspace` joined to the agent's workspace, with any `..` and a trailing separator
+kept. `remove` refuses the root workspace, the agent's workspace, and any directory
 containing either.
 
 Choose **Allow once** to approve only the current operation. When offered, **Allow proposed
 scope** saves the displayed grant for later operations while the session stays open; reopening
 the session asks again. Inspect **Details** before granting it. Path grants apply only to the
 approved target and access mode. Directory grants cover descendants; read and write grants remain
-separate.
+separate. A session reads back the output it kept in
+[spill files](../reference/job-output.md#spill-files) as it reads its own database, the file a
+`fetch` body was returned in among them, whether or not it was reopened since.
 Process execution remains subject to confirmation on each invocation. These defaults apply to
 the CLI; [library hosts](../development/embedding.md) can supply a different approval policy.
 
@@ -59,22 +65,21 @@ Capabilities are granted by the active [mode](#modes), or by a batch job's
 | `exec` | `exec` | Enabled |
 | `network` | HTTP(S) `fetch` | Enabled |
 | `targets` | Target-management tools and target-selection inputs | Disabled |
-| `ssh_agent` | Targets using `ssh.external_agent`, which forward an SSH agent Skyhook does not own; without it they are hidden | Disabled |
 | `agents` | Child-agent creation, also limited by available delegation depth | Enabled |
-| `interactive` (runtime only) | Human-facing root questions, approval prompts, and sensitive authentication | Enabled by the terminal host; never in a batch job |
+| `interactive` (runtime only) | Human-facing root questions and approval prompts | Enabled by the terminal host; never in a batch job |
 | `mcp` | MCP server startup and MCP tool availability | Enabled |
 
 Applications embedding Skyhook may declare additional namespaced capabilities, such as
 `security.verdict`. They follow the same mode, ceiling, and child-delegation restrictions as the
 built-ins. Only names declared by the application may be granted; ordinary Skyhook declares
 none. A host capability name is `<namespace>.<name>` (lowercase ASCII letters, digits and
-underscores, each component starting with a letter; at most 128 bytes in total).
+underscores, each component starting with a letter).
 
-A capability list is exact; `[]` grants no policy capabilities. Undeclared names and `interactive`
-are errors in a mode and in `--capabilities`. The host supplies `interactive` independently of the
-list: the terminal always has it and `skyhook batch` never does, so an empty list does not disable
-the terminal interface or root questions. Per-agent depth restrictions narrow the result. Enable
-target support by including `"targets"` in a mode.
+A capability list is exact; `[]` grants no policy capabilities. Undeclared names are errors in
+a mode and in `--capabilities`, and `interactive` in a mode. The host supplies `interactive`
+independently of the list: the terminal always has it and `skyhook batch` never does, so an
+empty list does not disable the terminal interface or root questions. Per-agent depth
+restrictions narrow the result. Enable target support by including `"targets"` in a mode.
 
 ## Modes
 
@@ -117,10 +122,9 @@ Approvals granted earlier stay granted but cannot be used while the mode lacks t
 A resumed session continues in the mode it was last in, as the current configuration defines it:
 the configuration decides what a reopened session's modes grant, more or less than before, and a
 batch session reopened in the terminal gains `interactive`. Opening a session whose modes the
-configuration has since changed or removed shows a warning and changes nothing, and neither do
-renaming it or cancelling a job. The change applies with the next work that runs the root agent: a
-prompt, retry, continue, script or job delivery. It is recorded together with the message that
-work commits, or just before a script starts. A root agent whose mode was removed moves to the
+configuration has since changed or removed shows a warning and changes nothing. The change
+applies with the next work that runs the root agent: a
+prompt, retry, continue, script or job delivery. A root agent whose mode was removed moves to the
 default mode. Child agents it already started keep what they started with, within what the
 configuration still allows. The session's history keeps every
 definition of a mode it used, so earlier entries still show what they ran under. Because `general`

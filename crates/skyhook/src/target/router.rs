@@ -1,80 +1,35 @@
-use std::{path::Path, sync::Arc};
-
-use serde::{Deserialize, Serialize};
-
+use crate::tool::authorization::AuthorizationError;
 use crate::{
-    execution::ExecutionLocation,
     remote::{PreparedConnection, RemoteError, RemoteManager},
     session::{Command, CoreState, Plan, SessionError, SessionEvent, SessionStore},
     tool::{
         ToolError,
-        authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
-        diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
-        policy::{Capability, CapabilitySet, PermissionUse, ResourceId},
+        authorization::{AuthorizationCoordinator, AuthorizationSubject},
     },
 };
+use skyhook_tools::diagnostic::{FailureSite, PartialContext};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 
-use super::{TargetDefinition, TargetError, TargetName, TargetRef, TargetRegistry};
+use crate::target::TargetError;
+use crate::target::{ConfiguredPasswords, PasswordUnconfigured, Route, TargetDefinition};
+use skyhook_tools::target::TargetName;
+use skyhook_worker::secret::Credential;
 
-/// The targets an SSH connection passes through, outermost first, and its
-/// destination: a snapshot; the registry may since have changed.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub(crate) struct Route {
-    pub hops: Vec<TargetDefinition>,
-    pub destination: TargetDefinition,
-}
-
-impl Route {
-    pub fn iter(&self) -> impl Iterator<Item = &TargetDefinition> {
-        self.hops.iter().chain([&self.destination])
-    }
-
-    /// Each target on the route with its revision, outermost first.
-    pub fn identity(&self) -> super::Revisions {
-        self.iter()
-            .map(|hop| (hop.name.clone(), hop.revision))
-            .collect()
-    }
-
-    /// Connecting needs target approval, plus ssh_agent approval when any hop
-    /// forwards an agent Skyhook does not own.
-    pub fn permissions(&self) -> Vec<PermissionUse> {
-        let resource = ResourceId::route(self.destination.name.clone(), self.identity());
-        let external = self.iter().any(|hop| hop.ssh.external_agent);
-        [Capability::Targets]
-            .into_iter()
-            .chain(external.then_some(Capability::SshAgent))
-            .map(|capability| PermissionUse::exact(capability, resource.clone()))
-            .collect()
-    }
-
-    pub fn authorization_arguments(&self) -> serde_json::Value {
-        let destination = &self.destination;
-        let names = |external: bool| {
-            self.iter()
-                .filter(|hop| !external || hop.ssh.external_agent)
-                .map(|hop| &hop.name)
-                .collect::<Vec<_>>()
-        };
-        serde_json::json!({
-            "destination": destination.name,
-            "host": destination.host,
-            "origin": destination.origin,
-            "route": names(false),
-            "external_agent": names(true),
-        })
-    }
-}
+use super::TargetRegistry;
 
 #[derive(Clone)]
 pub(crate) struct TargetRouter {
     store: SessionStore,
     remote: RemoteManager,
     authorization: AuthorizationCoordinator,
+    passwords: ConfiguredPasswords,
 }
 
+/// What a target's password reads as.
+type Read = Result<Credential, PasswordUnconfigured>;
+
 /// A registration's failure to commit: a refused or indeterminate append.
-struct Unsaved(RemoteError);
+struct Unsaved(ToolError);
 
 impl From<SessionError> for Unsaved {
     fn from(error: SessionError) -> Self {
@@ -86,8 +41,7 @@ impl From<SessionError> for Unsaved {
             }
             _ => Effects::Unchanged,
         };
-        let error = RemoteError::Session(Arc::new(error));
-        Self(registration_error(error, Operation::Save, effects))
+        Self(registration_error(error.into(), Operation::Save, effects))
     }
 }
 
@@ -96,19 +50,25 @@ impl TargetRouter {
         store: SessionStore,
         remote: RemoteManager,
         authorization: AuthorizationCoordinator,
+        passwords: ConfiguredPasswords,
     ) -> Self {
         Self {
             store,
             remote,
             authorization,
+            passwords,
         }
     }
 
-    pub(crate) async fn environment(
+    /// The coordinator whose grants and decisions this router's redefinitions revoke.
+    pub(crate) fn authorization(&self) -> &AuthorizationCoordinator {
+        &self.authorization
+    }
+
+    pub(crate) async fn agent_environment(
         &self,
-        authentication: crate::remote::backend::ProcessAuthentication,
-    ) -> Result<crate::remote::backend::ProcessEnvironment, RemoteError> {
-        self.remote.environment(authentication).await
+    ) -> Result<skyhook_worker::origin::ProcessEnvironment, RemoteError> {
+        self.remote.agent_environment().await
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -122,43 +82,24 @@ impl TargetRouter {
         &self,
         definition: TargetDefinition,
         subject: &AuthorizationSubject,
-    ) -> Result<TargetDefinition, RemoteError> {
+    ) -> Result<TargetDefinition, ToolError> {
         let rejected = |error: TargetError| {
             Unsaved(registration_error(
-                error,
+                error.into(),
                 Operation::Validate,
                 Effects::Unchanged,
             ))
         };
         let (agent, cancellation) = (subject.agent.clone(), subject.cancellation.clone());
-        let ssh_agent = subject.capabilities.contains(&Capability::SshAgent);
         let router = self.clone();
         let upsert = move |state: &CoreState| {
-            let targets = &state.targets;
-            // Without ssh_agent, targets reached through an external agent are
-            // invisible: they can be neither replaced nor used as a via or origin.
-            if !ssh_agent {
-                if targets.needs_ssh_agent(&definition.name) {
-                    let name = definition.name.clone();
-                    return Err(rejected(TargetError::NameUnavailable(name)));
-                }
-                if let Some((edge, parent)) = definition.parent_edge()
-                    && targets.needs_ssh_agent(parent)
-                {
-                    return Err(rejected(TargetError::UnknownReference {
-                        target: definition.name.clone(),
-                        edge,
-                        reference: parent.clone(),
-                    }));
-                }
-            }
-            let targets = targets.upsert(vec![definition]).map_err(rejected)?;
+            let destination = state.targets.upsert(definition).map_err(rejected)?;
             if cancellation.is_cancelled() {
-                let cancelled = RemoteError::Cancelled;
+                let cancelled = ToolError::cancelled();
                 let error = registration_error(cancelled, Operation::Prepare, Effects::Unchanged);
                 return Err(Unsaved(error));
             }
-            let destination = targets[0].clone();
+            let targets = vec![destination.clone()];
             let upserted = SessionEvent::TargetsUpserted {
                 targets: targets.clone(),
             };
@@ -174,25 +115,37 @@ impl TargetRouter {
         committed.map_err(|Unsaved(error)| error)
     }
 
+    /// Each of the session's targets with the credential its password is, for one
+    /// that reads a password.
+    pub(crate) fn list(&self) -> Vec<(TargetDefinition, Option<Read>)> {
+        let read = |target: TargetDefinition| {
+            let password = target.connection.password();
+            let read =
+                password.map(|password| self.passwords.credential(&target.name, password).cloned());
+            (target, read)
+        };
+        (self.targets(TargetRegistry::list).into_iter())
+            .map(read)
+            .collect()
+    }
+
+    /// The targets that read a password the configuration no longer gives them as the
+    /// session holds them.
+    pub(crate) fn unconfigured(&self) -> Vec<TargetName> {
+        let unconfigured = |(target, password): (TargetDefinition, Option<Read>)| {
+            matches!(password, Some(Err(_))).then_some(target.name)
+        };
+        self.list().into_iter().filter_map(unconfigured).collect()
+    }
+
     /// Read the session's targets.
     pub(crate) fn targets<T>(&self, read: impl FnOnce(&TargetRegistry) -> T) -> T {
         self.store.read(|state| read(&state.targets))
     }
 
-    /// Resolve a target visible with `capabilities`: without ssh_agent, a target whose
-    /// route forwards an external agent is unknown.
-    pub fn resolve(
-        &self,
-        target: &TargetName,
-        capabilities: &CapabilitySet,
-    ) -> Result<Route, TargetError> {
-        let route = self.targets(|targets| targets.route(target))?;
-        if !capabilities.contains(&Capability::SshAgent)
-            && route.iter().any(|hop| hop.ssh.external_agent)
-        {
-            return Err(TargetError::Unknown(target.clone()));
-        }
-        Ok(route)
+    /// The route to `target`.
+    pub fn resolve(&self, target: &TargetName) -> Result<Route, TargetError> {
+        self.targets(|targets| targets.route(target))
     }
 
     /// Connect along `route`, admitted only while every target on it is at the
@@ -203,13 +156,14 @@ impl TargetRouter {
     pub async fn prepare(
         &self,
         route: Route,
-        workspace: &Path,
+        workspace: Vec<skyhook_worker::op::TargetPath>,
         subject: &AuthorizationSubject,
     ) -> Result<PreparedConnection, RemoteError> {
         let redefined = || RemoteError::from(AuthorizationError::TargetRedefined);
+        // A route that no longer resolves changed too; planning again reports why.
         let current = || {
-            let current = self.resolve(&route.destination.name, &subject.capabilities)?;
-            (current.identity() == route.identity())
+            let current = self.resolve(&route.destination.name).ok();
+            (current.is_some_and(|current| current.identity() == route.identity()))
                 .then_some(())
                 .ok_or_else(redefined)
         };
@@ -229,12 +183,8 @@ impl TargetRouter {
 
 /// Registration happens on the session host. Target validation keeps the argument
 /// it rejected; other failures are attributed to the registration stage.
-fn registration_error(
-    error: impl Into<RemoteError>,
-    operation: Operation,
-    effects: Effects,
-) -> RemoteError {
-    error.into().or(
+fn registration_error(error: ToolError, operation: Operation, effects: Effects) -> ToolError {
+    error.or(
         PartialContext::new(operation, Subject::Label("target registration".into()))
             .at(FailureSite::Host)
             .effects(effects),
@@ -243,110 +193,57 @@ fn registration_error(
 
 #[cfg(test)]
 impl TargetRouter {
-    /// A router over `store`'s targets, with `definitions` added, whose
-    /// connections use the default factory.
+    /// A router over `store`'s targets, approving with `policy`, whose connections
+    /// use the default factory.
+    pub(crate) fn over(
+        store: &SessionStore,
+        policy: std::sync::Arc<dyn crate::tool::policy::Policy>,
+    ) -> Self {
+        let remote = RemoteManager::new(Default::default(), Default::default(), Default::default());
+        let authorization = AuthorizationCoordinator::new(policy, store.clone());
+        Self::new(store.clone(), remote, authorization, Default::default())
+    }
+
+    /// [`over`](Self::over) `store`'s targets, with `definitions` added.
     pub(crate) async fn test(
         store: &SessionStore,
         definitions: impl IntoIterator<Item = TargetDefinition>,
-        policy: Arc<dyn crate::tool::policy::Policy>,
+        policy: std::sync::Arc<dyn crate::tool::policy::Policy>,
     ) -> Self {
-        let remote = RemoteManager::new(
-            crate::remote::EmbeddedShimCatalog::default(),
-            Arc::new(crate::remote::RejectSensitivePrompts),
-            None,
-            Default::default(),
-        );
         let targets = definitions.into_iter().collect();
         let agent = crate::identity::AgentId::root(store.id());
         let upserted = SessionEvent::TargetsUpserted { targets };
         store.append(agent, upserted).await.unwrap();
-        let authorization = AuthorizationCoordinator::new(policy).with_targets(store.clone());
-        Self::new(store.clone(), remote, authorization)
+        Self::over(store, policy)
     }
 
     /// Connect with `factory` instead.
     pub(crate) fn with_connection_factory(
         mut self,
-        factory: Arc<dyn crate::remote::ConnectionFactory>,
+        factory: std::sync::Arc<dyn crate::remote::ConnectionFactory>,
     ) -> Self {
         self.remote = self.remote.with_connection_factory(factory);
         self
     }
-
-    pub(crate) fn authorization(&self) -> &AuthorizationCoordinator {
-        &self.authorization
-    }
-}
-
-/// Where a target-relative operation runs, with the route to a named target
-/// as resolved for the selection. The route is a snapshot, not evidence of
-/// continued registry freshness.
-pub(crate) struct SelectedLocation {
-    pub(crate) location: ExecutionLocation,
-    pub(crate) route: Option<Route>,
-}
-
-/// Select where a target-relative operation runs: the caller's location, or
-/// an explicit target, which requires the targets capability. The root runs
-/// in the root workspace; another target in its configured workspace, but
-/// naming the caller's own target keeps the caller's workspace.
-pub(crate) fn select_location(
-    caller: &ExecutionLocation,
-    root_workspace: &Path,
-    explicit: Option<&TargetRef>,
-    capabilities: &CapabilitySet,
-    router: Option<&TargetRouter>,
-) -> Result<SelectedLocation, ToolError> {
-    if explicit.is_some() && !capabilities.contains(&Capability::Targets) {
-        return Err(ToolError::invalid_arguments(
-            "target selection requires the targets capability",
-        ));
-    }
-    let Some(name) = explicit.unwrap_or(&caller.target).name() else {
-        let location = match explicit {
-            Some(_) => ExecutionLocation::root(root_workspace.to_owned()),
-            None => caller.clone(),
-        };
-        return Ok(SelectedLocation {
-            location,
-            route: None,
-        });
-    };
-    let router = router.ok_or_else(|| {
-        ToolError::invalid_arguments("remote targets are unavailable in this tool runtime")
-    })?;
-    let route = router
-        .resolve(name, capabilities)
-        .map_err(|error| ToolError::from(error.into_admission_error()))?;
-    let location = if caller.target.name() == Some(name) {
-        caller.clone()
-    } else {
-        let destination = &route.destination;
-        ExecutionLocation::named(destination.name.clone(), destination.workspace.clone())
-    };
-    Ok(SelectedLocation {
-        location,
-        route: Some(route),
-    })
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::tool::policy::{Capability, PermissionUse, ResourceId};
     use std::assert_matches;
     use std::sync::{Arc, atomic::Ordering};
 
     use super::*;
+    use crate::identity::{AgentId, SessionId};
+    use crate::tool::authorization::Asking;
     use crate::{
-        identity::{AgentId, JobId, SessionId},
         job::CancellationToken,
         remote::{ConnectionFactory, ShimFactory},
         tests::RecordingPolicy,
-        tool::{
-            authorization::Asking,
-            diagnostic::{Cause, PartialDiagnostic},
-            policy::PolicyDecision,
-        },
+        tool::policy::PolicyDecision,
     };
+    use skyhook_tools::diagnostic::{Cause, PartialDiagnostic};
+    use skyhook_worker::job::JobId;
 
     /// Allows, adopting the proposed grants.
     fn recording() -> Arc<RecordingPolicy> {
@@ -358,7 +255,7 @@ mod tests {
     }
 
     fn target(name: &str, via: Option<&str>) -> TargetDefinition {
-        TargetDefinition::test(name, format!("/{name}"), via)
+        crate::target::tests::definition(name, format!("/{name}"), via)
     }
 
     fn name(name: &str) -> TargetName {
@@ -374,62 +271,33 @@ mod tests {
 
     #[test]
     fn routes_derive_permissions_and_arguments_from_their_definitions() {
+        let edge = crate::target::tests::winrm("edge", None);
         let mut gateway = target("gateway", None);
-        gateway.revision = 7;
+        (gateway.revision, gateway.origin) = (7, Some(name("edge")));
+        gateway.ssh_mut().user = Some("ops".parse().unwrap());
         let mut destination = target("build", Some("gateway"));
-        destination.revision = 19;
-        let mut route = Route {
-            hops: vec![gateway],
-            destination,
-        };
-        let hops = vec![(name("gateway"), 7), (name("build"), 19)];
+        (destination.revision, destination.origin) = (19, Some(name("edge")));
+        let registry = super::TargetRegistry::from_definitions([edge, gateway, destination]);
+        let route = registry.unwrap().route(&name("build")).unwrap();
+        let hops = vec![(name("edge"), 1), (name("gateway"), 7), (name("build"), 19)];
         let resource = ResourceId::route(name("build"), hops);
         let permission = |capability| PermissionUse::exact(capability, resource.clone());
         assert_eq!(route.permissions(), [permission(Capability::Targets)]);
-        let arguments = route.authorization_arguments();
-        assert_eq!(arguments["route"], serde_json::json!(["gateway", "build"]));
-        // Forwarding an external agent through any hop needs its own approval.
-        route.hops[0].ssh.external_agent = true;
-        let expected = [Capability::Targets, Capability::SshAgent].map(permission);
-        assert_eq!(route.permissions(), expected);
-        let arguments = route.authorization_arguments();
-        assert_eq!(arguments["external_agent"], serde_json::json!(["gateway"]));
-    }
-
-    #[tokio::test]
-    async fn targets_needing_ssh_agent_are_invisible_without_it() {
-        let mut external = target("external", None);
-        external.ssh.external_agent = true;
-        let targets = [external, target("behind", Some("external"))];
-        let (_root, router) = router(targets, recording(), None).await;
-        let without = CapabilitySet::default();
-        let mut with = without.clone();
-        with.insert(Capability::SshAgent);
-        for hidden in ["external", "behind"] {
-            let resolved = router.resolve(&name(hidden), &without);
-            assert_matches!(resolved, Err(TargetError::Unknown(_)), "{hidden}");
-            router.resolve(&name(hidden), &with).unwrap();
-        }
-        assert!(router.targets(|targets| targets.list(&without)).is_empty());
-        assert_eq!(router.targets(|targets| targets.list(&with)).len(), 2);
-        // Hidden targets can be neither replaced nor routed through.
-        let subject = subject_for(&router.store);
-        let mut via = target("new", None);
-        via.via = Some(name("behind"));
-        let mut origin = target("new", None);
-        origin.origin = Some(name("behind"));
-        for (definition, argument) in [
-            (target("external", None), "name"),
-            (via, "via"),
-            (origin, "origin"),
-        ] {
-            let error = router.add(definition, &subject).await.unwrap_err();
-            let diagnostic = error.into_tool_error().diagnostic();
-            assert_matches!(diagnostic.cause, Cause::InvalidArguments(_));
-            assert_eq!(diagnostic.context.subject, Subject::argument([argument]));
-            assert_eq!(diagnostic.context.site, FailureSite::Host);
-            assert_eq!(diagnostic.context.effects, Effects::Unchanged);
-        }
+        // An approval shows where each hop leads and who logs in there, the origin
+        // and the jump as well as the destination.
+        let hop = |target: &str, user: Option<&str>| crate::target::RouteHop {
+            name: name(target),
+            host: format!("{target}.example.com"),
+            user: user.map(str::to_owned),
+        };
+        assert_eq!(
+            route.authorization_arguments().route,
+            [
+                hop("edge", Some("alice")),
+                hop("gateway", Some("ops")),
+                hop("build", None)
+            ]
+        );
     }
 
     fn subject() -> AuthorizationSubject {
@@ -473,11 +341,11 @@ mod tests {
         router: &TargetRouter,
         subject: &AuthorizationSubject,
     ) -> Result<PreparedConnection, RemoteError> {
-        let route = router
-            .resolve(&name("build"), &CapabilitySet::default())
-            .unwrap();
+        let route = router.resolve(&name("build")).unwrap();
         approve(router, &route, subject).await?;
-        router.prepare(route, Path::new("/override"), subject).await
+        router
+            .prepare(route, vec!["/override".into()], subject)
+            .await
     }
 
     async fn approve(
@@ -486,7 +354,8 @@ mod tests {
         subject: &AuthorizationSubject,
     ) -> Result<(), RemoteError> {
         let permissions = route.permissions();
-        let arguments = route.authorization_arguments();
+        let arguments = serde_json::to_value(route.authorization_arguments())
+            .expect("route arguments serialize");
         let authorize = router.authorization.authorize(
             subject,
             "connect_target".to_owned(),
@@ -511,7 +380,7 @@ mod tests {
         let factory = ShimFactory::new();
         let targets = definitions(&[("gateway", None), ("build", Some("gateway"))]);
         let (_root, router) = router(targets, recording(), Some(factory.clone())).await;
-        let resolve = || (router.resolve(&name("build"), &CapabilitySet::default())).unwrap();
+        let resolve = || (router.resolve(&name("build"))).unwrap();
         let admitted = resolve();
         factory.ready.add_permits(1);
         let prepared = prepare(&router, &subject()).await.unwrap();
@@ -555,14 +424,15 @@ mod tests {
                 crate::tests::bounded(preparing).await.unwrap()
             } else {
                 let subject = subject();
-                let stale = (router.resolve(&name("build"), &CapabilitySet::default())).unwrap();
+                let stale = (router.resolve(&name("build"))).unwrap();
                 approve(&router, &stale, &subject).await.unwrap();
                 replace_target(&router, target("gateway", None)).await;
-                crate::tests::bounded(router.prepare(stale, Path::new("/override"), &subject)).await
+                crate::tests::bounded(router.prepare(stale, vec!["/override".into()], &subject))
+                    .await
             };
             assert!(matches!(
-                prepared,
-                Err(RemoteError::Authorization(
+                prepared.err().map(|refused| refused.fault),
+                Some(crate::remote::RemoteFault::Authorization(
                     AuthorizationError::TargetRedefined
                 ))
             ));
@@ -579,22 +449,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_registration_changes_nothing_and_never_connects() {
-        let factory = ShimFactory::new();
-        let (_root, router) = router([], recording(), Some(factory.clone())).await;
+    async fn cancelled_registration_changes_nothing() {
+        let (_root, router) = router([], recording(), None).await;
         let subject = subject_for(&router.store);
         subject.cancellation.cancel();
         let error = router
             .add(target("cancelled", None), &subject)
             .await
             .unwrap_err();
-        let diagnostic = error.into_tool_error().diagnostic();
+        let diagnostic = error.diagnostic();
         assert_eq!(diagnostic.cause, Cause::Cancelled);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
         assert_eq!(diagnostic.context.effects, Effects::Unchanged);
         let added = router.targets(|targets| targets.get(&name("cancelled")));
         assert!(added.is_err());
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
         router.shutdown().await;
     }
 
@@ -609,7 +477,7 @@ mod tests {
             (SessionError::WrongSession, Effects::Unchanged),
         ] {
             let Unsaved(error) = SessionError::JournalFailed(journal_failure(cause)).into();
-            let diagnostic = error.into_tool_error().diagnostic();
+            let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.operation, Operation::Save);
             assert_eq!(diagnostic.context.effects, effects);
         }
@@ -619,10 +487,10 @@ mod tests {
             .add(target("second", None), &subject())
             .await
             .unwrap_err();
-        let diagnostic = error.into_tool_error().diagnostic();
+        let diagnostic = error.diagnostic();
         assert_eq!(
             diagnostic.cause,
-            PartialDiagnostic::session(&SessionError::WrongSession).cause
+            PartialDiagnostic::from(&SessionError::WrongSession).cause
         );
         assert_eq!(diagnostic.context.operation, Operation::Save);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
@@ -646,8 +514,7 @@ mod tests {
         let (_root, router) = router(targets, policy.clone(), None).await;
         let mut caller = subject_for(&router.store);
         caller.capabilities.insert(Capability::Write);
-        let path = crate::tool::policy::PathText::new("/src").unwrap();
-        let path = |target: &str| ResourceId::path(&target.parse().unwrap(), &path);
+        let path = |target: &str| ResourceId::path(&target.parse().unwrap(), "/src");
         let mcp = ResourceId::mcp("server", "operation");
         let asked = || policy.requests.lock().unwrap().len();
         let authorize = async |resource: &ResourceId| {
@@ -667,7 +534,7 @@ mod tests {
             authorize(&resource).await.unwrap();
         }
         assert_eq!(asked(), 3);
-        let stale = (router.resolve(&name("build"), &CapabilitySet::default())).unwrap();
+        let stale = (router.resolve(&name("build"))).unwrap();
         replace_target(&router, target("build", None)).await;
         assert_eq!(authorize(&mcp).await.unwrap(), 3);
         assert_eq!(authorize(&path("build")).await.unwrap(), 4);
@@ -696,72 +563,14 @@ mod tests {
         assert_matches!(forwarded.await, Err(AuthorizationError::TargetRedefined));
         assert_eq!(asked(), 5);
         // Journaled without the router, so nothing revokes what it replaces.
-        let redefined = router.targets(|targets| targets.upsert(vec![target("build", None)]));
+        let redefined = router.targets(|targets| targets.upsert(target("build", None)));
         let upserted = SessionEvent::TargetsUpserted {
-            targets: redefined.unwrap(),
+            targets: vec![redefined.unwrap()],
         };
         (router.store)
             .append(caller.agent.clone(), upserted)
             .await
             .unwrap();
         assert_eq!(authorize(&path("deep")).await.unwrap(), 6);
-    }
-
-    #[tokio::test]
-    async fn selection_resolves_inherit_root_and_other_targets() {
-        let root = Path::new("/root");
-        let build = ExecutionLocation::named("build".parse().unwrap(), "/caller-override".into());
-        let overridden = ExecutionLocation::root("/override".into());
-        let session = crate::tests::TestRuntime::new().await;
-        let targets = [
-            TargetDefinition::test("build", "/configured", None),
-            TargetDefinition::test("other", "relative directory/../project", None),
-        ];
-        let policy = crate::tests::RecordingPolicy::allowing();
-        let router = TargetRouter::test(&session.store, targets, policy).await;
-        let mut capabilities = CapabilitySet::default();
-        capabilities.insert(Capability::Targets);
-        let [root_target, current, other] =
-            ["root", "build", "other"].map(|name| name.parse::<TargetRef>().unwrap());
-        let select = |caller, explicit, capabilities| {
-            select_location(caller, root, explicit, capabilities, Some(&router))
-        };
-        for (caller, explicit, expected) in [
-            (&build, None, build.clone()),
-            (&overridden, None, overridden.clone()),
-            (
-                &build,
-                Some(&root_target),
-                ExecutionLocation::root("/root".into()),
-            ),
-            (
-                &overridden,
-                Some(&root_target),
-                ExecutionLocation::root("/root".into()),
-            ),
-            // An explicit current target keeps the caller's workspace override.
-            (&build, Some(&current), build.clone()),
-            (
-                &build,
-                Some(&other),
-                ExecutionLocation::named(
-                    "other".parse().unwrap(),
-                    "relative directory/../project".into(),
-                ),
-            ),
-        ] {
-            let selected = select(caller, explicit, &capabilities).unwrap();
-            assert_eq!(selected.location, expected);
-            assert_eq!(
-                selected.route.map(|route| route.destination.name.clone()),
-                expected.target.name().cloned()
-            );
-        }
-        // Naming any target needs the capability; inheriting one does not.
-        let without = CapabilitySet::default();
-        assert!(select(&overridden, Some(&root_target), &without).is_err());
-        assert!(select(&build, None, &without).is_ok());
-        let unknown = "missing".parse::<TargetRef>().unwrap();
-        assert!(select(&build, Some(&unknown), &capabilities).is_err());
     }
 }

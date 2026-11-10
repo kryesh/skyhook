@@ -1,10 +1,8 @@
 //! Output queries: what a page selects, and the bounds every query is admitted within.
 use super::*;
-use crate::{
-    newtype::Bounded,
-    tool::diagnostic::{Operation, Subject},
-};
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_regex::RegexMatcher;
+use skyhook_base::bounded::Bounded;
+use skyhook_worker::diagnostic::{Operation, Subject};
 use std::sync::Arc;
 
 /// What a page returns unless the query sets `limit`.
@@ -17,17 +15,13 @@ pub(crate) const MAX_CONTEXT: usize = 20;
 const QUERY_SYNTAX: &str = "query is not a JSONPath (RFC 9535) query. Filters are written \
     $[?search(@.title, '[Ee]ncoder')]: match() tests a whole string and search() any part of it, \
     and comparisons read @.count > 2 or @.state == 'open', joined with && and ||.";
-/// Bounds what compiling an untrusted pattern may allocate.
-pub const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
-
 /// How many lines, values, matches or listed jobs one page returns.
 pub type PageLimit = Bounded<1, { MAX_LIMIT as u64 }>;
 
-impl PageLimit {
-    pub fn get(self) -> usize {
-        // Lossless: the bound is a `usize`.
-        u64::from(self) as usize
-    }
+/// How many `limit` is.
+pub(crate) fn count(limit: PageLimit) -> usize {
+    // Lossless: the bound is a `usize`.
+    u64::from(limit) as usize
 }
 
 /// Paging selectors as a query sets them.
@@ -186,7 +180,7 @@ impl OutputArgs {
         };
         Ok(Query {
             field: self.field.clone().unwrap_or_else(FieldPointer::result),
-            limit: self.limit.unwrap_or(DEFAULT_LIMIT).get(),
+            limit: count(self.limit.unwrap_or(DEFAULT_LIMIT)),
             position,
             unit: self.unit,
         })
@@ -287,21 +281,12 @@ pub(super) struct Selection {
     pub(super) limit: usize,
 }
 
-/// The line-oriented regex builder output search shares with the `search` tool.
-pub(crate) fn line_matcher() -> RegexMatcherBuilder {
-    let mut builder = RegexMatcherBuilder::new();
-    builder
-        .line_terminator(Some(b'\n'))
-        .ban_byte(Some(b'\0'))
-        .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_SIZE_LIMIT);
-    builder
-}
-
 pub(super) fn pattern_matcher(pattern: &str) -> Result<Arc<RegexMatcher>, ToolError> {
-    let matcher = line_matcher().build(pattern).map_err(|_| {
-        ToolError::invalid_arguments("regular expression could not be compiled")
-            .operation(Operation::Validate, Subject::argument(["pattern"]))
-    })?;
+    let matcher = skyhook_worker::op::line_matcher()
+        .build(pattern)
+        .map_err(|_| {
+            ToolError::invalid_arguments("regular expression could not be compiled")
+                .operation(Operation::Validate, Subject::argument(["pattern"]))
+        })?;
     Ok(Arc::new(matcher))
 }

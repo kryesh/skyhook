@@ -5,13 +5,12 @@ mod naming;
 mod result;
 
 use super::manager::McpManager;
+use crate::tool::catalog::ToolPlacement;
+use crate::tool::catalog::{Invocation, RegistryError, ToolOptions};
+use crate::tool::policy::{Capability, ResourceId};
 use crate::{
     session::SessionStore,
-    tool::{
-        RegistryError, ToolContext, ToolOptions, ToolPlacement, ToolRegistryBuilder,
-        policy::{Capability, ResourceId},
-        registry::Invocation,
-    },
+    tool::{ToolContext, ToolRegistryBuilder},
 };
 use arguments::Arguments;
 use naming::tool_names;
@@ -50,15 +49,17 @@ pub fn register(
         let store = store.clone();
         let server = server.to_owned();
         let upstream_name = tool.name.to_string();
-        let description = format!(
-            "MCP tool {server}/{upstream_name}. {}{}",
+        let wrapped = adapted
+            .wrapped
+            .then_some("Pass the upstream tool input in arguments; bg controls the Skyhook job.");
+        let description = [
             tool.description.as_deref().unwrap_or(""),
-            if adapted.wrapped {
-                " Pass the upstream tool input in arguments; bg controls the Skyhook job."
-            } else {
-                ""
-            },
-        );
+            wrapped.unwrap_or(""),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
         let schema = adapted.schema.clone();
         if let Err(error) = builder.register_schema(
             name,
@@ -92,11 +93,12 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::catalog::InvocationKind;
+    use crate::tool::policy::CapabilitySet;
     use crate::{
         job::CancellationToken,
         tests::{RecordingPolicy, TestRuntime},
-        tool::executor::InvocationKind,
-        tool::{executor::ToolExecutor, policy::CapabilitySet},
+        tool::executor::ToolExecutor,
     };
     use serde_json::json;
 
@@ -134,7 +136,7 @@ for line in sys.stdin:
             "capabilities":["read","exec"]
         }))
         .unwrap();
-        let mut configs = std::collections::BTreeMap::from([("fixture".to_owned(), config)]);
+        let configs = std::collections::BTreeMap::from([("fixture".to_owned(), config)]);
         let defaults = CapabilitySet::default();
         let manager = McpManager::connect(
             &configs,
@@ -145,8 +147,6 @@ for line in sys.stdin:
         .await;
         let manager = Arc::new(manager);
         assert_eq!(manager.catalog().len(), 3, "{:?}", manager.warnings());
-        // Registration must use admitted catalog policy, not a later config join.
-        configs.clear();
         assert_eq!(
             manager.catalog()[0].capabilities,
             [Capability::Read, Capability::Exec]
@@ -163,13 +163,14 @@ for line in sys.stdin:
         for missing in [Capability::Exec, Capability::Mcp] {
             let tool = registry.get(native).unwrap();
             assert!(
-                tool.spec(&without(missing), crate::tool::registry::AgentLevel::Root)
+                tool.spec(&without(missing), crate::tool::catalog::AgentLevel::Root)
                     .is_err()
             );
         }
         let policy = RecordingPolicy::allowing();
         let root = runtime.root.path().to_path_buf();
-        let executor = ToolExecutor::new(registry, policy.clone(), runtime.jobs.clone(), root);
+        let router = crate::target::TargetRouter::over(&runtime.store, policy.clone());
+        let executor = ToolExecutor::new(registry, runtime.jobs.clone(), root, router);
         let agent = || runtime.agent.clone();
         let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();
         let native_input =

@@ -1,6 +1,6 @@
 //! Relational encoding of terminal diagnostics.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use libsql::Row;
 
@@ -9,111 +9,131 @@ use super::{
     decode::{Events, Query, u64_of},
     enum_column, optional_enum_column, params,
 };
-use crate::{
-    execution::{ExecutionLocation, path_bytes, path_from_bytes},
-    identity::JobId,
-    named_enum::named_enum,
-    tool::diagnostic::{
-        Cause, Diagnostic, DiagnosticContext, FailureSite, IoKind, PathFact, Subject,
-    },
+use skyhook_tools::diagnostic::{
+    Cause, CauseKind, ConnectionFault, Diagnostic, DiagnosticContext, FailureSite, SiteKind,
 };
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub(super) enum SiteKind {
-        Invocation = "invocation",
-        Host = "host",
-        Execution = "execution",
-    }
-}
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_worker::diagnostic::{PathFact, Subject, SubjectKind};
+use skyhook_worker::job::JobId;
+use skyhook_worker::op::{IoKind, OsError, TargetPath};
 
 /// The columns a [`Subject`] or [`Cause`] stores its fields in.
 #[derive(Default)]
 struct Columns {
-    path: Option<PathBuf>,
+    path: Option<TargetPath>,
+    native: Option<Vec<u8>>,
     text: Option<String>,
     job: Option<JobId>,
+    connection: Option<ConnectionFault>,
     io_kind: Option<IoKind>,
-    io_code: Option<Option<i32>>,
-    io_detail: Option<Option<String>>,
+    io_code: Option<i32>,
+    io_detail: Option<String>,
 }
 
-/// Declare `$kind`, the journal's name for each `$enum` variant, beside the
-/// [`Columns`] each variant's fields fill: `split` and `join` convert between them.
-macro_rules! stored_enum {
-    (
-        $enum:ident / $kind:ident {
-            $(
-                $variant:ident $(($tuple:ident))? $({ $($field:ident: $column:ident),+ })?
-                    = $text:literal
-            ),+ $(,)?
+impl Columns {
+    fn of_subject(subject: &Subject) -> Self {
+        match subject {
+            Subject::None | Subject::Process => Self::default(),
+            Subject::Path(path)
+            | Subject::WorkingDirectory(path)
+            | Subject::StagingFile(path)
+            | Subject::ParentDirectory(path)
+            | Subject::DirectoryEntry(path) => Self {
+                path: Some(path.clone()),
+                ..Self::default()
+            },
+            Subject::Argument(text) | Subject::Tool(text) | Subject::Label(text) => Self {
+                text: Some(text.clone()),
+                ..Self::default()
+            },
+            Subject::Job(job) => Self {
+                job: Some(*job),
+                ..Self::default()
+            },
         }
-    ) => {
-        named_enum! {
-            #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-            pub(super) enum $kind { $($variant = $text),+ }
-        }
-
-        impl $enum {
-            fn split(&self) -> ($kind, Columns) {
-                match self {
-                    $(
-                        Self::$variant $(($tuple))? $({ $($field: $column),+ })? => (
-                            $kind::$variant,
-                            Columns {
-                                $($tuple: Some($tuple.to_owned()),)?
-                                $($($column: Some($column.to_owned()),)+)?
-                                ..Columns::default()
-                            },
-                        )
-                    ),+
-                }
-            }
-
-            fn join(kind: $kind, columns: Columns) -> Option<Self> {
-                Some(match kind {
-                    $(
-                        $kind::$variant => Self::$variant
-                            $((columns.$tuple?))?
-                            $({ $($field: columns.$column?),+ })?
-                    ),+
-                })
-            }
-        }
-    };
-}
-
-stored_enum! {
-    Subject / SubjectKind {
-        None = "none",
-        Path(path) = "path",
-        WorkingDirectory(path) = "working_directory",
-        StagingFile(path) = "staging_file",
-        ParentDirectory(path) = "parent_directory",
-        DirectoryEntry(path) = "directory_entry",
-        Argument(text) = "argument",
-        Tool(text) = "tool",
-        Job(job) = "job",
-        Process = "process",
-        Label(text) = "label",
     }
-}
 
-stored_enum! {
-    Cause / CauseKind {
-        Io { kind: io_kind, code: io_code, detail: io_detail } = "io",
-        InvalidArguments(text) = "invalid_arguments",
-        Denied(text) = "denied",
-        Cancelled = "cancelled",
-        Interrupted = "interrupted",
-        InputClosed = "input_closed",
-        Message(text) = "message",
-        Json = "json",
-        Unavailable { tool: text } = "unavailable",
-        UnknownTool { tool: text } = "unknown_tool",
-        ScriptUnavailable { tool: text } = "script_unavailable",
-        UnknownJob { job: job } = "unknown_job",
-        JobAlreadyTerminal { job: job } = "job_already_terminal",
+    fn of_cause(cause: &Cause) -> Self {
+        match cause {
+            Cause::Io(OsError { kind, code, detail }) => Self {
+                io_kind: Some(*kind),
+                io_code: *code,
+                io_detail: detail.clone(),
+                ..Self::default()
+            },
+            Cause::InvalidArguments(text)
+            | Cause::Denied(text)
+            | Cause::Message(text)
+            | Cause::Unavailable { tool: text }
+            | Cause::UnknownTool { tool: text }
+            | Cause::ScriptUnavailable { tool: text } => Self {
+                text: Some(text.clone()),
+                ..Self::default()
+            },
+            Cause::Connection { fault, detail } => Self {
+                connection: Some(*fault),
+                text: Some(detail.clone()),
+                ..Self::default()
+            },
+            Cause::UnknownJob { job } | Cause::JobAlreadyTerminal { job } => Self {
+                job: Some(*job),
+                ..Self::default()
+            },
+            Cause::Unspelled { native } => Self {
+                native: Some(native.clone()),
+                ..Self::default()
+            },
+            Cause::Cancelled | Cause::Interrupted | Cause::InputClosed | Cause::Json => {
+                Self::default()
+            }
+        }
+    }
+
+    /// The subject of `kind`, if the column its field needs is set.
+    fn subject(self, kind: SubjectKind) -> Option<Subject> {
+        Some(match kind {
+            SubjectKind::None => Subject::None,
+            SubjectKind::Path => Subject::Path(self.path?),
+            SubjectKind::WorkingDirectory => Subject::WorkingDirectory(self.path?),
+            SubjectKind::StagingFile => Subject::StagingFile(self.path?),
+            SubjectKind::ParentDirectory => Subject::ParentDirectory(self.path?),
+            SubjectKind::DirectoryEntry => Subject::DirectoryEntry(self.path?),
+            SubjectKind::Argument => Subject::Argument(self.text?),
+            SubjectKind::Tool => Subject::Tool(self.text?),
+            SubjectKind::Job => Subject::Job(self.job?),
+            SubjectKind::Process => Subject::Process,
+            SubjectKind::Label => Subject::Label(self.text?),
+        })
+    }
+
+    /// The cause of `kind`, if the columns its fields need are set.
+    fn cause(self, kind: CauseKind) -> Option<Cause> {
+        Some(match kind {
+            CauseKind::Io => Cause::Io(OsError {
+                kind: self.io_kind?,
+                code: self.io_code,
+                detail: self.io_detail,
+            }),
+            CauseKind::InvalidArguments => Cause::InvalidArguments(self.text?),
+            CauseKind::Denied => Cause::Denied(self.text?),
+            CauseKind::Cancelled => Cause::Cancelled,
+            CauseKind::Interrupted => Cause::Interrupted,
+            CauseKind::InputClosed => Cause::InputClosed,
+            CauseKind::Message => Cause::Message(self.text?),
+            CauseKind::Connection => Cause::Connection {
+                fault: self.connection?,
+                detail: self.text?,
+            },
+            CauseKind::Json => Cause::Json,
+            CauseKind::Unavailable => Cause::Unavailable { tool: self.text? },
+            CauseKind::UnknownTool => Cause::UnknownTool { tool: self.text? },
+            CauseKind::ScriptUnavailable => Cause::ScriptUnavailable { tool: self.text? },
+            CauseKind::UnknownJob => Cause::UnknownJob { job: self.job? },
+            CauseKind::JobAlreadyTerminal => Cause::JobAlreadyTerminal { job: self.job? },
+            CauseKind::Unspelled => Cause::Unspelled {
+                native: self.native?,
+            },
+        })
     }
 }
 
@@ -125,47 +145,49 @@ impl Encoder {
         diagnostic: &Diagnostic,
     ) -> DbResult<()> {
         let context = &diagnostic.context;
-        let (subject, subject_columns) = context.subject.split();
-        let (site, target, workspace) = match &context.site {
-            FailureSite::Invocation => (SiteKind::Invocation, None, None),
-            FailureSite::Host => (SiteKind::Host, None, None),
+        let subject = Columns::of_subject(&context.subject);
+        let (target, workspace) = match &context.site {
+            FailureSite::Invocation | FailureSite::Host => (None, None),
             FailureSite::Execution(location) => (
-                SiteKind::Execution,
                 Some(self.target(db, &location.target)?),
-                Some(path_bytes(&location.workspace)),
+                Some(location.workspace.as_str()),
             ),
         };
-        let (cause, cause_columns) = diagnostic.cause.split();
+        let cause = Columns::of_cause(&diagnostic.cause);
         db.execute(
             "INSERT INTO job_finish_diagnostic (finish, operation, subject, subject_path, \
              subject_text, subject_job, site, location_target, location_workspace, effects, \
-             request, cause, io_kind, io_code, cause_text, io_detail, cause_job) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             request, cause, io_kind, io_code, cause_text, io_detail, cause_job, cause_native, \
+             connection_fault) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19)",
             params![
                 finish,
                 context.operation,
-                subject,
-                subject_columns.path.as_deref().map(path_bytes),
-                subject_columns.text,
-                subject_columns.job.map(JobId::get),
-                site,
+                context.subject.kind(),
+                subject.path.as_ref().map(TargetPath::as_str),
+                subject.text,
+                subject.job.map(JobId::get),
+                context.site.kind(),
                 target,
                 workspace,
                 context.effects,
                 context.request,
-                cause,
-                cause_columns.io_kind,
-                cause_columns.io_code.flatten().map(i64::from),
-                cause_columns.text,
-                cause_columns.io_detail.flatten(),
-                cause_columns.job.map(JobId::get),
+                diagnostic.cause.kind(),
+                cause.io_kind,
+                cause.io_code.map(i64::from),
+                cause.text,
+                cause.io_detail,
+                cause.job.map(JobId::get),
+                cause.native,
+                cause.connection,
             ],
         )?;
         for (position, fact) in context.paths.iter().enumerate() {
             db.execute(
                 "INSERT INTO diagnostic_path (finish, position, role, path) \
                  VALUES (?1, ?2, ?3, ?4)",
-                params![finish, position, fact.role, path_bytes(&fact.path)],
+                params![finish, position, fact.role, fact.path.as_str()],
             )?;
         }
         Ok(())
@@ -179,35 +201,33 @@ fn job(row: &Row, index: i32) -> DbResult<Option<JobId>> {
 }
 
 fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
-    let subject = Subject::join(
-        enum_column(row, 2)?,
-        Columns {
-            path: row.get::<Option<Vec<u8>>>(3)?.map(path_from_bytes),
-            text: row.get(4)?,
-            job: job(row, 5)?,
-            ..Columns::default()
-        },
-    )
+    let subject = Columns {
+        path: row.get::<Option<String>>(3)?.map(TargetPath::from),
+        text: row.get(4)?,
+        job: job(row, 5)?,
+        ..Columns::default()
+    }
+    .subject(enum_column(row, 2)?)
     .ok_or_else(|| corrupt("diagnostic subject does not match its columns"))?;
     let site = match enum_column(row, 6)? {
         SiteKind::Invocation => FailureSite::Invocation,
         SiteKind::Host => FailureSite::Host,
         SiteKind::Execution => FailureSite::Execution(ExecutionLocation {
             target: super::decode::parsed(row.get(7)?)?,
-            workspace: path_from_bytes(row.get(8)?),
+            workspace: row.get::<String>(8)?.into(),
         }),
     };
-    let cause = Cause::join(
-        enum_column(row, 11)?,
-        Columns {
-            io_kind: optional_enum_column(row, 12)?,
-            io_code: Some(row.get(13)?),
-            text: row.get(14)?,
-            io_detail: Some(row.get(15)?),
-            job: job(row, 16)?,
-            ..Columns::default()
-        },
-    )
+    let cause = Columns {
+        io_kind: optional_enum_column(row, 12)?,
+        io_code: row.get(13)?,
+        text: row.get(14)?,
+        io_detail: row.get(15)?,
+        job: job(row, 16)?,
+        native: row.get(17)?,
+        connection: optional_enum_column(row, 18)?,
+        ..Columns::default()
+    }
+    .cause(enum_column(row, 11)?)
     .ok_or_else(|| corrupt("diagnostic cause does not match its columns"))?;
     Ok(Diagnostic {
         context: DiagnosticContext {
@@ -235,7 +255,7 @@ pub(super) fn load(events: &Events) -> DbResult<HashMap<i64, Diagnostic>> {
             row.get(0)?,
             PathFact {
                 role: enum_column(row, 1)?,
-                path: path_from_bytes(row.get(2)?),
+                path: row.get::<String>(2)?.into(),
             },
         ))
     })? {
@@ -244,7 +264,8 @@ pub(super) fn load(events: &Events) -> DbResult<HashMap<i64, Diagnostic>> {
     let Query { sql, params } = events.scoped(
         "SELECT d.finish, d.operation, d.subject, d.subject_path, d.subject_text, \
          d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.request, d.cause, \
-         d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job \
+         d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job, d.cause_native, \
+         d.connection_fault \
          FROM job_finish_diagnostic d \
          LEFT JOIN target t ON t.id = d.location_target {scope}",
         "d.finish",
@@ -261,11 +282,14 @@ pub(super) fn load(events: &Events) -> DbResult<HashMap<i64, Diagnostic>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobRole;
     use crate::{
-        job::{JobEnd, JobRole},
+        job::JobEnd,
         session::{SessionEvent, db::tests::Fixture},
-        tool::diagnostic::{Effects, IoKind, Operation, PartialContext, PathRole, RequestEffects},
     };
+    use skyhook_tools::diagnostic::{PartialContext, RequestEffects};
+    use skyhook_worker::diagnostic::{Effects, Operation, PathRole};
+    use skyhook_worker::op::IoKind;
 
     fn finish(fixture: &mut Fixture, diagnostic: Option<Diagnostic>) {
         let root = fixture.records[0].agent.clone();
@@ -298,13 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn every_variant_and_native_path_round_trips() {
+    fn every_variant_round_trips() {
         let mut fixture = Fixture::new();
         fixture.start("/workspace");
-        let native = path_from_bytes(b"/remote-\xfe".to_vec());
+        let remote = TargetPath::from(r"C:\remote-é");
         let subjects = [
             Subject::None,
-            Subject::Path(native.clone()),
+            Subject::Path(remote.clone()),
             Subject::WorkingDirectory("/workspace".into()),
             Subject::StagingFile("/workspace/.staging".into()),
             Subject::ParentDirectory("/workspace/parent".into()),
@@ -321,29 +345,37 @@ mod tests {
             FailureSite::Host,
             FailureSite::Execution(ExecutionLocation::named(
                 "worker".parse().unwrap(),
-                native.clone(),
+                remote.clone(),
             )),
         ];
         let causes = [
-            Cause::Io {
+            Cause::Io(OsError {
                 kind: IoKind::NotFound,
                 code: Some(2),
                 detail: None,
-            },
-            Cause::Io {
+            }),
+            Cause::Io(OsError {
                 kind: IoKind::Other,
                 code: None,
                 detail: Some("custom capture failure".into()),
-            },
+            }),
             Cause::InvalidArguments("limit must be positive".into()),
             Cause::Denied("not approved".into()),
             Cause::Cancelled,
             Cause::Interrupted,
             Cause::InputClosed,
             Cause::Message("capture failed".into()),
+            Cause::Connection {
+                fault: ConnectionFault::Protocol,
+                detail: "shim closed before replying".into(),
+            },
             Cause::Json,
             Cause::UnknownJob {
                 job: JobId::new(999_998).unwrap(),
+            },
+            // A Windows target's UTF-16 code units, little-endian, kept as sent.
+            Cause::Unspelled {
+                native: vec![b'C', 0, b':', 0, 0x00, 0xd8],
             },
         ];
         for (index, operation) in Operation::ALL.iter().enumerate() {
@@ -358,7 +390,7 @@ mod tests {
                     paths: vec![
                         PathFact {
                             role: PathRole::Resolved,
-                            path: native.clone(),
+                            path: remote.clone(),
                         },
                         PathFact {
                             role: PathRole::Requested,
@@ -373,11 +405,11 @@ mod tests {
                     .at(FailureSite::Host)
                     .effects(Effects::OutputIncomplete)
                     .resolve(),
-                Cause::Io {
+                Cause::Io(OsError {
                     kind: IoKind::ALL[index % IoKind::ALL.len()],
                     code: Some(-123),
                     detail: None,
-                },
+                }),
             );
             finish(&mut fixture, Some(diagnostic));
             finish(&mut fixture, Some(io));

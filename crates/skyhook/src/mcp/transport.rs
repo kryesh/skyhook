@@ -1,8 +1,7 @@
-//! Root-session owned MCP transports. No shell interpolation or implicit reconnect/replay.
+//! Root-session owned MCP transports.
 
 use std::{collections::HashMap, io, path::Path, process::Stdio, sync::Arc, time::Duration};
 
-use crate::tool::diagnostic::opaque_io;
 use futures_util::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::{
@@ -18,20 +17,21 @@ use rmcp::{
         },
     },
 };
+use skyhook_tools::diagnostic::opaque_io;
 use tokio::process::{Child, Command};
 
 use super::{
     config::{CommandSpec, McpConnection, McpServerConfig},
     manager::McpError,
 };
-use crate::provider::dialect::{ConfiguredHeaders, Sources};
+use crate::provider::http::credentials::ConfiguredHeaders;
 
 pub(crate) type Client = RunningService<RoleClient, ()>;
 
 /// The largest MCP message read from a server: an HTTP body, an SSE event, or one
 /// stdio line. A larger stdio line is discarded on its own and the server stays usable;
 /// the call waiting for it ends at its timeout, since the discarded line cannot name it.
-pub(crate) const MAX_MESSAGE_BYTES: usize = crate::limits::WHOLE_VALUE_BYTES;
+pub(crate) const MAX_MESSAGE_BYTES: usize = skyhook_base::limits::WHOLE_VALUE_BYTES;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READINESS_POLL: Duration = Duration::from_millis(100);
 
@@ -40,15 +40,15 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 /// Dropping it kills the group and the child; Tokio reaps a dropped child as a
 /// best-effort fallback for a cancelled owner future.
 pub(crate) struct OwnedProcess {
-    group: crate::process_group::ProcessGroup,
+    group: skyhook_worker::process::ProcessGroup,
     child: Child,
 }
 
 impl OwnedProcess {
     fn spawn(spec: &CommandSpec, workspace: &Path, piped: bool) -> Result<Self, McpError> {
-        let mut command = Command::new(&spec.argv[0]);
+        let mut command = Command::new(spec.start_command.program());
         command
-            .args(&spec.argv[1..])
+            .args(spec.start_command.args())
             .envs(&spec.env)
             .current_dir(spec.directory(workspace))
             .kill_on_drop(true);
@@ -57,11 +57,9 @@ impl OwnedProcess {
         // Never leave an unread stderr pipe that could deadlock initialization.
         command.stderr(Stdio::null());
         command.process_group(0);
-        let child = command.spawn().map_err(McpError::Io)?;
-        Ok(Self {
-            group: crate::process_group::ProcessGroup::led_by(&child),
-            child,
-        })
+        let (child, group) =
+            skyhook_worker::process::ProcessGroup::spawn(&mut command).map_err(McpError::Io)?;
+        Ok(Self { group, child })
     }
 
     pub(crate) async fn shutdown(&mut self) {
@@ -186,14 +184,11 @@ async fn http_config(
     transport.reinit_on_expired_session = false;
     transport.retry_config = Arc::new(NeverRetry::default());
     transport.max_sse_event_size = MAX_MESSAGE_BYTES;
-    let mut sources = Sources::default();
-    let headers = headers.pending().try_map(|value| sources.read(value))?;
-    let resolved = headers.resolve().await.map_err(McpError::HeaderCommand)?;
-    let resolved = resolved.map();
-    let resolved = resolved
+    let headers = headers.pending().read().await?;
+    let headers = headers
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()));
-    transport.custom_headers.extend(resolved);
+    transport.custom_headers.extend(headers);
     Ok(transport)
 }
 
@@ -474,13 +469,12 @@ pub(crate) async fn connect(
                 .with_max_line_length(MAX_MESSAGE_BYTES);
             ().serve(transport).await.map_err(initialize_error)
         }
-        McpConnection::Http {
+        McpConnection::StreamableHttp {
             endpoint,
-            headers,
             start_if_unreachable,
         } => {
-            let transport = http_config(endpoint, headers).await?;
-            let client = crate::tls::client_builder()
+            let transport = http_config(endpoint.url.as_str(), &endpoint.headers).await?;
+            let client = skyhook_worker::tls::client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
                 .connect_timeout(CONNECT_TIMEOUT)
@@ -537,7 +531,7 @@ mod tests {
             );
             let config: McpServerConfig = crate::yaml::parse(&text).unwrap();
             match config.connection() {
-                McpConnection::Http { headers, .. } => headers.clone(),
+                McpConnection::StreamableHttp { endpoint, .. } => endpoint.headers.clone(),
                 McpConnection::Stdio(_) => unreachable!("an HTTP server"),
             }
         };

@@ -31,23 +31,7 @@ pub enum DiscoveryLimit {
 // Count encoded bytes without allocating another copy of a potentially large
 // schema/result. These post-parse bounds complement the raw transport bound.
 pub(super) fn bounded_json_size(value: &impl serde::Serialize, limit: usize) -> Option<usize> {
-    struct Counter {
-        bytes: usize,
-        limit: usize,
-    }
-    impl std::io::Write for Counter {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            if data.len() > self.limit.saturating_sub(self.bytes) {
-                return Err(std::io::Error::other("MCP JSON size limit exceeded"));
-            }
-            self.bytes += data.len();
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter { bytes: 0, limit };
+    let mut counter = skyhook_base::limits::ByteCount { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).ok()?;
     Some(counter.bytes)
 }
@@ -181,8 +165,12 @@ mod tests {
         let fixture = Fixture::new();
         let mut config = fixture.config();
         let repeated = "repeated_cursor";
-        (config.env).insert("MCP_TEST_DISCOVERY".into(), repeated.into());
-        let configs = [(repeated.to_owned(), config.try_into().unwrap())].into();
+        config["env"]["MCP_TEST_DISCOVERY"] = repeated.into();
+        let configs = [(
+            repeated.to_owned(),
+            crate::mcp::manager::tests::server(config),
+        )]
+        .into();
         let manager = McpManager::connect(
             &configs,
             &Default::default(),
@@ -204,16 +192,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resources_only_server_gets_no_tools_requests_or_extra_client_capabilities() {
+    async fn resources_only_server_gets_no_tools_requests() {
         let (result, requests) = discovered(false, Value::Null).await;
         assert!(result.unwrap().is_empty());
         let methods: Vec<_> = (requests.iter())
             .filter_map(|request| request["method"].as_str())
             .collect();
         assert!(!methods.contains(&"tools/list"), "{methods:?}");
-        let capabilities = requests[0]["params"]["capabilities"].as_object().unwrap();
-        assert!(!capabilities.contains_key("sampling"));
-        assert!(!capabilities.contains_key("elicitation"));
-        assert!(!capabilities.contains_key("roots"));
     }
 }

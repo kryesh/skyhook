@@ -6,6 +6,7 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
+    convert::Infallible,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
@@ -24,29 +25,40 @@ pub(crate) type Opener = Arc<dyn Fn(&Path) -> DbResult<Db> + Send + Sync>;
 /// page-cache and shared-memory locks than they gain.
 pub(crate) const CONNECTIONS: usize = 4;
 
-/// A turn on a connection that serves one caller at a time, so that a caller
-/// waiting for it holds no thread.
+/// A turn on a resource that serves one caller at a time, so that a caller waiting
+/// for it holds no thread.
 #[derive(Default)]
 pub(crate) struct Turn(Arc<tokio::sync::Mutex<()>>);
 
 impl Turn {
-    /// Run `work` on a blocking thread once it is this caller's turn. The work holds
-    /// the turn until it returns: a caller that stops waiting cannot stop work already
-    /// started, so the next turn must not begin beside it.
-    pub(crate) async fn take<T, E>(
+    pub(crate) async fn take<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
-        let turn = Arc::clone(&self.0).lock_owned().await;
-        crate::blocking(move || {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let Ok(done) = self
+            .take_unless(std::future::pending::<Infallible>(), work)
+            .await;
+        done
+    }
+
+    /// Run `work` on a blocking thread once it is this caller's turn, unless `stop`
+    /// comes first. The work holds the turn until it returns: a caller that stops
+    /// waiting cannot stop work already started, so the next turn must not begin
+    /// beside it.
+    pub(crate) async fn take_unless<T: Send + 'static, S>(
+        &self,
+        stop: impl Future<Output = S>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, S> {
+        let turn = tokio::select! {
+            turn = Arc::clone(&self.0).lock_owned() => turn,
+            stopped = stop => return Err(stopped),
+        };
+        Ok(skyhook_base::blocking(move || {
             let _turn = turn;
             work()
         })
-        .await
+        .await)
     }
 }
 
@@ -79,14 +91,10 @@ impl Own {
     }
 
     /// Run `work`, which reads through this connection, once it is its turn.
-    pub(crate) async fn hold<T, E>(
+    pub(crate) async fn hold<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         self.turn.take(work).await
     }
 }
@@ -170,16 +178,12 @@ impl ReadPool {
 
     /// Run `work`, which reads through this pool, on one of its reader threads, with
     /// its connection serving all of its reads. Waiting for a reader holds no thread.
-    /// `work` must not wait on reads made on another thread, and a panic in it is an
-    /// error, as in any blocking task.
-    pub(crate) async fn hold<T, E>(
+    /// `work` must not wait on reads made on another thread, and its panic is raised
+    /// again in the caller, as in any blocking task.
+    pub(crate) async fn hold<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         let (reply, result) = tokio::sync::oneshot::channel();
         self.push(Box::new(move || {
             // A caller that has gone needs nothing read.
@@ -189,11 +193,7 @@ impl ReadPool {
         }));
         match result.await.expect("a reader runs every queued job") {
             Ok(done) => done,
-            // Only a task makes a join error, so the panic is raised again in one.
-            Err(panic) => Err(tokio::task::spawn_blocking(move || resume_unwind(panic))
-                .await
-                .expect_err("re-raised")
-                .into()),
+            Err(panic) => resume_unwind(panic),
         }
     }
 
@@ -314,7 +314,8 @@ mod tests {
     }
 
     /// A caller that stops waiting leaves its started work holding the turn, so the
-    /// next caller's work runs after it, never beside it.
+    /// next caller's work runs after it, never beside it, and one stopped while still
+    /// waiting runs nothing.
     #[tokio::test]
     async fn cancelled_work_keeps_the_turn_until_it_returns() {
         let turn = Arc::new(Turn::default());
@@ -329,7 +330,6 @@ mod tests {
                     started.send(()).unwrap();
                     gate.recv().unwrap();
                     log.lock().unwrap().push("first ended");
-                    Ok::<_, tokio::task::JoinError>(())
                 })
                 .await
             })
@@ -343,13 +343,14 @@ mod tests {
             turn.0.try_lock().is_err(),
             "the started work still holds the turn"
         );
+        let stopped = turn.take_unless(std::future::ready(()), || {
+            panic!("a stopped wait runs nothing")
+        });
+        assert!(bounded(stopped).await.is_err());
         release.send(()).unwrap();
         let second = log.clone();
-        let next = move || {
-            second.lock().unwrap().push("second");
-            Ok::<_, tokio::task::JoinError>(())
-        };
-        bounded(turn.take(next)).await.unwrap();
+        let next = move || second.lock().unwrap().push("second");
+        bounded(turn.take(next)).await;
         assert_eq!(
             *log.lock().unwrap(),
             ["first started", "first ended", "second"]
@@ -369,20 +370,20 @@ mod tests {
             let held = pool.clone();
             let read = move || {
                 let read = || held.read(|_| -> DbResult<()> { panic!("a read that fails") });
-                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read));
-                Ok::<_, tokio::task::JoinError>(failed.is_err())
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).is_err()
             };
-            assert!(pool.hold(read).await.unwrap());
+            assert!(pool.hold(read).await);
         }
         let held = pool.clone();
-        let read = move || Ok::<_, tokio::task::JoinError>(held.read(|db| db.batch("SELECT 1")));
-        pool.hold(read).await.unwrap().unwrap();
+        let read = move || held.read(|db| db.batch("SELECT 1"));
+        pool.hold(read).await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_panic_in_held_work_is_an_error() {
+    async fn a_panic_in_held_work_is_raised_in_the_caller() {
         let pool = ReadPool::new("never-read.db".into(), read_only());
-        let held = pool.hold(|| -> Result<(), tokio::task::JoinError> { panic!("held work") });
-        assert!(held.await.unwrap_err().is_panic());
+        let caller = tokio::spawn(async move { pool.hold(|| panic!("held work")).await });
+        let panic = caller.await.unwrap_err().into_panic();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"held work"));
     }
 }

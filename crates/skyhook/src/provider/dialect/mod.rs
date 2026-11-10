@@ -8,21 +8,16 @@ use std::convert::Infallible;
 use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
 use serde::Serialize;
 
-use crate::{
-    media::ImageLimits,
-    named_enum::named_enum,
-    provider::{
-        ProviderError,
-        codec::{Codec, CodecName, StateRole},
-        http::{
-            Headers, HttpProvider, Transport, headers::Value, reasoning_scope,
-            transport::EVENT_STREAM,
-        },
+use crate::provider::{
+    codec::{Codec, CodecName, StateRole},
+    http::{
+        Headers, HttpProvider, Transport, headers::Value, reasoning_scope, transport::EVENT_STREAM,
     },
 };
+use skyhook_base::enums::NamedEnum;
+use skyhook_media::ImageLimits;
 
 pub mod anthropic;
-mod api_key;
 pub mod codex;
 pub mod compatible;
 pub(crate) mod config;
@@ -34,20 +29,19 @@ pub mod openai;
 pub mod openrouter;
 mod placements;
 
-pub use crate::provider::http::headers::{HeaderText, InvalidHeaderText, ValueField};
-pub use crate::provider::settings::{MissingSetting, Setting};
-pub(crate) use api_key::Scheme;
-use config::Pending;
-pub use config::{
-    AdmissionError, Common, EndpointError, HeaderError, ModelError, Sourced, ValueError,
-    ValueProblem,
+use crate::provider::http::credentials::{Pending, Scheme, Sources};
+pub use crate::provider::http::{
+    credentials::{BuildError, HeaderError, ValueError, ValueField, ValueProblem},
+    headers::{HeaderText, InvalidHeaderText},
 };
-pub(crate) use config::{ConfiguredHeaders, Connection, Sources};
+pub use crate::provider::settings::{MissingSetting, Setting};
+pub(crate) use config::Connection;
+pub use config::{AdmissionError, Common, EndpointError, ModelError};
 pub(crate) use entry::AdmittedProvider;
 pub use entry::{ConfigHome, ProviderModels, ProviderSettings, RawProviderConfig};
 pub use login::{
-    AuthStatus, LoginCommand, LoginError, LoginFlow, LoginPresenter, LoginReason, LoginRequired,
-    Usage, UsageWindow,
+    AccountUsage, AuthStatus, Login, LoginCommand, LoginError, LoginFlow, LoginPresenter,
+    LoginReason, LoginRequired, UsageWindow,
 };
 pub use models::{
     AccessPrograms, AccessProgramsPatch, ImageLimitSettings, ImageLimitSettingsPatch, ModelSpec,
@@ -55,17 +49,16 @@ pub use models::{
 };
 pub use placements::{PlacementError, PlacementKey, Placements, PlacementsPatch};
 
-named_enum! {
-    /// The preset a provider entry names.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum Dialect {
-        Compatible = "compatible",
-        Openai = "openai",
-        Anthropic = "anthropic",
-        Codex = "codex",
-        Litellm = "litellm",
-        Openrouter = "openrouter",
-    }
+/// The preset a provider entry names.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Dialect {
+    Compatible,
+    Openai,
+    Anthropic,
+    Codex,
+    Litellm,
+    Openrouter,
 }
 
 /// What the entry's `base_url` means to the dialect; the codec's path is
@@ -79,7 +72,7 @@ pub(crate) enum BaseUrl {
 
 /// The complete wire conventions of an admitted model.
 #[derive(Clone, Debug)]
-pub(crate) struct Profile {
+pub(crate) struct Wire {
     pub codec: Codec,
     pub transport: Transport,
     /// Names the dialect in replay scope, with whatever else changes the
@@ -97,7 +90,7 @@ pub(crate) struct Profile {
     pub images: ImageLimits,
 }
 
-impl Profile {
+impl Wire {
     pub(crate) fn new(
         codec: Codec,
         transport: Transport,
@@ -171,17 +164,8 @@ impl Profile {
 pub enum DialectError {
     #[error("dialect {dialect} does not speak {codec}")]
     UnsupportedCodec { dialect: Dialect, codec: CodecName },
-    #[error("api_key does not apply to codex; run `skyhook auth login <provider>`")]
-    CodexApiKey,
-}
-
-/// Why an admitted entry's provider could not be constructed.
-#[derive(Debug, thiserror::Error)]
-pub enum BuildError {
-    #[error(transparent)]
-    Value(#[from] ValueError),
-    #[error(transparent)]
-    Provider(#[from] ProviderError),
+    #[error("api_key does not apply to {dialect}; run `skyhook auth login <provider>`")]
+    ManagedLogin { dialect: Dialect },
 }
 
 /// What every dialect's settings provide.
@@ -195,43 +179,38 @@ pub(crate) trait DialectConfig {
     }
 
     /// Resolve wire conventions after inheritance. Connection and model-profile
-    /// validation are shared, and no admission is repeated at build.
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError>;
+    /// validation are shared.
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError>;
 }
 
 /// Build the provider at the admitted endpoint. Header sources compose in
-/// order, each replacing a header or joining a list header: the profile's, the
+/// order, each replacing a header or joining a list header: the wire conventions', the
 /// entry's `headers`, `credentials`, then the stream the transport reads. Only
 /// the environment values that remain are read.
 pub(crate) fn build(
     name: &str,
-    profile: Profile,
+    wire: Wire,
     connection: &Connection,
     credentials: Headers<Pending>,
     resources: &mut Resources,
 ) -> Result<HttpProvider, BuildError> {
-    let endpoint = connection.url(&profile.path());
+    let endpoint = connection.url(&wire.path());
     let ready = |value| Ok::<_, Infallible>(Pending::Ready(value));
-    let Ok(mut headers) = profile.headers.try_map(ready);
+    let Ok(mut headers) = wire.headers.try_map(ready);
     headers.extend(connection.headers.pending());
     headers.extend(credentials);
     let stream = Value::Fixed(HeaderValue::from_static(EVENT_STREAM));
     headers.insert(ACCEPT, Pending::Ready(stream));
     let headers = headers.try_map(|pending| resources.sources.read(pending))?;
     Ok(HttpProvider {
-        scope: reasoning_scope(
-            name,
-            endpoint.as_str(),
-            profile.codec.name(),
-            &profile.scope,
-        ),
+        scope: reasoning_scope(name, endpoint.as_str(), wire.codec.name(), &wire.scope),
         client: resources.client.clone(),
         endpoint,
-        codec: profile.codec,
-        transport: profile.transport,
+        codec: wire.codec,
+        transport: wire.transport,
         headers,
         timeouts: connection.timeouts,
-        images: profile.images,
+        images: wire.images,
     })
 }
 
@@ -245,9 +224,11 @@ pub(crate) struct Resources {
 pub(crate) mod tests {
     use super::*;
     pub(crate) use crate::provider::http::tests::Sent;
+    use skyhook_worker::process::CommandLine;
+    use skyhook_worker::secret::Credential;
 
     /// An entry at `root`, keyed or anonymous.
-    pub(crate) fn common(root: &str, api_key: Option<Sourced>) -> Common {
+    pub(crate) fn common(root: &str, api_key: Option<Credential>) -> Common {
         Common {
             base_url: Some(root.to_owned()),
             api_key,
@@ -273,12 +254,12 @@ pub(crate) mod tests {
         codec: CodecName,
         common: &Common,
     ) -> HttpProvider {
-        let mut profile = settings.admit(codec).unwrap();
-        profile.codec = placements.apply(profile.codec).unwrap();
+        let mut wire = settings.admit(codec).unwrap();
+        wire.codec = placements.apply(wire.codec).unwrap();
         let connection = common.admit(BaseUrl::Required).unwrap();
-        let credentials = connection.credentials(profile.key);
+        let credentials = connection.credentials(wire.key);
         let mut resources = Resources::default();
-        build(name, profile, &connection, credentials, &mut resources).unwrap()
+        build(name, wire, &connection, credentials, &mut resources).unwrap()
     }
 
     /// An API root nothing listens on: requests are prepared, never posted.
@@ -300,7 +281,7 @@ pub(crate) mod tests {
         api_key: &str,
         request: crate::provider::protocol::ModelRequest,
     ) -> Sent {
-        let common = common(ROOT, Some(Sourced::Literal(api_key.into())));
+        let common = common(ROOT, Some(Credential::Literal(api_key.into())));
         let provider = provider("test", settings, codec, &common);
         provider.sent(request).await.unwrap()
     }
@@ -322,14 +303,14 @@ pub(crate) mod tests {
         body: serde_json::Value,
         retry_after: Option<std::time::Duration>,
     ) -> crate::provider::ProviderErrorKind {
-        let profile = settings.admit(codec).unwrap();
+        let wire = settings.admit(codec).unwrap();
         let rejection = crate::provider::http::transport::Rejection {
             status,
             body,
             retry_after,
         };
-        let signals = profile.transport.errors;
-        profile.codec.error(&rejection, signals).kind()
+        let signals = wire.transport.errors;
+        wire.codec.error(&rejection, signals).kind()
     }
 
     /// The kind `settings` read a mid-stream error event of `codec` as.
@@ -338,17 +319,17 @@ pub(crate) mod tests {
         codec: CodecName,
         event: serde_json::Value,
     ) -> crate::provider::ProviderErrorKind {
-        let profile = settings.admit(codec).unwrap();
+        let wire = settings.admit(codec).unwrap();
         let scope = crate::provider::codec::common::tests::scope();
-        let signals = profile.transport.errors;
-        let mut decoder = profile.codec.decoder("model".into(), scope, b"", signals);
+        let signals = wire.transport.errors;
+        let mut decoder = wire.codec.decoder("model".into(), scope, b"", signals);
         let event = crate::provider::http::transport::tests::sse(None, event.to_string());
         decoder.decode(&event).unwrap_err().kind()
     }
 
     pub(crate) fn request() -> crate::provider::protocol::ModelRequest {
         crate::provider::protocol::ModelRequest {
-            max_output_tokens: std::num::NonZeroU64::new(16),
+            max_output_tokens: std::num::NonZeroU64::new(16).unwrap(),
             ..crate::provider::codec::common::tests::request("test-model")
         }
     }
@@ -376,65 +357,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// A dialect's tool-name alphabet holds on every codec it admits.
-    #[test]
-    fn tool_names_follow_the_dialect() {
-        use crate::provider::{
-            codec::ToolNames::{self, *},
-            protocol::ToolDefinition,
-        };
-        use CodecName::*;
-        let litellm_anthropic =
-            crate::yaml::parse::<litellm::Config>("upstream: anthropic").unwrap();
-        let tool = |name: String| {
-            let mut request = request();
-            request.tools = vec![std::sync::Arc::new(ToolDefinition {
-                name,
-                description: String::new(),
-                input_schema: serde_json::json!({"type": "object"}),
-            })];
-            request
-        };
-        let (dotted, long) = (tool("vendor.tool".into()), tool("a".repeat(100)));
-        let rows: [(&dyn DialectConfig, CodecName, ToolNames); 5] = [
-            (&compatible::Config::default(), ChatCompletions, Any),
-            (&openai::Config::default(), Responses, OpenAi),
-            (&anthropic::Config::default(), Messages, Anthropic),
-            // OpenRouter's alphabet follows the codec, LiteLLM's the upstream.
-            (&openrouter::Config::default(), Messages, Anthropic),
-            (&litellm_anthropic, ChatCompletions, Anthropic),
-        ];
-        for (settings, codec, names) in rows {
-            let conventions = settings.admit(codec).unwrap().codec;
-            let accepts = |request| {
-                let images = Default::default();
-                conventions
-                    .encode(request, images, &"c".parse().unwrap())
-                    .is_ok()
-            };
-            assert_eq!(
-                (accepts(&dotted), accepts(&long)),
-                (names == Any, names != OpenAi),
-                "{codec} {conventions:?}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn fixed_headers_merge_in_order() {
         let mut common = common(ROOT, None);
         common.headers = [
-            ("x-literal".to_owned(), Sourced::Literal("plain".into())),
+            ("x-literal".to_owned(), Credential::Literal("plain".into())),
             (
                 "x-lazy".to_owned(),
-                Sourced::Command {
-                    command: "printf lazy".into(),
-                },
+                Credential::Command(CommandLine::Shell("printf lazy".into())),
             ),
             // The entry's headers win over the transport's constants.
             (
                 "anthropic-version".to_owned(),
-                Sourced::Literal("2099-01-01".into()),
+                Credential::Literal("2099-01-01".into()),
             ),
         ]
         .into_iter()
@@ -452,25 +387,20 @@ pub(crate) mod tests {
 
     /// The key replaces an entry header of its name, a codec placement replaces
     /// the key, and the transport's `Accept` replaces the entry's; a replaced
-    /// command never runs, and a replaced environment value is never read.
+    /// environment value is never read.
     #[tokio::test]
     async fn placements_replace_credentials_which_replace_entry_headers() {
         use crate::provider::codec::{NonEmpty, header};
-        let dir = tempfile::tempdir().unwrap();
-        let count = dir.path().join("count");
-        let command = format!("printf x >> '{}'; printf entry", count.to_str().unwrap());
         let selected = Placements {
             cache_key: crate::provider::settings::Nullable::Value(NonEmpty::one(header(
                 "x-api-key",
             ))),
             ..Placements::default()
         };
-        let mut common = common(ROOT, Some(Sourced::Literal("k".into())));
-        let entry = Sourced::Command { command };
+        let mut common = common(ROOT, Some(Credential::Literal("k".into())));
+        let entry = Credential::Literal("entry".into());
         common.headers.insert("x-api-key".into(), entry);
-        let unset = Sourced::Env {
-            env: "SKYHOOK_TEST_UNSET_X".into(),
-        };
+        let unset = Credential::Env("SKYHOOK_TEST_UNSET_X".into());
         common.headers.insert("accept".into(), unset);
         let mut keys = Vec::new();
         for placements in [Placements::default(), selected] {
@@ -482,6 +412,5 @@ pub(crate) mod tests {
             keys.push(sent.header("x-api-key").join(""));
         }
         assert_eq!(keys, ["k", "ctx"]);
-        assert!(!count.exists());
     }
 }

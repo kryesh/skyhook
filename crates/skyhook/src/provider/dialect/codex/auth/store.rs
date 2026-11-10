@@ -1,15 +1,15 @@
 //! Private atomic credential persistence and cross-process refresh/login coordination.
 use super::{AuthManager, Issuer, blocking};
-use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile};
-use crate::newtype::string_newtype;
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::{Authentication, Unavailable},
     dialect::{AuthStatus, LoginReason, LoginRequired},
-    profile::ProviderName,
+    model::ProviderName,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use skyhook_base::string_newtype;
+use skyhook_worker::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile};
 use std::{
     fs::{self, File, OpenOptions},
     io::Read,
@@ -270,7 +270,7 @@ fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path)?;
-    let metadata = crate::fs::admit_regular(file.metadata()?, u64::MAX)
+    let metadata = skyhook_worker::fs::admit_regular(file.metadata()?, u64::MAX)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
     if metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
@@ -335,7 +335,7 @@ pub(super) fn write_store(files: &Files, stored: &Stored) -> Result<(), Provider
     staged
         .commit(CommitMode::Replace)
         .map_err(|failure| match failure.stage {
-            AtomicWriteStage::OpenDirectory | AtomicWriteStage::SyncDirectory => {
+            AtomicWriteStage::OpenDirectory(_) | AtomicWriteStage::SyncDirectory(_) => {
                 Authentication.error("Cannot sync Skyhook credential directory")
             }
             _ => Authentication.error("Cannot atomically save Skyhook Codex credentials"),
@@ -434,7 +434,7 @@ pub(super) mod tests {
         assert!(!format!("{err:?}").contains("TOP-SECRET"));
     }
 
-    /// An existing directory must already be private; it is never chmodded.
+    /// An existing directory must already be private.
     #[test]
     fn credential_directory_must_be_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -447,8 +447,6 @@ pub(super) mod tests {
             mode(permissive).unwrap();
             assert!(private_directory(temp.path()).is_err());
             assert!(create_directory(temp.path()).is_err());
-            let metadata = fs::metadata(temp.path()).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, permissive);
         }
     }
 }

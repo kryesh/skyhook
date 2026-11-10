@@ -5,19 +5,20 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::{
+    agent_state::{PROFILED, outcome_at},
     decode::*,
-    state::{PROFILED, outcome_at},
     *,
 };
+use crate::identity::AgentId;
+use crate::job::JobRole;
 use crate::{
-    identity::{AgentId, JobId},
-    job::JobRole,
-    provider::profile::ModelRef,
+    provider::model::ModelRef,
     session::{
         EntryKind, RequestRecord, RequestSeq,
         stats::{AgentOutcome, JobCounts, ToolStats},
     },
 };
+use skyhook_worker::job::JobId;
 
 /// What an agent's start records, the model it last applied, its owner job's name, and
 /// how its work last ended since its latest request, with when.

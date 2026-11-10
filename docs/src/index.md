@@ -6,7 +6,7 @@ or embed its Rust library in your own application.
 
 Skyhook supports OpenAI Chat Completions and Responses, Anthropic Messages, Codex/ChatGPT
 subscriptions, and compatible local model endpoints. Tools work in local workspaces and
-on SSH targets. The agent can call tools directly or use scripts to coordinate jobs and
+on Linux and Windows targets reached over SSH or WinRM. The agent can call tools directly or use scripts to coordinate jobs and
 child agents through the same permissions and saved-output system.
 
 ## Find your starting point

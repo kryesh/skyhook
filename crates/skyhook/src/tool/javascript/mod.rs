@@ -29,9 +29,9 @@ mod tests {
         source::{FILENAME, SubmittedSource},
     };
     use crate::tests::TestRuntime;
+    use crate::tool::catalog::ToolOptions;
     use crate::tool::{
-        ToolContext, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-        executor::ToolExecutor,
+        ToolContext, ToolError, ToolOutput, ToolRegistryBuilder, executor::ToolExecutor,
     };
 
     /// Small enough that the memory tests fill little; a script needs far less.

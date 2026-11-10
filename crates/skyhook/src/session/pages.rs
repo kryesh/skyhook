@@ -7,12 +7,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use super::TodoItem;
 use super::{
     EventRecord, Fact, Message, MessageSeq, RecordSeq, RequestRecord, RequestSeq, SessionError,
     SessionEvent, SessionStore, db,
 };
-use crate::identity::{AgentId, JobId};
-use crate::provider::protocol::ToolResult;
+use crate::config::mode::ModeName;
+use crate::identity::AgentId;
+use crate::provider::{model::ModelRef, protocol::ToolResult};
+use crate::tool::policy::CapabilitySet;
+use skyhook_tools::target::TargetRef;
+use skyhook_worker::job::JobId;
 
 /// Where a page of an ordered list starts. Keys bound a page and are never on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +66,7 @@ pub struct Answer {
 
 impl PageFacts {
     /// Fold an update's record, which the live slice decided `fact` of (see
-    /// [`Applied`](crate::agent::Applied)), its agent's open turn having begun at
+    /// [`Applied`](crate::session::Applied)), its agent's open turn having begun at
     /// `turn`, into what presenting the records `holds` holds reads. Returns the call
     /// it answered or admitted.
     pub fn observe(
@@ -115,18 +120,82 @@ pub struct AgentsPage {
     pub agents: Vec<AgentSummary>,
 }
 
-/// One agent: its start, its latest model and mode changes, its latest todos (a
-/// replacement or a checkpoint) and the latest record that ended a turn, in order.
-/// Folding the records shows the agent as the whole journal would.
+/// One agent as the whole journal leaves it.
 #[derive(Clone, Debug)]
 pub struct AgentSummary {
     pub agent: AgentId,
-    pub records: Vec<Arc<EventRecord>>,
-    pub owner_job: Option<JobId>,
+    pub outline: AgentOutline,
     /// When its latest finished turn began and ended (epoch milliseconds).
     pub finished: Option<(i64, i64)>,
     /// When its open turn began, if one is.
     pub turn: Option<i64>,
+}
+
+/// What a host shows of an agent beside its conversation: the model and mode it runs
+/// in, what it may do, where, for which job, and its todos, as its start and its
+/// latest model change, mode change and todos (a replacement or a checkpoint) leave
+/// them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentOutline {
+    pub model: ModelRef,
+    /// The mode it runs in, when it has one.
+    pub mode: Option<ModeName>,
+    pub capabilities: CapabilitySet,
+    pub target: TargetRef,
+    pub owner_job: Option<JobId>,
+    pub todos: Vec<TodoItem>,
+}
+
+impl AgentOutline {
+    /// The outline an agent's start gives it, if `event` is one.
+    pub fn started(event: &SessionEvent) -> Option<Self> {
+        let SessionEvent::AgentStarted {
+            owner_job,
+            profile,
+            mode,
+            capabilities,
+            location,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        Some(Self {
+            model: profile.name.clone(),
+            mode: mode.as_ref().map(|mode| mode.name.clone()),
+            capabilities: capabilities.clone(),
+            target: location.target.clone(),
+            owner_job: *owner_job,
+            todos: Vec::new(),
+        })
+    }
+
+    /// Fold `event`, a later record of the agent's own.
+    pub fn apply(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::ModelChanged { profile } => self.model = profile.name.clone(),
+            SessionEvent::ModeChanged { mode, capabilities } => {
+                self.mode = Some(mode.name.clone());
+                self.capabilities.clone_from(capabilities);
+            }
+            SessionEvent::TodosReplaced { items } => self.todos.clone_from(items),
+            SessionEvent::Compaction { checkpoint } => self.todos.clone_from(&checkpoint.todos),
+            _ => {}
+        }
+    }
+
+    /// The outline an agent's `records`, in order, leave it with: none without its start.
+    pub(crate) fn folded<'a>(records: impl IntoIterator<Item = &'a EventRecord>) -> Option<Self> {
+        let mut outline = None;
+        for record in records {
+            match (&mut outline, Self::started(&record.event)) {
+                (_, Some(started)) => outline = Some(started),
+                (Some(outline), None) => outline.apply(&record.event),
+                (None, None) => {}
+            }
+        }
+        outline
+    }
 }
 
 impl SessionStore {
@@ -216,7 +285,7 @@ impl super::Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::RuntimeEvent, session::SessionEvent, tests::TestRuntime};
+    use crate::{session::RuntimeEvent, session::SessionEvent, tests::TestRuntime};
 
     /// A page read after observing holds every entry the observation counted, and the
     /// updates after it carry each later one: a host placing updates by ordinal, counted

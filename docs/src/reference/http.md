@@ -31,12 +31,12 @@ const upload = (await tool.fetch({
   body: {kind: "file", path: "dist/archive.tar.gz"}
 })).unwrap();
 
-// Save a download on the execution target. Existing files are preserved unless overwrite:true.
+// Save a download on the execution target. An existing file is kept unless save_to.overwrite is true.
+// A large transfer needs a longer deadline, or none: timeout: null.
 const download = (await tool.fetch({
   url: "https://example.com/archive.tar.gz",
-  save_to: "archive.tar.gz",
-  max_bytes: 104857600,
-  timeout: 300
+  save_to: {path: "archive.tar.gz"},
+  timeout: null
 })).unwrap();
 
 // Explicitly opt out of certificate validation for a development HTTPS server.
@@ -59,7 +59,8 @@ Do not combine `auth` with an `Authorization` header or embed credentials in URL
 - `{kind:"json",value:...}` for any JSON value, including `null`.
 - `{kind:"form",fields:[["key","value"],...]}` for URL-encoded forms with repeated keys.
 - `{kind:"base64",value:"..."}` for inline binary data.
-- `{kind:"file",path:"..."}` for a regular-file upload as the raw request body.
+- `{kind:"file",path:"..."}` for a regular-file upload as the raw request body. The file is
+  streamed from where it is; a redirect that sends the body again reads the file as it is then.
 
 Multipart form-data encoding is not supported. File bodies can set their media type through the
 `Content-Type` request header; they are not interchangeable with multipart uploads.
@@ -91,10 +92,17 @@ charsets, and HTML meta charsets where applicable. Without an `Accept` header, `
 that answer other requests with an empty page or a non-HTML variant return their HTML, while APIs
 that serve no HTML still return JSON; `readable` sends
 `text/html,application/xhtml+xml;q=0.9,*/*;q=0.8`.
-`save_to` saves the response to a file on success instead of embedding the payload, creating
-missing parent directories, and ignores `response_format`. It and `overwrite` are offered only to
-agents with the `write` capability. Errors or cancellation do not replace
-an existing destination.
+`save_to: {path, overwrite?}` saves the response to the file at `path` on success instead of
+embedding the payload, creating missing parent directories, and ignores `response_format`. An
+existing file fails the call unless `overwrite` is true. `save_to` is offered only to agents with
+the `write` capability. Errors or cancellation do not replace an existing destination.
+
+A body over 4 MiB with no `save_to` is not returned inline either. The target that fetched it
+writes it to a new file in its [spill directory](job-output.md#spill-files) and the result names
+it: `body: {kind: "file", path, bytes}`, the same shape `save_to` returns, with the bytes as sent
+and no `response_format` applied. Read it with `read`, process it with `exec`, or move it with
+`write({path, source: {path}})`: the session reads that file without asking while it stays open.
+A fetch whose spill file cannot be created fails; a failed or cancelled fetch leaves no file.
 
 HTML is returned as `{kind: "page", title, byline?, site_name?, language?, scope, markdown}`.
 `scope` is `article` when the page has a readable main article, and `markdown` holds only that
@@ -117,9 +125,10 @@ complete payload for processing.
 
 ## Limits and failure diagnostics
 
-The default total `timeout` is 30 seconds, `connect_timeout` is 10 seconds, and `max_bytes` is
-10 MiB. The response limit can be raised to 100 MiB; total uploads are also capped at 100 MiB.
-Timeouts must be between 1 and 3600 seconds and `max_redirects` cannot exceed 20.
+The default total `timeout` is 30 seconds; `timeout: null` waits without a deadline.
+`connect_timeout` is 10 seconds, at most 3600, and `max_redirects` cannot exceed 20.
+`max_bytes` is unset by default; when given it fails a response whose decoded body is longer,
+whether returned or saved. It never applies to an upload.
 Limits apply while streaming, including to decompressed data; exceeding a limit fails
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
 independent: retrieve saved results with `jobs({job})`. Cancellation and timeouts cannot undo
@@ -135,7 +144,7 @@ max_bytes`. A failure after the request was sent notes that the request may have
 created directories to hold it, which remain.
 Failure messages never copy underlying error text, query strings, credentials, headers, or bodies;
 URLs are reduced to their origin. A response's `duration` is measured inside fetch on the execution
-target; it does not include SSH startup or initial tool approval.
+target; it does not include connection startup or initial tool approval.
 
 HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity, not
 successful ingestion. Permission denial and cancellation retain their separate semantics.
@@ -143,9 +152,9 @@ successful ingestion. Permission denial and cancellation retain their separate s
 ## Redirects, proxies, and security
 
 `redirects` is `safe` by default (follow GET/HEAD), `follow` to follow other methods too, or `manual`
-to return the redirect response. `max_redirects` defaults to 5. Changed origins require authorization;
-cross-origin requests do not inherit sensitive request headers, and HTTPS-to-HTTP redirects are
-rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
+to return the redirect response. `max_redirects` defaults to 5. A call is approved for the origin it
+names; the redirects it follows need no further approval. Cross-origin requests do not inherit
+sensitive request headers, and HTTPS-to-HTTP redirects are rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
 `proxy` selects an explicit HTTP proxy; otherwise fetch uses the target's proxy environment.
 HTTPS, here and for every other connection Skyhook makes, trusts the bundled Mozilla root list
 plus the system's CA store when one is present. `insecure` defaults to **false**. Setting it to

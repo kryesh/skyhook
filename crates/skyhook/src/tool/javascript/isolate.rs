@@ -308,32 +308,20 @@ fn sleep(
     arguments: v8::FunctionCallbackArguments,
     mut returned: v8::ReturnValue<v8::Value>,
 ) {
-    let milliseconds = arguments.get(0).number_value(scope).unwrap_or(f64::NAN);
-    let delay = Duration::try_from_secs_f64(milliseconds / 1000.0);
+    let milliseconds = arguments.get(0).number_value(scope).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs_f64(milliseconds / 1000.0);
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
     let promise = resolver.get_promise(scope).into();
+    let resolver = v8::Global::new(scope, resolver);
     let host = scope
         .get_slot_mut::<Host>()
         .expect("the isolate keeps its host");
     host.slept += 1;
     let slept = host.slept;
-    match delay {
-        Ok(delay) => {
-            let deadline = Instant::now() + delay;
-            host.deadlines.insert(slept, deadline);
-            let resolver = v8::Global::new(scope, resolver);
-            let host = scope
-                .get_slot_mut::<Host>()
-                .expect("the isolate keeps its host");
-            host.sleeps.insert((deadline, slept), resolver);
-        }
-        Err(failure) => {
-            let exception = error(scope, &failure.to_string());
-            resolver.reject(scope, exception);
-        }
-    }
+    host.deadlines.insert(slept, deadline);
+    host.sleeps.insert((deadline, slept), resolver);
     let number = v8::Number::new(scope, slept as f64).into();
     returned.set(v8::Array::new_with_elements(scope, &[promise, number]).into());
 }
@@ -514,9 +502,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::tests::bounded;
-    use crate::tool::diagnostic::Cause;
+    use crate::tool::catalog::ToolOptions;
     use crate::tool::javascript::tests::{echo_runtime, evaluate, plain, test_runtime};
-    use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder};
+    use crate::tool::{ToolOutput, ToolRegistryBuilder};
+    use skyhook_tools::diagnostic::Cause;
 
     #[tokio::test]
     async fn cancellation_stops_sleep_and_pending_promises_without_keeping_unawaited_work_alive() {
@@ -531,7 +520,7 @@ mod tests {
             let mut builder = ToolRegistryBuilder::default();
             let (notify, end) = (entered.clone(), ended.clone());
             builder
-                .register_product::<crate::tool::registry::Arguments, Value, _, _>(
+                .register_product::<skyhook_tools::arguments::Arguments, Value, _, _>(
                     "entered",
                     "",
                     ToolOptions::default(),

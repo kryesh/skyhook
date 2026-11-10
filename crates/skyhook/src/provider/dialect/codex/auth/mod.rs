@@ -1,12 +1,7 @@
-//! Skyhook-owned ChatGPT OAuth. Never consults CODEX_HOME, ~/.codex/auth.json,
-//! Flux's credential store, or any other application's credentials.
-//!
-//! Public-client protocol checked against codewandler-flux-credentials 0.59.3
-//! (src/lib.rs, codex_authorize_url) and upstream on 2026-09-08:
+//! Skyhook-owned ChatGPT OAuth as a public client: a PKCE callback, or OpenAI's
+//! /api/accounts/deviceauth flow.
 //! https://github.com/openai/codex/blob/main/codex-rs/login/src/server.rs
 //! https://github.com/openai/codex/blob/main/codex-rs/login/src/device_code_auth.rs
-//! Device auth is OpenAI's public /api/accounts/deviceauth flow, NOT the
-//! unrelated RFC 8628 grant. No client secret or privileged/private API is used.
 
 mod oauth;
 mod store;
@@ -133,14 +128,12 @@ struct Inner {
 }
 
 impl AuthManager {
-    /// Does not read credentials or perform network I/O. Login is deferred until
-    /// explicitly requested; credentials() never launches an interactive flow.
     pub(in crate::provider::dialect) fn new(
         command: LoginCommand,
         issuer: Issuer,
     ) -> Result<Self, ProviderError> {
         let files = store::Files::new(command.home.credentials()?, &command.provider)?;
-        let client = crate::tls::client_builder()
+        let client = skyhook_worker::tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)

@@ -3,43 +3,43 @@
 use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use cli::page::{
+use skyhook::job::JobState;
+use skyhook::product::page::{
     Block, Cell, Column, Detail, Disclosed, Record, RecordDetail, RecordKey, Section, SectionKey,
     Tone,
 };
-use skyhook::job::JobState;
 
 use super::words;
 use crate::cvss::{Cvss40, Severity};
 use crate::store::{
     Assessed, Behind, CandidateView, ConfidenceTier, Currency, EvidenceView, FlawStatus,
-    GroupMember, InventoryStatus, LastTask, ListedTask, Liveness, NodeId, NodeKind, NodeStatus,
-    NodeView, OpenTest, Owing, PathStatus, PremiseRef, PremiseStatus, Proposal, RunState, ShelfRow,
-    Status, Store, TaskDetail, TaskId,
+    GroupMember, InventoryStatus, LastTask, ListedTask, LiveInput, Liveness, NodeId, NodeKind,
+    NodeStatus, NodeView, OpenTest, Owing, PathStatus, PremiseRef, PremiseStatus, Proposal,
+    RunState, ShelfRow, StateScoped, Status, Store, TaskDetail, TaskId,
 };
 
 type Result<T> = std::result::Result<T, crate::store::Error>;
 
 /// The kinds of record the tab lists, in reading order.
 #[derive(Clone, Copy)]
-enum Shelf {
+enum ShelfKind {
     Nodes(NodeKind),
     Tasks(Liveness),
 }
 
-const SHELVES: [Shelf; 9] = [
-    Shelf::Nodes(NodeKind::Candidate),
-    Shelf::Nodes(NodeKind::Finding),
-    Shelf::Nodes(NodeKind::Path),
-    Shelf::Tasks(Liveness::Live),
-    Shelf::Tasks(Liveness::Ended),
-    Shelf::Nodes(NodeKind::Flaw),
-    Shelf::Nodes(NodeKind::Premise),
-    Shelf::Nodes(NodeKind::Component),
-    Shelf::Nodes(NodeKind::State),
+const SHELVES: [ShelfKind; 9] = [
+    ShelfKind::Nodes(NodeKind::Candidate),
+    ShelfKind::Nodes(NodeKind::Finding),
+    ShelfKind::Nodes(NodeKind::Path),
+    ShelfKind::Tasks(Liveness::Live),
+    ShelfKind::Tasks(Liveness::Ended),
+    ShelfKind::Nodes(NodeKind::Flaw),
+    ShelfKind::Nodes(NodeKind::Premise),
+    ShelfKind::Nodes(NodeKind::Component),
+    ShelfKind::Nodes(NodeKind::State),
 ];
 
-impl Shelf {
+impl ShelfKind {
     fn key(self) -> SectionKey {
         SectionKey(match self {
             Self::Nodes(NodeKind::Candidate) => "candidates",
@@ -78,9 +78,9 @@ impl Shelf {
 
 /// A section's column: its heading, its [`Column::priority`] and the cell it shows of each of
 /// its rows, so a section's columns and its records' cells come from one list.
-type Field<R> = (&'static str, u8, fn(&R) -> Cell);
+type ColumnOf<R> = (&'static str, u8, fn(&R) -> Cell);
 
-fn headings<R>(fields: &[Field<R>]) -> Vec<Column> {
+fn headings<R>(fields: &[ColumnOf<R>]) -> Vec<Column> {
     (fields.iter())
         .map(|(title, priority, _)| Column {
             title: (*title).to_owned(),
@@ -89,19 +89,19 @@ fn headings<R>(fields: &[Field<R>]) -> Vec<Column> {
         .collect()
 }
 
-fn cells<R>(fields: &[Field<R>], row: &R) -> Vec<Cell> {
+fn cells<R>(fields: &[ColumnOf<R>], row: &R) -> Vec<Cell> {
     fields.iter().map(|(_, _, cell)| cell(row)).collect()
 }
 
-const TASK_ID: Field<ListedTask> = ("id", 0, |listed| id(listed.task.id));
-const TASK_PHASE: Field<ListedTask> = ("phase", 0, |listed| words(listed.task.phase).into());
-const TASK_STATE: Field<ListedTask> = ("state", 0, |listed| job_state(listed.task.state));
-const TASK_SUBJECTS: Field<ListedTask> = ("subjects", 3, |listed| {
+const TASK_ID: ColumnOf<ListedTask> = ("id", 0, |listed| id(listed.task.id));
+const TASK_PHASE: ColumnOf<ListedTask> = ("phase", 0, |listed| words(listed.task.phase).into());
+const TASK_STATE: ColumnOf<ListedTask> = ("state", 0, |listed| job_state(listed.task.state));
+const TASK_SUBJECTS: ColumnOf<ListedTask> = ("subjects", 3, |listed| {
     ids(listed.task.subjects.iter()).into()
 });
 /// The brief's first line; the brief runs long, so it comes last, where the row's remaining
 /// width clips it.
-const TASK_BRIEF: Field<ListedTask> = ("brief", 0, |listed| {
+const TASK_BRIEF: ColumnOf<ListedTask> = ("brief", 0, |listed| {
     let first = |brief: &String| {
         brief
             .lines()
@@ -115,7 +115,7 @@ const TASK_BRIEF: Field<ListedTask> = ("brief", 0, |listed| {
         .map_or_else(dash, Cell::from)
 });
 
-fn task_fields(liveness: Liveness) -> &'static [Field<ListedTask>] {
+fn task_fields(liveness: Liveness) -> &'static [ColumnOf<ListedTask>] {
     match liveness {
         Liveness::Live => &[
             TASK_ID,
@@ -144,8 +144,8 @@ struct NodeRow {
     behind: Option<Behind>,
 }
 
-const NODE_ID: Field<NodeRow> = ("id", 0, |node| id(node.row.node.id));
-const NODE_STATUS: Field<NodeRow> = ("status", 0, |node| {
+const NODE_ID: ColumnOf<NodeRow> = ("id", 0, |node| id(node.row.node.id));
+const NODE_STATUS: ColumnOf<NodeRow> = ("status", 0, |node| {
     let currency = node
         .assessed
         .map_or(Currency::Current, |assessed| assessed.currency);
@@ -156,7 +156,7 @@ const NODE_STATUS: Field<NodeRow> = ("status", 0, |node| {
         _ => cell,
     }
 });
-const NODE_OWES: Field<NodeRow> = ("owes", 1, |node| {
+const NODE_OWES: ColumnOf<NodeRow> = ("owes", 1, |node| {
     let cell = owing(&node.row.owing);
     let lead = match node.behind {
         Some(Behind::Test { lead } | Behind::PremiseTest { lead, .. }) => lead,
@@ -168,15 +168,15 @@ const NODE_OWES: Field<NodeRow> = ("owes", 1, |node| {
         false => Cell::new(format!("{}, {waiting}", cell.text), cell.tone),
     }
 });
-const NODE_LAST: Field<NodeRow> = ("last task", 2, |node| last_task(node.row.last));
-const NODE_TITLE: Field<NodeRow> = ("title", 0, |node| node.row.node.title.clone().into());
-const NODE_SCORE: Field<NodeRow> = ("cvss", 0, |node| {
+const NODE_LAST: ColumnOf<NodeRow> = ("last task", 2, |node| last_task(node.row.last));
+const NODE_TITLE: ColumnOf<NodeRow> = ("title", 0, |node| node.row.node.title.clone().into());
+const NODE_SCORE: ColumnOf<NodeRow> = ("cvss", 0, |node| {
     (node.assessed).map_or_else(dash, |assessed| score(assessed.vector))
 });
 
 /// The columns of a section of `kind`'s nodes; a finding has no standing or work of its own,
 /// and a candidate leads with its score.
-fn node_fields(kind: NodeKind) -> &'static [Field<NodeRow>] {
+fn node_fields(kind: NodeKind) -> &'static [ColumnOf<NodeRow>] {
     match kind {
         NodeKind::Finding => &[NODE_ID, NODE_TITLE],
         NodeKind::Candidate => &[
@@ -205,7 +205,7 @@ fn score(vector: Cvss40) -> Cell {
 
 /// Every section in reading order, with records and detail for what `open` shows; a
 /// candidate with an open test shows it as proving, or abandoned once its job ended.
-pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec<Block>> {
+pub(crate) fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec<Block>> {
     let summary = &state.facts.summary;
     let coverage = &state.coverage;
     let candidates: u64 = coverage.candidates.values().sum();
@@ -213,29 +213,29 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
     for shelf in SHELVES {
         let key = shelf.key();
         let summary = match shelf {
-            Shelf::Nodes(NodeKind::Candidate) => Some(format!(
+            ShelfKind::Nodes(NodeKind::Candidate) => Some(format!(
                 "{candidates} total · {} proving",
                 state.open_tests.iter().filter(|test| test.live).count()
             )),
-            Shelf::Nodes(NodeKind::Path) => Some(format!(
+            ShelfKind::Nodes(NodeKind::Path) => Some(format!(
                 "{} swept · {} unswept",
                 coverage.swept,
                 coverage.paths - coverage.swept
             )),
-            Shelf::Tasks(Liveness::Live) => Some(format!(
+            ShelfKind::Tasks(Liveness::Live) => Some(format!(
                 "{} exhausted",
                 summary.exhausted.values().sum::<u64>()
             )),
             _ => None,
         };
         let (total, records) = match (shelf, open.limit(key)) {
-            (Shelf::Tasks(liveness), limit) => (
+            (ShelfKind::Tasks(liveness), limit) => (
                 store.task_count(liveness)?,
                 limit
                     .map(|limit| tasks(store, (key, liveness), limit, open))
                     .transpose()?,
             ),
-            (Shelf::Nodes(kind), Some(limit)) => {
+            (ShelfKind::Nodes(kind), Some(limit)) => {
                 let read = store.shelf(kind, limit)?;
                 let (assessments, behind) = match kind {
                     NodeKind::Candidate => {
@@ -253,7 +253,7 @@ pub fn sections(store: &Store, state: &RunState, open: &Disclosed) -> Result<Vec
                     .collect::<Result<_>>()?;
                 (read.total, Some(records))
             }
-            (Shelf::Nodes(kind), None) => (store.shelf(kind, 0)?.total, None),
+            (ShelfKind::Nodes(kind), None) => (store.shelf(kind, 0)?.total, None),
         };
         blocks.push(Block::Section(Section {
             key,
@@ -413,9 +413,12 @@ fn node_detail(view: &NodeView) -> Vec<Detail> {
         NodeView::State(state) => {
             lines.push(line(
                 "status",
-                vec![inventory_status(state.status), words(state.scope).into()],
+                vec![
+                    inventory_status(state.status),
+                    words(state.scope.kind()).into(),
+                ],
             ));
-            if let Some(input) = &state.input {
+            if let StateScoped::Input(LiveInput { read: Some(input) }) = &state.scope {
                 lines.push(line("read at", vec![input.location.to_string().into()]));
                 lines.push(line("trust", vec![words(input.trust).into()]));
             }
@@ -829,18 +832,18 @@ fn flaw_status(status: FlawStatus) -> Cell {
 
 #[cfg(test)]
 mod tests {
-    use cli::page::Toggle;
+    use skyhook::product::page::Toggle;
 
     use super::*;
     use crate::store::{
-        Begin, Link, PremiseScope, Verdict,
+        Begin, Edge, Listed, PremiseScope, Verdict,
         tests::{
             HIGH, assess, begun, component, fixture, job_state as set_job, path, premise, scenario,
             sweep, text, verdict,
         },
     };
 
-    fn section(blocks: &[Block], shelf: Shelf) -> &Section {
+    fn section(blocks: &[Block], shelf: ShelfKind) -> &Section {
         (blocks.iter())
             .find_map(|block| match block {
                 Block::Section(section) if section.key == shelf.key() => Some(section),
@@ -864,12 +867,12 @@ mod tests {
         let [first, second] = ["decoder", "parser"].map(|name| scenario(&store, &actor, name));
         assess(&store, second.candidate, HIGH);
         verdict(&store, second.candidate, Verdict::Validated);
-        let rests = Link::FlawPremise {
+        let rests = Edge::FlawPremise {
             flaw: second.flaw,
             premise: premise(&store, &actor, PremiseScope::Code),
         };
         store.link(&actor, &[rests]).unwrap();
-        let candidates = Shelf::Nodes(NodeKind::Candidate);
+        let candidates = ShelfKind::Nodes(NodeKind::Candidate);
         let mut open = Disclosed::default();
         open.apply(&Toggle::Section(candidates.key()));
         open.apply(&Toggle::Record(
@@ -917,7 +920,7 @@ mod tests {
             (false, true),
             "a premise linked since stales the review's verdict, not its assessment"
         );
-        let flaws = section(&blocks, Shelf::Nodes(NodeKind::Flaw));
+        let flaws = section(&blocks, ShelfKind::Nodes(NodeKind::Flaw));
         assert_eq!(flaws.total, 2);
     }
 
@@ -928,7 +931,7 @@ mod tests {
         let (_session, store, actor) = fixture();
         let scenario = scenario(&store, &actor, "decoder");
         (store.report(&actor, scenario.flaw, &text("overflow"), &text("report"))).unwrap();
-        let sweep = Begin::Sweep(vec![scenario.path]);
+        let sweep = Begin::Sweep(Listed::of([scenario.path]));
         let (_, ended, _) = begun(&store, &sweep);
         set_job(&store, ended, JobState::Completed);
         begun(&store, &sweep);
@@ -952,7 +955,7 @@ mod tests {
             );
         }
         for kind in [NodeKind::Component, NodeKind::State] {
-            let section = section(&blocks, Shelf::Nodes(kind));
+            let section = section(&blocks, ShelfKind::Nodes(kind));
             let title = (section.columns.iter())
                 .position(|column| column.title == "title")
                 .unwrap();
@@ -980,8 +983,8 @@ mod tests {
         let [first, second, third] =
             ["stream", "file", "pipe"].map(|name| path(&store, &actor, name, &[decoder]));
         sweep(&store, first);
-        let (_, _, task) = begun(&store, &Begin::Sweep(vec![second]));
-        let paths = Shelf::Nodes(NodeKind::Path);
+        let (_, _, task) = begun(&store, &Begin::Sweep(Listed::of([second])));
+        let paths = ShelfKind::Nodes(NodeKind::Path);
         let mut open = Disclosed::default();
         open.apply(&Toggle::Section(paths.key()));
         let blocks = opened(&store, &open);
@@ -1023,13 +1026,16 @@ mod tests {
         let (_session, store, actor) = fixture();
         let decoder = component(&store, &actor, "decoder");
         let stream = path(&store, &actor, "stream", &[decoder]);
-        let work = Begin::Sweep(vec![stream]);
+        let work = Begin::Sweep(Listed::of([stream]));
         let (_, job, failed) = begun(&store, &work);
         set_job(&store, job, JobState::Failed);
         let (_, job, cancelled) = begun(&store, &work);
         set_job(&store, job, JobState::Cancelled);
         let (_, _, running) = begun(&store, &work);
-        let (live, ended) = (Shelf::Tasks(Liveness::Live), Shelf::Tasks(Liveness::Ended));
+        let (live, ended) = (
+            ShelfKind::Tasks(Liveness::Live),
+            ShelfKind::Tasks(Liveness::Ended),
+        );
         let mut open = Disclosed::default();
         open.apply(&Toggle::Section(live.key()));
         open.apply(&Toggle::Section(ended.key()));
@@ -1050,6 +1056,5 @@ mod tests {
             .filter_map(|line| line.label.as_deref())
             .collect();
         assert_eq!(labels, ["subjects", "brief", "reply", "records"]);
-        assert!(!detail.more);
     }
 }

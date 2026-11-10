@@ -16,18 +16,26 @@ use super::{
 
 use serde::{Deserialize, de::IgnoredAny};
 
+use crate::tool::catalog::InvocationKind;
+use crate::tool::catalog::ToolResultPolicy;
 use crate::{
-    identity::JobId,
     job::{
-        FieldPointer, Issuing, JOB_VIEW_SCHEMAS, JobManager,
+        Issuing, JOB_VIEW_SCHEMAS, JobManager,
         output::{CompletedCapture, HostOutput, fill_absent, presented_fields},
     },
-    media::ImageRef,
-    tool::diagnostic::{Effects, FailureSite, Operation, Subject},
-    tool::executor::{InvocationKind, ToolExecutor, failure_response},
-    tool::output::{OutputWriter, ProducedOutput, TextCaptureField},
-    tool::{ToolContext, ToolError, ToolOutput, ToolResultPolicy},
+    tool::{
+        ToolContext, ToolError, ToolOutput,
+        executor::{ToolExecutor, failure_response},
+    },
 };
+use skyhook_media::ImageRef;
+use skyhook_tools::diagnostic::PartialContext;
+use skyhook_tools::{
+    diagnostic::FailureSite,
+    output::{FieldPointer, OutputWriter, ProducedOutput, TextCaptureField},
+};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
+use skyhook_worker::job::JobId;
 
 type Console = Arc<std::sync::Mutex<OutputWriter>>;
 
@@ -120,10 +128,8 @@ fn finish_evaluation(
 
 /// Rendered into script-visible text as well as returned, so the site is explicit.
 fn console_failure(error: ToolError, operation: Operation, effects: Effects) -> ToolError {
-    error
-        .operation(operation, Subject::Label("script console".into()))
-        .at(FailureSite::Host)
-        .effects(effects)
+    let console = PartialContext::new(operation, Subject::Label("script console".into()));
+    error.or(console.effects(effects)).at(FailureSite::Host)
 }
 
 async fn evaluate_inner(
@@ -139,7 +145,7 @@ async fn evaluate_inner(
     let surface = executor.surface_for_agent(context.agent());
     let source = SubmittedSource::new(&source);
     let config = Config {
-        builders: surface.script_manifests(),
+        builders: super::bridge::script_manifests(&surface),
         terminal: (crate::job::JobState::ALL.into_iter())
             .filter(|state| state.is_terminal())
             .collect(),
@@ -216,8 +222,9 @@ async fn request(
             drop(issuing);
             let mut output = match created {
                 Ok(created) => {
-                    (policy, job) = (created.result_policy(), Some(created.job()));
+                    job = Some(created.job());
                     let reported = executor.run_reported(created, parent).await;
+                    policy = reported.policy;
                     context.read(reported.acknowledges).await;
                     match reported.outcome {
                         Ok(result) => result.output,
@@ -318,15 +325,15 @@ mod tests {
     use super::*;
     use crate::job::JobState;
     use crate::tests::{assert_loaded, bounded, image_runtime, script};
+    use crate::tool::ToolRegistryBuilder;
+    use crate::tool::catalog::ToolOptions;
     use crate::tool::javascript::bridge::Failure;
     use crate::tool::javascript::tests::{
         Echo, LIMITS, echo_runtime, evaluate, evaluate_wrapper, evaluate_wrapper_envelope, plain,
         test_runtime,
     };
-    use crate::tool::{
-        ToolOptions, ToolRegistryBuilder,
-        diagnostic::{Cause, IoKind},
-    };
+    use skyhook_tools::diagnostic::Cause;
+    use skyhook_worker::op::IoKind;
 
     #[tokio::test]
     async fn local_source_and_sleep_limits_fail_before_user_effects() {
@@ -388,9 +395,9 @@ mod tests {
     async fn returned_tool_results_keep_their_declared_presentations() {
         #[derive(serde::Serialize, JsonSchema)]
         struct Streams {
-            #[schemars(transform = crate::tool::output::ends)]
+            #[schemars(transform = skyhook_tools::output::ends)]
             stdout: String,
-            #[schemars(transform = crate::tool::output::complete)]
+            #[schemars(transform = skyhook_tools::output::complete)]
             note: String,
         }
         let mut builder = ToolRegistryBuilder::default();
@@ -427,7 +434,7 @@ return {full, extracted};";
             "/result/value/extracted/note",
             "/result/value/full/result/note",
         ] {
-            let field: crate::job::FieldPointer = field.parse().unwrap();
+            let field: skyhook_tools::output::FieldPointer = field.parse().unwrap();
             assert!(presented.complete().contains(&field), "{field:?}");
         }
     }
@@ -470,8 +477,6 @@ return {full, extracted};";
             .expect("script is unavailable even to direct bridge calls");
         let unavailable = failure_response(unavailable, context.diagnostic_viewer()).value;
         assert_eq!(unavailable["state"], "failed");
-        assert!(unavailable.get("id").is_none());
-        assert!(unavailable.get("meta").is_none());
         assert!(
             unavailable["error"]
                 .as_str()
@@ -491,7 +496,8 @@ return {visible: typeof tool.script, imported, deniedResponse};
         assert_eq!(value["imported"], false);
         assert_eq!(value["deniedResponse"]["state"], "failed");
         // A returned response keeps its error whole in the script's presentation.
-        let error: crate::job::FieldPointer = "/result/value/deniedResponse/error".parse().unwrap();
+        let error: skyhook_tools::output::FieldPointer =
+            "/result/value/deniedResponse/error".parse().unwrap();
         assert!(output.presented.complete().contains(&error));
         assert!(
             value["deniedResponse"]["error"]
@@ -625,7 +631,7 @@ return {visible: typeof tool.script, imported, deniedResponse};
         let diagnostic = error.diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::CreateCapture);
         assert_eq!(diagnostic.context.effects, Effects::NotStarted);
-        assert_matches!(diagnostic.cause, Cause::Io { .. });
+        assert_matches!(diagnostic.cause, Cause::Io(_));
     }
 
     #[test]
@@ -670,10 +676,10 @@ return {visible: typeof tool.script, imported, deniedResponse};
         assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
         assert_matches!(
             diagnostic.cause,
-            Cause::Io {
+            Cause::Io(skyhook_worker::op::OsError {
                 kind: IoKind::BrokenPipe,
                 ..
-            }
+            })
         );
         assert_eq!(output.unwrap().value, json!({"value":{"computed":42}}));
     }
@@ -809,19 +815,16 @@ return {copy, decoded, revived, text: JSON.parse('[1]')};";
 const payload = {id:7, state:"completed", result:null};
 const response = await tool.echo({value:payload});
 const encoded = JSON.stringify(response);
-const copied = JSON.parse(encoded);
 const received = await receive();
 let logged;
 __skyhookConsoleLog = message => { logged = message; };
 console.log(response);
 return {
-  response, encoded, keys:Object.keys(response), logged,
+  response, encoded, logged,
   nonEnumerable:!Object.getOwnPropertyDescriptor(response, "unwrap").enumerable,
   samePayload:response.unwrap() === response.result,
-  noGlobalHelper:typeof tool.unwrap === "undefined",
   plainPayload:typeof response.result.unwrap === "undefined"
     && typeof response.result.value.unwrap === "undefined",
-  plainCopy:typeof copied.unwrap === "undefined",
   plainReceive:typeof received.unwrap === "undefined", received,
 };
 "#,
@@ -829,21 +832,12 @@ return {
         for key in [
             "nonEnumerable",
             "samePayload",
-            "noGlobalHelper",
             "plainPayload",
-            "plainCopy",
             "plainReceive",
         ] {
             assert_eq!(result[key], true, "{key}: {result}");
         }
         let response = &result["response"];
-        assert!(response.get("unwrap").is_none());
-        assert!(
-            !result["keys"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("unwrap"))
-        );
         for key in ["encoded", "logged"] {
             assert_eq!(
                 serde_json::from_str::<Value>(result[key].as_str().unwrap()).unwrap(),

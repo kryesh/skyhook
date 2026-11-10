@@ -1,30 +1,1648 @@
-//! Provider-neutral agent harness and runtime APIs.
+//! The provider-neutral agent harness: [`Harness`] builds sessions, [`SessionHandle`]
+//! drives one, and the session runtime runs its agents' loops over the session core.
 
 mod error;
 mod interaction;
-mod observation;
-mod runtime;
-pub(crate) mod todo;
 
-pub use error::{CompactionError, CompactionFault, Failure, HarnessError, TurnFailure};
-pub(crate) use error::{FailureKind, FaultKind};
+pub use error::{CompactionError, HarnessError};
+pub(crate) use interaction::QuestionOutput;
 pub use interaction::{
     HeaderError, HostEventsFuture, HostState, HostStateFuture, MAX_HEADER, Question,
     QuestionAnswer, QuestionError, QuestionFuture, QuestionHandler, QuestionHeader, QuestionOption,
-    QuestionReply, ResumeFuture, ResumeHook, RuntimeEvent,
+    QuestionReply, ResumeFuture, ResumeHook,
 };
-pub use observation::{
-    AgentActivity, Applied, ContextGauge, ContextUsage, Observation, ObservationSnapshot,
-    ObservedActivity, ObservedEvent, ObservedResponse, Settlement, StoppedReading, Views,
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, OnceLock, Weak},
 };
-pub use runtime::{
-    ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
-    QueuedPromptCommitted, QueuedPromptReceipt, Selection, SessionHandle, SessionMode,
-    SessionModel,
-};
-pub(crate) use todo::{ReplaceError, TodoUpdate};
-pub use todo::{TodoItem, TodoStatus};
 
-pub(crate) use interaction::QuestionOutput;
-pub(crate) use observation::{ViewRead, live, stream};
-pub(crate) use runtime::{Agents, Brief, ModelEntry, activities, activity, observed_agents};
+use tokio::sync::oneshot;
+
+use crate::config::mode::ModeName;
+use crate::identity::AgentId;
+use crate::session::{TodoItem, TurnFailure};
+use crate::tool::policy::CapabilitySet;
+use crate::{
+    job::{CancellationToken, JobManager},
+    mcp::{McpServerConfig, manager::McpManager},
+    provider::model::{ModelEntry, ModelRef},
+    remote::{EmbeddedShimCatalog, RemoteManager},
+    session::{
+        Command, CoreState, EventRecord, Message, Plan, RecordSeq, SessionEvent, SessionStore,
+        UserPart,
+    },
+    tool::{
+        ToolRegistry, ToolRegistryBuilder,
+        builtins::{HostSkills, register_coding_tools},
+        executor::ToolExecutor,
+        policy::Policy,
+    },
+};
+use skyhook_worker::job::JobId;
+
+// What the tests of this module's children read through it.
+#[cfg(test)]
+use {
+    crate::identity::SessionId,
+    crate::provider::{
+        Provider, ProviderError,
+        model::{ModelName, ModelProfile, ProviderName},
+        protocol::{CutReason, ModelRequest, ToolCall, ToolResult, Usage},
+    },
+    crate::session::{Failure, Key, MessageSeq, RuntimeEvent, SessionError, Settlement, Wait},
+    crate::tool::policy::{Capability, HostCapability, HostCapabilityDeclaration},
+    futures_util::StreamExt as _,
+    serde_json::json,
+    std::{path::Path, sync::atomic::Ordering},
+    tokio::fs,
+};
+
+mod activation;
+mod agents;
+mod calls;
+mod child;
+mod handle;
+mod inbox;
+mod interrupt;
+mod launch;
+mod selection;
+use crate::session::AppliedMode;
+use agents::{Activation, Flow, Invocation, Turn, Was};
+pub(crate) use agents::{Agents, activities, activity, observed_agents};
+mod compact;
+mod context;
+use context::AgentContext;
+mod questions;
+mod queue;
+pub use queue::{
+    QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommitted, QueuedPromptReceipt,
+};
+mod builder;
+mod tools;
+pub(crate) use child::Brief;
+mod wait;
+use calls::CreatedCall;
+use wait::Boundary;
+mod driver;
+mod foreground;
+mod recovery;
+mod resume;
+mod turn;
+pub use builder::HarnessBuilder;
+
+/// The images one submission carries: a message's attachments, or one tool result's
+/// images. It takes at most [`MAX_IMAGES`](Self::MAX_IMAGES) images of at most
+/// [`MAX_BYTES`](Self::MAX_BYTES) in all.
+#[derive(Default)]
+pub(crate) struct ImageBudget {
+    images: usize,
+    bytes: u64,
+}
+
+impl ImageBudget {
+    pub(crate) const MAX_IMAGES: usize = 8;
+    pub(crate) const MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+    /// Whether it takes no further image, whatever its size.
+    pub(crate) fn full(&self) -> bool {
+        self.images >= Self::MAX_IMAGES
+    }
+
+    /// Take an image of `bytes`; false, taking nothing, past either limit.
+    pub(crate) fn take(&mut self, bytes: u64) -> bool {
+        let total = self.bytes.saturating_add(bytes);
+        if self.full() || total > Self::MAX_BYTES {
+            return false;
+        }
+        (self.images, self.bytes) = (self.images + 1, total);
+        true
+    }
+}
+
+#[derive(Clone)]
+pub struct Harness {
+    inner: Arc<HarnessInner>,
+}
+
+struct HarnessInner {
+    workspace: PathBuf,
+    host: crate::identity::HostName,
+    session_root: PathBuf,
+    models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    /// What a new session's root runs on.
+    default_model: ModelRef,
+    policy: Arc<dyn Policy>,
+    questions: Option<Arc<dyn QuestionHandler>>,
+    host_state: Option<Arc<dyn HostState>>,
+    resume_hook: Option<Arc<dyn ResumeHook>>,
+    session_schema: crate::session::Schema,
+    extra_tools: ToolRegistry,
+    mcp: BTreeMap<String, McpServerConfig>,
+    instructions: Vec<String>,
+    prompts: crate::prompts::Prompts,
+    skills: HostSkills,
+    /// Model configuration, instruction, and skill diagnostics.
+    warnings: Vec<String>,
+    max_child_depth: usize,
+    coalescing: inbox::Coalescing,
+    foreground: foreground::Limits,
+    /// The most a new session can hold.
+    capabilities: CapabilitySet,
+    modes: builder::Modes,
+    targets: crate::target::ConfiguredTargets,
+    shim_catalog: EmbeddedShimCatalog,
+}
+
+impl HarnessInner {
+    /// Whether this harness's host created `store`'s session: only it can grant live
+    /// authority there; another host's opens view-only.
+    fn owns(&self, store: &SessionStore) -> bool {
+        store.host() == &self.host
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionHandle {
+    runtime: Arc<SessionRuntime>,
+    root: AgentId,
+    _open: Arc<Open>,
+}
+
+/// What every handle holds: once the last is gone, the session closes as a crash
+/// would leave it, and everything it runs stops.
+struct Open(SessionStore, crate::job::Supervisor);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.close_soon();
+        self.1.stop();
+    }
+}
+
+/// What a continue attempt actually did. A child-only continue leaves a live or
+/// waiting root untouched, so a caller cannot assume the root turn ran.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContinueOutcome {
+    /// Answer produced when the root turn itself was continued: only that turn adopts a
+    /// requested model or mode change. Resumed children keep their own, unless theirs
+    /// is gone and they move to the root's.
+    pub answer: Option<String>,
+    /// Retained child agents restarted by this call.
+    pub children_resumed: usize,
+}
+
+impl ContinueOutcome {
+    /// True when there was nothing to continue.
+    pub fn is_empty(&self) -> bool {
+        self.answer.is_none() && self.children_resumed == 0
+    }
+}
+
+/// Model and mode selections carried by a submitted or queued message, or by a
+/// continued turn. Issued by [`SessionHandle::selection`], so it only ever names a
+/// `provider/model` and a mode the issuing runtime instance has.
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    /// Model when this input is consumed. Omitted retains the agent's
+    /// active model, which for a refusal would deterministically refuse again;
+    /// later explicit queued selections can change it.
+    pub model: Option<SessionModel>,
+    /// Mode when this input is consumed: the root agent's capabilities, tools and
+    /// mode instructions from then on. Omitted retains the active mode.
+    pub mode: Option<SessionMode>,
+}
+
+/// A model one runtime instance admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionModel {
+    runtime: RuntimeInstance,
+    name: ModelRef,
+}
+
+/// A mode one runtime instance admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMode {
+    runtime: RuntimeInstance,
+    name: ModeName,
+}
+
+/// Process-local identity of one runtime instance and its immutable catalog. A
+/// resumed or reloaded session is a new instance, whatever its durable id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeInstance(u64);
+
+impl RuntimeInstance {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl SessionModel {
+    pub fn name(&self) -> &ModelRef {
+        &self.name
+    }
+}
+
+struct SessionRuntime {
+    instance: RuntimeInstance,
+    harness: Arc<HarnessInner>,
+    /// The most any agent can hold: the live harness ceiling, whatever the session
+    /// held when it last ran. A mode grants the root agent a subset.
+    capabilities: CapabilitySet,
+    store: SessionStore,
+    jobs: JobManager,
+    executor: ToolExecutor,
+    mcp: Arc<McpManager>,
+    /// Host-only diagnostics of the configuration, its instructions and skills,
+    /// MCP connections and the session's drift from them.
+    warnings: Vec<String>,
+    // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
+    _executor_slot: Arc<OnceLock<ToolExecutor>>,
+    router: crate::target::TargetRouter,
+    questions: Arc<questions::QuestionCoordinator>,
+    /// The hook a session this launch reopened runs before its first work here.
+    resume: Option<resume::Resume>,
+}
+
+type ChildCompletion = oneshot::Sender<Result<String, TurnFailure>>;
+
+/// Who waits for an input's answer: the session's own prompt, which receives the
+/// full error, or an owning job's waiter.
+enum RequestCompletion {
+    Root(oneshot::Sender<Result<String, HarnessError>>),
+    Child(ChildCompletion),
+}
+
+impl RequestCompletion {
+    fn settle(self, result: Result<String, HarnessError>) {
+        match self {
+            Self::Root(done) => drop(done.send(result)),
+            Self::Child(done) => drop(done.send(result.map_err(|error| (&error).into()))),
+        }
+    }
+}
+
+enum AgentCommand {
+    QueuedInputs(Vec<queue::QueuedInput>),
+    Input {
+        options: Selection,
+        content: Vec<UserPart>,
+        done: Option<RequestCompletion>,
+    },
+    /// Begin the child's invocation whose prompt the change that opened it
+    /// committed: its first request, whose answer `done` hears. Not input, so it
+    /// opens no coalescing window.
+    Begin(ChildCompletion),
+    /// Adopt `options` without input or a turn, as work that runs the root but
+    /// commits no message, such as a host script, must before it starts.
+    Select {
+        options: Selection,
+        done: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    /// Continue the root's turn, made busy from `resting` as it claimed this,
+    /// under `selection`, with the batch its failed turn held, claimed and
+    /// admitted, if any, as `continue` asks: `done` hears its answer.
+    Continue {
+        selection: Selection,
+        batch: Option<queue::Admitted>,
+        resting: Box<Turn>,
+        done: RequestCompletion,
+    },
+}
+
+impl AgentCommand {
+    /// Settle whoever waits on this command with `error`, returning the batch it
+    /// claimed from a failed turn, for that turn to hold again while it waits.
+    fn refuse(self, error: impl Fn() -> HarnessError) -> Option<queue::Admitted> {
+        match self {
+            Self::QueuedInputs(inputs) => {
+                inputs.into_iter().for_each(|input| input.reject(error()))
+            }
+            Self::Input {
+                done: Some(done), ..
+            } => done.settle(Err(error())),
+            Self::Input { done: None, .. } => {}
+            Self::Begin(done) => RequestCompletion::Child(done).settle(Err(error())),
+            Self::Select { done, .. } => {
+                let _ = done.send(Err(error()));
+            }
+            Self::Continue { batch, done, .. } => {
+                done.settle(Err(error()));
+                return batch;
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone)]
+enum AgentLaunch {
+    /// An agent journaled as it starts.
+    New {
+        model: ModelRef,
+        todos: Option<Vec<TodoItem>>,
+        available_depth: usize,
+        location: skyhook_tools::target::ExecutionLocation,
+        /// The agent's mode; a child has one only when its parent chose it.
+        mode: Option<AppliedMode>,
+        /// The most this agent may hold: its mode's set, or its parent's current set.
+        capabilities: CapabilitySet,
+        /// What its target's machine reported about itself as it launched.
+        facts: Option<Box<skyhook_worker::target::Facts>>,
+    },
+    /// An agent that started before, under its journaled contract narrowed to the
+    /// live configuration, on model `on` where named.
+    Resume { on: Option<ModelRef> },
+}
+
+/// The turn state an agent resumes in.
+#[derive(Clone)]
+enum Resumed {
+    Idle,
+    /// Its journaled turn stopped short of an answer, for this reason.
+    Parked(TurnFailure),
+}
+
+struct AgentLoop {
+    id: AgentId,
+    owner_job: Option<JobId>,
+    context: AgentContext,
+    location: skyhook_tools::target::ExecutionLocation,
+    settings: AgentSettings,
+}
+
+/// What an agent currently runs under; a consumed input may change any of it.
+struct AgentSettings {
+    /// The agent's mode, when it runs in one. Only the root's can change.
+    mode: Option<AppliedMode>,
+    capabilities: CapabilitySet,
+}
+
+struct TurnContext<'a> {
+    agent: &'a AgentId,
+    owner_job: Option<JobId>,
+    cancellation: &'a CancellationToken,
+    location: &'a skyhook_tools::target::ExecutionLocation,
+    /// What the agent runs under as of this request; a consumed input may change it.
+    settings: &'a mut AgentSettings,
+}
+
+impl TurnContext<'_> {
+    fn diagnostic_viewer(&self) -> skyhook_tools::diagnostic::DiagnosticViewer<'_> {
+        skyhook_tools::diagnostic::DiagnosticViewer::new(
+            self.settings.capabilities.target_view(),
+            self.location,
+        )
+    }
+}
+
+/// Why the root takes no input: the session's refusal once its phase refuses
+/// input, which is what ends the root's loop, or else its agent stopped.
+fn refused_input(phase: &crate::session::SessionPhase) -> HarnessError {
+    let refused = phase.admits(Command::Start);
+    refused.map_or_else(Into::into, |_| HarnessError::AgentStopped)
+}
+
+/// Why input whose reply was dropped was not taken.
+async fn dropped_input(store: &SessionStore) -> HarnessError {
+    store.behind(|state| refused_input(state.phase())).await
+}
+
+impl SessionRuntime {
+    /// Read the running agents as the core last left them.
+    fn agents<T>(&self, read: impl FnOnce(&Agents) -> T) -> T {
+        self.store.read(|state| read(&state.agents))
+    }
+
+    /// Journal the `events` of `agent`'s turn as `command`, given the state they
+    /// commit to: a model request, an attempt at one, or the state it carries.
+    /// Only a busy turn does: one an interrupt stopped, held or cancelled is
+    /// refused, and ends interrupted. The last event's record.
+    pub(super) async fn journal_turn(
+        &self,
+        agent: &AgentId,
+        command: Command,
+        events: impl FnOnce(&CoreState) -> Vec<SessionEvent> + Send + 'static,
+    ) -> Result<RecordSeq, HarnessError> {
+        let agent = agent.clone();
+        let journal = move |state: &CoreState| {
+            if !state.agents.busy(&agent) {
+                return Err(HarnessError::Interrupted);
+            }
+            let entries = events(state)
+                .into_iter()
+                .map(|event| (agent.clone(), event));
+            let journaled = |_: &mut CoreState, records: &[Arc<EventRecord>]| {
+                records.last().expect("a turn journals events").sequence
+            };
+            Ok(Plan::new(entries.collect(), journaled))
+        };
+        self.store.commit(command, journal).await
+    }
+
+    /// Journal `agent`'s model request, made under `context`, with a record of
+    /// that context unless it is the agent's latest, in one commit: requests
+    /// sharing a record keep their reported prompts comparable.
+    pub(super) async fn journal_request(
+        &self,
+        agent: &AgentId,
+        context: crate::session::ModelContext,
+        requested: impl FnOnce(RecordSeq) -> SessionEvent + Send + 'static,
+    ) -> Result<crate::session::RequestSeq, HarnessError> {
+        let author = agent.clone();
+        let events = move |state: &CoreState| {
+            let latest = (state.contracts.get(&author))
+                .and_then(|contract| contract.context.as_ref())
+                .filter(|(_, latest)| *latest == context);
+            match latest {
+                Some((recorded, _)) => vec![requested(*recorded)],
+                None => {
+                    let recorded = state.next_sequence();
+                    vec![SessionEvent::ModelContext { context }, requested(recorded)]
+                }
+            }
+        };
+        let requested = self.journal_turn(agent, Command::Start, events).await?;
+        Ok(requested.request())
+    }
+
+    /// Commit a call's result with the acknowledgement of the delivery it
+    /// reports, in one transaction: a result that never commits leaves it pending.
+    async fn commit_result(
+        &self,
+        agent: &AgentId,
+        result: crate::provider::protocol::ToolResult,
+        acknowledges: Option<crate::job::Delivery>,
+    ) -> Result<(), HarnessError> {
+        let message = Message::Tool(result);
+        let mut entries = vec![(agent.clone(), SessionEvent::MessageCommitted { message })];
+        let commit = move |state: &CoreState| {
+            entries.extend(acknowledges.and_then(|delivery| delivery.claim(state)));
+            Ok::<_, crate::job::JobError>(Plan::journal(entries))
+        };
+        Ok(self.store.commit(Command::Journal, commit).await?)
+    }
+}
+
+impl SessionRuntime {
+    pub(super) async fn build(
+        harness: Arc<HarnessInner>,
+        store: SessionStore,
+        jobs: JobManager,
+        resume: Option<resume::Resume>,
+    ) -> Result<Arc<Self>, HarnessError> {
+        // Only the creating host can grant live authority. In particular, viewing a
+        // foreign session must not connect this host's MCP servers.
+        let capabilities = if harness.owns(&store) {
+            harness.capabilities.clone()
+        } else {
+            CapabilitySet::empty()
+        };
+        let authorization = crate::tool::authorization::AuthorizationCoordinator::new(
+            harness.policy.clone(),
+            store.clone(),
+        );
+        let passwords = store.read(|state| harness.targets.passwords(&state.targets));
+        let remote = RemoteManager::new(
+            harness.shim_catalog.clone(),
+            passwords.clone(),
+            store.root().child_token(),
+        );
+        let router =
+            crate::target::TargetRouter::new(store.clone(), remote, authorization, passwords);
+        let executor_slot = Arc::new(OnceLock::new());
+        let runtime_slot = Arc::new(OnceLock::<Weak<Self>>::new());
+        let mut builder = ToolRegistryBuilder::default();
+        register_coding_tools(
+            &mut builder,
+            store.clone(),
+            jobs.clone(),
+            harness.skills.clone(),
+            router.clone(),
+        )?;
+        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
+        tools::register(
+            &mut builder,
+            runtime_slot.clone(),
+            &harness.models,
+            &harness.modes,
+        )?;
+        builder.extend(&harness.extra_tools)?;
+        let (mcp, connection) =
+            tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
+        let mut warnings = harness.warnings.clone();
+        warnings.extend(connection);
+        let executor = ToolExecutor::new(
+            builder.build(),
+            jobs.clone(),
+            harness.workspace.clone(),
+            router.clone(),
+        );
+        // Both slots are new, so neither set can find a value.
+        let _ = executor_slot.set(executor.clone());
+        let questions = Arc::new(questions::QuestionCoordinator::new(
+            jobs.clone(),
+            harness.questions.clone(),
+        ));
+        let mut runtime = Self {
+            instance: RuntimeInstance::next(),
+            harness,
+            capabilities,
+            store: store.clone(),
+            jobs: jobs.clone(),
+            executor,
+            _executor_slot: executor_slot,
+            mcp,
+            warnings,
+            router,
+            questions,
+            resume,
+        };
+        // A session another host views runs nothing here, so nothing drifts.
+        if runtime.harness.owns(&runtime.store) {
+            let drift = runtime.drift_warnings(&AgentId::root(runtime.store.id()));
+            runtime.warnings.extend(drift);
+            let unconfigured = runtime.router.unconfigured().into_iter().map(|target| {
+                format!(
+                    "The configuration no longer defines target `{target}` as this session \
+                     started with it, so the session reads no password for it; connections \
+                     through the target fail until it does."
+                )
+            });
+            runtime.warnings.extend(unconfigured);
+        }
+        let runtime = Arc::new(runtime);
+        let _ = runtime_slot.set(Arc::downgrade(&runtime));
+        let restarter: Arc<dyn crate::job::Restarter> = runtime.clone();
+        runtime.jobs.restart_with(Arc::downgrade(&restarter));
+        Ok(runtime)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// What a provider received, as distinct from what the session journals.
+    pub(crate) use crate::provider::protocol::{Message as Sent, UserContent as SentPart};
+
+    /// A committed conversation message as the provider receives it.
+    pub(crate) fn sent(message: &Message) -> Sent {
+        use crate::provider::protocol::{Entry, StateLifetime};
+        let Entry::Message(sent) = message.entry(StateLifetime::Persisted) else {
+            panic!("a conversation message")
+        };
+        sent
+    }
+    pub(super) use std::{
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    pub(super) use futures_util::{TryStreamExt, stream};
+
+    pub(super) use super::*;
+    pub(super) use crate::{
+        agent::Question,
+        provider::codec::common::tests::envelope,
+        provider::protocol::{
+            AssistantItem, Binding, BlockRef, ContextId, ItemKind, ReplayFormat, ResponseEvent,
+            ToolCall,
+        },
+        provider::{ProviderContext, ResponseStream},
+        session::tests::{on_commit, usage},
+        tests::bounded,
+    };
+
+    /// A request as the scripted context that received it saw it.
+    #[derive(Debug, PartialEq)]
+    pub(super) struct Served {
+        pub(super) context_id: ContextId,
+        pub(super) request: ModelRequest,
+    }
+
+    impl std::ops::Deref for Served {
+        type Target = ModelRequest;
+        fn deref(&self) -> &ModelRequest {
+            &self.request
+        }
+    }
+
+    pub(super) type Requests = Arc<StdMutex<Vec<Arc<Served>>>>;
+
+    /// Counts records (or record references) whose event matches a pattern.
+    macro_rules! count {
+        ($records:expr, $pattern:pat $(if $guard:expr)?) => {
+            IntoIterator::into_iter($records)
+                .filter(|record| matches!(&record.event, $pattern $(if $guard)?))
+                .count()
+        };
+    }
+    /// Collects a value bound by a pattern from each matching record event.
+    macro_rules! events {
+        ($records:expr, $pattern:pat $(if $guard:expr)? => $value:expr) => {
+            IntoIterator::into_iter($records)
+                .filter_map(|record| match &record.event {
+                    $pattern $(if $guard)? => Some($value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+    }
+    /// Implements `Provider` for cloneable fixture contexts.
+    macro_rules! cloned_provider {
+        ($($provider:ty),+) => {$(
+            impl crate::provider::Provider for $provider {
+                fn open_context(
+                    &self,
+                    _: crate::provider::protocol::ContextId,
+                ) -> Result<Box<dyn crate::provider::ProviderContext>, crate::provider::ProviderError> {
+                    Ok(Box::new(self.clone()))
+                }
+            }
+        )+};
+    }
+    pub(crate) use {count, events};
+
+    type Events = Vec<Result<ResponseEvent, ProviderError>>;
+
+    /// One scripted response, served to the first unserved request it matches.
+    pub(super) struct Step {
+        model: Option<&'static str>,
+        response: StdMutex<Option<Result<Events, ProviderError>>>,
+        gate: tokio::sync::Semaphore,
+        midstream: bool,
+    }
+
+    impl Step {
+        pub(super) fn stream(events: Events) -> Self {
+            Self {
+                model: None,
+                response: StdMutex::new(Some(Ok(events))),
+                gate: tokio::sync::Semaphore::new(1),
+                midstream: false,
+            }
+        }
+
+        pub(super) fn new(events: Vec<ResponseEvent>) -> Self {
+            Self::stream(events.into_iter().map(Ok).collect())
+        }
+
+        /// The invocation itself fails, before any stream exists.
+        pub(super) fn fail(error: ProviderError) -> Self {
+            let step = Self::stream(Vec::new());
+            *step.response.lock().unwrap() = Some(Err(error));
+            step
+        }
+
+        /// Serve only requests for this model.
+        pub(super) fn model(mut self, model: &'static str) -> Self {
+            self.model = Some(model);
+            self
+        }
+
+        /// Hold the response until `Script::release`.
+        pub(super) fn gated(mut self) -> Self {
+            self.gate = tokio::sync::Semaphore::new(0);
+            self
+        }
+
+        /// Stream every event but the terminal one, then hold it until `Script::release`.
+        pub(super) fn midstream(mut self) -> Self {
+            self.midstream = true;
+            self.gated()
+        }
+    }
+
+    /// A provider answering from `steps`, shared by every context it opens.
+    pub(super) struct Script {
+        steps: Vec<Step>,
+        served: StdMutex<Vec<Option<ModelRequest>>>,
+        /// Midstream steps whose stream reached its held terminal event.
+        held: StdMutex<Vec<usize>>,
+        changed: tokio::sync::Notify,
+        pub(super) requests: Requests,
+        pub(super) opened: AtomicUsize,
+        dropped: StdMutex<Vec<ContextId>>,
+        this: Weak<Script>,
+    }
+
+    impl Script {
+        pub(super) fn new(steps: impl IntoIterator<Item = Step>, requests: &Requests) -> Arc<Self> {
+            let steps = steps.into_iter().collect::<Vec<_>>();
+            let served = vec![None; steps.len()];
+            Arc::new_cyclic(|this| Self {
+                steps,
+                served: StdMutex::new(served),
+                held: StdMutex::default(),
+                changed: tokio::sync::Notify::new(),
+                requests: requests.clone(),
+                opened: AtomicUsize::new(0),
+                dropped: StdMutex::default(),
+                this: this.clone(),
+            })
+        }
+
+        /// What `found` yields, once it yields.
+        async fn when<T>(&self, found: impl Fn(&Self) -> Option<T>) -> T {
+            bounded(async {
+                loop {
+                    let notified = self.changed.notified();
+                    if let Some(found) = found(self) {
+                        return found;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+        }
+
+        /// The request that `step` served, once it arrives.
+        pub(super) async fn request(&self, step: usize) -> ModelRequest {
+            let served = |script: &Self| script.served.lock().unwrap()[step].clone();
+            self.when(served).await
+        }
+
+        /// Once midstream `step` has streamed all but its held terminal event.
+        pub(super) async fn held(&self, step: usize) {
+            let held = |script: &Self| script.held.lock().unwrap().contains(&step).then_some(());
+            self.when(held).await;
+        }
+
+        /// Replace the response of `step`, before it is served.
+        pub(super) fn respond(&self, step: usize, events: Vec<ResponseEvent>) {
+            let events = events.into_iter().map(Ok).collect();
+            *self.steps[step].response.lock().unwrap() = Some(Ok(events));
+        }
+
+        pub(super) fn release(&self, step: usize) {
+            self.steps[step].gate.add_permits(1);
+        }
+
+        /// Waits for a step's request, then lets its response through.
+        pub(super) async fn pass(&self, step: usize) -> ModelRequest {
+            let request = self.request(step).await;
+            self.release(step);
+            request
+        }
+
+        /// Whether any step at or after `step` has been requested.
+        pub(super) fn requested_from(&self, step: usize) -> bool {
+            let served = self.served.lock().unwrap();
+            served.iter().skip(step).any(Option::is_some)
+        }
+
+        pub(super) fn remaining(&self) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.is_none())
+                .count()
+        }
+
+        pub(super) fn dropped(&self, context: &ContextId) -> bool {
+            self.dropped.lock().unwrap().contains(context)
+        }
+
+        /// Once a context opened as `context` has been dropped.
+        pub(super) async fn released(&self, context: &ContextId) {
+            self.when(|script| script.dropped(context).then_some(()))
+                .await;
+        }
+    }
+
+    impl Provider for Script {
+        fn open_context(
+            &self,
+            context: ContextId,
+        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ScriptContext(
+                self.this.upgrade().unwrap(),
+                context,
+            )))
+        }
+    }
+
+    struct ScriptContext(Arc<Script>, ContextId);
+
+    impl Drop for ScriptContext {
+        fn drop(&mut self) {
+            self.0.dropped.lock().unwrap().push(self.1.clone());
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    impl ProviderContext for ScriptContext {
+        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
+            let script = self.0.clone();
+            let step = {
+                let mut served = script.served.lock().unwrap();
+                let free = |(index, step): &(usize, &Step)| {
+                    step.model
+                        .is_none_or(|model| request.model.as_str() == model)
+                        && served[*index].is_none()
+                };
+                let (step, _) = script
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .find(free)
+                    .expect("scripted response");
+                script.requests.lock().unwrap().push(Arc::new(Served {
+                    context_id: self.1.clone(),
+                    request: request.clone(),
+                }));
+                served[step] = Some(request);
+                step
+            };
+            script.changed.notify_waiters();
+            let started = async move {
+                let gate = async move |script: Arc<Script>| {
+                    script.steps[step].gate.acquire().await.unwrap().forget();
+                };
+                let midstream = script.steps[step].midstream;
+                if !midstream {
+                    gate(script.clone()).await;
+                }
+                let mut events = script.steps[step]
+                    .response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()?;
+                let split = if midstream {
+                    events.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                let rest = events.split_off(split);
+                let held = stream::once(async move {
+                    if midstream {
+                        script.held.lock().unwrap().push(step);
+                        script.changed.notify_waiters();
+                        gate(script).await;
+                    }
+                    stream::iter(rest)
+                });
+                Ok::<_, ProviderError>(
+                    Box::pin(stream::iter(events).chain(held.flatten())) as ResponseStream
+                )
+            };
+            Box::pin(stream::once(started).try_flatten())
+        }
+    }
+
+    pub(super) fn scripted_provider(
+        requests: &Requests,
+        responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
+    ) -> Arc<Script> {
+        Script::new(responses.into_iter().map(Step::new), requests)
+    }
+
+    /// The root delegates to a child that launches a background script awaiting
+    /// input, answers early, then answers `last`; the root then answers.
+    pub(super) fn answered_child_with_work(last: &str) -> [Vec<ResponseEvent>; 5] {
+        let script = json!({"source": "return await receive();", "bg": true});
+        [
+            response(vec![tool_call(
+                0,
+                "agent",
+                "agent",
+                json!({"prompt": "work"}),
+            )]),
+            response(vec![tool_call(0, "script", "script", script)]),
+            answer("premature child answer"),
+            answer(last),
+            answer("root done"),
+        ]
+    }
+
+    /// A session over `root` (sessions in `root/sessions`) answering from a script.
+    pub(super) async fn scripted_session(
+        responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
+    ) -> (tempfile::TempDir, Requests, SessionHandle) {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, responses);
+        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
+        (root, requests, ephemeral_session(&harness).await)
+    }
+
+    /// A session whose journal is never reopened, so it skips durability.
+    pub(super) async fn ephemeral_session(harness: &Harness) -> SessionHandle {
+        let store = SessionStore::create_ephemeral(
+            &harness.inner.session_root,
+            harness.inner.session_schema,
+        );
+        let store = store.await.unwrap();
+        let jobs = JobManager::new(store.clone());
+        let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, jobs, None);
+        let runtime = runtime.await.unwrap();
+        runtime
+            .start_root(runtime.new_root().unwrap(), open)
+            .await
+            .unwrap()
+    }
+
+    #[derive(Clone)]
+    pub(super) struct HangingProvider;
+
+    #[derive(Default)]
+    pub(super) struct RecordingQuestions {
+        pub(super) batches: Arc<StdMutex<Vec<Vec<Question>>>>,
+        pub(super) backgrounds: Arc<StdMutex<Vec<bool>>>,
+        /// Every question's answer.
+        pub(super) answer: String,
+        /// Fail every batch, as a host dismissing it would.
+        pub(super) cancel: bool,
+    }
+
+    cloned_provider!(HangingProvider);
+
+    impl ProviderContext for HangingProvider {
+        fn invoke(&mut self, _request: ModelRequest) -> ResponseStream {
+            Box::pin(stream::pending())
+        }
+    }
+
+    impl QuestionHandler for RecordingQuestions {
+        fn ask(
+            &self,
+            _agent: AgentId,
+            questions: Vec<Question>,
+            background: bool,
+        ) -> crate::agent::QuestionFuture {
+            self.backgrounds.lock().unwrap().push(background);
+            let answer = if self.cancel {
+                Err(crate::agent::QuestionError::Failed(
+                    "question cancelled".into(),
+                ))
+            } else {
+                let answer = crate::agent::QuestionAnswer::Text(self.answer.clone());
+                let reply = questions
+                    .iter()
+                    .map(|q| (q.header.clone(), answer.clone()))
+                    .collect();
+                self.batches.lock().unwrap().push(questions);
+                Ok(reply)
+            };
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// Every message of a request, as the JSON text assertions search.
+    pub(super) fn rendered(request: &ModelRequest) -> String {
+        serde_json::to_string(&request.context).unwrap()
+    }
+
+    /// A leaf child of the root on the default test profile, in the session workspace.
+    pub(super) fn child_launch(
+        session: &SessionHandle,
+        todos: Option<Vec<TodoItem>>,
+    ) -> AgentLaunch {
+        let workspace = session.runtime.harness.workspace.clone();
+        AgentLaunch::New {
+            model: session.runtime.harness.default_model.clone(),
+            todos,
+            available_depth: 0,
+            location: skyhook_tools::target::ExecutionLocation::root(crate::tests::text(workspace)),
+            mode: None,
+            capabilities: session.runtime.capabilities.clone(),
+            facts: None,
+        }
+    }
+
+    /// Poll `future`, which stays pending throughout, until `ready` holds.
+    pub(super) async fn pending_until<F: Future + ?Sized>(
+        future: &mut std::pin::Pin<Box<F>>,
+        mut ready: impl AsyncFnMut() -> bool,
+    ) {
+        bounded(async {
+            loop {
+                assert!(futures_util::poll!(future.as_mut()).is_pending());
+                if ready().await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// Every usage report the session journaled, as its requests' ledger folds it.
+    pub(super) async fn journaled_usage(session: &SessionHandle) -> Usage {
+        let ledger = crate::session::tests::ledger(&session.runtime.store);
+        let mut usage = Usage::default();
+        for request in ledger.requests.values() {
+            usage.accumulate(request.usage);
+        }
+        usage
+    }
+
+    pub(super) fn turn(session: &SessionHandle, agent: &AgentId) -> Turn {
+        session
+            .runtime
+            .agents(|agents| agents.get(agent).unwrap().turn.clone())
+    }
+
+    use super::agents::ChildLoop;
+    pub(super) use super::agents::INTERRUPTED;
+
+    /// Queue `command` for `agent`, as an owner or the host would.
+    pub(super) async fn send(session: &SessionHandle, agent: &AgentId, command: AgentCommand) {
+        let agent = agent.clone();
+        let send = move |state: &mut CoreState| state.agents.send(&agent, command);
+        assert!(session.runtime.store.live(send).await, "the agent runs");
+    }
+
+    /// Begin child `agent`'s invocation, as a launch whose prompt is committed does.
+    pub(super) async fn begin(session: &SessionHandle, agent: &AgentId, done: ChildCompletion) {
+        let agent = agent.clone();
+        let begin = move |state: &mut CoreState| state.agents.begin(&agent, done);
+        session.runtime.store.live(begin).await;
+    }
+
+    /// Queue `command` for child `agent` in the change that starts its parked loop.
+    pub(super) async fn unpark(session: &SessionHandle, agent: &AgentId, command: AgentCommand) {
+        let target = agent.clone();
+        let send = move |_: &CoreState| {
+            Ok(Plan::new(Vec::new(), move |state, _| {
+                state.agents.send(&target, command)
+            }))
+        };
+        let sent = bounded(session.runtime.with_loops(agent, send)).await;
+        assert!(sent.unwrap(), "the agent runs");
+    }
+
+    /// Wait until child `agent`'s loop parks.
+    pub(super) async fn until_parked(session: &SessionHandle, agent: &AgentId) {
+        until_loop(session, agent, |found| {
+            matches!(found, ChildLoop::Parked(..))
+        })
+        .await;
+    }
+
+    /// Wait until child `agent`'s loop has stopped for good.
+    pub(super) async fn until_stopped(session: &SessionHandle, agent: &AgentId) {
+        until_loop(session, agent, |found| found == ChildLoop::Stopped).await;
+    }
+
+    async fn until_loop(session: &SessionHandle, agent: &AgentId, wanted: fn(ChildLoop) -> bool) {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        let found_loop =
+            move |state: &CoreState| wanted(super::agents::child_loop(state, &agent)).then_some(());
+        found(session, [key], found_loop).await;
+    }
+
+    impl SessionRuntime {
+        /// Journal `message` as `agent`'s, whatever its turn.
+        pub(super) async fn commit(
+            &self,
+            agent: &AgentId,
+            message: Message,
+        ) -> Result<MessageSeq, SessionError> {
+            let event = SessionEvent::MessageCommitted { message };
+            let committed = self.store.append(agent.clone(), event).await?;
+            Ok(committed.sequence.message())
+        }
+    }
+
+    /// How many commands `agent` has yet to take.
+    pub(super) fn inbox(session: &SessionHandle, agent: &AgentId) -> usize {
+        session
+            .runtime
+            .agents(|agents| agents.get(agent).unwrap().inbox.len())
+    }
+
+    /// Whether `agent` has deliveries pending.
+    pub(super) fn pending(session: &SessionHandle, agent: &AgentId) -> bool {
+        session
+            .runtime
+            .store
+            .read(|state| state.jobs.has_pending(agent))
+    }
+
+    /// Wait until `agent` has deliveries pending.
+    pub(super) async fn until_pending(session: &SessionHandle, agent: &AgentId) {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        found(session, [key], move |state| {
+            state.jobs.has_pending(&agent).then_some(())
+        })
+        .await;
+    }
+
+    /// Wait until input waits in `agent`'s inbox.
+    pub(super) async fn until_queued(session: &SessionHandle, agent: &AgentId) {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        found(session, [key], move |state| {
+            (!state.agents.get(&agent)?.inbox.is_empty()).then_some(())
+        })
+        .await;
+    }
+
+    pub(super) fn assistant_commits(records: &[Arc<EventRecord>]) -> usize {
+        count!(
+            records,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(_)
+            }
+        )
+    }
+
+    /// The rendered runtime state at the end of the request, without its tags.
+    pub(super) fn request_runtime_state(request: &ModelRequest) -> String {
+        use crate::provider::protocol::{Entry, State, StateLifetime};
+        let Some(Entry::State(State {
+            text: state,
+            lifetime: StateLifetime::Current,
+        })) = request.context.last()
+        else {
+            panic!("expected the request's own state at its end");
+        };
+        (crate::session::STATE.body(state))
+            .expect("rendered state is tagged")
+            .to_owned()
+    }
+
+    pub(super) fn test_builder(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+        supports_images: bool,
+    ) -> HarnessBuilder {
+        let host = "test".parse().unwrap();
+        test_builder_as(host, workspace, sessions, provider, supports_images)
+    }
+
+    /// `test_builder` for the application `host`.
+    pub(super) fn test_builder_as(
+        host: crate::identity::HostName,
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+        supports_images: bool,
+    ) -> HarnessBuilder {
+        let profile = ModelProfile {
+            max_output: crate::tests::limit(16_384),
+            ..crate::tests::profile("test", supports_images)
+        };
+        HarnessBuilder::new(workspace, host)
+            .session_root(sessions)
+            .coalescing(inbox::Coalescing::NONE)
+            .provider(provider_name("test"), provider, models([("test", profile)]))
+            .default_model(model_ref("test"))
+    }
+
+    /// A test harness builder whose `test` provider also serves `entries`.
+    pub(super) fn serving<const N: usize>(
+        root: &Path,
+        provider: Arc<dyn Provider>,
+        entries: [(&str, ModelProfile); N],
+    ) -> HarnessBuilder {
+        test_builder(root, &root.join("sessions"), provider.clone(), false).provider(
+            provider_name("test"),
+            provider,
+            models(entries),
+        )
+    }
+
+    /// A session whose root is held on a child it interrupted mid-response, and
+    /// the root's prompt; `after` scripts the requests that follow. Only a
+    /// `durable` session can be reopened.
+    pub(super) async fn held_on_interrupted_child(
+        root: &Path,
+        durable: bool,
+        after: impl IntoIterator<Item = Step>,
+    ) -> (
+        Harness,
+        SessionHandle,
+        Arc<Script>,
+        Requests,
+        tokio::task::JoinHandle<Result<String, HarnessError>>,
+        JobId,
+    ) {
+        let child = json!({"prompt": "child task", "depth": 0});
+        let delegate = Step::new(response(vec![tool_call(0, "agent-0", "agent", child)]));
+        let steps = [delegate, Step::new(Vec::new()).midstream()];
+        let requests = Requests::default();
+        let provider = Script::new(steps.into_iter().chain(after), &requests);
+        let harness = test_harness(root, &root.join("sessions"), provider.clone()).await;
+        let session = if durable {
+            harness.new_session().await.unwrap()
+        } else {
+            ephemeral_session(&harness).await
+        };
+        let parent = spawn_prompt(&session, "delegate");
+        provider.request(1).await;
+        root_waiting(&session).await;
+        assert_eq!(session.interrupt().await, 2);
+        assert_eq!(turn(&session, &session.root), Turn::Held);
+        let job = session.runtime.jobs.list(&session.root).await.unwrap()[0].id;
+        (harness, session, provider, requests, parent, job)
+    }
+
+    /// Interrupt right behind the commit of the first record of `agent` from
+    /// here on that `matches` accepts; how many it stopped.
+    pub(super) async fn interrupt_on(
+        session: &SessionHandle,
+        agent: &AgentId,
+        matches: fn(&SessionEvent) -> bool,
+    ) -> impl Future<Output = usize> + use<> {
+        let (interrupting, store) = (session.clone(), &session.runtime.store);
+        on_commit(store, agent, matches, move || async move {
+            interrupting.interrupt().await
+        })
+        .await
+    }
+
+    /// The root's child 1, spawned under a running owner job.
+    pub(super) async fn spawned_child(session: &SessionHandle) -> (AgentId, JobId) {
+        let child = session.root.child(1);
+        let owner = owner(session, false).await;
+        let launch = child_launch(session, None);
+        let spawned = session
+            .runtime
+            .spawn_agent(child.clone(), Some(owner), launch);
+        spawned.await.unwrap();
+        (child, owner)
+    }
+
+    pub(super) fn input(
+        text: &str,
+        options: Selection,
+        done: Option<ChildCompletion>,
+    ) -> AgentCommand {
+        let content = vec![UserPart::Text { text: text.into() }];
+        AgentCommand::Input {
+            options,
+            content,
+            done: done.map(RequestCompletion::Child),
+        }
+    }
+
+    pub(super) async fn child_input(
+        session: &SessionHandle,
+        child: &AgentId,
+        done: Option<ChildCompletion>,
+    ) {
+        send(session, child, input("task", Selection::default(), done)).await;
+    }
+
+    /// Prompt the root from a task.
+    pub(super) fn spawn_prompt(
+        session: &SessionHandle,
+        text: &'static str,
+    ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt(text).await })
+    }
+
+    /// Wait until `find` finds what it looks for in the session's core state,
+    /// which only what `keys` names changes.
+    pub(super) async fn found<T: Send + 'static>(
+        session: &SessionHandle,
+        keys: impl IntoIterator<Item = Key>,
+        find: impl Fn(&CoreState) -> Option<T> + Send + Sync + 'static,
+    ) -> T {
+        let wait = Wait::on(keys, find);
+        bounded(session.runtime.store.until(wait)).await.unwrap()
+    }
+
+    /// Wait until `agent`'s activity is one `wanted` accepts.
+    pub(super) async fn activity_is(
+        session: &SessionHandle,
+        agent: &AgentId,
+        wanted: fn(&crate::session::AgentActivity) -> bool,
+    ) {
+        let (key, agent) = (Key::Agent(agent.clone()), agent.clone());
+        let activity = move |state: &CoreState| {
+            let activity = crate::agent::activity(state, &agent)?;
+            wanted(&activity.state).then_some(())
+        };
+        found(session, [key], activity).await;
+    }
+
+    /// Wait until the root runs tools or waits on children.
+    pub(super) async fn root_waiting(session: &SessionHandle) {
+        use crate::session::AgentActivity::{Tools, WaitingChildren};
+        let waiting = |state: &_| matches!(state, Tools | WaitingChildren);
+        activity_is(session, &session.root, waiting).await;
+    }
+
+    /// Job `job` once `predicate` accepts it.
+    pub(super) async fn until(
+        session: &SessionHandle,
+        job: JobId,
+        predicate: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
+    ) -> crate::job::JobEnvelope {
+        found(session, [Key::Job(job)], move |state| {
+            crate::job::tests::job_snapshot(state, job).filter(&predicate)
+        })
+        .await
+    }
+
+    /// The first of `owner`'s jobs that `find` accepts, once there is one.
+    pub(super) async fn job_found(
+        session: &SessionHandle,
+        owner: &AgentId,
+        find: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
+    ) -> JobId {
+        let first = move |_: &CoreState, jobs: Vec<crate::job::JobEnvelope>| {
+            jobs.into_iter().find(|job| find(job)).map(|job| job.id)
+        };
+        jobs_found(session, owner, [], first).await
+    }
+
+    /// Wait until `find` finds what it looks for in the session's core state and
+    /// what `owner`'s jobs are shown as, which only `owner` and what `keys` name
+    /// change.
+    pub(super) async fn jobs_found<T: Send + 'static>(
+        session: &SessionHandle,
+        owner: &AgentId,
+        keys: impl IntoIterator<Item = Key>,
+        find: impl Fn(&CoreState, Vec<crate::job::JobEnvelope>) -> Option<T> + Send + Sync + 'static,
+    ) -> T {
+        let owner = owner.clone();
+        let keys: Vec<_> = std::iter::once(Key::Agent(owner.clone()))
+            .chain(keys)
+            .collect();
+        let read = move |journal: &_| crate::job::tests::Shown::read(journal, owner);
+        let wait = move |shown: crate::job::tests::Shown| {
+            Wait::on(keys, move |state| find(state, shown.jobs(state)))
+        };
+        let found = session.runtime.store.until_read(read, wait);
+        bounded(found).await.unwrap()
+    }
+
+    pub(super) async fn terminal(
+        session: &SessionHandle,
+        job: JobId,
+    ) -> crate::job::tests::Hydrated {
+        until(session, job, |job| job.state.is_terminal()).await;
+        session.runtime.jobs.wait(job, true).await.unwrap()
+    }
+
+    /// Journal the start of the root's child `index`, as the agent tool would.
+    pub(super) async fn start_child(
+        session: &SessionHandle,
+        index: u32,
+        owner: Option<JobId>,
+    ) -> AgentId {
+        let workspace = session.runtime.harness.workspace.clone();
+        let store = &session.runtime.store;
+        crate::session::tests::start_child(store, &session.root, index, owner, &workspace).await
+    }
+
+    /// A running Agent-role job owning retained children and their questions.
+    pub(super) async fn owner(session: &SessionHandle, background: bool) -> JobId {
+        let jobs = &session.runtime.jobs;
+        let spec = crate::job::JobSpec {
+            accepts_input: true,
+            background,
+            role: crate::job::JobRole::Agent,
+            ..crate::job::JobSpec::test(session.root.clone(), "agent")
+        };
+        jobs.test_running(spec).await.into_test_id()
+    }
+
+    /// Parks the root, so while it lives the idle root leaves a child's responses
+    /// pending rather than consuming them.
+    pub(super) struct QuietRoot<'a>(&'a SessionHandle);
+
+    impl Drop for QuietRoot<'_> {
+        fn drop(&mut self) {
+            set_root_turn(self.0, Turn::Idle);
+        }
+    }
+
+    pub(super) fn set_root_turn(session: &SessionHandle, turn: Turn) {
+        let root = session.root.clone();
+        let set = move |state: &mut CoreState| {
+            // A failed session runs no agent.
+            if let Some(facts) = state.agents.get_mut(&root) {
+                facts.set_turn(turn);
+            }
+        };
+        session.runtime.store.enqueue(set);
+    }
+
+    pub(super) fn quiet_root(session: &SessionHandle) -> QuietRoot<'_> {
+        set_root_turn(session, Turn::Parked(TurnFailure::Cancelled));
+        QuietRoot(session)
+    }
+
+    pub(super) async fn test_harness(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+    ) -> Harness {
+        test_builder(workspace, sessions, provider, false)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    pub(super) async fn shutdown_session(session: SessionHandle) {
+        bounded(session.shutdown()).await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    pub(super) fn mode_name(name: &str) -> ModeName {
+        name.parse().unwrap()
+    }
+
+    /// The edition of `mode`, whose instructions are text.
+    pub(super) fn edition(mode: &crate::config::mode::Mode) -> crate::config::mode::Edition {
+        use crate::config::mode::Written;
+        crate::config::mode::Edition {
+            capabilities: mode.capabilities.clone(),
+            instructions: (mode.instructions.as_ref()).map(|text| text.written().unwrap().clone()),
+            hint: mode.hint.clone(),
+        }
+    }
+
+    /// A mode granting `capabilities`, with its `instructions` written out.
+    pub(super) fn mode(
+        capabilities: &[Capability],
+        instructions: Option<&str>,
+    ) -> crate::config::mode::Mode {
+        crate::config::mode::Mode {
+            capabilities: listed(capabilities),
+            instructions: instructions.map(|text| text.parse().unwrap()),
+            hint: None,
+        }
+    }
+
+    pub(super) fn listed(capabilities: &[Capability]) -> crate::tool::policy::ModeCapabilities {
+        let set: CapabilitySet = capabilities.iter().cloned().collect();
+        set.try_into().unwrap()
+    }
+
+    /// A model under the `test` provider.
+    pub(super) fn model_ref(name: &str) -> ModelRef {
+        format!("test/{name}").parse().unwrap()
+    }
+
+    pub(super) fn provider_name(name: &str) -> ProviderName {
+        name.parse().unwrap()
+    }
+
+    pub(super) fn models<const N: usize>(
+        entries: [(&str, ModelProfile); N],
+    ) -> [(ModelName, ModelProfile); N] {
+        entries.map(|(name, profile)| (name.parse().unwrap(), profile))
+    }
+
+    /// A normal finish: tool use when any item is a call, otherwise an answer.
+    pub(super) fn response(items: Vec<AssistantItem>) -> Vec<ResponseEvent> {
+        vec![ResponseEvent::End(
+            crate::provider::protocol::Completion::finished(items).unwrap(),
+        )]
+    }
+
+    /// An abnormal end keeping `items`, which must not include calls.
+    pub(super) fn cut(items: Vec<AssistantItem>, reason: CutReason) -> Vec<ResponseEvent> {
+        vec![ResponseEvent::End(
+            crate::provider::protocol::Completion::cut(items, reason).unwrap(),
+        )]
+    }
+
+    pub(super) fn answer(text: impl Into<String>) -> Vec<ResponseEvent> {
+        response(vec![AssistantItem::text("answer", 0, text)])
+    }
+
+    pub(super) async fn next_recovery(
+        events: &mut tokio::sync::broadcast::Receiver<crate::session::ObservedEvent>,
+    ) -> Arc<crate::session::EventRecord> {
+        bounded(async {
+            loop {
+                if let RuntimeEvent::Record(record) = events.recv().await.unwrap().event
+                    && matches!(
+                        record.event,
+                        SessionEvent::ModelFailed {
+                            failure: crate::session::AttemptFailure::Retrying { .. },
+                            ..
+                        }
+                    )
+                {
+                    return record;
+                }
+            }
+        })
+        .await
+    }
+
+    /// A provisional delta into the single block of item `item`.
+    pub(super) fn delta(item: &str, kind: ItemKind, text: &str) -> ResponseEvent {
+        ResponseEvent::Delta {
+            block: BlockRef::single(item),
+            kind,
+            text: text.into(),
+        }
+    }
+
+    /// A tool call item `tool-{position}` invoking `name` with call id `id`.
+    pub(super) fn tool_call(
+        position: u32,
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> AssistantItem {
+        let call = ToolCall::new(id, name, arguments).unwrap();
+        AssistantItem::tool_call(format!("tool-{position}"), position, call)
+    }
+
+    /// An `agent` call `id` delegating "`id` task" with `depth` levels below it.
+    pub(super) fn delegation(id: &str, depth: u32) -> AssistantItem {
+        let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
+        tool_call(0, id, "agent", arguments)
+    }
+
+    pub(super) fn todo(text: &str, status: crate::session::TodoStatus) -> TodoItem {
+        TodoItem {
+            text: text.parse().unwrap(),
+            status,
+        }
+    }
+
+    /// Enqueue one batch and await every receipt; results keep input order.
+    pub(super) async fn enqueue_prompts(
+        session: &SessionHandle,
+        prompts: Vec<QueuedPrompt>,
+    ) -> Vec<Result<queue::QueuedPromptCommitted, HarnessError>> {
+        let mut results = Vec::new();
+        for receipt in session.enqueue_prompts(prompts).await {
+            results.push(receipt.await);
+        }
+        results
+    }
+
+    pub(super) fn recoverable() -> ProviderError {
+        crate::provider::ProviderErrorKind::Transport.error("scripted connection lost")
+    }
+
+    /// Run `operation`, letting each retried failure's backoff elapse once it is
+    /// journaled: what a retry does is under test, not how long it waits.
+    pub(super) async fn retrying<T>(
+        session: &SessionHandle,
+        operation: impl Future<Output = T>,
+    ) -> T {
+        let mut updates = session.store().observe().updates;
+        let mut operation = std::pin::pin!(operation);
+        loop {
+            tokio::select! {
+                output = &mut operation => return output,
+                update = updates.recv() => {
+                    if let RuntimeEvent::Record(record) = update.expect("the observer keeps up").event {
+                        elapse_backoff(&record).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Let the backoff a retried failure `record` waits out elapse.
+    pub(super) async fn elapse_backoff(record: &EventRecord) {
+        let backoff = match &record.event {
+            SessionEvent::ModelFailed {
+                failure: crate::session::AttemptFailure::Retrying { delay, .. },
+                ..
+            } => Duration::from_millis(delay.millis()),
+            // The record does not say which attempt failed: the longest backoff.
+            SessionEvent::CompactionFailed { error, .. } if error.retryable() => {
+                compact::RETRY_BACKOFF * u32::from(compact::MAX_COMPACTION_ATTEMPTS)
+            }
+            _ => return,
+        };
+        crate::tests::elapse(backoff).await;
+    }
+
+    /// A valid, otherwise empty compaction continuation.
+    pub(super) fn summary_json() -> serde_json::Value {
+        json!({
+            "objective": "Continue the user's task.", "user_instructions": [],
+            "session_rules": [], "plan": [], "resumption_point": "Continue the user's task.",
+            "completed_work": [], "findings": [], "decisions": [], "open_issues": [],
+            "next_actions": [], "running_work": [], "recovery_details": [], "jobs": [],
+            "additional_context": [], "todo_reconciliation": [], "todos": []
+        })
+    }
+
+    pub(super) fn last_tool_results(request: &ModelRequest) -> &[ToolResult] {
+        let Some(Sent::Tool(results)) = request.messages().last() else {
+            panic!("expected tool results at the end of the history");
+        };
+        results
+    }
+
+    pub(super) fn builder(root: &Path, requests: Requests) -> HarnessBuilder {
+        let provider = scripted_provider(&requests, [answer("done"), answer("done")]);
+        test_builder(root, &root.join("sessions"), provider, false).max_child_depth(1)
+    }
+}

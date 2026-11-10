@@ -2,10 +2,9 @@
 //! and jobs by id.
 
 use super::{JobEnvelope, JobError, JobManager, Settled};
-use crate::{
-    identity::{AgentId, JobId},
-    session::{Page, SessionError},
-};
+use crate::identity::AgentId;
+use crate::session::{Page, SessionError};
+use skyhook_worker::job::JobId;
 
 /// Which jobs a page lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,9 +78,10 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobRole;
     use crate::{
-        agent::{ObservationSnapshot, RuntimeEvent},
-        job::{JobEnd, JobRole, JobState, JobTransition},
+        job::{JobEnd, JobState, JobTransition},
+        session::{ObservationSnapshot, RuntimeEvent},
         session::{SessionEvent, tests::job_created},
         tests::TestRuntime,
     };

@@ -37,16 +37,12 @@ impl Reads {
 
     /// Run `work`, which reads through these reads, on one of their reader threads,
     /// with its connection serving all of its reads. Waiting for a reader holds no
-    /// thread. `work` must not wait on reads made on another thread, and a panic in
-    /// it is an error, as in any blocking task.
-    pub(crate) async fn hold<T, E>(
+    /// thread. `work` must not wait on reads made on another thread, and its panic is
+    /// raised again in the caller, as in any blocking task.
+    pub(crate) async fn hold<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         match self {
             Self::Pool(pool) => pool.hold(work).await,
             Self::Own(own) => own.hold(work).await,

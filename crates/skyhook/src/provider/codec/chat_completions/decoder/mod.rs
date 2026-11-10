@@ -5,17 +5,18 @@ mod reasoning;
 mod tools;
 
 use super::{NATIVE, ReasoningFormat, wire};
-use crate::media::BlobDigest;
 use crate::provider::{
     ProviderError,
     codec::{
         common::{Finish, Settle, Settlement, StopReason},
+        errors::ErrorSignals,
         usage::{Counters, InputAccounting},
     },
-    http::{errors::ErrorSignals, transport::SseEvent},
+    http::transport::SseEvent,
     protocol::{Completion, ResponseEvent, Scope},
 };
 use serde_json::{Map, Value};
+use skyhook_media::BlobDigest;
 use std::collections::BTreeMap;
 
 enum Block {

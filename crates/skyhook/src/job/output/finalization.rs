@@ -26,34 +26,10 @@ pub(crate) fn prepare_completed(
     let saved = Saved::load(output).ok();
     let empty = BTreeMap::new();
     let registered = saved.as_ref().map_or(&empty, |saved| &saved.captures);
-    let fields = completed
-        .iter()
-        .map(CompletedCapture::field)
-        .collect::<Vec<_>>();
-    let bound = completed
-        .iter()
-        .enumerate()
-        .filter_map(|(index, capture)| {
-            let field = capture.field();
-            let registration = registered.get(field)?;
-            (capture.belongs_to(output.job, registration.id)
-                && registration.kind == capture.kind()
-                // Every receipt for a duplicate or overlapping field is unbound:
-                // neither can be referenced without shadowing the other.
-                && fields.iter().enumerate().all(|(other, candidate)| {
-                    other == index
-                        || (*candidate != field
-                            && !field.contains(candidate)
-                            && !candidate.contains(field))
-                }))
-            .then_some(capture)
-        })
-        .collect::<Vec<_>>();
-
     let has_result = result.is_some();
     let mut document = json!({"result": result});
     let mut references = BTreeSet::new();
-    for capture in bound {
+    for capture in &completed {
         let field = capture.field();
         let Some(saved) = &saved else { break };
         let Some(value) = admitted_value(&document, saved, capture).ok().flatten() else {
@@ -66,12 +42,22 @@ pub(crate) fn prepare_completed(
             references.insert(field.clone());
         }
     }
+    let files: Vec<_> = (completed.iter())
+        .filter_map(|capture| {
+            let registration = registered.get(capture.field())?;
+            Some((registration.id, capture.file()?.clone()))
+        })
+        .collect();
     let root = FieldPointer::result();
-    // Cut-off output is never taken as JSON, however it happens to end.
-    let candidates = match captures_complete {
+    // Cut-off output is never taken as JSON, however it happens to end, and neither
+    // is a field whose capture holds only the first bytes of a file.
+    let mut candidates = match captures_complete {
         true => projection::json_text_fields(&document["result"], &root, schema),
         false => BTreeSet::new(),
     };
+    for capture in completed.iter().filter(|capture| capture.file().is_some()) {
+        candidates.remove(capture.field());
+    }
     presented.extend(projection::presented_fields(
         &document["result"],
         &root,
@@ -86,6 +72,7 @@ pub(crate) fn prepare_completed(
             referenced: &references,
             candidates: &candidates,
             presented,
+            files,
         },
     )
 }
@@ -101,7 +88,7 @@ fn admitted_value(
     let field = capture.field();
     let source = || {
         saved
-            .capture(field)
+            .held(field)
             .ok_or_else(|| invalid("completed capture is missing"))
     };
     // A terminal primitive abandons the raw capture, even when the sender
@@ -224,11 +211,9 @@ mod tests {
     use crate::job::{AgentId, output::tests::fixture_with, tests::runtime};
     use crate::tool::ToolOutput;
 
-    /// Two running jobs of one session: receipts are bound to exactly one of them.
-    async fn outputs(manager: &JobManager, agent: &AgentId) -> (Output, Output) {
-        let first = fixture_with(manager, agent, None, None).await;
-        let second = fixture_with(manager, agent, None, None).await;
-        (manager.output(first).await, manager.output(second).await)
+    async fn output(manager: &JobManager, agent: &AgentId) -> Output {
+        let job = fixture_with(manager, agent, None, None).await;
+        manager.output(job).await
     }
 
     fn completed(
@@ -237,7 +222,7 @@ mod tests {
         kind: CaptureKind,
         bytes: &[u8],
     ) -> CompletedCapture {
-        let mut writer = PendingCapture::create(output, &pointer(field), kind)
+        let mut writer = crate::job::output::create_capture(output, &pointer(field), kind)
             .unwrap()
             .open();
         writer.write_all(bytes).unwrap();
@@ -270,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn completed_receipts_install_omitted_fields_and_preserve_existing_wire_references() {
         let (_root, manager, agent) = runtime().await;
-        let (output, _) = outputs(&manager, &agent).await;
+        let output = output(&manager, &agent).await;
         let captures = [
             ("/result/text", CaptureKind::Text, "é\ntext".as_bytes()),
             ("/result/matches", CaptureKind::Json, br#"{"a":[1,true]}"#),
@@ -308,10 +293,6 @@ mod tests {
     async fn invalid_capture_receipts_publish_the_product_with_incomplete_captures() {
         let (_root, manager, agent) = runtime().await;
         for (failure, bytes) in [
-            ("job", &b"valid"[..]),
-            ("registration", &b"valid"[..]),
-            ("overlap", &b"valid"[..]),
-            ("duplicate", &b"valid"[..]),
             ("missing", &b"valid"[..]),
             ("json", &b"{} trailing"[..]),
             ("utf8", &b"ok\xff"[..]),
@@ -320,7 +301,7 @@ mod tests {
             // inspected, since IO completion alone did not reference them.
             ("existing", &b"\xff"[..]),
         ] {
-            let (output, other) = outputs(&manager, &agent).await;
+            let output = output(&manager, &agent).await;
             let kind = if failure == "json" {
                 CaptureKind::Json
             } else {
@@ -334,47 +315,23 @@ mod tests {
             let mut proofs = vec![completed(&output, field, kind, bytes)];
             // A valid sibling receipt is still referenced beside a rejected one.
             proofs.push(completed(&output, "/result/ok", CaptureKind::Text, b"fine"));
-            match failure {
-                "registration" => {
-                    let raw = saved(&output).captures[&pointer(field)].id;
-                    output.db.delete_capture(raw).unwrap();
-                    drop(
-                        PendingCapture::create(&output, &pointer(field), CaptureKind::Json)
-                            .unwrap(),
-                    );
-                }
-                "overlap" => proofs.push(completed(
-                    &output,
-                    "/result/raw/nested",
-                    CaptureKind::Text,
-                    b"nested",
-                )),
-                "duplicate" => proofs.push(proofs[0].clone()),
-                "missing" => {
-                    let raw = saved(&output).captures[&pointer(field)].id;
-                    output.db.delete_capture(raw).unwrap();
-                }
-                _ => {}
+            if failure == "missing" {
+                let raw = saved(&output).captures[&pointer(field)].id;
+                output.db.delete_capture(raw).unwrap();
             }
-            let target = if failure == "job" { &other } else { &output };
             let result = json!({"scalar":"text", "number":4});
-            finish(&manager, target, result, proofs).await;
-            let document = document(target);
+            finish(&manager, &output, result, proofs).await;
+            let document = document(&output);
             assert_eq!(document["result"]["scalar"], "text", "{failure}");
             let kept = (failure == "existing").then(|| json!(4));
             assert_eq!(document.pointer(field), kept.as_ref(), "{failure}");
-            let referenced = target.test_fields();
-            let expected: &[&str] = if failure == "job" {
-                &[]
-            } else {
-                &["/result/ok"]
-            };
+            let referenced = output.test_fields();
             assert_eq!(
                 referenced
                     .iter()
                     .map(FieldPointer::as_str)
                     .collect::<Vec<_>>(),
-                expected,
+                ["/result/ok"],
                 "{failure}"
             );
             let captures = captures::available_captures(&saved(&output), true);
@@ -417,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn unrelated_capture_is_neither_adopted_nor_overwritten_by_ordinary_results() {
         let (_root, manager, agent) = runtime().await;
-        let (output, _) = outputs(&manager, &agent).await;
+        let output = output(&manager, &agent).await;
         let _unreferenced = completed(
             &output,
             "/result/raw",

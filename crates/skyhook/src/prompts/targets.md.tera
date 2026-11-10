@@ -2,4 +2,4 @@ Tools default to the target and workspace in context. A tool's target selects th
 
 "root" selects the session host running Skyhook and its configured workspace. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
 
-Remote commands receive the SSH agent their target's connection forwards in SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts.
+Remote commands receive SSH_AUTH_SOCK when their target's connection forwards an SSH agent.

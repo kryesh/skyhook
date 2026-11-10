@@ -21,12 +21,13 @@ use super::{
     protects,
 };
 use crate::job::output::{
-    CONTENT_BYTES, FieldPointer, ToolError, check_cancelled,
+    CONTENT_BYTES, ToolError, check_cancelled,
     json::saved_json,
-    projection::Presented,
-    render::Clipped,
     shape::{COLLECTION_MEMBERS, ObjectBuilder, Scalar, Shape},
+    stream::Clipped,
 };
+use skyhook_tools::output::FieldPointer;
+use skyhook_tools::output::Presented;
 
 /// Bytes pooled that a candidate competes with before it is skipped.
 const POOL_BYTES: usize = 4 * CONTENT_BYTES;
@@ -130,8 +131,7 @@ pub(super) struct Text {
     /// The most bytes a fit keeping all that was pooled shows.
     pub(super) limit: usize,
     pub(super) bytes: usize,
-    pub(super) newlines: usize,
-    pub(super) ends_line: bool,
+    pub(super) lines: usize,
 }
 
 /// Where a candidate sits: its rank, the smallest shared sample count that
@@ -301,10 +301,8 @@ impl<R: Read> Walker<'_, R> {
                 let limit = if text_field { TEXT_BYTES } else { sample };
                 let mut text = self.text(limit, text_field && keep == Keep::Ends)?;
                 if let Some(clipped) = self.clipped.get(field) {
-                    let size = |count: u64| usize::try_from(count).unwrap_or(usize::MAX);
-                    text.bytes = size(clipped.extent.bytes);
-                    text.newlines = size(clipped.extent.newlines);
-                    text.ends_line = clipped.extent.ends_line;
+                    text.bytes = usize::try_from(clipped.extent.bytes).unwrap_or(usize::MAX);
+                    text.lines = clipped.extent.lines();
                     text.end.clone_from(&clipped.end);
                 }
                 text.role = role(&mut self.text_bytes, self.accounting, record, keep, &text);
@@ -548,16 +546,17 @@ impl<R: Read> Walker<'_, R> {
             end: Vec::new(),
             limit,
             bytes: 0,
-            newlines: 0,
-            ends_line: false,
+            lines: 0,
         };
+        let mut extent = crate::session::CaptureExtent::default();
         let mut buffer = [0; 8 * 1024];
         loop {
             check_cancelled(self.cancellation)?;
             let count = input.read(&mut buffer)?;
-            let Some(last) = buffer[..count].last() else {
+            if count == 0 {
+                text.lines = extent.lines();
                 return Ok(text);
-            };
+            }
             let chunk = &buffer[..count];
             let room = (limit + 1).saturating_sub(text.prefix.len()).min(count);
             text.prefix.extend_from_slice(&chunk[..room]);
@@ -567,8 +566,7 @@ impl<R: Read> Walker<'_, R> {
                 text.end.drain(..excess);
             }
             text.bytes += count;
-            text.newlines += chunk.iter().filter(|&&byte| byte == b'\n').count();
-            text.ends_line = *last == b'\n';
+            extent = extent.after(chunk);
         }
     }
 }

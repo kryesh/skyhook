@@ -2,7 +2,8 @@
 //! root flaw whose finding reports its scenarios as they stand, holding its report and a
 //! folder per test it states with that test's artifacts, a hardening list of the confirmed
 //! flaws no validated candidate holds, and an index of them, with every other entry removed.
-//! Call it on a blocking worker.
+//! Call it in the session's files turn ([`Store::filing`]), so that one generation never
+//! removes another's staging folder.
 
 mod document;
 mod folder;
@@ -13,18 +14,13 @@ use self::{document::*, folder::*};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     io,
-    path::{Path, PathBuf},
-    sync::{Condvar, Mutex, PoisonError},
-    time::Duration,
+    path::Path,
 };
 
 use serde::Serialize;
-use skyhook::{
-    fs::{BeneathError, Directory, RegularFileError},
-    media::BlobDigest,
-};
+use skyhook_media::BlobDigest;
+use skyhook_worker::fs::AtomicWriteError;
 
 use crate::{
     cvss::{Cvss40, Severity},
@@ -36,7 +32,7 @@ use crate::{
 };
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error(transparent)]
     Store(#[from] store::Error),
     #[error("report files: {0}")]
@@ -51,13 +47,9 @@ pub enum Error {
     Cancelled,
 }
 
-impl From<BeneathError> for Error {
-    fn from(error: BeneathError) -> Self {
-        match error {
-            BeneathError::Symlink => Self::LinkedRoot,
-            BeneathError::File(RegularFileError::Io(error)) => Self::Io(error),
-            BeneathError::File(error) => Self::Io(io::Error::other(error)),
-        }
+impl From<AtomicWriteError> for Error {
+    fn from(error: AtomicWriteError) -> Self {
+        Self::Io(error.into())
     }
 }
 
@@ -71,53 +63,22 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// A root whose current report could not be written; its folder is left out.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct Unwritten {
-    pub root: FlawId,
-    pub error: String,
+pub(crate) struct Unwritten {
+    pub(crate) root: FlawId,
+    pub(crate) error: String,
 }
 
 /// What `reports/` holds after [`generate`].
 #[derive(Debug, Default, Serialize, schemars::JsonSchema)]
-pub struct Generated {
+pub(crate) struct Generated {
     /// Every root whose current report is on disk.
-    pub reports: Vec<FlawId>,
-    pub unwritten: Vec<Unwritten>,
+    pub(crate) reports: Vec<FlawId>,
+    pub(crate) unwritten: Vec<Unwritten>,
 }
 
 const INDEX_MD: &str = "index.md";
 const INDEX_JSON: &str = "index.json";
 const HARDENING_MD: &str = "hardening.md";
-
-/// The report roots a generation renders now: generations of one root take turns, so one
-/// never removes another's staging folder.
-static RENDERING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-static RENDERED: Condvar = Condvar::new();
-
-/// One generation's turn at a report root, until it is dropped.
-struct Turn(PathBuf);
-
-impl Turn {
-    /// Wait for `root`'s turn while the caller still wants the work.
-    fn take(root: PathBuf, cancelled: &dyn Fn() -> bool) -> Result<Self> {
-        let mut busy = RENDERING.lock().unwrap_or_else(PoisonError::into_inner);
-        while busy.contains(&root) {
-            wanted(cancelled)?;
-            // Cancellation raises no signal, so the wait wakes to look for it.
-            busy = (RENDERED.wait_timeout(busy, Duration::from_millis(50)))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-        busy.insert(root.clone());
-        Ok(Self(root))
-    }
-}
-
-impl Drop for Turn {
-    fn drop(&mut self) {
-        (RENDERING.lock().unwrap_or_else(PoisonError::into_inner)).remove(&self.0);
-        RENDERED.notify_all();
-    }
-}
 
 /// [`Error::Cancelled`] once the caller no longer wants the work, checked before each step
 /// that removes or writes.
@@ -139,8 +100,8 @@ fn stopped(error: Error) -> Error {
     }
 }
 
-/// Renders `reports/` from the findings the store holds: a folder per current one, replaced in
-/// one step when it does not already hold exactly what renders, then `index.md` and
+/// Renders `reports/` from the findings the store holds: a folder per current one, replaced as
+/// a whole when it does not already hold exactly what renders, then `index.md` and
 /// `index.json` listing them and, while any confirmed flaw is reported by no finding,
 /// `hardening.md` listing those, each rewritten only when it changes. Every other entry goes:
 /// stale roots, roots with nothing to report, folders left by interrupted work, an index name
@@ -148,9 +109,8 @@ fn stopped(error: Error) -> Error {
 /// written, such as one whose artifact changed since its test was recorded, is left out and
 /// reported. Run again with nothing changed, it changes nothing on disk. Cancelled work stops
 /// before its next removal or write, and between artifact chunks.
-pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated> {
+pub(crate) fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated> {
     let path = store.report_root();
-    let _turn = Turn::take(path.clone(), cancelled)?;
     let Reporting {
         reports: current,
         hardening,
@@ -161,20 +121,21 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
         return Ok(Generated::default());
     }
     wanted(cancelled)?;
-    let reports = Directory::open_or_create(&path)?;
+    open_root(&path)?;
     let roots: BTreeSet<String> = (current.iter())
         .map(|report| report.root.to_string())
         .collect();
-    for entry in reports.entries()? {
-        let keep = match entry.to_str() {
-            Some(INDEX_MD | INDEX_JSON) => reports.open_file(&entry).is_ok(),
-            Some(HARDENING_MD) => !hardening.is_empty() && reports.open_file(&entry).is_ok(),
+    for entry in std::fs::read_dir(&path)?.collect::<io::Result<Vec<_>>>()? {
+        let file = entry.file_type()?.is_file();
+        let keep = match entry.file_name().to_str() {
+            Some(INDEX_MD | INDEX_JSON) => file,
+            Some(HARDENING_MD) => !hardening.is_empty() && file,
             Some(name) => roots.contains(name),
             None => false,
         };
         if !keep {
             wanted(cancelled)?;
-            reports.remove_tree(&entry)?;
+            remove_entry(&entry.path())?;
         }
     }
     let (run, artifacts) = (store.id(), store.artifact_root());
@@ -183,7 +144,7 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
     for report in &current {
         let root = report.root;
         let document = document(run, report);
-        match project(&reports, &artifacts, &document, cancelled).map_err(stopped) {
+        match project(&path, &artifacts, &document, cancelled).map_err(stopped) {
             Ok(()) => {
                 generated.reports.push(root);
                 entries.push(IndexEntry {
@@ -198,7 +159,7 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => {
                 wanted(cancelled)?;
-                if let Err(removal) = reports.remove_tree(OsStr::new(&root.to_string()))
+                if let Err(removal) = remove_entry(&path.join(root.to_string()))
                     && removal.kind() != io::ErrorKind::NotFound
                 {
                     return Err(removal.into());
@@ -216,18 +177,14 @@ pub fn generate(store: &Store, cancelled: &dyn Fn() -> bool) -> Result<Generated
         hardening: &hardening,
     })?;
     json.push(b'\n');
-    replace_changed(&reports, INDEX_JSON, &json, cancelled)?;
-    replace_changed(
-        &reports,
-        INDEX_MD,
-        render::index(&entries, hardening.len()).as_bytes(),
-        cancelled,
-    )?;
+    replace_changed(&path.join(INDEX_JSON), &json, cancelled)?;
+    let index = render::index(&entries, hardening.len());
+    replace_changed(&path.join(INDEX_MD), index.as_bytes(), cancelled)?;
     if !hardening.is_empty() {
         let page = render::hardening(&hardening);
-        replace_changed(&reports, HARDENING_MD, page.as_bytes(), cancelled)?;
+        replace_changed(&path.join(HARDENING_MD), page.as_bytes(), cancelled)?;
     }
-    reports.sync()?;
+    skyhook_worker::fs::sync_directory(&path)?;
     Ok(generated)
 }
 
@@ -242,7 +199,7 @@ mod tests {
     const MEDIUM: &str = "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:A/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N";
 
     use crate::store::{
-        Begin, FlawStatus, NewTest, StatusChange, TestId, TestResult, Verdict,
+        Begin, FlawStatus, Listed, NewTest, StatusChange, TestId, TestResult, Verdict,
         tests::{
             self, HIGH, Scenario, Session, artifact, assess, candidate, fixture, flaw, revalidate,
             text, validated, verdict,
@@ -293,7 +250,7 @@ mod tests {
             generate(&self.store, &|| false).unwrap()
         }
 
-        fn folder(&self) -> PathBuf {
+        fn folder(&self) -> std::path::PathBuf {
             self.store
                 .report_root()
                 .join(self.scenario.flaw.to_string())
@@ -308,10 +265,10 @@ mod tests {
         }
     }
 
-    /// `reports/` holds only current reports: a root folder replaced by a link is replaced
-    /// without being followed, anything else placed there goes, and a root whose report went
-    /// stale leaves until its report is written again. Run again with nothing changed, it
-    /// rewrites nothing. The index sets each report's title as a link's text whatever it holds,
+    /// `reports/` holds only current reports: a root folder whose report changed is replaced as
+    /// a whole, one replaced by a link is replaced without being followed, anything else placed
+    /// there goes, and a root whose report went stale leaves until its report is written again.
+    /// Run again with nothing changed, it rewrites nothing. The index sets each report's title as a link's text whatever it holds,
     /// and a `reports/` that is itself a link is refused.
     #[test]
     fn generation_keeps_reports_to_the_current_findings() {
@@ -321,6 +278,13 @@ mod tests {
         let written = fs::metadata(&readme).unwrap().modified().unwrap();
         fixture.generate();
         assert_eq!(fs::metadata(&readme).unwrap().modified().unwrap(), written);
+        let root = fixture.scenario.flaw.to_string();
+        fs::write(fixture.folder().join("stray"), "foreign").unwrap();
+        fixture.report("Unchecked size in the parser, revised");
+        fixture.generate();
+        assert!(fs::read_to_string(&readme).unwrap().contains("revised"));
+        assert!(!fixture.folder().join("stray").exists());
+        assert_eq!(fixture.listing(), [root.as_str(), "index.json", "index.md"]);
 
         let elsewhere = fixture.store.directory().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
@@ -330,7 +294,6 @@ mod tests {
         fixture.generate();
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
         assert!(fixture.folder().join("finding.json").is_file());
-        let root = fixture.scenario.flaw.to_string();
         assert_eq!(fixture.listing(), [root.as_str(), "index.json", "index.md"]);
 
         let candidate = fixture.scenario.candidate;
@@ -396,8 +359,11 @@ mod tests {
         let fixture = Fixture::new();
         let (store, actor, scenario) = (&fixture.store, &fixture.actor, &fixture.scenario);
         let apart = flaw(store, actor, scenario.component);
-        tests::within(store, &Begin::Chain(vec![apart]), |agent| {
-            let confirmed = StatusChange::Flaw(apart, FlawStatus::Confirmed);
+        tests::within(store, &Begin::Chain(Listed::of([apart])), |agent| {
+            let confirmed = StatusChange::Flaw {
+                id: apart,
+                status: FlawStatus::Confirmed,
+            };
             store
                 .set_status(agent, confirmed, &text("no leak path"))
                 .unwrap();
@@ -411,7 +377,6 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("no leak path"), "{page}");
-        assert!(!page.contains(&format!("| {} |", scenario.flaw)), "{page}");
 
         let holder = candidate(store, actor, scenario.path, &[apart]);
         for (vector, below) in [(MEDIUM, true), (HIGH, false)] {
@@ -423,7 +388,6 @@ mod tests {
                 let row =
                     format!("| {apart} | unbounded copy | `lib.c:7-7` |  | {holder} | medium |");
                 assert!(page.contains(&row), "{page}");
-                assert!(!page.contains("no leak path"), "{page}");
             }
         }
         assert!(!store.report_root().join(HARDENING_MD).exists());

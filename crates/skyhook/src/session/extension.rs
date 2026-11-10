@@ -8,13 +8,15 @@ use std::{
     },
 };
 
-use super::{DATABASE_FILE, Reads, Schema, SessionError, SharedDb, db};
+use super::store::DATABASE_FILE;
+use super::{Reads, Schema, SessionError, SharedDb, db};
+use crate::identity::SessionId;
 use crate::{
-    blocking,
     db::{Db, DbError, Own, Turn},
-    identity::{JobId, SessionId},
     job::{ChildResult, output::Saved},
 };
+use skyhook_base::blocking;
+use skyhook_worker::job::JobId;
 
 /// An agent job's brief and final reply as the journal holds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +35,8 @@ enum Access {
     Session {
         db: SharedDb,
         turn: Arc<Turn>,
+        /// The turn on the product's files in the session directory.
+        files: Arc<Turn>,
         /// Writes committed so far, counted once each has committed.
         generation: Arc<AtomicU64>,
     },
@@ -77,6 +81,7 @@ impl ExtensionDb {
             access: Access::Session {
                 db,
                 turn: Arc::default(),
+                files: Arc::default(),
                 generation: Arc::default(),
             },
         }
@@ -174,10 +179,10 @@ impl ExtensionDb {
             |error: &dyn std::fmt::Display| db::corrupt(format!("agent job result: {error}"));
         let reads = self.reads();
         let rows = run.map(|run| reads.saved(run)).transpose()?;
-        let result = (rows.map(|rows| Saved::of(reads, rows)?.result()))
+        let result = (rows.map(|rows| Saved::of(reads, rows)?.reading(Saved::result)))
             .transpose()
             .map_err(|error| corrupt(&error))?
-            .flatten();
+            .and_then(|(_, result)| result);
         let reply = (result.map(serde_json::from_value::<ChildResult>))
             .transpose()
             .map_err(|error| corrupt(&error))?
@@ -212,30 +217,31 @@ impl ExtensionDb {
 
     /// Run `work`, whose reads go to one reader, on that reader's thread. Waiting for
     /// a reader holds no thread.
-    pub async fn reading<T, E>(
-        &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+    pub async fn reading<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> T {
         self.reads.hold(work).await
     }
 
     /// Run `work`, which may write, once it is this caller's turn among the
     /// extension's writers; waiting holds no thread.
-    pub async fn writing<T, E>(
-        &self,
-        work: impl FnOnce() -> Result<T, E> + Send + 'static,
-    ) -> Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+    pub async fn writing<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> T {
         match &self.access {
             Access::Session { turn, .. } => turn.take(work).await,
             Access::Inspecting => blocking(work).await,
+        }
+    }
+
+    /// Run `work`, which keeps the product's files in the session's
+    /// [`directory`](Self::directory), once it is this caller's turn among those who
+    /// do, unless `stop` comes first; waiting holds no thread. It may read and write
+    /// the tables too, beside the writers' turns.
+    pub async fn filing<T: Send + 'static, S>(
+        &self,
+        stop: impl Future<Output = S>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, S> {
+        match &self.access {
+            Access::Session { files, .. } => files.take_unless(stop, work).await,
+            Access::Inspecting => Ok(blocking(work).await),
         }
     }
 }
@@ -257,7 +263,8 @@ pub(crate) mod tests {
     /// capture included, whether read beside a held reader or not.
     #[tokio::test]
     async fn an_agent_jobs_texts_read_its_reply_whole() {
-        use crate::job::{JobManager, JobRole, JobSpec};
+        use crate::job::JobRole;
+        use crate::job::{JobManager, JobSpec};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let store = SessionStore::create_ephemeral(&sessions, TABLES)
@@ -285,14 +292,11 @@ pub(crate) mod tests {
         assert_eq!(tables.reading(read).await.unwrap(), expected);
     }
 
-    pub(crate) const TABLES: Schema = Schema::extended(
-        ::schema::image!(
-            format = 1,
-            sql = "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT;",
-            sql = "CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;"
-        ),
-        seed,
-    );
+    const DDL: &str = "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT; \
+         CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;";
+
+    pub(crate) const TABLES: Schema =
+        Schema::extended(crate::session::ProductImage::layered(DDL, 1), seed);
 
     /// A product's tables open, and their sessions list for the product, only with their
     /// own format, beside a journal that opens without them; an inspection reads them
@@ -343,15 +347,8 @@ pub(crate) mod tests {
         store.close().await.unwrap();
         drop(store);
 
-        // The same tables, created as each session is, at another format.
-        let changed = Schema::extended(
-            crate::session::ProductImage::layered(
-                "CREATE TABLE fixture_kind(name TEXT PRIMARY KEY) STRICT; \
-                 CREATE TABLE fixture(id INTEGER PRIMARY KEY, note TEXT NOT NULL) STRICT;",
-                2,
-            ),
-            seed,
-        );
+        // The same tables at another format.
+        let changed = Schema::extended(crate::session::ProductImage::layered(DDL, 2), seed);
         assert!(matches!(
             SessionStore::open(sessions, id, Some((&host, changed))).await,
             Err(SessionError::Database(DbError::Extension(1)))

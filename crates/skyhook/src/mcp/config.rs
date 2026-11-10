@@ -1,184 +1,181 @@
-use crate::{
-    provider::dialect::{ConfiguredHeaders, HeaderError, Sourced},
-    tool::policy::{Capability, CapabilitySet},
-};
-use serde::{Deserialize, Serialize};
+use crate::tool::policy::{Capability, CapabilitySet};
+use crate::{provider::http::credentials::ConfiguredHeaders, yaml};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde_json::{Map, Value};
+use skyhook_base::{bounded::TimeoutSecs, string_newtype};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpTransport {
-    Stdio,
-    StreamableHttp,
-}
-
-/// An admitted connection. Mutable input is represented by [`RawMcpServerConfig`];
-/// deserialize or use `TryFrom` to validate it without startup or secret lookup.
-/// Serialization retains the original flat configuration shape and URL spelling.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(try_from = "RawMcpServerConfig", into = "RawMcpServerConfig")]
+/// A configured server, admitted as written: without startup or secret lookup.
+/// It serializes in the flat shape and URL spelling it was written in.
+#[derive(Clone, Debug)]
 pub struct McpServerConfig {
     connection: McpConnection,
-    capabilities: Vec<Capability>,
-    startup_timeout: Duration,
-    call_timeout: Duration,
+    settings: Settings,
 }
 
-#[derive(Clone, Debug)]
+/// What every transport takes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Settings {
+    #[serde(default)]
+    capabilities: Vec<Capability>,
+    #[serde(default = "default_startup_timeout_secs")]
+    startup_timeout_secs: TimeoutSecs,
+    #[serde(default = "default_call_timeout_secs")]
+    call_timeout_secs: TimeoutSecs,
+}
+
+const fn default_startup_timeout_secs() -> TimeoutSecs {
+    TimeoutSecs::new::<30>()
+}
+const fn default_call_timeout_secs() -> TimeoutSecs {
+    TimeoutSecs::new::<120>()
+}
+
+/// How a server is reached, tagged by `transport`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
 pub(super) enum McpConnection {
     Stdio(CommandSpec),
-    Http {
-        endpoint: String,
-        headers: ConfiguredHeaders,
+    StreamableHttp {
+        #[serde(flatten)]
+        endpoint: Endpoint,
+        /// Run only while the endpoint is unreachable.
+        #[serde(flatten)]
         start_if_unreachable: Option<CommandSpec>,
     },
 }
 
-/// Strings remain exactly those supplied by YAML: executable/arguments are never
-/// split, trimmed, shell-expanded, or normalized. Only executable shape is checked.
-#[derive(Clone, Debug)]
+/// The `transport` names, which select the fields beside them.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Transport {
+    Stdio,
+    StreamableHttp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct Endpoint {
+    pub(super) url: Url,
+    /// Header names mapped to their values, read only when the server is contacted.
+    #[serde(default)]
+    pub(super) headers: ConfiguredHeaders,
+}
+
+string_newtype! {
+    /// An MCP endpoint, kept as written.
+    pub struct Url(&'static str) = |url| {
+        let absolute = reqwest::Url::parse(url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        absolute.then_some(()).ok_or("MCP HTTP url must be an absolute http or https URL")
+    };
+}
+
+/// Strings are used exactly as written; only executable shape is checked.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CommandSpec {
-    pub(super) argv: Vec<String>,
+    pub(super) start_command: Argv,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cwd: Option<PathBuf>,
+    #[serde(default)]
     pub(super) env: BTreeMap<String, String>,
 }
 
 impl CommandSpec {
-    /// The configured directory, else the session workspace: never the
-    /// directory Skyhook happened to be launched from.
+    /// The configured directory, else the session workspace.
     pub(super) fn directory<'a>(&'a self, workspace: &'a Path) -> &'a Path {
         self.cwd.as_deref().unwrap_or(workspace)
     }
 }
 
-/// Editable external DTO. Conversion into [`McpServerConfig`] is mandatory before
-/// connecting; this type cannot be passed to transport or manager startup APIs.
-#[serde_with::skip_serializing_none]
+/// A program and its arguments.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawMcpServerConfig {
-    pub transport: McpTransport,
-    pub start_command: Option<Vec<String>>,
-    pub url: Option<String>,
-    #[serde(default)]
-    pub capabilities: Vec<Capability>,
-    #[serde(default = "default_startup_timeout_secs")]
-    pub startup_timeout_secs: u64,
-    #[serde(default = "default_call_timeout_secs")]
-    pub call_timeout_secs: u64,
-    pub cwd: Option<PathBuf>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// Header names mapped to their values, read only when the server is contacted.
-    #[serde(default)]
-    pub headers: indexmap::IndexMap<String, Sourced>,
-}
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub(super) struct Argv(Vec<String>);
 
-const fn default_startup_timeout_secs() -> u64 {
-    30
-}
-const fn default_call_timeout_secs() -> u64 {
-    120
-}
+impl TryFrom<Vec<String>> for Argv {
+    type Error = &'static str;
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum McpConfigError {
-    #[error("startup_timeout_secs must be positive and fit a timer deadline")]
-    StartupTimeout,
-    #[error("call_timeout_secs must be positive and fit a timer deadline")]
-    CallTimeout,
-    #[error("start_command must contain a nonempty executable")]
-    EmptyCommand,
-    #[error("stdio transport requires start_command")]
-    MissingCommand,
-    #[error("stdio transport does not accept url or headers")]
-    StdioEndpoint,
-    #[error(transparent)]
-    Header(#[from] HeaderError),
-    #[error("streamable_http transport requires url")]
-    MissingUrl,
-    #[error("MCP HTTP url must be an absolute http or https URL")]
-    Url,
-    #[error("cwd and env require start_command")]
-    LaunchWithoutCommand,
-    #[error("cwd cannot be represented as UTF-8")]
-    NonUtf8Cwd,
-}
-
-impl TryFrom<RawMcpServerConfig> for McpServerConfig {
-    type Error = McpConfigError;
-    fn try_from(raw: RawMcpServerConfig) -> Result<Self, Self::Error> {
-        let timeout = |seconds, error| {
-            let timeout = Duration::from_secs(seconds);
-            let fits = std::time::Instant::now().checked_add(timeout).is_some();
-            (seconds > 0 && fits).then_some(timeout).ok_or(error)
-        };
-        let startup_timeout = timeout(raw.startup_timeout_secs, McpConfigError::StartupTimeout)?;
-        let call_timeout = timeout(raw.call_timeout_secs, McpConfigError::CallTimeout)?;
-        if let Some(command) = &raw.start_command
-            && command
-                .first()
-                .is_none_or(|program| program.trim().is_empty())
-        {
-            return Err(McpConfigError::EmptyCommand);
+    fn try_from(argv: Vec<String>) -> Result<Self, &'static str> {
+        match argv.first() {
+            Some(program) if !program.trim().is_empty() => Ok(Self(argv)),
+            _ => Err("must contain a nonempty executable"),
         }
-        let connection = match raw.transport {
-            McpTransport::Stdio => {
-                let argv = raw.start_command.ok_or(McpConfigError::MissingCommand)?;
-                if raw.url.is_some() || !raw.headers.is_empty() {
-                    return Err(McpConfigError::StdioEndpoint);
-                }
-                McpConnection::Stdio(CommandSpec {
-                    argv,
-                    cwd: raw.cwd,
-                    env: raw.env,
-                })
-            }
-            McpTransport::StreamableHttp => {
-                let original = raw.url.ok_or(McpConfigError::MissingUrl)?;
-                let absolute = reqwest::Url::parse(&original).is_ok_and(|url| {
-                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
-                });
-                if !absolute {
-                    return Err(McpConfigError::Url);
-                }
-                if raw.start_command.is_none() && (raw.cwd.is_some() || !raw.env.is_empty()) {
-                    return Err(McpConfigError::LaunchWithoutCommand);
-                }
-                McpConnection::Http {
-                    endpoint: original,
-                    headers: ConfiguredHeaders::admit(&raw.headers)?,
-                    start_if_unreachable: raw.start_command.map(|argv| CommandSpec {
-                        argv,
-                        cwd: raw.cwd,
-                        env: raw.env,
-                    }),
+    }
+}
+
+impl From<Argv> for Vec<String> {
+    fn from(argv: Argv) -> Self {
+        argv.0
+    }
+}
+
+impl Argv {
+    pub(super) fn program(&self) -> &str {
+        &self.0[0]
+    }
+
+    pub(super) fn args(&self) -> &[String] {
+        &self.0[1..]
+    }
+}
+
+impl<'de> Deserialize<'de> for McpServerConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut fields = Map::new();
+        let settings = yaml::split(deserializer, &mut fields)?;
+        let transport = fields
+            .remove("transport")
+            .ok_or_else(|| de::Error::missing_field("transport"))?;
+        let connection = match Transport::deserialize(transport).map_err(de::Error::custom)? {
+            Transport::Stdio => McpConnection::Stdio(yaml::located(fields)?),
+            Transport::StreamableHttp => {
+                let mut launch = Map::new();
+                let endpoint =
+                    yaml::split(Value::Object(fields), &mut launch).map_err(de::Error::custom)?;
+                let start_if_unreachable = (!launch.is_empty())
+                    .then(|| yaml::located(launch))
+                    .transpose()?;
+                McpConnection::StreamableHttp {
+                    endpoint,
+                    start_if_unreachable,
                 }
             }
         };
         Ok(Self {
             connection,
-            capabilities: raw.capabilities,
-            startup_timeout,
-            call_timeout,
+            settings,
         })
     }
+}
+
+impl Serialize for McpServerConfig {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = yaml::object(&self.connection);
+        fields.extend(yaml::object(&self.settings));
+        fields.serialize(serializer)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum McpConfigError {
+    #[error("cwd cannot be represented as UTF-8")]
+    NonUtf8Cwd,
 }
 
 impl McpServerConfig {
     pub(super) fn connection(&self) -> &McpConnection {
         &self.connection
     }
-    /// Resolve a relative launch `cwd` against `base`, the directory of the file
-    /// that declared this server.
+    /// Resolve a relative launch `cwd` against `base`.
     pub fn resolve_cwd(&mut self, base: &Path) -> Result<(), McpConfigError> {
         let command = match &mut self.connection {
             McpConnection::Stdio(command) => command,
-            McpConnection::Http {
+            McpConnection::StreamableHttp {
                 start_if_unreachable,
                 ..
             } => match start_if_unreachable {
@@ -198,165 +195,134 @@ impl McpServerConfig {
         Ok(())
     }
     pub fn capabilities(&self) -> &[Capability] {
-        &self.capabilities
+        &self.settings.capabilities
     }
     /// Whether an agent holding `capabilities` may use this server: MCP itself
     /// and every capability the server lists.
     pub fn permitted_by(&self, capabilities: &CapabilitySet) -> bool {
         capabilities.contains(&Capability::Mcp)
-            && self
-                .capabilities
-                .iter()
-                .all(|cap| capabilities.contains(cap))
+            && (self.settings.capabilities.iter()).all(|cap| capabilities.contains(cap))
     }
     pub fn startup_timeout(&self) -> Duration {
-        self.startup_timeout
+        self.settings.startup_timeout_secs.into()
     }
     pub fn call_timeout(&self) -> Duration {
-        self.call_timeout
-    }
-    pub fn transport(&self) -> McpTransport {
-        match self.connection {
-            McpConnection::Stdio(_) => McpTransport::Stdio,
-            McpConnection::Http { .. } => McpTransport::StreamableHttp,
-        }
-    }
-}
-
-impl From<McpServerConfig> for RawMcpServerConfig {
-    fn from(config: McpServerConfig) -> Self {
-        let transport = config.transport();
-        let (command, url, headers) = match config.connection {
-            McpConnection::Stdio(command) => (Some(command), None, Default::default()),
-            McpConnection::Http {
-                endpoint,
-                headers,
-                start_if_unreachable,
-            } => (start_if_unreachable, Some(endpoint), headers.sourced()),
-        };
-        let (start_command, cwd, env) = match command {
-            Some(command) => (Some(command.argv), command.cwd, command.env),
-            None => (None, None, BTreeMap::new()),
-        };
-        Self {
-            transport,
-            start_command,
-            url,
-            capabilities: config.capabilities,
-            startup_timeout_secs: config.startup_timeout.as_secs(),
-            call_timeout_secs: config.call_timeout.as_secs(),
-            cwd,
-            env,
-            headers,
-        }
+        self.settings.call_timeout_secs.into()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
-    use std::path::Path;
+    use skyhook_worker::secret::Credential;
 
     const STDIO: &str = "transport: 'stdio'\nstart_command: ['server']";
 
+    /// Each transport takes its own fields, and a server dumps as written with its
+    /// defaults in effect; admission is pure, leaving existence, access and
+    /// environment values to startup, and header names are normalized.
     #[test]
-    fn flat_config_roundtrips_without_changing_defaults_or_endpoint_semantics() {
+    fn transports_take_their_own_fields_and_dump_as_written() {
         for text in [
-            "transport: 'stdio'\nstart_command: [' server name ', 'a b', '$UNEXPANDED']",
-            "transport: 'streamable_http'\nurl: 'HTTPS://Example.COM:443/a%2Fb?q=x#fragment'",
-            "transport: 'streamable_http'\nurl: 'http://user:password@localhost:1234/mcp'",
-            "transport: 'streamable_http'\nurl: 'http://[::1]:1234/mcp'\nstart_command: ['server', '--flag']\ncwd: 'relative/path'\nenv: { KEY: 'value' }\nheaders: { authorization: { env: 'MISSING_MCP_TEST_TOKEN' }, x-command: { command: 'printf v' }, x-title: 'skyhook' }\ncapabilities: ['read', 'exec']\nstartup_timeout_secs: 2\ncall_timeout_secs: 9",
+            "transport: 'stdio'\nstart_command: [' server name ', 'a b', '$UNEXPANDED']\nenv: {}\ncapabilities: []\nstartup_timeout_secs: 30\ncall_timeout_secs: 120",
+            "transport: 'streamable_http'\nurl: 'HTTPS://Example.COM:443/a%2Fb?q=x#fragment'\nheaders: {}\ncapabilities: []\nstartup_timeout_secs: 30\ncall_timeout_secs: 120",
+            "transport: 'streamable_http'\nurl: 'http://[::1]:1234/mcp'\nheaders: { authorization: { env: 'MISSING_MCP_TEST_TOKEN' }, x-command: { command: 'printf v' } }\nstart_command: ['/nonexistent/mcp-command', '--flag']\ncwd: 'relative/path'\nenv: { KEY: 'value' }\ncapabilities: ['read', 'exec']\nstartup_timeout_secs: 2\ncall_timeout_secs: 9",
         ] {
-            let raw: RawMcpServerConfig = crate::yaml::parse(text).unwrap();
-            let expected = serde_json::to_value(&raw).unwrap();
-            let config: McpServerConfig = crate::yaml::parse(text).unwrap();
-            assert_eq!(serde_json::to_value(&config).unwrap(), expected);
-            let encoded = serde_saphyr::to_string(&config).unwrap();
-            let decoded: McpServerConfig = crate::yaml::parse(&encoded).unwrap();
-            assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
-            assert_eq!(config.transport(), raw.transport);
+            let config: McpServerConfig = yaml::parse(text).unwrap();
+            let written = yaml::from_str(text).unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap(), written);
         }
+        let config: McpServerConfig = yaml::parse(
+            "transport: streamable_http\nurl: http://h/mcp\nheaders: {Authorization: x}",
+        )
+        .unwrap();
+        let dumped = serde_json::to_value(config).unwrap();
+        let literal = serde_json::to_value(Credential::Literal("x".into())).unwrap();
+        assert_eq!(
+            dumped["headers"],
+            serde_json::json!({"authorization": literal})
+        );
     }
 
     #[test]
-    fn admission_rejects_invalid_connections_commands_and_timeouts() {
-        use McpConfigError::*;
-        // Admission is pure: existence, access and environment values remain
-        // startup concerns, and header names are normalized.
-        let config: McpServerConfig = crate::yaml::parse("transport: 'streamable_http'\nurl: 'http://localhost:1234/mcp'\nstart_command: ['/nonexistent/mcp-command']\ncwd: '/nonexistent/mcp-directory'\nheaders: { Authorization: { env: 'MISSING_MCP_TEST_TOKEN' } }").unwrap();
-        let raw: RawMcpServerConfig = config.into();
-        let env = "MISSING_MCP_TEST_TOKEN".to_owned();
-        assert_eq!(raw.headers["authorization"], Sourced::Env { env });
-        let cwd = Some(Path::new("/nonexistent/mcp-directory"));
-        assert_eq!(raw.cwd.as_deref(), cwd);
+    fn misplaced_or_missing_fields_are_refused_by_name() {
         let http = "transport: 'streamable_http'\nurl: 'https://example.com/mcp'";
-        let cases = [
-            ("transport: 'stdio'".into(), MissingCommand),
-            ("transport: 'stdio'\nstart_command: []".into(), EmptyCommand),
+        for (text, expected) in [
             (
-                "transport: 'stdio'\nstart_command: ['']".into(),
-                EmptyCommand,
+                "transport: 'stdio'".to_owned(),
+                "missing field `start_command`",
+            ),
+            (
+                "transport: 'stdio'\nstart_command: []".into(),
+                "start_command: must contain a nonempty executable",
             ),
             (
                 "transport: 'stdio'\nstart_command: ['   ']".into(),
-                EmptyCommand,
+                "start_command: must contain a nonempty executable",
             ),
             (
                 format!("{STDIO}\nurl: 'https://example.com/mcp'"),
-                StdioEndpoint,
+                "url: unknown field `url`",
             ),
             (
                 format!("{STDIO}\nheaders: {{ Authorization: 'TOKEN' }}"),
-                StdioEndpoint,
+                "headers: unknown field `headers`",
+            ),
+            ("transport: 'streamable_http'".into(), "missing field `url`"),
+            (
+                "transport: 'streamable_http'\nurl: '/mcp'".into(),
+                "MCP HTTP url must be an absolute http or https URL",
+            ),
+            (
+                "transport: 'streamable_http'\nurl: 'ftp://example.com/mcp'".into(),
+                "MCP HTTP url must be an absolute http or https URL",
             ),
             (
                 format!("{http}\nheaders: {{ 'invalid name': 'TOKEN' }}"),
-                Header(HeaderError::Name("invalid name".into())),
+                "headers: `invalid name` is not a valid header name",
             ),
-            ("transport: 'streamable_http'".into(), MissingUrl),
-            ("transport: 'streamable_http'\nurl: ''".into(), Url),
-            ("transport: 'streamable_http'\nurl: '/mcp'".into(), Url),
             (
-                "transport: 'streamable_http'\nurl: 'ftp://example.com/mcp'".into(),
-                Url,
+                format!("{http}\ncwd: 'work'"),
+                "missing field `start_command`",
             ),
-            (format!("{http}\nstart_command: []"), EmptyCommand),
-            (format!("{http}\ncwd: 'work'"), LaunchWithoutCommand),
             (
                 format!("{http}\nenv: {{ MODE: 'test' }}"),
-                LaunchWithoutCommand,
-            ),
-            (format!("{STDIO}\nstartup_timeout_secs: 0"), StartupTimeout),
-            (format!("{STDIO}\ncall_timeout_secs: 0"), CallTimeout),
-            (
-                format!("{STDIO}\nstartup_timeout_secs: {}", u64::MAX),
-                StartupTimeout,
+                "missing field `start_command`",
             ),
             (
-                format!("{STDIO}\ncall_timeout_secs: {}", u64::MAX),
-                CallTimeout,
+                format!("{http}\nstart_command: []"),
+                "start_command: must contain a nonempty executable",
             ),
-        ];
-        for (text, expected) in cases {
-            let raw: RawMcpServerConfig = crate::yaml::parse(&text).unwrap();
-            let error = McpServerConfig::try_from(raw).unwrap_err();
-            assert_eq!(error, expected, "{text}");
-        }
-        let extras = [
-            "capabilities: ['unknown_capability']",
-            "capabilities: ['Read']",
-            "command: ['other']",
-            "startup_timeout_secs: -1",
-            "call_timeout_secs: -1",
-            "startup_timeout_secs: 1.5",
-            "call_timeout_secs: '120'",
-        ]
-        .map(|extra| format!("{STDIO}\n{extra}"));
-        let sse = "transport: 'sse'\nstart_command: ['server']";
-        for text in extras.iter().map(String::as_str).chain([sse]) {
-            let parsed = crate::yaml::parse::<RawMcpServerConfig>(text);
-            assert_matches!(parsed, Err(crate::yaml::YamlError::Value(_)), "{text}");
+            (
+                "start_command: ['server']".into(),
+                "missing field `transport`",
+            ),
+            (
+                "transport: 'sse'\nstart_command: ['server']".into(),
+                "unknown variant `sse`",
+            ),
+            (
+                format!("{STDIO}\ncommand: ['other']"),
+                "unknown field `command`",
+            ),
+            (
+                format!("{STDIO}\ncapabilities: ['Read']"),
+                "capabilities[0]`: host capability must be",
+            ),
+            (
+                format!("{STDIO}\nstartup_timeout_secs: 0"),
+                "startup_timeout_secs`: must be 1 through 86400",
+            ),
+            (
+                format!("{STDIO}\ncall_timeout_secs: '120'"),
+                "call_timeout_secs`: invalid type",
+            ),
+        ] {
+            let mcp = format!("mcp:\n  s:\n    {}", text.replace('\n', "\n    "));
+            let error = crate::config::Config::from_yaml(&mcp)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{text}: {error}");
         }
     }
 }

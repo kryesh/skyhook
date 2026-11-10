@@ -1,0 +1,69 @@
+[package]
+name = "skyhook-apps"
+description = "The skyhook and skyhook-security terminal applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "skyhook"
+path = "src/bin/skyhook.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "skyhook-security"
+path = "src/bin/skyhook-security.rs"
+test = false
+bench = false
+doc = false
+
+[dependencies]
+skyhook.workspace = true
+skyhook-base.workspace = true
+skyhook-media.workspace = true
+skyhook-security.workspace = true
+skyhook-tools.workspace = true
+skyhook-worker.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm = { version = "0.29", features = ["event-stream", "use-dev-tty"] }
+dotenvy = "0.15"
+futures-util.workspace = true
+ignore.workspace = true
+indexmap.workspace = true
+libc.workspace = true
+pulldown-cmark = { workspace = true, default-features = true }
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm_0_29",
+    "layout-cache",
+] }
+rust-embed = { version = "8", features = [
+    "include-exclude",
+    "deterministic-timestamps",
+] }
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+syntect = { version = "5", default-features = false, features = [
+    "default-fancy",
+] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+unicode-segmentation = "1"
+unicode-width.workspace = true
+zeroize.workspace = true
+
+# Windows keeps its system allocator.
+[target.'cfg(not(windows))'.dependencies]
+mimalloc.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+tempfile.workspace = true

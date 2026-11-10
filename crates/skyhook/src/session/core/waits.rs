@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tokio::sync::oneshot::Sender;
 
 use super::CoreState;
-use crate::identity::{AgentId, JobId};
+use crate::identity::AgentId;
+use skyhook_worker::job::JobId;
 
 /// What a wait reads: it is decided again once a change touches one of these.
 /// A session-wide change (phase, flow or activation) decides every wait again,
@@ -103,10 +104,49 @@ impl<T: Send + 'static> Wait<T> {
     }
 }
 
+impl Wait<()> {
+    /// Decide with no one awaiting it: once `decide` reads anything, `take`
+    /// consumes it in the change that decides it. It goes only with every wait,
+    /// as the session stops.
+    pub(crate) fn standing<D: 'static>(
+        keys: impl IntoIterator<Item = Key>,
+        decide: impl Fn(&CoreState) -> Option<D> + Send + Sync + 'static,
+        take: impl FnOnce(&mut CoreState, D) + Send + Sync + 'static,
+    ) -> Self {
+        let take = Some(take);
+        Self {
+            keys: keys.into_iter().collect(),
+            waiter: Box::new(move |_| Box::new(Standing { decide, take })),
+        }
+    }
+}
+
 /// A registered wait and the reply it resolves.
 pub(super) trait Waiter: Send + Sync {
     /// Decide, replying once decided: true once it decided or its waiter gave up.
     fn resolve(&mut self, state: &mut CoreState) -> bool;
+}
+
+/// A decision no one awaits, and what it consumes once decided.
+struct Standing<F, G> {
+    decide: F,
+    take: Option<G>,
+}
+
+impl<D, F, G> Waiter for Standing<F, G>
+where
+    F: Fn(&CoreState) -> Option<D> + Send + Sync,
+    G: FnOnce(&mut CoreState, D) + Send + Sync,
+{
+    fn resolve(&mut self, state: &mut CoreState) -> bool {
+        let Some(decided) = (self.decide)(state) else {
+            return false;
+        };
+        if let Some(take) = self.take.take() {
+            take(state, decided);
+        }
+        true
+    }
 }
 
 /// A decision and what it consumes once decided.

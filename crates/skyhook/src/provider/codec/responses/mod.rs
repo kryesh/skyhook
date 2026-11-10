@@ -1,13 +1,13 @@
-//! Native OpenAI Responses wire codec, shared with Codex.
+//! Native Responses wire codec, shared by every Responses dialect.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Value, json};
 
+use crate::provider::codec::errors::ErrorSignals;
 use crate::provider::codec::{
     CodecName,
     common::{Finish, Native, replay},
 };
-use crate::provider::http::errors::ErrorSignals;
 use crate::provider::{
     ProviderError,
     protocol::{
@@ -77,7 +77,7 @@ struct ReasoningState {
 }
 
 /// A malformed/partial arguments.done is retained until the stop reason is
-/// known. Validated objects are never converted back to strings for checking.
+/// known.
 enum FinalArguments {
     Object(serde_json::Map<String, Value>),
     Incomplete(String),

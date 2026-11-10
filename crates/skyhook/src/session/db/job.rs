@@ -12,13 +12,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use serde_json::Value;
 
+use crate::identity::{AgentId, SessionId};
 use crate::{
-    execution::path_bytes,
-    identity::{AgentId, JobId, SessionId},
     job::{AgentProgress, ChildStatus, Invocation, JobStatus, RunTiming},
-    media::BlobDigest,
     session::{EntryKind, EventRecord, ModelCallOrigin, RecordSeq, SessionEvent},
 };
+use skyhook_media::BlobDigest;
+use skyhook_worker::job::JobId;
 
 /// A job's status row, with the records its facts start from: its creation, its
 /// latest finish while its state is a finish's, and the commits of its answer and
@@ -269,7 +269,7 @@ impl Encoder {
                         *accepts_input,
                         *background,
                         target,
-                        path_bytes(&location.workspace),
+                        location.workspace.as_str(),
                     ],
                 )
                 .map(drop)
@@ -527,8 +527,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::job::JobRole;
     use crate::{
-        job::{Invocation, JobEnd, JobRole, JobTransition, Run, output::Presented},
+        job::{Invocation, JobEnd, JobTransition, Run},
         provider::protocol::{AssistantItem, ToolCall},
         session::{
             Command, CoreState, Message, ModelContext, ModelPurpose, Plan, SessionError,
@@ -537,6 +538,7 @@ mod tests {
         },
         tests::TestRuntime,
     };
+    use skyhook_tools::output::Presented;
 
     /// An agent job yields the brief it was launched with, whether its model call or
     /// itself holds its arguments with whatever envelope they carry, and its latest run that
@@ -579,6 +581,7 @@ mod tests {
                 captures_complete: true,
                 fields: Vec::new(),
                 staged: Vec::new(),
+                files: Vec::new(),
                 presented: Presented::new(),
             };
             let finished = SessionEvent::JobFinished {

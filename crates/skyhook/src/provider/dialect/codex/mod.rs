@@ -1,10 +1,9 @@
 //! The ChatGPT subscription service: Responses over Skyhook-owned OAuth
 //! credentials, a sticky per-turn routing header, and cache affinity by headers and body.
-//! Authentication never imports the official client's credentials.
+mod account;
 pub mod auth;
-mod usage;
 
-pub use usage::Account;
+pub use account::Account;
 
 use std::{sync::Arc, time::Duration};
 
@@ -13,8 +12,8 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use zeroize::Zeroizing;
 
 use super::{
-    AdmissionError, BaseUrl, Common, Connection, Dialect, DialectConfig, DialectError,
-    LoginCommand, Pending, Profile, entry::ProviderOptions,
+    BaseUrl, Connection, Dialect, DialectConfig, DialectError, Login, LoginCommand, Wire,
+    entry::{KeySource, ProviderOptions},
 };
 use crate::provider::{
     ProviderError,
@@ -23,7 +22,11 @@ use crate::provider::{
         UnsignedReasoning, header, path,
         responses::{self, Instructions, ReasoningSummary},
     },
-    http::{Headers, Session, Transport, auth::Authenticator, headers::Value},
+    http::{
+        Headers, Session, Transport,
+        credentials::Pending,
+        headers::{Authenticator, Value},
+    },
 };
 
 const ACCOUNT_HEADER: HeaderName = HeaderName::from_static("chatgpt-account-id");
@@ -53,11 +56,7 @@ fn responses() -> responses::Dialect {
         schema: SchemaConstraint::Strict,
         state_role: StateRole::System,
         unsigned: UnsignedReasoning::Dropped,
-        metadata_events: &[
-            "codex.rate_limits",
-            "codex.response.metadata",
-            "responsesapi.websocket_timing",
-        ],
+        metadata_events: &["codex.rate_limits", "codex.response.metadata"],
         ..responses::Dialect::stateless()
     }
 }
@@ -88,21 +87,15 @@ crate::provider::settings::settings! {
 }
 
 impl ProviderOptions for Options {
-    fn admit(&self, common: &Common, base_url: BaseUrl) -> Result<Connection, AdmissionError> {
-        let connection = common.admit(base_url)?;
-        if common.api_key.is_some() {
-            return Err(DialectError::CodexApiKey.into());
-        }
-        Ok(connection)
-    }
+    const KEY: KeySource = KeySource::Login;
 
     fn login(
         &self,
         command: LoginCommand,
         connection: &Connection,
-    ) -> Result<Option<Account>, ProviderError> {
+    ) -> Result<Option<Login>, ProviderError> {
         let manager = auth::AuthManager::new(command, self.issuer())?;
-        Ok(Some(Account::new(manager, connection)))
+        Ok(Some(Login::Codex(Account::new(manager, connection))))
     }
 }
 
@@ -119,7 +112,7 @@ impl DialectConfig for Config {
         BaseUrl::Default("https://chatgpt.com/backend-api")
     }
 
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError> {
         if codec != CodecName::Responses {
             return Err(DialectError::UnsupportedCodec {
                 dialect: Dialect::Codex,
@@ -127,10 +120,10 @@ impl DialectConfig for Config {
             });
         }
         let codec = Codec::Responses(responses());
-        let mut profile = Profile::new(codec, transport(), Dialect::Codex, super::openai::IMAGES);
-        profile.service = Some("codex");
-        profile.fixed(ORIGINATOR, SKYHOOK);
-        Ok(profile)
+        let mut wire = Wire::new(codec, transport(), Dialect::Codex, super::openai::IMAGES);
+        wire.service = Some("codex");
+        wire.fixed(ORIGINATOR, SKYHOOK);
+        Ok(wire)
     }
 }
 
@@ -200,7 +193,7 @@ mod tests {
     use crate::provider::{
         Provider,
         codec::common::tests::reduce,
-        dialect::{ModelError, Sourced},
+        dialect::{AdmissionError, Common, ModelError},
         http::tests::reasoning_tool_request,
         protocol::Outcome,
     };
@@ -219,13 +212,13 @@ mod tests {
             base_url: Some(server.url.trim_end_matches("/responses").to_owned()),
             ..Common::default()
         };
-        let profile = Config::default().admit(request.codec).unwrap();
-        let profile = request.apply(profile).unwrap();
+        let wire = Config::default().admit(request.codec).unwrap();
+        let wire = request.apply(wire).unwrap();
         let connection = common.admit(BaseUrl::Required).unwrap();
         let credentials = subscription(auth::test_manager(directory));
         super::super::build(
             name,
-            profile,
+            wire,
             &connection,
             credentials,
             &mut super::super::Resources::default(),
@@ -240,7 +233,6 @@ mod tests {
         let body: String = [
             json!({"type":"codex.rate_limits","rate_limits":{}}),
             json!({"type":"codex.response.metadata","metadata":{}}),
-            json!({"type":"responsesapi.websocket_timing","timing":{}}),
             json!({"type":"response.output_item.added","output_index":0,"item":message}),
             json!({"type":"response.output_item.done","output_index":0,"item":message}),
             // Codex omits terminal output; streamed items remain authoritative.
@@ -294,7 +286,10 @@ mod tests {
         for (entry, error) in [
             (
                 "    api_key: k\n".to_owned(),
-                DialectError::CodexApiKey.to_string(),
+                DialectError::ManagedLogin {
+                    dialect: Dialect::Codex,
+                }
+                .to_string(),
             ),
             (
                 format!("    explicit_caching: true\n{model}"),
@@ -315,22 +310,16 @@ mod tests {
         assert_eq!(options.issuer().as_str(), "https://auth.openai.com/");
         Config::default().admit(CodecName::Responses).unwrap();
         assert_eq!(
-            options
-                .admit(&Common::default(), Config::base_url())
-                .unwrap()
-                .root
-                .as_str(),
+            (Common::default().admit(Config::base_url()).unwrap().root).as_str(),
             "https://chatgpt.com/backend-api"
         );
-        for base_url in [None, Some("https://api.example/codex".to_owned())] {
-            let common = Common {
-                base_url,
-                api_key: Some(Sourced::Literal("k".to_owned())),
-                ..Common::default()
-            };
+        // A key is refused at the service or a mirror.
+        for base_url in ["", "base_url: https://api.example/codex\n"] {
+            let yaml = format!("dialect: codex\n{base_url}api_key: k");
+            let entry = crate::yaml::parse::<super::super::RawProviderConfig>(&yaml).unwrap();
             assert!(matches!(
-                options.admit(&common, Config::base_url()),
-                Err(AdmissionError::Dialect(DialectError::CodexApiKey))
+                entry.admit(),
+                Err(AdmissionError::Dialect(DialectError::ManagedLogin { .. }))
             ));
         }
         let mirror = |url: &str| crate::yaml::parse::<Options>(&format!("auth_url: '{url}'"));

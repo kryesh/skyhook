@@ -2,91 +2,9 @@
 //! reads: `x-skyhook-preview` declares fields never shortened or text keeping
 //! both ends, and JSON-declared text is classified when saved.
 use super::*;
-use crate::json_schema::{Node, Resolver, accepts, declared_types};
-use crate::tool::output::{FieldPresentation, PREVIEW};
 use jsonschema::{JsonType, JsonTypeSet};
-
-/// Fields of a result whose presentation is declared, each presented one way.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Presented {
-    complete: BTreeSet<FieldPointer>,
-    ends: BTreeSet<FieldPointer>,
-}
-
-impl Presented {
-    pub(crate) const fn new() -> Self {
-        Self {
-            complete: BTreeSet::new(),
-            ends: BTreeSet::new(),
-        }
-    }
-
-    /// Fields never shortened.
-    pub(crate) const fn complete(&self) -> &BTreeSet<FieldPointer> {
-        &self.complete
-    }
-
-    /// Text fields keeping their first and last lines.
-    pub(crate) const fn ends(&self) -> &BTreeSet<FieldPointer> {
-        &self.ends
-    }
-
-    /// A field declared both ways is complete.
-    pub(crate) fn insert(&mut self, field: FieldPointer, presentation: FieldPresentation) {
-        match presentation {
-            FieldPresentation::Complete => {
-                self.ends.remove(&field);
-                self.complete.insert(field);
-            }
-            FieldPresentation::Ends if !self.complete.contains(&field) => {
-                self.ends.insert(field);
-            }
-            FieldPresentation::Ends => {}
-        }
-    }
-
-    pub(crate) fn fields(&self) -> impl Iterator<Item = (&FieldPointer, FieldPresentation)> {
-        let of = |presentation| move |field| (field, presentation);
-        (self.complete.iter().map(of(FieldPresentation::Complete)))
-            .chain(self.ends.iter().map(of(FieldPresentation::Ends)))
-    }
-
-    /// The value at `field` is a presentation already: presenting it again
-    /// leaves it whole.
-    pub(crate) fn presentation(field: FieldPointer) -> Self {
-        Self::from_iter([(field, FieldPresentation::Complete)])
-    }
-
-    /// These presentations, of a value placed at `field`.
-    pub(crate) fn at(&self, field: &FieldPointer) -> Self {
-        let placed = |(inner, presentation)| (field.join(inner), presentation);
-        self.fields().map(placed).collect()
-    }
-
-    /// The presentations of the value at `field`, addressed from it.
-    pub(crate) fn within(&self, field: &FieldPointer) -> Self {
-        let inside = |(inner, presentation): (&FieldPointer, _)| {
-            Some((inner.relative_to(field)?, presentation))
-        };
-        self.fields().filter_map(inside).collect()
-    }
-}
-
-impl Extend<(FieldPointer, FieldPresentation)> for Presented {
-    fn extend<I: IntoIterator<Item = (FieldPointer, FieldPresentation)>>(&mut self, fields: I) {
-        for (field, presentation) in fields {
-            self.insert(field, presentation);
-        }
-    }
-}
-
-impl FromIterator<(FieldPointer, FieldPresentation)> for Presented {
-    fn from_iter<I: IntoIterator<Item = (FieldPointer, FieldPresentation)>>(fields: I) -> Self {
-        let mut presented = Self::default();
-        presented.extend(fields);
-        presented
-    }
-}
+use skyhook_tools::output::{FieldPresentation, PREVIEW};
+use skyhook_tools::schema::navigate::{Node, Resolver, accepts, declared_types};
 
 /// Typed presentation assembled before the JobView is serialized.
 pub(super) struct Projected {
@@ -117,8 +35,8 @@ pub(super) fn project(
             (Some(document["result"].take()), None, Vec::new())
         }
         Some(_) => {
-            let reading = render::Reading::Sampled { presented };
-            let mut input = render::json_text(saved, &root, &document["result"], reading)?;
+            let reading = stream::Reading::Sampled { presented };
+            let mut input = stream::json_text(saved, &root, &document["result"], reading)?;
             let clipped = input.take_clipped();
             let preview = preview::preview(input, &root, presented, &clipped, cancellation)?;
             (Some(preview.value), preview.shape, preview.truncated)
@@ -164,7 +82,6 @@ pub(crate) fn json_text_fields(
 
 /// Insert `null` for each member the schema declares but `value` lacks, where the
 /// schema provably applies: a union branch counts only as the one that matches.
-#[cfg(feature = "script")]
 pub(crate) fn fill_absent(value: &mut Value, schema: &Value) {
     fn visit<'a>(value: &mut Value, schemas: &[Node<'a>], root: &'a Value) {
         let applicable = ApplicableSchemas::new(schemas, root, value, Branches::Unique);
@@ -240,7 +157,6 @@ enum Branches {
     /// Every branch the value may match: annotations hold wherever any may apply.
     Matching,
     /// The branch only when it is the one the value matches.
-    #[cfg(feature = "script")]
     Unique,
 }
 
@@ -264,7 +180,6 @@ impl<'a> ApplicableSchemas<'a> {
         Self(applicable)
     }
 
-    #[cfg(feature = "script")]
     fn declared(&self) -> impl Iterator<Item = &'a String> {
         (self.0.iter())
             .filter_map(|node| node.schema.get("properties")?.as_object())
@@ -499,7 +414,7 @@ mod tests {
     async fn text_fields_keep_their_limits_and_views_survive_resume() {
         let value = json!({"content":"line\n".repeat(250), "stdout":"é\\\"".repeat(TEXT_BYTES),
             "stderr":"e".repeat(2 * TEXT_BYTES), "extra":["z".repeat(10000)],
-            "instructions":"i".repeat(2 * TEXT_BYTES), "exit_code":7});
+            "instructions":"i".repeat(2 * TEXT_BYTES), "exit":{"code":7}});
         let schema = json!({"type":"object","properties":{"instructions":{PREVIEW:"complete"}}});
         let error = "failure details ".repeat(2000);
         let crate::tests::TestRuntime {
@@ -523,12 +438,12 @@ mod tests {
             result["extra"][0].as_str().unwrap().len(),
             SAMPLE_TEXT_BYTES[0]
         );
-        for field in ["instructions", "exit_code"] {
+        for field in ["instructions", "exit"] {
             assert_eq!(result[field], value[field]);
         }
         let rendered_error = ToolError::failed(error)
             .diagnostic()
-            .render(&Default::default());
+            .render(skyhook_tools::diagnostic::TargetView::Hidden);
         assert_eq!(view["error"], rendered_error);
         // Only strings were cut, so there is no shape. What was cut is read first.
         assert!(view["presentation"]["shape"].is_null());
@@ -588,7 +503,7 @@ mod tests {
     async fn declared_streams_keep_their_last_lines_from_storage() {
         let line = |line: usize| format!("line {line}\n");
         let stdout: String = (1..=20_000).map(line).collect();
-        let value = json!({"stdout": stdout, "stderr": "warning\n", "exit_code": 1});
+        let value = json!({"stdout": stdout, "stderr": "warning\n", "exit": {"code": 1}});
         let ends = json!({"type":"string", PREVIEW:"ends"});
         let schema = json!({"type":"object","properties":{"stdout":ends,"stderr":ends}});
         let (_root, manager, agent) = crate::job::tests::runtime().await;

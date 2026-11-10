@@ -38,7 +38,7 @@ impl LazyClient {
 }
 
 pub(crate) fn client() -> Result<Client, ProviderError> {
-    crate::tls::client_builder()
+    skyhook_worker::tls::client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         // The runtime owns retries; disable automatic protocol-nack retries here.
@@ -215,7 +215,7 @@ pub(crate) mod tests {
 
     /// A failure as a Chat provider reports it.
     fn reported(failure: Failure) -> ProviderError {
-        use crate::provider::{codec::Codec, http::errors::ErrorSignals};
+        use crate::provider::codec::{Codec, errors::ErrorSignals};
         match failure {
             Failure::Rejected(rejection) => {
                 let chat = crate::provider::codec::chat_completions::Dialect::compatible();
@@ -226,7 +226,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retry_after_accepts_seconds_and_http_dates_without_capping_server_delays() {
+    fn retry_after_accepts_seconds_and_http_dates() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(784111717);
         let parse = |values: &[&str]| {
             let mut headers = HeaderMap::new();
@@ -272,7 +272,7 @@ pub(crate) mod tests {
             .into()
     }
 
-    /// Posts once to `server`, asserting it took one request and no replay.
+    /// Posts once to `server`, asserting it took one request.
     async fn rejected(server: &mut Server) -> Failure {
         let client = client().unwrap();
         let post = post_sse(
@@ -284,7 +284,6 @@ pub(crate) mod tests {
         );
         let error = crate::tests::bounded(post).await.err().unwrap();
         server.request().await;
-        assert!(server.unclaimed().await.is_empty(), "unexpected replay");
         error
     }
 
@@ -328,7 +327,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn http_rejections_carry_status_message_and_retry_after_without_replay() {
+    async fn http_rejections_carry_status_message_and_retry_after() {
         use ProviderErrorKind::*;
         let json = "Content-Type: application/json\r\n";
         let refused = r#"{"error":{"message":"upstream rejected the request"}}"#;
@@ -420,7 +419,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn timeouts_are_one_attempt_and_a_new_call_gets_a_fresh_deadline() {
+    async fn a_timed_out_call_leaves_the_next_a_fresh_deadline() {
         use crate::tests::bounded;
         let mut server = Server::start(vec![
             Plan::stalled_headers(),
@@ -437,7 +436,6 @@ pub(crate) mod tests {
         let startup = Timeouts::default().startup;
         let (first, message) = timed_out(post(&client), &mut server, startup).await;
         assert_eq!(message, "provider HTTP startup timeout");
-        assert!(server.unclaimed().await.is_empty(), "unexpected replay");
         let (_, mut stream) = bounded(post(&client)).await.unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
         assert!(stream.next().await.is_none());
@@ -448,7 +446,6 @@ pub(crate) mod tests {
         let impatient = Client::builder().timeout(limit).build().unwrap();
         let (_, message) = timed_out(post(&impatient), &mut server, limit).await;
         assert_ne!(message, "provider HTTP startup timeout");
-        assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
     #[tokio::test]

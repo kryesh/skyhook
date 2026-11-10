@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Message;
-use crate::named_enum::named_enum;
+use skyhook_base::enums::NamedEnum;
 
 /// One entry of a request's context.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -21,20 +21,19 @@ pub struct State {
     pub lifetime: StateLifetime,
 }
 
-named_enum! {
-    /// How long a state stays in the model's view.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    pub enum StateLifetime {
-        /// Committed to the conversation: the model reads it in every later request a
-        /// response follows it in.
-        Persisted = "persisted",
-        /// An earlier request's state, which that request's response follows. The model
-        /// never reads it: a codec that can hide it resends it so the conversation stays
-        /// unchanged for reasoning bound to it, and any other omits it.
-        Superseded = "superseded",
-        /// This request's own state.
-        Current = "current",
-    }
+/// How long a state stays in the model's view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StateLifetime {
+    /// Committed to the conversation: the model reads it in every later request a
+    /// response follows it in.
+    Persisted,
+    /// An earlier request's state, which that request's response follows. The model
+    /// never reads it: a codec that can hide it resends it so the conversation stays
+    /// unchanged for reasoning bound to it, and any other omits it.
+    Superseded,
+    /// This request's own state.
+    Current,
 }
 
 impl From<Message> for Entry {

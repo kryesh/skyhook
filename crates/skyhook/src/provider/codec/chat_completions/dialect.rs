@@ -1,8 +1,8 @@
 //! The conventions that vary between Chat Completions servers.
 use crate::provider::{
     codec::{
-        BodyPath, BreakpointBudget, Cache, CacheControl, Identity, Locations, NonEmpty,
-        SchemaConstraint, StateRole, ToolNames, UnsignedReasoning, path,
+        BodyPath, Cache, CacheControl, Identity, Locations, NonEmpty, SchemaConstraint, StateRole,
+        ToolNames, UnsignedReasoning, path,
     },
     protocol::ReplayFormat,
 };
@@ -130,12 +130,11 @@ pub(crate) struct Dialect {
     pub tool_stream: Locations<BodyPath>,
     pub schema: SchemaConstraint,
     pub identity: Identity,
-    /// Breakpoints go on marked system segments and history boundaries, within
-    /// `breakpoints`, which forces the parts form on those messages: as
-    /// `prompt_cache_breakpoint` in explicit mode, or as `cache_control` in any.
+    /// Breakpoints go on marked system segments and history boundaries, which
+    /// forces the parts form on those messages: as `prompt_cache_breakpoint` in
+    /// explicit mode, or as `cache_control` in any.
     pub cache: Cache,
     pub cache_control: CacheControl,
-    pub breakpoints: BreakpointBudget,
     pub state_role: StateRole,
 }
 
@@ -158,8 +157,6 @@ impl Dialect {
             identity: Identity::NONE,
             cache: Cache::Automatic,
             cache_control: CacheControl::Omitted,
-            // A request makes at most four explicit cache writes.
-            breakpoints: BreakpointBudget::new(4),
             state_role: StateRole::User,
         }
     }

@@ -1,37 +1,63 @@
 //! The native event types.
 
 use super::*;
-use crate::named_enum::named_enum;
+use skyhook_base::enums::NamedEnum;
 
-named_enum! {
-    /// The native event types this codec reads; others carry nothing it uses.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) parsed enum Event {
-        ItemAdded = "response.output_item.added",
-        ItemDone = "response.output_item.done",
-        TextDelta = "response.output_text.delta",
-        TextDone = "response.output_text.done",
-        RefusalDelta = "response.refusal.delta",
-        RefusalDone = "response.refusal.done",
-        ReasoningDelta = "response.reasoning_text.delta",
-        ReasoningDone = "response.reasoning_text.done",
-        SummaryDelta = "response.reasoning_summary_text.delta",
-        SummaryDone = "response.reasoning_summary_text.done",
-        ArgumentsDelta = "response.function_call_arguments.delta",
-        ArgumentsDone = "response.function_call_arguments.done",
-        PartAdded = "response.content_part.added",
-        PartDone = "response.content_part.done",
-        ReasoningPartAdded = "response.reasoning_part.added",
-        ReasoningPartDone = "response.reasoning_part.done",
-        SummaryPartAdded = "response.reasoning_summary_part.added",
-        SummaryPartDone = "response.reasoning_summary_part.done",
-        Completed = "response.completed",
-        Incomplete = "response.incomplete",
-        Failed = "response.failed",
-        Error = "error" | "response.error",
-        Aborted = "response.aborted" | "response.cancelled" | "response.canceled"
-            | "response.interrupted",
-    }
+/// The native event types this codec reads; others carry nothing it uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Event {
+    #[serde(rename = "response.output_item.added")]
+    ItemAdded,
+    #[serde(rename = "response.output_item.done")]
+    ItemDone,
+    #[serde(rename = "response.output_text.delta")]
+    TextDelta,
+    #[serde(rename = "response.output_text.done")]
+    TextDone,
+    #[serde(rename = "response.refusal.delta")]
+    RefusalDelta,
+    #[serde(rename = "response.refusal.done")]
+    RefusalDone,
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningDelta,
+    #[serde(rename = "response.reasoning_text.done")]
+    ReasoningDone,
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    SummaryDelta,
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    SummaryDone,
+    #[serde(rename = "response.function_call_arguments.delta")]
+    ArgumentsDelta,
+    #[serde(rename = "response.function_call_arguments.done")]
+    ArgumentsDone,
+    #[serde(rename = "response.content_part.added")]
+    PartAdded,
+    #[serde(rename = "response.content_part.done")]
+    PartDone,
+    #[serde(rename = "response.reasoning_part.added")]
+    ReasoningPartAdded,
+    #[serde(rename = "response.reasoning_part.done")]
+    ReasoningPartDone,
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    SummaryPartAdded,
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    SummaryPartDone,
+    #[serde(rename = "response.completed")]
+    Completed,
+    #[serde(rename = "response.incomplete")]
+    Incomplete,
+    #[serde(rename = "response.failed")]
+    Failed,
+    #[serde(alias = "response.error")]
+    Error,
+    #[serde(
+        rename = "response.aborted",
+        alias = "response.cancelled",
+        alias = "response.canceled",
+        alias = "response.interrupted"
+    )]
+    Aborted,
 }
 
 impl Event {

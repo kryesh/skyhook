@@ -1,92 +1,20 @@
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use skyhook::{
-    Bounded,
-    identity::AgentId,
-    tool::{RegistryError, ToolError, ToolRegistryBuilder, policy::CapabilitySet},
-};
+use skyhook::tool::catalog::RegistryError;
+use skyhook::tool::policy::CapabilitySet;
+use skyhook::tool::{ToolError, ToolRegistryBuilder};
+use skyhook_base::bounded::Bounded;
 
 use super::{Action, Placement, holds, options, output};
 use crate::capabilities::SecurityCapability;
 use crate::store::{
-    ComponentId, Cursor, EnvironmentView, Event, FlawId, FlawStatus, Found, Keyed, ListQuery,
-    Listing, Live, NodeId, NodeKind, NodeSummary, NodeView, Page, PremiseScope, PremiseStatus,
-    Search, SearchError, SpentWork, Startables, StateScope, Status, Store, Synthesis, Task,
-    TaskDetail, TaskId,
+    Cursor, Event, Found, ListItem, ListQuery, Listing, Live, NodeId, NodeKind, NodeView, Page,
+    Search, SearchError, SpentWork, Startables, Store, Synthesis, TaskDetail, TaskId,
 };
 
 /// The events a task read shows of its child's, `more` flagging the rest.
 const TASK_EVENTS: usize = 100;
-
-/// Records of one kind, filtered: live nodes, environments or tasks
-#[derive(Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ListRecord {
-    Component {},
-    Path {},
-    State {
-        scope: Option<StateScope>,
-    },
-    Premise {
-        scope: Option<PremiseScope>,
-        status: Option<PremiseStatus>,
-    },
-    Flaw {
-        status: Option<FlawStatus>,
-        component: Option<ComponentId>,
-    },
-    Candidate {
-        root: Option<FlawId>,
-        state: Option<Status>,
-    },
-    Finding {},
-    Environment {},
-    Task {},
-}
-
-/// A listed record: a node's summary, an environment or a task.
-#[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
-enum Listed {
-    Node(NodeSummary),
-    Environment(EnvironmentView),
-    Task(Task),
-}
-
-impl Keyed for Listed {
-    fn key(&self) -> i64 {
-        match self {
-            Self::Node(node) => node.key(),
-            Self::Environment(environment) => environment.key(),
-            Self::Task(task) => task.key(),
-        }
-    }
-}
-
-fn listed<T>(listing: Listing<T>, wrap: fn(T) -> Listed) -> Listing<Listed> {
-    Listing {
-        items: listing.items.into_iter().map(wrap).collect(),
-        next_after: listing.next_after,
-    }
-}
-
-impl ListRecord {
-    fn read(self, store: &Store, page: Page) -> crate::store::Result<Listing<Listed>> {
-        let nodes = |query: ListQuery| Ok(listed(store.list(&query, page)?, Listed::Node));
-        match self {
-            Self::Component {} => nodes(ListQuery::Component),
-            Self::Path {} => nodes(ListQuery::Path),
-            Self::State { scope } => nodes(ListQuery::State { scope }),
-            Self::Premise { scope, status } => nodes(ListQuery::Premise { scope, status }),
-            Self::Flaw { status, component } => nodes(ListQuery::Flaw { status, component }),
-            Self::Candidate { root, state } => nodes(ListQuery::Candidate { root, state }),
-            Self::Finding {} => nodes(ListQuery::Finding),
-            Self::Environment {} => Ok(listed(store.environments(page)?, Listed::Environment)),
-            Self::Task {} => Ok(listed(store.task_page(page)?, Listed::Task)),
-        }
-    }
-}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -178,10 +106,10 @@ actions! {
         /// "flaw", status: "suspected"}, page}`. → page of {id, title, status?}, or of
         /// environment or task records
         list => List {
-            record: ListRecord,
+            record: ListQuery,
             #[serde(default)]
             page: Page,
-        } -> Listing<Listed>,
+        } -> Listing<ListItem>,
         /// Live nodes by their own text and code locations, a merged node's under the node it was
         /// merged into; needs `pattern`, `file` or `function`. → page of {id, title, status?,
         /// kind, hits: [{in, text}], more?: unlisted hits}
@@ -211,7 +139,7 @@ impl Action for Query {
 }
 
 impl Query {
-    fn execute(self, store: &Store, _: &AgentId) -> Result<Value, ToolError> {
+    fn execute(self, store: &Store) -> Result<Value, ToolError> {
         match self {
             Self::Startable(a) => output::<result::Startable>(
                 store.startable(&a.running, &a.spent, &a.live, a.after, a.limit),
@@ -219,7 +147,7 @@ impl Query {
             Self::Synthesis(a) => output::<result::Synthesis>(store.synthesis(&a.spent)),
             Self::Node(a) => output::<result::Node>(store.node(a.id)),
             Self::Task(a) => output::<result::Task>(store.task(a.id, TASK_EVENTS)),
-            Self::List(a) => output::<result::List>(a.record.read(store, a.page)),
+            Self::List(a) => output::<result::List>(store.list(&a.record, a.page)),
             Self::Search(a) => output::<result::Search>(store.search(&a.search, a.page)),
             Self::History(a) => output::<result::History>(store.history(a.node, a.page)),
         }
@@ -232,6 +160,6 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         "research_query",
         "Read the run's research graph and the work it owes. Every list is a keyset page {items: T[], next_after?: integer}: continue with page.after = next_after until it is absent, even when a page is empty. Result: JobView<T>, T as each action gives after →",
         options::<Query>(),
-        |store, actor, _, query| query.execute(store, actor),
+        |store, _, _, query| query.execute(store),
     )
 }

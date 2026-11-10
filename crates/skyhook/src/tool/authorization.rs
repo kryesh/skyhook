@@ -5,75 +5,19 @@ use std::{
 
 use futures_util::future::{BoxFuture, FutureExt as _, Shared, WeakShared};
 
+use crate::identity::AgentId;
+use crate::target::{Revisions, TargetDefinition};
+use crate::tool::policy::{ApprovalGrant, CapabilitySet, PermissionUse};
 use crate::{
-    identity::{AgentId, JobId},
     job::CancellationToken,
     session::SessionStore,
-    target::{Revisions, TargetDefinition, TargetName, TargetRegistry, replaces},
+    target::{TargetRegistry, replaces},
 };
+use skyhook_tools::arguments::Arguments;
+use skyhook_tools::target::TargetName;
+use skyhook_worker::job::JobId;
 
-use super::{
-    AdmissionError,
-    policy::{
-        Approval, ApprovalGrant, AuthorizationRequest, CapabilitySet, PermissionUse, Policy,
-        PolicyDecision, ResourceId,
-    },
-};
-
-/// Whether a decision may ask anyone. One for a call naming a path outside the
-/// root that does not resolve may not: asking would tell the call it exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum Asking {
-    Allowed,
-    Never,
-}
-
-impl Asking {
-    /// Whether a call whose path preflight left `unresolved` may ask anyone.
-    pub(crate) const fn for_unresolved<T>(unresolved: &Option<T>) -> Self {
-        match unresolved {
-            Some(_) => Self::Never,
-            None => Self::Allowed,
-        }
-    }
-}
-
-#[derive(Clone, Debug, thiserror::Error, serde::Deserialize, serde::Serialize)]
-pub(crate) enum AuthorizationError {
-    #[error("{0}")]
-    Denied(String),
-    #[error("cancelled")]
-    Cancelled,
-    #[error("{0}")]
-    InvalidGrant(String),
-    /// The named tool needs a capability its subject lacks.
-    #[error("tool `{0}` is unavailable in this context")]
-    Unavailable(String),
-    /// The policy stopped before deciding; nothing was denied or allowed.
-    #[error("authorization could not be decided")]
-    PolicyFailed,
-    /// The call names a target since redefined: a stale route or revision, or a
-    /// pending decision the redefinition revoked. An approval never carries over
-    /// to a replaced target.
-    #[error("target was redefined")]
-    TargetRedefined,
-}
-
-/// The one tool-facing reading of an authorization failure, whichever path
-/// (local, remote worker, or route) authorized. What the failure left behind is
-/// the call site's to say: only admission knows nothing had started.
-impl From<AuthorizationError> for AdmissionError {
-    fn from(error: AuthorizationError) -> Self {
-        match error {
-            AuthorizationError::Denied(reason) => Self::denied(reason),
-            AuthorizationError::Cancelled => Self::cancelled(),
-            AuthorizationError::Unavailable(tool) => Self::unavailable(&tool),
-            AuthorizationError::InvalidGrant(_)
-            | AuthorizationError::PolicyFailed
-            | AuthorizationError::TargetRedefined => Self::failed(error),
-        }
-    }
-}
+use super::policy::{Approval, AuthorizationRequest, Policy, PolicyDecision};
 
 #[derive(Clone)]
 pub(crate) struct AuthorizationSubject {
@@ -88,63 +32,25 @@ pub(crate) struct AuthorizationSubject {
 /// request. The tool's own arguments keep their namespace.
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct AuthorizationArguments {
-    pub(crate) tool: super::registry::Arguments,
+    pub(crate) tool: Arguments,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) route: Option<serde_json::Value>,
+    pub(crate) route: Option<crate::target::RouteArguments>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<SourceArguments>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct SourceArguments {
-    pub(crate) path: String,
-    pub(crate) target: crate::target::TargetRef,
+    pub(crate) path: skyhook_worker::op::TargetPath,
+    pub(crate) target: skyhook_tools::target::TargetRef,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) route: Option<serde_json::Value>,
+    pub(crate) route: Option<crate::target::RouteArguments>,
 }
 
 impl AuthorizationArguments {
-    /// The document a request shows, naming the origin a running request moved to.
-    pub(crate) fn document(&self, network_origin: Option<&str>) -> serde_json::Value {
-        #[derive(serde::Serialize)]
-        struct Document<'a> {
-            #[serde(flatten)]
-            arguments: &'a AuthorizationArguments,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            network_origin: Option<&'a str>,
-        }
-        let document = Document {
-            arguments: self,
-            network_origin,
-        };
-        serde_json::to_value(document).expect("JSON values and strings serialize")
-    }
-}
-
-/// What a running invocation asks its host to authorize.
-#[derive(Debug)]
-pub(crate) enum Reauthorization {
-    /// Permissions derived where the invocation runs.
-    Permissions(Vec<PermissionUse>, Asking),
-    /// The origin a running request moved to, which the policy is also shown.
-    Network(String),
-}
-
-impl Reauthorization {
-    /// The permissions asked for on `target`, the origin a request moved to,
-    /// and whether the decision may ask anyone.
-    pub(crate) fn into_parts(
-        self,
-        target: &crate::target::TargetRef,
-    ) -> (Vec<PermissionUse>, Option<String>, Asking) {
-        match self {
-            Self::Permissions(permissions, asking) => (permissions, None, asking),
-            Self::Network(origin) => {
-                let resource = super::policy::ResourceId::network(target, &origin);
-                let permission = PermissionUse::new(super::policy::Capability::Network, resource);
-                (vec![permission], Some(origin), Asking::Allowed)
-            }
-        }
+    /// The document a request shows.
+    pub(crate) fn document(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("JSON values and strings serialize")
     }
 }
 
@@ -165,9 +71,8 @@ enum Ended {
 pub(crate) struct AuthorizationCoordinator {
     policy: Arc<dyn Policy>,
     state: Arc<Mutex<ApprovalState>>,
-    /// The session whose target revisions grants and decisions count for; without
-    /// it, every target counts as current.
-    targets: Option<SessionStore>,
+    /// The session whose target revisions grants and decisions count for.
+    targets: SessionStore,
 }
 
 /// Grants last as long as the coordinator: a reopened session asks again.
@@ -192,31 +97,23 @@ struct Decision {
 }
 
 impl AuthorizationCoordinator {
-    pub fn new(policy: Arc<dyn Policy>) -> Self {
+    /// A coordinator counting grants and decisions only for the revisions of
+    /// `targets`' targets they were approved or asked for.
+    pub fn new(policy: Arc<dyn Policy>, targets: SessionStore) -> Self {
         Self {
             policy,
             state: Arc::default(),
-            targets: None,
+            targets,
         }
-    }
-
-    /// Count grants and decisions only for the revisions of `store`'s targets
-    /// they were approved or asked for.
-    pub(crate) fn with_targets(mut self, store: SessionStore) -> Self {
-        self.targets = Some(store);
-        self
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, ApprovalState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Read the session's targets, if any are tracked.
-    fn read<T>(&self, read: impl FnOnce(Option<&TargetRegistry>) -> T) -> T {
-        match &self.targets {
-            Some(store) => store.read(|state| read(Some(&state.targets))),
-            None => read(None),
-        }
+    /// Read the session's targets.
+    fn read<T>(&self, read: impl FnOnce(&TargetRegistry) -> T) -> T {
+        self.targets.read(|state| read(&state.targets))
     }
 
     /// Withdraw the decisions asked about a revision `redefined` replaces; a call
@@ -280,8 +177,9 @@ impl AuthorizationCoordinator {
     }
 
     /// The decision `permissions` wait for, asked by this call or joined from
-    /// another; none once usable grants cover them. Target revisions are read under this
-    /// lock, so no grant counts, and no decision is asked, for one replaced.
+    /// another; none once usable grants cover them, or they read the session's own
+    /// spill files. Target revisions are read under this lock, so no grant counts,
+    /// and no decision is asked, for one replaced.
     fn pending(
         &self,
         subject: &AuthorizationSubject,
@@ -293,17 +191,22 @@ impl AuthorizationCoordinator {
     ) -> Result<Option<Pending>, AuthorizationError> {
         let mut state = self.state();
         let grants = &mut state.grants;
-        let asked = self.read(|targets| {
-            grants.retain(|(_, approved)| current(targets, approved));
-            let asked = (permissions.iter()).map(|use_| revisions(targets, &use_.resource));
-            (current(targets, admitted).then(|| asked.collect::<Option<Vec<_>>>())).flatten()
+        let asked = self.targets.read(|session| {
+            let targets = &session.targets;
+            grants.retain(|(_, approved)| targets.current(approved));
+            let asked = (permissions.iter()).map(|use_| targets.revisions(&use_.resource));
+            let asked = (targets.current(admitted))
+                .then(|| asked.collect::<Option<Vec<_>>>())
+                .flatten()?;
+            let covered = |use_: &&PermissionUse| {
+                session.spills.covers(use_, targets)
+                    || (grants.iter())
+                        .any(|(grant, _)| grant.covers(&use_.capability, &use_.resource))
+            };
+            let needed = (permissions.iter()).filter(|use_| !covered(use_)).cloned();
+            Some((asked, needed.collect::<Vec<_>>()))
         });
-        let asked = asked.ok_or(AuthorizationError::TargetRedefined)?;
-        let covered = |use_: &&PermissionUse| {
-            (state.grants.iter()).any(|(grant, _)| grant.covers(&use_.capability, &use_.resource))
-        };
-        let needed = (permissions.iter()).filter(|use_| !covered(use_)).cloned();
-        let needed = needed.collect::<Vec<_>>();
+        let (asked, needed) = asked.ok_or(AuthorizationError::TargetRedefined)?;
         if needed.is_empty() {
             return Ok(None);
         }
@@ -369,10 +272,10 @@ impl AuthorizationCoordinator {
         let grants = result.map_err(Ended::Refused)?;
         let approved = self.read(|targets| {
             let approved = grants.into_iter().filter_map(|grant| {
-                let revisions = revisions(targets, &grant.resource)?;
+                let revisions = targets.revisions(&grant.resource)?;
                 Some((grant, revisions))
             });
-            current(targets, &decision.revisions).then(|| approved.collect::<Vec<_>>())
+            (targets.current(&decision.revisions)).then(|| approved.collect::<Vec<_>>())
         });
         for (grant, revisions) in approved.ok_or(Ended::Revoked)? {
             state.grants.retain(|(known, _)| known != &grant);
@@ -443,32 +346,74 @@ impl AuthorizationCoordinator {
     }
 }
 
-/// Whether every target in `revisions` is still at its revision, as grants,
-/// decisions and the connections asking for them count only while they are.
-fn current(targets: Option<&TargetRegistry>, revisions: &[(TargetName, u64)]) -> bool {
-    targets.is_none_or(|targets| targets.current(revisions))
-}
-
-/// The revision of every target `resource` names, as `targets` now stand.
-fn revisions(targets: Option<&TargetRegistry>, resource: &ResourceId) -> Option<Revisions> {
-    targets.map_or(Some(Vec::new()), |targets| targets.revisions(resource))
-}
-
 /// A decision a call waits for.
 enum Pending {
     Asked(ApprovalFuture),
     /// Another call's, for an overlapping proposal.
     Joined(ApprovalFuture),
 }
+
+/// Whether a decision may ask anyone. One for a call naming a path outside the
+/// root that does not resolve may not: asking would tell the call it exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Asking {
+    Allowed,
+    Never,
+}
+
+impl Asking {
+    /// Whether a call whose path preflight left `unresolved` may ask anyone.
+    pub const fn for_unresolved<T>(unresolved: &Option<T>) -> Self {
+        match unresolved {
+            Some(_) => Self::Never,
+            None => Self::Allowed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, serde::Deserialize, serde::Serialize)]
+pub enum AuthorizationError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    InvalidGrant(String),
+    /// The named tool needs a capability its subject lacks.
+    #[error("tool `{0}` is unavailable in this context")]
+    Unavailable(String),
+    /// The policy stopped before deciding; nothing was denied or allowed.
+    #[error("authorization could not be decided")]
+    PolicyFailed,
+    /// The call names a target since redefined: a stale route or revision, or a
+    /// pending decision the redefinition revoked. An approval never carries over
+    /// to a replaced target.
+    #[error("target was redefined")]
+    TargetRedefined,
+}
+
+/// The one tool-facing reading of an authorization failure. What the failure left
+/// behind is the call site's to say: only admission knows nothing had started.
+impl From<AuthorizationError> for skyhook_tools::error::AdmissionError {
+    fn from(error: AuthorizationError) -> Self {
+        match error {
+            AuthorizationError::Denied(reason) => Self::denied(reason),
+            AuthorizationError::Cancelled => Self::cancelled(),
+            AuthorizationError::Unavailable(tool) => Self::unavailable(&tool),
+            AuthorizationError::InvalidGrant(_)
+            | AuthorizationError::PolicyFailed
+            | AuthorizationError::TargetRedefined => Self::failed(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
-    use crate::{
-        identity::SessionId,
-        tool::policy::{Capability, ResourceId},
-    };
+    use crate::identity::SessionId;
+    use crate::tool::policy::{Capability, ResourceId};
 
     fn subject(cancellation: CancellationToken) -> AuthorizationSubject {
         AuthorizationSubject {
@@ -478,6 +423,15 @@ mod tests {
             capabilities: CapabilitySet::default(),
             cancellation,
         }
+    }
+
+    /// A coordinator over a new session's targets, and the session it keeps open.
+    async fn coordinator(
+        policy: Arc<dyn Policy>,
+    ) -> (crate::tests::TestRuntime, AuthorizationCoordinator) {
+        let session = crate::tests::TestRuntime::new().await;
+        let coordinator = AuthorizationCoordinator::new(policy, session.store.clone());
+        (session, coordinator)
     }
 
     async fn authorize(
@@ -505,7 +459,7 @@ mod tests {
     async fn grants_are_cached_for_arbitrary_resources_but_denials_are_not() {
         let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
         let policy = Arc::new(crate::tests::PromptingPolicy(prompts));
-        let coordinator = AuthorizationCoordinator::new(policy);
+        let (_session, coordinator) = coordinator(policy).await;
         let subject = subject(CancellationToken::new());
         let resource = ResourceId::mcp("server", "operation");
         let denied = authorize(&coordinator, &subject, &resource);
@@ -527,7 +481,7 @@ mod tests {
         for answered in [true, false] {
             let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
             let policy = Arc::new(crate::tests::PromptingPolicy(prompts));
-            let coordinator = AuthorizationCoordinator::new(policy);
+            let (_session, coordinator) = coordinator(policy).await;
             let resource = ResourceId::session("shared");
             let first = CancellationToken::new();
             let spawned = tokio::spawn({
@@ -576,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_policy_fails_every_call_waiting_on_it() {
         let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
-        let coordinator = AuthorizationCoordinator::new(Arc::new(PanickingPolicy(prompts)));
+        let (_session, coordinator) = coordinator(Arc::new(PanickingPolicy(prompts))).await;
         let (subject, resource) = (
             subject(CancellationToken::new()),
             ResourceId::session("one"),
@@ -606,8 +560,8 @@ mod tests {
     #[tokio::test]
     async fn only_calls_that_may_ask_share_a_decision() {
         let (prompts, _asked) = tokio::sync::mpsc::unbounded_channel();
-        let coordinator =
-            AuthorizationCoordinator::new(Arc::new(crate::tests::PromptingPolicy(prompts)));
+        let policy = Arc::new(crate::tests::PromptingPolicy(prompts));
+        let (_session, coordinator) = coordinator(policy).await;
         let subject = subject(CancellationToken::new());
         let permissions = [PermissionUse::exact(
             Capability::Write,

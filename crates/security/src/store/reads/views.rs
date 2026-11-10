@@ -4,31 +4,32 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::super::*;
+use crate::cvss::Severity;
 
 /// A result recorded outside the work owning it that differs from the standing one, which that
 /// work decides: the latest, with the task and agent that recorded it.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
-pub struct Proposal<T> {
-    pub value: T,
-    pub event: EventId,
+pub(crate) struct Proposal<T> {
+    pub(crate) value: T,
+    pub(crate) event: EventId,
     /// The work it was recorded within; none outside every task.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<TaskId>,
-    pub agent: AgentId,
+    pub(crate) task: Option<TaskId>,
+    pub(crate) agent: AgentId,
 }
 
 /// A proposed assessment.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
-pub struct Scored {
-    pub vector: String,
-    pub severity: Severity,
-    pub score: f64,
+pub(crate) struct Scored {
+    pub(crate) vector: String,
+    pub(crate) severity: Severity,
+    pub(crate) score: f64,
 }
 
 /// A proposal of the result a phase records on its subject.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(untagged)]
-pub enum Proposed {
+pub(crate) enum Proposed {
     Premise(PremiseStatus),
     Flaw(FlawStatus),
     Assessment(Scored),
@@ -37,331 +38,335 @@ pub enum Proposed {
 
 /// What every node view leads with.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct Head {
-    pub id: NodeId,
-    pub title: String,
-    pub body: String,
+pub(crate) struct Head {
+    pub(crate) id: NodeId,
+    pub(crate) title: String,
+    pub(crate) body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub merged_into: Option<NodeId>,
-    pub evidence: Vec<EvidenceView>,
+    pub(crate) merged_into: Option<NodeId>,
+    pub(crate) evidence: Vec<EvidenceView>,
     /// The latest tasks on it or on a node merged into it, newest first: `task` reads each.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tasks: Vec<TaskId>,
+    pub(crate) tasks: Vec<TaskId>,
 }
 
 /// A neighbouring node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Ref {
-    pub id: NodeId,
-    pub title: String,
+pub(crate) struct Ref {
+    pub(crate) id: NodeId,
+    pub(crate) title: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct PremiseRef {
-    pub id: PremiseId,
-    pub title: String,
-    pub scope: PremiseScope,
-    pub status: PremiseStatus,
+pub(crate) struct PremiseRef {
+    pub(crate) id: PremiseId,
+    pub(crate) title: String,
+    pub(crate) scope: PremiseScope,
+    pub(crate) status: PremiseStatus,
 }
 
 /// A decided premise of a flaw leaving a state wrong, which the state's check may contradict:
 /// the decision its standing rests on, the task that decision was recorded within, and how much
 /// evidence it carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct DecidedPremise {
+pub(crate) struct DecidedPremise {
     #[serde(flatten)]
-    pub premise: PremiseRef,
-    pub decided: EventId,
+    pub(crate) premise: PremiseRef,
+    pub(crate) decided: EventId,
     /// None when decided outside every task.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<TaskId>,
-    pub evidence: u64,
+    pub(crate) task: Option<TaskId>,
+    pub(crate) evidence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct FlawRef {
-    pub id: FlawId,
-    pub title: String,
-    pub status: FlawStatus,
+pub(crate) struct FlawRef {
+    pub(crate) id: FlawId,
+    pub(crate) title: String,
+    pub(crate) status: FlawStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct CandidateRef {
-    pub id: CandidateId,
-    pub title: String,
-    pub status: Status,
+pub(crate) struct CandidateRef {
+    pub(crate) id: CandidateId,
+    pub(crate) title: String,
+    pub(crate) status: Status,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct EvidenceView {
-    pub id: EvidenceId,
+pub(crate) struct EvidenceView {
+    pub(crate) id: EvidenceId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Location>,
+    pub(crate) location: Option<Location>,
     /// Where it was observed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<EnvironmentId>,
-    pub stance: Stance,
-    pub note: String,
-    pub event: EventId,
+    pub(crate) environment: Option<EnvironmentId>,
+    pub(crate) stance: Stance,
+    pub(crate) note: String,
+    pub(crate) event: EventId,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct Step {
-    pub position: u32,
-    pub component: Ref,
+pub(crate) struct Step {
+    pub(crate) position: u32,
+    pub(crate) component: Ref,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Location>,
-    pub note: String,
+    pub(crate) location: Option<Location>,
+    pub(crate) note: String,
 }
 
-/// A state's scope, with an input state's trust.
+/// An input state's trust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(tag = "scope", rename_all = "snake_case")]
-pub enum Scoped {
-    Input { trust: Trust },
-    Handed,
-    Instance,
-    Stored,
+#[schemars(inline)]
+pub(crate) struct Trusted {
+    pub(crate) trust: Trust,
 }
 
 /// A state a path reads or writes, at the location it does.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct AccessRef {
-    pub id: StateId,
-    pub title: String,
+pub(crate) struct AccessRef {
+    pub(crate) id: StateId,
+    pub(crate) title: String,
     #[serde(flatten)]
-    pub scope: Scoped,
-    pub status: InventoryStatus,
-    pub access: Access,
-    pub location: Location,
+    pub(crate) scope: StateScoped<Trusted>,
+    pub(crate) status: InventoryStatus,
+    pub(crate) access: Access,
+    pub(crate) location: Location,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct ComponentView {
+pub(crate) struct ComponentView {
     #[serde(flatten)]
-    pub head: Head,
-    pub status: InventoryStatus,
-    pub files: Vec<String>,
-    pub interfaces: Vec<InterfaceName>,
+    pub(crate) head: Head,
+    pub(crate) status: InventoryStatus,
+    pub(crate) files: Vec<String>,
+    pub(crate) interfaces: Vec<InterfaceName>,
     /// The live paths stepping through it.
-    pub paths: Vec<Ref>,
-    pub flaws: Vec<FlawRef>,
+    pub(crate) paths: Vec<Ref>,
+    pub(crate) flaws: Vec<FlawRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct PathView {
+pub(crate) struct PathView {
     #[serde(flatten)]
-    pub head: Head,
-    pub steps: Vec<Step>,
+    pub(crate) head: Head,
+    pub(crate) steps: Vec<Step>,
     /// The states its flow reads or writes.
-    pub states: Vec<AccessRef>,
-    pub premises: Vec<PremiseRef>,
-    pub candidates: Vec<CandidateRef>,
+    pub(crate) states: Vec<AccessRef>,
+    pub(crate) premises: Vec<PremiseRef>,
+    pub(crate) candidates: Vec<CandidateRef>,
     /// While unswept and it reads a recorded input or handed state, it owes a sweep.
-    pub status: PathStatus,
+    pub(crate) status: PathStatus,
 }
 
 /// A path's read or write of a state, at the location it does.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct AccessView {
-    pub path: Ref,
-    pub access: Access,
-    pub location: Location,
+pub(crate) struct AccessView {
+    pub(crate) path: Ref,
+    pub(crate) access: Access,
+    pub(crate) location: Location,
 }
 
 /// An input state's trust and the read defining it.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct InputView {
-    pub location: Location,
-    pub trust: Trust,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub(crate) struct InputView {
+    /// The location of its defining read
+    pub(crate) location: Location,
+    pub(crate) trust: Trust,
+}
+
+/// A live input state's trust and defining read; a merged one's location is free for another.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(inline)]
+pub(crate) struct LiveInput {
+    #[serde(flatten)]
+    pub(crate) read: Option<InputView>,
 }
 
 /// The event that last recorded a state's check across calls, and whether it stands: no access,
 /// edit or merge came since, and no premise its checks rest on failed or was contradicted.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct CheckView {
-    pub event: EventId,
-    pub note: Option<String>,
-    pub current: bool,
+pub(crate) struct CheckView {
+    pub(crate) event: EventId,
+    pub(crate) note: Option<String>,
+    pub(crate) current: bool,
     /// The premises its checks cleared it on.
-    pub rests_on: Vec<PremiseRef>,
+    pub(crate) rests_on: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct StateView {
+pub(crate) struct StateView {
     #[serde(flatten)]
-    pub head: Head,
-    pub scope: StateScope,
-    pub status: InventoryStatus,
-    /// A live input state's trust and defining read; a merged one's location is free for another.
+    pub(crate) head: Head,
     #[serde(flatten)]
-    pub input: Option<InputView>,
+    pub(crate) scope: StateScoped<LiveInput>,
+    pub(crate) status: InventoryStatus,
     /// Each path's reads and writes of it, by path.
-    pub accesses: Vec<AccessView>,
+    pub(crate) accesses: Vec<AccessView>,
     /// The flaws leaving it wrong.
-    pub flaws: Vec<FlawRef>,
+    pub(crate) flaws: Vec<FlawRef>,
     /// The decided premises of those flaws.
-    pub premises: Vec<DecidedPremise>,
+    pub(crate) premises: Vec<DecidedPremise>,
     /// Its latest check across calls; none until one is recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub check: Option<CheckView>,
+    pub(crate) check: Option<CheckView>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct PremiseView {
+pub(crate) struct PremiseView {
     #[serde(flatten)]
-    pub head: Head,
-    pub scope: PremiseScope,
+    pub(crate) head: Head,
+    pub(crate) scope: PremiseScope,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Location>,
-    pub status: PremiseStatus,
+    pub(crate) location: Option<Location>,
+    pub(crate) status: PremiseStatus,
     /// A status its settle, or for a deployment premise the user, has yet to decide.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed: Option<Proposal<PremiseStatus>>,
+    pub(crate) proposed: Option<Proposal<PremiseStatus>>,
     /// A proposal or contradicting evidence came after its status.
-    pub disputed: bool,
-    pub flaws: Vec<Ref>,
-    pub paths: Vec<Ref>,
+    pub(crate) disputed: bool,
+    pub(crate) flaws: Vec<Ref>,
+    pub(crate) paths: Vec<Ref>,
     /// The states whose checks rest on it.
-    pub states: Vec<Ref>,
+    pub(crate) states: Vec<Ref>,
     /// The premises it holds only if they do.
-    pub rests_on: Vec<PremiseRef>,
+    pub(crate) rests_on: Vec<PremiseRef>,
     /// The premises holding only if it does.
-    pub rested_on_by: Vec<PremiseRef>,
+    pub(crate) rested_on_by: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct Chained {
-    pub id: CandidateId,
-    pub title: String,
-    pub position: u32,
+pub(crate) struct Chained {
+    pub(crate) id: CandidateId,
+    pub(crate) title: String,
+    pub(crate) position: u32,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct FlawView {
+pub(crate) struct FlawView {
     #[serde(flatten)]
-    pub head: Head,
-    pub component: Ref,
-    pub location: Location,
+    pub(crate) head: Head,
+    pub(crate) component: Ref,
+    pub(crate) location: Location,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwe: Option<u32>,
-    pub status: FlawStatus,
+    pub(crate) cwe: Option<u32>,
+    pub(crate) status: FlawStatus,
     /// A status its chain has yet to decide.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed: Option<Proposal<FlawStatus>>,
-    pub premises: Vec<PremiseRef>,
+    pub(crate) proposed: Option<Proposal<FlawStatus>>,
+    pub(crate) premises: Vec<PremiseRef>,
     /// The states it leaves wrong.
-    pub states: Vec<Ref>,
-    pub candidates: Vec<Chained>,
+    pub(crate) states: Vec<Ref>,
+    pub(crate) candidates: Vec<Chained>,
     /// Its report, as its group's root.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finding: Option<FindingId>,
+    pub(crate) finding: Option<FindingId>,
 }
 
 /// A flaw of a candidate's chain, with the premises it depends on.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct ChainLink {
+pub(crate) struct ChainLink {
     #[serde(flatten)]
-    pub flaw: FlawRef,
-    pub premises: Vec<PremiseRef>,
+    pub(crate) flaw: FlawRef,
+    pub(crate) premises: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct AssessmentView {
-    pub vector: String,
-    pub severity: Severity,
-    pub score: f64,
-    pub note: Option<String>,
+pub(crate) struct AssessmentView {
+    pub(crate) vector: String,
+    pub(crate) severity: Severity,
+    pub(crate) score: f64,
+    pub(crate) note: Option<String>,
     /// Nothing it judged changed after what it stands on.
-    pub current: bool,
+    pub(crate) current: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct VerdictView {
-    pub verdict: Verdict,
-    pub note: Option<String>,
+pub(crate) struct VerdictView {
+    pub(crate) verdict: Verdict,
+    pub(crate) note: Option<String>,
     /// Nothing it judged changed after what it stands on.
-    pub current: bool,
+    pub(crate) current: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct ArtifactView {
-    pub path: String,
-    pub role: ArtifactRole,
+pub(crate) struct ArtifactView {
+    pub(crate) path: String,
+    pub(crate) role: ArtifactRole,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct TestView {
-    pub id: TestId,
-    pub result: TestResult,
-    pub note: Option<String>,
+pub(crate) struct TestView {
+    pub(crate) id: TestId,
+    pub(crate) result: TestResult,
+    pub(crate) note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<EnvironmentId>,
-    pub artifacts: Vec<ArtifactView>,
+    pub(crate) environment: Option<EnvironmentId>,
+    pub(crate) artifacts: Vec<ArtifactView>,
 }
 
 /// A path a candidate's scenario performs.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct ActionView {
-    pub path: Ref,
-    pub steps: Vec<Step>,
-    pub states: Vec<AccessRef>,
+pub(crate) struct ActionView {
+    pub(crate) path: Ref,
+    pub(crate) steps: Vec<Step>,
+    pub(crate) states: Vec<AccessRef>,
     /// The premises its path relies on.
-    pub premises: Vec<PremiseRef>,
+    pub(crate) premises: Vec<PremiseRef>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct CandidateView {
+pub(crate) struct CandidateView {
     #[serde(flatten)]
-    pub head: Head,
+    pub(crate) head: Head,
     /// The paths its scenario performs, in order: the first is where the attacker starts.
-    pub actions: Vec<ActionView>,
+    pub(crate) actions: Vec<ActionView>,
     /// Its flaws from the root.
-    pub chain: Vec<ChainLink>,
-    pub status: Status,
+    pub(crate) chain: Vec<ChainLink>,
+    pub(crate) status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<ConfidenceTier>,
+    pub(crate) confidence: Option<ConfidenceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assessment: Option<AssessmentView>,
+    pub(crate) assessment: Option<AssessmentView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub verdict: Option<VerdictView>,
+    pub(crate) verdict: Option<VerdictView>,
     /// An assessment its review has yet to decide.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed_assessment: Option<Proposal<Scored>>,
+    pub(crate) proposed_assessment: Option<Proposal<Scored>>,
     /// A verdict its review has yet to decide.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed_verdict: Option<Proposal<Verdict>>,
-    pub tests: Vec<TestView>,
+    pub(crate) proposed_verdict: Option<Proposal<Verdict>>,
+    pub(crate) tests: Vec<TestView>,
     /// The test its testing stands on: its latest that is not pending, recorded at its standing
     /// verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub settling_test: Option<TestId>,
-    pub environments: Vec<EnvironmentView>,
+    pub(crate) settling_test: Option<TestId>,
+    pub(crate) environments: Vec<EnvironmentView>,
 }
 
 /// A scenario a finding reports.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct Scenario {
-    pub candidate: CandidateRef,
+pub(crate) struct Scenario {
+    pub(crate) candidate: CandidateRef,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<ConfidenceTier>,
-    pub severity: Severity,
+    pub(crate) confidence: Option<ConfidenceTier>,
+    pub(crate) severity: Severity,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct FindingView {
+pub(crate) struct FindingView {
     #[serde(flatten)]
-    pub head: Head,
-    pub root: Ref,
-    pub scenarios: Vec<Scenario>,
+    pub(crate) head: Head,
+    pub(crate) root: Ref,
+    pub(crate) scenarios: Vec<Scenario>,
     /// It reports some scenarios, as they stand: `generate` publishes it.
-    pub current: bool,
+    pub(crate) current: bool,
 }
 
 /// A node with its neighbourhood.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum NodeView {
+pub(crate) enum NodeView {
     Component(ComponentView),
     Path(PathView),
     State(StateView),
@@ -372,7 +377,7 @@ pub enum NodeView {
 }
 
 impl NodeView {
-    pub fn head(&self) -> &Head {
+    pub(crate) fn head(&self) -> &Head {
         match self {
             Self::Component(view) => &view.head,
             Self::Path(view) => &view.head,
@@ -386,13 +391,13 @@ impl NodeView {
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct EnvironmentView {
-    pub id: EnvironmentId,
-    pub instructions: String,
+pub(crate) struct EnvironmentView {
+    pub(crate) id: EnvironmentId,
+    pub(crate) instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate: Option<CandidateId>,
-    pub serves: Vec<Served>,
-    pub event: EventId,
+    pub(crate) candidate: Option<CandidateId>,
+    pub(crate) serves: Vec<Served>,
+    pub(crate) event: EventId,
 }
 
 impl Keyed for EnvironmentView {

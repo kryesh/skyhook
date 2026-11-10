@@ -1,12 +1,15 @@
 # Built-in tools
 
 `read`, `search`, `glob`, `exec`, `fetch`, `write`, `replace`, `remove`, `script`, `targets`,
-`target_add`, `skill`, `jobs`, `wait`, `ask`, `todo`, and `agent`. Calls use the
+`target_add`, `skill`, `jobs`, `control`, `wait`, `ask`, `todo`, and `agent`. Calls use the
 [common JobView envelope](javascript.md#jobview-response-contract); native payloads are in `.result`.
 `skill` is offered only when skills were discovered.
 
-`exec({command})` runs a string with `/bin/sh -lc`, or an array as a program and arguments without
-shell parsing: `exec({command: "cargo test 2>&1 | tail"})` or `exec({command: ["cargo", "test"]})`.
+`exec({command})` runs a string with the target's shell (`/bin/sh -lc`, or Windows PowerShell 5.1
+on a Windows target), or an array as a program and arguments without shell parsing:
+`exec({command: "cargo test 2>&1 | tail"})` or `exec({command: ["cargo", "test"]})`. A stream
+over 4 MiB is kept in a file on the target that ran the command
+([spill files](job-output.md#spill-files)).
 
 `jobs()` lists the current agent's active jobs, excluding the listing call and its containing script.
 `jobs({all:true})` includes completed history. A listing returns `{jobs, older}`: the newest
@@ -39,11 +42,16 @@ See the [JavaScript response contract](javascript.md#responseunwrap-and-native-r
 
 ## Reading and replacing text
 
-`read({path})` reads only regular files. A file is text when it is valid UTF-8 without NUL bytes;
+`read({path})` reads a regular file or lists a directory. A file is text when it is valid UTF-8 without NUL bytes;
 any other file is attached if it decodes as a supported image (PNG, JPEG, GIF or WebP) and
-rejected otherwise.
+rejected otherwise. A text file of at most 4 MiB is captured as it is read. A larger one is
+not copied: the result shows its first lines, and each later read of its content reads the file
+as it is then ([spill files](job-output.md#spill-files)).
 `replace({path, old, new, count?})` edits files of at most 64 MiB, both before and after the
-replacement; `old` and `new` together are at most 4 MiB, as is `write` content.
+replacement; `old` and `new` together are at most 4 MiB, as is `write` content. In a file whose
+every line break is CRLF, each line break in `old` and `new`, `\n` or `\r\n`, stands for `\r\n`, so
+the file keeps its endings. Files with LF or mixed endings are matched and edited exactly as given,
+and `write` always stores its content exactly.
 
 ## Creating files with `write`
 
@@ -57,8 +65,9 @@ caller's target and workspace. The source is read on its own target: the caller'
 is omitted, or the named one, which requires the `targets` capability and follows the same
 workspace rules as any target selection. One approval covers reading the source, connecting to
 its target, and writing the destination, except that a remote source path outside that target's
-authorization root is approved separately when its target requests it. Contents stream in chunks, through the session host when
-either end is remote, and the destination is replaced only once the whole copy has arrived.
+authorization root is approved separately when its target requests it. A copy between machines
+passes through the session host, and the destination is replaced only once the whole copy has
+arrived.
 For example, an agent on a remote target can copy a file from the session host with
 `write({path: "tool.bin", source: {path: "/srv/tools/tool.bin", target: "root"}})`.
 

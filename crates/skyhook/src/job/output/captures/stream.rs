@@ -7,37 +7,37 @@ use std::{
 
 use super::{CaptureKind, Output};
 use crate::{
-    identity::JobId,
     job::JobManager,
     session::{CaptureExtent, SessionStore},
     tool::ToolOutput,
-    tool::output::{
-        Abandonment, CaptureEvent, CaptureId, CaptureTarget, FieldPointer, OutputContext,
-        OutputEvent, OutputSink, ProducedOutput,
-    },
 };
+use skyhook_tools::output::{
+    Abandonment, CaptureEvent, CaptureFile, CaptureId, CaptureTarget, FieldPointer, OutputContext,
+    OutputEvent, OutputSink, ProducedOutput,
+};
+use skyhook_worker::{fs::spill::SpillError, job::JobId};
 
 /// Only successful consuming finalization constructs this evidence. Finalizing a
 /// writer is not publication: discovery reports completion only after the
 /// terminal document references this capture.
 #[derive(Clone, Debug)]
 pub struct CompletedCapture {
-    job: JobId,
     capture: i64,
     field: FieldPointer,
     kind: CaptureKind,
+    /// The file on the job's target that holds all of what this holds the first of.
+    file: Option<CaptureFile>,
 }
 
 impl CompletedCapture {
-    pub(crate) fn belongs_to(&self, job: JobId, capture: i64) -> bool {
-        self.job == job && self.capture == capture
-    }
-
     pub(crate) fn field(&self) -> &FieldPointer {
         &self.field
     }
     pub(crate) fn kind(&self) -> CaptureKind {
         self.kind
+    }
+    pub(crate) fn file(&self) -> Option<&CaptureFile> {
+        self.file.as_ref()
     }
 }
 
@@ -46,12 +46,27 @@ fn database(error: crate::db::DbError) -> io::Error {
 }
 
 #[cfg(test)]
-pub(crate) type PendingCapture = crate::tool::output::PendingProducer<StoredCapture>;
+pub(crate) type PendingCapture = skyhook_tools::output::PendingProducer<StoredCapture>;
+
+/// A capture of `field` reserved in `output`, which an abandoned producer retains.
+#[cfg(test)]
+pub(crate) fn create_capture(
+    output: &Output,
+    field: &FieldPointer,
+    kind: CaptureKind,
+) -> io::Result<PendingCapture> {
+    Ok(PendingCapture::new(
+        StoredCapture::reserve(output, field, kind)?,
+        skyhook_tools::output::Abandon::Retain,
+    ))
+}
 
 pub(crate) struct StoredCapture {
     output: Output,
     completed: CompletedCapture,
     extent: CaptureExtent,
+    /// The file that holds it, once it passed the saved-field limit.
+    spilled: Option<(std::fs::File, skyhook_worker::op::TargetPath)>,
 }
 
 impl StoredCapture {
@@ -66,17 +81,50 @@ impl StoredCapture {
         Ok(Self {
             output: output.clone(),
             completed: CompletedCapture {
-                job: output.job,
                 capture,
                 field: field.clone(),
                 kind,
+                file: None,
             },
             extent: CaptureExtent::default(),
+            spilled: None,
         })
+    }
+
+    /// Move the capture's rows to a new file in the session host's spill directory.
+    fn spill(&mut self) -> io::Result<()> {
+        let (capture, extent) = (self.completed.capture, self.extent);
+        let (mut file, path) = self.output.spill_file(capture)?;
+        let moved = (self.output.db).spill_capture(capture, extent, (&mut file, &path));
+        if let Err(error) = moved {
+            let _ = std::fs::remove_file(path.as_str());
+            return Err(error);
+        }
+        self.spilled = Some((file, path));
+        Ok(())
     }
 
     fn changed(&self) {
         self.output.changes.changed(self.output.run());
+    }
+
+    /// The latest of the stream the capture holds the first bytes of, as its target
+    /// told it: kept in memory, where each replaces the one before.
+    fn latest(&mut self, extent: CaptureExtent, text: String) {
+        let latest = crate::session::LiveTail {
+            extent,
+            text: text.into(),
+        };
+        (self.output.changes).latest(self.completed.capture, Some(latest));
+        self.changed();
+    }
+}
+
+/// What a capture's target last told of its stream goes with its writer: finished,
+/// its job records what the target kept.
+impl Drop for StoredCapture {
+    fn drop(&mut self) {
+        self.output.changes.latest(self.completed.capture, None);
     }
 }
 
@@ -84,24 +132,36 @@ impl CaptureTarget for StoredCapture {
     type Finished = CompletedCapture;
 
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.extent = self
-            .output
-            .db
-            .append_capture(self.completed.capture, self.extent, bytes)
-            .map_err(database)?;
+        let after = self.extent.after(bytes);
+        if self.spilled.is_none() && after.bytes > self.output.spill.bytes {
+            self.spill()?;
+        }
+        let (db, capture) = (&self.output.db, self.completed.capture);
+        self.extent = match &mut self.spilled {
+            Some((file, _)) => {
+                io::Write::write_all(file, bytes).map_err(SpillError::At)?;
+                db.extend_spill(capture, after).map_err(database)?;
+                after
+            }
+            None => (db.append_capture(capture, self.extent, bytes)).map_err(database)?,
+        };
         self.changed();
         Ok(())
     }
 
     fn finish(&mut self) -> io::Result<CompletedCapture> {
+        if let Some((file, _)) = &self.spilled {
+            file.sync_data().map_err(SpillError::At)?;
+        }
         Ok(self.completed.clone())
     }
 
+    /// A discarded capture takes the file it was moved to with it.
     fn discard(&mut self) -> io::Result<()> {
-        self.output
-            .db
-            .delete_capture(self.completed.capture)
-            .map_err(database)?;
+        let spilled = self.output.db.delete_capture(self.completed.capture);
+        if let Some(path) = spilled.map_err(database)? {
+            let _ = std::fs::remove_file(path);
+        }
         self.changed();
         Ok(())
     }
@@ -113,7 +173,7 @@ pub(crate) struct HostOutput {
     collector: Arc<CaptureCollector>,
 }
 
-pub(crate) struct CaptureCollector {
+struct CaptureCollector {
     output: Output,
     store: SessionStore,
     supervisor: crate::job::Supervisor,
@@ -152,16 +212,7 @@ impl HostOutput {
     }
 
     pub(crate) fn finish(&self, output: ProducedOutput) -> io::Result<ToolOutput> {
-        if output
-            .captures
-            .iter()
-            .any(|capture| !self.context.owns(capture))
-        {
-            return Err(io::Error::other("capture belongs to another producer"));
-        }
-        let captures = self
-            .collector
-            .select(output.captures.iter().map(|capture| capture.id()))?;
+        let captures = self.collector.select(&output.captures)?;
         let mut imported = ToolOutput::new(output.value)
             .with_captures(captures)
             .with_images(output.images)
@@ -169,10 +220,30 @@ impl HostOutput {
         imported.streams = output.streams;
         Ok(imported)
     }
+
+    /// [`finish`](Self::finish) what a call produced on the machine its connection
+    /// reached along `route`, none for the session host. The files that machine keeps
+    /// of the output are recorded as on that route, and the spill files it reports
+    /// creating as the session's own, before the output is the job's.
+    pub(crate) async fn finish_on(
+        &self,
+        route: &crate::target::Revisions,
+        mut output: ProducedOutput,
+    ) -> io::Result<ToolOutput> {
+        let spilled = std::mem::take(&mut output.spilled);
+        let imported = self.finish(output)?;
+        let routed = |capture: &CompletedCapture| capture.file.is_some() && !route.is_empty();
+        if !spilled.is_empty() || imported.captures.iter().any(routed) {
+            let (store, run) = (&self.collector.store, self.collector.output.run());
+            let kept = store.keep(run, route.clone(), spilled).await;
+            kept.map_err(io::Error::other)?;
+        }
+        Ok(imported)
+    }
 }
 
 impl CaptureCollector {
-    pub(crate) async fn new(jobs: &JobManager, job: JobId) -> Self {
+    async fn new(jobs: &JobManager, job: JobId) -> Self {
         Self {
             output: jobs.output(job).await,
             store: jobs.store().clone(),
@@ -182,14 +253,19 @@ impl CaptureCollector {
         }
     }
 
+    /// The captures `finished` selects, each with the file its producer says holds
+    /// all of it.
     pub(crate) fn select(
         &self,
-        ids: impl IntoIterator<Item = CaptureId>,
+        finished: &[skyhook_tools::output::FinishedOutput],
     ) -> io::Result<Vec<CompletedCapture>> {
         let mut captures = self.captures.lock().unwrap_or_else(PoisonError::into_inner);
-        ids.into_iter()
-            .map(|id| match captures.remove(&id) {
-                Some(CollectedCapture::Finished(capture)) => Ok(capture),
+        (finished.iter())
+            .map(|selected| match captures.remove(&selected.id()) {
+                Some(CollectedCapture::Finished(mut capture)) => {
+                    capture.file = selected.file().cloned();
+                    Ok(capture)
+                }
                 _ => Err(io::Error::other("selected capture is not finished")),
             })
             .collect()
@@ -229,6 +305,9 @@ impl OutputSink for CaptureCollector {
                 )?));
             }
             CaptureEvent::Write { id, data } => writing(&mut captures, id)?.append(&data)?,
+            CaptureEvent::Latest { id, extent, text } => {
+                writing(&mut captures, id)?.latest(extent, text)
+            }
             CaptureEvent::Discard { id } => {
                 writing(&mut captures, id)?.discard()?;
                 captures.insert(id, CollectedCapture::Closed);
@@ -245,8 +324,8 @@ impl OutputSink for CaptureCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::output::{Saved, captures::available_captures, tests::fixture};
-    use crate::tool::output::{Abandon, TextCaptureField};
+    use crate::job::output::{Saved, tests::fixture};
+    use skyhook_tools::output::{Abandon, TextCaptureField};
     use std::{
         future::{Future, poll_fn},
         io::Write,
@@ -254,25 +333,8 @@ mod tests {
     };
 
     impl CompletedCapture {
-        pub(crate) fn matches(&self, job: JobId, field: &str) -> bool {
-            self.job == job && self.field.as_str() == field
-        }
-
         pub(crate) fn capture_id(&self) -> i64 {
             self.capture
-        }
-    }
-
-    impl PendingCapture {
-        pub(crate) fn create(
-            output: &Output,
-            field: &FieldPointer,
-            kind: CaptureKind,
-        ) -> io::Result<Self> {
-            Ok(Self::new(
-                StoredCapture::reserve(output, field, kind)?,
-                Abandon::Retain,
-            ))
         }
     }
 
@@ -284,7 +346,7 @@ mod tests {
     }
 
     fn captures(output: &Output, terminal: bool) -> Vec<super::super::CaptureDescriptor> {
-        available_captures(&Saved::load(output).unwrap(), terminal)
+        super::super::available_captures(&Saved::load(output).unwrap(), terminal)
     }
 
     /// Polls a write exactly once, then drops it mid-flight.
@@ -298,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_output_preserves_abandonment_and_validates_origin() {
+    async fn host_output_preserves_abandonment_and_imports_selected_captures() {
         let (_root, manager, job) = fixture(None).await;
         let host = HostOutput::new(&manager, job).await;
         let context = host.context();
@@ -370,15 +432,6 @@ mod tests {
                 .unwrap(),
             image.bytes()
         );
-        let foreign = HostOutput::new(&manager, job).await;
-        assert!(
-            foreign
-                .finish(
-                    ProducedOutput::new(serde_json::Value::Null)
-                        .with_captures(vec![selected.clone()])
-                )
-                .is_err()
-        );
         let output = host
             .finish(
                 ProducedOutput::new(serde_json::json!({"matches": []}))
@@ -386,7 +439,7 @@ mod tests {
                     .with_images(vec![reference]),
             )
             .unwrap();
-        assert!(output.captures[0].matches(job, "/result/matches"));
+        assert_eq!(output.captures[0].field().as_str(), "/result/matches");
         assert_eq!(
             manager
                 .output(job)
@@ -406,7 +459,7 @@ mod tests {
         let mut notices = || {
             std::iter::from_fn(|| updates.try_recv().ok())
                 .filter(|update| match update.event {
-                    crate::agent::RuntimeEvent::OutputChanged {
+                    crate::session::RuntimeEvent::OutputChanged {
                         job: changed,
                         invocation,
                     } => {
@@ -436,7 +489,7 @@ mod tests {
         let (_root, manager, job) = fixture(None).await;
         let output = manager.output(job).await;
         let matches = "/result/matches".parse().unwrap();
-        let mut writer = PendingCapture::create(&output, &matches, CaptureKind::Json)
+        let mut writer = crate::job::output::create_capture(&output, &matches, CaptureKind::Json)
             .unwrap()
             .open();
         writer.write_all(b"[\"a\"]").unwrap();
@@ -476,7 +529,8 @@ mod tests {
             let content = TextCaptureField::Content.pointer();
             let mut capture = text(&output, TextCaptureField::Content).open();
             capture.write_text("before failure\n").unwrap();
-            let collision = PendingCapture::create(&output, &content, CaptureKind::Text);
+            let collision =
+                crate::job::output::create_capture(&output, &content, CaptureKind::Text);
             assert!(collision.is_err());
             assert_eq!(
                 output.test_bytes(content.as_str()).unwrap(),
@@ -495,7 +549,7 @@ mod tests {
             assert!(output.test_bytes(content.as_str()).is_none());
             let mut capture = text(&output, TextCaptureField::Stdout).open_async();
             // Several chunks, with characters across their boundaries.
-            let payload = "é🦀".repeat(crate::tool::output::OUTPUT_CHUNK_BYTES * 4 / 6);
+            let payload = "é🦀".repeat(skyhook_worker::op::CHUNK_BYTES * 4 / 6);
             poll_once(capture.write_text(&payload)).await;
             assert!(capture.finish_nonempty().await.unwrap().is_some());
             let stdout = output

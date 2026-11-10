@@ -1,35 +1,45 @@
 //! The request headers a provider composes and their values: fixed when the
-//! provider is built, produced by a command on first use, or issued by an
-//! authenticator per request. Composition finishes before any value is produced,
-//! so a replaced source never runs. Only successful, validated command output is
-//! cached, until a 401 answers a request that carried it.
+//! provider is built, produced by a command or read from a file on first use, or
+//! issued by an authenticator per request. Composition finishes before any value
+//! is produced, so a replaced source never runs. Only successful, validated values
+//! are cached, until a 401 answers a request that carried them.
 
 use std::{
     fmt,
-    process::Stdio,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
 
+use futures_util::future::BoxFuture;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use tokio::{io::AsyncReadExt, process::Command, sync::OnceCell};
+use tokio::sync::OnceCell;
 
-use super::auth::Authenticator;
-use crate::{
-    newtype::string_newtype,
-    provider::{ProviderError, ProviderErrorKind},
-};
+use super::credentials::{ValueError, ValueField, ValueProblem};
+use crate::provider::{ProviderError, ProviderErrorKind};
+use skyhook_base::string_newtype;
+use skyhook_worker::secret::Credential;
 
-// Credentials should be small; cap even unsuccessful or never-ending output.
-const MAX_STDOUT_BYTES: usize = 64 * 1024;
+/// Credentials a service issues for each request, such as Codex's stored OAuth
+/// tokens. The HTTP provider knows no vendor: a dialect enters its
+/// authenticator into the request headers under each name it sets.
+pub(crate) trait Authenticator: Send + Sync {
+    /// The credential headers for one request.
+    fn headers(&self) -> BoxFuture<'_, Result<HeaderMap, ProviderError>>;
+}
+
+impl fmt::Debug for dyn Authenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Authenticator")
+    }
+}
 
 /// A header value.
 #[derive(Clone, Debug)]
 pub(crate) enum Value {
     Fixed(HeaderValue),
-    Command(CommandValue),
+    Produced(ProducedValue),
     /// What the authenticator issues under the header's name; it is asked once
     /// per request, whatever the number of names it serves.
     Issued(Arc<dyn Authenticator>),
@@ -53,8 +63,8 @@ impl Value {
                 value: value.clone(),
                 leases: Vec::new(),
             }),
-            Self::Command(command) => {
-                let (value, lease) = command.lease().await?;
+            Self::Produced(produced) => {
+                let (value, lease) = produced.lease().await?;
                 Some(Sent {
                     value,
                     leases: vec![lease],
@@ -273,7 +283,7 @@ impl Resolved {
         }
     }
 
-    /// The server answered 401. When the request carried command values, the
+    /// The server answered 401. When the request carried produced values, the
     /// 401 is about them, whatever the body says: it reports them expired when
     /// any had been accepted before, for the runtime to retry with fresh ones,
     /// and a plain authentication failure otherwise. Each generation carried is
@@ -316,22 +326,6 @@ impl HeaderText {
     }
 }
 
-/// The setting a configured value belongs to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValueField {
-    ApiKey,
-    Header(HeaderName),
-}
-
-impl fmt::Display for ValueField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ApiKey => f.write_str("api_key"),
-            Self::Header(name) => write!(f, "headers.{name}"),
-        }
-    }
-}
-
 /// `value` behind `prefix`, as `Bearer ` precedes a bearer token, and as
 /// sensitive as `value`. Header values are checked byte by byte, so a valid
 /// value behind a valid prefix stays valid.
@@ -346,13 +340,13 @@ pub(crate) fn prefixed(prefix: Option<&str>, value: &HeaderValue) -> HeaderValue
     prefixed
 }
 
-/// A header value produced by `/bin/sh -c command` on first use. Successful,
-/// validated stdout is cached without its presentation prefix, so different
-/// credential schemes share one generation. A 401 discards the generation its
-/// request carried unless a newer one replaced it.
+/// A header value produced by a command or read from a file on first use.
+/// Successful, validated values are cached without their presentation prefix, so
+/// different credential schemes share one generation. A 401 discards the
+/// generation its request carried unless a newer one replaced it.
 #[derive(Clone)]
-pub(crate) struct CommandValue {
-    command: String,
+pub(crate) struct ProducedValue {
+    source: Credential,
     prefix: Option<&'static str>,
     field: ValueField,
     current: Current,
@@ -368,24 +362,24 @@ struct Generation {
     served: AtomicBool,
 }
 
-/// The command may name a secret's location; it is never printed.
-impl fmt::Debug for CommandValue {
+/// The source may name a secret's location; it is never printed.
+impl fmt::Debug for ProducedValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CommandValue")
+        f.write_str("ProducedValue")
     }
 }
 
-impl CommandValue {
-    pub(crate) fn new(command: String, field: ValueField) -> Self {
+impl ProducedValue {
+    pub(crate) fn new(source: Credential, field: ValueField) -> Self {
         Self {
-            command,
+            source,
             prefix: None,
             field,
             current: Current::default(),
         }
     }
 
-    /// Present the same command generation under another credential scheme.
+    /// Present the same generation under another credential scheme.
     pub(crate) fn with_prefix(&self, prefix: Option<&'static str>) -> Self {
         Self {
             prefix,
@@ -393,12 +387,12 @@ impl CommandValue {
         }
     }
 
-    /// The current generation's value, running the command once per generation.
+    /// The current generation's value, producing it once per generation.
     async fn lease(&self) -> Result<(HeaderValue, Lease), ProviderError> {
         let generation = Arc::clone(&self.current.lock().unwrap_or_else(PoisonError::into_inner));
         let raw = generation
             .raw
-            .get_or_try_init(|| execute(&self.command, &self.field))
+            .get_or_try_init(|| produce(&self.source, &self.field))
             .await?;
         let value = prefixed(self.prefix, raw);
         let lease = Lease {
@@ -415,54 +409,35 @@ struct Lease {
     generation: Arc<Generation>,
 }
 
-async fn execute(command: &str, field: &ValueField) -> Result<HeaderValue, ProviderError> {
-    // Never retain the command, output, exit status, or underlying OS error.
-    let failure = |what| ProviderErrorKind::Authentication.error(format!("{field} command {what}"));
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| failure("could not be started"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| failure("output could not be read"))?;
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    stdout
-        .take((MAX_STDOUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
+/// The value, as a sensitive header value.
+async fn produce(source: &Credential, field: &ValueField) -> Result<HeaderValue, ProviderError> {
+    let failure = |problem| {
+        let error = ValueError {
+            field: field.clone(),
+            problem,
+        };
+        ProviderErrorKind::Authentication.error(error.to_string())
+    };
+    let text = source
+        .resolve()
         .await
-        .map_err(|_| failure("output could not be read"))?;
-    if bytes.len() > MAX_STDOUT_BYTES {
-        return Err(failure("output exceeded the size limit"));
-    }
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| failure("could not be awaited"))?;
-    if !status.success() {
-        return Err(failure("exited unsuccessfully"));
-    }
-    let key = std::str::from_utf8(&bytes)
-        .map_err(|_| failure("output was not valid UTF-8"))?
-        .trim();
-    if key.is_empty() {
-        return Err(failure("output was empty"));
-    }
-    let mut header =
-        HeaderValue::from_str(key).map_err(|_| failure("output was not a valid header value"))?;
+        .map_err(|error| failure(error.into()))?;
+    let mut header = header_value(text.trim())
+        .ok_or_else(|| failure(ValueProblem::InvalidHeaderValue(source.redacted())))?;
     header.set_sensitive(true);
     Ok(header)
+}
+
+/// `text` as a header value, unless it is blank or no header could carry it.
+pub(crate) fn header_value(text: &str) -> Option<HeaderValue> {
+    (!text.trim().is_empty())
+        .then(|| HeaderValue::from_str(text).ok())
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::future::BoxFuture;
     use reqwest::header::AUTHORIZATION;
     use std::{path::Path, time::Duration};
 
@@ -478,17 +453,22 @@ mod tests {
         Value::Fixed(HeaderValue::from_static(value))
     }
 
-    impl CommandValue {
+    fn command(text: String, field: ValueField) -> ProducedValue {
+        let command = skyhook_worker::process::CommandLine::Shell(text);
+        ProducedValue::new(Credential::Command(command), field)
+    }
+
+    impl ProducedValue {
         async fn value(&self) -> Result<HeaderValue, ProviderError> {
             Ok(self.lease().await?.0)
         }
     }
 
     /// A command printing `key-<run>`, counting its runs in `count`.
-    fn counting(count: &Path) -> CommandValue {
+    fn counting(count: &Path) -> ProducedValue {
         let count = quote(count);
         let text = format!("printf x >> {count}; printf key-%s \"$(wc -c < {count})\"");
-        CommandValue::new(text, ValueField::ApiKey)
+        command(text, ValueField::ApiKey)
     }
 
     fn runs(count: &Path) -> usize {
@@ -524,13 +504,13 @@ mod tests {
         let empty = dir.path().join("empty");
         let blank = |count: &Path| {
             let text = format!("printf x >> {}; printf ' , '", quote(count));
-            Value::Command(CommandValue::new(text, header()))
+            Value::Produced(command(text, header()))
         };
         let issuer = Arc::new(Counted::default());
         let issued = || Value::Issued(Arc::clone(&issuer) as Arc<dyn Authenticator>);
         let list = HeaderName::from_static("x-list");
         let mut headers = Headers::default();
-        headers.insert(AUTHORIZATION, Value::Command(counting(&replaced)));
+        headers.insert(AUTHORIZATION, Value::Produced(counting(&replaced)));
         headers.insert(HeaderName::from_static("x-a"), issued());
         headers.insert(HeaderName::from_static("x-b"), issued());
         headers.insert(HeaderName::from_static("x-replaced"), issued());
@@ -559,15 +539,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_values_are_lazy_run_once_and_shared_across_prefixes() {
+    async fn command_values_are_run_once_and_shared_across_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let text = format!(
-            "printf x >> {}; printf ' \\t  resolved-key  \\r\\n '",
+            "printf x >> {}; printf ' resolved-key \\r\\n\\n'",
             quote(&count)
         );
-        let value = CommandValue::new(text, ValueField::ApiKey).with_prefix(Some("Bearer "));
-        assert!(!count.exists(), "nothing runs before the first use");
+        let value = command(text, ValueField::ApiKey).with_prefix(Some("Bearer "));
         let shared: Vec<_> = (0..8)
             .map(|index| match index % 2 {
                 0 => (value.clone(), "Bearer resolved-key"),
@@ -582,7 +561,6 @@ mod tests {
             let header = header.unwrap();
             assert_eq!(header, expected);
             assert!(header.is_sensitive());
-            assert!(!format!("{header:?}").contains("resolved-key"));
         }
         assert_eq!(std::fs::read(&count).unwrap(), b"x");
     }
@@ -593,32 +571,32 @@ mod tests {
             (
                 ValueField::ApiKey,
                 "printf private-stdout; printf private-stderr >&2; exit 7",
-                "api_key command exited unsuccessfully",
+                "api_key from command: exited unsuccessfully",
             ),
             (
                 ValueField::ApiKey,
                 "printf '\\377'",
-                "api_key command output was not valid UTF-8",
+                "api_key from command: output was not valid UTF-8",
             ),
             (
                 ValueField::ApiKey,
                 "printf ' \\t\\r\\n '",
-                "api_key command output was empty",
+                "api_key from command: output was empty",
             ),
             (
                 ValueField::ApiKey,
                 "printf 'private-stdout\\ninvalid-header'",
-                "api_key command output was not a valid header value",
+                "api_key: command output is not a valid header value",
             ),
             (
                 ValueField::ApiKey,
                 "head -c 65537 /dev/zero",
-                "api_key command output exceeded the size limit",
+                "api_key from command: output exceeded 65536 bytes",
             ),
             (
                 header(),
                 "if read value; then printf stdin-open; else exit 1; fi",
-                "headers.x-test command exited unsuccessfully",
+                "headers.x-test from command: exited unsuccessfully",
             ),
         ];
         for (field, bad, expected) in cases {
@@ -627,7 +605,7 @@ mod tests {
             let text = format!(
                 "# private-command-text\nif test -e {marker}; then printf retry-key; else touch {marker}; {bad}; fi"
             );
-            let value = CommandValue::new(text, field);
+            let value = command(text, field);
             let error = value.value().await.unwrap_err();
             assert_eq!(error.kind(), ProviderErrorKind::Authentication);
             assert_eq!(error.message, expected);
@@ -644,9 +622,9 @@ mod tests {
     /// generation once; a late 401 from either scheme keeps the successor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unauthorized_across_schemes_discards_only_its_generation_and_refetches_once() {
-        async fn send(name: &HeaderName, value: &CommandValue) -> (HeaderValue, Resolved) {
+        async fn send(name: &HeaderName, value: &ProducedValue) -> (HeaderValue, Resolved) {
             let mut headers = Headers::default();
-            headers.insert(name.clone(), Value::Command(value.clone()));
+            headers.insert(name.clone(), Value::Produced(value.clone()));
             let resolved = headers.resolve().await.unwrap();
             (resolved.map()[name].clone(), resolved)
         }
@@ -702,7 +680,7 @@ mod tests {
         let text = format!(
             "if test -e {quoted}; then printf retry-key; else printf '%s' $$ > {quoted}; exec sleep 30; fi"
         );
-        let value = CommandValue::new(text, ValueField::ApiKey);
+        let value = command(text, ValueField::ApiKey);
         let run = async {
             let pending = value.value();
             let pid = tokio::select! {

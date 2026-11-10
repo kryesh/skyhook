@@ -1,7 +1,6 @@
 //! What a session's database holds: the journal's tables, and a product's beside them.
-//! Every session is created from an image whose journal schema is this build's: images
-//! come only from the journal's own or from `schema::image!`, which layers a
-//! product's tables on it, and each is checked before a session is created from it.
+//! Every session is created from the image of this build's journal schema, a product's
+//! tables created over it.
 
 use super::db;
 use crate::db::{Db, DbError, DbResult, Place, Seeding, params};
@@ -24,40 +23,18 @@ enum Tables {
 }
 
 /// A product's tables over the journal's schema, under a format of their own: any
-/// change to the tables is a new one, which every open by the product checks. Made by
-/// `schema::image!`, or by [`layered`](Self::layered).
+/// change to the tables is a new one, which every open by the product checks.
 #[derive(Clone, Copy, Debug)]
 pub struct ProductImage {
-    source: Source,
+    ddl: &'static str,
     format: i64,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Source {
-    /// The journal's schema with the tables and their format, serialized.
-    Built(&'static [u8]),
-    /// DDL run over the journal's image as each session is created.
-    Layered(&'static str),
-}
-
 impl ProductImage {
-    /// What `schema::image!` expands to, which built `image` and recorded
-    /// `format` in it.
-    #[doc(hidden)]
-    pub const fn __built(image: &'static [u8], format: i64) -> Self {
-        Self {
-            source: Source::Built(image),
-            format,
-        }
-    }
-
     /// Tables `ddl` creates over the journal's schema as each session is created, at
-    /// `format`: for DDL `image!` cannot read, which only literals and files supply.
+    /// `format`.
     pub const fn layered(ddl: &'static str, format: i64) -> Self {
-        Self {
-            source: Source::Layered(ddl),
-            format,
-        }
+        Self { ddl, format }
     }
 }
 
@@ -80,18 +57,15 @@ impl Schema {
         let Tables::Product { image, seed } = self.0 else {
             return db::create(place, db::IMAGE, |_| Ok(()));
         };
-        match image.source {
-            Source::Built(bytes) => db::create(place, bytes, |db| seed(db, Seeding::Fill)),
-            Source::Layered(ddl) => db::create(place, db::IMAGE, |db| {
-                db.batch("CREATE TABLE extension(format INTEGER NOT NULL) STRICT;")?;
-                db.execute(
-                    "INSERT INTO extension(format) VALUES (?1)",
-                    params![image.format],
-                )?;
-                db.batch(ddl)?;
-                seed(db, Seeding::Fill)
-            }),
-        }
+        db::create(place, db::IMAGE, |db| {
+            db.batch("CREATE TABLE extension(format INTEGER NOT NULL) STRICT;")?;
+            db.execute(
+                "INSERT INTO extension(format) VALUES (?1)",
+                params![image.format],
+            )?;
+            db.batch(image.ddl)?;
+            seed(db, Seeding::Fill)
+        })
     }
 
     /// Check that a session database, whose journal its opener checked, holds these

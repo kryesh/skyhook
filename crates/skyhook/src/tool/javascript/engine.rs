@@ -376,8 +376,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::tests::bounded;
-    use crate::tool::diagnostic::{Cause, Effects};
     use crate::tool::javascript::tests::{LIMITS, plain};
+    use skyhook_tools::diagnostic::Cause;
+    use skyhook_worker::diagnostic::Effects;
 
     #[tokio::test]
     async fn memory_limits_reject_buffers_and_end_scripts_that_exhaust_the_heap() {

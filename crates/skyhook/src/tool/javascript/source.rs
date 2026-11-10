@@ -80,8 +80,9 @@ impl SubmittedSource {
 mod tests {
     use std::assert_matches;
 
-    use crate::tool::diagnostic::{Cause, Effects, Operation};
     use crate::tool::javascript::tests::plain;
+    use skyhook_tools::diagnostic::Cause;
+    use skyhook_worker::diagnostic::{Effects, Operation};
 
     #[tokio::test]
     async fn syntax_errors_report_body_positions() {

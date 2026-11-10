@@ -33,7 +33,7 @@ instruction or a budget they stated. Change the template's launch depths when th
 for it.
 
 ```js
-{% if live %}{% include "security/scripts/scheduler.live.js" %}{% else %}{% include "security/scripts/scheduler.no-live.js" %}{% endif %}
+{% include "security/scripts/scheduler.js" %}
 ```
 
 ## Analysis

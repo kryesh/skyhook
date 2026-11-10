@@ -3,17 +3,15 @@
 
 use serde::Serialize;
 
-use crate::{
-    named_enum::named_enum,
-    provider::{
-        codec::{
-            BodyPath, CacheKey, Codec, CodecName, Locations, NonEmpty, chat_completions, messages,
-            overlaps, responses,
-        },
-        http::Fields,
-        settings::Nullable,
+use crate::provider::{
+    codec::{
+        BodyPath, CacheKey, Codec, CodecName, Locations, NonEmpty, chat_completions, messages,
+        overlaps, responses,
     },
+    http::Fields,
+    settings::Nullable,
 };
+use skyhook_base::enums::NamedEnum;
 
 /// Locations chosen in place of the preset, if any were: none for null.
 fn chosen<T: Clone>(selection: &Nullable<NonEmpty<T>>) -> Option<Locations<T>> {
@@ -24,17 +22,16 @@ fn chosen<T: Clone>(selection: &Nullable<NonEmpty<T>>) -> Option<Locations<T>> {
     }
 }
 
-named_enum! {
-    /// A placement dimension, as configuration spells it.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum PlacementKey {
-        OutputLimit = "output_limit",
-        ReasoningEffort = "reasoning_effort",
-        ReasoningReplay = "reasoning_replay",
-        ToolStream = "tool_stream",
-        CacheKey = "cache_key",
-        UserId = "user_id",
-    }
+/// A placement dimension, as configuration spells it.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementKey {
+    OutputLimit,
+    ReasoningEffort,
+    ReasoningReplay,
+    ToolStream,
+    CacheKey,
+    UserId,
 }
 
 /// A selection the codec has no dimension for, or one that would write where
@@ -427,9 +424,9 @@ mod tests {
                 CodecName::Responses,
                 CodecName::Messages,
             ] {
-                if let Ok(profile) = settings.admit(family) {
+                if let Ok(wire) = settings.admit(family) {
                     assert_eq!(
-                        check(&profile.codec, &profile.transport.fields),
+                        check(&wire.codec, &wire.transport.fields),
                         Ok(()),
                         "preset {index} {family}"
                     );

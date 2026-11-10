@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Remote shim targets; each is staged as target/shims/<os>-<arch>.
-shim_targets := "x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+shim_targets := "x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu"
 
 # Release builds route C and C++ allocations through mimalloc as well as Rust's.
 release_features := "--features mimalloc/override"
@@ -24,24 +24,24 @@ setup:
 # Debug CLI; reads whatever is in target/shims live from disk.
 [positional-arguments]
 run *args:
-    cargo run --locked -p cli -- "$@"
+    cargo run --locked -p skyhook-apps --bin skyhook -- "$@"
 
 # Debug security companion; reads whatever is in target/shims live from disk.
 [positional-arguments]
 run-security *args:
-    cargo run --locked -p security -- "$@"
+    cargo run --locked -p skyhook-apps --bin skyhook-security -- "$@"
 
 # Debug applications; read whatever is in target/shims live from disk.
 build:
-    cargo build --locked -p cli -p security
+    cargo build --locked -p skyhook-apps
 
 # Static release applications for `target`; embed whatever is in target/shims at compile time.
 build-release target=host_target:
     # rust-embed cannot see newly added files; force the embedding module to rebuild.
-    touch crates/cli/src/embedded_shims.rs
+    touch crates/apps/src/shims.rs
     v8=$(scripts/v8-archive.sh {{ quote(target) }}); \
     RUSTY_V8_ARCHIVE="$v8/librusty_v8.a" RUSTY_V8_SRC_BINDING_PATH="$v8/src_binding.rs" \
-        cargo zigbuild --locked --release -p cli -p security --target {{ quote(target) }} {{ release_features }}
+        cargo zigbuild --locked --release -p skyhook-apps --target {{ quote(target) }} {{ release_features }}
 
 # Debug builds of every shim, staged into target/shims.
 build-shims: (_shims "dev")
@@ -64,7 +64,6 @@ test:
 # Lint all targets.
 lint:
     cargo clippy --locked --workspace --all-targets -- -D warnings
-    cargo clippy --locked --workspace --lib --bins --exclude cli --exclude security --no-default-features -- -D warnings
 
 # Format all Rust code.
 fmt:
@@ -99,7 +98,8 @@ _shims mode:
 # Build the shim for every target in shim_targets, staged into target/shims.
 _shim_targets profile dir features="":
     for triple in {{ shim_targets }}; do \
-        os="${triple#*-*-}"; \
-        cargo zigbuild --locked --profile {{ profile }} -p shim --target "$triple" {{ features }}; \
-        install -Dm 755 "target/$triple/{{ dir }}/shim" "target/shims/${os%%-*}-${triple%%-*}"; \
+        os="${triple#*-*-}"; os="${os%%-*}"; \
+        exe=""; [ "$os" = windows ] && exe=.exe; \
+        cargo zigbuild --locked --profile {{ profile }} -p skyhook-shim --target "$triple" {{ features }}; \
+        install -Dm 755 "target/$triple/{{ dir }}/shim$exe" "target/shims/$os-${triple%%-*}"; \
     done

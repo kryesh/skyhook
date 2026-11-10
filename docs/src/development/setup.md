@@ -4,7 +4,7 @@
 
 - Rust 1.99 or newer via rustup, and [just](https://just.systems/) on `PATH`.
 - [Zig](https://ziglang.org/download/) 0.15 or newer on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) for release
-  builds and the SSH shims; debug builds and tests do not need it.
+  builds and the remote shims; debug builds and tests do not need it.
 - `python3` on `PATH` for the test suite, whose MCP tests run a scripted server.
 
 ```sh
@@ -13,8 +13,8 @@ cd skyhook
 just setup
 ```
 
-`just setup` adds the `rustfmt` and `clippy` components, both musl shim targets, and this machine's
-release target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. See
+`just setup` adds the `rustfmt` and `clippy` components, every shim target, and this machine's release
+target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. See
 [remote transport and shims](remote-transport-and-shims.md) for shim profiles and artifacts.
 
 ## Release builds
@@ -51,8 +51,8 @@ Run these commands from the repository root:
 | Command | Purpose |
 | --- | --- |
 | `just setup` | Install the Rust-side tooling, shim targets, and this machine's release target. |
-| `just build-shims` | Cross-compile debug SSH shims into `target/shims`; requires Zig. |
-| `just build-shims-release` | Cross-compile size-optimised SSH shims into `target/shims`; requires Zig. |
+| `just build-shims` | Cross-compile debug shims for every Linux and Windows shim target into `target/shims`; requires Zig. |
+| `just build-shims-release` | Cross-compile size-optimised shims into `target/shims`; requires Zig. |
 | `just build` | Debug builds of both applications; they read `target/shims` live at runtime. |
 | `just build-release [target]` | Release builds of both applications in `target/<target>/release`, embedding the current contents of `target/shims`; `target` defaults to the static musl target of this Linux machine's architecture (`just --evaluate host_target` prints it). |
 | `just build-full [target]` | Release shims, then release applications for `target` that embed them. |
@@ -66,11 +66,9 @@ Run these commands from the repository root:
 | `just pages-build` | Build the Pages artifact and add `.nojekyll`. |
 | `just pages-publish [remote] [branch]` | Publish the built book via a temporary worktree, never force-pushing; defaults to `origin` and `pages`. |
 
-There is no build script. The library's one cargo feature, `script` (on by default), provides the
-`script` tool and V8; the shim builds without it. A plain `cargo build` builds the two applications;
-pass `-p shim` to build the shim.
-Shims are only ever built by the `build-shims*` recipes; a CLI built without them reports an
-explicit missing-shim error if asked to use SSH.
+A plain `cargo build` builds the two applications; pass `-p skyhook-shim` to build the shim.
+Shims are only ever built by the `build-shims*` recipes; an application built without them reports
+an explicit missing-shim error when asked to connect to a remote target.
 
 ## Verification
 
@@ -96,9 +94,9 @@ when changing Rust documentation examples. For book changes, run `just docs` and
 rendered pages and links. `AGENTS.md` also covers test policy, including stress runs for tests
 that coordinate gated provider steps.
 
-The workspace holds the `skyhook` library, the `cli` host with the `skyhook` binary, the
-`security` crate with the `skyhook-security` binary, the `schema` macro crate and the `shim`
-remote shim under `crates/`. See
-[architecture](architecture.md) and [embedding](embedding.md) for the library boundaries.
-[Documentation and publishing](documentation.md) covers local preview and manual GitHub Pages
+These checks compile and test for the build machine only. Windows code is compiled by
+`just build-shims` alone, so run it after changing anything under `cfg(windows)`.
+
+See [architecture](architecture.md#crate-layout) for the crates and
+[documentation and publishing](documentation.md) for local preview and manual GitHub Pages
 publishing.

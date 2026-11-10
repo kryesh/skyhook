@@ -7,10 +7,11 @@ use super::*;
 
 mod stream;
 #[cfg(test)]
-pub(crate) use stream::PendingCapture;
-pub(crate) use stream::{CaptureCollector, CompletedCapture, HostOutput};
+pub(crate) use stream::create_capture;
+pub(crate) use stream::{CompletedCapture, HostOutput};
 
-pub use crate::tool::output::CaptureKind;
+use skyhook_tools::output::CaptureKind;
+use skyhook_tools::target::{ExecutionLocation, TargetRef};
 
 /// Descriptors describe raw captures, not a replacement structured result. In
 /// particular, incomplete JSON is only safe to read through explicit byte paging
@@ -21,6 +22,49 @@ pub struct CaptureDescriptor {
     pub(crate) complete: bool,
     /// The capture's page, when the host hydrated one
     pub output: Option<Box<crate::job::JobView>>,
+}
+
+/// A file that holds a field's bytes in place of the session's database, as host
+/// inspection shows it to the session's user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldFile {
+    pub field: FieldPointer,
+    /// The machine holding the file: the session host for what the session moved
+    /// there, the job's target for what it wrote or was asked to read.
+    pub target: TargetRef,
+    pub path: skyhook_worker::op::TargetPath,
+    /// The bytes the file held of the field when it was saved.
+    pub bytes: u64,
+    /// Why the session host can no longer read the file it kept.
+    pub unreadable: Option<String>,
+}
+
+/// The files holding the fields of a job that ran at `location`.
+pub(super) fn field_files(saved: &Saved, location: &ExecutionLocation) -> Vec<FieldFile> {
+    use crate::session::{CaptureBytes, TargetFile};
+    let held = |capture: &CaptureRow| {
+        let (target, path, bytes) = match &capture.bytes {
+            CaptureBytes::Rows => return None,
+            CaptureBytes::Spilled { path, extent } => (
+                TargetRef::Root,
+                path.to_string_lossy().into_owned().into(),
+                extent.bytes,
+            ),
+            CaptureBytes::Target(TargetFile { file, .. }) => (
+                location.target.clone(),
+                file.path().clone(),
+                file.extent().bytes,
+            ),
+        };
+        Some(FieldFile {
+            field: capture.pointer.clone(),
+            target,
+            path,
+            bytes,
+            unreadable: (saved.unreadable.get(&capture.pointer)).map(ToString::to_string),
+        })
+    };
+    saved.captures.values().filter_map(held).collect()
 }
 
 pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDescriptor> {
@@ -38,7 +82,11 @@ pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDe
         .map(|capture| CaptureDescriptor {
             output: None,
             field: capture.pointer.clone(),
-            complete: complete && capture.referenced,
+            // A field whose saved bytes are gone is no complete one: it shows empty,
+            // and reading it says so.
+            complete: complete
+                && capture.referenced
+                && !saved.unreadable.contains_key(&capture.pointer),
         })
         .collect()
 }

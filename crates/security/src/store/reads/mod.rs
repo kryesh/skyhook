@@ -9,19 +9,23 @@ use super::*;
 
 mod list;
 mod neighbours;
+mod page;
+mod reporting;
 mod search;
 mod shelf;
 mod views;
 
-pub use list::*;
+pub(crate) use list::*;
 pub(super) use neighbours::{decided_premises, proposed, undecided_premises};
-pub use search::*;
-pub use shelf::*;
-pub use views::*;
+pub(crate) use page::*;
+pub(crate) use reporting::*;
+pub(crate) use search::*;
+pub(crate) use shelf::*;
+pub(crate) use views::*;
 
 impl Store {
     /// The node `id`, merged or not, with its neighbourhood.
-    pub fn node(&self, id: NodeId) -> Result<NodeView> {
+    pub(crate) fn node(&self, id: NodeId) -> Result<NodeView> {
         let session = self.id();
         self.read(|db| {
             let (kind, head) = optional(
@@ -59,7 +63,7 @@ impl Store {
     }
 
     /// A page of the run's environments, oldest first.
-    pub fn environments(&self, page: Page) -> Result<Listing<EnvironmentView>> {
+    pub(crate) fn environments(&self, page: Page) -> Result<Listing<EnvironmentView>> {
         self.read(|db| {
             let items = environments(
                 db,
@@ -74,12 +78,9 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::tests::{
-            access, check, component, fixture, location, path, premise, scenario, state, sweep,
-            text,
-        },
-        *,
+    use super::*;
+    use crate::store::tests::{
+        access, check, component, fixture, location, path, premise, scenario, state, sweep, text,
     };
 
     /// A state's check stands until an access, edit or merge comes after it, whether or not the
@@ -111,8 +112,7 @@ mod tests {
         assert!(current());
         store.link(&actor, &[write(4)]).unwrap();
         assert!(!current());
-        let retracted =
-            StatusChange::State(window, StateMark::Inventory(InventoryStatus::Retracted));
+        let retracted = StatusChange::State(StateMark::Retracted { id: window });
         store.set_status(&actor, retracted, &text("gone")).unwrap();
         assert!(!current());
     }

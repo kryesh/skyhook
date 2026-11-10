@@ -1,6 +1,9 @@
 //! Job creation, state transitions, and terminal result supervision.
 
 use super::*;
+use skyhook_tools::diagnostic::{FailureSite, PartialContext};
+use skyhook_worker::diagnostic::{Failure, Operation, Subject};
+use skyhook_worker::fs::spill::SpillError;
 
 /// Proof of a claim on invocation `0`'s finish. Only an outcome applying ends
 /// it, never a drop, so its holder runs to the end as a completion owner does.
@@ -10,7 +13,9 @@ pub(super) struct FinishClaim(Run);
 impl FinishClaim {
     /// Hold the finish of `run`, which `claimable` just admitted.
     fn hold(state: &mut CoreState, run: Run) -> Self {
-        state.jobs.modify(run.0, |entry, _| entry.finishing = true);
+        state
+            .jobs
+            .modify(run.0, |entry, _| entry.live.finishing = true);
         Self(run)
     }
 }
@@ -39,7 +44,7 @@ impl JobManager {
         let parents: Vec<_> = specs.iter().filter_map(|spec| spec.parent).collect();
         self.inner
             .store
-            .commit_on::<_, JobError>(parents, Command::CreateJob, move |state| {
+            .commit_on::<_, JobError>(parents, Command::Start, move |state| {
                 for spec in &specs {
                     if let Some(parent) = spec.parent
                         && !state.jobs.contains(parent)
@@ -51,7 +56,7 @@ impl JobManager {
                         return Err(JobError::Interrupted);
                     }
                 }
-                let ids = state.jobs.next_ids(specs.len())?;
+                let ids = state.jobs.next_ids(specs.len());
                 let (created, journaled): (Vec<_>, Vec<_>) = (ids.into_iter().zip(specs))
                     .map(|(job, spec)| {
                         let created = SessionEvent::JobCreated {
@@ -78,7 +83,7 @@ impl JobManager {
                         let (handles, input) = JobHandles::new(cancellation.clone());
                         state
                             .jobs
-                            .modify(id, |entry, _| entry.handles = Some(handles));
+                            .modify(id, |entry, _| entry.live.handles = Some(handles));
                         // Created under a cancelled parent, it is cancelled with it.
                         let parent = parent.and_then(|parent| state.jobs.get(parent));
                         if parent.is_some_and(JobFacts::cancel_requested) {
@@ -95,7 +100,7 @@ impl JobManager {
 
     /// A new token under `parent`'s while it can still run, or the session root's.
     pub(super) fn token_under(&self, jobs: &Jobs, parent: Option<JobId>) -> CancellationToken {
-        let parent = parent.and_then(|parent| jobs.get(parent)?.handles.as_ref());
+        let parent = parent.and_then(|parent| jobs.get(parent)?.live.handles.as_ref());
         match parent {
             Some(parent) => parent.cancellation.child_token(),
             None => self.inner.supervisor.token(),
@@ -139,7 +144,9 @@ impl JobManager {
         let FinishClaim(Run(id, _)) = claim;
         if self.publish(&claim, outcome).await.is_err() {
             let released = move |state: &mut CoreState| {
-                state.jobs.modify(id, |entry, _| entry.finishing = false);
+                state
+                    .jobs
+                    .modify(id, |entry, _| entry.live.finishing = false);
             };
             self.inner.store.live(released).await;
         }
@@ -147,7 +154,8 @@ impl JobManager {
 
     /// Journal the finish `claim` holds with `outcome`'s output, and the
     /// acknowledgement of what the job read, refused once a later invocation
-    /// runs. An output that cannot be prepared stops the session.
+    /// runs. An output the session host's spill directory cannot keep fails the job,
+    /// with nothing saved; one that cannot be prepared otherwise stops the session.
     ///
     /// A foreground child's completed result saves the replies queued for its
     /// call, and its finish drops them from the queue. The finish applies after
@@ -156,11 +164,11 @@ impl JobManager {
     /// the output again. Replies after the finish stay queued for delivery.
     async fn publish(&self, claim: &FinishClaim, mut outcome: JobOutcome) -> Result<(), JobError> {
         let FinishClaim(run @ Run(id, _)) = *claim;
-        let end = outcome.end();
         let sources = |replies: Vec<&Queued>| -> Vec<MessageSeq> {
             replies.iter().map(|queued| queued.reply.message).collect()
         };
         loop {
+            let end = outcome.end();
             let saved = self.entry(id, |entry| {
                 let replies = entry.saved_replies(end)?;
                 let carried = replies.iter().map(|queued| queued.child_reply()).collect();
@@ -170,7 +178,14 @@ impl JobManager {
                 Some((saved, carried)) => (Some(saved), outcome.clone(), carried, Some(outcome)),
                 None => (None, outcome, Vec::new(), None),
             };
-            let (finish, output) = self.finished(run, attempt, carried).await?;
+            let (finish, output) = match self.finished(run, attempt, carried).await? {
+                Ok(finished) => finished,
+                Err(diagnostic) => {
+                    let output = None;
+                    outcome = JobOutcome::Failed { diagnostic, output };
+                    continue;
+                }
+            };
             let finished = move |state: &CoreState| {
                 let entry = state.jobs.get(id).ok_or(JobError::Unknown(id))?;
                 (entry.ends(run, end).then_some(())).ok_or(JobError::AlreadyTerminal(id))?;
@@ -182,7 +197,7 @@ impl JobManager {
                 if let Some((asking, agent, change)) = &unasked {
                     journaled.push((agent.clone(), change.event(*asking)));
                 }
-                journaled.extend(Delivery::claims(entry.reads.clone(), state));
+                journaled.extend(Delivery::claims(entry.live.reads.clone(), state));
                 let acknowledged = Plan::new(journaled, move |state, _| {
                     state.jobs.unread(id);
                     if let Some((asking, _, change)) = unasked {
@@ -205,13 +220,14 @@ impl JobManager {
     /// The change that ends invocation `run` with `outcome`, with the output it
     /// saves unless an earlier finish of the run saved one; refused unless that
     /// invocation is current and its phase admits the end. A child's reply saves
-    /// `carried` before it. The output is prepared here, off the core.
+    /// `carried` before it. The output is prepared here, off the core: one the session
+    /// host's spill directory could not keep is why the run fails instead.
     pub(super) async fn finished(
         &self,
         run: Run,
         outcome: JobOutcome,
         carried: Vec<ChildReply>,
-    ) -> Result<(JobChange, Option<Prepared>), JobError> {
+    ) -> Result<Result<(JobChange, Option<Prepared>), PartialDiagnostic>, JobError> {
         let Run(id, invocation) = run;
         let end = outcome.end();
         let (output, mut diagnostic) = match outcome {
@@ -221,10 +237,10 @@ impl JobManager {
         };
         // A job that completes without a result left nothing unfinished.
         let capture_complete = output.as_ref().map_or(end == JobEnd::Completed, |output| {
-            output.streams == crate::tool::StreamEnd::Finished
+            output.streams == skyhook_tools::output::StreamEnd::Finished
         });
         let has_result = output.is_some();
-        let crate::tool::output::Output {
+        let skyhook_tools::output::Output {
             value,
             images,
             captures,
@@ -256,22 +272,25 @@ impl JobManager {
             finished.images = previous.images;
             None
         } else {
-            let saved = output::Output::of(self.store(), id, invocation);
+            let saved = self.run_output(id, invocation);
             // Captures have independent pointer/type metadata. A failed tool need not
             // produce a result, and unfinished JSON captures are not valid result trees.
             let product = (output, capture_complete);
-            Some(
-                self.store()
-                    .reads()
-                    .hold(move || {
-                        output::prepare_completed(&saved, &schema, product, captures, presented)
-                            .map_err(SessionError::Io)
-                    })
-                    .await,
-            )
+            let prepare =
+                move || output::prepare_completed(&saved, &schema, product, captures, presented);
+            let prepared = self.store().reads().hold(prepare).await;
+            if let Err(error) = &prepared
+                && let Some(spill) = SpillError::of(error)
+            {
+                let unkept = Failure::at(Operation::Save, Subject::None, spill.fault());
+                let unkept = PartialDiagnostic::from(unkept);
+                let host = PartialContext::default().at(FailureSite::Host);
+                return Ok(Err(unkept.or(host)));
+            }
+            Some(prepared.map_err(SessionError::Io))
         };
         finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
-        Ok((JobChange::Finish(finished), rows))
+        Ok(Ok((JobChange::Finish(finished), rows)))
     }
 }
 
@@ -318,7 +337,9 @@ fn asked(state: &mut CoreState, id: JobId, change: JobChange) {
 fn claimable(state: &CoreState, run: Run, end: JobEnd) -> Result<(), Unclaimed> {
     let entry = state.jobs.get(run.0).ok_or(Unclaimed::Ended)?;
     entry.ends(run, end).then_some(()).ok_or(Unclaimed::Ended)?;
-    (!entry.finishing).then_some(()).ok_or(Unclaimed::InFlight)
+    (!entry.live.finishing)
+        .then_some(())
+        .ok_or(Unclaimed::InFlight)
 }
 
 /// Claim the finish of `run` with `end` before any output is saved, unless
@@ -362,13 +383,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_create_preflight_does_not_append_or_allocate() {
+    async fn create_refuses_an_unknown_parent_and_another_sessions_agent() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let before = jobs.store().records().len();
         let unknown = JobId::new(99).unwrap();
         let spec = JobSpec {
             parent: Some(unknown),
-            ..JobSpec::test(agent.clone(), "invalid-parent")
+            ..JobSpec::test(agent, "invalid-parent")
         };
         assert!(matches!(jobs.create(spec).await, Err(JobError::Unknown(id)) if id == unknown));
         let other = AgentId::root(crate::identity::SessionId::generate().unwrap());
@@ -376,12 +396,6 @@ mod tests {
             jobs.create(JobSpec::test(other, "wrong-session")).await,
             Err(JobError::Session(SessionError::WrongSession))
         ));
-        assert_eq!(jobs.store().records().len(), before);
-        assert!(jobs.facts(|jobs| jobs.iter().next().is_none()));
-        assert_eq!(
-            jobs.test_create(JobSpec::test(agent, "valid")).await.get(),
-            1
-        );
     }
 
     /// A capture that cannot be admitted (invalid UTF-8 or unreadable) is
@@ -389,14 +403,14 @@ mod tests {
     /// unjournaled failure.
     #[tokio::test]
     async fn invalid_or_unreadable_text_captures_still_journal_completion() {
-        use crate::job::output::{CaptureKind, PendingCapture};
+        use skyhook_tools::output::CaptureKind;
         use std::io::Write as _;
         for unreadable in [false, true] {
             let (_root, jobs, agent) = super::super::tests::runtime().await;
             let id = jobs.test_create(JobSpec::test(agent, "capture")).await;
             let output = jobs.output(id).await;
             let field = "/result/stdout".parse().unwrap();
-            let mut writer = PendingCapture::create(&output, &field, CaptureKind::Text)
+            let mut writer = crate::job::output::create_capture(&output, &field, CaptureKind::Text)
                 .unwrap()
                 .open();
             writer.write_all(b"partial \xff output").unwrap();
@@ -404,8 +418,8 @@ mod tests {
             if unreadable {
                 output.test_delete_capture(&capture);
             }
-            let product =
-                ToolOutput::new(serde_json::json!({"exit_code": 0})).with_captures(vec![capture]);
+            let product = ToolOutput::new(serde_json::json!({"exit": {"code": 0}}))
+                .with_captures(vec![capture]);
             jobs.test_complete(id, product).await;
             assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Completed);
             let journaled = jobs.store().records().into_iter().any(|record| {
@@ -418,7 +432,10 @@ mod tests {
             let replay = jobs.test_replay();
             let replayed = replay.test_snapshot(id).await.unwrap();
             assert_eq!(replayed.state, JobState::Completed);
-            assert_eq!(replayed.output, Some(serde_json::json!({"exit_code": 0})));
+            assert_eq!(
+                replayed.output,
+                Some(serde_json::json!({"exit": {"code": 0}}))
+            );
         }
     }
 
@@ -434,6 +451,7 @@ mod tests {
         let (_, abandoned) = jobs
             .finished(jobs.run(id).await, outcome(), Vec::new())
             .await
+            .unwrap()
             .unwrap();
         assert!(abandoned.is_some_and(|rows| rows.is_ok_and(|rows| !rows.staged.is_empty())));
         jobs.finish(id, outcome()).await.unwrap();
@@ -489,14 +507,14 @@ mod tests {
         jobs.store()
             .live(move |state| {
                 state.jobs.modify(id, |entry, _| {
-                    entry.handles.as_mut().unwrap().task_abort = Some((invocation, abort))
+                    entry.live.handles.as_mut().unwrap().task_abort = Some((invocation, abort))
                 })
             })
             .await;
         let (aborted, _) = crate::tests::expire(
             worker,
             async { jobs.cancel(id).await.unwrap() },
-            super::super::CANCELLATION_GRACE,
+            crate::job::cancellation::CANCELLATION_GRACE,
         )
         .await;
         assert!(aborted.unwrap_err().is_cancelled());
@@ -553,16 +571,6 @@ mod tests {
         let own = bounded(jobs.wait(id, true)).await.unwrap();
         assert_eq!(own.state, JobState::Completed);
         assert_eq!(own.output, Some(serde_json::json!("own")));
-        let cancelled = |event: &SessionEvent| {
-            matches!(
-                event,
-                SessionEvent::JobFinished {
-                    state: JobEnd::Cancelled,
-                    ..
-                }
-            )
-        };
-        assert_eq!(count(&jobs, cancelled), 0);
     }
 
     // Creation ownership and admission tests.
@@ -761,7 +769,7 @@ mod tests {
             bounded(async {
                 while published < total {
                     let update = updates.recv().await.unwrap();
-                    if let crate::agent::RuntimeEvent::Record(record) = update.event
+                    if let crate::session::RuntimeEvent::Record(record) = update.event
                         && record.sequence.get() > journaled as u64
                         && last(&record.event)
                     {

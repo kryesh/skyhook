@@ -6,18 +6,15 @@ use std::{sync::Arc, time::Duration};
 use futures_util::{TryStreamExt, stream};
 use reqwest::Url;
 
-use crate::{
-    media::ImageLimits,
-    provider::{
-        Provider, ProviderContext, ProviderError, ResponseStream,
-        codec::{self, BodyPath, Codec, CodecName},
-        protocol::{AssistantItem, ContextId, Message, ModelRequest, ResponseEvent, Scope},
-    },
+use crate::provider::{
+    Provider, ProviderContext, ProviderError, ResponseStream,
+    codec::{self, BodyPath, Codec, CodecName},
+    protocol::{AssistantItem, ContextId, Message, ModelRequest, ResponseEvent, Scope},
 };
 use images::FittedImages;
+use skyhook_media::ImageLimits;
 
-pub(crate) mod auth;
-pub(crate) mod errors;
+pub(crate) mod credentials;
 pub(crate) mod headers;
 pub(crate) mod images;
 pub(crate) mod session;
@@ -33,7 +30,7 @@ pub(crate) use session::Session;
 #[derive(Clone, Debug)]
 pub(crate) struct Transport {
     pub session: Session,
-    pub errors: errors::ErrorSignals,
+    pub errors: codec::errors::ErrorSignals,
     pub fields: Fields,
 }
 
@@ -41,7 +38,7 @@ impl Transport {
     pub(crate) fn plain() -> Self {
         Self {
             session: Session::None,
-            errors: errors::ErrorSignals::NONE,
+            errors: codec::errors::ErrorSignals::NONE,
             fields: Fields::default(),
         }
     }
@@ -96,32 +93,9 @@ pub(crate) struct Timeouts {
     pub read_idle: Duration,
 }
 
-impl Default for Timeouts {
-    fn default() -> Self {
-        Self {
-            startup: Duration::from_secs(600),
-            read_idle: Duration::from_secs(600),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "startup_timeout_secs and read_idle_timeout_secs must be positive, representable durations"
-)]
-pub struct TimeoutError;
-
-impl Timeouts {
-    pub(crate) fn validate(self) -> Result<(), TimeoutError> {
-        if [self.startup, self.read_idle]
-            .into_iter()
-            .any(|value| value.is_zero() || std::time::Instant::now().checked_add(value).is_none())
-        {
-            return Err(TimeoutError);
-        }
-        Ok(())
-    }
-}
+/// Both timeouts of an entry that names neither.
+pub(crate) const DEFAULT_TIMEOUT: skyhook_base::bounded::TimeoutSecs =
+    skyhook_base::bounded::TimeoutSecs::new::<600>();
 
 #[derive(Clone)]
 pub(crate) struct HttpProvider {
@@ -147,8 +121,8 @@ pub(crate) fn reasoning_scope(
     dialect: &str,
 ) -> Scope {
     let codec = codec.path_suffix();
-    let digest = crate::sha256_hex(format!("{name}\0{endpoint}\0{codec}\0{dialect}"));
-    Scope::try_from(digest).expect("digest is nonblank")
+    let digest = skyhook_base::hex::Sha256::of(format!("{name}\0{endpoint}\0{codec}\0{dialect}"));
+    Scope::try_from(digest.to_string()).expect("digest is nonblank")
 }
 
 /// Drop sealed replay issued under another scope; readable reasoning goes wherever
@@ -300,6 +274,15 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
     use std::sync::Arc;
 
+    impl Default for Timeouts {
+        fn default() -> Self {
+            Self {
+                startup: DEFAULT_TIMEOUT.into(),
+                read_idle: DEFAULT_TIMEOUT.into(),
+            }
+        }
+    }
+
     type Events = Vec<Result<transport::SseEvent, ProviderError>>;
 
     /// A request as a provider posts it.
@@ -339,14 +322,12 @@ pub(crate) mod tests {
     pub(crate) fn chat_request(model: &str, messages: Vec<Message>) -> ModelRequest {
         ModelRequest {
             context: entries(messages),
-            tools: vec![std::sync::Arc::new(
-                crate::provider::protocol::ToolDefinition {
-                    name: "lookup".into(),
-                    description: "Find a value".into(),
-                    input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
-                },
-            )],
-            max_output_tokens: std::num::NonZeroU64::new(512),
+            tools: vec![std::sync::Arc::new(crate::tool::catalog::ToolDefinition {
+                name: "lookup".into(),
+                description: "Find a value".into(),
+                input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+            })],
+            max_output_tokens: std::num::NonZeroU64::new(512).unwrap(),
             ..request(model)
         }
     }
@@ -379,7 +360,7 @@ pub(crate) mod tests {
                 ]),
                 tool_result("call_1", "inspect", json!({"ok":true}), vec![], false),
             ]),
-            max_output_tokens: std::num::NonZeroU64::new(100),
+            max_output_tokens: std::num::NonZeroU64::new(100).unwrap(),
             ..request("gpt-5")
         }
     }
@@ -489,8 +470,8 @@ pub(crate) mod tests {
             "model".into(),
             scope(),
             chat_completions::ReasoningFormat::Text,
-            errors::ErrorSignals::NONE,
-            crate::media::BlobDigest::of(b""),
+            codec::errors::ErrorSignals::NONE,
+            skyhook_media::BlobDigest::of(b""),
         ));
         let reduced = reduce_without_eof(events, decoder).await;
         assert_eq!(
@@ -533,7 +514,7 @@ pub(crate) mod tests {
     async fn chat_round_trip_persists_history_and_replays_readable_reasoning_across_providers() {
         use crate::provider::{
             Provider,
-            dialect::{self, Sourced, compatible},
+            dialect::{self, compatible},
             protocol::{Message, Outcome},
         };
         crate::tests::bounded(async {
@@ -548,7 +529,7 @@ pub(crate) mod tests {
                 json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
             ];
             let (url, server) = serve(vec![first, answer.clone(), answer]).await;
-            let common = dialect::tests::common(&url, Some(Sourced::Literal("k".into())));
+            let common = dialect::tests::common(&url, Some(skyhook_worker::secret::Credential::Literal("k".into())));
             let settings = compatible::Config::default();
             let chat = codec::CodecName::ChatCompletions;
             let configured = |name| dialect::tests::provider(name, &settings, chat, &common);
@@ -594,10 +575,17 @@ pub(crate) mod tests {
 
     /// A Responses provider at `server` whose bearer key a command produces.
     fn keyed_by_command(server: &Server, session: Session, command: String) -> HttpProvider {
-        use headers::{CommandValue, ValueField};
-        let key = CommandValue::new(command, ValueField::ApiKey).with_prefix(Some("Bearer "));
+        use credentials::ValueField;
+        use headers::ProducedValue;
+        use skyhook_worker::process::CommandLine;
+        use skyhook_worker::secret::Credential;
+        let command = Credential::Command(CommandLine::Shell(command));
+        let key = ProducedValue::new(command, ValueField::ApiKey).with_prefix(Some("Bearer "));
         let mut composed = Headers::default();
-        composed.insert(reqwest::header::AUTHORIZATION, headers::Value::Command(key));
+        composed.insert(
+            reqwest::header::AUTHORIZATION,
+            headers::Value::Produced(key),
+        );
         let endpoint = Url::parse(&server.url).unwrap();
         let codec = codec::Codec::Responses(responses::Dialect::stateless());
         HttpProvider {
@@ -694,10 +682,10 @@ pub(crate) mod tests {
         let mut context = provider.open_context("c".parse().unwrap()).unwrap();
         let mut request = reasoning_tool_request(&provider.scope);
         let turn: Vec<_> = request.messages().cloned().collect();
-        // Neither an unpolled nor an invalid invocation resolves the credential.
-        drop(context.invoke(request.clone()));
+        // An invalid invocation fails before the credential resolves.
         let mut invalid = request.clone();
-        invalid.reasoning = Some("adaptive".into());
+        let unloaded = vec![common::tests::image()];
+        invalid.context = entries(vec![tool_result("c", "read", json!({}), unloaded, false)]);
         assert!(context.invoke(invalid).next().await.unwrap().is_err());
         assert!(!count.exists());
         request.context = entries(vec![user("start")]);

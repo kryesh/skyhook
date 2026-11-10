@@ -12,13 +12,12 @@ use struson::{
 };
 
 use super::{
-    FieldPointer, Match, MatchPage, OutputPreview, ToolError, check_cancelled,
+    FieldPointer, Match, MatchPage, OutputPreview, Presented, ToolError, check_cancelled,
     elements::Budget,
-    json::{self, saved_json},
+    json::saved_json,
     preview::{self, Accounting, json_bytes},
-    projection::Presented,
-    render::{Clipped, JsonField},
     shape::Shape,
+    stream::JsonField,
 };
 
 /// What selects a match page's values from a JSON field.
@@ -42,7 +41,7 @@ pub(super) fn page(
     limit: usize,
     cancellation: &crate::job::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
-    let value = read(json, crate::limits::WHOLE_VALUE_BYTES)?;
+    let value = read(json, skyhook_base::limits::WHOLE_VALUE_BYTES)?;
     check_cancelled(cancellation)?;
     type Nodes<'v> =
         Box<dyn Iterator<Item = Result<(usize, FieldPointer, &'v Value), ToolError>> + 'v>;
@@ -97,10 +96,10 @@ pub(super) fn page(
         }
         let bytes = serde_json::to_vec(node)?;
         let pooled = preview::pool(
-            &mut json::reader(bytes.as_slice()),
+            &mut skyhook_tools::output::json::reader(bytes.as_slice()),
             &at,
             &Presented::default(),
-            &Clipped::new(),
+            &json.clipped,
             cancellation,
             Accounting::Page,
         )?;
@@ -147,13 +146,18 @@ fn read(json: &mut JsonField, cap: usize) -> Result<Value, ToolError> {
         }
     };
     if json.meter.refused() || position(json) - start > cap as u64 {
-        return Err(ToolError::failed(format!(
-            "pattern or query input exceeds {} MiB of JSON; select a field within it",
-            cap >> 20
-        )));
+        return Err(too_large(cap));
     }
     copied.map_err(saved_json)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// How a filter fails whose input is over `cap` bytes of JSON.
+pub(super) fn too_large(cap: usize) -> ToolError {
+    ToolError::failed(format!(
+        "pattern or query input exceeds {} MiB of JSON; select a field within it",
+        cap >> 20
+    ))
 }
 
 /// Bytes of JSON text the reader has consumed.

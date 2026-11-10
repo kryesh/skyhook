@@ -6,7 +6,7 @@
 //! decides: OpenAI's conventions on Chat and Responses, with Chat replaying the
 //! `thinking_blocks` its Bedrock path returns, and standard Messages on Messages; both
 //! send unsigned thinking back, which only Anthropic's services refuse.
-//! Tool names follow the upstream's alphabet on every codec; response schemas are
+//! Chat tool names follow the upstream's alphabet; response schemas are
 //! strict except behind Anthropic, which does not honour `strict`, so they go as written.
 //! Every codec takes the proxy's virtual key as a bearer token; deployment tags ride
 //! `x-litellm-tags`.
@@ -16,37 +16,31 @@
 //! under OpenAI's conventions also carry `prompt_cache_key`, which the proxy passes
 //! to the service for its own cache affinity.
 
+use crate::provider::codec::errors::{ErrorSignals, error_object};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 
-use super::{Dialect, DialectConfig, DialectError, Profile};
-use crate::{
-    named_enum::named_enum,
-    newtype::string_newtype,
-    provider::{
-        ProviderErrorKind,
-        codec::{
-            BodyPath, BreakpointBudget, CacheControl, CacheKey, Codec, CodecName, Locations,
-            NonEmpty, StateRole, ToolNames, UnsignedReasoning,
-            chat_completions::{self, EmptyContent, NativeReplay, ReasoningReplay},
-            common::lenient,
-            header, messages, path,
-        },
-        http::{
-            Transport,
-            errors::{ErrorSignals, error_object},
-        },
+use super::{Dialect, DialectConfig, DialectError, Wire};
+use crate::provider::{
+    ProviderErrorKind,
+    codec::{
+        BodyPath, CacheControl, CacheKey, Codec, CodecName, Locations, NonEmpty, StateRole,
+        ToolNames, UnsignedReasoning,
+        chat_completions::{self, EmptyContent, NativeReplay, ReasoningReplay},
+        common::lenient,
+        header, messages, path,
     },
+    http::Transport,
 };
+use skyhook_base::{enums::NamedEnum, string_newtype};
 
-named_enum! {
-    /// The family behind an alias.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum Upstream {
-        Openai = "openai",
-        Anthropic = "anthropic",
-        Bedrock = "bedrock",
-    }
+/// The family behind an alias.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Upstream {
+    Openai,
+    Anthropic,
+    Bedrock,
 }
 
 impl Upstream {
@@ -86,9 +80,8 @@ fn chat_anthropic() -> chat_completions::Dialect {
     chat_completions::Dialect {
         reasoning_replay: thinking_blocks(UnsignedReasoning::Dropped),
         empty_content: EmptyContent::Null,
+        tool_names: ToolNames::Anthropic,
         cache_control: CacheControl::Sent { ttl: None },
-        // The service's cap on breakpoints per request.
-        breakpoints: BreakpointBudget::new(4),
         ..chat_completions::Dialect::compatible()
     }
 }
@@ -165,7 +158,7 @@ crate::provider::settings::settings! {
 }
 
 impl DialectConfig for Config {
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError> {
         let anthropic = self.upstream.is_anthropic();
         let anthropic_messages = codec == CodecName::Messages && anthropic;
         let mut conventions = match codec {
@@ -180,9 +173,7 @@ impl DialectConfig for Config {
             }
             CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
-        if anthropic {
-            *conventions.tool_names_mut() = ToolNames::Anthropic;
-        } else {
+        if !anthropic {
             super::openai::conventions(&mut conventions);
         }
         let session = Locations::one(header("x-litellm-session-id"));
@@ -191,9 +182,9 @@ impl DialectConfig for Config {
         } else {
             session
         };
-        let mut profile = Profile {
+        let mut wire = Wire {
             scope: self.upstream.scope(),
-            ..Profile::new(
+            ..Wire::new(
                 conventions,
                 transport(),
                 Dialect::Litellm,
@@ -203,18 +194,18 @@ impl DialectConfig for Config {
         if anthropic_messages {
             // These conventions send state as turn-scoped system messages, which the
             // bare upstream scope does not mean.
-            profile.discriminate("messages", &"anthropic");
-            super::anthropic::state(&mut profile, self.state_role);
+            wire.discriminate("messages", &"anthropic");
+            super::anthropic::state(&mut wire, self.state_role);
         } else {
-            profile.state_role(self.state_role, StateRole::User);
+            wire.state_role(self.state_role, StateRole::User);
         }
         if !self.tags.is_empty() {
-            profile.discriminate("tags", &self.tags);
+            wire.discriminate("tags", &self.tags);
             let tags: Vec<_> = self.tags.iter().map(Tag::as_str).collect();
             let value = HeaderValue::from_str(&tags.join(",")).expect("tags join into header text");
-            profile.fixed("x-litellm-tags", value);
+            wire.fixed("x-litellm-tags", value);
         }
-        Ok(profile)
+        Ok(wire)
     }
 }
 

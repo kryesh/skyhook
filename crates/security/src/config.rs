@@ -1,36 +1,38 @@
-//! Security-only settings layered by the shared loader, independently of config.yaml.
+//! Security-only settings, which a host reads beside the shared configuration and hands in.
 
-use std::{collections::BTreeMap, num::NonZeroU16, path::Path};
+use skyhook::product::Attendance;
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    num::NonZeroU16,
+    path::{Path, PathBuf},
+};
 
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use skyhook::{
-    Prose,
-    config::{
-        Config, ConfigError, LayerResolutionError, LayerSources, LayeredConfig, ResolvedConfig,
-        resolve_layers,
-    },
-    mcp::config::{McpConfigError, McpServerConfig},
-    provider::profile::ModelRef,
-    tool::policy::{Mode, ModeName},
+    config::mode::{Mode, ModeName},
+    config::{Config, ConfigError},
+    mcp::config::McpServerConfig,
+    provider::model::ModelRef,
 };
+use skyhook_base::{enums::NamedEnum, newtype::Prose};
 
 use crate::{
     cvss::Severity,
-    presets,
+    modes,
     store::{LivePolicy, RunOptions},
 };
 
-skyhook::named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-    pub enum ModelRole {
-        Orchestrator = "orchestrator",
-        Explorer = "explorer",
-        Validator = "validator",
-        Environment = "environment",
-        Poc = "poc",
-        Reporter = "reporter",
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    Orchestrator,
+    Explorer,
+    Validator,
+    Environment,
+    Poc,
+    Reporter,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,18 +41,14 @@ pub struct ModelAssignment {
     pub roles: IndexSet<ModelRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<Prose>,
+    /// Where the host read the assignment, named when it is refused.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
-impl clap::ValueEnum for LivePolicy {
-    fn value_variants<'a>() -> &'a [Self] {
-        &Self::ALL
-    }
-    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        Some(clap::builder::PossibleValue::new(self.as_str()))
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The product's own settings as a host read them; a document that sets none is the
+/// default.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default)]
@@ -66,119 +64,71 @@ pub struct SecurityConfig {
     pub workers: Option<NonZeroU16>,
     #[serde(default)]
     pub shortlist: Option<Severity>,
-    /// Absence is distinct from an explicit ask: headless defaults to no.
+    /// Absence is distinct from an explicit ask: a batch job defaults to no.
     #[serde(default)]
     pub live: Option<LivePolicy>,
+    /// Where the host read the settings, named in what the product warns of them.
     #[serde(skip)]
-    sources: LayerSources,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            models: IndexMap::new(),
-            mcp: BTreeMap::new(),
-            modes: IndexMap::new(),
-            workers: None,
-            shortlist: None,
-            live: None,
-            sources: LayerSources::default(),
-        }
-    }
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("{}: models.{model}: {error}", source.display())]
+pub(crate) enum Error {
+    #[error("{}", named(.file.as_deref(), format_args!("models.{model}: {error}")))]
     ModelAssignment {
-        source: std::path::PathBuf,
+        file: Option<PathBuf>,
         model: ModelRef,
         #[source]
         error: Box<ConfigError>,
     },
-    #[error("mcp.{name}: {error}")]
-    Mcp {
-        name: String,
-        #[source]
-        error: McpConfigError,
-    },
-    #[error(
-        "live: ask requires an interactive session; use --live yes or --live no in headless mode"
-    )]
-    HeadlessAsk,
-    #[error("--live sets a new session's policy; a resumed run keeps the one it started with")]
-    LiveOnResume,
     #[error(transparent)]
     Shared(#[from] ConfigError),
 }
 
-impl LayeredConfig for SecurityConfig {
-    type Error = Error;
-
-    const FILE_NAME: &'static str = "security.yaml";
-    const NAMED_ENTRIES: &'static [&'static str] = &["models", "modes", "mcp"];
-
-    fn missing() -> Option<Self> {
-        Some(Self::default())
-    }
-
-    fn admit_layer(&mut self, sources: &LayerSources) -> Result<(), Error> {
-        for (name, server) in &mut self.mcp {
-            let file = sources.entry("mcp", name).expect("MCP server has a source");
-            let directory = file.parent().expect("absolute config path has a parent");
-            server.resolve_cwd(directory).map_err(|error| Error::Mcp {
-                name: name.clone(),
-                error,
-            })?;
-        }
-        self.sources = sources.clone();
-        Ok(())
+/// `message` as said of `file`, when the host named one.
+fn named(file: Option<&Path>, message: impl Display) -> String {
+    match file {
+        Some(file) => format!("{}: {message}", file.display()),
+        None => message.to_string(),
     }
 }
 
 impl SecurityConfig {
-    pub async fn resolve(
-        workspace: &Path,
-        explicit: Option<&Path>,
-    ) -> Result<ResolvedConfig<Self>, LayerResolutionError> {
-        resolve_layers(workspace, explicit).await
-    }
-
-    /// A new run's options: the flags', then the configured, then the defaults.
-    pub fn run_options(
+    /// A new run's options: the flags', then the configured, then the defaults; an
+    /// attended launch's live policy defaults to ask, a batch job's to no.
+    pub(crate) fn run_options(
         &self,
         shortlist: Option<Severity>,
         workers: Option<NonZeroU16>,
+        live: Option<LivePolicy>,
+        attendance: Attendance,
     ) -> RunOptions {
         let defaults = RunOptions::default();
         RunOptions {
             threshold: shortlist.or(self.shortlist).unwrap_or(defaults.threshold),
             workers: workers.or(self.workers).unwrap_or(defaults.workers),
+            live: live.or(self.live).unwrap_or(match attendance {
+                Attendance::Batch => LivePolicy::No,
+                Attendance::Attended => LivePolicy::Ask,
+            }),
         }
     }
 
-    /// A new run's policy: the flag's, the configuration's, or the default (interactive: ask;
-    /// headless: no).
-    pub fn live_policy(&self, cli: Option<LivePolicy>, headless: bool) -> LivePolicy {
-        cli.or(self.live).unwrap_or(if headless {
-            LivePolicy::No
-        } else {
-            LivePolicy::Ask
-        })
+    /// What the settings leave for the host to tell the user.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let unassigned = (self.models.values()).all(|assignment| assignment.roles.is_empty());
+        let warning = "no model role hints configured; every agent runs on the default model (see security.example.yaml)";
+        Vec::from_iter(unassigned.then(|| named(self.file.as_deref(), warning)))
     }
 
     /// Replace ordinary modes with the security modes, merge MCP servers, and rewrite model
     /// offers. Nothing changes when an assigned model is not configured.
-    pub fn apply(&self, config: &mut Config) -> Result<(), Error> {
-        for model in self.models.keys() {
+    pub(crate) fn apply(&self, config: &mut Config) -> Result<(), Error> {
+        for (model, assignment) in &self.models {
             config
                 .model_profile(model)
                 .map_err(|error| Error::ModelAssignment {
-                    source: self
-                        .sources
-                        .entry("models", &model.to_string())
-                        .unwrap_or_else(|| Path::new(Self::FILE_NAME))
-                        .to_path_buf(),
+                    file: assignment.file.clone(),
                     model: model.clone(),
                     error: Box::new(error),
                 })?;
@@ -190,8 +140,8 @@ impl SecurityConfig {
         {
             config.default_model = Some(model.clone());
         }
-        config.modes = presets::configured(&self.modes);
-        config.default_mode = presets::root();
+        config.modes = modes::configured(&self.modes);
+        config.default_mode = modes::root();
         config.mcp.extend(self.mcp.clone());
         let hints: Vec<(ModelRef, Option<Prose>)> = config
             .models()
@@ -261,9 +211,7 @@ providers:
     }
 
     fn parse(value: serde_json::Value) -> SecurityConfig {
-        let mut config: SecurityConfig = serde_json::from_value(value).unwrap();
-        config.admit_layer(&LayerSources::default()).unwrap();
-        config
+        serde_json::from_value(value).unwrap()
     }
 
     #[test]
@@ -276,7 +224,7 @@ providers:
         config.default_model = Some("test/first".parse().unwrap());
         security.apply(&mut config).unwrap();
         assert_eq!(config.default_model, Some("test/second".parse().unwrap()));
-        assert_eq!(config.default_mode, presets::root());
+        assert_eq!(config.default_mode, modes::root());
         for (model, hint) in [
             (
                 "test/second",
@@ -299,7 +247,7 @@ providers:
             );
         }
         assert!(!config.modes.contains_key("general"));
-        assert!(config.modes.contains_key(&presets::root()));
+        assert!(config.modes.contains_key(&modes::root()));
         config.into_runtime().unwrap();
 
         let mut config = shared();
@@ -311,32 +259,14 @@ providers:
         assert!(config.models().all(|(_, profile)| profile.hint.is_none()));
     }
 
-    #[tokio::test]
-    async fn explicit_file_records_model_source_and_replaces_named_modes() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("selected.yaml");
-        std::fs::write(
-            &path,
-            r#"
-models:
-  test/missing:
-    roles: [validator]
-modes:
-  report:
-    capabilities: [read, targets]
-mcp:
-  security:
-    transport: stdio
-    start_command: [/bin/true]
-"#,
-        )
-        .unwrap();
-        let mut security =
-            SecurityConfig::resolve(Path::new("/workspace-is-not-read"), Some(&path))
-                .await
-                .unwrap()
-                .config;
-        let modes = presets::configured(&security.modes);
+    #[test]
+    fn a_refused_assignment_names_its_file_and_named_modes_replace() {
+        let mut security = parse(json!({
+            "models": {"test/missing": {"roles": ["validator"]}},
+            "modes": {"report": {"capabilities": ["read", "targets"]}},
+            "mcp": {"security": {"transport": "stdio", "start_command": ["/bin/true"]}},
+        }));
+        let modes = modes::configured(&security.modes);
         assert_eq!(
             modes["report"]
                 .capabilities
@@ -351,8 +281,15 @@ mcp:
         assert!(modes.contains_key("orchestrate"));
         let mut config = shared();
         let before = serde_json::to_value(&config).unwrap();
+        let refusal = "models.test/missing: invalid model `test/missing`: model is not configured";
+        assert_eq!(
+            security.apply(&mut config).unwrap_err().to_string(),
+            refusal
+        );
+        security.models[0].file = Some("/user/security.yaml".into());
         let error = security.apply(&mut config).unwrap_err();
-        assert_matches!(&error, Error::ModelAssignment { source, .. } if source == &path);
+        assert_matches!(&error, Error::ModelAssignment { .. });
+        assert_eq!(error.to_string(), format!("/user/security.yaml: {refusal}"));
         assert_eq!(serde_json::to_value(&config).unwrap(), before);
         security.models.clear();
         security.apply(&mut config).unwrap();
@@ -362,27 +299,30 @@ mcp:
     #[test]
     fn policy_defaults_and_cli_precedence() {
         let mut config = SecurityConfig::default();
-        assert_eq!(config.run_options(None, None), RunOptions::default());
+        let batch = config.run_options(None, None, None, Attendance::Batch);
+        assert_eq!(batch, RunOptions::default());
+        let live = |config: &SecurityConfig, flag, attendance| {
+            config.run_options(None, None, flag, attendance).live
+        };
+        assert_eq!(live(&config, None, Attendance::Attended), LivePolicy::Ask);
         config.shortlist = Some(Severity::High);
         config.workers = NonZeroU16::new(3);
         let options = |shortlist, workers| {
-            let options = config.run_options(shortlist, workers);
+            let options = config.run_options(shortlist, workers, None, Attendance::Batch);
             (options.threshold, options.workers.get())
         };
         assert_eq!(options(None, None), (Severity::High, 3));
         let flags = options(Some(Severity::Medium), NonZeroU16::new(2));
         assert_eq!(flags, (Severity::Medium, 2));
-        assert_eq!(config.live_policy(None, false), LivePolicy::Ask);
-        assert_eq!(config.live_policy(None, true), LivePolicy::No);
         config.live = Some(LivePolicy::Ask);
-        assert_eq!(config.live_policy(None, true), LivePolicy::Ask);
+        assert_eq!(live(&config, None, Attendance::Batch), LivePolicy::Ask);
         assert_eq!(
-            config.live_policy(Some(LivePolicy::Yes), true),
+            live(&config, Some(LivePolicy::Yes), Attendance::Batch),
             LivePolicy::Yes
         );
         config.live = Some(LivePolicy::Yes);
         assert_eq!(
-            config.live_policy(Some(LivePolicy::No), false),
+            live(&config, Some(LivePolicy::No), Attendance::Attended),
             LivePolicy::No
         );
     }

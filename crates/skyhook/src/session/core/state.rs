@@ -8,18 +8,19 @@ use super::{
     EventRecord, JournalFailure, SessionError, SessionEvent, SessionPhase,
     waits::{Dirty, Wait, Waits},
 };
+use crate::identity::AgentId;
 use crate::{
-    agent::{
-        ObservationSnapshot, ObservedActivity, ObservedEvent, RuntimeEvent,
-        todo::{self, AgentTodos},
-    },
-    identity::{AgentId, JobId},
     job::{Invocation, Jobs, Run},
     session::{
         EntryKind, Message, RecordSeq, RequestSeq, ResidentLedger, UserPart,
         agent_state::AgentStates, db::Opening,
     },
+    session::{
+        ObservationSnapshot, ObservedActivity, ObservedEvent, RuntimeEvent,
+        todo::{self, AgentTodos},
+    },
 };
+use skyhook_worker::job::JobId;
 
 #[derive(Default)]
 pub(crate) struct CoreState {
@@ -30,10 +31,14 @@ pub(crate) struct CoreState {
     /// What the journal leaves of each started agent beside its requests.
     pub(crate) agent_states: AgentStates,
     pub(crate) todos: BTreeMap<AgentId, AgentTodos>,
+    /// The root's contract, and each child's while its loop runs.
+    pub(crate) contracts: crate::session::Contracts,
     pub(crate) jobs: Jobs,
     /// Never journaled: the agents whose loops run.
     pub(crate) agents: crate::agent::Agents,
     pub(crate) targets: crate::target::TargetRegistry,
+    /// The spill files that are the session's own to read.
+    pub(crate) spills: crate::session::OwnSpills,
     /// Whether the session has a title: one it was given, or else its root's
     /// first prompt text.
     pub(crate) titled: bool,
@@ -89,7 +94,7 @@ pub(in crate::session) struct Observed {
     applied: RecordSeq,
     /// Counts publications, so an observer applies each one once.
     revision: u64,
-    views: crate::agent::Views,
+    views: crate::session::Views,
     /// The run of each job whose output changed after it was last read, as
     /// observers were told.
     unread: HashMap<JobId, Invocation>,
@@ -97,6 +102,9 @@ pub(in crate::session) struct Observed {
     unread_responses: HashSet<(AgentId, RequestSeq)>,
     /// Each open feed of an agent's records, in order as they apply.
     feeds: HashMap<AgentId, Vec<Feed>>,
+    /// The latest of each capture whose target keeps what follows its rows while
+    /// its command runs.
+    pub(in crate::session) latest: HashMap<i64, crate::session::LiveTail>,
 }
 
 /// A feed of one agent's records of the kinds its subscriber folds.
@@ -109,12 +117,12 @@ struct Feed {
 pub(in crate::session) struct Posted {
     revision: u64,
     applied: RecordSeq,
-    views: crate::agent::Views,
+    views: crate::session::Views,
 }
 
 impl CoreState {
     /// Why `agent`'s journal leaves its last turn short of an answer, if it does.
-    pub(crate) fn stopped_turn(&self, agent: &AgentId) -> Option<crate::agent::TurnFailure> {
+    pub(crate) fn stopped_turn(&self, agent: &AgentId) -> Option<crate::session::TurnFailure> {
         self.agent_states.get(agent)?.stopped(agent, &self.requests)
     }
 
@@ -134,6 +142,7 @@ impl CoreState {
             seeds,
             titled,
             entries,
+            spills,
         } = opening;
         let mut registry = crate::target::TargetRegistry::default();
         records
@@ -144,14 +153,15 @@ impl CoreState {
             requests: ledger,
             agent_states: AgentStates::opened(agents),
             todos,
-            agents: crate::agent::Agents::opened(&records, children),
+            contracts: crate::session::Contracts::opened(&records, children),
             targets: registry,
+            spills: crate::session::OwnSpills::opened(spills),
             titled,
             ..Self::default()
         };
-        let views = crate::agent::Views {
+        let views = crate::session::Views {
             entries,
-            context: crate::agent::ContextGauge::opened(&gauged),
+            context: crate::session::ContextGauge::opened(&gauged),
             ..Default::default()
         };
         let observed = Observed {
@@ -182,11 +192,11 @@ impl CoreState {
     pub(super) fn apply(
         &mut self,
         record: &Arc<EventRecord>,
-    ) -> Result<(Option<JobId>, crate::agent::ViewRead), SessionError> {
+    ) -> Result<(Option<JobId>, crate::session::ViewRead), SessionError> {
         let job = self.jobs.apply(record)?;
         self.agent_states.apply(record, &mut self.requests);
-        let read = crate::agent::Views::read(&self.requests, record);
-        self.agents.observe(record);
+        let read = crate::session::Views::read(&self.requests, record);
+        self.contracts.observe(record);
         todo::apply(&mut self.todos, record);
         self.targets.apply(&record.event);
         self.dirty.agent(&record.agent);
@@ -209,7 +219,7 @@ impl CoreState {
         &mut self,
         observed: &mut Observed,
         record: &Arc<EventRecord>,
-        read: crate::agent::ViewRead,
+        read: crate::session::ViewRead,
     ) {
         self.counters.apply(record);
         observed.applied = record.sequence;
@@ -268,10 +278,19 @@ impl CoreState {
         wait: Wait<T>,
         reply: tokio::sync::oneshot::Sender<T>,
     ) {
-        if matches!(self.phase, SessionPhase::Closed | SessionPhase::Failed(_)) {
-            return;
+        if self.decides() {
+            self.waits.register(wait, reply);
         }
-        self.waits.register(wait, reply);
+    }
+
+    /// Whether the session still decides: not once it closed or failed.
+    pub(crate) fn decides(&self) -> bool {
+        !matches!(self.phase, SessionPhase::Closed | SessionPhase::Failed(_))
+    }
+
+    /// Register a [`standing`](Wait::standing) wait.
+    pub(crate) fn stand(&mut self, wait: Wait<()>) {
+        self.wait(wait, tokio::sync::oneshot::channel().0);
     }
 
     /// How many registered waits read `key`.
@@ -354,9 +373,11 @@ impl CoreState {
         self.activity = crate::agent::activities(self);
     }
 
-    /// Drop every wait: a closed session decides nothing more.
-    pub(super) fn close_waits(&mut self) {
+    /// Drop every wait and question batch, whose asks see it stopped: a closed
+    /// session decides nothing more.
+    pub(super) fn close(&mut self) {
         self.waits.clear();
+        self.agents.drop_batches();
     }
 
     /// Stop for `failure` as reopening the session shows it: as `opened` from the
@@ -416,7 +437,7 @@ impl Observed {
     pub(in crate::session) fn post(&mut self, event: RuntimeEvent) {
         let applied = self.applied;
         let committed = |sequence| sequence <= applied;
-        crate::agent::live(&mut self.views.responses, None, committed, event);
+        crate::session::live(&mut self.views.responses, None, committed, event);
     }
 
     /// Fold `event`, streamed for `request`, returning the update telling observers
@@ -427,7 +448,7 @@ impl Observed {
         event: crate::provider::protocol::ResponseEvent,
     ) -> Option<RuntimeEvent> {
         let key = (agent, request);
-        crate::agent::stream(&mut self.views.responses, key.clone(), event);
+        crate::session::stream(&mut self.views.responses, key.clone(), event);
         let told = !self.unread_responses.insert(key.clone());
         (!told).then(|| RuntimeEvent::ResponseChanged {
             agent: key.0,
@@ -440,7 +461,7 @@ impl Observed {
     pub(in crate::session) fn response(
         &mut self,
         request: &(AgentId, RequestSeq),
-    ) -> Option<crate::agent::ObservedResponse> {
+    ) -> Option<crate::session::ObservedResponse> {
         self.unread_responses.remove(request);
         self.views.responses.get(request).cloned()
     }

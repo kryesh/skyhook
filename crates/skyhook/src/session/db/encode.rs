@@ -6,11 +6,9 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::{Db, DbResult, corrupt, params, rejected};
-use crate::{
-    identity::AgentId,
-    session::{EventRecord, SessionEvent},
-    target::TargetRef,
-};
+use crate::identity::AgentId;
+use crate::session::{EventRecord, SessionEvent};
+use skyhook_tools::target::TargetRef;
 
 pub(super) fn json(value: &impl Serialize) -> DbResult<String> {
     serde_json::to_string(value).map_err(|error| corrupt(error.to_string()))
@@ -71,11 +69,10 @@ impl Encoder {
         };
         let ordinal = self.ordinal(db, entry.agent)?;
         db.execute(
-            "INSERT INTO entry (seq, public_id, agent, agent_ordinal, created_millis, kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO entry (seq, agent, agent_ordinal, created_millis, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 entry.seq,
-                record.id.to_bytes().to_vec(),
                 entry.agent,
                 ordinal,
                 record.timestamp_millis,
@@ -238,18 +235,17 @@ mod tests {
     // Encode -> decode round trip of every session event kind.
     use serde_json::json;
 
+    use crate::{job::JobRole, tool::catalog::ToolDefinition};
     use crate::{
-        agent::CompactionFault,
-        execution::ExecutionLocation,
-        identity::JobId,
-        job::JobView,
-        job::{JobEnd, JobRole, JobState, JobTransition},
-        media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
-        provider::codec::common::tests::envelope,
-        provider::protocol::{
-            AssistantItem, Binding, HistoryLifetime, ReplayFormat, ResponseSchema, SystemSegment,
-            ToolCall, ToolDefinition, Usage,
+        job::{JobEnd, JobState, JobTransition, JobView},
+        provider::{
+            codec::common::tests::envelope,
+            protocol::{
+                AssistantItem, Binding, HistoryLifetime, ReplayFormat, ResponseSchema,
+                SystemSegment, ToolCall, Usage,
+            },
         },
+        session::CompactionFault,
         session::{
             AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, JobEvent,
             Message, ModelCallOrigin, ModelContext, ModelPurpose, RecordSeq, RuntimeState,
@@ -257,9 +253,11 @@ mod tests {
             db::tests::{Fixture, result, user},
             tests::{child_started, profile},
         },
-        target::TargetDefinition,
-        target::TargetRef,
     };
+    use skyhook_media::{AttachmentRef, ImageFormat, ImageRef, TextRef};
+    use skyhook_tools::target::ExecutionLocation;
+    use skyhook_tools::target::TargetRef;
+    use skyhook_worker::job::JobId;
 
     #[test]
     fn every_event_kind_round_trips() {
@@ -278,7 +276,7 @@ mod tests {
             blob: image,
         };
         let mut profile = profile();
-        profile.profile.reasoning = Some("high".into());
+        profile.profile.reasoning = Some(crate::provider::model::Effort::High);
         let agent_context = ModelContext {
             purpose: ModelPurpose::Agent,
             profile: profile.clone(),
@@ -298,7 +296,7 @@ mod tests {
         });
         // A mode that grants nothing still records the change. An entry with a
         // definition records its name's next edition; one without names the latest.
-        let edition = |instructions: Option<&str>| crate::tool::policy::Mode {
+        let edition = |instructions: Option<&str>| crate::config::mode::Mode {
             capabilities: instructions
                 .map(|_| crate::tool::policy::Capability::Read)
                 .into_iter()
@@ -445,9 +443,46 @@ mod tests {
             diagnostic: None,
             images: Vec::new(),
         });
-        one!(SessionEvent::TargetsUpserted {
-            targets: vec![TargetDefinition::test("build", "/srv", None)],
-        });
+        // Every transport, authentication, trust and password form journals as given.
+        let ssh = |ssh| json!({"type": "ssh", "host": "h", "ssh": ssh});
+        let winrm = |winrm| json!({"type": "winrm", "host": "h", "winrm": winrm});
+        let given = [
+            ssh(json!({})),
+            ssh(json!({"forward_agent": true, "password": "pw"})),
+            ssh(json!({"key": "/k", "password": "literal"})),
+            ssh(json!({"password": {"env": "PASSWORD"}})),
+            ssh(json!({"password": {"command": "pass show build"}})),
+            ssh(json!({"password": {"command": ["pass", "show", "build"]}})),
+            ssh(json!({"key": "~/k", "password": {"file": "~/password"}})),
+            winrm(json!({"user": "CORP\\u", "password": "pw", "auth": "negotiate", "tls": "off"})),
+            winrm(
+                json!({"user": "u", "password": {"env": "PW"}, "auth": "basic",
+                "tls": {"ca": "~/ca.pem"}, "port": 15986}),
+            ),
+            winrm(
+                json!({"user": "u@corp", "password": {"command": ["pass"]}, "auth": "kerberos",
+                "kdc": "dc:750", "tls": {"fingerprint": "0a".repeat(32)}}),
+            ),
+            winrm(json!({"user": "u@corp", "password": "pw", "auth": "kerberos", "tls": "system"})),
+            winrm(json!({"user": "u", "password": "pw", "tls": "insecure"})),
+        ];
+        // A configured target journals that it reads a password, not the password.
+        let configured = [
+            ssh(json!({"password": "pw"})),
+            ssh(json!({"key": "/k", "password": "pw"})),
+            winrm(json!({"user": "u", "password": "pw"})),
+        ];
+        let definition = |name: String, config| {
+            let config = serde_json::from_value(config).unwrap();
+            crate::target::TargetDefinition::from_config(name, config).unwrap()
+        };
+        let given = (given.into_iter().enumerate())
+            .map(|(index, config)| definition(format!("t{index}"), config));
+        let configured = (configured.into_iter().enumerate())
+            .map(|(index, config)| definition(format!("c{index}"), config));
+        let configured = crate::target::ConfiguredTargets::of(configured.collect());
+        let targets = given.chain(configured.definitions()).collect();
+        one!(SessionEvent::TargetsUpserted { targets });
         one!(SessionEvent::JobClaimed { job });
         one!(SessionEvent::JobCancelRequested { job });
         one!(SessionEvent::JobReleased { job });
@@ -464,9 +499,9 @@ mod tests {
             notification: None,
         });
         one!(SessionEvent::TodosReplaced {
-            items: vec![crate::agent::TodoItem {
+            items: vec![crate::session::TodoItem {
                 text: "todo".parse().unwrap(),
-                status: crate::agent::TodoStatus::InProgress,
+                status: crate::session::TodoStatus::InProgress,
             }],
         });
         one!(SessionEvent::TodosReplaced { items: Vec::new() });
@@ -502,9 +537,9 @@ mod tests {
                 message: Message::User(vec![UserPart::Compaction {
                     text: "summary".into(),
                 }]),
-                todos: vec![crate::agent::TodoItem {
+                todos: vec![crate::session::TodoItem {
                     text: "kept".parse().unwrap(),
-                    status: crate::agent::TodoStatus::Pending,
+                    status: crate::session::TodoStatus::Pending,
                 }],
                 retained: vec![prompt.message()],
                 attempt: summary_attempt,
@@ -584,9 +619,9 @@ mod tests {
                 },
                 reader,
             ],
-            todos: vec![crate::agent::TodoItem {
+            todos: vec![crate::session::TodoItem {
                 text: "todo".parse().unwrap(),
-                status: crate::agent::TodoStatus::Completed,
+                status: crate::session::TodoStatus::Completed,
             }],
             location: ExecutionLocation::root("/workspace".into()),
             host: None,
@@ -623,7 +658,7 @@ mod tests {
         });
         let location = ExecutionLocation::root("/workspace".into());
         let failed = SessionEvent::AgentFailed {
-            failure: crate::agent::Failure::Refused("filtered".into()),
+            failure: crate::session::Failure::Refused("filtered".into()),
         };
         let started = child_started(Some(owner), location);
         let child_events = [started, failed].map(|event| (child.clone(), event));

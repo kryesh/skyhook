@@ -38,14 +38,9 @@ impl std::fmt::Display for SessionPhase {
 pub(crate) enum Command {
     /// Settle what the process that last ran the session left open.
     Activate,
-    CreateJob,
-    LaunchAgent,
-    BeginTurn,
-    /// Journal a model request, or an attempt at one, for a turn or its compaction.
-    Request,
-    Submit,
-    Continue,
-    Send,
+    /// Start new work: create a job, launch an agent, begin a turn, journal a model
+    /// request or an attempt at one, or take input.
+    Start,
     /// Record what running work does.
     Journal,
     BeginShutdown,
@@ -78,27 +73,16 @@ impl SessionPhase {
             (Viewing | Running | ShuttingDown | Closed, Close)
             | (Viewing | Closed, BeginShutdown) => Closed,
             (Running | ShuttingDown, BeginShutdown) | (ShuttingDown, Journal) => ShuttingDown,
-            (
-                Running,
-                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send | Journal,
-            ) => Running,
+            (Running, Start | Journal) => Running,
             // Closing leaves an interruption suspended, as the journal leaves it for
             // the next process: settling it would let a released owner claim it.
-            (
-                Viewing,
-                CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send | Journal,
-            )
+            (Viewing, Start | Journal)
             | (Running, Activate)
-            | (
-                ShuttingDown | Closed,
-                Activate | CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send,
-            )
+            | (ShuttingDown | Closed, Activate | Start)
             | (Closed, Journal)
-            | (
-                Failed(_),
-                Activate | CreateJob | LaunchAgent | BeginTurn | Request | Submit | Continue | Send
-                | Journal | BeginShutdown | Close,
-            ) => return Err(self.refusal()),
+            | (Failed(_), Activate | Start | Journal | BeginShutdown | Close) => {
+                return Err(self.refusal());
+            }
         };
         let dated = match (self, &next) {
             (Running, Running) => Dated::Now,
@@ -165,12 +149,12 @@ mod tests {
         // Each chain starts from the session reopened to view it.
         let chains: [&[(Command, Option<SessionPhase>)]; 2] = [
             &[
-                (Submit, None),
+                (Start, None),
                 (Activate, Some(Running)),
                 (Activate, None),
-                (Submit, Some(Running)),
+                (Start, Some(Running)),
                 (BeginShutdown, Some(ShuttingDown)),
-                (Submit, None),
+                (Start, None),
                 (Journal, Some(ShuttingDown)),
                 (BeginShutdown, Some(ShuttingDown)),
                 (Close, Some(Closed)),

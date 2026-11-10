@@ -2,8 +2,8 @@
 use super::*;
 use crate::provider::{
     codec::{
-        Cache, CacheControl, CodecName,
-        common::{PreparedImages, check_tool, system_text},
+        Cache, CacheControl,
+        common::{PreparedImages, system_text},
         placement::breakpoint,
         set_each,
     },
@@ -68,7 +68,6 @@ pub(crate) fn encode(
     if !request.tools.is_empty() {
         let mut tools = Vec::new();
         for tool in &request.tools {
-            check_tool(tool, dialect.tool_names, CodecName::Responses)?;
             tools.push(json!({"type":"function", "name":tool.name,
                 "description":tool.description, "parameters":tool.input_schema, "strict":false}));
         }
@@ -80,11 +79,10 @@ pub(crate) fn encode(
         settings.insert("text".into(), json!({"format": format}));
     }
     if let Some(reasoning) = &request.reasoning {
-        CodecName::Responses.place_effort(&dialect.effort, &mut settings, reasoning)?;
+        set_each(dialect.effort.iter(), &mut settings, json!(reasoning))?;
     }
-    if let Some(max) = request.max_output_tokens {
-        set_each(dialect.output_limit.iter(), &mut settings, json!(max))?;
-    }
+    let limit = json!(request.max_output_tokens);
+    set_each(dialect.output_limit.iter(), &mut settings, limit)?;
     Ok(settings)
 }
 
@@ -93,8 +91,9 @@ mod tests {
     use super::*;
     use crate::provider::{
         codec::{CacheTtl, common::tests::request},
-        protocol::{ResponseSchema, SystemSegment, ToolDefinition},
+        protocol::{ResponseSchema, SystemSegment},
     };
+    use crate::tool::catalog::ToolDefinition;
 
     #[test]
     fn summary_effort_and_access_programs_are_placed_by_the_dialect() {
@@ -103,7 +102,7 @@ mod tests {
             reasoning_summary: Some(ReasoningSummary::Auto),
             ..Dialect::stateless()
         };
-        for effort in [None, Some("high".into())] {
+        for effort in [None, Some(crate::provider::model::Effort::High)] {
             let expected = effort.as_ref().map(|e| json!(e));
             req.reasoning = effort;
             let body = encode(&req, Default::default(), &summarized).unwrap();
@@ -111,12 +110,10 @@ mod tests {
             assert_eq!(body["reasoning"].get("effort"), expected.as_ref());
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
-        req.reasoning = Some("low".into());
+        req.reasoning = Some(crate::provider::model::Effort::Low);
         let silent = Dialect::stateless();
         let body = encode(&req, Default::default(), &silent).unwrap();
         assert_eq!(body["reasoning"], json!({"effort":"low"}));
-        req.reasoning = Some("adaptive".into());
-        assert!(encode(&req, Default::default(), &silent).is_err());
         // An access program is sent only where the dialect selects one.
         req.reasoning = None;
         for cyber in [
@@ -137,19 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_history_is_explicit_and_http_envelope_is_unchanged() {
+    fn empty_history_is_explicit() {
         let mut req = request("gpt-5");
         req.context.clear();
-        req.max_output_tokens = None;
         let encoded = crate::provider::codec::Codec::Responses(Dialect::stateless())
             .encode(&req, Default::default(), &"session".parse().unwrap())
             .unwrap();
-        assert!(encoded.headers.is_empty());
         assert_eq!(
             Value::Object(encoded.body),
             json!({
                 "model":"gpt-5", "input":[], "stream":true, "store":false,
-                "include":["reasoning.encrypted_content"], "prompt_cache_key":"session"
+                "include":["reasoning.encrypted_content"], "prompt_cache_key":"session",
+                "max_output_tokens":8192
             })
         );
     }
@@ -168,7 +164,7 @@ mod tests {
         })];
         let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         req.response_schema = Some(ResponseSchema::new("answer", schema.clone()).unwrap());
-        req.reasoning = Some("high".into());
+        req.reasoning = Some(crate::provider::model::Effort::High);
         let body = encode(&req, Default::default(), &Dialect::stateless()).unwrap();
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");

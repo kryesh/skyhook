@@ -9,24 +9,25 @@ use std::{
 };
 
 use super::{
+    agent_state::agent_states,
     decode::*,
     encode::json,
     history::since_agent_request,
     job::{JobRow, job_rows},
     message::Scope,
-    request::{Named, named_requests},
-    state::agent_states,
+    requests::{Named, named_requests},
     *,
 };
+use crate::identity::{AgentId, SessionId};
 use crate::{
-    agent::todo::{self, AgentTodos},
-    identity::{AgentId, JobId, SessionId},
     job::JobSeeds,
+    session::todo::{self, AgentTodos},
     session::{
         EntryKind, EventRecord, MessageSeq, ModelPurpose, RecordSeq, RequestRecord, RequestSeq,
         ResidentLedger, agent_state::AgentState,
     },
 };
+use skyhook_worker::job::JobId;
 
 /// What a session opens to, read from its rows.
 pub(in crate::session) struct Opening {
@@ -47,6 +48,9 @@ pub(in crate::session) struct Opening {
     pub titled: bool,
     /// How many entries each agent's transcript holds.
     pub entries: BTreeMap<AgentId, u64>,
+    /// The spill files the session's runs had their targets create, each as its run's
+    /// route and its path's components.
+    pub spills: Vec<(crate::target::Revisions, Vec<String>)>,
 }
 
 /// What `session` opens to.
@@ -162,6 +166,7 @@ pub(in crate::session) fn opening(db: &Db, session: SessionId) -> DbResult<Openi
         seeds: job_seeds(db, &agents, &resident)?,
         titled: titled(db)?,
         entries,
+        spills: super::output::own_spills(db)?,
     })
 }
 
@@ -259,19 +264,6 @@ pub(in crate::session) fn agent(
     Ok(Some(AgentRecords { records, children }))
 }
 
-/// The jobs `agent` created, in id order.
-pub(in crate::session) fn created_by(db: &Db, agent: &AgentId) -> DbResult<Vec<JobId>> {
-    let Some(agent) = agent_row(db, agent)? else {
-        return Ok(Vec::new());
-    };
-    db.query(
-        "SELECT j.id FROM entry e JOIN job j ON j.created = e.seq \
-         WHERE e.agent = ?1 AND e.kind = ?2 ORDER BY j.id",
-        params![agent, EntryKind::JobCreated],
-        |row| job(row.get(0)?),
-    )
-}
-
 /// What the job folds count across the whole journal, for the `loaded` jobs:
 /// every child launch and installed name (one each per child agent), the highest
 /// id, and per owner how many jobs of the latest response it has loaded jobs of are
@@ -331,5 +323,5 @@ fn titled(db: &Db) -> DbResult<bool> {
     let titled = db.query_row("SELECT EXISTS (SELECT 1 FROM title)", Vec::new(), |row| {
         Ok(row.get::<bool>(0)?)
     })?;
-    Ok(titled.unwrap_or_default() || super::state::root_prompt(db)?.is_some())
+    Ok(titled.unwrap_or_default() || super::summary::root_prompt(db)?.is_some())
 }

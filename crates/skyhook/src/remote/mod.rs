@@ -1,30 +1,20 @@
-//! Remote transport sessions, shim protocol, and platform artifacts.
+//! Remote transport sessions to shims over SSH and WinRM, and the platform artifacts
+//! deployed as them.
 
 mod artifact;
 pub(crate) mod backend;
+mod bootstrap;
 mod client;
 mod error;
-mod flow;
+mod launch;
 mod manager;
-mod payload;
-mod prompt;
-mod protocol;
-mod service;
-mod ssh;
-mod transport;
-pub mod worker;
+mod route;
 
-pub use artifact::{Arch, ArtifactError, EmbeddedShim, EmbeddedShimCatalog, Os, Platform};
+pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
 #[cfg(test)]
 pub(crate) use backend::ConnectionFactory;
-pub(crate) use error::RemoteError;
+pub(crate) use client::{Flown, Landed};
+pub(crate) use error::{RemoteError, RemoteFault};
 #[cfg(test)]
-pub(crate) use manager::tests::ShimFactory;
+pub(crate) use manager::tests::{ServingFactory, ShimFactory};
 pub(crate) use manager::{PreparedConnection, RemoteManager};
-pub use prompt::{
-    PromptAnswer, RejectSensitivePrompts, Requester, RequesterExecutable, SecretValue,
-    SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
-    SensitivePromptKind,
-};
-pub use ssh::askpass_main;
-pub(crate) use ssh::{AskpassServer, SshOption, apply_environment};

@@ -1,9 +1,11 @@
 # Saved job output
 
-Tools execute once and save their complete results. File reads capture snapshots;
-subsequent retrieval does not reread changed files. Search and glob capture their complete result
-sets. There is no configured capture-size cap or automatic eviction; storage failures are reported
-as failures, with retained partial output marked incomplete.
+Tools execute once and save their complete results. A file read captures a snapshot, which later
+retrieval does not reread; a text file over 4 MiB is the exception, read where it is each time
+(see [Spill files](#spill-files)). Search and glob capture their complete result sets. No output
+is cut or evicted to fit a size: a result field over 4 MiB is kept in a file instead of in the
+session. Storage failures are reported as failures, with retained partial output marked
+incomplete.
 
 ## Tool result shapes
 
@@ -14,7 +16,7 @@ ordinary response.
 
 Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
 Nulls in tool payloads are preserved; fields a tool has no value for are absent.
-Process results contain `exit_code`, or `signal` when a signal killed the process, and the
+Process results contain `exit: {code}`, or `exit: {signal}` when a signal killed the process, and the
 `stdout` and `stderr` streams that produced output; scripts read an absent stream as `null`.
 A `stdout` holding JSON is read as that JSON; see [JSON output](#json-output).
 Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{header,prompt,options?,multiple?}]}`, their answers keyed by `header`.
@@ -43,8 +45,10 @@ Diagnostic messages identify the failed operation and its subject, such as a pat
 job, or output field. Workspace-operation failures include the applicable execution target;
 host/session failures are not attributed to the caller's remote target. “On session host” is
 shown when the viewing agent is on a different target and omitted for an agent on the host.
-Inspecting a remote job's saved output does not connect to that machine: a retrieval failure concerns saved output,
-while a retrieved execution error retains the original operation's context.
+Inspecting a job's saved output connects to no machine, with one exception: a read that needs
+bytes the job's target keeps in a file ([Spill files](#spill-files)) reads them on that target. A
+retrieval failure concerns saved output, while a retrieved execution error retains the original
+operation's context.
 
 Structured job diagnostics are rendered for the viewing agent, exposing target aliases only when
 that viewer's capabilities permit them. This is not a general redaction guarantee for saved output. A `jobs` output read made with broader
@@ -185,7 +189,7 @@ jobs({job:42, field:"/result/stdout/items", pattern:"\"api-[0-9]+\""})
 jobs({job:42, field:"/result/stdout", query:"$.items[?@.status.phase == 'Failed'].metadata.name"})
 ```
 
-`field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and
+`field` is a JSON Pointer: `/result/content` selects a file's content, `/result/stdout` and
 `/result/stderr` select process streams. For scripts, `/result/console` selects captured console
 text and `/result/value` selects the JavaScript return; append pointer segments for nested data,
 for example `/result/value/items`. The empty pointer `""` selects the whole saved output, the
@@ -251,13 +255,105 @@ rejected, so query a field within it. This limits a query's input, not its evalu
 starts, a query runs to completion, and queries that repeat selectors can produce many duplicate
 matches.
 
+## Spill files
+
+A session's database holds at most 4 MiB of one result field. A larger field is kept in a file,
+on the machine that produced it, and reads as a field the database holds does: the same preview,
+pages, searches and queries, and whole in a script. A `fetch` body is the exception, returned as
+a file. This section tells the session's user where the files are.
+
+| Field | Where its bytes are |
+| --- | --- |
+| `fetch` body over 4 MiB, without `save_to` | A new file on the target that fetched it; the result names it as `body: {kind: "file", path, bytes}` ([HTTP](http.md)) |
+| `exec` `stdout` or `stderr` over 4 MiB | A new file on the target that ran the command, holding the whole stream as text |
+| `search` matches, `glob` paths, script `console` and returned values, MCP text, over 4 MiB | A new file on the session host |
+| `read` of a text file over 4 MiB | The file itself, where it is; nothing is copied |
+
+New files are written to the spill directory of the machine that holds them, one directory per
+session: `~/.cache/skyhook/spill/<session id>/`, or under `$XDG_CACHE_HOME` when that is set; on
+Windows, `%LOCALAPPDATA%\skyhook\spill\<session id>\`. The directory and its files are readable
+by their user alone; a session directory that already exists as a link, one other users can
+enter, or one whose path is not Unicode, is refused rather than used. **Spill files are not part
+of a session and Skyhook never
+removes them**, neither when a session ends nor later: delete the directory when its contents
+are no longer wanted. A session opens, resumes and replays without them.
+
+The TUI's job card shows each field kept in a file, as `<field> · file on <target> · <bytes>
+bytes` with the file's path under it, to open there.
+
+When the directory cannot be created or written, the call that needed the file fails, and the
+session goes on: a `fetch` fails; a command's call fails with the
+output it had sent; a stream to the session host fails its call with the 4 MiB it had, marked
+incomplete; and a job whose result holds a part that cannot be kept fails with no result saved.
+The failure says why, such as `storage full`, and on which machine: the file it could not keep
+belongs in that machine's spill directory. A fetch body or a command's stream appears
+only when it is whole: a fetch that fails, or a fetch or command that is cancelled part way,
+leaves none, while a command stopped by its `timeout` leaves the file of what it had written,
+which reads like any other.
+
+What a read of such a field does depends on who holds the file:
+
+- **Session-host files** are read as the database is. A detected JSON value stays JSON.
+- **A command's stream** is plain text, never read as JSON. The session keeps the first 4 MiB as
+  they arrived and the last 16 KiB and line count the target reported, so previews show both ends
+  and `total_lines` as for any stream, with no connection. Anything more, a page of its middle,
+  a `pattern` search, a `query` or `pattern` over the result that contains it, or a script's
+  whole view, is read from the file across the connection to the target, as far as the target
+  counted when it wrote it.
+- **A referenced file** is counted once, on its target, when the `read` first opens it, which is
+  one pass over the file there; a file that is not UTF-8 text throughout fails the `read`, as a
+  smaller one does. `total_lines` is the count taken then, on every later page: it
+  is not taken again. Each page shows the file as it is when paged, so after the file changes a
+  page shows the changed file beside the first count, and a `start` past the file's end returns
+  an empty page. What a preview or page already showed stays as recorded.
+
+While a command whose stream passed 4 MiB still runs, its target reports the stream's latest
+16 KiB and its line count so far, at most four times a second and once more when the stream
+ends before the command does: a page of the running field
+reads its first lines and its latest ones, with the running `total_lines`, and an empty page for
+the lines between, which are readable when the command ends. The latest lines are those that
+begin within the reported 16 KiB; a longer last line reads from its beginning, as far as the
+first 4 MiB hold it.
+
+A read across the connection can be cancelled like any call, and a target that is slow to answer
+delays no other read of saved output. A page reads from its first line; a `pattern` is matched on the session host, so a rare pattern in a large
+remote file reads much of it across the connection. A `query`, or a `pattern` over a result,
+reads the field into memory within their 64 MiB limit, and a script's whole view is bounded by
+the script's memory.
+
+The files written for a session, a command's stream, a `fetch` body and the session host's own,
+are its saved output: it reads them without asking, before and after a resume. A stream is read
+as the database is, and a `fetch` body's path is handed to its caller, which reads that one file
+with `read` or as a `write` `source`. Reading one on another machine uses that target's
+connection, which is approved as any connection to it is. A referenced file is not the
+session's: each read of it through `jobs` resolves the path again and asks what a `read` of it by
+the caller would ask, so a grant held for the file answers it and a resumed session, which holds
+none, asks again. Any other `read` that names a file in a spill directory is an ordinary read of
+a path outside the workspace.
+
+A file on a target is on the machine the call reached: the target, and every target its
+connection passed through, as the session defined them then. Those definitions are the
+session's own, kept through a resume whatever the configuration says since. Once `target_add`
+redefines one of them the same name may reach another machine, so a field kept in a file there
+reads as `saved output for <field> is no longer available`, and a `fetch` body's path there is
+a path like any other.
+
+Saved bytes that cannot be read, because a file is gone, cannot be opened or read, is no longer
+a regular file, holds less than was saved, or its target cannot be reached, fail the read with
+`saved output for <field> is no longer available`. The rest of the job stays readable: a preview
+shows a command's stream or a referenced file from what the session holds, and a session-host
+field as empty, listed in `presentation.captures` as incomplete. The job card shows why a
+session-host file cannot be read (`not found`, `permission denied`, `not a regular file`,
+`shorter than was saved`).
+
 ## Persistence and live output
 
-Reads are repeatable and survive session resume. Finished jobs with retained partial output have
+Reads are repeatable and survive session resume, except where a [spill file](#spill-files) was
+changed or removed since. Finished jobs with retained partial output have
 an `Output incomplete; captured fields remain readable with jobs({job, field}).` notice, including when viewing the final captured page.
 
-The view's `presentation.captures` lists captures that are not a finished part of the result: live,
-unfinished, or abandoned output, even without a structured result:
+The view's `presentation.captures` lists captures that are not a finished part of the result,
+live, unfinished, or abandoned output, even without a structured result:
 
 ```json
 [{"field":"/result/console","complete":false}]
@@ -272,14 +368,12 @@ Local captures, including script console output, can be read while running. Remo
 become available as they are transferred; inspecting already-transferred output does not require
 reconnecting to the remote machine.
 
-The TUI's automatic output view shows the structured result and previews any available captures
-not represented there. This exposes both process streams while live and preserves stderr and exit
+The TUI's job card shows the structured result and previews any available captures not
+represented there. This exposes both process streams while live and preserves stderr and exit
 status on completion. While a job runs, each capture shows its latest lines, up to 20 within a
-page's bytes, and follows them as output arrives. Explicit field, page, and search selections
-remain selected; choose **automatic output** in the Saved output menu to return to automatic
-viewing. The menu lists up to 100 fields one level below the one shown, from the page of it shown,
-starting with the result's fields and captures, and the field above it; **more fields** shows the
-field from where the list stops, so the menu lists the rest.
+page's bytes, and follows them as output arrives. Under the preview the card shows each
+[file](#spill-files) a field is kept in, with its target and size; the rest of a truncated field
+is the model's to read with `jobs`.
 
 Recorded model requests keep the previews, pages, and notifications the model actually saw;
 they are not regenerated from saved output.

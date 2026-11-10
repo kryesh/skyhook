@@ -3,16 +3,19 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value, json};
 
-use super::{ModelError, Placements, Profile};
-use crate::{
-    media::{ImageBytes, ImageEdge, ImageLimits},
-    newtype::{Blank, nonblank, string_newtype},
-    provider::{
-        codec::{Cache, Codec, CodecName, CyberAccessProgram, ReasoningSummary, path},
-        profile::ModelProfile,
-        settings::{Nullable, Patch},
-    },
+use super::{ModelError, Placements, Wire};
+use crate::provider::{
+    codec::{Cache, Codec, CodecName, CyberAccessProgram, ReasoningSummary, path},
+    model::ModelProfile,
+    settings::{Nullable, Patch},
 };
+use crate::yaml;
+use skyhook_base::{
+    enums::NamedEnum,
+    newtype::{Blank, nonblank},
+    string_newtype,
+};
+use skyhook_media::{ImageBytes, ImageEdge, ImageLimits};
 
 string_newtype! {
     /// A service tier's wire ID. Catalogs may advertise tiers unknown to this client.
@@ -24,7 +27,7 @@ crate::provider::settings::settings! {
     pub struct Request => RequestPatch {
         @flatten { pub placements: Placements }
         pub codec: CodecName => required,
-        /// The wire tier ID, sent without client aliases.
+        /// The wire tier ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub service_tier: Option<ServiceTier> => default,
         /// Responses only: the summary detail requested in place of the dialect's
@@ -65,19 +68,18 @@ crate::provider::settings::settings! {
     }
 }
 
-crate::named_enum::named_enum! {
-    /// A setting only the Responses codec can send.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum ResponseSetting {
-        ReasoningSummary = "reasoning_summary",
-        AccessPrograms = "access_programs",
-    }
+/// A setting only the Responses codec can send.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseSetting {
+    ReasoningSummary,
+    AccessPrograms,
 }
 
 impl Request {
     /// The wire conventions with the shared selections applied, or the first one
     /// the codec cannot send.
-    pub(crate) fn apply(&self, mut wire: Profile) -> Result<Profile, ModelError> {
+    pub(crate) fn apply(&self, mut wire: Wire) -> Result<Wire, ModelError> {
         wire.codec = self.placements.apply(wire.codec)?;
         if self.explicit_caching == Some(true) {
             *wire.codec.cache_mut().ok_or(ModelError::ExplicitCaching)? = Cache::Explicit;
@@ -136,31 +138,21 @@ impl<P: Patch> RequestSettings<P> {
     }
 
     pub(crate) fn fields(&self) -> Map<String, Value> {
-        let mut fields = object(&self.dialect);
-        fields.extend(object(&self.request));
+        let mut fields = yaml::object(&self.dialect);
+        fields.extend(yaml::object(&self.request));
         fields
-    }
-}
-
-pub(crate) fn object(value: &impl Serialize) -> Map<String, Value> {
-    match serde_json::to_value(value).expect("configuration serializes") {
-        Value::Object(fields) => fields,
-        _ => unreachable!("configuration fields serialize as a mapping"),
     }
 }
 
 impl<'de, P: Patch> Deserialize<'de> for RequestSettings<P> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        fn parse<T: Patch, E: de::Error>(fields: Map<String, Value>) -> Result<T, E> {
-            serde_path_to_error::deserialize(Value::Object(fields)).map_err(E::custom)
-        }
         let fields = Map::<String, Value>::deserialize(deserializer)?;
         let (request, dialect) = fields
             .into_iter()
             .partition(|(key, _)| RequestPatch::FIELDS.contains(&key.as_str()));
         Ok(Self {
-            request: parse(request)?,
-            dialect: parse(dialect)?,
+            request: yaml::located(request)?,
+            dialect: yaml::located(dialect)?,
         })
     }
 }
@@ -180,7 +172,7 @@ pub struct ModelSpec<P> {
 impl<'de, P: Patch> Deserialize<'de> for ModelSpec<P> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut fields = Map::new();
-        let profile = crate::yaml::split(deserializer, &mut fields)?;
+        let profile = yaml::split(deserializer, &mut fields)?;
         let settings =
             RequestSettings::deserialize(Value::Object(fields)).map_err(de::Error::custom)?;
         Ok(Self { profile, settings })
@@ -189,7 +181,7 @@ impl<'de, P: Patch> Deserialize<'de> for ModelSpec<P> {
 
 impl<P: Patch> Serialize for ModelSpec<P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut fields = object(&self.profile);
+        let mut fields = yaml::object(&self.profile);
         // Omission here is config-only: the shared profile's JSON contract is unchanged.
         fields.retain(|_, value| !value.is_null());
         fields.extend(self.settings.fields());
@@ -198,17 +190,14 @@ impl<P: Patch> Serialize for ModelSpec<P> {
 }
 
 impl<P> ModelSpec<P> {
-    pub(crate) fn validate(&self, wire: &Profile) -> Result<(), ModelError> {
+    pub(crate) fn validate(&self, wire: &Wire) -> Result<(), ModelError> {
         self.profile.validate_limits()?;
         super::placements::check(&wire.codec, &wire.transport.fields)?;
         let levels = wire.codec.name().effort_levels();
-        if let Some(effort) = &self.profile.reasoning
+        if let Some(effort) = self.profile.reasoning
             && !levels.accepts(effort)
         {
-            return Err(ModelError::Reasoning {
-                effort: effort.clone(),
-                levels,
-            });
+            return Err(ModelError::Reasoning { effort, levels });
         }
         Ok(())
     }
@@ -219,7 +208,7 @@ mod tests {
     use super::*;
     use crate::provider::dialect::{DialectConfig, compatible};
 
-    fn apply(text: &str) -> Result<Profile, ModelError> {
+    fn apply(text: &str) -> Result<Wire, ModelError> {
         let request: Request = crate::yaml::parse(text).unwrap();
         request.apply(compatible::Config::default().admit(request.codec).unwrap())
     }

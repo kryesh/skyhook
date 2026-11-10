@@ -136,13 +136,25 @@ impl<'de> Deserialize<'de> for StringKey {
     }
 }
 
+/// Deserialize `fields` as `T`, a refusal naming the path of the value it refused.
+pub fn located<T: serde::de::DeserializeOwned, E: de::Error>(
+    fields: Map<String, Value>,
+) -> Result<T, E> {
+    serde_path_to_error::deserialize(Value::Object(fields)).map_err(E::custom)
+}
+
+/// The fields `value` serializes as.
+pub(crate) fn object(value: &impl serde::Serialize) -> Map<String, Value> {
+    match serde_json::to_value(value).expect("configuration serializes") {
+        Value::Object(fields) => fields,
+        _ => unreachable!("configuration fields serialize as a mapping"),
+    }
+}
+
 /// Deserialize a struct from a mapping it shares: the keys `T` names are read
 /// in place, so their errors keep their path, and `rest` receives every other key.
 /// A structural alternative to `#[serde(flatten)]`, which loses the path.
-pub(crate) fn split<'de, T, D>(
-    deserializer: D,
-    rest: &mut Map<String, Value>,
-) -> Result<T, D::Error>
+pub fn split<'de, T, D>(deserializer: D, rest: &mut Map<String, Value>) -> Result<T, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,

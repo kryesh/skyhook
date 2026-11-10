@@ -116,12 +116,12 @@ impl Jobs {
         state: &CoreState,
         author: AgentId,
         message: Message,
-        owner: Option<(JobId, &str)>,
+        owner: Option<JobId>,
         follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)>,
         after: impl FnOnce(&mut CoreState) + Send + 'static,
     ) -> Result<Plan<MessageSeq>, JobError> {
         let job = owner
-            .map(|(job, text)| Self::check_child(state, &author, job, &message, text).map(|()| job))
+            .map(|job| Self::check_child(state, &author, job).map(|()| job))
             .transpose()?;
         let mut entries = vec![(author, SessionEvent::MessageCommitted { message })];
         entries.extend(follow(state.next_sequence()));
@@ -134,8 +134,8 @@ impl Jobs {
         }))
     }
 
-    /// Whether job `job` takes `child`'s assistant turn `message`, publishing its
-    /// visible `text` once committed; that commit wakes the owner through
+    /// Whether job `job` takes `child`'s assistant turn, publishing its
+    /// visible text once committed; that commit wakes the owner through
     /// [`woken`]. The source sequence is the delivery ID. Empty visible text is
     /// committed to history but produces no delivery/wake.
     ///
@@ -143,17 +143,7 @@ impl Jobs {
     /// invocation that goes on releases it through [`JobManager::notify_owner`].
     /// A turn with tool calls is progress and wakes the owner at once, as does
     /// a reply committed after the job already finished.
-    fn check_child(
-        state: &CoreState,
-        child: &AgentId,
-        job: JobId,
-        message: &Message,
-        text: &str,
-    ) -> Result<(), JobError> {
-        // Refuse a projection that replay could not reproduce (including reasoning).
-        Reply::of(message)
-            .filter(|reply| reply.text == text)
-            .ok_or(JobError::ChildTextMismatch)?;
+    fn check_child(state: &CoreState, child: &AgentId, job: JobId) -> Result<(), JobError> {
         let entry = state.job(job)?;
         let launched = entry.child().ok_or(JobError::NoChild(job))?;
         if launched.agent.as_ref() != Some(child) {
@@ -221,6 +211,7 @@ mod tests {
     use crate::provider::protocol::AssistantItem;
     use crate::session::JobEvent;
     use crate::tests::TestRuntime;
+    use skyhook_tools::output::FieldPointer;
 
     use crate::job::delivery::LIFECYCLE_BATCH_BYTES;
 
@@ -276,7 +267,7 @@ mod tests {
     async fn answer(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> MessageSeq {
         let message = assistant(text);
         manager
-            .commit_child_message(child, job, message, text.into(), |_| Vec::new())
+            .commit_child_message(child, job, message, |_| Vec::new())
             .await
             .unwrap()
     }
@@ -351,16 +342,8 @@ mod tests {
         assert!(shown < texts.len(), "{result}");
         // Paging continues the field it reads, from the first reply not shown.
         let messages: FieldPointer = "/result/messages".parse().unwrap();
-        let next = |view: &JobView| match view.continuation() {
-            None => None,
-            Some(output::Continuation {
-                field, start, unit, ..
-            }) => {
-                assert!(field.is_none_or(|field| *field == messages));
-                Some((start, unit))
-            }
-        };
-        let (mut read, mut start) = (Vec::new(), next(&view));
+        let first = Some((shown + 1, output::PageUnit::Elements));
+        let (mut read, mut start) = (Vec::new(), first);
         while let Some((at, unit)) = start {
             let mut args = output::OutputArgs::new(job);
             (args.field, args.start, args.unit) = (Some(messages.clone()), Some(at), Some(unit));
@@ -370,7 +353,8 @@ mod tests {
                 panic!("{page:?}");
             };
             read.extend(page_of.elements.iter().map(|reply| reply["text"].clone()));
-            start = next(&page);
+            let next = preview.and_then(output::OutputPreview::continuation);
+            start = next.map(|next| (next.start, next.unit));
         }
         assert_eq!(read, texts[shown..]);
         for state in [manager.clone(), manager.test_replay()] {
@@ -688,12 +672,8 @@ mod tests {
                 AssistantItem::reasoning("thought", 0, "private reasoning", None),
                 AssistantItem::text("blank", 1, blank),
             ];
-            // A turn publishes its normalized projection, which a blank turn empties.
-            let projection = String::new();
             manager
-                .commit_child_message(&child, job, Message::Assistant(items), projection, |_| {
-                    Vec::new()
-                })
+                .commit_child_message(&child, job, Message::Assistant(items), |_| Vec::new())
                 .await
                 .unwrap();
             // Committed to history, but not as a reply.
@@ -721,43 +701,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_association_or_projection_never_commits() {
-        let (_root, manager, owner, child, job) = child_job(false).await;
-        let before = manager.store().records().len();
-        for (author, text, projection, expected) in [
-            (
-                child.clone(),
-                "visible",
-                "private",
-                JobError::ChildTextMismatch,
-            ),
-            // Raw blank text is not the normalized projection.
-            (child.clone(), "\n\n", "\n\n", JobError::ChildTextMismatch),
-            (
-                owner.child(2),
-                "visible",
-                "visible",
-                JobError::ChildOwnerMismatch(job),
-            ),
-            (
-                owner.clone(),
-                "visible",
-                "visible",
-                JobError::ChildOwnerMismatch(job),
-            ),
-        ] {
-            let message = assistant(text);
-            let result =
-                manager
-                    .commit_child_message(&author, job, message, projection.into(), |_| Vec::new());
+    async fn invalid_association_is_refused() {
+        let (_root, manager, owner, _child, job) = child_job(false).await;
+        for author in [owner.child(2), owner.clone()] {
+            let message = assistant("visible");
+            let result = manager.commit_child_message(&author, job, message, |_| Vec::new());
             let failure = result.await.unwrap_err();
-            assert_eq!(
-                std::mem::discriminant(&failure),
-                std::mem::discriminant(&expected),
-                "unexpected: {failure}"
-            );
+            assert!(matches!(failure, JobError::ChildOwnerMismatch(refused) if refused == job));
         }
-        assert_eq!(manager.store().records().len(), before);
-        assert!(!manager.has_pending(&owner));
     }
 }

@@ -4,50 +4,19 @@ use std::collections::HashMap;
 
 use super::{decode::*, encode::*, *};
 use crate::{
-    agent::TodoItem,
-    execution::{ExecutionLocation, path_bytes, path_from_bytes},
     job::{AgentMessage, AgentProgress},
-    media::{AttachmentRef, BlobDigest, BlobRef, ImageFormat, ImageRef, TextRef},
-    named_enum::named_enum,
     provider::protocol::{
         AssistantItem, ItemId, ItemKind, Position, Provenance, Replay, TextBlock, ToolCall,
         ToolResult,
     },
+    session::TodoItem,
     session::{
-        HostCursor, HostEvent, JobEvent, Message, RuntimeState, SessionEvent, StateJob,
-        StateJobKind, UserPart,
+        HostCursor, HostEvent, JobEvent, JobEventKind, Message, MessageRole, RuntimeState,
+        SessionEvent, StateJob, StateJobKind, UserPart, UserPartKind,
     },
 };
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub(super) enum MessageRole {
-        User = "user",
-        Assistant = "assistant",
-        Tool = "tool",
-        State = "state",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub(super) enum UserPartKind {
-        Text = "text",
-        Attachment = "attachment",
-        JobEvents = "job_events",
-        ParentInput = "parent_input",
-        Compaction = "compaction",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub(super) enum JobEventKind {
-        Message = "message",
-        Job = "job",
-        Host = "host",
-    }
-}
+use skyhook_media::{AttachmentRef, BlobDigest, BlobRef, ImageFormat, ImageRef, TextRef};
+use skyhook_tools::target::ExecutionLocation;
 
 impl Encoder {
     /// Insert a message committed by `agent`; a tool result binds to that agent's
@@ -78,32 +47,21 @@ impl Encoder {
     }
 
     pub(super) fn message(&mut self, db: &Db, message: &Message) -> DbResult<i64> {
-        let role = match message {
-            Message::User(_) => MessageRole::User,
-            Message::Assistant(_) => MessageRole::Assistant,
-            Message::State(_) => MessageRole::State,
-            Message::Tool(_) => {
-                return Err(rejected(
-                    "tool results are only stored as committed agent messages",
-                ));
-            }
-        };
-        let id = message_row(db, role)?;
+        if let Message::Tool(_) = message {
+            return Err(rejected(
+                "tool results are only stored as committed agent messages",
+            ));
+        }
+        let id = message_row(db, message.kind())?;
         match message {
             Message::User(parts) => {
                 for (position, part) in parts.iter().enumerate() {
-                    let (kind, text, attachment) = match part {
-                        UserPart::Text { text } => (UserPartKind::Text, Some(text), None),
-                        UserPart::ParentInput { text } => {
-                            (UserPartKind::ParentInput, Some(text), None)
-                        }
-                        UserPart::Compaction { text } => {
-                            (UserPartKind::Compaction, Some(text), None)
-                        }
-                        UserPart::Attachment { attachment } => {
-                            (UserPartKind::Attachment, None, Some(attachment))
-                        }
-                        UserPart::JobEvents { .. } => (UserPartKind::JobEvents, None, None),
+                    let (text, attachment) = match part {
+                        UserPart::Text { text }
+                        | UserPart::ParentInput { text }
+                        | UserPart::Compaction { text } => (Some(text), None),
+                        UserPart::Attachment { attachment } => (None, Some(attachment)),
+                        UserPart::JobEvents { .. } => (None, None),
                     };
                     let (blob, format, file) = match attachment {
                         Some(AttachmentRef::Text(text)) => {
@@ -118,7 +76,7 @@ impl Encoder {
                     let row = db.insert(
                         "INSERT INTO user_part (message, position, kind, text, blob, \
                          image_format, file) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![id, position, kind, text, blob, format, file],
+                        params![id, position, part.kind(), text, blob, format, file],
                     )?;
                     if let UserPart::JobEvents { events } = part {
                         job_events(db, row, events)?;
@@ -145,8 +103,11 @@ impl Encoder {
                 message,
                 state.time.timestamp_millis(),
                 target,
-                path_bytes(&state.location.workspace),
-                state.host.as_ref().map(crate::Prose::as_str)
+                state.location.workspace.as_str(),
+                state
+                    .host
+                    .as_ref()
+                    .map(skyhook_base::newtype::Prose::as_str)
             ],
         )?;
         self.state_jobs(db, message, &state.jobs, None, &mut 0)?;
@@ -193,7 +154,7 @@ impl Encoder {
                     job.name.as_ref(),
                     job.state,
                     target,
-                    path_bytes(&job.workspace),
+                    job.workspace.as_str(),
                     job.age_seconds,
                     progress.map(|progress| progress.turns),
                     progress.map(|progress| progress.tool_calls),
@@ -393,7 +354,7 @@ pub(super) struct Messages {
         (
             chrono::DateTime<chrono::Utc>,
             ExecutionLocation,
-            Option<crate::Prose>,
+            Option<skyhook_base::newtype::Prose>,
         ),
     >,
     state_jobs: HashMap<i64, Vec<StateJobRow>>,
@@ -465,7 +426,7 @@ fn state_job(row: &Row) -> DbResult<StateJobRow> {
             name: row.get::<Option<String>>(5)?.map(parsed).transpose()?,
             state: enum_column(row, 6)?,
             target: row.get::<Option<String>>(7)?.map(parsed).transpose()?,
-            workspace: path_from_bytes(row.get(8)?),
+            workspace: row.get::<String>(8)?.into(),
             age_seconds: row.get(9)?,
             children: Vec::new(),
         },

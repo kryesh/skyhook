@@ -2,20 +2,20 @@
 //! position, and its compact presentation.
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
+use skyhook_base::enums::NamedEnum;
 
 /// Objects with more members than this are collections: their members are
 /// sampled like array elements and their shape merges every member's value.
 pub(crate) const COLLECTION_MEMBERS: usize = 100;
 
-crate::named_enum::named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) parsed enum Scalar {
-        Null = "null",
-        Boolean = "boolean",
-        Integer = "integer",
-        Number = "number",
-        String = "string",
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Scalar {
+    Null,
+    Boolean,
+    Integer,
+    Number,
+    String,
 }
 
 impl Scalar {

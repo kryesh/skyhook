@@ -1,16 +1,8 @@
-use std::{borrow::Cow, sync::LazyLock};
-
-use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Map, Value};
-use skyhook::{
-    identity::AgentId,
-    tool::{
-        AdmissionError, RegistryError, ToolContext, ToolError, ToolRegistryBuilder,
-        arguments::deserialize_arguments,
-        policy::{Capability, CapabilitySet},
-    },
-};
+use serde_json::Value;
+use skyhook::identity::AgentId;
+use skyhook::tool::catalog::RegistryError;
+use skyhook::tool::policy::{Capability, CapabilitySet};
+use skyhook::tool::{ToolContext, ToolError, ToolRegistryBuilder};
 
 use super::{Action, Placement, holds, options, output};
 use crate::{
@@ -18,9 +10,8 @@ use crate::{
     cvss::Cvss40,
     reporting::{self, Generated},
     store::{
-        Assessment, Begun, CandidateId, EditRecord, EnvironmentId, EvidenceId, FindingId, FlawId,
-        MAX_ARTIFACTS, MAX_ATTACHMENTS, NewEnvironment, NewEvidence, NewRecord, NewTest, NodeId,
-        Served, Serves, StatusRecord, Store, TestArtifact, TestId, TestResult, Text, Upsert,
+        Assessment, Begun, CandidateId, Edge, EnvironmentId, EvidenceId, FindingId, FlawId, Listed,
+        NewEnvironment, NewEvidence, NewTest, NodeId, StatusChange, Store, TestId, Text,
     },
 };
 
@@ -38,25 +29,15 @@ actions! {
         /// flaws leaving it wrong}
         begin => Begin(crate::store::Begin) -> Begun,
         /// Create a node, its fields inside `record`: `{action: "upsert", record: {kind: "path",
-        /// title, body}}`; or edit node `id`, the fields given: `{action: "upsert", record: {id,
-        /// title}}`. → node id
-        upsert => Upsert { record: UpsertRecord } -> NodeId,
-        /// Add edges; an ordered one at `position`, or last
-        link => Link {
-            #[schemars(length(max = MAX_ATTACHMENTS))]
-            links: Vec<crate::store::Link>,
-        } -> (),
-        /// Remove edges; a path step by its position
-        unlink => Unlink {
-            #[schemars(length(max = MAX_ATTACHMENTS))]
-            links: Vec<crate::store::Unlink>,
-        } -> (),
+        /// title, body}}`; or edit node `id` of its `kind`, the fields given: `{action: "upsert",
+        /// record: {kind: "path", id, title}}`. → node id
+        upsert => Upsert { record: crate::store::Upsert } -> NodeId,
+        /// Add edges
+        link => Link { links: Listed<Edge> } -> (),
+        /// Remove edges
+        unlink => Unlink { links: Listed<Edge> } -> (),
         /// Observations about one node. → evidence ids
-        evidence => Evidence {
-            node: NodeId,
-            #[schemars(length(max = MAX_ATTACHMENTS))]
-            items: Vec<NewEvidence>,
-        } -> Vec<EvidenceId>,
+        evidence => Evidence { node: NodeId, items: Listed<NewEvidence> } -> Vec<EvidenceId>,
         merge => Merge(crate::store::Merge) -> (),
         /// Decide a premise, judge a flaw, mark a path swept or unswept, mark a state `checked`
         /// across calls, or retract a state, path or component recorded in error: it then stands
@@ -65,7 +46,7 @@ actions! {
         /// `checked` state names in `rests_on` the premises its clearing relies on:
         /// `{record: {kind: "state", id, status: "checked", rests_on: [premise ids]}, note}`; each
         /// owes a settle while undecided, and one failing or contradicted owes the check again
-        set_status => SetStatus { record: StatusRecord, note: Text } -> (),
+        set_status => SetStatus { record: StatusChange, note: Text } -> (),
         /// The store scores `vector`: record the vector, never compute a score. → {severity,
         /// score, shortlisted}
         assess => Assess {
@@ -76,47 +57,31 @@ actions! {
         } -> Assessment,
         verdict => Verdict { candidate: CandidateId, verdict: crate::store::Verdict, note: Text } -> (),
         /// A `pending` result's note says what it waits for. → test id
-        test => Test {
-            candidate: CandidateId,
-            result: TestResult,
-            note: Text,
-            environment: Option<EnvironmentId>,
-            /// Files below the run's artifacts directory, each tagged with its role
-            #[serde(default)]
-            #[schemars(length(max = MAX_ARTIFACTS))]
-            artifacts: Vec<TestArtifact>,
-        } -> TestId,
+        test => Test(NewTest) -> TestId,
         /// A running instance, for one candidate or any: how to work in it, and the interfaces
         /// it serves. → environment id
-        environment => Environment {
-            instructions: Text,
-            candidate: Option<CandidateId>,
-            #[serde(default)]
-            #[schemars(with = "Vec<Served>", length(max = MAX_ATTACHMENTS))]
-            serves: Serves,
-        } -> EnvironmentId,
+        environment => Environment(NewEnvironment) -> EnvironmentId,
         /// The root flaw's report: markdown citing node and test ids. → finding id
         report => Report { root: FlawId, title: Text, body: Text } -> FindingId,
         /// Render the run's reports/ from the store: a folder per root with a current
         /// finding, and an index. → {reports: root ids written, unwritten: [{root, error}]}
         generate => Generate {} -> Generated,
     }
-    unions: [links, record]
+    unions: [record]
 }
 
 impl Action for Research {
     fn permitted(action: Name, capabilities: &CapabilitySet) -> bool {
-        let [research, verdict, test, scheduled, coordinate] =
-            SecurityCapability::ALL.map(SecurityCapability::capability);
+        use SecurityCapability::{Coordinate, Research, Scheduled, Test, Verdict};
         match action {
-            Name::begin => holds(capabilities, [scheduled]),
+            Name::begin => holds(capabilities, [Scheduled.capability()]),
             // A verdict judges research, so it needs both authorities; a test needs its own,
             // so an agent that tests and records what it observes never decides verdicts.
-            Name::verdict => holds(capabilities, [research, verdict]),
-            Name::test => holds(capabilities, [test]),
-            Name::report => holds(capabilities, [verdict, Capability::Write]),
-            Name::generate => holds(capabilities, [coordinate]),
-            _ => holds(capabilities, [research]),
+            Name::verdict => holds(capabilities, [Research, Verdict].map(|c| c.capability())),
+            Name::test => holds(capabilities, [Test.capability()]),
+            Name::report => holds(capabilities, [Verdict.capability(), Capability::Write]),
+            Name::generate => holds(capabilities, [Coordinate.capability()]),
+            _ => holds(capabilities, [Research.capability()]),
         }
     }
 
@@ -139,9 +104,7 @@ impl Research {
     ) -> Result<Value, ToolError> {
         match self {
             Self::Begin(work) => output::<result::Begin>(store.begin(actor, &work)),
-            Self::Upsert(a) => {
-                output::<result::Upsert>(store.upsert(actor, &a.record.read(store)?))
-            }
+            Self::Upsert(a) => output::<result::Upsert>(store.upsert(actor, &a.record)),
             Self::Link(a) => output::<result::Link>(store.link(actor, &a.links)),
             Self::Unlink(a) => output::<result::Unlink>(store.unlink(actor, &a.links)),
             Self::Evidence(a) => {
@@ -149,7 +112,7 @@ impl Research {
             }
             Self::Merge(merge) => output::<result::Merge>(store.merge(actor, &merge)),
             Self::SetStatus(a) => {
-                output::<result::SetStatus>(store.set_status(actor, a.record.into(), &a.note))
+                output::<result::SetStatus>(store.set_status(actor, a.record, &a.note))
             }
             Self::Assess(a) => {
                 output::<result::Assess>(store.assess(actor, a.candidate, a.vector, &a.note))
@@ -157,22 +120,8 @@ impl Research {
             Self::Verdict(a) => {
                 output::<result::Verdict>(store.verdict(actor, a.candidate, a.verdict, &a.note))
             }
-            Self::Test(a) => {
-                let test = NewTest {
-                    candidate: a.candidate,
-                    result: a.result,
-                    note: a.note,
-                    environment: a.environment,
-                    artifacts: a.artifacts,
-                };
-                output::<result::Test>(store.record_test(actor, &test))
-            }
-            Self::Environment(a) => {
-                let environment = NewEnvironment {
-                    instructions: a.instructions,
-                    candidate: a.candidate,
-                    serves: a.serves,
-                };
+            Self::Test(test) => output::<result::Test>(store.record_test(actor, &test)),
+            Self::Environment(environment) => {
                 output::<result::Environment>(store.environment(actor, &environment))
             }
             Self::Report(a) => {
@@ -182,66 +131,6 @@ impl Research {
                 output::<result::Generate>(reporting::generate(store, &|| context.is_cancelled()))
             }
         }
-    }
-}
-
-/// An upsert's record, read as a new node's without an `id`, else as an edit's, whose kind,
-/// when it leaves it out, is node `id`'s.
-#[derive(Deserialize)]
-#[serde(transparent)]
-struct UpsertRecord(Map<String, Value>);
-
-/// Arguments holding a `record`, so a refusal is located inside it.
-#[derive(Deserialize, JsonSchema)]
-struct Recorded<T> {
-    record: T,
-}
-
-impl UpsertRecord {
-    fn read(mut self, store: &Store) -> Result<Upsert, ToolError> {
-        #[derive(Deserialize)]
-        struct Edit {
-            id: NodeId,
-        }
-        let upsert = match self.0.contains_key("id") {
-            false => Upsert::try_from(self.parse::<NewRecord>()?),
-            true => {
-                if !self.0.contains_key("kind") {
-                    let kind = store.kind(self.parse::<Edit>()?.id);
-                    let kind = kind.map_err(ToolError::failed)?;
-                    self.0.insert("kind".to_owned(), kind.as_str().into());
-                }
-                Upsert::try_from(self.parse::<EditRecord>()?)
-            }
-        };
-        upsert.map_err(ToolError::failed)
-    }
-
-    fn parse<T: DeserializeOwned>(&self) -> Result<T, AdmissionError> {
-        static SCHEMA: LazyLock<Value> =
-            LazyLock::new(skyhook::tool::input_schema_for::<Recorded<UpsertRecord>>);
-        let arguments = Map::from_iter([("record".to_owned(), Value::Object(self.0.clone()))]);
-        deserialize_arguments::<Recorded<T>>(&SCHEMA, &arguments).map(|read| read.record)
-    }
-}
-
-impl JsonSchema for UpsertRecord {
-    fn schema_name() -> Cow<'static, str> {
-        "UpsertRecord".into()
-    }
-
-    /// A new node, an edit of one of a kind, or an edit leaving its kind out.
-    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        schemars::json_schema!({"anyOf": [
-            generator.subschema_for::<NewRecord>(),
-            generator.subschema_for::<EditRecord>(),
-            {
-                "description": "An edit of node `id` leaving out its `kind`: the fields its kind takes",
-                "type": "object",
-                "properties": {"id": generator.subschema_for::<NodeId>()},
-                "required": ["id"],
-            },
-        ]})
     }
 }
 

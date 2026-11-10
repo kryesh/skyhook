@@ -1,5 +1,7 @@
 //! Saved output documents and captures: loading, preparing and sizing them.
 use super::*;
+use crate::session::{CaptureExtent, StagedBytes};
+use skyhook_worker::fs::spill::SpillError;
 
 /// Strings longer than this are offloaded from a saved document into captures.
 const OFFLOAD_BYTES: usize = 4 * 1024;
@@ -8,21 +10,25 @@ fn database(error: crate::db::DbError) -> ToolError {
     ToolError::io(std::io::Error::other(error))
 }
 
-/// One run's output rows in the session database. Every operation locks the
-/// connection briefly, so call it off async worker threads for anything large.
+/// One run's output rows in the session database, and where its fields past the
+/// saved-field limit are kept. Every operation locks the connection briefly, so call
+/// it off async worker threads for anything large.
 #[derive(Clone)]
 pub(crate) struct Output {
     pub(super) db: SharedDb,
     pub(super) reads: crate::session::Reads,
     pub(super) changes: crate::session::OutputChanges,
+    pub(super) spill: Spill,
+    session: crate::identity::SessionId,
     pub(super) job: JobId,
     pub(super) invocation: crate::job::Invocation,
 }
 
 impl Output {
-    /// The rows of run `invocation` of job `job`.
+    /// The rows of run `invocation` of job `job`, spilling as `spill` says.
     pub(crate) fn of(
         store: &crate::session::SessionStore,
+        spill: &Spill,
         job: JobId,
         invocation: crate::job::Invocation,
     ) -> Self {
@@ -30,6 +36,8 @@ impl Output {
             db: store.outputs(),
             reads: store.reads(),
             changes: store.output_changes(),
+            spill: spill.clone(),
+            session: store.id(),
             job,
             invocation,
         }
@@ -38,6 +46,18 @@ impl Output {
     /// The rows' key: the job and its run.
     pub(super) fn run(&self) -> crate::job::Run {
         crate::job::Run(self.job, self.invocation)
+    }
+
+    /// A new, empty file in the session host's spill directory for `part` of the run's
+    /// output, created for its user alone. There is no other place to keep it: the
+    /// write that needed the file fails as creating it did.
+    pub(super) fn spill_file(
+        &self,
+        part: impl std::fmt::Display,
+    ) -> Result<(std::fs::File, skyhook_worker::op::TargetPath), SpillError> {
+        let stem = format!("job{}-part{part}", self.job);
+        let name = skyhook_worker::fs::spill::SpillName::unique(&self.session, &stem);
+        skyhook_worker::fs::spill::create(self.spill.root.as_deref(), &name)
     }
 }
 
@@ -67,13 +87,60 @@ pub(crate) struct Saved {
     pub(super) captures: BTreeMap<FieldPointer, CaptureRow>,
     /// Fields with a declared presentation, as saved with the result.
     pub(crate) presented: Presented,
+    /// The fields whose file in the session host's spill directory no longer holds
+    /// what was saved there, and why: a preview shows each as its placeholder, and
+    /// reading one fails.
+    pub(super) unreadable: BTreeMap<FieldPointer, Unreadable>,
+    /// The latest of each capture whose target is keeping its stream as it runs.
+    following: std::collections::HashMap<i64, crate::session::LiveTail>,
+    /// The captures whose file failed a reader of this snapshot, until
+    /// [`Saved::reading`] makes their fields unreadable.
+    lost: (reader::Lost, std::sync::mpsc::Receiver<(i64, Unreadable)>),
+}
+
+/// Why the file the session host kept a field in cannot be read, as its user is told.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub(super) enum Unreadable {
+    #[error("{}", .0.as_str().replace('_', " "))]
+    Os(skyhook_worker::op::IoKind),
+    #[error("not a regular file")]
+    NotRegular,
+    #[error("shorter than was saved")]
+    Short,
+}
+
+impl Unreadable {
+    /// Why `capture`'s file is not the regular file, at least as long, that was saved.
+    fn of(capture: &CaptureRow) -> Option<Self> {
+        let crate::session::CaptureBytes::Spilled { path, extent } = &capture.bytes else {
+            return None;
+        };
+        match std::fs::symlink_metadata(path) {
+            Err(error) => Some(Self::Os(error.kind().into())),
+            Ok(found) if !found.is_file() => Some(Self::NotRegular),
+            Ok(found) if found.len() < extent.bytes => Some(Self::Short),
+            Ok(_) => None,
+        }
+    }
+
+    /// Why a read of a field's file failed with `error`.
+    pub(super) fn read(error: &std::io::Error) -> Self {
+        use skyhook_worker::op::FsError;
+        match error.get_ref().and_then(|source| source.downcast_ref()) {
+            Some(FsError::NotRegular) => Self::NotRegular,
+            _ if error.kind() == std::io::ErrorKind::UnexpectedEof => Self::Short,
+            _ => Self::Os(error.kind().into()),
+        }
+    }
 }
 
 impl Saved {
     pub(crate) fn load(output: &Output) -> Result<Self, ToolError> {
         output.changes.read(output.run());
         let rows = output.reads.saved(output.run()).map_err(database)?;
-        Self::of(output.reads.clone(), rows)
+        let mut saved = Self::of(output.reads.clone(), rows)?;
+        saved.following = output.changes.following();
+        Ok(saved)
     }
 
     /// What a run saved, from its `rows`; capture bytes are read through `reads`.
@@ -97,11 +164,17 @@ impl Saved {
             }
             None => (None, BTreeSet::new()),
         };
+        let unreadable = captures
+            .iter()
+            .filter_map(|capture| Some((capture.pointer.clone(), Unreadable::of(capture)?)));
         Ok(Self {
             reads,
             product,
             fields,
             presented,
+            following: Default::default(),
+            lost: std::sync::mpsc::channel(),
+            unreadable: unreadable.collect(),
             captures: captures
                 .into_iter()
                 .map(|capture| (capture.pointer.clone(), capture))
@@ -109,28 +182,76 @@ impl Saved {
         })
     }
 
-    /// Any registered capture at `field`, complete or not.
-    pub(super) fn capture(&self, field: &FieldPointer) -> Option<Source> {
-        self.captures.get(field).map(|capture| {
-            Source::Capture(reader::CaptureReader::new(self.reads.clone(), capture.id))
-        })
+    /// What `read` makes of this snapshot, with the snapshot. A field whose file
+    /// fails `read` is unreadable from then on, and `read` starts over: the failure
+    /// is that field's, as if its file had been found gone.
+    pub(crate) fn reading<T>(
+        mut self,
+        read: impl Fn(&Self) -> Result<T, ToolError>,
+    ) -> Result<(Self, T), ToolError> {
+        loop {
+            let made = read(&self);
+            let mut found = false;
+            for (capture, why) in self.lost.1.try_iter() {
+                if let Some(row) = self.captures.values().find(|row| row.id == capture) {
+                    found |= self.unreadable.insert(row.pointer.clone(), why).is_none();
+                }
+            }
+            if !found {
+                return Ok((self, made?));
+            }
+        }
     }
 
-    /// The bytes of a referenced field, which the document stores as a placeholder.
-    /// A detected sequence reads as the array it presents.
-    pub(super) fn stored(&self, field: &FieldPointer) -> Option<Box<dyn Read>> {
-        let capture = self
+    /// A reader of what the session holds of `capture`.
+    pub(super) fn reader(&self, capture: &CaptureRow) -> reader::CaptureReader {
+        reader::CaptureReader::new(self.reads.clone(), capture.id).reporting(self.lost.0.clone())
+    }
+
+    /// What the session holds of any registered capture at `field`, complete or not:
+    /// all of it, or the first bytes of a file on the job's target.
+    pub(super) fn held(&self, field: &FieldPointer) -> Option<Source> {
+        let capture = self.captures.get(field)?;
+        Some(Source::Capture(self.reader(capture)))
+    }
+
+    /// What the session holds of `capture`, unless its file there is unreadable:
+    /// all of it, or the first bytes of a file on the job's target.
+    pub(super) fn bytes(&self, capture: &CaptureRow) -> Result<Source, ToolError> {
+        self.readable(&capture.pointer)?;
+        let latest = self.following.get(&capture.id).cloned();
+        Ok(Source::Capture(self.reader(capture).following(latest)))
+    }
+
+    /// Fails for a `field` whose file the session host can no longer read.
+    pub(super) fn readable(&self, field: &FieldPointer) -> Result<(), ToolError> {
+        match self.unreadable.contains_key(field) {
+            true => Err(files::unavailable(field)),
+            false => Ok(()),
+        }
+    }
+
+    /// The capture of a referenced field, which the document stores as a placeholder.
+    pub(super) fn referenced(&self, field: &FieldPointer) -> Option<&CaptureRow> {
+        (self
             .fields
             .contains(field)
-            .then(|| self.captures.get(field))
-            .flatten()?;
-        let source = reader::CaptureReader::new(self.reads.clone(), capture.id);
-        Some(if capture.detection == Some(json::Detection::Sequence) {
-            let source = BufReader::with_capacity(IO_BUFFER_BYTES, source);
-            Box::new(json::SequenceArray::new(source))
-        } else {
-            Box::new(source)
-        })
+            .then(|| self.captures.get(field)))
+        .flatten()
+    }
+
+    /// All the bytes of a referenced field's `capture`. A detected sequence reads as
+    /// the array it presents.
+    pub(super) fn whole(&self, capture: &CaptureRow) -> Result<Box<dyn Read>, ToolError> {
+        let source = self.bytes(capture)?;
+        Ok(
+            if capture.detection == Some(skyhook_tools::output::json::Detection::Sequence) {
+                let source = BufReader::with_capacity(IO_BUFFER_BYTES, source);
+                Box::new(super::json::SequenceArray::new(source))
+            } else {
+                Box::new(source)
+            },
+        )
     }
 }
 
@@ -143,6 +264,8 @@ pub(super) struct Stored<'a> {
     /// Fields whose presentation is declared; the paths of complete ones stay in
     /// the document.
     pub(super) presented: Presented,
+    /// Registered captures that hold the first bytes of a file on the job's target.
+    pub(super) files: Vec<(i64, skyhook_tools::output::CaptureFile)>,
 }
 
 /// Prepare a compact product, so loading it never parses a large value. Captures
@@ -166,8 +289,17 @@ pub(super) fn prepare_document(
         fields: Vec::new(),
         staged: Vec::new(),
     };
-    offload.visit(&FieldPointer::root(), &mut document)?;
+    let visited = offload.visit(&FieldPointer::root(), &mut document);
     let Offload { fields, staged, .. } = offload;
+    if let Err(error) = visited {
+        // Nothing keeps what was staged for a product that is not saved.
+        for capture in staged {
+            if let Ok(Some(file)) = output.db.delete_capture(capture.id()) {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        return Err(error);
+    }
     let result = has_result
         .then(|| serde_json::to_string(&document["result"]))
         .transpose()?;
@@ -177,6 +309,7 @@ pub(super) fn prepare_document(
         captures_complete,
         fields,
         staged,
+        files: stored.files,
         presented: stored.presented,
     })
 }
@@ -186,7 +319,7 @@ struct Offload<'a> {
     registered: &'a BTreeMap<FieldPointer, CaptureRow>,
     stored: &'a Stored<'a>,
     /// Registered captures the saved document references.
-    fields: Vec<(i64, Option<json::Detection>)>,
+    fields: Vec<(i64, Option<skyhook_tools::output::json::Detection>)>,
     staged: Vec<StagedCapture>,
 }
 
@@ -198,7 +331,10 @@ impl Offload<'_> {
             let detection = match value {
                 Value::String(_) if self.stored.candidates.contains(field) => {
                     let source = reader::CaptureReader::new(self.output.reads.clone(), capture.id);
-                    Some(classify(json::detect(source)?, value))
+                    Some(classify(
+                        skyhook_tools::output::json::detect(source)?,
+                        value,
+                    ))
                 }
                 Value::String(_) | Value::Object(_) | Value::Array(_) => {
                     clear(value);
@@ -216,7 +352,7 @@ impl Offload<'_> {
         }
         match value {
             Value::String(text) if self.stored.candidates.contains(field) => {
-                let detection = json::detect(text.as_bytes())?;
+                let detection = skyhook_tools::output::json::detect(text.as_bytes())?;
                 // Short text that is not JSON stays inline, unclassified.
                 if detection.placeholder().is_none() && text.len() <= OFFLOAD_BYTES {
                     return Ok(());
@@ -277,21 +413,38 @@ impl Offload<'_> {
             && !text_field(value)
     }
 
+    /// Stage `data` as a capture at `field`: in rows, or past the saved-field limit
+    /// in a file of its own.
     fn store(
         &mut self,
         field: &FieldPointer,
-        kind: (CaptureKind, Option<json::Detection>),
+        kind: (CaptureKind, Option<skyhook_tools::output::json::Detection>),
         data: &[u8],
     ) -> std::io::Result<()> {
-        let run = self.output.run();
-        let staged = (self.output.db).stage_capture(run, field, kind, data);
-        self.staged.push(staged.map_err(std::io::Error::other)?);
+        let (run, db) = (self.output.run(), &self.output.db);
+        let stage =
+            |bytes| (db.stage_capture(run, field, kind, bytes)).map_err(std::io::Error::other);
+        let staged = if data.len() as u64 > self.output.spill.bytes {
+            let (mut file, path) = self.output.spill_file(self.staged.len())?;
+            let extent = CaptureExtent::default().after(data);
+            let kept = (file.write_all(data).and_then(|()| file.sync_data()))
+                .map_err(|error| SpillError::At(error).into())
+                .and_then(|()| stage(StagedBytes::File(&path, extent)));
+            // Nothing records a file its capture was not staged with.
+            kept.inspect_err(|_| drop(std::fs::remove_file(path.as_str())))?
+        } else {
+            stage(StagedBytes::Rows(data))?
+        };
+        self.staged.push(staged);
         Ok(())
     }
 }
 
 /// What candidate text holds; a JSON field presents as its empty container.
-fn classify(detection: json::Detection, value: &mut Value) -> json::Detection {
+fn classify(
+    detection: skyhook_tools::output::json::Detection,
+    value: &mut Value,
+) -> skyhook_tools::output::json::Detection {
     *value = detection
         .placeholder()
         .unwrap_or_else(|| Value::String(String::new()));
@@ -340,12 +493,48 @@ impl Saved {
         let mut document = hydrate(self, product.document())?;
         Ok(product.result.is_some().then(|| document["result"].take()))
     }
+
+    /// The result's fields at or under `within` that the job's target holds in files,
+    /// of which the session holds only the first bytes.
+    pub(super) fn on_target(&self, within: &FieldPointer) -> Held {
+        let held = |field: &FieldPointer| match &self.captures.get(field)?.bytes {
+            crate::session::CaptureBytes::Target(file) => Some((field.clone(), file.clone())),
+            _ => None,
+        };
+        let fields = self.fields.iter();
+        let fields = fields.filter(|field| *field == within || within.contains(field));
+        fields.filter_map(held).collect()
+    }
+
+    /// This with each of `texts` as its field's value, as if the session held it:
+    /// what a read of a field its job's target holds read there.
+    pub(super) fn holding(mut self, texts: Vec<(FieldPointer, String)>) -> Self {
+        let root = FieldPointer::result();
+        for (field, text) in texts {
+            self.fields.remove(&field);
+            self.captures.remove(&field);
+            let result = self
+                .product
+                .as_mut()
+                .and_then(|product| product.result.as_mut());
+            let within = field.as_str().strip_prefix(root.as_str());
+            if let Some(slot) = (result.zip(within)).and_then(|(result, at)| result.pointer_mut(at))
+            {
+                *slot = text.into();
+            }
+        }
+        self
+    }
 }
+
+/// Fields a document holds only the first bytes of, with the files on the job's target
+/// that hold them whole.
+pub(super) type Held = Vec<(FieldPointer, crate::session::TargetFile)>;
 
 /// Install referenced fields into the document.
 pub(super) fn hydrate(saved: &Saved, value: Value) -> Result<Value, ToolError> {
     let root = FieldPointer::root();
-    let mut text = render::json_text(saved, &root, &value, render::Reading::Whole)?;
+    let mut text = stream::json_text(saved, &root, &value, stream::Reading::Whole)?;
     // Parsing bytes in memory is several times faster than through a reader, and
     // the document is held whole either way.
     let mut bytes = Vec::new();
@@ -357,16 +546,16 @@ pub(super) fn hydrate(saved: &Saved, value: Value) -> Result<Value, ToolError> {
 /// batching budgets: the previewed result, its shape and its truncation records, or
 /// a page when it cannot be previewed.
 pub(crate) fn presented_size(output: &Output) -> usize {
-    let measure = || -> Result<usize, ToolError> {
-        let saved = Saved::load(output)?;
-        let cancellation = crate::job::CancellationToken::new();
-        let projected = projection::project(&saved, &cancellation)?;
+    let cancellation = crate::job::CancellationToken::new();
+    let measure = |saved: &Saved| {
+        let projected = projection::project(saved, &cancellation)?;
         let truncated = (!projected.truncated.is_empty()).then_some(&projected.truncated);
         Ok(preview::json_bytes(&projected.result)
             + projected.shape.as_ref().map_or(0, preview::json_bytes)
             + truncated.map_or(0, preview::json_bytes))
     };
-    measure().unwrap_or(PAGE_BYTES)
+    let measured = Saved::load(output).and_then(|saved| saved.reading(measure));
+    measured.map_or(PAGE_BYTES, |(_, bytes)| bytes)
 }
 
 #[cfg(test)]
@@ -389,7 +578,9 @@ impl Output {
         if let Some(existing) = self.test_saved().captures.get(&field) {
             self.db.delete_capture(existing.id).unwrap();
         }
-        let mut writer = PendingCapture::create(self, &field, kind).unwrap().open();
+        let mut writer = crate::job::output::create_capture(self, &field, kind)
+            .unwrap()
+            .open();
         writer.write_all(bytes).unwrap();
         writer.flush().unwrap();
         // Keep the row: dropping a writer only deletes abandoned builtin text captures.
@@ -397,7 +588,7 @@ impl Output {
     }
 
     pub(crate) fn test_bytes(&self, field: &str) -> Option<Vec<u8>> {
-        let mut source = self.test_saved().capture(&field.parse().unwrap())?;
+        let mut source = self.test_saved().held(&field.parse().unwrap())?;
         let mut bytes = Vec::new();
         source.read_to_end(&mut bytes).unwrap();
         Some(bytes)
@@ -424,13 +615,148 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobManager, output::tests::fixture_with, tests::runtime};
+    use crate::job::{JobManager, JobOutcome, output::tests::fixture_with, tests::runtime};
     use crate::tool::ToolOutput;
+    use skyhook_tools::output::json::Detection;
 
     /// The result `output`'s saved document holds.
     fn value(output: &Output) -> Value {
         let saved = output.test_saved();
         hydrate(&saved, saved.product.as_ref().unwrap().document()).unwrap()["result"].take()
+    }
+
+    /// Parts of a result past the saved-field limit are kept in files, text and JSON
+    /// alike, and stay fields: paged and queried as before, and read whole into the
+    /// value a script holds. Host inspection tells where they are kept. Once a file
+    /// cannot be read its field shows empty and incomplete, and reading it fails as
+    /// unavailable.
+    #[tokio::test]
+    async fn result_parts_past_the_limit_are_kept_in_files_and_read_as_fields() {
+        let runtime = crate::tests::TestRuntime::new()
+            .await
+            .spilling_past(8 * 1024);
+        let (manager, agent) = (&runtime.jobs, &runtime.agent);
+        let log: String = (0..2000).map(|line| format!("line {line}\n")).collect();
+        let rows: Vec<Value> = (0..2000).map(|row| json!({"row": row})).collect();
+        let result = json!({"log": log, "rows": rows, "trace": log, "note": "kept inline"});
+        let completed = JobOutcome::Completed(ToolOutput::new(result.clone()).into());
+        let id = fixture_with(manager, agent, None, Some(completed)).await;
+        let output = manager.output(id).await;
+        let saved = Saved::load(&output).unwrap();
+        let spills = runtime.root.path().to_str().unwrap();
+        let capabilities = CapabilitySet::default();
+        let inspect = async || {
+            let inspected = manager.inspect_output_with_captures(
+                OutputArgs::new(id),
+                Default::default(),
+                &capabilities,
+            );
+            inspected.await.unwrap()
+        };
+        let files = inspect().await.files;
+        let [log, rows, trace] = &files[..] else {
+            panic!("three fields are kept in files: {files:?}")
+        };
+        for file in &files {
+            let held = std::fs::metadata(file.path.as_str()).unwrap().len();
+            assert_eq!((file.bytes, &file.unreadable), (held, &None));
+            let host = skyhook_tools::target::TargetRef::Root;
+            assert!(file.path.as_str().starts_with(spills) && file.target == host);
+        }
+        for capture in saved.captures.values() {
+            let stored = output.reads.capture_window(capture.id, 0, 1).unwrap().1;
+            assert!(matches!(stored, crate::session::Stored::File(_)));
+        }
+        assert_eq!(saved.result().unwrap(), Some(result));
+
+        let mut args = OutputArgs::new(id);
+        (args.field, args.start) = (Some("/result/log".parse().unwrap()), Some(1999));
+        let page = manager.present_output(args, &Default::default()).await;
+        let page = &page.unwrap()["presentation"]["preview"];
+        assert_eq!(page["lines"], json!(["line 1998", "line 1999"]));
+        let mut args = OutputArgs::new(id);
+        args.field = Some("/result/rows".parse().unwrap());
+        args.query = Some("$[?@.row == 1500]".into());
+        let found = manager.present_output(args, &Default::default()).await;
+        let found = &found.unwrap()["presentation"]["preview"]["matches"];
+        assert_eq!(found[0]["value"], json!({"row": 1500}));
+
+        // A file that is gone, cut short or closed to its reader leaves the result
+        // readable: its field shows empty and incomplete, the session's user is told
+        // why, and reading the field fails as unavailable.
+        std::fs::remove_file(log.path.as_str()).unwrap();
+        let cut = std::fs::File::options()
+            .write(true)
+            .open(rows.path.as_str());
+        cut.unwrap().set_len(10).unwrap();
+        let closed = std::os::unix::fs::PermissionsExt::from_mode(0o000);
+        std::fs::set_permissions(trace.path.as_str(), closed).unwrap();
+        let whole = manager.present_output(OutputArgs::new(id), &capabilities);
+        let whole = whole.await.unwrap();
+        let shown = json!({"log": "", "rows": [], "trace": "", "note": "kept inline"});
+        assert_eq!(whole["result"], shown);
+        let emitted = serde_json::to_vec(&shown).unwrap().len();
+        assert_eq!(presented_size(&output), emitted);
+        let lost = json!([{"field": "/result/log", "complete": false},
+            {"field": "/result/rows", "complete": false},
+            {"field": "/result/trace", "complete": false}]);
+        assert_eq!(whole["presentation"]["captures"], lost);
+        let reasons = inspect().await.files.into_iter();
+        let reasons: Vec<_> = reasons.filter_map(|file| file.unreadable).collect();
+        let told = ["not found", "shorter than was saved", "permission denied"];
+        assert_eq!(reasons, told);
+        for (field, kept) in [
+            ("/result/log", "/result/log"),
+            ("/result/rows/3", "/result/rows"),
+            ("/result/trace", "/result/trace"),
+        ] {
+            let mut args = OutputArgs::new(id);
+            args.field = Some(field.parse().unwrap());
+            let page = manager.present_output(args, &Default::default()).await;
+            let failed = page.unwrap_err().to_string();
+            let plain = format!("saved output for {kept} is no longer available");
+            assert!(failed.ends_with(&plain), "{failed}");
+        }
+    }
+
+    /// A part its spill directory cannot keep fails its job, saying why, with no
+    /// result saved, and the session goes on to journal the next job. A long key is
+    /// kept like any other: files are named by ordinal.
+    #[tokio::test]
+    async fn a_part_that_cannot_be_kept_fails_its_job_and_the_session_goes_on() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let blocked = runtime.root.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let large = |key: &str| {
+            let result = json!({key: "x".repeat(16 * 1024)});
+            JobOutcome::Completed(ToolOutput::new(result).into())
+        };
+        let spilling = |root: Option<&std::path::Path>| {
+            let (root, bytes) = (root.map(Into::into), 8 * 1024);
+            JobManager::spilling(runtime.store.clone(), Spill { root, bytes })
+        };
+        let unkept = [
+            (
+                Some(&*blocked),
+                "save failed: not a directory (OS error 20)",
+            ),
+            (None, "save failed: this user has no cache directory"),
+        ];
+        for (root, told) in unkept {
+            let manager = spilling(root);
+            let id = fixture_with(&manager, &runtime.agent, None, Some(large("text"))).await;
+            let failed = manager.test_snapshot(id).await.unwrap();
+            assert_eq!(failed.state, crate::job::JobState::Failed);
+            assert_eq!(failed.output, None);
+            let hidden = skyhook_tools::diagnostic::TargetView::Hidden;
+            let reason = failed.diagnostic.as_ref().unwrap().render(hidden);
+            assert_eq!(reason, told);
+        }
+        let manager = spilling(Some(&runtime.root.path().join("spills")));
+        let long = "k".repeat(300);
+        let id = fixture_with(&manager, &runtime.agent, None, Some(large(&long))).await;
+        let kept = manager.test_snapshot(id).await.unwrap();
+        assert_eq!(kept.output.unwrap()[&long], "x".repeat(16 * 1024));
     }
 
     #[tokio::test]
@@ -472,9 +798,10 @@ mod tests {
             let mut result = json!({"note":"{\"x\":1}"});
             let mut receipts = Vec::new();
             if captured {
-                let mut writer = PendingCapture::create(&output, &stdout, CaptureKind::Text)
-                    .unwrap()
-                    .open();
+                let mut writer =
+                    crate::job::output::create_capture(&output, &stdout, CaptureKind::Text)
+                        .unwrap()
+                        .open();
                 writer.write_all(text.as_bytes()).unwrap();
                 receipts.push(writer.finish().unwrap());
             } else {
@@ -529,7 +856,7 @@ mod tests {
         let (root, manager, agent) = runtime().await;
         let mut output = ToolOutput::new(result);
         if !captures_complete {
-            output.streams = crate::tool::StreamEnd::Cut;
+            output.streams = skyhook_tools::output::StreamEnd::Cut;
         }
         let outcome = crate::job::JobOutcome::Completed(output.into());
         let id = fixture_with(&manager, &agent, Some(schema.clone()), Some(outcome)).await;
@@ -537,14 +864,22 @@ mod tests {
         (root, manager, saved)
     }
 
+    /// Text whose schema declares JSON content is read as the value it holds, unless
+    /// its producer did not finish it.
     #[tokio::test]
     async fn output_a_producer_did_not_finish_is_never_taken_as_json() {
         let schema = json!({"type":"object","properties":{
-            "stdout":{"type":"string","contentMediaType":"application/json"}
+            "stdout":{"type":"string","contentMediaType":"application/json"},
+            "stderr":{"type":"string"}
         }});
-        let (_root, _manager, saved) = saved(&schema, json!({"stdout": "{\"a\":1}"}), false).await;
-        let document = saved.product.as_ref().unwrap().document();
-        assert_eq!(document["result"]["stdout"], "{\"a\":1}");
+        let result = json!({"stdout": "{\"a\":1}", "stderr": "[]"});
+        for (finished, stdout) in [(true, json!({"a":1})), (false, json!("{\"a\":1}"))] {
+            let (_root, _manager, saved) = saved(&schema, result.clone(), finished).await;
+            let cancellation = crate::job::CancellationToken::new();
+            let projected = super::projection::project(&saved, &cancellation);
+            let projected = projected.unwrap().result.unwrap();
+            assert_eq!(projected, json!({"stdout": stdout, "stderr": "[]"}));
+        }
     }
 
     #[tokio::test]
@@ -613,10 +948,6 @@ mod tests {
         let saved = Saved::load(&output).unwrap();
         let fields: Vec<_> = saved.fields.iter().map(FieldPointer::as_str).collect();
         assert_eq!(fields, ["/result/details/log", "/result/items"]);
-        assert_eq!(
-            saved.captures[&FieldPointer::result().property("items")].kind,
-            CaptureKind::Json
-        );
         assert_eq!(value(&output), result);
     }
 }

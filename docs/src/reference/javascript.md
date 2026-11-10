@@ -137,7 +137,9 @@ background so that agent can answer (see
 Truncation entries keep their source paths rooted at `/result/...`.
 
 JavaScript receives complete data; model views may shorten fields as described in
-[saved job output](job-output.md#automatic-previews). A returned tool response keeps its own
+[saved job output](job-output.md#automatic-previews). A field kept in a
+[spill file](job-output.md#spill-files) is read whole into the script like any other, so a large
+one counts against the heap limit. A returned tool response keeps its own
 fields whole in the script's own preview, and its result is previewed as a direct read of that
 result would be; a page a `jobs` read returns is a presentation already and stays whole.
 A value taken out of a response, such as `response.result`, is shortened like any other returned
@@ -159,7 +161,7 @@ It returns `response.result` when the response is completed (an absent `state` m
 or `null` when the job has no result, and throws for failed or pending responses; the thrown error has `error.response` containing the envelope and `error.output` equal to its
 `.result`, plus `error.job` and `error.code` when the response has an `id` or denial `code`. The method is non-enumerable and runtime-only: `Object.keys`, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
-`receive()` values are not decorated, and there is no built-in `tool.unwrap` helper.
+`receive()` values are not decorated.
 
 `jobs({job})` reads already return views, so read their `result`, `presentation.preview`,
 `presentation.captures`, or pagination rather than unwrapping them. A script's whole-output

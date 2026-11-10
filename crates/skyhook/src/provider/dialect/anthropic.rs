@@ -1,29 +1,26 @@
 //! api.anthropic.com: the Messages API with its version header, `x-api-key`,
 //! prefix-bound thinking, cache breakpoint lifetimes, and workspace-scoped keys.
 
+use crate::provider::codec::errors::{ErrorSignals, error_object};
 use serde::Deserialize;
 
-use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, Scheme};
-use crate::media::ImageLimits;
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Scheme, Wire};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, StateRole, ToolNames, UnsignedReasoning,
+        CacheTtl, Codec, CodecName, StateRole, UnsignedReasoning,
         messages::{self, SystemState, ThinkingBinding},
     },
-    http::{
-        Transport,
-        errors::{ErrorSignals, error_object},
-        headers::HeaderText,
-    },
+    http::{Transport, headers::HeaderText},
 };
+use skyhook_media::ImageLimits;
 
 /// What the service accepts of an image: 8000 px, and 7.5 MiB, which is 10 MiB
 /// as base64.
-const IMAGES: ImageLimits = ImageLimits::new(8000, 15 * 512 * 1024);
+const IMAGES: ImageLimits = ImageLimits::new::<8000, { 15 * 512 * 1024 }>();
 
-/// Anthropic's Messages conventions, wherever the service is reached, with its
-/// tool-name alphabet. Signed thinking is bound to the exact conversation before it;
+/// Anthropic's Messages conventions, wherever the service is reached.
+/// Signed thinking is bound to the exact conversation before it;
 /// letting the service drop a mismatched block keeps mode switches and compaction
 /// from failing, and the runtime still unbinds client-side. System-role state is
 /// turn-scoped, which keeps that conversation fixed as the state changes. The service
@@ -32,7 +29,6 @@ pub(super) fn messages() -> messages::Dialect {
     messages::Dialect {
         thinking_binding: ThinkingBinding::DropOnMismatch,
         unsigned: UnsignedReasoning::Dropped,
-        tool_names: ToolNames::Anthropic,
         system_state: SystemState::TurnScoped,
         ..messages::Dialect::standard()
     }
@@ -47,10 +43,10 @@ const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
 /// Send state in the configured role, `system` by default, and announce the betas
 /// Anthropic's conventions need: block binding, and turn-scoped system messages when
 /// state takes the system role.
-pub(super) fn state(profile: &mut Profile, configured: Option<StateRole>) {
-    let state_role = profile.state_role(configured, StateRole::System);
+pub(super) fn state(wire: &mut Wire, configured: Option<StateRole>) {
+    let state_role = wire.state_role(configured, StateRole::System);
     let turn_scoped = (state_role == StateRole::System).then_some(CLEAR_AT_BETA);
-    profile.listed(
+    wire.listed(
         messages::BETA_HEADER,
         [BINDING_BETA].into_iter().chain(turn_scoped),
     );
@@ -113,27 +109,27 @@ impl DialectConfig for Config {
     }
 
     /// The key travels as the codec's own, `x-api-key`.
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError> {
         if codec != CodecName::Messages {
             return Err(DialectError::UnsupportedCodec {
                 dialect: Dialect::Anthropic,
                 codec,
             });
         }
-        let mut codec = Codec::Messages(messages());
-        if let Some(ttl) = codec.cache_ttl_mut() {
-            *ttl = self.cache_ttl;
-        }
-        let mut profile = Profile {
+        let codec = Codec::Messages(messages::Dialect {
+            cache_ttl: self.cache_ttl,
+            ..messages()
+        });
+        let mut wire = Wire {
             key: Scheme::XApiKey,
-            ..Profile::new(codec, transport(), Dialect::Anthropic, IMAGES)
+            ..Wire::new(codec, transport(), Dialect::Anthropic, IMAGES)
         };
-        state(&mut profile, self.state_role);
+        state(&mut wire, self.state_role);
         if let Some(workspace) = &self.workspace_id {
-            profile.discriminate("workspace_id", workspace);
-            profile.fixed("anthropic-workspace-id", workspace.value());
+            wire.discriminate("workspace_id", workspace);
+            wire.fixed("anthropic-workspace-id", workspace.value());
         }
-        Ok(profile)
+        Ok(wire)
     }
 }
 
@@ -141,10 +137,8 @@ impl DialectConfig for Config {
 mod tests {
     use super::*;
     use crate::provider::dialect::tests::replay_scope;
-    use crate::provider::dialect::{
-        Sourced,
-        tests::{ROOT, common, head, provider, request},
-    };
+    use crate::provider::dialect::tests::{ROOT, common, head, provider, request};
+    use skyhook_worker::secret::Credential;
     use std::assert_matches;
 
     /// The service takes back only thinking it signed, so unsigned thinking stays
@@ -223,11 +217,11 @@ mod tests {
             cache_ttl: Some(CacheTtl::OneHour),
             state_role: None,
         };
-        let mut common = common(ROOT, Some(Sourced::Literal("k".into())));
+        let mut common = common(ROOT, Some(Credential::Literal("k".into())));
         // A configured beta joins the dialect's rather than replacing them.
         common.headers.insert(
             "anthropic-beta".into(),
-            Sourced::Literal("context-1m-2025-08-07".into()),
+            Credential::Literal("context-1m-2025-08-07".into()),
         );
         let provider = provider("test", &configured, CodecName::Messages, &common);
         let sent = provider.sent(request()).await.unwrap();

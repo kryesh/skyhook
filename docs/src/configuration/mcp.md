@@ -13,8 +13,8 @@ mcp:
     capabilities: ["read"]
     cwd: "mcp-work"                  # Relative to its config file's directory; default: workspace.
     env: { LOG_LEVEL: "warn" }        # Environment overrides for the launched process.
-    startup_timeout_secs: 30         # Default; must be a positive integer.
-    call_timeout_secs: 120           # Default; must be a positive integer.
+    startup_timeout_secs: 30         # Default; whole seconds from 1 through 86400.
+    call_timeout_secs: 120           # Default; whole seconds from 1 through 86400.
 
   service:
     transport: "streamable_http"
@@ -41,29 +41,31 @@ the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as `WORKERS: "4"`.
 
-HTTP `headers` maps header names to values in the forms a provider's
-[`headers`](authentication.md) take: a literal, `env: NAME`, or `command: "..."`. The complete value
-is sent as the header (for example, `MY_MCP_AUTHORIZATION` can contain `Bearer ...`). Invalid or
-repeated header names, blank values and invalid literals are refused with the configuration. An
-environment value is read, and a command run, when the connection starts; a missing, blank or
-invalid value, or a failed command, prevents that server's connection from starting. Prefer `env`
-or `command` for secrets, and do not put them in `start_command` arguments or literal `env` values.
+HTTP `headers` maps header names to [credentials](authentication.md#credentials): a literal,
+`{env: NAME}`, `{command: "..."}` or `{command: ["program", "arg"]}`, or `{file: path}`. The
+complete value is sent as the header (for example, `MY_MCP_AUTHORIZATION` can contain
+`Bearer ...`). Invalid or repeated header names, blank values and invalid literals are refused with
+the configuration. An environment value is read, a command run and a file read when the connection
+starts; a missing, blank or invalid value, or a failed command or unreadable file, prevents that
+server's connection from starting. Prefer `env`, `command` or `file` for secrets, and do not put
+them in `start_command` arguments or literal `env` values.
 
 ## Trust and permissions
 
 **Trust boundary:** configured startup commands are trusted configuration, including commands
 from a workspace `.skyhook/config.yaml` overlay. Review workspace config before use. They run during
 session startup without a model tool-approval prompt, only on the local root/session host—not on
-selected SSH targets. Only configure commands and endpoints you trust. Child agents share the
+selected remote targets. Only configure commands and endpoints you trust. Child agents share the
 session's MCP connections rather than starting their own servers.
 
 The session must hold the global **`mcp` capability** before any MCP server is launched or contacted,
 and before any MCP tool can be exposed or invoked. Each server's `capabilities` sequence defaults to
 `[]` and adds requirements to that global gate. Valid names are `read`, `write`, `exec`, `network`,
-`targets`, `ssh_agent`, `agents`, `interactive`, and `mcp`. An agent must hold **all** listed capabilities to see
+`targets`, `agents`, `interactive`, and `mcp`, and any capability the application itself declares,
+such as `skyhook-security`'s. An agent must hold **all** listed capabilities to see
 or call a server's tools; otherwise those tools are hidden from both the model catalog and
 JavaScript access. Servers whose requirements exceed the session's capabilities are not contacted
-or launched at all. This is a host-configured gate, not an inference from server annotations.
+or launched at all.
 Nonempty lists also request those permissions through the normal approval policy, scoped to the
 MCP server/tool rather than a filesystem workspace. The implicit global `mcp` requirement is
 availability-only and introduces no approval prompt. `approve_all` never bypasses missing
@@ -81,7 +83,8 @@ interface's sidebar shows each server's startup status.
 
 Imported tools are available to the model and through `tool` builders inside `script`. Use the
 exact advertised name and schema rather than deriving them from the server's tool name. Names
-usually look like `mcp_filesystem_write_file`, but may have a suffix to avoid conflicts. Arguments
+usually look like `mcp_filesystem_write_file`, but may have a suffix to avoid conflicts; each
+tool's description is the server's own. Arguments
 may appear at the top level or under an `arguments` object so they do not conflict with common
 Skyhook arguments such as `bg`. Tools with invalid or unsupported input schemas are warned about
 and skipped individually.
@@ -92,7 +95,7 @@ Call a tool with `tool[name](...)` or its fluent builder. Calls return the
 [saved-output image handling](../reference/javascript.md#saved-output-and-serialization), and server-reported errors retain their
 output in failed jobs.
 
-Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
-bounds discovery sizes and each message a server sends, at 64 MiB; a larger stdio message is
+Calls can be cancelled and run in the background as built-in tools can. Skyhook bounds the size
+of what discovery returns, and each message a server sends at 64 MiB; a larger stdio message is
 discarded, the call it answered ends at its call timeout, and the server keeps serving other
 calls. Skyhook does not replay a call with an uncertain outcome after a connection failure. Cancellation cannot undo effects that already occurred on the server.

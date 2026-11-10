@@ -2,7 +2,7 @@ use skyhook::tool::policy::HostCapabilityDeclaration;
 use skyhook::tool::policy::{Capability, HostCapability};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecurityCapability {
+pub(crate) enum SecurityCapability {
     Research,
     Verdict,
     Test,
@@ -13,7 +13,7 @@ pub enum SecurityCapability {
 }
 
 impl SecurityCapability {
-    pub const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Research,
         Self::Verdict,
         Self::Test,
@@ -21,7 +21,7 @@ impl SecurityCapability {
         Self::Coordinate,
     ];
 
-    pub fn host(self) -> HostCapability {
+    pub(crate) fn host(self) -> HostCapability {
         match self {
             Self::Research => "security.research",
             Self::Verdict => "security.verdict",
@@ -33,12 +33,12 @@ impl SecurityCapability {
         .expect("built-in security capability names are valid")
     }
 
-    pub fn capability(self) -> Capability {
+    pub(crate) fn capability(self) -> Capability {
         Capability::Host(self.host())
     }
 
     /// How the sidebar names the capability.
-    pub fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Research => "Record research",
             Self::Verdict => "Decide verdicts",
@@ -49,7 +49,7 @@ impl SecurityCapability {
     }
 }
 
-pub fn declarations() -> impl Iterator<Item = HostCapabilityDeclaration> {
+pub(crate) fn declarations() -> impl Iterator<Item = HostCapabilityDeclaration> {
     SecurityCapability::ALL
         .into_iter()
         .map(|capability| HostCapabilityDeclaration {

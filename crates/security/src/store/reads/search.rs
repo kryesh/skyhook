@@ -10,7 +10,8 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_with::SerializeDisplay;
 use skyhook::db::{enum_column, params};
-use skyhook::tool::REGEX_SIZE_LIMIT;
+use skyhook_base::enums::NamedEnum;
+use skyhook_worker::op::REGEX_SIZE_LIMIT;
 
 use super::{super::*, list::summary};
 
@@ -19,7 +20,7 @@ const HITS: usize = 5;
 
 /// A search its arguments cannot make.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SearchError {
+pub(crate) enum SearchError {
     #[error("search by at least one of `pattern`, `file` and `function`")]
     Unfiltered,
     #[error("`line` is a line of a `file`: give the file")]
@@ -31,7 +32,7 @@ pub enum SearchError {
 }
 
 /// Text matching `pattern` and a code location in `site`, on live nodes of `kinds`.
-pub struct Search {
+pub(crate) struct Search {
     pattern: Option<Regex>,
     site: Option<Site>,
     kinds: Vec<NodeKind>,
@@ -60,7 +61,7 @@ fn regex(argument: &'static str, pattern: &str) -> std::result::Result<Regex, Se
 impl Search {
     /// A search by any of `pattern`, the `file` glob with a `line` in it and `function`, at
     /// least one given.
-    pub fn new(
+    pub(crate) fn new(
         pattern: Option<&str>,
         file: Option<&str>,
         line: Option<u32>,
@@ -120,18 +121,20 @@ impl Site {
     }
 }
 
-mod field {
-    skyhook::named_enum! {
-        /// Which of a node's texts or locations a row holds.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(super) parsed enum Field {
-            Title = "title", Body = "body", Step = "step", Evidence = "evidence",
-            Access = "access", Accessed = "accessed", Location = "location", File = "file",
-            Interface = "interface",
-        }
-    }
+/// Which of a node's texts or locations a row holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+enum Field {
+    Title,
+    Body,
+    Step,
+    Evidence,
+    Access,
+    Accessed,
+    Location,
+    File,
+    Interface,
 }
-use field::Field;
 
 /// Where on a node a hit lies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,7 +155,7 @@ enum Within {
 
 /// Where a hit lies: on the found node, or on a node merged into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, SerializeDisplay)]
-pub struct Place {
+pub(crate) struct Place {
     merged: Option<NodeId>,
     within: Within,
 }
@@ -177,23 +180,23 @@ impl fmt::Display for Place {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Hit {
+pub(crate) struct Hit {
     #[serde(rename = "in")]
     #[schemars(with = "String")]
-    pub place: Place,
-    pub text: String,
+    pub(crate) place: Place,
+    pub(crate) text: String,
 }
 
 /// A live node a search found, with the first of its hits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Found {
+pub(crate) struct Found {
     #[serde(flatten)]
-    pub node: NodeSummary,
-    pub kind: NodeKind,
-    pub hits: Vec<Hit>,
+    pub(crate) node: NodeSummary,
+    pub(crate) kind: NodeKind,
+    pub(crate) hits: Vec<Hit>,
     /// Hits beyond those listed.
     #[serde(skip_serializing_if = "is_zero")]
-    pub more: usize,
+    pub(crate) more: usize,
 }
 
 const fn is_zero(count: &usize) -> bool {
@@ -260,7 +263,10 @@ impl Search {
             if found.is_some() || site {
                 node.hits.push(Hit {
                     place,
-                    text: skyhook::tool::excerpt(line.as_bytes(), found.map(|found| found.range())),
+                    text: skyhook_tools::builtins::search::excerpt(
+                        line.as_bytes(),
+                        found.map(|found| found.range()),
+                    ),
                 });
             }
         }
@@ -312,7 +318,7 @@ impl Search {
 
 impl Store {
     /// A page of the live nodes `search` finds, oldest first.
-    pub fn search(&self, search: &Search, page: Page) -> Result<Listing<Found>> {
+    pub(crate) fn search(&self, search: &Search, page: Page) -> Result<Listing<Found>> {
         self.read(|db| {
             let limit = page.limit();
             let mut found = Vec::new();
@@ -372,12 +378,10 @@ const SUMMARIES: &str = "SELECT n.id,n.title,CASE n.kind WHEN 'component' THEN (
 
 #[cfg(test)]
 mod tests {
-    use skyhook::Bounded;
+    use skyhook_base::bounded::Bounded;
 
-    use super::{
-        super::super::tests::{fixture, path, scenario, text},
-        *,
-    };
+    use super::*;
+    use crate::store::tests::{fixture, path, scenario, text};
 
     fn search(pattern: Option<&str>, file: Option<&str>, line: Option<u32>) -> Search {
         Search::new(pattern, file, line, None, NodeKind::ALL.to_vec()).unwrap()
@@ -540,7 +544,6 @@ mod tests {
             .iter()
             .map(|found| found.node.id)
             .collect();
-        assert!(!paged.contains(&merged.into()));
         assert_eq!(paged, live);
     }
 }

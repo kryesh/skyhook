@@ -1,10 +1,31 @@
 # Authentication
 
-## API keys and environment files
+## Credentials
 
-Any configured value that may hold a secret—`api_key` and an entry's fixed `headers`—takes one
-of three forms: a literal, `env: NAME` to read an environment variable, or `command: "..."` to
-run a command:
+A configured value that may hold a secret—a provider's `api_key` and fixed `headers`, MCP
+[`headers`](mcp.md), and an SSH or WinRM target's
+[`password`](../guide/execution-targets.md#passwords)—is a credential. It takes one of these forms:
+
+| Form | Value |
+| --- | --- |
+| `"text"` | The text itself. |
+| `{env: NAME}` | The environment variable `NAME`, which must be set and nonempty. |
+| `{command: "..."}` | The standard output of shell text run with the shell of the machine that uses the credential: `/bin/sh -c`, or Windows PowerShell 5.1 on Windows. |
+| `{command: ["program", "arg"]}` | The standard output of a program run directly, without a shell. |
+| `{file: path}` | A file's contents. |
+
+A map names exactly one source. A command's output and a file's contents lose one trailing line
+ending (`\n`, then `\r`). A command runs with standard input closed and standard error
+discarded; its standard output is limited to 64 KiB, and it must exit successfully with UTF-8
+output that is not blank. A file path is absolute on the machine that reads it (`/` on Linux; a
+drive root such as `C:\`, or a `\\server\share` path, on Windows) or starts with `~/` (your home
+directory); the file must be a regular file of at most 4 KiB, owned by you and accessible to
+nobody else (`chmod 600`), and hold UTF-8 text that is not blank. On Windows, as OpenSSH for
+Windows requires of private keys, the file's owner and everyone its access list allows must be
+you, SYSTEM, Administrators or TrustedInstaller. Errors name the setting, the kind of source
+(and an environment variable's name) and its problem, such as
+`api_key from env PROXY_TOKEN: not set`, never the value, a command's text or output, or a file's
+contents.
 
 ```yaml
 providers:
@@ -18,6 +39,10 @@ providers:
     # api_key: "sk-ant-..."
     # api_key:
     #   command: "op read 'op://Private/Anthropic/api-key'"
+    # api_key:
+    #   command: ["pass", "show", "anthropic"]
+    # api_key:
+    #   file: "~/.config/skyhook/anthropic-key"
     headers:
       x-title: "skyhook"
       x-proxy-token:
@@ -25,33 +50,33 @@ providers:
 ```
 
 A literal secret is stored in plain text in the configuration file, and `skyhook dump config`
-prints it. Prefer `env` or `command` for secrets. `api_key` and `headers` are provider-only:
-all models in that provider instance share their credential resources, even when their codecs or
-request settings differ. A LiteLLM virtual key is sent as a bearer token for every codec,
-including `messages`.
+prints it. Prefer another form for secrets. Commands are trusted host configuration, executed
+on the machine that uses the credential with Skyhook's environment there; they do not run through
+tool approval. Use a noninteractive secret-manager command that writes only the secret to stdout.
+Do not put literal secrets in command strings or commit them to configuration files.
+
+## API keys
+
+`api_key` and `headers` are provider-only: all models in that provider instance share their
+credential resources, even when their codecs or request settings differ. A LiteLLM virtual key is
+sent as a bearer token for every codec, including `messages`.
 
 Environment-variable values the provider sends are resolved when it is built and must be present
 and nonblank. They are used as they are, not trimmed: a value with a trailing newline fails,
-naming the provider and field. A command runs only on the first model request that sends its value, not when
-configuration is loaded or a conversation is opened. A successful command's stdout is decoded as
-UTF-8 and trimmed of leading/trailing whitespace and newlines, then cached in memory for that
-provider instance. All its models, concurrent requests, and child conversations share the cache;
-a new process or provider instance resolves the value again. Failed commands are not cached and
-may be retried on a subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
-and the next request runs the command again. If the refused value had been accepted before, as
+naming the provider and field. A command runs, and a file is read, only on the first model request
+that sends its value, not when configuration is loaded or a conversation is opened. The value is
+trimmed of leading and trailing whitespace and newlines, then kept in memory for the provider's
+models to share; a failure is not kept, so the next request tries again.
+When the server refuses a kept value with HTTP 401, the value is discarded and the next request
+runs the command, or reads the file, again. If the refused value had been accepted before, as
 when a short-lived token expires, the model request is retried automatically; a value refused on
-its first use fails the request. Empty output, invalid UTF-8, output that is not a valid header
-value, and nonzero exits fail the request without including command output in the error. Stdout
-is limited to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command
-timeout.
-Cancelling the invocation terminates the command's immediate child process, but does not guarantee
-termination of any descendants it launched.
+its first use fails the request. A value that is empty or not a valid header value fails the
+request without including it in the error. A command has no timeout of its own and runs before
+the HTTP startup timeout begins. Cancelling the request terminates the command's own process,
+not necessarily its descendants. Provider commands run in Skyhook's process working directory,
+not an agent's workspace or remote target.
 
-Commands are trusted host configuration, executed with `/bin/sh -c`, inheriting Skyhook's process
-working directory and environment, not an agent's workspace or remote target. They do not run
-through tool approval. Standard input is closed and standard error is discarded; use a noninteractive
-secret-manager command that writes only the key to stdout. Do not put literal secrets in command
-strings or commit them to configuration files.
+## Environment files
 
 At CLI startup, Skyhook loads **`.env` in the invocation directory** before constructing providers.
 Existing process environment variables take precedence. A missing file is ignored; Skyhook does
@@ -100,8 +125,6 @@ provider, as `<provider>.json`. For a provider in the user configuration that is
 configuration defines, it is `<workspace>/.skyhook/credentials/`; keep that directory out of version
 control. For `--config path.yaml`, it is beside that file. Skyhook creates the directory when you
 first log in, readable only by you, and refuses to use one that grants any access to other users.
-Checking status or starting a session creates nothing there, except a missing lock file beside saved
-credentials.
 
 To sign a provider out, delete its `credentials/<provider>.json` while no session is using it.
 Nothing is revoked on the server, so this is also how to clear credentials for a provider you have

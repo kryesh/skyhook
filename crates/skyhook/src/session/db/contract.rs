@@ -3,15 +3,29 @@
 use std::collections::HashMap;
 
 use super::{decode::*, encode::*, *};
+use crate::target::{
+    Connection, ConnectionKind, Password, SshAuth, SshAuthKind, SshOptions, TargetDefinition,
+    WinrmOptions,
+};
+use crate::tool::catalog::ToolDefinition;
+use crate::tool::policy::CapabilitySet;
 use crate::{
-    execution::{path_bytes, path_from_bytes},
+    config::mode::Edition,
     provider::{
-        profile::ModelProfile,
-        protocol::{ResponseSchema, SystemSegment, ToolDefinition},
+        model::ModelProfile,
+        protocol::{ResponseSchema, SystemSegment},
     },
     session::{ModeSelection, ModelContext, ProfileSnapshot, SessionEvent},
-    target::{SshAuth, SshOptions, TargetAuth, TargetDefinition, TargetName},
-    tool::policy::{CapabilitySet, Edition, InteractiveListed},
+    tool::policy::InteractiveListed,
+};
+use skyhook_tools::target::TargetName;
+use skyhook_worker::{
+    op::TargetPath,
+    origin::{
+        ssh::SshUser,
+        winrm::{Auth, AuthKind, Fingerprint, Tls, TlsKind},
+    },
+    secret::Credential,
 };
 
 fn digest(value: &impl serde::Serialize) -> DbResult<Vec<u8>> {
@@ -50,7 +64,7 @@ impl Encoder {
                 db.execute(
                     "INSERT INTO agent_start (entry, profile, location_target, \
                      location_workspace) VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, profile, target, path_bytes(&location.workspace)],
+                    params![seq, profile, target, location.workspace.as_str()],
                 )?;
                 if let Some(mode) = mode {
                     self::mode(db, seq, mode)?;
@@ -83,41 +97,102 @@ impl Encoder {
                     .transpose()
             };
             let (via, origin) = (named(&definition.via)?, named(&definition.origin)?);
-            let ssh = &definition.ssh;
-            let key = match &ssh.auth {
-                TargetAuth::Key { path } => Some(path_bytes(path)),
-                _ => None,
-            };
             let revision = db.insert(
-                "INSERT INTO target_revision (target, entry, revision, source, host, \
-                 workspace, ssh_user, ssh_port, ssh_auth, ssh_key_path, ssh_external_agent, \
-                 via, origin) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO target_revision (target, entry, revision, source, host, os, \
+                 workspace, transport, via, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     target,
                     entry,
                     definition.revision,
                     definition.source,
                     &definition.host,
-                    path_bytes(&definition.workspace),
-                    ssh.user.clone(),
-                    ssh.port.map(std::num::NonZeroU16::get),
-                    ssh.auth.kind(),
-                    key,
-                    ssh.external_agent,
+                    definition.os,
+                    definition.workspace.as_str(),
+                    definition.connection.kind(),
                     via,
                     origin,
                 ],
             )?;
-            for (key, value) in &ssh.options {
-                db.execute(
-                    "INSERT INTO target_ssh_option (revision, key, value) VALUES (?1, ?2, ?3)",
-                    params![revision, key, value],
-                )?;
+            match &definition.connection {
+                Connection::Ssh(ssh) => self::ssh(db, revision, ssh)?,
+                Connection::Winrm(winrm) => self::winrm(db, revision, winrm)?,
+            }
+            if let Some(password) = definition.connection.password() {
+                self::password(db, revision, password)?;
             }
         }
         Ok(())
     }
+}
+
+fn ssh(db: &Db, revision: i64, ssh: &SshOptions) -> DbResult<()> {
+    let key = match &ssh.auth {
+        SshAuth::Key { path, .. } => Some(path.as_str()),
+        _ => None,
+    };
+    db.execute(
+        "INSERT INTO target_ssh (revision, user, port, auth, key_path, forward_agent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            revision,
+            ssh.user.as_ref().map(SshUser::as_str),
+            ssh.port.map(std::num::NonZeroU16::get),
+            ssh.auth.kind(),
+            key,
+            ssh.forward_agent,
+        ],
+    )?;
+    for (key, value) in &ssh.options {
+        db.execute(
+            "INSERT INTO target_ssh_option (revision, key, value) VALUES (?1, ?2, ?3)",
+            params![revision, key.as_str(), value.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn winrm(db: &Db, revision: i64, winrm: &WinrmOptions) -> DbResult<()> {
+    let (ca, fingerprint) = match &winrm.tls {
+        Tls::Ca(path) => (Some(path.as_str()), None),
+        Tls::Fingerprint(fingerprint) => (None, Some(fingerprint.as_bytes().to_vec())),
+        Tls::System | Tls::Insecure | Tls::Off => (None, None),
+    };
+    db.execute(
+        "INSERT INTO target_winrm (revision, user, auth, kdc, tls, ca_path, fingerprint, port) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            revision,
+            winrm.auth.user(),
+            winrm.auth.kind(),
+            winrm.auth.kdc().map(ToString::to_string),
+            winrm.tls.kind(),
+            ca,
+            fingerprint,
+            winrm.port.map(std::num::NonZeroU16::get),
+        ],
+    )
+    .map(drop)
+}
+
+/// Journal the password a revision reads: a credential its definition gives, as given,
+/// and of the configuration's only that the revision reads it.
+fn password(db: &Db, revision: i64, password: &Password) -> DbResult<()> {
+    let (kind, text, file, argv) = match password.given().map(Credential::parts) {
+        Some((kind, text, file, argv)) => (Some(kind), text, file, argv),
+        None => (None, None, None, &[][..]),
+    };
+    db.execute(
+        "INSERT INTO target_password (revision, source, text, file) VALUES (?1, ?2, ?3, ?4)",
+        params![revision, kind, text, file.map(TargetPath::as_str)],
+    )?;
+    for (position, value) in argv.iter().enumerate() {
+        db.execute(
+            "INSERT INTO target_password_argument (revision, position, value) VALUES (?1, ?2, ?3)",
+            params![revision, position as i64, value],
+        )?;
+    }
+    Ok(())
 }
 
 /// Apply a mode: an entry with a definition records the name's next edition, and
@@ -179,7 +254,7 @@ fn profile(db: &Db, snapshot: &ProfileSnapshot) -> DbResult<i64> {
             &snapshot.name.model,
             &snapshot.name.provider,
             &profile.model,
-            profile.reasoning.as_deref(),
+            profile.reasoning,
             profile.max_context.get(),
             profile.max_output.get(),
             profile.supports_images,
@@ -296,7 +371,7 @@ pub(super) fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
                 name: model_ref(&row.get::<String>(2)?, &row.get::<String>(1)?)?,
                 profile: ModelProfile {
                     model: parsed(row.get(3)?)?,
-                    reasoning: row.get(4)?,
+                    reasoning: optional_enum_column(row, 4)?,
                     max_context: limit(row.get(5)?)?,
                     max_output: limit(row.get(6)?)?,
                     supports_images: row.get(7)?,
@@ -318,49 +393,141 @@ pub(super) fn targets(events: &Events) -> DbResult<HashMap<i64, Vec<TargetDefini
              WHERE revision IN (SELECT id FROM target_revision {scope}) ORDER BY revision, key",
             "entry",
         )?,
-        |row| Ok((row.get::<String>(1)?, row.get::<String>(2)?)),
+        |row| {
+            let (key, value) = (row.get::<String>(1)?.parse(), row.get::<String>(2)?.parse());
+            key.ok()
+                .zip(value.ok())
+                .ok_or_else(|| corrupt("SSH option is invalid"))
+        },
+    )?;
+    let arguments = grouped(
+        db,
+        events.scoped(
+            "SELECT revision, value FROM target_password_argument \
+             WHERE revision IN (SELECT id FROM target_revision {scope}) ORDER BY revision, position",
+            "entry",
+        )?,
+        |row| Ok(row.get::<String>(1)?),
+    )?;
+    let passwords = keyed(
+        db,
+        events.scoped(
+            "SELECT revision, source, text, file FROM target_password \
+             WHERE revision IN (SELECT id FROM target_revision {scope})",
+            "entry",
+        )?,
+        |row| {
+            let Some(kind) = optional_enum_column(row, 1)? else {
+                return Ok(Password::Configured);
+            };
+            let file = row.get::<Option<String>>(3)?.map(TargetPath::from);
+            let argv = (arguments.get(&row.get::<i64>(0)?).cloned()).unwrap_or_default();
+            (Credential::from_parts(kind, row.get(2)?, file, argv).map(Password::Given))
+                .ok_or_else(|| corrupt("target password is inconsistent"))
+        },
+    )?;
+    let port = |row: &Row, index| -> DbResult<_> {
+        let port = row.get::<Option<u32>>(index)?;
+        Ok(port
+            .and_then(|port| u16::try_from(port).ok())
+            .and_then(std::num::NonZeroU16::new))
+    };
+    let mut ssh = keyed(
+        db,
+        events.scoped(
+            "SELECT revision, user, port, auth, key_path, forward_agent FROM target_ssh \
+             WHERE revision IN (SELECT id FROM target_revision {scope})",
+            "entry",
+        )?,
+        |row| {
+            let revision = row.get::<i64>(0)?;
+            let password = passwords.get(&revision).cloned();
+            let key = row.get::<Option<String>>(4)?;
+            let auth = match (enum_column(row, 3)?, key, password) {
+                (SshAuthKind::Agent, None, None) => SshAuth::Agent,
+                (SshAuthKind::Key, Some(key), password) => SshAuth::Key {
+                    path: key.into(),
+                    password,
+                },
+                (SshAuthKind::Password, None, Some(password)) => SshAuth::Password { password },
+                _ => return Err(corrupt("target authentication is inconsistent")),
+            };
+            Ok(SshOptions {
+                user: (row.get::<Option<String>>(1)?)
+                    .map(|user| user.parse().map_err(|_| corrupt("SSH user is invalid")))
+                    .transpose()?,
+                port: port(row, 2)?,
+                auth,
+                forward_agent: row.get(5)?,
+                options: (options.get(&revision).into_iter().flatten().cloned()).collect(),
+            })
+        },
+    )?;
+    let mut winrm = keyed(
+        db,
+        events.scoped(
+            "SELECT revision, user, auth, kdc, tls, ca_path, fingerprint, port FROM target_winrm \
+             WHERE revision IN (SELECT id FROM target_revision {scope})",
+            "entry",
+        )?,
+        |row| {
+            let inconsistent = || corrupt("target authentication is inconsistent");
+            let password =
+                (passwords.get(&row.get::<i64>(0)?).cloned()).ok_or_else(inconsistent)?;
+            let user = row.get::<String>(1)?;
+            let kdc = row.get::<Option<String>>(3)?.map(parsed).transpose()?;
+            let auth = match (enum_column(row, 2)?, kdc) {
+                (AuthKind::Kerberos, kdc) => Auth::Kerberos {
+                    principal: parsed(user)?,
+                    password,
+                    kdc,
+                },
+                (AuthKind::Negotiate, None) => Auth::Negotiate { user, password },
+                (AuthKind::Basic, None) => Auth::Basic { user, password },
+                _ => return Err(inconsistent()),
+            };
+            let (ca, fingerprint) = (row.get::<Option<String>>(5)?, row.get(6)?);
+            let tls = match (enum_column(row, 4)?, ca, fingerprint) {
+                (TlsKind::System, None, None) => Tls::System,
+                (TlsKind::Insecure, None, None) => Tls::Insecure,
+                (TlsKind::Off, None, None) => Tls::Off,
+                (TlsKind::Ca, Some(path), None) => Tls::Ca(path.into()),
+                (TlsKind::Fingerprint, None, Some(fingerprint)) => {
+                    Tls::Fingerprint(Fingerprint::from_bytes(bytes(fingerprint)?))
+                }
+                _ => return Err(corrupt("target TLS is inconsistent")),
+            };
+            let port = port(row, 7)?;
+            Ok(WinrmOptions { auth, tls, port })
+        },
     )?;
     let mut targets: HashMap<i64, Vec<TargetDefinition>> = HashMap::new();
     let Query { sql, params } = events.scoped(
-        "SELECT r.entry, r.id, t.name, r.revision, r.source, r.host, r.workspace, r.ssh_user, \
-         r.ssh_port, r.ssh_auth, r.ssh_key_path, r.ssh_external_agent, v.name, o.name \
+        "SELECT r.entry, r.id, t.name, r.revision, r.source, r.host, r.workspace, v.name, \
+         o.name, r.os, r.transport \
          FROM target_revision r JOIN target t ON t.id = r.target \
          LEFT JOIN target v ON v.id = r.via LEFT JOIN target o ON o.id = r.origin \
          {scope} ORDER BY r.entry, r.id",
         "r.entry",
     )?;
     for (entry, target) in db.query(sql, params, |row| {
-        let auth = match (enum_column(row, 9)?, row.get::<Option<Vec<u8>>>(10)?) {
-            (SshAuth::Default, None) => TargetAuth::Default,
-            (SshAuth::Agent, None) => TargetAuth::Agent,
-            (SshAuth::Key, Some(key)) => TargetAuth::Key {
-                path: path_from_bytes(key),
-            },
-            _ => return Err(corrupt("target authentication is inconsistent")),
+        let revision = row.get::<i64>(1)?;
+        let (ssh, winrm) = (ssh.remove(&revision), winrm.remove(&revision));
+        let connection = match (enum_column(row, 10)?, ssh, winrm) {
+            (ConnectionKind::Ssh, Some(ssh), None) => Connection::Ssh(ssh),
+            (ConnectionKind::Winrm, None, Some(winrm)) => Connection::Winrm(winrm),
+            _ => return Err(corrupt("target settings are not its transport's")),
         };
-        let port = row.get::<Option<u32>>(8)?;
         Ok((
             row.get::<i64>(0)?,
             TargetDefinition {
                 name: parsed(row.get(2)?)?,
                 host: row.get(5)?,
-                ssh: SshOptions {
-                    user: row.get(7)?,
-                    port: port
-                        .and_then(|port| u16::try_from(port).ok())
-                        .and_then(std::num::NonZeroU16::new),
-                    auth,
-                    external_agent: row.get(11)?,
-                    options: options
-                        .get(&row.get::<i64>(1)?)
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                        .collect(),
-                },
-                workspace: path_from_bytes(row.get(6)?),
-                via: row.get::<Option<String>>(12)?.map(parsed).transpose()?,
-                origin: row.get::<Option<String>>(13)?.map(parsed).transpose()?,
+                os: enum_column(row, 9)?,
+                connection,
+                workspace: row.get::<String>(6)?.into(),
+                via: row.get::<Option<String>>(7)?.map(parsed).transpose()?,
+                origin: row.get::<Option<String>>(8)?.map(parsed).transpose()?,
                 source: enum_column(row, 4)?,
                 revision: row.get(3)?,
             },

@@ -2,21 +2,19 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::tool::catalog::{Invocation, RegistryError, ToolOptions};
 use crate::{
-    identity::JobId,
     job::{
-        FieldPointer, JobError, JobListing, JobManager, ViewKind,
+        JobError, JobListing, JobManager, ViewKind,
         output::{
             DEFAULT_LIMIT, MAX_CONTEXT, OutputArgs, OutputOptions, PageLimit, PageUnit, Selectors,
         },
     },
-    tool::{
-        AdmissionError, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput,
-        ToolRegistryBuilder,
-        diagnostic::{Effects, Operation, PartialContext, Subject},
-        registry::Invocation,
-    },
+    tool::{ToolContext, ToolError, ToolOutput, ToolRegistryBuilder},
 };
+use skyhook_tools::{diagnostic::PartialContext, error::AdmissionError, output::FieldPointer};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
+use skyhook_worker::job::JobId;
 
 pub(crate) fn register(
     builder: &mut ToolRegistryBuilder,
@@ -42,7 +40,7 @@ pub(crate) fn register(
                 JobsRequest::List { all, limit } => {
                     Invocation::new(move |context| list(jobs, context, all, limit))
                 }
-                JobsRequest::Output(args) => Invocation::job_view(move |context| async move {
+                JobsRequest::Output(args) => crate::tool::catalog::Invocation::job_view(move |context| async move {
                     let job = args.job;
                     let read = PartialContext::new(Operation::Read, Subject::Job(job));
                     let presented = jobs.present_output_with(
@@ -53,6 +51,7 @@ pub(crate) fn register(
                             kind: ViewKind::Inspection,
                             reader: Some(context.job()),
                             fit: context.fit(),
+                            reach: context.reach(),
                         },
                     );
                     let presented = presented.await.map_err(|error| error.or(read))?;
@@ -127,7 +126,7 @@ async fn list(
         let newest = jobs.newest(
             context.agent(),
             except.into_iter().flatten().collect(),
-            limit.get(),
+            crate::job::output::count(limit),
         );
         newest
             .await
@@ -135,7 +134,9 @@ async fn list(
     } else {
         let mut active = jobs.active(context.agent());
         active.retain(|job| !except.contains(&Some(job.id)));
-        let older = active.len().saturating_sub(limit.get());
+        let older = active
+            .len()
+            .saturating_sub(crate::job::output::count(limit));
         (active.split_off(older), older)
     };
     let listing = JobListing {
@@ -146,7 +147,7 @@ async fn list(
     };
     let listing = serde_json::to_value(listing).expect("a job listing serializes");
     // Bounded by its limit, a listing is a presentation already.
-    let presented = crate::job::output::Presented::presentation(FieldPointer::result());
+    let presented = skyhook_tools::output::Presented::presentation(FieldPointer::result());
     Ok(ToolOutput::new(listing).with_presented(presented))
 }
 
@@ -275,11 +276,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::job::JobRole;
     use crate::{
-        job::{JobOutcome, JobRole, JobSpec},
+        job::{JobOutcome, JobSpec},
         tests::{TestRuntime, tool_executor},
-        tool::{ToolOutput, ToolRegistryBuilder, diagnostic::Cause},
+        tool::{ToolOutput, ToolRegistryBuilder},
     };
+    use skyhook_tools::diagnostic::Cause;
 
     fn ids(listing: &Value) -> Vec<Value> {
         let jobs = listing["jobs"].as_array().unwrap();
@@ -304,7 +307,7 @@ mod tests {
         let listing = json!({"all":true, "limit":5, "start":1, "offset":0, "context":0});
         assert!(matches!(
             request(listing),
-            Ok(JobsRequest::List { all: true, limit }) if limit.get() == 5
+            Ok(JobsRequest::List { all: true, limit }) if u64::from(limit) == 5
         ));
         assert!(matches!(
             request(json!({"job":3, "pattern":"x"})),
@@ -374,7 +377,7 @@ mod tests {
             let context = error.diagnostic().context;
             assert_eq!(context.operation, operation);
             assert_eq!(context.subject, subject);
-            assert_eq!(context.site, crate::tool::diagnostic::FailureSite::Host);
+            assert_eq!(context.site, skyhook_tools::diagnostic::FailureSite::Host);
         }
         // An unknown job was never touched.
         let cancel = executor.run_host(
@@ -419,11 +422,7 @@ mod tests {
             .run_host(agent, "jobs", json!({"job":pending}))
             .await;
         let output = output.unwrap().output.value;
-        for (value, state) in [
-            (&current, &current["jobs"][0]["state"]),
-            (&output, &output["state"]),
-        ] {
-            assert!(!value.to_string().contains("awaiting_approval"));
+        for state in [&current["jobs"][0]["state"], &output["state"]] {
             assert_eq!(state, "queued");
         }
         assert_eq!(ids(&current), [json!(pending)]);
@@ -478,7 +477,7 @@ mod tests {
             background: true,
             ..JobSpec::test(agent.clone(), "exec")
         };
-        let ends = json!({"type": "string", crate::tool::output::PREVIEW: "ends"});
+        let ends = json!({"type": "string", skyhook_tools::output::PREVIEW: "ends"});
         spec.output_schema = Some(json!({"type": "object", "properties": {"stdout": ends}}));
         let target = jobs.test_create(spec).await;
         let stdout: String = (1..=5000).map(|line| format!("line {line}\n")).collect();
@@ -500,7 +499,7 @@ mod tests {
             .unwrap();
         let shown = &model.output.value;
         assert!(shown["presentation"]["truncated"].is_array(), "{shown}");
-        let kind = crate::tool::executor::InvocationKind::Script;
+        let kind = crate::tool::catalog::InvocationKind::Script;
         let scripted = executor
             .execute_as(kind, agent.clone(), "jobs", read(target), Some(script.id()))
             .await

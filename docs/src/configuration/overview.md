@@ -1,7 +1,6 @@
 # Configuration overview
 
-Skyhook uses YAML configuration. The files are not rewritten when the terminal remembers a
-model.
+Skyhook uses YAML configuration.
 
 ## File selection and layering
 
@@ -18,8 +17,7 @@ Without `--config`, Skyhook:
    selects the workspace; otherwise it is the invocation directory. No ancestor workspace
    configurations are loaded. An unreadable or invalid workspace file is an error.
 
-Automatic discovery uses only `config.yaml`, not `config.yml` or `config.toml`; there is no TOML
-fallback.
+Automatic discovery uses only `config.yaml`, not `config.yml`.
 
 Missing optional user files are fine: a complete workspace-only configuration can be used.
 A broken user file is not silently treated as missing if no fallback succeeds. The effective
@@ -64,9 +62,7 @@ targets:
     host: "old-build.internal"
     via: "bastion"
     ssh:
-      auth:
-        kind: "key"
-        path: "~/.ssh/old-build"
+      key: "~/.ssh/old-build"
 ```
 
 Then use this `<workspace>/.skyhook/config.yaml`:
@@ -104,9 +100,9 @@ numbers, and null. Duplicate keys, non-string keys, custom tags, non-finite numb
 documents, and YAML `<<` merge keys are rejected. Anchors and aliases are supported with bounded
 expansion. YAML merge keys are unrelated to Skyhook's file layering.
 
-Use indentation for nested settings, not dotted table headers. Quote values that must stay strings,
-especially numeric-looking SSH options and environment values: `ServerAliveInterval: "15"` and
-`WORKERS: "4"`, not unquoted numbers. Actual numeric settings such as `max_context` remain numbers.
+Quote values that must stay strings, especially numeric-looking SSH options and environment
+values: `ServerAliveInterval: "15"` and `WORKERS: "4"`, not unquoted numbers. Actual numeric
+settings such as `max_context` remain numbers.
 
 For multiline instructions or shell-command strings, a literal block scalar preserves line breaks:
 
@@ -123,15 +119,6 @@ modes:
 (`>` or `>-`) turn ordinary line breaks into spaces, so use them only when that is intended.
 MCP `start_command` remains a sequence of argument strings, not a shell-command block.
 
-## Migrating from TOML
-
-Manually convert the contents of each old `config.toml` to YAML, then rename it to `config.yaml`.
-Replace table headers with nested mappings and `key = value` assignments with `key: value`;
-keep the same configuration keys, values, and model declaration order. Check quoting and multiline
-string whitespace rather than only changing punctuation. Update explicit `--config` paths too.
-Renaming alone does not convert TOML, and Skyhook does not convert files automatically or fall back
-to the old format. Use `skyhook dump config` to validate and inspect the effective YAML.
-
 ## Paths and environment
 
 Relative MCP `cwd` values resolve against the directory of the **source file defining that
@@ -141,13 +128,13 @@ not the workspace root. An MCP server without `cwd`, from either file, starts in
 workspace rather than the directory `skyhook` was launched from.
 
 The CLI always stores and discovers sessions in `<workspace>/.skyhook/sessions`, including
-headless execution and resume. It does not search other workspaces or honor `session_root` overrides.
+headless execution and resume.
 Remote paths resolve on the selected [execution target](../guide/execution-targets.md).
 The workspace is a base directory, not filesystem isolation.
 
 The CLI loads **`.env` from the invocation directory**, with existing process environment
 variables taking precedence. Neither `--workspace` nor `--config` changes that location.
-See [authentication](authentication.md#api-keys-and-environment-files).
+See [authentication](authentication.md#environment-files).
 
 ## Inspect without starting a session
 
@@ -171,7 +158,7 @@ for selectors and incompatible options.
   `.env`, and Skyhook-owned Codex login.
 - [Permissions and capabilities](../guide/permissions.md): `approve_all`, modes, and their exact
   capability allowlists.
-- [Execution targets](../guide/execution-targets.md): SSH destinations, origins, routing,
+- [Execution targets](../guide/execution-targets.md): SSH and WinRM destinations, origins, routing,
   and authentication.
 - [MCP servers](mcp.md): trusted local server startup and imported tools.
 

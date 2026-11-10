@@ -1,16 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/base",
+    "crates/macros",
+    "crates/media",
     "crates/skyhook",
-    "crates/cli",
+    "crates/tools",
+    "crates/worker",
     "crates/schema",
     "crates/security",
     "crates/shim",
+    "crates/apps",
 ]
-default-members = ["crates/cli", "crates/security"]
+default-members = ["crates/apps"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -18,9 +23,15 @@ repository = "https://github.com/kryesh/skyhook"
 
 [workspace.dependencies]
 skyhook = { path = "crates/skyhook" }
-cli = { path = "crates/cli" }
-schema = { path = "crates/schema" }
+skyhook-base = { path = "crates/base" }
+skyhook-macros = { path = "crates/macros" }
+skyhook-media = { path = "crates/media" }
+skyhook-tools = { path = "crates/tools" }
+skyhook-worker = { path = "crates/worker" }
+skyhook-security = { path = "crates/security" }
+skyhook-schema = { path = "crates/schema" }
 base64 = "0.23"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "serde",
@@ -29,6 +40,8 @@ clap = { version = "4", features = ["derive", "string"] }
 iana-time-zone = "0.1"
 futures-util = "0.3"
 getrandom = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
 http = "1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = [
@@ -38,20 +51,35 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 indexmap = { version = "2", features = ["serde"] }
+libc = "0.2"
 libsql = { version = "0.10", default-features = false, features = ["core"] }
 mimalloc = "0.1"
-jsonschema = { version = "0.60", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
+proc-macro2 = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
+quote = "1"
 regex = "1"
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
+    "json",
+    "stream",
+    "charset",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "http2",
+] }
 schemars = { version = "1", features = ["chrono04", "preserve_order"] }
 serde = { version = "1", features = ["derive", "rc"] }
+serde_bytes = "0.11"
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 serde_path_to_error = "0.1"
 serde-saphyr = "2"
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 sha2 = "0.11"
+struson = "0.7"
 tempfile = "3"
-# preserve_order keeps context maps, such as a JSON-encoded one, in field order.
 tera = { version = "2", default-features = false, features = [
     "preserve_order",
 ] }
@@ -68,8 +96,10 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "rt"] }
+unicode-width = "0.2"
 url = "2"
+windows-sys = "0.61.2"
 zeroize = "1"
 
 [profile.dev.package."*"]

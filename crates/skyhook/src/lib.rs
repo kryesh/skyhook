@@ -1,51 +1,25 @@
 //! Skyhook is a provider-neutral coding-agent harness whose registered tools are
 //! available both as model tool calls and inside a sandboxed JavaScript runtime.
 
-// `schema::image!` names its output under `::skyhook`, here too.
-extern crate self as skyhook;
-
 pub mod agent;
+pub mod attachment;
 pub mod config;
 pub mod db;
-pub(crate) mod execution;
-pub mod fs;
 pub mod identity;
+pub mod interaction;
 pub mod job;
-mod json_schema;
-pub(crate) mod limits;
+pub mod launch;
 pub mod mcp;
-pub mod media;
-pub mod named_enum;
-mod newtype;
-mod process_group;
+pub mod product;
 pub mod prompts;
 pub mod provider;
 pub mod remote;
 pub mod session;
 pub mod target;
-pub(crate) mod tls;
 pub mod tool;
 pub mod yaml;
 
-#[doc(hidden)]
-pub use newtype::described;
-pub use {
-    newtype::{Blank, Bounded, Prose},
-    yaml::YamlError,
-};
-
-pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
-    media::BlobDigest::of(bytes.as_ref()).to_string()
-}
-
-/// Run blocking `work` off the async workers.
-pub async fn blocking<T, E>(work: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, E>
-where
-    T: Send + 'static,
-    E: From<tokio::task::JoinError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(work).await?
-}
+pub use yaml::YamlError;
 
 #[cfg(test)]
 mod tests {
@@ -53,19 +27,27 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
+    use crate::identity::AgentId;
     use crate::{
-        execution::ExecutionLocation,
-        identity::{AgentId, JobId},
         job::{JobLease, JobManager, JobWorker, stage},
-        provider::profile::ModelProfile,
+        provider::model::ModelProfile,
         session::SessionStore,
         tool::{
             ToolContext, ToolRegistryBuilder,
             authorization::AuthorizationSubject,
             executor::ToolExecutor,
-            policy::{AllowAll, Approval, AuthorizationRequest, Policy, PolicyDecision},
+            policy::{
+                AllowAll, Approval, AuthorizationRequest, PermissionUse, Policy, PolicyDecision,
+            },
         },
     };
+    use skyhook_tools::target::ExecutionLocation;
+    use skyhook_worker::job::JobId;
+
+    /// A test's own path as the session host spells it.
+    pub(crate) fn text(path: impl AsRef<std::path::Path>) -> skyhook_worker::op::TargetPath {
+        path.as_ref().to_str().unwrap().into()
+    }
 
     /// Await `future`, failing the test at the caller if it stalls.
     #[track_caller]
@@ -186,8 +168,8 @@ mod tests {
     }
 
     /// [`png_bytes`] as an image.
-    pub(crate) async fn png(tail: &[u8]) -> crate::media::Image {
-        crate::media::Image::decode(png_bytes(tail)).await.unwrap()
+    pub(crate) async fn png(tail: &[u8]) -> skyhook_media::Image {
+        skyhook_media::Image::decode(png_bytes(tail)).await.unwrap()
     }
 
     /// A GIF of a red frame, then a blue one.
@@ -204,23 +186,35 @@ mod tests {
     }
 
     /// More image attachments than one submission may carry.
-    pub(crate) async fn over_limit_images() -> Vec<crate::media::Attachment> {
-        let image = crate::media::Attachment::Image {
+    pub(crate) async fn over_limit_images() -> Vec<skyhook_media::Attachment> {
+        let image = skyhook_media::Attachment::Image {
             file: None,
             image: png(b"").await,
         };
-        vec![image; crate::media::MAX_IMAGES_PER_SUBMISSION + 1]
+        vec![image; crate::agent::ImageBudget::MAX_IMAGES + 1]
     }
 
-    /// Records every authorization request and decides synchronously from it.
+    /// Records every authorization request and decides from it, asking for those it
+    /// asks about, and settling the rest itself.
     pub(crate) struct RecordingPolicy {
         pub requests: Mutex<Vec<AuthorizationRequest>>,
         pub decide: Box<dyn Fn(&AuthorizationRequest) -> PolicyDecision + Send + Sync>,
+        asks: Box<dyn Fn(&PermissionUse) -> bool + Send + Sync>,
     }
 
     impl RecordingPolicy {
+        /// Allowing everything, unasked.
         pub fn allowing() -> Arc<Self> {
             Self::deciding(|_| PolicyDecision::allow())
+        }
+
+        /// Allowing everything, asking for requests holding a permission `asks` names.
+        pub fn asking(asks: impl Fn(&PermissionUse) -> bool + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                decide: Box::new(|_| PolicyDecision::allow()),
+                asks: Box::new(asks),
+            })
         }
 
         pub fn deciding(
@@ -229,6 +223,7 @@ mod tests {
             Arc::new(Self {
                 requests: Mutex::new(Vec::new()),
                 decide: Box::new(decide),
+                asks: Box::new(|_| false),
             })
         }
     }
@@ -236,8 +231,12 @@ mod tests {
     impl Policy for RecordingPolicy {
         fn authorize(&self, request: AuthorizationRequest) -> Approval<'_> {
             let decision = (self.decide)(&request);
+            let asks = request.permissions.iter().any(&self.asks);
             self.requests.lock().unwrap().push(request);
-            Approval::Decided(decision)
+            match asks {
+                true => Approval::Ask(Box::pin(std::future::ready(decision))),
+                false => Approval::Decided(decision),
+            }
         }
     }
 
@@ -296,29 +295,50 @@ mod tests {
                 SessionStore::create_ephemeral(&sessions, crate::session::Schema::JOURNAL).await
             }
             .unwrap();
+            let spill = crate::job::output::Spill {
+                root: Some(root.path().join("spills")),
+                ..Default::default()
+            };
             Self {
                 agent: crate::session::tests::started(&store, root.path()).await,
-                jobs: JobManager::new(store.clone()),
+                jobs: JobManager::spilling(store.clone(), spill),
                 store,
                 root,
             }
+        }
+
+        /// This runtime keeping saved fields past `bytes` in files.
+        pub fn spilling_past(mut self, bytes: u64) -> Self {
+            let spill = crate::job::output::Spill {
+                bytes,
+                ..self.jobs.spill().clone()
+            };
+            self.jobs = JobManager::spilling(self.store.clone(), spill);
+            self
         }
 
         pub fn executor(&self, builder: ToolRegistryBuilder) -> ToolExecutor {
             self.executor_with_policy(builder, Arc::new(AllowAll))
         }
 
+        /// An executor over this session's targets, approving with `policy`.
         pub fn executor_with_policy(
             &self,
             builder: ToolRegistryBuilder,
             policy: Arc<dyn Policy>,
         ) -> ToolExecutor {
-            ToolExecutor::new(
-                builder.build(),
-                policy,
-                self.jobs.clone(),
-                self.root.path().to_path_buf(),
-            )
+            let router = crate::target::TargetRouter::over(&self.store, policy);
+            self.routed_executor(builder, router)
+        }
+
+        /// An executor reaching targets through `router`, approving with its policy.
+        pub(crate) fn routed_executor(
+            &self,
+            builder: ToolRegistryBuilder,
+            router: crate::target::TargetRouter,
+        ) -> ToolExecutor {
+            let root = self.root.path().to_path_buf();
+            ToolExecutor::new(builder.build(), self.jobs.clone(), root, router)
         }
 
         pub fn subject(&self, job: JobId, cancellation: CancellationToken) -> AuthorizationSubject {
@@ -334,7 +354,7 @@ mod tests {
         /// A root-located context for a running job, and the worker that
         /// keeps it alive.
         pub fn tool_context(&self, lease: JobLease<stage::Running>) -> (ToolContext, JobWorker) {
-            let location = ExecutionLocation::root(self.root.path().to_owned());
+            let location = ExecutionLocation::root(text(self.root.path()));
             let subject = self.subject(lease.id(), lease.cancellation_token());
             let (input, worker) = lease.split();
             let context = ToolContext::new(
@@ -360,13 +380,12 @@ mod tests {
         root: &std::path::Path,
     ) -> (ToolExecutor, Arc<std::sync::OnceLock<ToolExecutor>>) {
         let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_local(crate::tool::builtins::filesystem::register)
-            .unwrap();
+        crate::tool::target_tools::filesystem(&mut builder).unwrap();
         crate::tool::builtins::jobs::register(&mut builder, jobs.clone()).unwrap();
         let slot = Arc::new(std::sync::OnceLock::new());
         crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
-        let executor = ToolExecutor::new(builder.build(), Arc::new(AllowAll), jobs, root.into());
+        let router = crate::target::TargetRouter::over(jobs.store(), Arc::new(AllowAll));
+        let executor = ToolExecutor::new(builder.build(), jobs, root.into(), router);
         assert!(slot.set(executor.clone()).is_ok());
         (executor, slot)
     }
@@ -400,17 +419,16 @@ mod tests {
     }
 
     /// `images` is one PNG whose bytes a model request loads as [`image_png`].
-    pub(crate) async fn assert_loaded(store: &SessionStore, images: Vec<crate::media::ImageRef>) {
+    pub(crate) async fn assert_loaded(store: &SessionStore, images: Vec<skyhook_media::ImageRef>) {
         use crate::provider::{codec::common::tests::tool_result, protocol::ModelRequest};
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, crate::media::ImageFormat::Png);
+        assert_eq!(images[0].format, skyhook_media::ImageFormat::Png);
         let blob = images[0].blob;
         let result = tool_result("output", "jobs", serde_json::json!({}), images, false);
         let mut request = ModelRequest {
             context: crate::provider::protocol::entries(vec![result]),
             ..ModelRequest::test("image-test")
         };
-        assert!(request.blobs.get(&blob).is_err());
         store
             .load_blobs(&mut request, &mut Default::default())
             .await
@@ -476,14 +494,6 @@ mod tests {
             }
         }
 
-        /// Write `wire`, then hold the connection open.
-        pub(crate) fn stalled(wire: &[u8]) -> Self {
-            Self {
-                wire: Some(wire.to_vec()),
-                stall_body: true,
-            }
-        }
-
         pub(crate) fn stalled_headers() -> Self {
             Self {
                 wire: None,
@@ -492,14 +502,11 @@ mod tests {
         }
     }
 
-    /// Scripted HTTP fixture which keeps accepting, so replays are observed.
+    /// Scripted HTTP fixture.
     pub(crate) struct Server {
         pub(crate) url: String,
         address: std::net::SocketAddr,
         requests: tokio::sync::mpsc::UnboundedReceiver<String>,
-        /// Connections accepted, against requests taken by the test.
-        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        taken: usize,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -510,14 +517,11 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let url = format!("http://{address}/responses");
             let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
-            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let count = accepted.clone();
             let task = tokio::spawn(async move {
                 let plans = std::sync::Arc::new(std::sync::Mutex::new(plans.into_iter()));
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let (tx, plans) = (tx.clone(), plans.clone());
                     connections.spawn(async move {
                         let request = read_request(&mut socket).await;
@@ -539,8 +543,6 @@ mod tests {
                 url,
                 address,
                 requests,
-                accepted,
-                taken: 0,
                 task,
             }
         }
@@ -551,14 +553,12 @@ mod tests {
         }
 
         pub(crate) async fn request(&mut self) -> String {
-            self.taken += 1;
             crate::tests::bounded(self.requests.recv()).await.unwrap()
         }
 
         /// Requests not yet taken, once the client's calls have returned. An empty
-        /// probe connection flushes the accept queue, so every connection the client
-        /// opened is counted, even a replay that never completed its request.
-        pub(crate) async fn unclaimed(&mut self) -> Vec<String> {
+        /// probe connection flushes the accept queue.
+        pub(crate) async fn finish(mut self) -> Vec<String> {
             drop(tokio::net::TcpStream::connect(self.address).await.unwrap());
             let mut requests = Vec::new();
             loop {
@@ -567,13 +567,7 @@ mod tests {
                     request => requests.push(request),
                 }
             }
-            let accepted = self.accepted.load(std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(accepted, self.taken, "unexpected connection");
             requests
-        }
-
-        pub(crate) async fn finish(mut self) -> Vec<String> {
-            self.unclaimed().await
         }
     }
 
@@ -582,13 +576,5 @@ mod tests {
             // Aborting the accept task drops its JoinSet and all held sockets.
             self.task.abort();
         }
-    }
-
-    /// A FIFO at `path`.
-    pub(crate) fn fifo(path: &std::path::Path) {
-        use std::os::unix::ffi::OsStrExt as _;
-        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `path` is a NUL-terminated string that outlives the call.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
 }

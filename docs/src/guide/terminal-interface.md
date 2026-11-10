@@ -38,9 +38,8 @@ composer Enter (even with an empty draft); slash commands do not automatically r
 If Skyhook cannot write a session's journal, that session stops as if the process had crashed:
 its queued input is dropped and its conversation shows why. It stays open to read until you close
 it, and reopening it continues from what was saved.
-Queued input lives only in the running interface: it is not saved with the session. Each open
-session keeps its own queue, which keeps delivering while you look at another session and is
-discarded when its session is closed.
+Queued input lives only in the running interface. Each open session keeps its own queue, which
+keeps delivering while you look at another session and is discarded when its session is closed.
 
 `/retry` continues failed or interrupted turns without duplicating their original prompts, and
 resends, as one batch on the bottom bar's model and mode, queued messages a failure or interrupt
@@ -78,10 +77,11 @@ Feedback on an action, such as an attached file, an export, or a setting that co
 shows briefly on the notice line instead. An export finishes even if you switch away from its
 session meanwhile.
 
-Job output is paged and searchable without acknowledging the agent's pending notifications.
-Select a job and press `o` for output fields, regex search, and the next page; `c` asks to
-confirm, then requests cancellation (useful for background jobs, since interrupting already
-cancels the foreground tool).
+An expanded job card shows a summary of the job's output: the preview the model sees, with what
+it left out, and the [file](../reference/job-output.md#spill-files) each field past 4 MiB is
+kept in, to open there. Reading it does not acknowledge the agent's pending
+notifications. Select a job and press `c` to confirm, then request cancellation (useful for
+background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
 cards. Earlier progress messages remain readable after the job completes or resumes. Child-agent
 messages and answers, and question prompts and option descriptions, render as Markdown, both in
@@ -131,14 +131,15 @@ Tool follow-ups, retries, compaction, and `/retry` retain the active turn's mode
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model, unless `--model` names another: the session
 switches to it at startup, before any message or startup script, rather than for the next message
-as `/model` does. `/models` remains an alias for `/model`.
+as `/model` does. `/models` is an alias for `/model`.
 A session whose recorded model is no longer configured still opens, with a startup warning, and
 is never moved to another model on its own. A message sent to it stays queued and the model
 picker opens: the model chosen there becomes the session's, then the message is sent. Children
 whose own model is gone restart on it too.
 
 The interface stores the last submitted model and mode and the sidebar setting in the workspace's
-`.skyhook/state.json`, beside its sessions, without changing the model configuration.
+`.skyhook/state.json` (`skyhook-security` in `.skyhook/security-state.json`), beside its sessions,
+without changing the model configuration.
 Session titles are saved with their history.
 
 A sidebar beside the conversation shows the application's name, then the session's title; click
@@ -209,7 +210,8 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 
 The `Ctrl+X` preview stays open until the next key; `Esc` cancels it. It shows Model
 and Inspect agent, plus Questions when requests are pending, Sessions when another open
-session needs attention, and Edit queue when queued messages are available. Other bound shortcuts still work even when hidden
+session needs attention, Edit queue when queued messages are available, and Continue when
+something can be continued. Other bound shortcuts still work even when hidden
 from the preview.
 
 Type `/` in an empty composer to open the command palette. Search by command name
@@ -259,20 +261,7 @@ conversation; open menus keep input focus until closed. `Esc` dismisses foregrou
 questions and permissions without answering them; reopen pending requests with `Ctrl+X R`
 (or `/attention`, labelled **Reopen questions and permissions** in the palette).
 Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
-Commands have no terminal, so password prompts from SSH and from `sudo` in commands (locally or
-on a target) appear as authentication prompts. The typed answer stays out of the conversation, but
-it goes to whichever process asked, and a command the agent runs can ask too and capture it.
-As a hint, each prompt names the program that appears to have asked and, when it runs under one,
-the job: for example `Requested by /usr/bin/ssh` or `Requested by sudo (running as uid 0) in job 12`.
-A program running as another user, such as `sudo`, shows only its name and user, since its
-executable cannot be read. This is best-effort attribution, not proof of who asked or where the
-answer goes: a command started by a genuine program, such as an SSH `ProxyCommand`, can ask in
-that program's name and receive the answer. Answer only prompts you expect from the work you
-asked for, and treat one that names a program you don't expect (a script, a shell, Skyhook
-itself) or an `unknown program` as raised by the agent's command.
-For background questions and authentication prompts, `Esc` cancels the request;
-cancelled requests cannot be reopened. Authentication prompts take priority over questions,
-permissions, and menus; interrupted question drafts resume afterward.
+For background questions, `Esc` cancels the request; cancelled requests cannot be reopened.
 
 Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you
 set ready to edit, or empty while the title is automatic; the composer and its draft are left

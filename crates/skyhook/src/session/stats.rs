@@ -12,11 +12,12 @@ use serde::Serialize;
 use super::{
     EntryKind, ModelPurpose, RequestPhase, RequestRecord, SessionError, agent_state::Outcome, db,
 };
+use crate::identity::{AgentId, SessionId};
 use crate::{
-    agent::Failure,
-    identity::{AgentId, JobId, SessionId},
-    provider::{profile::ModelRef, protocol::UsageTotals},
+    provider::{model::ModelRef, protocol::UsageTotals},
+    session::Failure,
 };
+use skyhook_worker::job::JobId;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SessionStats {
@@ -201,25 +202,6 @@ impl JobCounts {
     }
 }
 
-/// `root`, or the agent's child indexes such as `1:2`.
-#[must_use]
-pub fn agent_label(agent: &AgentId) -> String {
-    if agent.path().is_empty() {
-        return "root".into();
-    }
-    let path: Vec<_> = agent.path().iter().map(u32::to_string).collect();
-    path.join(":")
-}
-
-/// The name of an agent no job named.
-#[must_use]
-pub fn default_name(agent: &AgentId) -> String {
-    if agent.path().is_empty() {
-        return "root".into();
-    }
-    format!("agent {}", agent_label(agent))
-}
-
 impl super::SessionStore {
     /// Summarise a session without taking its lock; a live owner may keep writing.
     /// It reads the whole journal by aggregate, a page of requests at a time.
@@ -247,7 +229,7 @@ fn read(db: &crate::db::Db, session: SessionId) -> Result<SessionStats, crate::d
             continue;
         };
         let mut stats = AgentStats {
-            name: start.name.unwrap_or_else(|| default_name(agent)),
+            name: start.name.unwrap_or_else(|| agent.default_name()),
             depth: agent.depth(),
             model: Some(start.model),
             owner_job: start.owner_job,
@@ -330,11 +312,11 @@ fn time(millis: i64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobRole;
     use crate::provider::protocol::Usage;
     use crate::tests::TestRuntime;
     use crate::{
-        execution::ExecutionLocation,
-        job::{JobEnd, JobRole},
+        job::JobEnd,
         provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
             AttemptRef, CompletedOutcome, Message, MessageSeq, ModelContext, ModelPurpose,
@@ -343,6 +325,7 @@ mod tests {
         },
     };
     use serde_json::json;
+    use skyhook_tools::target::ExecutionLocation;
     use std::assert_matches;
 
     /// Journal job `index`, a delegation named `worker`, and start the root's child
@@ -361,7 +344,7 @@ mod tests {
             output_schema: None,
             accepts_input: true,
             background: false,
-            location: ExecutionLocation::root(workspace.to_path_buf()),
+            location: ExecutionLocation::root(crate::tests::text(workspace)),
         };
         let (store, root) = (&session.store, &session.agent);
         store.append(root.clone(), created).await.unwrap();

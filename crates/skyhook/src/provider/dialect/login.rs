@@ -2,9 +2,52 @@
 
 use std::{fmt, time::Duration};
 
-use super::{AdmissionError, ConfigHome, Dialect};
+use super::{AdmissionError, BuildError, ConfigHome, Dialect, codex};
 use crate::identity::HostName;
-use crate::provider::{ProviderError, ProviderErrorKind::Authentication, profile::ProviderName};
+use crate::provider::{
+    ProviderError, ProviderErrorKind::Authentication, http::Headers, http::credentials::Pending,
+    model::ProviderName,
+};
+
+/// The credentials Skyhook manages for an entry whose dialect signs in.
+#[derive(Clone)]
+pub enum Login {
+    Codex(codex::Account),
+}
+
+impl Login {
+    pub async fn login(
+        &self,
+        flow: LoginFlow,
+        presenter: &dyn LoginPresenter,
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::Codex(account) => account.login(flow, presenter).await,
+        }
+    }
+
+    /// Local state only; the server is neither asked nor refreshed.
+    pub async fn status(&self) -> Result<AuthStatus, ProviderError> {
+        match self {
+            Self::Codex(account) => account.status().await,
+        }
+    }
+
+    /// Present the credentials to the service in a request that spends no
+    /// quota, refreshing them first if a request would.
+    pub async fn check(&self) -> Result<AccountUsage, BuildError> {
+        match self {
+            Self::Codex(account) => account.check().await,
+        }
+    }
+
+    /// The credential headers every request of the entry sends.
+    pub(super) fn into_headers(self) -> Headers<Pending> {
+        match self {
+            Self::Codex(account) => account.into_headers(),
+        }
+    }
+}
 
 /// Why a configured provider has no login to manage.
 #[derive(Debug, thiserror::Error)]
@@ -31,8 +74,7 @@ pub enum LoginFlow {
     Device,
 }
 
-/// Where a login flow tells the human what to do. The library writes nothing to
-/// the terminal itself.
+/// Where a login flow tells the human what to do.
 pub trait LoginPresenter: Send + Sync {
     /// Authorize at `url`; the flow then waits for the browser's callback.
     fn authorize(&self, url: &str);
@@ -42,7 +84,7 @@ pub trait LoginPresenter: Send + Sync {
 
 /// What the service reports for a signed-in account; what it omits is absent.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Usage {
+pub struct AccountUsage {
     /// The service's name for the account's plan, shown as given.
     pub plan: Option<String>,
     pub windows: Vec<UsageWindow>,

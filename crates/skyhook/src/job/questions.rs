@@ -185,13 +185,13 @@ impl JobManager {
                 let mut full = Vec::new();
                 for (ask, answer) in asking.answers(reply)? {
                     let input = (state.jobs.get(ask))
-                        .filter(|entry| !entry.answered())
-                        .and_then(|entry| Some(entry.handles.as_ref()?.input.clone()));
+                        .filter(|entry| entry.ask() != Some(AskPhase::Answered))
+                        .and_then(|entry| Some(entry.live.handles.as_ref()?.input.clone()));
                     let Some(input) = input else {
                         continue;
                     };
                     match input.try_send(answer) {
-                        Ok(()) => drop(state.jobs.modify(ask, |entry, _| entry.answer())),
+                        Ok(()) => state.jobs.advance_ask(ask, AskPhase::Answered),
                         Err(mpsc::error::TrySendError::Full(_)) => full.push(input),
                         // Its handler stopped listening: it ends unanswered.
                         Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -217,6 +217,33 @@ impl JobManager {
 }
 
 impl Jobs {
+    /// `owner`'s unfinished asks issued under `parent`, or by a model response
+    /// without one, that have yet to join a batch.
+    pub(crate) fn unbatched(
+        &self,
+        owner: &AgentId,
+        parent: Option<JobId>,
+    ) -> impl Iterator<Item = JobId> {
+        let asks = (self.unfinished(owner)).filter(move |(_, entry)| {
+            entry.parent == parent && entry.ask() == Some(AskPhase::Issued)
+        });
+        asks.map(|(id, _)| id)
+    }
+
+    /// Whether ask `id` holds back a batch: it is live, unlike one let go of, and
+    /// has yet to join one.
+    pub(crate) fn holds_batch(&self, id: JobId) -> bool {
+        matches!(self.lookup(id), Lookup::Held(entry) if entry.live() && entry.ask() == Some(AskPhase::Issued))
+    }
+
+    pub(crate) fn advance_ask(&mut self, id: JobId, to: AskPhase) {
+        self.modify(id, |entry, _| {
+            if let RoleState::Question(phase) = &mut entry.role {
+                *phase = to;
+            }
+        });
+    }
+
     fn answered_through(&self, ask: JobId) -> Option<JobId> {
         let mut job = self.get(ask)?.parent?;
         while self.get(job)?.role() != JobRole::Agent {

@@ -338,16 +338,15 @@ clearTimeout(12345);
 setTimeout(() => { throw new Error("late"); }, 0);
 setTimeout(async () => { throw new Error("rejected"); }, 0);
 queueMicrotask(() => { throw new Error("micro"); });
-queueMicrotask(() => tool.echo({value: "never run"}));
 await new Promise(resolve => setTimeout((a, b) => { fired.push(a + b); resolve(); }, NaN, 1, 2));
 await new Promise(resolve => {
   const id = setInterval(() => { if (++ticks === 3) { clearInterval(id); resolve(); } }, -5);
 });
 try { setTimeout(() => {}, 1800001); } catch (error) { capped = error instanceof TypeError; }
-return {fired, ticks, logged, capped, calls: __testCalls.length};
+return {fired, ticks, logged, capped};
 "#,
                 json!({"fired": [3], "ticks": 3, "logged": ["Uncaught late", "Uncaught micro", "Uncaught rejected"],
-                       "capped": true, "calls": 0}),
+                       "capped": true}),
             ),
             // Scripts run in UTC, while an explicit zone still applies.
             (

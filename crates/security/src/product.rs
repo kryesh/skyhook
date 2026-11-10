@@ -1,95 +1,51 @@
-use std::{
-    num::NonZeroU16,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{num::NonZeroU16, path::Path, sync::Arc};
 
-use clap::builder::PossibleValue;
-use cli::{
-    Color, Configured, Error, Identity, Opening, Palette, Product, RootMode, SessionContext,
-    SyntaxPalette, Table, Theme, page::Disclosed,
+use skyhook::identity::SessionId;
+use skyhook::product::{
+    Configured, Error, Identity, Product, RootMode, SessionContext,
+    page::{Disclosed, Page},
 };
-use skyhook::{
-    config::{Config, ConfigDiagnostic, LayeredConfig, workspace_session_root},
-    identity::SessionId,
-    session::SessionStore,
-    tool::diagnostic::escape_controls,
-};
+use skyhook::{config::Config, session::SessionStore};
 
 use crate::{
     config::SecurityConfig,
     cvss::Severity,
-    session::{ResearchFactory, Scope, resumed_policy},
+    session::ResearchFactory,
     store::{LivePolicy, Run, Store},
-};
-
-/// Red emphasis in place of Skyhook's blue; code keeps the shared syntax palette.
-/// Emphasis contrasts 3.5:1 on the selected row and 4.7:1 on the user surface;
-/// errors move to orange so they never read as emphasis.
-const THEME: Theme = Theme {
-    ui: Palette {
-        emphasis: Color::Rgb(255, 96, 106),
-        strong: Color::Rgb(255, 130, 160),
-        error: Color::Rgb(255, 128, 0),
-        ..Palette::DEFAULT
-    },
-    syntax: SyntaxPalette::DEFAULT,
 };
 
 pub struct Security;
 
-#[derive(clap::Args)]
-pub struct Args {
-    /// Whether a new run's agents work against a running target: probing it and demonstrating
-    /// findings (interactive: ask; batch: no). A resumed run keeps its own.
-    #[arg(long, value_enum)]
+/// Why a launch is refused before its session opens.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Refused {
+    #[error(
+        "live: ask requires an interactive session; use --live yes or --live no in headless mode"
+    )]
+    BatchAsk,
+}
+
+/// What a launch of the security product runs with, beside the shared configuration.
+pub struct Options {
+    /// Whether a new run's agents work against a running target; a resumed run keeps its own.
     pub live: Option<LivePolicy>,
     /// Shortlist threshold for a new run: the lowest severity a review judges in full.
-    #[arg(long, value_enum)]
     pub shortlist: Option<Severity>,
     /// How many agents the orchestrator's scheduler runs at once.
-    #[arg(long)]
     pub workers: Option<NonZeroU16>,
-    /// Explicit security.yaml; independent of --config.
-    #[arg(long)]
-    pub security_config: Option<PathBuf>,
-}
-
-impl clap::ValueEnum for Severity {
-    fn value_variants<'a>() -> &'a [Self] {
-        &Self::ALL
-    }
-
-    fn to_possible_value(&self) -> Option<PossibleValue> {
-        Some(PossibleValue::new(self.as_str()))
-    }
-}
-
-#[derive(clap::Subcommand)]
-pub enum Command {
-    /// List the workspace's security sessions, each one run, or show one as its Research
-    /// page with every section open in full.
-    Runs {
-        #[arg(short, long, default_value = ".")]
-        workspace: PathBuf,
-        session: Option<SessionId>,
-    },
+    /// The product's own settings, as the host read them.
+    pub config: SecurityConfig,
 }
 
 impl Product for Security {
-    type Args = Args;
-    type Command = Command;
+    type Options = Options;
 
     fn identity(&self) -> Identity {
         Identity {
             host: "skyhook-security".parse().expect("static host identity"),
             schema: crate::store::SCHEMA,
             display_name: "Skyhook Security",
-            about: "Evidence-led security research over a flaw-first ledger",
-            placeholder: "Set the scope above and describe the target to start the security analysis, or /sessions to open one.",
-            state_file: "security-state.json",
             root_mode: RootMode::Fixed,
-            theme: THEME,
             capabilities: crate::capabilities::declarations().collect(),
         }
     }
@@ -97,119 +53,28 @@ impl Product for Security {
     async fn configure(
         &self,
         config: &mut Config,
-        args: Args,
+        requested: Options,
         context: SessionContext<'_>,
     ) -> Result<Configured, Error> {
-        let resolved =
-            SecurityConfig::resolve(context.workspace, args.security_config.as_deref()).await?;
-        let security = resolved.config;
-        if let (Opening::Resume(_), Some(_)) = (context.opening, args.live) {
-            return Err(crate::config::Error::LiveOnResume.into());
-        }
-        let scope = Scope {
-            options: security.run_options(args.shortlist, args.workers),
-            live: security.live_policy(args.live, context.headless),
-        };
-        let factory = ResearchFactory::new(scope, args.workers);
-        // The policy is checked once, on what the opened session runs under; another host's
-        // session opens without this product's resources.
-        let (live, factory) = match context.opening {
-            Opening::Resume(id) if self.owns(context.workspace, id).await? => {
-                let live = resumed_policy(context.workspace, id, scope.live).await?;
-                (live, factory.resuming(id, live))
-            }
-            Opening::New(_) | Opening::Resume(_) => (scope.live, factory),
-        };
-        if context.headless && live == LivePolicy::Ask {
-            return Err(crate::config::Error::HeadlessAsk.into());
-        }
+        let security = &requested.config;
+        let options = security.run_options(
+            requested.shortlist,
+            requested.workers,
+            requested.live,
+            context.attendance,
+        );
+        let factory = ResearchFactory::new(options, requested.workers);
         security.apply(config)?;
-        let mut report = resolved.report;
-        if security
-            .models
-            .values()
-            .all(|assignment| assignment.roles.is_empty())
-        {
-            report.diagnostics.push(ConfigDiagnostic {
-                path: report
-                    .sources
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| PathBuf::from(SecurityConfig::FILE_NAME)),
-                message: "no model role hints configured; every agent runs on the default model (see security.example.yaml)".to_owned(),
-            });
-        }
         Ok(Configured {
-            report,
+            warnings: security.warnings(),
             factory: Arc::new(factory),
         })
-    }
-
-    async fn command(&self, command: Command) -> Result<(), Error> {
-        match command {
-            Command::Runs {
-                workspace,
-                session: Some(session),
-            } => {
-                let root = workspace_session_root(&workspace);
-                let store = Store::inspect(&root, session).await?;
-                let text = tokio::task::spawn_blocking(move || run_detail(&store)).await??;
-                print!("{text}");
-                Ok(())
-            }
-            Command::Runs {
-                workspace,
-                session: None,
-            } => {
-                let runs = runs(&workspace_session_root(&workspace), &self.identity()).await?;
-                if runs.is_empty() {
-                    println!("No security runs.");
-                    return Ok(());
-                }
-                let mut table = Table {
-                    header: &["Session", "Created", "Findings"],
-                    numeric_from: 2,
-                    rows: Vec::new(),
-                };
-                let mut unavailable = Vec::new();
-                for (id, run) in runs {
-                    match run {
-                        Ok((run, findings)) => {
-                            table.rows.push(vec![
-                                run.id.to_string(),
-                                run.created.to_rfc3339(),
-                                findings.to_string(),
-                            ]);
-                        }
-                        Err(error) => unavailable.push(format!(
-                            "{id}  unavailable: {}",
-                            escape_controls(error.to_string())
-                        )),
-                    }
-                }
-                let mut output = String::new();
-                table.render(&mut output);
-                output.extend(unavailable.iter().map(|line| format!("{line}\n")));
-                print!("{output}");
-                Ok(())
-            }
-        }
-    }
-}
-
-impl Security {
-    /// Whether session `id` of `workspace` is one of this product's own.
-    async fn owns(&self, workspace: &Path, id: SessionId) -> Result<bool, Error> {
-        let identity = self.identity();
-        let root = workspace_session_root(workspace);
-        let summary = SessionStore::summary(&root, id, Some(identity.owner())).await?;
-        Ok(summary.host == identity.host)
     }
 }
 
 /// Every session `identity` created under `root`, oldest first, with its run or why it
 /// cannot be read. Other hosts' sessions are not runs.
-async fn runs(
+pub async fn runs(
     root: &Path,
     identity: &Identity,
 ) -> Result<Vec<(SessionId, Result<(Run, u64), Error>)>, Error> {
@@ -222,7 +87,11 @@ async fn runs(
                 async {
                     let store = Store::inspect(root, id).await?;
                     let read = move || {
-                        Ok::<_, crate::store::Error>((store.run()?, store.coverage()?.findings))
+                        let run = store.started()?.ok_or(crate::store::Error::NotFound {
+                            record: crate::store::Record::Run,
+                            id: None,
+                        })?;
+                        Ok::<_, crate::store::Error>((run, store.coverage()?.findings))
                     };
                     Ok::<_, Error>(tokio::task::spawn_blocking(read).await??)
                 }
@@ -236,68 +105,75 @@ async fn runs(
     Ok(runs)
 }
 
-/// One run as plain text: the Research page with every section open in full, as the store
-/// holds it; never a report the agents should write.
-fn run_detail(store: &Store) -> Result<String, crate::store::Error> {
-    let state = store.run_state()?;
-    let mut out = String::new();
-    (state.page(store, &Disclosed::whole(), None)?).render(&mut out);
-    Ok(out)
+/// One run as its Research page with every section open in full, as the store holds it.
+pub fn run_page(store: &Store) -> Result<Page, Error> {
+    Ok(store.run_state()?.page(store, &Disclosed::whole(), None)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use skyhook::config::workspace_session_root;
+    use skyhook::product::{Attendance, Opening};
     use std::assert_matches;
 
     use super::*;
     use crate::store::tests::{component, fixture, harness};
+    use skyhook::product::page::{Block, Record};
 
-    /// A run's detail lists every record of a section, however many there are.
+    /// A run's page supplies every record of a section, however many there are.
     #[test]
-    fn run_detail_lists_every_record() {
+    fn run_page_supplies_every_record() {
         let (_session, store, actor) = fixture();
         let count = Disclosed::PAGE + 1;
         for index in 0..count {
             component(&store, &actor, &format!("part{index}"));
         }
-        let detail = run_detail(&store).unwrap();
-        let listed = (detail.lines())
-            .filter(|line| {
-                (line.split_whitespace().last()).is_some_and(|name| name.starts_with("part"))
-            })
-            .count();
-        assert_eq!(listed, count, "{detail}");
+        let page = run_page(&store).unwrap();
+        let records = (page.blocks.iter()).flat_map(|block| match block {
+            Block::Section(section) => section.records.as_slice(),
+            _ => &[],
+        });
+        let named = |record: &&Record| record.cells.iter().any(|c| c.text.starts_with("part"));
+        assert_eq!(records.filter(named).count(), count, "{page:?}");
     }
 
-    /// The product's configuration for `opening` of `workspace`, from the `security.yaml` in
-    /// it, with `live` given on the command line.
+    /// The product's configuration for `opening` of `workspace` under the `configured`
+    /// policy, with `live` given on the command line, once its session is prepared.
     async fn configure(
         workspace: &Path,
         opening: Opening<'_>,
-        headless: bool,
-        live: Option<LivePolicy>,
+        attendance: Attendance,
+        (configured, live): (LivePolicy, Option<LivePolicy>),
     ) -> Result<Configured, Error> {
-        let args = Args {
+        let args = Options {
             live,
             shortlist: None,
             workers: None,
-            security_config: Some(workspace.join("security.yaml")),
+            config: SecurityConfig {
+                live: Some(configured),
+                ..SecurityConfig::default()
+            },
         };
         let context = SessionContext {
             workspace,
             opening,
-            headless,
+            attendance,
         };
         let mut config = Config::from_yaml("{}").unwrap();
-        Security.configure(&mut config, args, context).await
+        let configured = Security.configure(&mut config, args, context).await?;
+        configured
+            .factory
+            .prepare(harness(workspace), context)
+            .await?;
+        Ok(configured)
     }
 
-    /// The run a new session of `configured` starts.
+    /// The run a new session of `configured` starts in the terminal.
     async fn start(workspace: &Path, configured: Configured) -> SessionId {
         let context = SessionContext {
             workspace,
             opening: Opening::New(None),
-            headless: true,
+            attendance: Attendance::Attended,
         };
         let prepared = configured.factory.prepare(harness(workspace), context);
         let prepared = prepared.await.unwrap();
@@ -309,46 +185,46 @@ mod tests {
         session.id()
     }
 
-    /// Why configuration refused a launch.
-    fn refusal(result: Result<Configured, Error>) -> crate::config::Error {
+    /// Why a launch was refused.
+    fn refusal(result: Result<Configured, Error>) -> Refused {
         let error = result.err().expect("the launch is refused");
         *error.downcast().unwrap()
     }
 
-    /// A headless launch is refused when its run would ask: a new run under the command
-    /// line's or the configuration's policy, a resumed run under its own, which `--live`
-    /// cannot change. `runs` lists every run.
+    /// A batch launch is refused when its run would ask: a new run under the command
+    /// line's or the configuration's policy, a resumed run under its own. `runs` lists
+    /// every run.
     #[tokio::test]
-    async fn headless_admission_follows_the_policy_the_run_is_under() {
-        use crate::config::Error::{HeadlessAsk, LiveOnResume};
+    async fn batch_admission_follows_the_policy_the_run_is_under() {
+        use Refused::BatchAsk;
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path();
-        let policy = |live: &str| {
-            std::fs::write(workspace.join("security.yaml"), format!("live: {live}\n")).unwrap()
-        };
-        policy("ask");
+        let ask = (LivePolicy::Ask, None);
         let new = Opening::New(None);
-        let refused = refusal(configure(workspace, new, true, None).await);
-        assert_matches!(refused, HeadlessAsk);
-        let quiet = configure(workspace, new, true, Some(LivePolicy::No)).await;
+        let refused = refusal(configure(workspace, new, Attendance::Batch, ask).await);
+        assert_matches!(refused, BatchAsk);
+        let quiet = (LivePolicy::Ask, Some(LivePolicy::No));
+        let quiet = configure(workspace, new, Attendance::Batch, quiet).await;
         let quiet = start(workspace, quiet.unwrap()).await;
         let asking = start(
             workspace,
-            configure(workspace, new, false, None).await.unwrap(),
+            configure(workspace, new, Attendance::Attended, ask)
+                .await
+                .unwrap(),
         )
         .await;
         let resume = Opening::Resume(quiet);
-        configure(workspace, resume, true, None).await.unwrap();
-        let live = Some(LivePolicy::Yes);
-        let refused = refusal(configure(workspace, resume, true, live).await);
-        assert_matches!(refused, LiveOnResume);
-        policy("no");
-        let refused = refusal(configure(workspace, Opening::Resume(asking), true, None).await);
-        assert_matches!(refused, HeadlessAsk);
+        configure(workspace, resume, Attendance::Batch, ask)
+            .await
+            .unwrap();
+        let no = (LivePolicy::No, None);
+        let refused =
+            refusal(configure(workspace, Opening::Resume(asking), Attendance::Batch, no).await);
+        assert_matches!(refused, BatchAsk);
 
         let listed = runs(&workspace_session_root(workspace), &Security.identity()).await;
         let listed: Vec<_> = (listed.unwrap().into_iter())
-            .map(|(id, run)| (id, run.unwrap().0.live))
+            .map(|(id, run)| (id, run.unwrap().0.options.live))
             .collect();
         assert_eq!(listed.len(), 2);
         for run in [(quiet, LivePolicy::No), (asking, LivePolicy::Ask)] {

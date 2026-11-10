@@ -1,17 +1,12 @@
 //! Host interaction contracts and streamed runtime events.
 
-use std::sync::Arc;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::session::RequestSeq;
-use crate::{
-    identity::{AgentId, JobId},
-    session::EventRecord,
-};
+use crate::identity::AgentId;
 
 /// The most characters a question's header holds.
 pub const MAX_HEADER: usize = 24;
@@ -25,7 +20,7 @@ pub enum HeaderError {
     Long,
 }
 
-crate::newtype::string_newtype! {
+skyhook_base::string_newtype! {
     /// A question's short title: its tab among the questions asked together, unique
     /// among them, and the key its answer is filed under
     #[derive(PartialOrd, Ord)]
@@ -42,9 +37,9 @@ crate::newtype::string_newtype! {
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
     /// Short answer label, returned as the answer when chosen
-    pub label: crate::Prose,
+    pub label: skyhook_base::newtype::Prose,
     /// What choosing it means: its effect or tradeoff
-    pub description: crate::Prose,
+    pub description: skyhook_base::newtype::Prose,
     /// The option you recommend: at most one, unless the question takes several
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recommended: bool,
@@ -54,7 +49,7 @@ pub struct QuestionOption {
     /// other options, in the same framing for each; keep it under about 20 lines and 60
     /// columns. Give every option a preview or none
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview: Option<crate::Prose>,
+    pub preview: Option<skyhook_base::newtype::Prose>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
@@ -63,7 +58,7 @@ pub struct Question {
     pub header: QuestionHeader,
     /// The complete question as Markdown, shown to the user or owning parent agent. Put
     /// lists and separate points on their own lines
-    pub prompt: crate::Prose,
+    pub prompt: skyhook_base::newtype::Prose,
     /// Suggested answers with distinct labels; free-form input is always allowed. A chosen
     /// suggestion answers with its label, or {"answer": "label", "comment": "text"} with a
     /// comment
@@ -119,7 +114,7 @@ impl Question {
 /// Presentation never shortens it
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub(crate) struct QuestionOutput {
-    #[schemars(transform = crate::tool::output::complete)]
+    #[schemars(transform = skyhook_tools::output::complete)]
     pub questions: Vec<Question>,
 }
 
@@ -166,7 +161,8 @@ pub trait QuestionHandler: Send + Sync {
     fn ask(&self, agent: AgentId, questions: Vec<Question>, background: bool) -> QuestionFuture;
 }
 
-pub type HostStateFuture<'a> = Pin<Box<dyn Future<Output = Option<crate::Prose>> + Send + 'a>>;
+pub type HostStateFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<skyhook_base::newtype::Prose>> + Send + 'a>>;
 
 pub type HostEventsFuture<'a> = Pin<
     Box<
@@ -232,46 +228,6 @@ pub enum QuestionError {
     Unavailable,
     #[error("question failed: {0}")]
     Failed(String),
-}
-
-#[derive(Clone, Debug)]
-pub enum RuntimeEvent {
-    Record(Arc<EventRecord>),
-    /// A job as the record that follows leaves it.
-    Job(Box<crate::job::JobEnvelope>),
-    /// Jobs the session no longer holds: what last moved them is their last view,
-    /// until a record moves one again, which reports it anew.
-    JobsUnheld(Vec<JobId>),
-    /// `request`'s response streamed after it was last read: read it with
-    /// [`SessionStore::response`](crate::session::SessionStore::response). No further
-    /// one is posted for it until it is read again, or a record of its agent applies.
-    ResponseChanged {
-        agent: AgentId,
-        request: RequestSeq,
-    },
-    ResponseSettled {
-        agent: AgentId,
-        request: RequestSeq,
-        settlement: super::Settlement,
-    },
-    /// An agent's activity moved, as the session's state reads it; none once the
-    /// agent no longer runs, as a parked child does not.
-    Activity {
-        agent: AgentId,
-        activity: Option<super::ObservedActivity>,
-    },
-    TurnCompleted {
-        agent: AgentId,
-    },
-    /// Run `invocation` of `job` captured output after its output was last read.
-    /// No further one is posted for that run until its output is read again or
-    /// the run finishes.
-    OutputChanged {
-        job: JobId,
-        invocation: crate::job::Invocation,
-    },
-    /// The phase the session moved to.
-    Phase(crate::session::SessionPhase),
 }
 
 #[cfg(test)]

@@ -2,23 +2,25 @@
 //! see it as context entries: runtime state as state, job events as runtime text,
 //! so the renderers here are part of the session format.
 
-use std::{fmt, path::PathBuf};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::job::JobName;
 use crate::{
-    agent::TodoItem,
-    execution::ExecutionLocation,
-    identity::JobId,
     job::{AgentMessage, AgentProgress, JobState, JobView},
-    media::AttachmentRef,
     provider::protocol::{self, AssistantItem, Entry, StateLifetime, ToolResult},
-    target::TargetRef,
-    tool::registry::JobName,
+    session::TodoItem,
 };
+use skyhook_base::enums::Kinds;
+use skyhook_media::AttachmentRef;
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_tools::target::TargetRef;
+use skyhook_worker::job::JobId;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Kinds)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
+#[kinds(name = MessageRole)]
 pub enum Message {
     User(Vec<UserPart>),
     Assistant(Vec<AssistantItem>),
@@ -27,8 +29,9 @@ pub enum Message {
     State(RuntimeState),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Kinds)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[kinds(name = UserPartKind)]
 pub enum UserPart {
     Text {
         text: String,
@@ -154,7 +157,7 @@ pub struct RuntimeState {
     pub location: ExecutionLocation,
     /// The host's section, rendered by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<crate::Prose>,
+    pub host: Option<skyhook_base::newtype::Prose>,
 }
 
 impl RuntimeState {
@@ -176,7 +179,7 @@ pub struct StateJob {
     pub state: JobState,
     /// None when the agent may not see targets.
     pub target: Option<TargetRef>,
-    pub workspace: PathBuf,
+    pub workspace: skyhook_worker::op::TargetPath,
     pub age_seconds: u64,
     pub children: Vec<StateJob>,
 }
@@ -200,8 +203,9 @@ impl StateJobKind {
 
 /// One entry of a job-events notification: a child's reply, a job's presented view, or
 /// what the host had for the agent as its request was made.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Kinds)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[kinds(name = JobEventKind)]
 pub enum JobEvent {
     Message(AgentMessage),
     Job(Box<JobView>),
@@ -396,7 +400,7 @@ fn render_jobs(
             write!(f, " target={}", quoted(target.as_str()))?;
         }
         if job.workspace != location.workspace {
-            write!(f, " workspace={}", quoted(&job.workspace.to_string_lossy()))?;
+            write!(f, " workspace={}", quoted(job.workspace.as_str()))?;
         }
         f.write_str("\n")?;
         render_jobs(f, &job.children, Some(job.job), location)?;
@@ -426,6 +430,15 @@ pub(crate) fn cell(value: &str) -> String {
     shown(value, !value.is_empty() && value != "-" && bare)
 }
 
+/// A path ending its line, bare unless a line break, a quote, or a space at either end
+/// would hide where it ends; backslashes stay as they are.
+pub(crate) fn path_cell(value: &str) -> String {
+    shown(
+        value,
+        !value.contains(['\n', '\r', '"']) && value.trim() == value,
+    )
+}
+
 /// Keep a line's text bare, but escape text that could end the line or the block, read
 /// as a heading, the job table's columns or a quoted value, or hide its edges.
 fn line(value: &str) -> String {
@@ -442,7 +455,7 @@ fn line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::TodoStatus;
+    use crate::session::TodoStatus;
 
     /// A host event's view naming its own `kind` is refused where it is built and where the
     /// journal reads it back.
@@ -611,6 +624,22 @@ mod tests {
         assert_eq!(cell(""), "\"\"");
         assert_eq!(cell("two words"), "\"two words\"");
         assert_eq!(cell("λ"), "\"λ\"");
+    }
+
+    /// A path ending its line is quoted only where its end would be unclear.
+    #[test]
+    fn line_ending_paths_are_bare_unless_their_end_is_ambiguous() {
+        let cases = [
+            (r"C:\Users\x", r"C:\Users\x"),
+            ("/work space/a", "/work space/a"),
+            ("/work ", r#""/work ""#),
+            (" /work", r#"" /work""#),
+            ("/a\nb", r#""/a\nb""#),
+            (r#"/say "hi""#, r#""/say \"hi\"""#),
+        ];
+        for (raw, shown) in cases {
+            assert_eq!(path_cell(raw), shown, "{raw:?}");
+        }
     }
 
     use crate::provider::codec::common::tests::envelope;

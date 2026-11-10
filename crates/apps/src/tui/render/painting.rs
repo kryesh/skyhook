@@ -1,0 +1,623 @@
+//! Theme palette, terminal cell painting, and row decoration.
+
+use super::row::Row;
+use crate::tui::markdown;
+use crate::tui::model::Surface;
+use crate::tui::theme::theme;
+use crate::tui::wrapping::cells;
+use ratatui::Frame;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
+use std::ops::ControlFlow;
+
+pub(super) fn background(surface: Surface) -> Color {
+    match surface {
+        Surface::User => theme().ui.user,
+        Surface::Agent => theme().ui.agent,
+        Surface::Panel => theme().ui.panel,
+        _ => theme().ui.base,
+    }
+}
+pub(super) fn foreground(surface: Surface) -> Color {
+    match surface {
+        Surface::Muted | Surface::Status | Surface::Reasoning => theme().ui.muted,
+        Surface::Error => theme().ui.error,
+        _ => theme().ui.fg,
+    }
+}
+pub(super) fn spinner(tick: usize) -> &'static str {
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][tick % 10]
+}
+
+pub(super) fn fill(frame: &mut Frame, rect: Rect, color: Color) {
+    let buffer = frame.buffer_mut();
+    let rect = rect.intersection(buffer.area);
+    let stride = buffer.area.width as usize;
+    let x = rect.x.saturating_sub(buffer.area.x) as usize;
+    for y in rect.y..rect.bottom() {
+        let start = (y - buffer.area.y) as usize * stride + x;
+        for cell in &mut buffer.content[start..start + rect.width as usize] {
+            cell.reset();
+            cell.bg = color;
+        }
+    }
+}
+pub(super) fn focus_cursor(frame: &mut Frame, x: u16, y: u16, bg: Color) {
+    text(frame, r(x, y, 1, 1), "▌", theme().ui.emphasis, bg);
+}
+pub(super) fn text(
+    frame: &mut Frame,
+    rect: Rect,
+    text: impl Into<Line<'static>>,
+    fg: Color,
+    bg: Color,
+) {
+    let mut line = text.into();
+    for span in &mut line.spans {
+        if span.content.contains(char::is_control) {
+            span.content = crate::tui::format::clean(&span.content).into();
+        }
+    }
+    render_line(
+        &line,
+        rect,
+        frame.buffer_mut(),
+        Style::default().fg(fg).bg(bg),
+    );
+}
+/// The thumb of a track spanning `total`, where the view `shown` sits, flush with
+/// each end while the view reaches it; whether there is one, as none is drawn while
+/// the view shows everything.
+pub(super) fn scroll_thumb(
+    frame: &mut Frame,
+    track: Rect,
+    shown: std::ops::Range<f64>,
+    total: f64,
+    bg: Color,
+) -> bool {
+    if track.height == 0 || (shown.start <= 0.0 && shown.end >= total) {
+        return false;
+    }
+    let cell = |at: f64| (at / total * f64::from(track.height)).round() as u16;
+    let start = cell(shown.start).min(track.height - 1);
+    let end = cell(shown.end).clamp(start + 1, track.height);
+    for y in start..end {
+        let cell = r(track.x, track.y + y, 1, 1);
+        text(frame, cell, "▐", theme().ui.muted, bg);
+    }
+    true
+}
+pub(super) fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
+    Rect::new(x, y, width, height)
+}
+
+/// Paint Markdown geometry without inserting decorative text into the source.
+pub(super) fn render_row_line(
+    line: &Line<'_>,
+    layout: &markdown::RowLayout,
+    area: Rect,
+    buffer: &mut Buffer,
+    style: Style,
+) {
+    if !layout.has_geometry() {
+        render_line(line, area, buffer, style);
+        return;
+    }
+    let area = area.intersection(buffer.area);
+    if area.is_empty() {
+        return;
+    }
+    buffer.set_style(area, style.patch(line.style));
+    let prefix_width = layout.prefix.width().min(area.width as usize);
+    if prefix_width > 0 {
+        render_line(
+            &layout.prefix,
+            r(area.x, area.y, prefix_width as u16, 1),
+            buffer,
+            style,
+        );
+    }
+    if let Some(code) = layout.code() {
+        let offset = code.indent();
+        let rect = r(
+            area.x.saturating_add(offset as u16),
+            area.y,
+            code.width() as u16,
+            1,
+        )
+        .intersection(area);
+        buffer.set_style(rect, Style::default().bg(theme().ui.code_bg));
+    }
+    if layout.decorative() {
+        return;
+    }
+    let mut byte = 0;
+    let mut column = prefix_width;
+    let (source_prefix, source_prefix_width) = layout.source_prefix();
+    let body_end = layout.code().map_or(area.width as usize, |code| {
+        code.body_end().min(area.width as usize)
+    });
+    let row = buffer.index_of(area.x, area.y);
+    each_cell(line, |symbol, size, style| {
+        if byte == source_prefix {
+            column = layout
+                .code()
+                .map_or(prefix_width + source_prefix_width, |code| code.body_start());
+        }
+        let in_prefix = byte < source_prefix;
+        let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
+        if !in_prefix && column + size > body_end {
+            return ControlFlow::Break(());
+        }
+        if size > 0 && !prefix_clipped && column + size <= area.width as usize {
+            buffer.content[row + column]
+                .set_symbol(symbol)
+                .set_style(style);
+        }
+        byte += symbol.len();
+        column += size;
+        ControlFlow::Continue(())
+    });
+}
+
+/// Each printable grapheme of `line` with its cell width and style, until `paint`
+/// breaks.
+fn each_cell<'a>(
+    line: &'a Line<'_>,
+    mut paint: impl FnMut(&'a str, usize, Style) -> ControlFlow<()>,
+) {
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for (_, symbol, width) in cells(&span.content) {
+            let printable =
+                matches!(symbol.as_bytes(), [b' '..=b'~']) || !symbol.contains(char::is_control);
+            if printable && paint(symbol, width, style).is_break() {
+                return;
+            }
+        }
+    }
+}
+
+/// Paint borrowed spans with an unwrapped Paragraph's clipping and styling:
+/// wide continuation cells keep the area style, and graphemes wider than the
+/// area are skipped.
+pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, style: Style) {
+    let area = area.intersection(buffer.area);
+    if area.is_empty() {
+        return;
+    }
+    // Paragraph applies line style to glyphs, not continuation/trailing cells.
+    // Markdown block backgrounds are painted separately from explicit geometry.
+    buffer.set_style(area, style);
+    let fits = area.width as usize;
+    let width = || {
+        let mut total = 0;
+        shown(line, fits, |_, width, _| total += width);
+        total as u16
+    };
+    let offset = match line.alignment.unwrap_or(Alignment::Left) {
+        Alignment::Left => 0,
+        Alignment::Center => area.width / 2 - width() / 2,
+        Alignment::Right => area.width - width(),
+    };
+    let mut cell = buffer.index_of(area.x, area.y) + offset as usize;
+    shown(line, fits, |symbol, width, style| {
+        if width != 0 {
+            buffer.content[cell].set_symbol(symbol).set_style(style);
+            cell += width;
+        }
+    });
+}
+
+/// The graphemes of `line` an area `fits` cells wide shows: wider ones are
+/// skipped, and the first that overflows ends the line.
+fn shown<'a>(line: &'a Line<'_>, fits: usize, mut each: impl FnMut(&'a str, usize, Style)) {
+    let mut used = 0;
+    each_cell(line, |symbol, width, style| {
+        if width > fits {
+            return ControlFlow::Continue(());
+        }
+        used += width;
+        if used > fits {
+            return ControlFlow::Break(());
+        }
+        each(symbol, width, style);
+        ControlFlow::Continue(())
+    });
+}
+
+impl Row {
+    pub(super) fn background(
+        &self,
+        expanded: bool,
+        interactive: bool,
+        text_selected: bool,
+    ) -> Color {
+        // Fill expanded items and collapsed hover/focus highlights uniformly.
+        // Text selection is painted separately over the persistent expanded fill.
+        if !self.layout.is_spacer() && (expanded || (interactive && !text_selected)) {
+            theme().ui.code_bg
+        } else {
+            background(self.surface)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
+    use super::super::tests::{fixture_row, selected_text, text_x};
+    use super::*;
+    use crate::tui::markdown::tests::continued;
+    use crate::tui::render::rows::RowBlocks;
+    use crate::tui::render::selection::TextPosition;
+    use ratatui::style::Modifier;
+    use ratatui::text::Span;
+    use ratatui::widgets::{Paragraph, Widget};
+
+    /// Exercise the paint path: source strings alone cannot reveal a gap
+    /// inserted by source_prefix_width or decorative continuation prefixes.
+    fn painted_markdown(text: &str) -> Vec<String> {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let width = 12;
+        let layout = markdown::layout_highlighted(text, false, width as usize, None);
+        let rows: Vec<Row> = layout
+            .lines
+            .into_iter()
+            .map(|line| fixture_row(line.line, line.layout, 0, width))
+            .collect();
+        let blocks = RowBlocks::entry(rows.clone());
+        let end = TextPosition {
+            row: rows.len() - 1,
+            byte: usize::MAX,
+        };
+        let copied = selected_text(&blocks, (TextPosition { row: 0, byte: 0 }, end));
+        let source = markdown::render(text, false, width as usize);
+        let source: Vec<_> = source.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            copied,
+            source.join("\n"),
+            "wrapping/prefix geometry must not change copied source: {text:?}"
+        );
+        rows.iter()
+            .map(|row| {
+                let area = Rect::new(0, 0, width, 1);
+                let mut buffer = Buffer::empty(area);
+                render_row_line(&row.line, &row.layout, area, &mut buffer, Style::default());
+                let painted: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                painted.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_descendants_use_only_their_own_container_prefix_and_hanging_indent() {
+        for (text, expected) in [
+            ("- [ ] task\n  - child", &["• [ ] task", "  • child"][..]),
+            ("- [ ] task\n  > quoted", &["• [ ] task", "  │ quoted"]),
+            ("- [ ] task\n\n  10. child", &["• [ ] task", "  10. child"]),
+            ("- [ ] task\n  - [x] hi", &["• [ ] task", "  • [x] hi"]),
+            (
+                "> - [ ] task\n>   - child",
+                &["│ • [ ] task", "│   • child"],
+            ),
+            ("- [ ] task\n  > - child", &["• [ ] task", "  │ • child"]),
+            (
+                "10. [ ] task\n    - child",
+                &["10. [ ] task", "    • child"],
+            ),
+            // Wrapped descendants hang beneath their own markers only.
+            (
+                "- [ ] task\n  - child one",
+                &["• [ ] task", "  • child", "    one"],
+            ),
+            (
+                "- [ ] task\n  > quoted one",
+                &["• [ ] task", "  │ quoted", "  │ one"],
+            ),
+            // Nested tasks retain their own checkbox's hanging width.
+            (
+                "- [ ] task\n  - [x] one two",
+                &["• [ ] task", "  • [x] one", "        two"],
+            ),
+            // The task paragraph still hangs beneath its checkbox.
+            (
+                "- [ ] alpha beta\n  gamma",
+                &["• [ ] alpha", "      beta", "      gamma"],
+            ),
+        ] {
+            assert_eq!(painted_markdown(text), expected, "{text:?}");
+        }
+    }
+
+    /// Table borders paint at the same unicode width as the screen.
+    #[test]
+    fn table_borders_paint_aligned() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let source = "| H |\n| --- |\n| **لالالا** |\n| 界👩‍💻e\u{301} |";
+        for width in 6..30 {
+            let lines = markdown::rendered(source, width);
+            let grid_width = lines[0].width();
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width as u16, lines.len() as u16));
+            for (y, line) in lines.iter().enumerate() {
+                let y = y as u16;
+                assert_eq!(line.width(), grid_width);
+                let area = Rect::new(0, y, width as u16, 1);
+                render_line(line, area, &mut buffer, Style::default());
+                let left = buffer[(0, y)].symbol();
+                let right = buffer[((grid_width - 1) as u16, y)].symbol();
+                let expected = match left {
+                    "┌" => "┐",
+                    "├" => "┤",
+                    "└" => "┘",
+                    "│" => "│",
+                    _ => panic!("unexpected left border: {left}"),
+                };
+                assert_eq!(
+                    right, expected,
+                    "misaligned border at width {width}, row {y}"
+                );
+            }
+        }
+    }
+
+    fn markdown_rows(input: &str, width: u16, cache: Option<&HighlightCache>) -> Vec<Row> {
+        let columns = width as usize;
+        let layout = markdown::layout_highlighted(input, false, columns, cache);
+        let rows = layout.lines.into_iter();
+        rows.map(|line| fixture_row(line.line, line.layout, 1, width))
+            .collect()
+    }
+
+    fn copy_rows(rows: &[Row]) -> String {
+        let blocks = RowBlocks::entry(rows.to_vec());
+        let end = TextPosition {
+            row: rows.len() - 1,
+            byte: usize::MAX,
+        };
+        selected_text(&blocks, (TextPosition { row: 0, byte: 0 }, end))
+    }
+
+    /// The copyable text of unwrapped markdown.
+    fn original(input: &str) -> String {
+        let lines = markdown::render(input, true, 80);
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_code_geometry(rows: &[Row], width: u16) {
+        for row in rows {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width + 2, 1));
+            buffer.set_style(buffer.area, Style::default().bg(theme().ui.agent));
+            let style = Style::default().fg(theme().ui.fg).bg(theme().ui.agent);
+            render_row_line(
+                &row.line,
+                &row.layout,
+                Rect::new(1, 0, width, 1),
+                &mut buffer,
+                style,
+            );
+            let left = 1 + row.layout.code().map_or(0, |code| code.indent());
+            for x in 0..width + 2 {
+                let code = row.layout.code().is_some_and(|code| {
+                    (left..(left + code.width()).min(width as usize + 1)).contains(&(x as usize))
+                });
+                let expected = if code {
+                    theme().ui.code_bg
+                } else {
+                    theme().ui.agent
+                };
+                assert_eq!(buffer[(x, 0)].bg, expected, "row={:?}, x={x}", row.text());
+            }
+            if row.layout.decorative() {
+                assert!(row.text().is_empty());
+                assert!(row.sources().next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_code_geometry_fits_pads_wraps_and_preserves_copy() {
+        for input in [
+            "```\n  alpha beta gamma delta  \n\n    \nlast\n```",
+            "```unknown\n  alpha beta gamma delta  \n\n    \nlast\n```",
+            "    alpha beta gamma delta  \n\n    last",
+            "```\nlast",
+            "```\n界 👩‍💻 لا\n```",
+            "> ```\n> short  \n> \n> last\n> ```",
+            "- ```\n  short\n  last\n  ```",
+            "```\na\n```\n\n```\nlonger\n```",
+        ] {
+            let original = original(input);
+            for width in [1, 2, 3, 7, 80] {
+                let rows = markdown_rows(input, width, None);
+                assert_code_geometry(&rows, width);
+                assert_eq!(copy_rows(&rows), original, "input {input:?}, width {width}");
+                let code_rows: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row.layout.code().is_some())
+                    .collect();
+                assert!(code_rows.len() >= 3);
+                assert!(code_rows[0].layout.decorative());
+                assert!(code_rows.last().unwrap().layout.decorative());
+                for row in code_rows.iter().filter(|row| !row.layout.decorative()) {
+                    assert!(row.line.style.bg.is_none());
+                    if row.layout.source_prefix().0 == 0 && row.layout.prefix.width() == 0 {
+                        let pad = row.layout.code().unwrap().padding();
+                        assert_eq!(text_x(row), 1 + pad as u16);
+                        assert_eq!(row.byte_at_column(text_x(row)), 0);
+                    }
+                }
+            }
+        }
+        let input = "before `inline` after\n\n```\nabc\n\nx\n```\n\nafter";
+        let rows = markdown_rows(input, 40, None);
+        let code: Vec<_> = rows.iter().filter_map(|row| row.layout.code()).collect();
+        assert_eq!(code.len(), 5); // three source rows plus top/bottom
+        assert!(
+            code.iter()
+                .all(|code| code.width() == 5 && code.padding() == 1)
+        );
+        assert_code_geometry(&rows, 40);
+        assert!(rows.first().unwrap().layout.code().is_none());
+        assert!(rows.last().unwrap().layout.code().is_none());
+        assert_eq!(copy_rows(&rows), "before inline after\n\nabc\n\nx\n\nafter");
+    }
+
+    #[test]
+    fn markdown_code_geometry_survives_highlight_arrival_without_styling_tools() {
+        let source = "let answer = 42;  \n\n// a sufficiently long comment to wrap\n";
+        let input = format!("```rust\n{source}```");
+        let document = Document {
+            sections: vec![Section::Code {
+                source: source.into(),
+                language: "rust".into(),
+                indent: 0,
+                gutters: Default::default(),
+                role: Role::Constant,
+            }],
+        };
+        let mut cache = HighlightCache::default();
+        let pending = markdown_rows(&input, 80, Some(&cache));
+        cache.wait(&document);
+        let highlighted = markdown_rows(&input, 80, Some(&cache));
+        assert_eq!(copy_rows(&pending), copy_rows(&highlighted));
+        let layouts = |rows: &[Row]| {
+            rows.iter()
+                .map(|row| row.layout.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(layouts(&pending), layouts(&highlighted));
+        assert_ne!(pending[1].line.spans, highlighted[1].line.spans);
+        for width in [1, 5, 80] {
+            assert_code_geometry(&markdown_rows(&input, width, Some(&cache)), width);
+        }
+        let tool_lines = document.lines(Some(&cache));
+        assert!(tool_lines.iter().all(|line| line.style.bg.is_none()));
+        let mut spans = tool_lines.iter().flat_map(|line| &line.spans);
+        assert!(spans.all(|span| span.style.bg.is_none()));
+        let visible = |spans: &[Span<'static>]| {
+            let spans = spans.iter().filter(|span| !span.content.is_empty());
+            spans.cloned().collect::<Vec<_>>()
+        };
+        let source_rows = highlighted.iter().filter(|row| !row.layout.decorative());
+        for (markdown, tool) in source_rows.zip(tool_lines) {
+            assert_eq!(visible(&markdown.line.spans), visible(&tool.spans));
+        }
+    }
+
+    #[test]
+    fn markdown_hanging_prefixes_are_decorative_and_preserve_copy() {
+        for input in [
+            "- alpha bravo charlie delta echo foxtrot",
+            "10. alpha bravo charlie delta echo foxtrot",
+            "- [ ] alpha bravo charlie delta echo foxtrot",
+            "> alpha bravo charlie delta echo foxtrot",
+            "> - alpha bravo charlie delta echo foxtrot",
+            "1. outer\n   - inner alpha bravo charlie delta echo foxtrot",
+        ] {
+            let original = original(input);
+            for width in [8, 16, 24] {
+                let rows = markdown_rows(input, width, None);
+                assert_eq!(copy_rows(&rows), original, "{input:?}, width {width}");
+                for row in rows.iter().filter(|row| continued(&row.layout)) {
+                    assert!(
+                        row.layout.prefix.width() >= 2,
+                        "missing hanging prefix for {input:?}"
+                    );
+                    assert_eq!(row.byte_at_column(text_x(row)), 0);
+                    assert!(text_x(row) >= row.x + 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_only_overlay_preserves_each_underlying_background() {
+        let area = Rect::new(3, 1, 17, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 2));
+        for (index, cell) in buffer.content.iter_mut().enumerate() {
+            let bg = if index % 2 == 0 {
+                Color::Red
+            } else {
+                Color::Blue
+            };
+            cell.set_symbol("x")
+                .set_bg(bg)
+                .set_style(Style::default().add_modifier(Modifier::all()));
+        }
+        let backgrounds = |buffer: &Buffer| {
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.bg)
+                .collect::<Vec<_>>()
+        };
+        let before = backgrounds(&buffer);
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .remove_modifier(Modifier::all());
+        render_line(&Line::from("↓ Latest activity"), area, &mut buffer, style);
+        assert_eq!(backgrounds(&buffer), before);
+        let cells = (area.x..area.right()).map(|x| &buffer[(x, area.y)]);
+        assert_eq!(
+            cells.clone().map(|cell| cell.symbol()).collect::<String>(),
+            "↓ Latest activity"
+        );
+        assert!(cells.clone().all(|cell| cell.modifier.is_empty()));
+    }
+
+    #[test]
+    fn scroll_thumb_shows_the_share_and_position_in_view() {
+        let thumb = |top, total| {
+            let backend = ratatui::backend::TestBackend::new(1, 4);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let frame = terminal
+                .draw(|frame| {
+                    let shown = top as f64..(top + 4) as f64;
+                    scroll_thumb(frame, r(0, 0, 1, 4), shown, total as f64, theme().ui.base);
+                })
+                .unwrap();
+            let cells = frame.buffer.content.iter();
+            cells.map(|cell| cell.symbol()).collect::<String>()
+        };
+        assert_eq!(thumb(0, 4), "    ");
+        assert_eq!(thumb(0, 8), "▐▐  ");
+        assert_eq!(thumb(4, 8), "  ▐▐");
+        assert_eq!(thumb(3, 100), "▐   ", "a long overflow keeps one cell");
+        assert_eq!(thumb(96, 100), "   ▐");
+    }
+
+    #[test]
+    fn borrowed_lines_match_paragraph_styles_and_clipping() {
+        let bold = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        let lines = [
+            Line::from("plain text"),
+            Line::from("  界 👩‍💻 wide  "),
+            Line::from(vec![
+                Span::styled("bold ", bold),
+                Span::styled("界 tail", Style::default().bg(Color::Blue)),
+            ])
+            .style(Style::default().add_modifier(Modifier::ITALIC)),
+            Line::default(),
+        ];
+        let style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        for line in lines {
+            for width in 0..20 {
+                let area = Rect::new(2, 1, width, 1);
+                let mut expected = Buffer::empty(Rect::new(0, 0, 25, 3));
+                let mut actual = expected.clone();
+                Paragraph::new(line.clone())
+                    .style(style)
+                    .render(area, &mut expected);
+                render_line(&line, area, &mut actual, style);
+                assert_eq!(actual, expected, "width {width}: {line:?}");
+            }
+        }
+    }
+}

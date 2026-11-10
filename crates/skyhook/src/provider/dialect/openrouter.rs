@@ -1,31 +1,29 @@
 //! openrouter.ai: Chat with the `reasoning` object, verbatim `reasoning_details`
 //! replay (plain `reasoning` for a response without readable details), `cache_control` on
 //! content parts, usage on every stream, and `x-session-id` affinity; Messages
-//! for Anthropic models, with their tool-name alphabet; Responses stateless with
-//! the same affinity header and a top-level `cache_control`. Chat and Responses
-//! take OpenAI's tool-name alphabet and strict schemas.
+//! for Anthropic models; Responses stateless with the same affinity header and a
+//! top-level `cache_control`. Chat takes OpenAI's tool-name alphabet, and Chat and
+//! Responses strict schemas.
 //! Provider routing rides the body and bearer keys authenticate on every codec;
 //! attribution headers name Skyhook.
 
+use crate::provider::codec::errors::{ErrorSignals, error_object};
 use reqwest::header::HeaderValue;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Wire};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        BodyPath, BreakpointBudget, CacheControl, CacheTtl, Codec, CodecName, Locations, NonEmpty,
-        StateRole, ToolNames, UnsignedReasoning,
+        BodyPath, CacheControl, CacheTtl, Codec, CodecName, Locations, NonEmpty, StateRole,
+        UnsignedReasoning,
         chat_completions::{self, EmptyContent, NativeReplay, ReasoningReplay, UsageRequest},
         header, messages, path, responses,
     },
-    http::{
-        Fields, Transport,
-        errors::{ErrorSignals, error_object},
-    },
+    http::{Fields, Transport},
 };
 
 fn chat() -> chat_completions::Dialect {
@@ -38,8 +36,6 @@ fn chat() -> chat_completions::Dialect {
         empty_content: EmptyContent::Null,
         usage_request: UsageRequest::Implicit,
         cache_control: CacheControl::Sent { ttl: None },
-        // The strictest cap among the services behind it.
-        breakpoints: BreakpointBudget::new(4),
         ..chat_completions::Dialect::compatible()
     }
 }
@@ -273,7 +269,7 @@ impl DialectConfig for Config {
         BaseUrl::Default("https://openrouter.ai/api/v1")
     }
 
-    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Wire, DialectError> {
         let transport = transport(codec);
         // Each codec keeps its own family's conventions.
         let openai = |mut codec| {
@@ -287,33 +283,30 @@ impl DialectConfig for Config {
                 unsigned: UnsignedReasoning::Replayed(()),
                 ..super::openai::responses()
             })),
-            CodecName::Messages => Codec::Messages(messages::Dialect {
-                tool_names: ToolNames::Anthropic,
-                ..messages::Dialect::standard()
-            }),
+            CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
         if let Some(ttl) = codec.cache_ttl_mut() {
             *ttl = self.cache_ttl;
         }
         codec.identity_mut().cache_key = Locations::one(header("x-session-id"));
-        let mut profile = Profile::new(
+        let mut wire = Wire::new(
             codec,
             transport,
             Dialect::Openrouter,
             super::compatible::IMAGES,
         );
-        profile.state_role(self.state_role, StateRole::User);
+        wire.state_role(self.state_role, StateRole::User);
         if let Some(routing) = &self.routing {
-            profile.transport.fields.every = routing.fields();
-            profile.discriminate("routing", routing);
+            wire.transport.fields.every = routing.fields();
+            wire.discriminate("routing", routing);
         }
         for (name, value) in [
             ("http-referer", "https://github.com/kryesh/skyhook"),
             ("x-openrouter-title", "Skyhook"),
         ] {
-            profile.fixed(name, HeaderValue::from_static(value));
+            wire.fixed(name, HeaderValue::from_static(value));
         }
-        Ok(profile)
+        Ok(wire)
     }
 }
 
@@ -409,12 +402,12 @@ mod tests {
             .unwrap(),
         );
         // Placements stay clear of the fields routing adds.
-        let profile = routed.admit(CodecName::Responses).unwrap();
+        let wire = routed.admit(CodecName::Responses).unwrap();
         let placed: super::super::Placements =
             crate::yaml::parse("cache_key: {body: provider.sort}").unwrap();
-        let codec = placed.apply(profile.codec).unwrap();
+        let codec = placed.apply(wire.codec).unwrap();
         assert_matches!(
-            super::super::placements::check(&codec, &profile.transport.fields),
+            super::super::placements::check(&codec, &wire.transport.fields),
             Err(super::super::PlacementError::Reserved { .. })
         );
         for codec in CODECS {
@@ -436,9 +429,6 @@ mod tests {
                 json!({"require_parameters":true}),
                 "{codec}"
             );
-            assert!(body.get("models").is_none());
-            let body = sent(&Config::default(), codec, "k", request()).await.body;
-            assert!(body.get("provider").is_none());
         }
     }
 

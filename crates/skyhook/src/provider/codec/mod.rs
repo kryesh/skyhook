@@ -6,25 +6,27 @@
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::{Value, json};
+use skyhook_base::enums::NamedEnum;
 
+use crate::provider::model::Effort;
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::InvalidRequest,
     http::{
         Headers,
-        errors::{self, ErrorSignals},
         transport::{Rejection, SseEvent},
     },
     protocol::{ContextId, ModelRequest, ResponseEvent, ResponseSchema, Scope},
 };
-use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_valid_tool_name};
+use crate::tool::catalog::is_valid_tool_name;
 use common::PreparedImages;
+use errors::ErrorSignals;
 
 pub mod chat_completions;
 pub(crate) mod common;
+pub(crate) mod errors;
 mod locations;
 pub(crate) mod messages;
-mod openai;
 mod placement;
 pub(crate) mod responses;
 pub(crate) mod usage;
@@ -33,18 +35,15 @@ pub(crate) use locations::Locations;
 pub use locations::NonEmpty;
 pub(crate) use locations::set_each;
 pub use placement::{BodyPath, CacheKey, CacheTtl};
-pub(crate) use placement::{
-    BreakpointBudget, Cache, CacheControl, Identity, header, overlaps, path,
-};
+pub(crate) use placement::{Cache, CacheControl, Identity, header, overlaps, path};
 pub use responses::{CyberAccessProgram, ReasoningSummary};
 
-crate::named_enum::named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum CodecName {
-        ChatCompletions = "chat_completions",
-        Responses = "responses",
-        Messages = "messages",
-    }
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CodecName {
+    ChatCompletions,
+    Responses,
+    Messages,
 }
 
 impl CodecName {
@@ -59,25 +58,15 @@ impl CodecName {
 
     /// The `reasoning` profile values the family accepts.
     pub(crate) fn effort_levels(self) -> EffortLevels {
+        use Effort::*;
         match self {
-            Self::ChatCompletions | Self::Responses => OPENAI_EFFORT,
-            Self::Messages => MESSAGES_EFFORT,
+            Self::ChatCompletions | Self::Responses => {
+                EffortLevels(&[None, Minimal, Low, Medium, High, Xhigh, Max])
+            }
+            // `off` and `adaptive` select a thinking mode; the rest are
+            // `output_config.effort` levels under adaptive thinking.
+            Self::Messages => EffortLevels(&[Off, Adaptive, Low, Medium, High, Xhigh, Max]),
         }
-    }
-
-    /// Write `effort` at each of `paths`. A journaled profile resumes on the
-    /// live entry, which may speak another family since the profile was
-    /// admitted, so the level is checked again here.
-    pub(crate) fn place_effort(
-        self,
-        paths: &NonEmpty<BodyPath>,
-        root: &mut serde_json::Map<String, Value>,
-        effort: &str,
-    ) -> Result<(), ProviderError> {
-        if !self.effort_levels().accepts(effort) {
-            return Err(InvalidRequest.error(format!("Unsupported reasoning effort: {effort}")));
-        }
-        set_each(paths.iter(), root, Value::from(effort))
     }
 }
 
@@ -89,18 +78,17 @@ pub(crate) enum Codec {
     Messages(messages::Dialect),
 }
 
-crate::named_enum::named_enum! {
-    /// The role runtime state takes on the wire.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    pub enum StateRole {
-        /// The protocol's harness role: a system message on Messages, turn-scoped where
-        /// its dialect says; a system or developer message on Chat; a developer message
-        /// on Responses.
-        System = "system",
-        /// User content, for servers without a harness role mid-conversation: it joins
-        /// the user turn before it, or is a user turn of its own.
-        User = "user",
-    }
+/// The role runtime state takes on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StateRole {
+    /// The protocol's harness role: a system message on Messages, turn-scoped where
+    /// its dialect says; a system or developer message on Chat; a developer message
+    /// on Responses.
+    System,
+    /// User content, for servers without a harness role mid-conversation: it joins
+    /// the user turn before it, or is a user turn of its own.
+    User,
 }
 
 /// An encoded request: the body and the headers the dialect places values in.
@@ -199,14 +187,6 @@ impl Codec {
         }
     }
 
-    pub(crate) fn tool_names_mut(&mut self) -> &mut ToolNames {
-        match self {
-            Self::ChatCompletions(dialect) => &mut dialect.tool_names,
-            Self::Responses(dialect) => &mut dialect.tool_names,
-            Self::Messages(dialect) => &mut dialect.tool_names,
-        }
-    }
-
     /// How a response schema is transmitted, where the family has a choice.
     pub(crate) fn schema_mut(&mut self) -> Option<&mut SchemaConstraint> {
         match self {
@@ -239,9 +219,9 @@ impl Codec {
     pub(crate) fn error(&self, rejection: &Rejection, signals: ErrorSignals) -> ProviderError {
         let reading = match self {
             Self::ChatCompletions(_) | Self::Responses(_) => {
-                openai::read::<openai::Code>(&rejection.body)
+                errors::read::<errors::Code>(&rejection.body)
             }
-            Self::Messages(_) => openai::read::<messages::Code>(&rejection.body),
+            Self::Messages(_) => errors::read::<messages::Code>(&rejection.body),
         };
         errors::classify(
             Some(rejection.status),
@@ -264,7 +244,7 @@ impl Codec {
         match self {
             Self::ChatCompletions(dialect) => {
                 let format = dialect.reasoning_replay.format();
-                let request = crate::media::BlobDigest::of(body);
+                let request = skyhook_media::BlobDigest::of(body);
                 let decoder = chat_completions::Decoder::new(model, scope, format, errors, request);
                 Decoder::ChatCompletions(decoder)
             }
@@ -302,19 +282,18 @@ impl Decoder {
 
 /// The `reasoning` profile values an endpoint accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EffortLevels(pub(crate) &'static [&'static str]);
-
-const OPENAI_EFFORT: EffortLevels =
-    EffortLevels(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
-
-/// Messages thinking settings: `off` and `adaptive` select a thinking mode;
-/// the rest are `output_config.effort` levels under adaptive thinking.
-const MESSAGES_EFFORT: EffortLevels =
-    EffortLevels(&["off", "adaptive", "low", "medium", "high", "xhigh", "max"]);
+pub struct EffortLevels(&'static [Effort]);
 
 impl EffortLevels {
-    pub(crate) fn accepts(&self, effort: &str) -> bool {
+    pub(crate) fn accepts(self, effort: Effort) -> bool {
         self.0.contains(&effort)
+    }
+}
+
+impl std::fmt::Display for EffortLevels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<_> = self.0.iter().map(|effort| effort.as_str()).collect();
+        f.write_str(&names.join(", "))
     }
 }
 
@@ -358,6 +337,7 @@ impl SchemaConstraint {
     }
 }
 
+const OPENAI_MAX_TOOL_NAME_BYTES: usize = 64;
 const ANTHROPIC_MAX_TOOL_NAME_BYTES: usize = 128;
 
 /// Which tool names an endpoint accepts: any nonblank name, or a bounded
@@ -373,7 +353,7 @@ impl ToolNames {
     fn limit(self) -> Option<usize> {
         match self {
             Self::Any => None,
-            Self::OpenAi => Some(MAX_TOOL_NAME_BYTES),
+            Self::OpenAi => Some(OPENAI_MAX_TOOL_NAME_BYTES),
             Self::Anthropic => Some(ANTHROPIC_MAX_TOOL_NAME_BYTES),
         }
     }
@@ -382,13 +362,6 @@ impl ToolNames {
         match self.limit() {
             None => !name.trim().is_empty(),
             Some(limit) => is_valid_tool_name(name, limit),
-        }
-    }
-
-    pub(crate) fn rule(self) -> String {
-        match self.limit() {
-            None => "a nonblank name".into(),
-            Some(limit) => format!("1–{limit} ASCII letters, digits, underscores or hyphens"),
         }
     }
 }
@@ -418,14 +391,6 @@ mod tests {
             encoded.body["metadata"],
             serde_json::json!({"session": "session", "user": "session"})
         );
-        let plain = Codec::Messages(messages::Dialect::standard());
-        assert!(
-            plain
-                .encode(&request, Default::default(), &context)
-                .unwrap()
-                .headers
-                .is_empty()
-        );
     }
 
     /// Admission keeps placements clear of the listed fields, so every path an
@@ -434,7 +399,8 @@ mod tests {
     /// listed field is written by some dialect.
     #[test]
     fn listed_fields_cover_every_body_path_an_encoder_writes() {
-        use crate::provider::protocol::{ResponseSchema, SystemSegment, ToolDefinition};
+        use crate::provider::protocol::{ResponseSchema, SystemSegment};
+        use crate::tool::catalog::ToolDefinition;
         use serde_json::{Map, json};
         /// The paths under `prefix` that are neither listed nor lead to one.
         fn unlisted(prefix: &str, object: &Map<String, Value>, listed: &[&str]) -> Vec<String> {
@@ -472,7 +438,7 @@ mod tests {
             )
             .unwrap(),
         );
-        request.reasoning = Some("high".into());
+        request.reasoning = Some(Effort::High);
         // Whether some row's body holds each listed field.
         let mut written = std::collections::BTreeMap::<_, bool>::new();
         let nested = messages::Dialect {
@@ -543,27 +509,9 @@ mod tests {
     fn tool_name_rules() {
         assert!(ToolNames::Any.accepts("vendor.tool/雪"));
         assert!(!ToolNames::Any.accepts(" "));
-        assert!(ToolNames::OpenAi.accepts(&"a".repeat(MAX_TOOL_NAME_BYTES)));
-        assert!(!ToolNames::OpenAi.accepts(&"a".repeat(MAX_TOOL_NAME_BYTES + 1)));
+        assert!(ToolNames::OpenAi.accepts(&"a".repeat(OPENAI_MAX_TOOL_NAME_BYTES)));
+        assert!(!ToolNames::OpenAi.accepts(&"a".repeat(OPENAI_MAX_TOOL_NAME_BYTES + 1)));
         assert!(ToolNames::Anthropic.accepts(&"a".repeat(ANTHROPIC_MAX_TOOL_NAME_BYTES)));
         assert!(!ToolNames::Anthropic.accepts("vendor.tool"));
-        // An encoder refuses a tool its names reject.
-        let mut request = common::tests::request("m");
-        request.tools = vec![std::sync::Arc::new(
-            crate::provider::protocol::ToolDefinition {
-                name: "vendor.tool".into(),
-                description: String::new(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-        )];
-        let mut codec = Codec::ChatCompletions(chat_completions::Dialect::compatible());
-        let context = "c".parse().unwrap();
-        assert!(codec.encode(&request, Default::default(), &context).is_ok());
-        *codec.tool_names_mut() = ToolNames::OpenAi;
-        assert!(
-            codec
-                .encode(&request, Default::default(), &context)
-                .is_err()
-        );
     }
 }

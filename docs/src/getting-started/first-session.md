@@ -53,8 +53,7 @@ for inspection and follow-up input after the work finishes. These interface mode
 interactive terminal. Use `skyhook batch` with `-p/--prompt` or `-s/--script` for headless execution
 with redirected input/output support and automatic exit; see [Headless execution](../guide/headless.md).
 
-An unused startup draft creates no saved session. The first sent message or explicitly run
-script creates the session. Use `--workspace PATH` to select another workspace. Normally,
+The first sent message or explicitly run script creates the session. Use `--workspace PATH` to select another workspace. Normally,
 `<workspace>/.skyhook/config.yaml` overlays the selected user configuration, entry by entry. Use
 `--config path.yaml` to load **only** that file instead, with no user/workspace config merging.
 See [configuration layering](../configuration/overview.md#file-selection-and-layering), including
@@ -74,7 +73,7 @@ See [dump](../reference/cli.md#dump) for compatible options. After a session,
 
 Actions with effects outside the workspace require approval. See
 [permissions and capabilities](../guide/permissions.md) before using `--approve-all`; it bypasses
-tool approvals, not authentication prompts.
+tool approvals, not capability gates.
 
 Next, learn the [terminal interface](../guide/terminal-interface.md),
 [session and context behavior](../guide/sessions-and-context.md), or

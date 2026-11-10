@@ -1,31 +1,30 @@
 use std::time::Duration;
 
+use skyhook_base::enums::NamedEnum;
 use thiserror::Error;
 
-crate::named_enum::named_enum! {
-    /// Normalized failure classes, spelled as displayed. The runtime retries on the
-    /// kind alone.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-    pub enum ProviderErrorKind {
-        Authentication = "Authentication",
-        /// A command-sourced value the server accepted before was refused with
-        /// HTTP 401 and discarded: a retry runs the command again.
-        CredentialExpired = "CredentialExpired",
-        /// Quota, credit, or spend limit exhausted: never retried.
-        Billing = "Billing",
-        InvalidRequest = "InvalidRequest",
-        ContextWindowExceeded = "ContextWindowExceeded",
-        Protocol = "Protocol",
-        Timeout = "Timeout",
-        Transport = "Transport",
-        RateLimited = "RateLimited",
-        /// A retryable server-side failure: 5xx, overloaded, or an in-stream error.
-        Unavailable = "Unavailable",
-        /// A completed response with no text or call to act on: retried like an outage.
-        EmptyResponse = "EmptyResponse",
-        /// Skyhook's own work on the request failed, such as a panic: never retried.
-        Internal = "Internal",
-    }
+/// Normalized failure classes, spelled as displayed. The runtime retries on the
+/// kind alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, NamedEnum)]
+pub enum ProviderErrorKind {
+    Authentication,
+    /// A command-sourced value the server accepted before was refused with
+    /// HTTP 401 and discarded: a retry runs the command again.
+    CredentialExpired,
+    /// Quota, credit, or spend limit exhausted: never retried.
+    Billing,
+    InvalidRequest,
+    ContextWindowExceeded,
+    Protocol,
+    Timeout,
+    Transport,
+    RateLimited,
+    /// A retryable server-side failure: 5xx, overloaded, or an in-stream error.
+    Unavailable,
+    /// A completed response with no text or call to act on: retried like an outage.
+    EmptyResponse,
+    /// Skyhook's own work on the request failed, such as a panic: never retried.
+    Internal,
 }
 
 impl ProviderErrorKind {
@@ -98,7 +97,7 @@ impl ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::named_enum::NamedEnum;
+    use skyhook_base::enums::NamedEnum;
 
     #[test]
     fn only_transient_kinds_are_retryable() {

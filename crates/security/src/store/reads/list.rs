@@ -1,16 +1,18 @@
-//! Keyset listings of live nodes of one kind.
+//! Keyset listings of one kind of record: live nodes, environments or tasks.
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use skyhook::db::{optional_enum_column, params};
+use skyhook_base::bounded::Bounded;
 
 use super::super::*;
 
-/// What a listing of one kind of node selects.
-#[derive(Clone, Copy, Debug)]
-pub enum ListQuery {
-    Component,
-    Path,
+/// Records of one kind, filtered: live nodes, environments or tasks
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ListQuery {
+    Component {},
+    Path {},
     State {
         scope: Option<StateScope>,
     },
@@ -26,19 +28,27 @@ pub enum ListQuery {
         root: Option<FlawId>,
         state: Option<Status>,
     },
-    Finding,
+    Finding {},
+    Environment {},
+    Task {},
 }
 
-impl ListQuery {
-    const fn kind(self) -> NodeKind {
+/// A listed record: a node's summary, an environment or a task.
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(rename = "Listed")]
+pub(crate) enum ListItem {
+    Node(NodeSummary),
+    Environment(EnvironmentView),
+    Task(Task),
+}
+
+impl Keyed for ListItem {
+    fn key(&self) -> i64 {
         match self {
-            Self::Component => NodeKind::Component,
-            Self::Path => NodeKind::Path,
-            Self::State { .. } => NodeKind::State,
-            Self::Premise { .. } => NodeKind::Premise,
-            Self::Flaw { .. } => NodeKind::Flaw,
-            Self::Candidate { .. } => NodeKind::Candidate,
-            Self::Finding => NodeKind::Finding,
+            Self::Node(node) => node.key(),
+            Self::Environment(environment) => environment.key(),
+            Self::Task(task) => task.key(),
         }
     }
 }
@@ -46,7 +56,7 @@ impl ListQuery {
 /// A node's own status, by its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(untagged)]
-pub enum NodeStatus {
+pub(crate) enum NodeStatus {
     Inventory(InventoryStatus),
     Path(PathStatus),
     Premise(PremiseStatus),
@@ -56,11 +66,11 @@ pub enum NodeStatus {
 
 /// A live node as a listing shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct NodeSummary {
-    pub id: NodeId,
-    pub title: String,
+pub(crate) struct NodeSummary {
+    pub(crate) id: NodeId,
+    pub(crate) title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<NodeStatus>,
+    pub(crate) status: Option<NodeStatus>,
 }
 
 impl Keyed for NodeSummary {
@@ -105,34 +115,45 @@ macro_rules! list_sql {
 }
 
 impl Store {
-    /// A page of live nodes of one kind, oldest first.
-    pub fn list(&self, query: &ListQuery, page: Page) -> Result<Listing<NodeSummary>> {
-        let kind = query.kind();
-        let mut bound = params![page.after, kind];
-        let sql = match *query {
-            ListQuery::Component => {
-                list_sql!("c.status", "JOIN component c ON c.node=n.id", "1")
+    /// A page of records of one kind, oldest first.
+    pub(crate) fn list(&self, query: &ListQuery, page: Page) -> Result<Listing<ListItem>> {
+        let (kind, filter, sql) = match *query {
+            ListQuery::Environment {} => {
+                return Ok(self.environments(page)?.map(ListItem::Environment));
             }
-            ListQuery::Path => list_sql!("p.status", "JOIN path p ON p.node=n.id", "1"),
-            ListQuery::State { scope } => {
-                bound.extend(params![scope]);
+            ListQuery::Task {} => return Ok(self.task_page(page)?.map(ListItem::Task)),
+            ListQuery::Component {} => (
+                NodeKind::Component,
+                params![],
+                list_sql!("c.status", "JOIN component c ON c.node=n.id", "1"),
+            ),
+            ListQuery::Path {} => (
+                NodeKind::Path,
+                params![],
+                list_sql!("p.status", "JOIN path p ON p.node=n.id", "1"),
+            ),
+            ListQuery::State { scope } => (
+                NodeKind::State,
+                params![scope],
                 list_sql!(
                     "s.status",
                     "JOIN state s ON s.node=n.id",
                     "(?3 IS NULL OR s.scope=?3)"
-                )
-            }
-            ListQuery::Finding => list_sql!("NULL", "", "1"),
-            ListQuery::Premise { scope, status } => {
-                bound.extend(params![scope, status]);
+                ),
+            ),
+            ListQuery::Finding {} => (NodeKind::Finding, params![], list_sql!("NULL", "", "1")),
+            ListQuery::Premise { scope, status } => (
+                NodeKind::Premise,
+                params![scope, status],
                 list_sql!(
                     "p.status",
                     "JOIN premise_standing p ON p.node=n.id",
                     "(?3 IS NULL OR p.scope=?3) AND (?4 IS NULL OR p.status=?4)"
-                )
-            }
-            ListQuery::Flaw { status, component } => {
-                bound.extend(params![status, component]);
+                ),
+            ),
+            ListQuery::Flaw { status, component } => (
+                NodeKind::Flaw,
+                params![status, component],
                 match component {
                     Some(_) => {
                         "SELECT n.id,n.title,f.status FROM flaw x CROSS JOIN node n ON n.id=x.node \
@@ -144,10 +165,11 @@ impl Store {
                         "JOIN flaw_standing f ON f.node=n.id",
                         "(?3 IS NULL OR f.status=?3)"
                     ),
-                }
-            }
-            ListQuery::Candidate { root, state } => {
-                bound.extend(params![root, state]);
+                },
+            ),
+            ListQuery::Candidate { root, state } => (
+                NodeKind::Candidate,
+                params![root, state],
                 match root {
                     Some(_) => {
                         "SELECT n.id,n.title,s.state FROM candidate_flaw r CROSS JOIN node n ON \
@@ -160,12 +182,76 @@ impl Store {
                         "JOIN candidate_state s ON s.candidate=n.id",
                         "(?4 IS NULL OR s.state=?4)"
                     ),
-                }
-            }
+                },
+            ),
         };
+        let bound = [params![page.after, kind], filter].concat();
         self.read(|db| {
             let items = first_rows(db, sql, bound, page.limit(), |row| summary(row, kind))?;
-            Ok(Listing::keyset(items, page))
+            Ok(Listing::keyset(items, page).map(ListItem::Node))
         })
     }
+}
+
+/// A keyset page: records after `after`, at most `limit` of them
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Page {
+    pub(crate) after: i64,
+    pub(crate) limit: Bounded<1, 1000>,
+}
+impl Page {
+    pub(crate) const fn new(after: i64, limit: Bounded<1, 1000>) -> Self {
+        Self { after, limit }
+    }
+    pub(crate) fn limit(self) -> usize {
+        u64::from(self.limit) as usize
+    }
+}
+impl Default for Page {
+    fn default() -> Self {
+        Self::new(0, Bounded::new::<100>())
+    }
+}
+
+/// One keyset page: the records read and the cursor to continue from, `None` at the end.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub(crate) struct Listing<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) next_after: Option<i64>,
+}
+impl<T> Listing<T> {
+    pub(crate) fn map<U>(self, wrap: impl FnMut(T) -> U) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().map(wrap).collect(),
+            next_after: self.next_after,
+        }
+    }
+}
+impl<T> std::ops::Deref for Listing<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items
+    }
+}
+impl<T> IntoIterator for Listing<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+impl<T: Keyed> Listing<T> {
+    /// A full page continues after its last key; a shorter one is the end.
+    pub(crate) fn keyset(items: Vec<T>, page: Page) -> Self {
+        let next_after = (items.len() == page.limit())
+            .then(|| items.last().map(Keyed::key))
+            .flatten();
+        Self { items, next_after }
+    }
+}
+
+/// The record id a keyset page orders by.
+pub(crate) trait Keyed {
+    fn key(&self) -> i64;
 }

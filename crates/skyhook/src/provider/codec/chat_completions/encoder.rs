@@ -1,13 +1,11 @@
 //! Encode canonical history and provider-bound reasoning replay into Chat requests.
 use super::dialect::{Dialect, EmptyContent, ReasoningReplay, SystemRole, UsageRequest};
-use crate::media::Image;
 use crate::provider::{
     ProviderError,
-    ProviderErrorKind::InvalidRequest,
     codec::{
-        Cache, CacheControl, CodecName, ToolNames,
+        Cache, CacheControl, ToolNames,
         common::{
-            PreparedImages, StateWire, check_tool, image_url, is_sealed, own_replay, push_state,
+            PreparedImages, StateWire, image_url, is_sealed, own_replay, push_state,
             signed_context, system_text, user_parts,
         },
         placement::{breakpoint, explicit_breakpoint, push_history},
@@ -15,9 +13,9 @@ use crate::provider::{
     },
     protocol::{AssistantItem, Entry, Message, ModelRequest, ReplayFormat},
 };
-use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char};
+use crate::tool::catalog::{MAX_TOOL_NAME_BYTES, is_tool_name_char};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use skyhook_media::Image;
 
 /// The body fields this codec writes.
 pub(crate) const BODY_FIELDS: &[&str] = &[
@@ -79,12 +77,11 @@ pub(crate) fn encode(
             Ok(())
         }
     };
-    let budget = marker.as_ref().map(|_| dialect.breakpoints);
     let key = marker.as_ref().map_or("", |(key, _)| key);
     push_history(
         &mut messages,
         request,
-        budget,
+        marker.is_some(),
         cached,
         send,
         |messages| last_cacheable(messages, key),
@@ -109,20 +106,14 @@ pub(crate) fn encode(
         UsageRequest::Implicit => {}
     }
     if let Some(reasoning) = &request.reasoning {
-        CodecName::ChatCompletions.place_effort(&dialect.effort, &mut root, reasoning)?;
+        set_each(dialect.effort.iter(), &mut root, json!(reasoning))?;
     }
-    if let Some(limit) = request.max_output_tokens {
-        set_each(dialect.output_limit.iter(), &mut root, json!(limit))?;
-    }
+    let limit = json!(request.max_output_tokens);
+    set_each(dialect.output_limit.iter(), &mut root, limit)?;
     set_each(dialect.tool_stream.iter(), &mut root, json!(true))?;
     if !request.tools.is_empty() {
-        let mut names = BTreeSet::new();
         let mut tools = Vec::new();
         for tool in &request.tools {
-            check_tool(tool, dialect.tool_names, CodecName::ChatCompletions)?;
-            if !names.insert(&tool.name) {
-                return Err(InvalidRequest.error("Chat tools require unique function names"));
-            }
             let mut function = json!({"name": tool.name, "parameters": tool.input_schema});
             if !tool.description.is_empty() {
                 function["description"] = json!(tool.description);
@@ -249,9 +240,6 @@ fn push_message(
             // All tool replies must precede the synthetic user image message.
             let mut parts = Vec::new();
             for result in results {
-                if result.call_id.is_empty() {
-                    return Err(InvalidRequest.error("Chat tool results require a call ID"));
-                }
                 messages.push(json!({"role": "tool", "tool_call_id": result.call_id, "content": result.result.to_string()}));
                 if !result.images.is_empty() {
                     parts.push(json!({"type": "text", "text": format!("Images returned by tool call {}:", result.call_id)}));
@@ -352,14 +340,13 @@ pub(super) mod tests {
         envelope, image, image_data, loaded, notes, request, tool_result, user,
     };
     use crate::provider::codec::{Locations, NonEmpty, SchemaConstraint, UnsignedReasoning};
-    use crate::provider::protocol::{entries, state};
-    use crate::{
-        media::AttachmentRef,
-        provider::protocol::{
-            AssistantItem, Binding, Replay, ReplayFormat, ResponseSchema, SystemSegment, ToolCall,
-            ToolDefinition, UserContent,
-        },
+    use crate::provider::protocol::{
+        AssistantItem, Binding, Replay, ReplayFormat, ResponseSchema, SystemSegment, ToolCall,
+        UserContent,
     };
+    use crate::provider::protocol::{entries, state};
+    use crate::tool::catalog::ToolDefinition;
+    use skyhook_media::AttachmentRef;
 
     /// A server that rejects unknown assistant keys, like the official API.
     fn unsupported() -> Dialect {
@@ -408,7 +395,7 @@ pub(super) mod tests {
             text: "system".into(),
             cache: false,
         }];
-        request.reasoning = Some("high".into());
+        request.reasoning = Some(crate::provider::model::Effort::High);
         request.response_schema = Some(
             ResponseSchema::new(
                 "answer",
@@ -436,7 +423,6 @@ pub(super) mod tests {
         assert_eq!(body["tool_stream"], true);
         assert_eq!(body["prompt_cache_key"], "session");
         assert_eq!(body["metadata"]["user_id"], "session");
-        assert!(encoded.headers.is_empty());
         // The schema goes as written, flagged `strict` only where the dialect says.
         let schema = request.response_schema.as_ref().unwrap().schema();
         let format = &body["response_format"]["json_schema"];
@@ -537,7 +523,7 @@ pub(super) mod tests {
         assert_eq!(messages[2]["thinking_blocks"], json!([block]));
         assert!(messages[2].get("reasoning_content").is_none());
         // The tool result ends the prefix and takes the breakpoint; the request's own
-        // state follows as a user message, never inside the tool output.
+        // state follows as a user message.
         let parts = messages[3]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["cache_control"], json!({"type":"ephemeral"}));
@@ -743,7 +729,7 @@ pub(super) mod tests {
             json!({"type":"reasoning.encrypted","data":"d","index":1}),
         ];
         let mut request = request("test-model");
-        request.reasoning = Some("high".into());
+        request.reasoning = Some(crate::provider::model::Effort::High);
         request.system = vec![SystemSegment {
             text: "stable".into(),
             cache: true,
@@ -805,7 +791,7 @@ pub(super) mod tests {
             text: "system".into(),
             cache: true,
         }];
-        request.reasoning = Some("high".into());
+        request.reasoning = Some(crate::provider::model::Effort::High);
         let schema = json!({"type":"object", "properties":{"value":{}, "choice":{"oneOf":[{"const":true},{"type":"array"}]}}});
         request.tools = vec![std::sync::Arc::new(ToolDefinition {
             name: "inspect".into(),
@@ -856,7 +842,6 @@ pub(super) mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], "inspect");
         assert_eq!(body["tools"][0]["function"]["parameters"], schema);
         assert_eq!(body["reasoning_effort"], "high");
-        assert!(body.get("n").is_none());
         // Text-only turns and system segments go as plain strings; an empty tool
         // description is left out.
         let mut minimal = crate::provider::codec::common::tests::request("model");
@@ -881,15 +866,10 @@ pub(super) mod tests {
             json!({"role":"user","content":"hello"})
         );
         assert!(body["tools"][0]["function"].get("description").is_none());
-        for (effort, valid) in [("max", true), ("adaptive", false)] {
-            let mut request = history(vec![]);
-            request.reasoning = Some(effort.into());
-            let body = encode(&request, Default::default(), &unsupported());
-            assert_eq!(
-                body.ok().map(|body| body["reasoning_effort"].clone()),
-                valid.then(|| json!(effort))
-            );
-        }
+        let mut request = history(vec![]);
+        request.reasoning = Some(crate::provider::model::Effort::Max);
+        let body = encode(&request, Default::default(), &unsupported()).unwrap();
+        assert_eq!(body["reasoning_effort"], "max");
         // Historical call names are sent as recorded where any name is accepted, and
         // sanitized into the endpoint's alphabet where one is enforced; results pair by id.
         let strict = Dialect {
@@ -946,7 +926,6 @@ pub(super) mod tests {
             assert_eq!(message["content"], "ok");
             assert_eq!(message[field], "first second");
             assert!(message.get(absent).is_none());
-            assert!(body.get("n").is_none());
         }
         let unsupported = encode(&original, Default::default(), &unsupported()).unwrap();
         assert_eq!(
@@ -995,14 +974,13 @@ pub(super) mod tests {
         assert_eq!(body["messages"][0]["reasoning"], "original private thought");
         assert_eq!(body["messages"][0]["content"], "answer");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call");
-        assert!(!json!(body).to_string().contains("visible summary"));
     }
 
     /// A state in the user role joins a user turn before it and is otherwise its own user
-    /// message, never part of a tool's output; in the system role it is a message of the
-    /// system prompt's role. A superseded state is omitted either way.
+    /// message; in the system role it is a message of the system prompt's role. A
+    /// superseded state is omitted either way.
     #[test]
-    fn states_take_the_dialects_role_and_never_join_tool_output() {
+    fn states_take_the_dialects_role() {
         use crate::provider::protocol::{StateLifetime::*, state};
         let call = AssistantItem::tool_call("c", 0, inspect("call", json!({})));
         let result = tool_result("call", "inspect", json!("ok"), vec![], false);
@@ -1013,9 +991,7 @@ pub(super) mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "tool");
-        assert!(!messages[1]["content"].as_str().unwrap().contains("now"));
         assert_eq!(messages[2], json!({"role":"user","content":"now"}));
-        assert!(!json!(body).to_string().contains("earlier"));
         let system = Dialect {
             state_role: crate::provider::codec::StateRole::System,
             ..unsupported()

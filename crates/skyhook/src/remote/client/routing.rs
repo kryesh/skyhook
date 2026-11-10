@@ -1,452 +1,107 @@
-//! Dispatch shim responses without blocking frame reads on host callbacks.
+//! Write a connection's frames, and route a worker's to the calls they answer,
+//! without blocking frame reads.
 use super::*;
-use crate::{
-    remote::{PromptAnswer, flow::CHUNK_BYTES, protocol::ControlRequest},
-    tool::authorization::AuthorizationError,
-};
-use tokio::io::AsyncRead;
+use futures_util::FutureExt as _;
+use tokio::sync::mpsc::error::TrySendError;
 
+/// Run the connection: `writing` writes what `outbox` sends while the worker's
+/// frames are routed, until the transport fails or `shutdown` ends the connection.
 pub(super) async fn route_responses<R>(
-    output: R,
+    mut output: FrameReader<R>,
+    writing: impl Future<Output = std::io::Result<()>>,
+    outbox: Outbox<ClientFrame>,
     state: &Mutex<ConnectionState>,
-    writer: &Arc<Mutex<Writer>>,
-    location: ExecutionLocation,
-    prompts: Arc<dyn SensitivePromptHandler>,
     shutdown: CancellationToken,
     owner: Box<dyn Send>,
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut results = super::results::Results::default();
+    // Never done while `outbox` is held, but polled again after the end is sent.
+    let writing = writing.fuse();
+    tokio::pin!(writing);
     let error = tokio::select! {
-        Err(error) = route(output, state, writer, location, prompts, &mut results) => error,
-        () = shutdown.cancelled() => RemoteError::Cancelled,
+        Err(error) = &mut writing => transport_error(error, Operation::Send),
+        Err(error) = route(&mut output, state) => error,
+        () = shutdown.cancelled() => {
+            // Ending the connection on purpose: the worker stops its calls, then
+            // acknowledges the end. A transport that stalls any of it, the frames
+            // queued before the end included, is released once the grace is over.
+            outbox.send(ClientFrame::End);
+            let grace = skyhook_worker::protocol::END_GRACE + lock(state).ending;
+            let end = async {
+                tokio::select! {
+                    _ = &mut writing => {}
+                    _ = route(&mut output, state) => {}
+                }
+            };
+            let _ = tokio::time::timeout(grace, end).await;
+            RemoteFault::Cancelled.into()
+        }
     };
-    // Stop transport resources before draining: persistence must not need a live
-    // socket or acknowledgements, and eviction must not abort accepted payloads.
     drop(owner);
-    let error = transport_error(error, Operation::Receive);
-    state.lock().await.fail(error.clone());
-    results.shutdown(state).await;
-    fail_connection(state, error).await;
+    fail_connection(state, transport_error(error, Operation::Receive));
 }
 
 async fn route<R>(
-    mut output: R,
+    output: &mut FrameReader<R>,
     state: &Mutex<ConnectionState>,
-    writer: &Arc<Mutex<Writer>>,
-    location: ExecutionLocation,
-    prompts: Arc<dyn SensitivePromptHandler>,
-    results: &mut super::results::Results,
-) -> Result<std::convert::Infallible, RemoteError>
+) -> Result<(), RemoteError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut callbacks = tokio::task::JoinSet::<Result<Option<PromptId>, RemoteError>>::new();
-    let mut prompt_tasks = HashMap::<PromptId, crate::job::CancellationToken>::new();
     loop {
-        // Keep the frame read alive while servicing callbacks: read_exact is not
-        // cancellation-safe, so restarting it could lose part of a frame.
-        let response = {
-            let reading = read_frame::<_, Response>(&mut output);
-            tokio::pin!(reading);
-            loop {
-                tokio::select! {
-                    response = &mut reading => break response,
-                    completed = results.tasks.join_next(), if !results.tasks.is_empty() => {
-                        results.complete(state, completed.expect("nonempty ingestion set")).await?;
-                    }
-                    completed = callbacks.join_next(), if !callbacks.is_empty() => {
-                        match completed {
-                            Some(Ok(Ok(Some(id)))) => { prompt_tasks.remove(&id); }
-                            Some(Ok(Ok(None))) => {}
-                            Some(Err(error)) if error.is_cancelled() => {}
-                            Some(Ok(Err(error))) => return Err(error),
-                            Some(Err(error)) => return Err(RemoteError::task_failed("remote callback", error)),
-                            None => unreachable!("nonempty callback set"),
-                        }
-                    }
-                }
-            }
-        };
-        let response = response
+        let frame = (output.next::<WorkerFrame>().await)
             .map_err(|error| transport_error(error, Operation::Receive))?
-            .ok_or(RemoteError::Protocol(ProtocolError::Violation(
-                "shim closed before replying",
-            )))?;
-        match response {
-            Response::Payload { request_id, event } => {
-                results
-                    .payload(state, writer, &location, request_id, event)
-                    .await?;
-            }
-            Response::SensitiveCancelled { prompt_id } => {
-                if let Some(cancellation) = prompt_tasks.remove(&prompt_id) {
-                    cancellation.cancel();
-                }
-            }
-            Response::StreamData { channel, data } => {
-                let invalid = data.len() > CHUNK_BYTES;
-                let overflow = {
-                    let state = state.lock().await;
-                    state.streams.get(&channel).is_some_and(|sender| {
-                        !sender.output.is_closed() && sender.output.try_send(data).is_err()
-                    })
-                };
-                if invalid || overflow {
-                    return Err(ProtocolError::Violation(
-                        "invalid stream output or flow-control overflow",
-                    )
-                    .into());
-                }
-            }
-            Response::StreamClosed { channel, error } => {
-                if let Some(stream) = state.lock().await.streams.remove(&channel) {
-                    let result = error.map_or(Ok(()), |mut diagnostic| {
-                        diagnostic.bind_worker(&location);
-                        Err(RemoteError::Remote {
-                            diagnostic: Box::new(diagnostic.into()),
-                            output: None,
-                        })
-                    });
-                    let _ = stream.closed.send(result);
-                }
-            }
-            Response::StreamAck { channel } => {
-                let invalid = {
-                    let state = state.lock().await;
-                    state
-                        .streams
-                        .get(&channel)
-                        .is_some_and(|stream| stream.credit.0.acknowledge().is_err())
-                };
-                if invalid {
-                    return Err(ProtocolError::Violation("invalid stream credit").into());
-                }
-            }
-            Response::SourceAck { request_id } => {
-                // Acknowledgements may trail a call that has already ended.
-                let invalid = state
-                    .lock()
-                    .await
-                    .pending
-                    .get(&request_id)
-                    .is_some_and(|pending| {
-                        pending
-                            .upload
-                            .as_ref()
-                            .is_none_or(|credits| credits.0.acknowledge().is_err())
-                    });
-                if invalid {
-                    return Err(ProtocolError::Violation("invalid source upload credit").into());
-                }
-            }
-            Response::SensitivePrompt {
-                prompt_id,
-                mut prompt,
-            } => {
-                if prompt_tasks.contains_key(&prompt_id) {
-                    return Err(ProtocolError::Violation("duplicate prompt").into());
-                }
-                prompt.origin = location.target.clone();
-                let writer = writer.clone();
-                let prompts = prompts.clone();
-                let cancellation = crate::job::CancellationToken::new();
-                let cancelled = cancellation.clone();
-                callbacks.spawn(async move {
-                    // Cancellation stops the prompt, not a partially committed
-                    // answer frame. Once answering starts only connection shutdown
-                    // may abort this write.
-                    let answer = tokio::select! {
-                        answer = prompts.prompt(prompt) => answer,
-                        () = cancelled.cancelled() => return Ok(Some(prompt_id)),
-                    };
-                    let answer = answer.unwrap_or(PromptAnswer::Rejected);
-                    let answer = ControlRequest::SensitiveAnswer { prompt_id, answer };
-                    write_frame(&mut *writer.lock().await, &Request::Control(answer))
-                        .await
-                        .map_err(|error| transport_error(error, Operation::Send))?;
-                    Ok(Some(prompt_id))
+            .ok_or(Violation::ClosedBeforeReply)?;
+        match frame {
+            WorkerFrame::Events { id, events } => {
+                let state = lock(state);
+                // A call dropped since discards what was still in flight for it.
+                let overflow = (state.calls.get(&id)).is_some_and(|call| {
+                    matches!(call.events.try_send(events), Err(TrySendError::Full(_)))
                 });
-                prompt_tasks.insert(prompt_id, cancellation);
+                if overflow {
+                    return Err(Violation::EventOverflow.into());
+                }
             }
-            Response::Tool { request_id } => results.terminal(request_id)?,
-            Response::Authorization {
-                request_id,
-                authorization_id,
-                request,
-            } => {
-                // The worker names its own machine as the root; everything it asks
-                // for is bound to this connection's target.
-                let (permissions, origin, asking) = request.into_parts(&location.target);
-                let (context, admitted) = {
-                    let state = state.lock().await;
-                    let pending = state.pending.get(&request_id);
-                    let context = (pending.filter(|pending| !pending.sender.is_closed()))
-                        .map(|pending| pending.context.clone());
-                    (context, state.admitted.clone())
-                };
-                let writer = writer.clone();
-                callbacks.spawn(async move {
-                    let decision = match context {
-                        Some(context) => {
-                            context
-                                .authorize(permissions, origin, asking, &admitted)
-                                .await
-                        }
-                        None => Err(AuthorizationError::PolicyFailed),
-                    };
-                    write_frame(
-                        &mut *writer.lock().await,
-                        &Request::AuthorizationDecision {
-                            request_id,
-                            authorization_id,
-                            decision,
-                        },
-                    )
-                    .await
-                    .map_err(|error| transport_error(error, Operation::Send))?;
-                    Ok(None)
+            WorkerFrame::InputAck { id } => {
+                let state = lock(state);
+                let invalid = (state.calls.get(&id)).is_some_and(|call| {
+                    (call.input.as_ref()).is_none_or(|credits| !credits.acknowledge())
                 });
+                if invalid {
+                    return Err(Violation::InputCredit.into());
+                }
             }
-            Response::Ready { .. } => {
-                return Err(
-                    ProtocolError::Violation("received a second remote ready response").into(),
-                );
+            WorkerFrame::Performing { id, resolved } => {
+                land(state, id, Landed::Performing(resolved))?;
+            }
+            WorkerFrame::Held { id, resolved } => land(state, id, Landed::Held(resolved))?,
+            WorkerFrame::Done { id, outcome } => {
+                let call = lock(state).calls.remove(&id);
+                if let Some(call) = call {
+                    let _ = call.done.send(Ok(outcome));
+                }
+            }
+            WorkerFrame::Ended => {
+                return Err(RemoteFault::Cancelled.into());
+            }
+            WorkerFrame::Ready(_) | WorkerFrame::Refused(_) => {
+                return Err(Violation::SecondHandshake.into());
             }
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::tests::{
-        build, fixture_context, fixture_context_with, output, route_fixture, sink, test_connection,
-        write_result,
+/// Tell contained call `id` where its paths resolved; a call not contained, or told
+/// already, has no such answer.
+fn land(state: &Mutex<ConnectionState>, id: CallId, landed: Landed) -> Result<(), RemoteError> {
+    let mut state = lock(state);
+    // A call dropped since discards its answer.
+    let Some(call) = state.calls.get_mut(&id) else {
+        return Ok(());
     };
-    use super::*;
-    use crate::remote::protocol::AuthorizationId;
-    use crate::tests::bounded;
-    use crate::tool::authorization::{
-        Asking, AuthorizationArguments, AuthorizationCoordinator, Reauthorization,
-    };
-    use crate::tool::policy::{Capability, PermissionUse, ResourceId};
-    use std::assert_matches;
-
-    const PROMPT: PromptId = PromptId::new(9);
-    const AUTHORIZATION: AuthorizationId = AuthorizationId::new(7);
-
-    /// What a worker forwards of `request`.
-    fn forwarded(request: Reauthorization) -> crate::remote::protocol::Forwarded {
-        crate::remote::protocol::Forwarded::of(request)
-            .unwrap()
-            .unwrap()
-    }
-
-    async fn control(reader: &mut tokio::io::DuplexStream) -> Option<Request> {
-        loop {
-            let request = read_frame(reader).await.unwrap();
-            if !matches!(request, Some(Request::PayloadAck)) {
-                return request;
-            }
-        }
-    }
-
-    async fn register(
-        state: &Mutex<ConnectionState>,
-        id: u64,
-        context: &ToolContext,
-    ) -> oneshot::Receiver<super::super::PendingResult> {
-        let (sender, receiver) = oneshot::channel();
-        let call = PendingCall {
-            sender,
-            context: context.clone(),
-            upload: None,
-        };
-        state.lock().await.pending.insert(RequestId::new(id), call);
-        receiver
-    }
-
-    #[tokio::test]
-    async fn authorization_callbacks_do_not_block_dispatch_and_fail_the_connection_on_write_error()
-    {
-        use crate::tool::policy::{Approval, AuthorizationRequest, Policy, PolicyDecision};
-        use tokio::sync::Notify;
-        struct WaitingPolicy(Arc<Notify>, Arc<Notify>);
-        impl Policy for WaitingPolicy {
-            fn authorize(&self, _: AuthorizationRequest) -> Approval<'_> {
-                Approval::Ask(Box::pin(async move {
-                    self.0.notify_one();
-                    self.1.notified().await;
-                    PolicyDecision::allow()
-                }))
-            }
-        }
-        let runtime = crate::tests::TestRuntime::new().await;
-        let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        let policy = WaitingPolicy(entered.clone(), release.clone());
-        let context = fixture_context(&runtime).with_invocation_authority(
-            AuthorizationCoordinator::new(Arc::new(policy)),
-            "read".into(),
-            AuthorizationArguments::default(),
-        );
-        let connection = test_connection();
-        let (mut requests, responses) = tokio::io::duplex(4096);
-        let (input, mut replies) = tokio::io::duplex(4096);
-        let writer: Arc<Mutex<Writer>> = Arc::new(Mutex::new(Box::new(input)));
-        let first_result = register(&connection.state, 1, &context).await;
-        let receiver = register(&connection.state, 2, &context).await;
-        let state = connection.state.clone();
-        let reader = tokio::spawn(async move { route_fixture(responses, &state, &writer).await });
-        let prompt = || Response::SensitivePrompt {
-            prompt_id: PROMPT,
-            prompt: crate::remote::SensitivePrompt::test(
-                crate::remote::SensitivePromptKind::Password,
-            ),
-        };
-        bounded(async {
-            let outside = ResourceId::path(
-                &crate::target::TargetRef::Root,
-                &crate::tool::policy::PathText::new("/outside").unwrap(),
-            );
-            let request = Response::Authorization {
-                request_id: RequestId::new(1),
-                authorization_id: AUTHORIZATION,
-                request: forwarded(Reauthorization::Permissions(
-                    vec![PermissionUse::new(Capability::Read, outside)],
-                    Asking::Allowed,
-                )),
-            };
-            write_frame(&mut requests, &request).await.unwrap();
-            entered.notified().await;
-            write_result(&mut requests, RequestId::new(2), output("second")).await;
-            let completed = receiver.await.unwrap().unwrap();
-            assert_eq!(completed.output.value, "second");
-            write_frame(&mut requests, &prompt()).await.unwrap();
-            assert_matches!(
-                control(&mut replies).await,
-                Some(Request::Control(ControlRequest::SensitiveAnswer {
-                    prompt_id: PROMPT,
-                    answer: PromptAnswer::Rejected
-                }))
-            );
-            release.notify_one();
-            assert_matches!(
-                control(&mut replies).await,
-                Some(Request::AuthorizationDecision {
-                    authorization_id: AUTHORIZATION,
-                    decision: Ok(()),
-                    ..
-                })
-            );
-        })
-        .await;
-        // No further incoming frame should be required to observe callback failure.
-        drop(replies);
-        write_frame(&mut requests, &prompt()).await.unwrap();
-        let error = bounded(first_result)
-            .await
-            .unwrap()
-            .unwrap_err()
-            .into_tool_error()
-            .diagnostic();
-        assert_eq!(error.context.operation, Operation::Send);
-        assert_eq!(error.context.site, FailureSite::Host);
-        assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
-        assert_matches!(error.cause, crate::tool::diagnostic::Cause::Io { .. });
-        reader.await.unwrap();
-    }
-
-    /// A worker's network request is bound to the connection it arrives on, not
-    /// to the target of the call it serves, such as a source read for a tool
-    /// running elsewhere.
-    #[tokio::test]
-    async fn network_reauthorization_is_bound_to_the_connection_target() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let policy = crate::tests::RecordingPolicy::allowing();
-        let capabilities = [Capability::Network].into_iter().collect();
-        let job = crate::identity::JobId::new(1).unwrap();
-        let context = fixture_context_with(&runtime, job, capabilities).with_invocation_authority(
-            AuthorizationCoordinator::new(policy.clone()),
-            "read".into(),
-            AuthorizationArguments::default(),
-        );
-        assert_eq!(
-            context.execution_location().target,
-            crate::target::TargetRef::Root
-        );
-        let connection = test_connection();
-        let (mut requests, responses) = tokio::io::duplex(4096);
-        let (input, mut replies) = tokio::io::duplex(4096);
-        let writer: Arc<Mutex<Writer>> = Arc::new(Mutex::new(Box::new(input)));
-        let _pending = register(&connection.state, 1, &context).await;
-        let state = connection.state.clone();
-        let reader = tokio::spawn(async move { route_fixture(responses, &state, &writer).await });
-        let origin = "https://example.test";
-        let request = Response::Authorization {
-            request_id: RequestId::new(1),
-            authorization_id: AUTHORIZATION,
-            request: forwarded(Reauthorization::Network(origin.to_owned())),
-        };
-        write_frame(&mut requests, &request).await.unwrap();
-        assert_matches!(
-            bounded(control(&mut replies)).await,
-            Some(Request::AuthorizationDecision {
-                decision: Ok(()),
-                ..
-            })
-        );
-        {
-            let seen = policy.requests.lock().unwrap();
-            let [request] = &seen[..] else {
-                panic!("one request: {seen:?}");
-            };
-            let network = ResourceId::network(&build().target, origin);
-            let expected = [PermissionUse::new(Capability::Network, network)];
-            assert_eq!(request.permissions, expected);
-            assert_eq!(request.arguments["network_origin"], origin);
-        }
-        drop(requests);
-        reader.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_or_closed_response_fails_pending_requests() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let context = fixture_context(&runtime);
-        for (orphan, invalid_frame) in [(true, false), (false, false), (false, true)] {
-            let (mut peer, stream) = tokio::io::duplex(4096);
-            let state = Arc::new(Mutex::new(ConnectionState::default()));
-            let receiver = register(&state, 1, &context).await;
-            let reader = tokio::spawn(async move { route_fixture(stream, &state, &sink()).await });
-            if orphan {
-                let orphaned = Response::Tool {
-                    request_id: RequestId::new(99),
-                };
-                write_frame(&mut peer, &orphaned).await.unwrap();
-            }
-            if invalid_frame {
-                use tokio::io::AsyncWriteExt as _;
-                peer.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
-            }
-            drop(peer);
-            let error = receiver
-                .await
-                .unwrap()
-                .unwrap_err()
-                .into_tool_error()
-                .diagnostic();
-            assert_eq!(error.context.operation, Operation::Receive);
-            assert_eq!(error.context.site, FailureSite::Host);
-            assert_eq!(
-                error.context.subject,
-                Subject::Label("remote transport".into())
-            );
-            assert_eq!(error.context.request, RequestEffects::MayHaveExecuted);
-            if invalid_frame {
-                assert_matches!(error.cause, crate::tool::diagnostic::Cause::Io { .. });
-            }
-            reader.await.unwrap();
-        }
-    }
+    let landing = call.landing.take().ok_or(Violation::ForeignAnswer)?;
+    let _ = landing.send(landed);
+    Ok(())
 }

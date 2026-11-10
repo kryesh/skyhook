@@ -1,6 +1,6 @@
 //! Stable, bounded MCP registry names with catalog-wide collision avoidance.
 use super::super::manager::DiscoveredTool;
-use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
+use crate::tool::catalog::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Prefer readable names. Allocate against the whole catalog before registration
@@ -43,7 +43,12 @@ pub(super) fn tool_names(
         let tool = item.tool.name.as_ref();
         // Length-delimited originals distinguish identities such as a_b/c and
         // a/b_c, as well as names that normalize to the same ASCII spelling.
-        let hash = crate::sha256_hex(format!("{}:{server}{}:{tool}", server.len(), tool.len()));
+        let hash = skyhook_base::hex::Sha256::of(format!(
+            "{}:{server}{}:{tool}",
+            server.len(),
+            tool.len()
+        ))
+        .to_string();
         let readable: String = name
             .chars()
             .map(|c| if is_tool_name_char(c) { c } else { '_' })

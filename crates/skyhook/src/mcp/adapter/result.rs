@@ -1,20 +1,18 @@
 //! Preserve MCP result envelopes and persist bounded image attachments.
 use crate::{
-    media::{
-        BlobDigest, Image, ImageFormat, ImageRef, MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION,
-        MAX_IMAGES_PER_SUBMISSION, MediaError, decode_base64_bounded,
-    },
     session::SessionStore,
-    tool::{
-        ToolError, ToolOutput,
-        diagnostic::{Effects, Operation, PartialContext, Subject},
-    },
+    tool::{ToolError, ToolOutput},
 };
 #[cfg(test)]
 use base64::Engine as _;
 use rmcp::model::{Annotations, CallToolResult, ContentBlock, MetaObject, ResultType};
 use serde::Serialize;
 use serde_json::Value;
+use skyhook_media::{
+    Base64Error, BlobDigest, Image, ImageFormat, ImageRef, MAX_IMAGE_BYTES, decode_base64_bounded,
+};
+use skyhook_tools::diagnostic::PartialContext;
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,9 +31,7 @@ struct SanitizedResult {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum SanitizedBlock {
-    // Only map_result creates this, after excluding images. Preserve the complete
-    // upstream non-image value instead of defining a closed text/resource/audio
-    // subset: arbitrary metadata and structured values stay open.
+    // The complete upstream non-image block.
     NonImage(ContentBlock),
     Image(SanitizedImage),
 }
@@ -92,7 +88,7 @@ impl McpImage {
 pub(super) fn schema() -> Value {
     let text = serde_json::json!({
         "type": "object",
-        "properties": {"type": {"const": "text"}, "text": crate::tool::output::JsonText::schema()},
+        "properties": {"type": {"const": "text"}, "text": skyhook_tools::output::JsonText::schema()},
         "required": ["type", "text"]
     });
     serde_json::json!({
@@ -140,31 +136,22 @@ pub(super) async fn map_result(
         content,
     };
     let mut images = Vec::new();
-    let mut total_bytes = 0_u64;
+    let mut budget = crate::agent::ImageBudget::default();
     for (index, source) in sources {
         let SanitizedBlock::Image(block) = &mut sanitized.content[index] else {
             continue;
         };
         let subject = Subject::Label(format!("MCP image block {index}"));
-        let reference = match import_image(
-            &source,
-            &block.mime_type,
-            images.len(),
-            total_bytes,
-            store,
-            &subject,
-        )
-        .await
-        {
-            Ok(reference) => reference,
-            Err(error) => {
-                block.status = ImageStatus::Failed {
-                    message: error.to_string(),
-                };
-                return Err(error.with_result(output(&sanitized, images)?));
-            }
-        };
-        total_bytes += reference.blob.bytes;
+        let reference =
+            match import_image(&source, &block.mime_type, &mut budget, store, &subject).await {
+                Ok(reference) => reference,
+                Err(error) => {
+                    block.status = ImageStatus::Failed {
+                        message: error.to_string(),
+                    };
+                    return Err(error.with_result(output(&sanitized, images)?));
+                }
+            };
         block.status = ImageStatus::Imported {
             image: McpImage::new(index, &reference),
         };
@@ -181,8 +168,7 @@ pub(super) async fn map_result(
 async fn import_image(
     source: &str,
     mime_type: &str,
-    image_count: usize,
-    total_bytes: u64,
+    budget: &mut crate::agent::ImageBudget,
     store: &SessionStore,
     subject: &Subject,
 ) -> Result<ImageRef, ToolError> {
@@ -191,13 +177,13 @@ async fn import_image(
     };
     let import_context = context(Operation::Deserialize);
     let exceeded = || ToolError::failed("MCP images exceed attachment limits");
-    if image_count >= MAX_IMAGES_PER_SUBMISSION {
+    if budget.full() {
         return Err(exceeded().context(import_context));
     }
     let limit = usize::try_from(MAX_IMAGE_BYTES).expect("image limit fits usize");
     let bytes = decode_base64_bounded(source, limit).map_err(|error| {
         match error {
-            MediaError::TooLarge => exceeded(),
+            Base64Error::TooLarge => exceeded(),
             other => ToolError::failed(format!("invalid MCP image encoding: {other}")),
         }
         .context(import_context.clone())
@@ -213,13 +199,10 @@ async fn import_image(
         )
         .context(import_context));
     }
-    let image = Image::decode(bytes).await.map_err(|error| match error {
-        MediaError::Task(error) => error.into(),
-        error => {
-            ToolError::failed(format!("invalid MCP image: {error}")).context(import_context.clone())
-        }
+    let image = Image::decode(bytes).await.map_err(|error| {
+        ToolError::failed(format!("invalid MCP image: {error}")).context(import_context.clone())
     })?;
-    if total_bytes + image.bytes().len() as u64 > MAX_IMAGE_BYTES_PER_SUBMISSION {
+    if !budget.take(image.bytes().len() as u64) {
         return Err(exceeded().context(import_context));
     }
     store
@@ -308,7 +291,7 @@ mod tests {
             for image in &output.images {
                 assert_eq!(
                     (&image.file, image.format),
-                    (&None, crate::media::ImageFormat::Png)
+                    (&None, skyhook_media::ImageFormat::Png)
                 );
                 let stored = runtime
                     .store
@@ -365,7 +348,7 @@ mod tests {
         let [stored] = output.images.as_slice() else {
             panic!("expected the declared JPEG")
         };
-        assert_eq!(stored.format, crate::media::ImageFormat::Jpeg);
+        assert_eq!(stored.format, skyhook_media::ImageFormat::Jpeg);
         assert_eq!(
             output.value["content"][0]["image"],
             json!({
@@ -379,7 +362,7 @@ mod tests {
         let gif = base64::engine::general_purpose::STANDARD.encode(crate::tests::animated_gif());
         let result = json!({"content":[{"type":"image","mimeType":"image/gif","data":gif}]});
         let output = map(&result, &runtime).await.unwrap();
-        assert_eq!(output.images[0].format, crate::media::ImageFormat::Png);
+        assert_eq!(output.images[0].format, skyhook_media::ImageFormat::Png);
         // Valid bytes under an unsupported or mismatched declaration are rejected.
         let mismatch = "invalid MCP image: data does not match its declared image type";
         for (mime, data, message) in [
@@ -414,14 +397,14 @@ mod tests {
         assert_eq!(output.value["content"][2]["text"], "preserved");
         // An image past the count is refused before its data is read.
         let image = json!({"type":"image","mimeType":"image/png","data":png()});
-        let mut content = vec![image; MAX_IMAGES_PER_SUBMISSION];
+        let mut content = vec![image; crate::agent::ImageBudget::MAX_IMAGES];
         content.push(json!({"type":"image","mimeType":"image/png","data":"not base64!"}));
         let (error, output) = failed(map(&json!({ "content": content }), &runtime).await);
         assert!(
             error.contains("MCP images exceed attachment limits"),
             "{error}"
         );
-        assert_eq!(output.images.len(), MAX_IMAGES_PER_SUBMISSION);
+        assert_eq!(output.images.len(), crate::agent::ImageBudget::MAX_IMAGES);
     }
 
     #[tokio::test]

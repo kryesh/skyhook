@@ -11,7 +11,8 @@ provider is used.
 Every provider names a **dialect**, the server's wire conventions. Each model selects a **codec**,
 either directly or from its provider's defaults: `chat_completions`, `responses`, or `messages`.
 The codec is the API family; `base_url` names the shared API root and Skyhook appends
-`/chat/completions`, `/responses`, or `/messages` for the selected model.
+`/chat/completions`, `/responses`, or `/messages` for the selected model
+(`/codex/responses` for a `codex` provider).
 Different models on one provider may use different supported codecs:
 
 | Dialect | Codecs | Use for |
@@ -29,8 +30,7 @@ dialect accepts fixed request `headers` for proxies or attribution, the
 `anthropic-beta` adds to the betas Skyhook announces rather than replacing them. The credential
 header and header placements (`cache_key: {header: …}`, or a dialect's own) replace an entry
 header of the same name; so does `Accept`, which is always `text/event-stream`. A shadowed
-header's command does not run for that request. There are no model aliases or automatic vendor
-detection: `model` is the identifier sent on the wire.
+header's command does not run for that request.
 
 ## Provider defaults and model settings
 
@@ -57,7 +57,6 @@ requests no summaries, and a placement selection of `null` places nothing. A set
 sends something, such as `state_role` or `reasoning_effort`, refuses `null`; leave it out to take
 its default. Lists, such as LiteLLM's `tags`, refuse `null` too: `[]` is the empty list. A
 placement selection's list of locations is never empty; `null` is how it places nothing.
-Provider-only settings differ: `startup_timeout_secs: null`, for one, takes the default.
 
 Every model must have `codec`, and LiteLLM models must also have `upstream`, **after inheritance**.
 A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
@@ -99,7 +98,7 @@ reasoning conventions to use for each alias.
 
 `service_tier` selects the backend's tier ID, such as `priority`, `flex`, or `ultrafast`, on any
 dialect and codec, as a provider default or beside `model`. It is unset by default and sent
-exactly as written: Skyhook does not translate client aliases such as `fast`. Check that the
+exactly as written. Check that the
 endpoint and model accept the tier before selecting it. Faster tiers can cost more or use more of
 a subscription; see [ChatGPT speed](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
@@ -170,8 +169,8 @@ proceeds. Each dialect sets defaults:
 
 `image_limits` replaces either limit, as a provider default or beside `model`; a limit left out
 keeps the default, and `image_limits: null` restores both. `max_bytes` is at most 8 MiB, since no
-image is stored larger, and `max_edge` at most 65535 px, the largest JPEG; a larger value reads
-as that maximum. The limits are per image: a service
+image is stored larger, and `max_edge` at most 65535 px, the largest JPEG; a larger value is
+refused. The limits are per image: a service
 rule that depends on how many images a request holds, or on their total pixel area, is not
 applied. Changing a model's limits from its dialect's defaults changes the images earlier
 reasoning saw, so signed reasoning from before the change is not replayed afterward.
@@ -233,7 +232,7 @@ Every model profile requires `max_context` and `max_output`. Both must be positi
 `max_output` must be smaller than `max_context`. Prompt/history, reasoning, and generated
 text share the context window. Automatic [compaction](../guide/sessions-and-context.md#conversation-compaction)
 is triggered by a response whose reported input, cached input, and output tokens reach
-90% of `max_context - max_output`; it does not estimate the next request. Compaction precedes
+90% of `max_context - max_output`. Compaction precedes
 tool execution, or, after a final answer, the agent's next request. The summarizer sees the
 pending calls, and their results reach the first post-compaction request intact; a pending `todo`
 replacement is superseded by its reconciled list.
@@ -261,8 +260,7 @@ then reuses little of the history. `none` sends no runtime state, except to a
 compaction summary, which needs the current todo list to reconcile it. See
 [runtime state](../reference/runtime-state.md) for what the model receives.
 
-Runtime state is the harness speaking, so it never appears as tool output. A dialect's
-`state_role` selects how it is sent:
+A dialect's `state_role` selects how runtime state is sent:
 
 - `system` uses the protocol's harness role: a system message on `messages`, a system or
   developer message on `chat_completions`, and a developer message on `responses`. Through
@@ -360,8 +358,8 @@ for server options.
 
 For every provider, **transient/network failures retry until success or cancellation**,
 with no attempt limit. This includes connection failures, interrupted streams, timeouts,
-rate limits, temporary server errors, an expired command-sourced credential
-([authentication](authentication.md#api-keys-and-environment-files)), and a response with
+rate limits, temporary server errors, an expired credential from a command or file
+([authentication](authentication.md#api-keys)), and a response with
 neither visible text nor a tool call, such as reasoning alone. Other authentication, billing
 (exhausted quota, credit, or spend limit, however the service reports it), invalid-request, and
 malformed-response errors stop the request instead of retrying. So do refusals, and a response
@@ -415,8 +413,7 @@ accept only reasoning they signed or encrypted never get the rest: `anthropic`, 
 `codex` on `responses`, and `litellm` behind Anthropic and on `responses`.
 
 Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
-replay their returned reasoning under **`reasoning_content` by default**. Ordinary Chat responses
-without reasoning do not acquire an invented reasoning field.
+replay their returned reasoning under **`reasoning_content` by default**.
 A server that spells the key differently selects it with `reasoning_replay: "reasoning"`; `reasoning_replay: null` keeps reasoning local. The `openai` dialect never
 replays on Chat, since the official API rejects unknown message keys; `litellm` behind an
 `anthropic` or `bedrock` upstream replays the thinking blocks the proxy returns, and `openrouter` replays its
@@ -429,16 +426,16 @@ is signed, and plain-text reasoning stays local. Responses and Messages replay n
 automatically; a Responses reasoning item that restates its summary as content, or the reverse,
 is kept once, as its final item states.
 
-Reasoning is replayed with its owning assistant turn, including turns that only call tools;
-it is never merged into answer text or fabricated `<think>` tags. Server-side tool and reasoning
-parsers/templates must be configured appropriately; Skyhook does not infer them from model names.
+Reasoning is replayed with its owning assistant turn, including turns that only call tools.
+Server-side tool and reasoning parsers/templates must be configured appropriately.
 Chat requests send `max_output` as `max_completion_tokens`; a server that only honours
 `max_tokens` sets `output_limit: "max_tokens"`.
 
 ## Connection timeouts
 
-Every provider accepts positive `startup_timeout_secs` and `read_idle_timeout_secs` settings
-(both default to 600 seconds). Startup is a deadline for each HTTP attempt, while read-idle resets
+Every provider accepts `startup_timeout_secs` and `read_idle_timeout_secs` settings, each a
+whole number of seconds from 1 through 86400 (both default to 600 seconds); `null` is refused, so
+leave one out to take its default. Startup is a deadline for each HTTP attempt, while read-idle resets
 after each response-body chunk. For example:
 
 ```yaml

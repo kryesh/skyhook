@@ -12,51 +12,51 @@ use super::{super::*, list::summary};
 
 /// A phase a node owes now with no task of it live, exhausted or not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Owing {
-    pub phase: Phase,
-    pub exhausted: bool,
+pub(crate) struct Owing {
+    pub(crate) phase: Phase,
+    pub(crate) exhausted: bool,
 }
 
 /// A node's latest task, by its job's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LastTask {
-    pub id: TaskId,
-    pub phase: Phase,
-    pub state: JobState,
+pub(crate) struct LastTask {
+    pub(crate) id: TaskId,
+    pub(crate) phase: Phase,
+    pub(crate) state: JobState,
 }
 
 #[derive(Clone, Debug)]
-pub struct ShelfRow {
-    pub node: NodeSummary,
-    pub owing: Vec<Owing>,
-    pub last: Option<LastTask>,
+pub(crate) struct ShelfRow {
+    pub(crate) node: NodeSummary,
+    pub(crate) owing: Vec<Owing>,
+    pub(crate) last: Option<LastTask>,
 }
 
 /// The first rows of a kind, and how many live nodes it has.
 #[derive(Clone, Debug)]
-pub struct Shelf {
-    pub total: u64,
-    pub rows: Vec<ShelfRow>,
+pub(crate) struct Shelf {
+    pub(crate) total: u64,
+    pub(crate) rows: Vec<ShelfRow>,
 }
 
 /// A member of a root group, as the Research page lists it.
 #[derive(Clone, Copy, Debug)]
-pub struct GroupMember {
-    pub candidate: CandidateId,
-    pub state: Status,
-    pub severity: Option<crate::cvss::Severity>,
-    pub confidence: Option<ConfidenceTier>,
+pub(crate) struct GroupMember {
+    pub(crate) candidate: CandidateId,
+    pub(crate) state: Status,
+    pub(crate) severity: Option<crate::cvss::Severity>,
+    pub(crate) confidence: Option<ConfidenceTier>,
 }
 
 /// A candidate's assessment, and whether the results its standing comes from still stand.
 #[derive(Clone, Copy, Debug)]
-pub struct Assessed {
-    pub vector: crate::cvss::Cvss40,
-    pub currency: Currency,
+pub(crate) struct Assessed {
+    pub(crate) vector: crate::cvss::Cvss40,
+    pub(crate) currency: Currency,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Currency {
+pub(crate) enum Currency {
     Current,
     /// Something it rests on changed since: it is owed again.
     Stale,
@@ -304,7 +304,7 @@ impl Facts {
                     (PremiseStatus::Undecided, Some(PremiseScope::Deployment)) => 0,
                     (PremiseStatus::Undecided, _) => 1,
                     // A decided premise owing its settle again is disputed.
-                    (_, _) if work != Work::None as i64 => 2,
+                    (_, _) if work != RowWork::None as i64 => 2,
                     (PremiseStatus::Holds, _) => 3,
                     (PremiseStatus::Fails, _) => 4,
                 };
@@ -332,39 +332,39 @@ impl Facts {
 
 /// What work a row's node has: a live task, work owed, work owed but exhausted, or none.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Work {
+enum RowWork {
     Running = 0,
     Owed = 1,
     Exhausted = 2,
     None = 3,
 }
 
-fn work(row: &ShelfRow) -> Work {
+fn work(row: &ShelfRow) -> RowWork {
     if row.last.is_some_and(|task| !task.state.is_terminal()) {
-        Work::Running
+        RowWork::Running
     } else if row.owing.iter().any(|owing| !owing.exhausted) {
-        Work::Owed
+        RowWork::Owed
     } else if row.owing.is_empty() {
-        Work::None
+        RowWork::None
     } else {
-        Work::Exhausted
+        RowWork::Exhausted
     }
 }
 
 impl Store {
     /// The first `limit` live nodes of `kind`, unswept paths first, each with what it owes now
     /// and its latest task.
-    pub fn shelf(&self, kind: NodeKind, limit: usize) -> Result<Shelf> {
+    pub(crate) fn shelf(&self, kind: NodeKind, limit: usize) -> Result<Shelf> {
         self.read(|db| shelf(db, kind, limit))
     }
 
     /// Which other candidate each of `candidates` waits behind, and why.
-    pub fn behind(&self, candidates: &[NodeId]) -> Result<BTreeMap<NodeId, Behind>> {
+    pub(crate) fn behind(&self, candidates: &[NodeId]) -> Result<BTreeMap<NodeId, Behind>> {
         self.read(|db| Ok(queues::behind(db, candidates)?.into_iter().collect()))
     }
 
     /// The live members of `candidate`'s root group, most severe first, each by its state.
-    pub fn root_group(&self, candidate: NodeId) -> Result<Vec<GroupMember>> {
+    pub(crate) fn root_group(&self, candidate: NodeId) -> Result<Vec<GroupMember>> {
         self.read(|db| {
             let sql = "SELECT s.candidate,s.state,s.severity,s.confidence FROM candidate_root r \
                        JOIN candidate_root o ON o.root=r.root JOIN candidate_state s ON \
@@ -383,7 +383,7 @@ impl Store {
 
     /// The assessments of those of `candidates` that were assessed, each with whether its
     /// results still stand.
-    pub fn assessments(&self, candidates: &[NodeId]) -> Result<BTreeMap<NodeId, Assessed>> {
+    pub(crate) fn assessments(&self, candidates: &[NodeId]) -> Result<BTreeMap<NodeId, Assessed>> {
         self.read(|db| {
             let sql = "SELECT candidate,vector,stale FROM candidate_state WHERE candidate IN \
                        (SELECT value FROM json_each(?1)) AND vector IS NOT NULL";
@@ -405,12 +405,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::super::tests::{
-            HIGH, assess, begun, candidate, decide, fixture, flaw, judge, premise, scenario, test,
-            text, verdict,
-        },
-        *,
+    use super::*;
+    use crate::store::tests::{
+        HIGH, assess, begun, candidate, decide, fixture, flaw, judge, premise, scenario, test,
+        text, verdict,
     };
 
     /// Each section lists its most relevant rows first: candidates by standing then score, a
@@ -443,7 +441,7 @@ mod tests {
             PremiseScope::Deployment,
         ]
         .map(|scope| premise(&store, &actor, scope));
-        let links = [decided, code, deployment].map(|premise| Link::FlawPremise {
+        let links = [decided, code, deployment].map(|premise| Edge::FlawPremise {
             flaw: severe.flaw,
             premise,
         });
@@ -462,12 +460,12 @@ mod tests {
         let (_session, store, actor) = fixture();
         let decoder = scenario(&store, &actor, "decoder");
         let [exhausted, owed, idle] = [(); 3].map(|_| premise(&store, &actor, PremiseScope::Code));
-        let links = [exhausted, owed].map(|premise| Link::FlawPremise {
+        let links = [exhausted, owed].map(|premise| Edge::FlawPremise {
             flaw: decoder.flaw,
             premise,
         });
         store.link(&actor, &links).unwrap();
-        crate::store::queues::tests::exhaust(&store, &Begin::Settle(vec![exhausted]));
+        crate::store::work::queues::tests::exhaust(&store, &Begin::Settle(Listed::of([exhausted])));
         let order: Vec<NodeId> = (store.shelf(NodeKind::Premise, 10).unwrap().rows.iter())
             .map(|row| row.node.id)
             .collect();
@@ -504,7 +502,7 @@ mod tests {
         let scenario = scenario(&store, &actor, "decoder");
         let id = scenario.candidate;
         let code = premise(&store, &actor, PremiseScope::Code);
-        let rests = Link::FlawPremise {
+        let rests = Edge::FlawPremise {
             flaw: scenario.flaw,
             premise: code,
         };
@@ -529,7 +527,7 @@ mod tests {
             scenario(&store, &actor, "a").candidate,
             scenario(&store, &actor, "b").candidate,
         );
-        let (_, _, task) = begun(&store, &Begin::Review(vec![merged]));
+        let (_, _, task) = begun(&store, &Begin::Review(Listed::of([merged])));
         let merge = Merge {
             node: merged.into(),
             into: kept.into(),

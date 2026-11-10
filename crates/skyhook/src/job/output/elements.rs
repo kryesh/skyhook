@@ -1,18 +1,17 @@
 //! Pages of a JSON field's elements or members: whole consecutive values within
 //! the page budget. A first value that is not whole within it is sampled; any
 //! later one starts the next page.
-use std::{collections::BTreeSet, io::Read};
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
-use struson::reader::{JsonReader, JsonStreamReader};
+use struson::reader::JsonReader;
 
 use super::{
-    ElementPage, FieldPointer, MemberPage, NextChild, OutputFields, OutputPreview,
-    OutputTruncation, ToolError, check_cancelled,
+    ElementPage, FieldPointer, MemberPage, OutputPreview, OutputTruncation, Presented, ToolError,
+    check_cancelled,
     json::saved_json,
     preview::{self, Accounting, Pooled},
-    projection::Presented,
-    render::JsonField,
+    stream::JsonField,
 };
 
 /// Up to `limit` values of the container `json` is positioned at, from `index`.
@@ -161,48 +160,6 @@ impl Budget {
     }
 }
 
-/// Children listed for host field discovery before the rest are left to paging.
-const LISTED_CHILDREN: usize = 100;
-
-/// Pointers of up to `LISTED_CHILDREN` members or elements of the container
-/// `reader` is at, from `index`, and where the rest continue.
-pub(super) fn children<R: Read>(
-    reader: &mut JsonStreamReader<R>,
-    container: Container,
-    field: &FieldPointer,
-    index: usize,
-    cancellation: &crate::job::CancellationToken,
-) -> Result<OutputFields, ToolError> {
-    match container {
-        Container::Object => reader.begin_object(),
-        Container::Array => reader.begin_array(),
-    }
-    .map_err(saved_json)?;
-    let (mut fields, mut position) = (Vec::new(), 0);
-    while reader.has_next().map_err(saved_json)? {
-        check_cancelled(cancellation)?;
-        if fields.len() == LISTED_CHILDREN {
-            let unit = container.unit();
-            let next = Some(NextChild {
-                index: position,
-                unit,
-            });
-            return Ok(OutputFields { fields, next });
-        }
-        let child = match container {
-            Container::Object => {
-                let name = reader.next_name().map_err(saved_json)?;
-                (position >= index).then(|| field.property(name))
-            }
-            Container::Array => (position >= index).then(|| field.index(position)),
-        };
-        fields.extend(child);
-        reader.skip_value().map_err(saved_json)?;
-        position += 1;
-    }
-    Ok(OutputFields { fields, next: None })
-}
-
 /// The container a JSON field is, which names the unit it pages in.
 #[derive(Clone, Copy)]
 pub(super) enum Container {
@@ -347,32 +304,5 @@ mod tests {
         assert_eq!(page.shape, Some(json!([5000, {"n": "integer"}])));
         let cut = page.truncated.as_ref().unwrap();
         assert_eq!(cut[0].field().as_str(), "/result/items/0");
-    }
-
-    #[test]
-    fn children_are_listed_from_an_index_up_to_the_listing_limit() {
-        let list = |value: &Value, container, index| {
-            let bytes = serde_json::to_vec(value).unwrap();
-            let mut json =
-                JsonField::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
-            let field = FieldPointer::result();
-            children(
-                &mut json.reader,
-                container,
-                &field,
-                index,
-                &Default::default(),
-            )
-            .unwrap()
-        };
-        let items = json!(vec![0; LISTED_CHILDREN + 1]);
-        let first = list(&items, Container::Array, 0);
-        assert_eq!(first.fields.len(), LISTED_CHILDREN);
-        assert_eq!(first.next.map(|next| next.index), Some(LISTED_CHILDREN));
-        let rest = list(&items, Container::Array, LISTED_CHILDREN);
-        assert_eq!(rest.fields, [FieldPointer::result().index(LISTED_CHILDREN)]);
-        assert_eq!(rest.next, None);
-        let members = list(&json!({"a/b": 1, "c": 2}), Container::Object, 1);
-        assert_eq!(members.fields, [FieldPointer::result().property("c")]);
     }
 }

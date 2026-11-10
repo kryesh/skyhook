@@ -1,7 +1,7 @@
 //! Where a dialect places a value: dot paths into the body, the one dimension that
 //! may also be a header (cache affinity), and the values placed there.
 
-use std::{borrow::Cow, fmt, num::NonZeroUsize};
+use std::{borrow::Cow, fmt};
 
 use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
@@ -197,41 +197,31 @@ pub(crate) fn explicit_breakpoint() -> Value {
 }
 
 /// The most prompt-cache breakpoints one request may mark, its system prompt's
-/// included. Each codec's dialects default to the cap its API documents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BreakpointBudget(NonZeroUsize);
-
-impl BreakpointBudget {
-    pub(crate) const fn new(budget: usize) -> Self {
-        match NonZeroUsize::new(budget) {
-            Some(budget) => Self(budget),
-            None => panic!("a breakpoint budget allows at least one breakpoint"),
-        }
-    }
-}
+/// included: the cap each API documents.
+const BREAKPOINTS: usize = 4;
 
 /// Push the sent prefix of the request's context and then the rest, marking cache
 /// breakpoints at the prefix's end and before each earlier response in it: each
 /// earlier request's prefix ended there, and a cache is read back only at a marked
 /// boundary. `locate` names the unmarked block a breakpoint would go on, the last
-/// text pushed so far, and `mark` marks it. Where `budget` cannot hold every distinct
-/// block beside the `system` breakpoints, the oldest go unmarked. A detached history
-/// is never reused, so it is not marked, and without a budget the server places its
-/// own breakpoints.
+/// text pushed so far, and `mark` marks it. Where [`BREAKPOINTS`] cannot hold every
+/// distinct block beside the `system` breakpoints, the oldest go unmarked. A detached
+/// history is never reused, so it is not marked, and unless `marked` the server places
+/// its own breakpoints.
 pub(crate) fn push_history<T, L: PartialEq>(
     target: &mut T,
     request: &ModelRequest,
-    budget: Option<BreakpointBudget>,
+    marked: bool,
     system: usize,
     mut push: impl FnMut(&mut T, &Entry) -> Result<(), ProviderError>,
     locate: impl Fn(&T) -> Option<L>,
     mut mark: impl FnMut(&mut T, L),
 ) -> Result<(), ProviderError> {
     let (prefix, rest) = sent(&request.context);
-    let marks = budget.filter(|_| request.history_lifetime == HistoryLifetime::Extends);
+    let marked = marked && request.history_lifetime == HistoryLifetime::Extends;
     let mut seams = Vec::new();
     let mut seam = |target: &T| {
-        if let Some(block) = locate(target).filter(|_| marks.is_some())
+        if let Some(block) = locate(target).filter(|_| marked)
             && !seams.contains(&block)
         {
             seams.push(block);
@@ -244,17 +234,9 @@ pub(crate) fn push_history<T, L: PartialEq>(
         push(target, entry)?;
     }
     seam(target);
-    if let Some(BreakpointBudget(budget)) = budget {
-        let slots = (budget.get().checked_sub(system))
-            .filter(|slots| *slots > 0 || seams.is_empty())
-            .ok_or_else(|| {
-                InvalidRequest.error(format!(
-                    "at most {budget} cache breakpoints fit a request, including one for history"
-                ))
-            })?;
-        for block in seams.into_iter().rev().take(slots) {
-            mark(target, block);
-        }
+    let slots = BREAKPOINTS.saturating_sub(system);
+    for block in seams.into_iter().rev().take(slots) {
+        mark(target, block);
     }
     rest.into_iter().try_for_each(|entry| push(target, entry))
 }

@@ -1,10 +1,9 @@
 -- Dictionaries are filled from the Rust enums when the database is created.
 CREATE TABLE node_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
--- The kind of node each phase works, and its place in the pipeline (`Phase::stage`).
+-- The kind of node each phase works.
 CREATE TABLE task_phase(
     name TEXT PRIMARY KEY,
     subject TEXT NOT NULL REFERENCES node_kind(name),
-    stage INTEGER NOT NULL,
     UNIQUE(name,subject)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE location_kind(name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -386,7 +385,7 @@ CREATE TABLE test_artifact(
     PRIMARY KEY(test,path)
 ) STRICT, WITHOUT ROWID;
 
--- The scheduling log. A task has no end of its own: it is live while its job is.
+-- The scheduling log. A task is live while its job is.
 CREATE TABLE task(
     id INTEGER PRIMARY KEY,
     job INTEGER NOT NULL REFERENCES job(id),

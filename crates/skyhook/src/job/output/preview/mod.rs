@@ -15,6 +15,7 @@ mod text;
 use std::{collections::BTreeSet, io::Read};
 
 use serde_json::Value;
+use skyhook_tools::output::Presented;
 
 use pool::Node;
 pub(super) use pool::pool;
@@ -22,8 +23,7 @@ use present::Fit;
 pub(super) use text::trailing_lines;
 
 use super::{
-    CONTENT_BYTES, FieldPointer, OutputTruncation, ToolError, json, projection::Presented,
-    render::Clipped, shape::Shape,
+    CONTENT_BYTES, FieldPointer, OutputTruncation, ToolError, shape::Shape, stream::Clipped,
 };
 
 /// Budget for a preview's sampled content, its shape and its truncation records.
@@ -90,7 +90,7 @@ pub(super) fn preview(
     clipped: &Clipped,
     cancellation: &crate::job::CancellationToken,
 ) -> Result<Preview, ToolError> {
-    let mut reader = json::reader(input);
+    let mut reader = skyhook_tools::output::json::reader(input);
     let pooled = pool(
         &mut reader,
         field,
@@ -192,8 +192,8 @@ pub(super) fn json_bytes(value: &impl serde::Serialize) -> usize {
 mod tests {
     use super::*;
     use crate::job::output::shape::COLLECTION_MEMBERS;
-    use crate::tool::output::FieldPresentation;
     use serde_json::json;
+    use skyhook_tools::output::FieldPresentation;
     use std::assert_matches;
 
     fn run(value: &Value, complete: &[&str]) -> Preview {
@@ -365,10 +365,10 @@ mod tests {
         let heavy: serde_json::Map<_, _> = (0..100)
             .map(|index| (format!("m{index:02}"), json!(inner)))
             .collect();
-        let value = json!({"stdout": "done\n", "items": [heavy], "exit_code": 0});
+        let value = json!({"stdout": "done\n", "items": [heavy], "exit": {"code": 0}});
         let preview = run(&value, &[]);
         assert_eq!(preview.value["stdout"], "done\n");
-        assert_eq!(preview.value["exit_code"], 0);
+        assert_eq!(preview.value["exit"]["code"], 0);
         let items = preview.value["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         let sample = items[0].as_object().unwrap();

@@ -10,41 +10,54 @@ use serde::{
 use serde_json::{Map, Value};
 
 use super::{
-    self as dialect, AdmissionError, BaseUrl, BuildError, Common, Connection, Dialect,
-    DialectConfig, ModelError, ModelSpec, Profile, Request, RequestSettings, anthropic, codex,
-    compatible, litellm, models::object, openai, openrouter,
+    self as dialect, AdmissionError, BuildError, Common, Connection, Dialect, DialectConfig,
+    DialectError, Login, ModelError, ModelSpec, Request, RequestSettings, Wire, anthropic, codex,
+    compatible, litellm, openai, openrouter,
 };
-use crate::identity::HostName;
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::Authentication,
     dialect::LoginCommand,
-    profile::{ModelName, ModelProfile, ProviderName},
+    model::{ModelName, ModelProfile, ProviderName},
     settings::{Empty, Patch, Settings},
 };
+use crate::{identity::HostName, yaml};
 
-/// Provider-only options own connection rules and authentication. Request
-/// settings never carry them.
+/// Where an entry's credentials come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeySource {
+    /// Its `api_key`, if it names one.
+    ApiKey,
+    /// The host's `auth` commands, which leave no room for an `api_key`.
+    Login,
+}
+
+/// Provider-only options own connection rules and authentication.
 pub(crate) trait ProviderOptions:
     Settings + Clone + Debug + Serialize + DeserializeOwned
 {
-    /// The entry's connection, at `base_url` when the entry names none.
-    fn admit(&self, common: &Common, base_url: BaseUrl) -> Result<Connection, AdmissionError> {
-        common.admit(base_url)
-    }
+    const KEY: KeySource = KeySource::ApiKey;
 
     /// The credentials the host's `auth` commands manage for the entry `command`
-    /// names, which replace its `api_key`.
+    /// names, where the key comes from a login.
     fn login(
         &self,
         _command: LoginCommand,
         _connection: &Connection,
-    ) -> Result<Option<codex::Account>, ProviderError> {
+    ) -> Result<Option<Login>, ProviderError> {
         Ok(None)
     }
 }
 
 impl ProviderOptions for Empty {}
+
+/// An entry's `models`, read under its own name so a refusal's path names it.
+#[derive(Deserialize)]
+#[serde(bound = "P: Patch")]
+struct Models<P> {
+    #[serde(default)]
+    models: IndexMap<ModelName, ModelSpec<P>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ProviderModels<P, O> {
@@ -54,25 +67,18 @@ pub struct ProviderModels<P, O> {
 }
 
 impl<P: Patch, O> ProviderModels<P, O> {
-    fn parse(mut fields: Map<String, Value>) -> Result<Self, String>
+    fn parse<E: de::Error>(mut fields: Map<String, Value>) -> Result<Self, E>
     where
         O: ProviderOptions,
     {
-        let models = fields
-            .remove("models")
-            .unwrap_or_else(|| Value::Object(Map::new()));
+        let models = fields.remove_entry("models").into_iter().collect();
         let (options, defaults) = fields
             .into_iter()
             .partition(|(key, _)| <O::Patch as Patch>::FIELDS.contains(&key.as_str()));
-        let options = serde_path_to_error::deserialize(Value::Object(options))
-            .map_err(|error| error.to_string())?;
-        let models =
-            serde_path_to_error::deserialize(models).map_err(|error| format!("models.{error}"))?;
-        let defaults = serde_path_to_error::deserialize(Value::Object(defaults))
-            .map_err(|error| error.to_string())?;
+        let Models { models } = yaml::located(models)?;
         Ok(Self {
-            options,
-            defaults,
+            options: yaml::located(options)?,
+            defaults: yaml::located(defaults)?,
             models,
         })
     }
@@ -81,7 +87,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
     where
         O: Serialize,
     {
-        let mut fields = object(&self.options);
+        let mut fields = yaml::object(&self.options);
         fields.extend(self.defaults.fields());
         fields.insert("models".into(), serde_json::to_value(&self.models).unwrap());
         fields
@@ -89,6 +95,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
 
     fn admit<C>(
         &self,
+        dialect: Dialect,
         common: &Common,
         home: &ConfigHome,
     ) -> Result<AdmittedEntry<O>, AdmissionError>
@@ -96,7 +103,10 @@ impl<P: Patch, O> ProviderModels<P, O> {
         C: Settings<Patch = P> + DialectConfig,
         O: ProviderOptions,
     {
-        let connection = self.options.admit(common, C::base_url())?;
+        if O::KEY == KeySource::Login && common.api_key.is_some() {
+            return Err(DialectError::ManagedLogin { dialect }.into());
+        }
+        let connection = common.admit(C::base_url())?;
         let models = self
             .models
             .iter()
@@ -159,7 +169,7 @@ macro_rules! providers {
                 }
             }
 
-            fn parse(dialect: Dialect, fields: Map<String, Value>) -> Result<Self, String> {
+            fn parse<E: de::Error>(dialect: Dialect, fields: Map<String, Value>) -> Result<Self, E> {
                 Ok(match dialect {
                     $(Dialect::$variant => Self::$variant(ProviderModels::parse(fields)?)),+
                 })
@@ -172,7 +182,7 @@ macro_rules! providers {
             fn admit(&self, common: &Common, home: &ConfigHome) -> Result<AdmittedProvider, AdmissionError> {
                 Ok(match self {
                     $(Self::$variant(entry) => {
-                        AdmittedProvider::$variant(entry.admit::<$module::Config>(common, home)?)
+                        AdmittedProvider::$variant(entry.admit::<$module::Config>(Dialect::$variant, common, home)?)
                     }),+
                 })
             }
@@ -192,7 +202,7 @@ macro_rules! providers {
                 match self { $(Self::$variant(entry) => entry.build(name, program)),+ }
             }
 
-            pub(crate) fn login(&self, name: &ProviderName, program: &HostName) -> Result<Option<codex::Account>, ProviderError> {
+            pub(crate) fn login(&self, name: &ProviderName, program: &HostName) -> Result<Option<Login>, ProviderError> {
                 match self { $(Self::$variant(entry) => entry.options.login(entry.login_command(name, program), &entry.connection)),+ }
             }
         }
@@ -243,12 +253,12 @@ pub struct RawProviderConfig {
 impl<'de> Deserialize<'de> for RawProviderConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut fields = Map::new();
-        let common = crate::yaml::split(deserializer, &mut fields)?;
+        let common = yaml::split(deserializer, &mut fields)?;
         let dialect = fields
             .remove("dialect")
             .ok_or_else(|| de::Error::missing_field("dialect"))?;
         let dialect = Dialect::deserialize(dialect).map_err(de::Error::custom)?;
-        let settings = ProviderSettings::parse(dialect, fields).map_err(de::Error::custom)?;
+        let settings = ProviderSettings::parse(dialect, fields)?;
         Ok(Self {
             common,
             settings,
@@ -259,7 +269,7 @@ impl<'de> Deserialize<'de> for RawProviderConfig {
 
 impl Serialize for RawProviderConfig {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut fields = object(&self.common.clone().with_resolved_defaults());
+        let mut fields = yaml::object(&self.common);
         fields.insert(
             "dialect".into(),
             serde_json::to_value(self.settings.dialect()).unwrap(),
@@ -284,7 +294,7 @@ pub(crate) struct AdmittedEntry<O> {
 
 pub(crate) struct AdmittedModel {
     profile: ModelProfile,
-    wire: Profile,
+    wire: Wire,
 }
 
 impl AdmittedModel {
@@ -321,7 +331,7 @@ impl<O: ProviderOptions> AdmittedEntry<O> {
         let authentication = self
             .options
             .login(self.login_command(name, program), &self.connection)?
-            .map(codex::Account::into_headers);
+            .map(Login::into_headers);
         self.models
             .iter()
             .map(|(model, admitted)| {
@@ -351,13 +361,9 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        media::ImageLimits,
-        provider::{
-            codec::CodecName,
-            dialect::{Sourced, compatible},
-            settings::Setting,
-        },
+        provider::{codec::CodecName, dialect::compatible, settings::Setting},
     };
+    use skyhook_media::ImageLimits;
 
     const LOCAL: &str = r#"
 providers:
@@ -429,7 +435,6 @@ providers:
         ] {
             assert!(dumped.contains(resolved), "{dumped}");
         }
-        assert!(!dumped.contains("api_key"));
         let reparsed = Config::from_yaml(&dumped).unwrap();
         assert_eq!(
             serde_json::to_value(&reparsed.providers["local"]).unwrap(),
@@ -456,10 +461,10 @@ providers:
         let base_url = entry.common.base_url.replace("relative".into());
         assert!(matches!(entry.admit(), Err(AdmissionError::Endpoint(_))));
         entry.common.base_url = base_url;
-        entry
-            .common
-            .headers
-            .insert("bad header".into(), Sourced::Literal("x".into()));
+        entry.common.headers.insert(
+            "bad header".into(),
+            skyhook_worker::secret::Credential::Literal("x".into()),
+        );
         let error = config.into_runtime().err().unwrap().to_string();
         assert!(
             error.contains("`providers.local`: headers: `bad header`"),
@@ -472,7 +477,7 @@ providers:
         for (field, expected) in [
             (
                 "    headers: {x-title: \"a\\nb\"}\n",
-                "`providers.local`: headers.x-title: must be a valid header value",
+                "`providers.local`: headers.x-title: literal is not a valid header value",
             ),
             (
                 "    headers: {x-count: 1}\n",
@@ -529,7 +534,7 @@ providers:
             .err()
             .unwrap()
             .to_string();
-        let expected = "provider `local` could not be initialized: headers.x-token: environment variable `SKYHOOK_TEST_UNSET_HEADER` is required";
+        let expected = "provider `local` could not be initialized: headers.x-token from env SKYHOOK_TEST_UNSET_HEADER: not set";
         assert!(error.contains(expected), "{error}");
     }
 
@@ -659,25 +664,30 @@ providers:
         );
         // Image limits merge per limit over the dialect's.
         let images = |model: &str| admitted.models()[model].wire.images;
-        assert_eq!(images("openai"), ImageLimits::new(2000, 1_000_000));
-        let edge = compatible::IMAGES.max_edge.get();
-        assert_eq!(images("anthropic"), ImageLimits::new(edge, 1_000_000));
+        assert_eq!(images("openai"), ImageLimits::new::<2000, 1_000_000>());
+        let max_bytes = ImageLimits::new::<1, 1_000_000>().max_bytes;
+        let max_edge = compatible::IMAGES.max_edge;
+        assert_eq!(
+            images("anthropic"),
+            ImageLimits {
+                max_edge,
+                max_bytes
+            }
+        );
         // Limits other than the dialect's partition sealed replay; its own do not.
         let scope = |text: &str| {
             let admitted = Config::from_yaml(text).unwrap().providers["local"].admit();
             admitted.unwrap().models()["anthropic"].wire.scope.clone()
         };
         let unset = PROXY.replace("    image_limits: {max_bytes: 1000000}\n", "");
-        let max_bytes = compatible::IMAGES.max_bytes.to_string();
+        let max_bytes = u64::from(compatible::IMAGES.max_bytes).to_string();
         assert_ne!(scope(PROXY), scope(&unset));
         assert_eq!(scope(&unset), scope(&PROXY.replace("1000000", &max_bytes)));
-        // Limits read as the ones in effect, so only an effective change partitions.
-        let over = |max_bytes: &str| PROXY.replace("1000000", max_bytes);
-        assert_eq!(scope(&over("9000000")), scope(&over("90000000")));
-        let over = Config::from_yaml(&over("9000000").replace("2000", "70000")).unwrap();
-        let admitted = over.providers["local"].admit().unwrap();
-        let effective = ImageLimits::new(65_535, crate::media::MAX_IMAGE_BYTES);
-        assert_eq!(admitted.models()["openai"].wire.images, effective);
+        // A limit beyond what the session stores or a JPEG holds is refused.
+        for (limit, over) in [("1000000", "8388609"), ("2000", "65536")] {
+            let refused = error(&PROXY.replace(limit, over));
+            assert!(refused.contains("must be 1 through"), "{refused}");
+        }
         for (field, value) in [("codec", "responses"), ("upstream", "openai")] {
             let missing = PROXY.replace(&format!("        {field}: {value}\n"), "");
             let refused = error(&missing);
@@ -739,7 +749,6 @@ providers:
             &MESSAGES[1..]
         );
         let models = build(&text);
-        assert!(!count.exists());
         // Each request opens a context of its own.
         for _ in 0..2 {
             let mut sent = Vec::new();

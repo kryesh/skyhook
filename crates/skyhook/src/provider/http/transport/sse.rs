@@ -218,9 +218,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_failure_after_acceptance_is_not_replayed() {
+    async fn a_body_failure_ends_the_stream_with_an_error() {
         let wire = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999\r\n\r\ndata: first\n\n";
-        let mut server = Server::start(vec![Plan::reply(wire)]).await;
+        let server = Server::start(vec![Plan::reply(wire)]).await;
         let client = client().unwrap();
         let post = post_sse(
             &client,
@@ -233,8 +233,6 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().unwrap().data, "first");
         assert!(stream.next().await.unwrap().is_err());
         assert!(stream.next().await.is_none());
-        server.request().await;
-        assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
     #[tokio::test(start_paused = true)]

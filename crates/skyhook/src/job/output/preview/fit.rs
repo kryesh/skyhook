@@ -119,9 +119,11 @@ pub(super) fn shallower(depth: usize) -> Fit {
 mod tests {
     use super::super::{Accounting, Pooled, pool::pool};
     use super::*;
-    use crate::job::output::{FieldPointer, projection::Presented, render::Clipped};
-    use crate::tool::output::FieldPresentation;
+    use crate::job::output::stream::Clipped;
     use serde_json::{Value, json};
+    use skyhook_tools::output::FieldPointer;
+    use skyhook_tools::output::FieldPresentation;
+    use skyhook_tools::output::Presented;
     use std::collections::BTreeSet;
 
     /// The reference deliberately presents every candidate, without pruning.
@@ -165,7 +167,7 @@ mod tests {
 
     fn pooled(value: &Value, presented: &Presented, accounting: Accounting) -> Pooled {
         let bytes = serde_json::to_vec(value).unwrap();
-        let mut reader = crate::job::output::json::reader(bytes.as_slice());
+        let mut reader = skyhook_tools::output::json::reader(bytes.as_slice());
         let (field, clipped) = (FieldPointer::result(), Clipped::new());
         pool(
             &mut reader,

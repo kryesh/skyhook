@@ -3,10 +3,8 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::{
-    agent::{FailureKind, FaultKind},
-    tool::policy::Capability,
-};
+use crate::session::{FailureKind, FaultKind};
+use crate::tool::policy::Capability;
 
 impl Sql for &Capability {
     fn sql(self) -> Value {
@@ -26,31 +24,40 @@ pub(super) fn record_capability(db: &Db, capability: &Capability) -> DbResult<()
 /// Seed each dictionary with its enum's spellings and flags, or check them.
 pub(super) fn seed(dictionaries: &Dictionaries<'_>) -> DbResult<()> {
     let Dictionaries(db, seeding) = *dictionaries;
+    use crate::job::JobRole;
+    use crate::target::{ConnectionKind, SshAuthKind, TargetSource};
     use crate::{
-        agent::TodoStatus,
-        job::{AnswerKind, CaptureKind, JobRole, JobState},
-        media::ImageFormat,
+        job::{AnswerKind, JobState},
         provider::{
-            profile::StateMode,
+            model::{Effort, StateMode},
             protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
         },
+        session::TodoStatus,
         session::{EntryKind, ModelPurpose, TitleSource, Truncation, event::ResponseOutcome},
-        target::{SshAuth, TargetSource},
-        tool::diagnostic::{Effects, IoKind, Operation, PathRole, RequestEffects},
     };
+    use skyhook_media::ImageFormat;
+    use skyhook_tools::diagnostic::{CauseKind, ConnectionFault, RequestEffects, SiteKind};
+    use skyhook_worker::diagnostic::{Effects, Operation, PathRole, SubjectKind};
+    use skyhook_worker::{op::IoKind, secret::CredentialKind};
     capabilities(db, seeding)?;
     dictionaries.flagged("entry_kind", ["activity"], &EntryKind::ALL, |kind| {
         [kind.is_activity()]
     })?;
     dictionaries.names("title_source", &TitleSource::ALL)?;
     dictionaries.names("target_source", &TargetSource::ALL)?;
-    dictionaries.names("ssh_auth", &SshAuth::ALL)?;
+    dictionaries.names("transport", &ConnectionKind::ALL)?;
+    dictionaries.names("ssh_auth", &SshAuthKind::ALL)?;
+    dictionaries.names("winrm_auth", &skyhook_worker::origin::winrm::AuthKind::ALL)?;
+    dictionaries.names("winrm_tls", &skyhook_worker::origin::winrm::TlsKind::ALL)?;
+    dictionaries.names("os", &skyhook_worker::target::Os::ALL)?;
+    dictionaries.names("credential_source", &CredentialKind::ALL)?;
     dictionaries.names("state_mode", &StateMode::ALL)?;
+    dictionaries.names("reasoning_effort", &Effort::ALL)?;
     dictionaries.names("model_purpose", &ModelPurpose::ALL)?;
-    dictionaries.names("message_role", &message::MessageRole::ALL)?;
+    dictionaries.names("message_role", &crate::session::MessageRole::ALL)?;
     dictionaries.names("image_format", &ImageFormat::ALL)?;
-    dictionaries.names("user_part_kind", &message::UserPartKind::ALL)?;
-    dictionaries.names("job_event_kind", &message::JobEventKind::ALL)?;
+    dictionaries.names("user_part_kind", &crate::session::UserPartKind::ALL)?;
+    dictionaries.names("job_event_kind", &crate::session::JobEventKind::ALL)?;
     dictionaries.names("item_kind", &ItemKind::ALL)?;
     dictionaries.names("replay_binding", &Binding::ALL)?;
     dictionaries.names("replay_format", &ReplayFormat::ALL)?;
@@ -59,27 +66,34 @@ pub(super) fn seed(dictionaries: &Dictionaries<'_>) -> DbResult<()> {
     dictionaries.names("response_outcome", &ResponseOutcome::ALL)?;
     dictionaries.names("cut_reason", &Truncation::ALL)?;
     dictionaries.names("job_role", &JobRole::ALL)?;
-    dictionaries.names("capture_kind", &CaptureKind::ALL)?;
-    dictionaries.names("capture_detection", &crate::job::output::Detection::ALL)?;
+    dictionaries.names("capture_kind", &skyhook_tools::output::CaptureKind::ALL)?;
+    dictionaries.names(
+        "capture_detection",
+        &skyhook_tools::output::json::Detection::ALL,
+    )?;
     dictionaries.names(
         "field_presentation",
-        &crate::tool::output::FieldPresentation::ALL,
+        &skyhook_tools::output::FieldPresentation::ALL,
     )?;
     dictionaries.names("diagnostic_operation", &Operation::ALL)?;
-    dictionaries.names("diagnostic_subject", &diagnostic::SubjectKind::ALL)?;
-    dictionaries.names("diagnostic_site", &diagnostic::SiteKind::ALL)?;
+    dictionaries.names("diagnostic_subject", &SubjectKind::ALL)?;
+    dictionaries.names("diagnostic_site", &SiteKind::ALL)?;
     dictionaries.names("diagnostic_effects", &Effects::ALL)?;
     dictionaries.names("diagnostic_request_effects", &RequestEffects::ALL)?;
-    dictionaries.names("diagnostic_cause", &diagnostic::CauseKind::ALL)?;
+    dictionaries.names("diagnostic_cause", &CauseKind::ALL)?;
+    dictionaries.names("diagnostic_connection_fault", &ConnectionFault::ALL)?;
     dictionaries.names("diagnostic_io_kind", &IoKind::ALL)?;
     dictionaries.names("diagnostic_path_role", &PathRole::ALL)?;
     dictionaries.flagged("job_state", ["terminal"], &JobState::ALL, |state| {
         [state.is_terminal()]
     })?;
     dictionaries.names("job_answer", &AnswerKind::ALL)?;
-    dictionaries.names("request_phase", &request::PhaseKind::ALL)?;
-    dictionaries.names("agent_last", &state::LastKind::ALL)?;
-    dictionaries.names("agent_outcome", &state::OutcomeKind::ALL)?;
+    dictionaries.names("request_phase", &crate::session::requests::PhaseKind::ALL)?;
+    dictionaries.names("agent_last", &crate::session::agent_state::LastKind::ALL)?;
+    dictionaries.names(
+        "agent_outcome",
+        &crate::session::agent_state::OutcomeKind::ALL,
+    )?;
     dictionaries.names("failure_kind", &FailureKind::ALL)?;
     dictionaries.names(
         "provider_error_kind",

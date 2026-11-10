@@ -178,7 +178,7 @@ impl JobWorker {
         jobs.inner.store.enqueue(move |state| {
             let attached = state.jobs.modify(id, |entry, _| {
                 let running = entry.invocation == invocation && entry.end().is_none();
-                let handles = entry.handles.as_mut().filter(|_| running)?;
+                let handles = entry.live.handles.as_mut().filter(|_| running)?;
                 handles.task_abort = Some((invocation, abort));
                 Some(())
             });
@@ -296,9 +296,10 @@ impl<T> Drop for WorkerGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::policy::CapabilitySet;
     use crate::{
         job::{JobError, JobId, JobManager, JobSpec, JobState},
-        tool::{ToolOutput, policy::CapabilitySet},
+        tool::ToolOutput,
     };
     async fn leased(tool: &str) -> (tempfile::TempDir, JobManager, JobLease, JobId) {
         let (root, jobs, agent) = crate::job::tests::runtime().await;
@@ -384,7 +385,7 @@ mod tests {
             }
             if tool == "panic" {
                 let diagnostic = result.diagnostic.as_ref().unwrap();
-                let execute = crate::tool::diagnostic::Operation::Execute;
+                let execute = skyhook_worker::diagnostic::Operation::Execute;
                 assert_eq!(diagnostic.context.operation, execute);
             }
             if tool.starts_with("abandoned") {

@@ -3,10 +3,8 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::tool::{
-    ToolError,
-    diagnostic::{Effects, Operation, Subject},
-};
+use crate::tool::ToolError;
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 
 use super::{
     bridge::{Failure, Returned},

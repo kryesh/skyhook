@@ -10,12 +10,13 @@ use super::{
     message::{Messages, Owner, Scope},
     *,
 };
+use crate::identity::{AgentId, SessionId};
 use crate::{
-    execution::{ExecutionLocation, path_from_bytes},
-    identity::{AgentId, EventId, JobId, SessionId},
-    provider::profile::ModelRef,
+    provider::model::ModelRef,
     session::{EntryKind, EventRecord, RecordSeq, SessionEvent},
 };
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_worker::job::JobId;
 
 /// The entries a decode reassembles: every one, or those listed.
 pub(in crate::session) type Entries<'a> = Scope<'a, RecordSeq>;
@@ -140,17 +141,17 @@ pub(super) fn grouped<T>(
 /// A profile's qualified name, validated when it was written.
 pub(super) fn model_ref(provider: &str, name: &str) -> DbResult<ModelRef> {
     let invalid =
-        |error: crate::provider::profile::NameError| corrupt(format!("model_profile: {error}"));
+        |error: crate::provider::model::NameError| corrupt(format!("model_profile: {error}"));
     Ok(ModelRef::new(
         provider.parse().map_err(invalid)?,
         name.parse().map_err(invalid)?,
     ))
 }
 
-pub(super) fn location(target: String, workspace: Vec<u8>) -> DbResult<ExecutionLocation> {
+pub(super) fn location(target: String, workspace: String) -> DbResult<ExecutionLocation> {
     Ok(ExecutionLocation {
         target: parsed(target)?,
-        workspace: path_from_bytes(workspace),
+        workspace: workspace.into(),
     })
 }
 
@@ -211,25 +212,24 @@ pub(in crate::session) fn decode_records(
     )?;
     contract::events(&mut events)?;
     messages.events(&mut events)?;
-    request::events(&mut events, &messages, &mut todos)?;
+    requests::events(&mut events, &messages, &mut todos)?;
     job::events(&mut events)?;
     let mut targets = contract::targets(&events)?;
     let agents = agent_paths(db, session, scope)?;
     let Query { sql, params } = events.scoped(
-        "SELECT seq, public_id, agent, created_millis, kind FROM entry {scope} ORDER BY seq",
+        "SELECT seq, agent, created_millis, kind FROM entry {scope} ORDER BY seq",
         "seq",
     )?;
     let entries = db.query(sql, params, |row| {
         Ok((
             row.get::<i64>(0)?,
-            row.get::<Vec<u8>>(1)?,
+            row.get::<i64>(1)?,
             row.get::<i64>(2)?,
-            row.get::<i64>(3)?,
-            enum_column::<EntryKind>(row, 4)?,
+            enum_column::<EntryKind>(row, 3)?,
         ))
     })?;
     let mut records = Vec::with_capacity(entries.len());
-    for (seq, public_id, agent, created, kind) in entries {
+    for (seq, agent, created, kind) in entries {
         // Rows filed under an entry of another kind, or missing, are corrupt.
         let event = match (kind, events.by_entry.remove(&seq)) {
             (EntryKind::SessionStarted, None) => SessionEvent::SessionStarted {
@@ -253,7 +253,6 @@ pub(in crate::session) fn decode_records(
             }
         };
         records.push(Arc::new(EventRecord {
-            id: EventId::from_bytes(bytes(public_id)?),
             sequence: sequence(seq),
             timestamp_millis: created,
             agent: agents

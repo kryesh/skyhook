@@ -1,7 +1,8 @@
 //! Stateless line reads over immutable or append-only saved fields.
 use super::*;
-use super::{json::saved_json, render::TextField};
+use super::{json::saved_json, stream::TextField};
 use grep_matcher::Matcher as _;
+use skyhook_worker::fs::spill::SpillError;
 use std::{
     collections::VecDeque,
     io::{BufRead, Cursor},
@@ -9,9 +10,9 @@ use std::{
 use struson::reader::JsonReader as _;
 
 const READ_AHEAD: usize = 256 * 1024;
-const REGEX_LINE_BYTES: usize = crate::limits::WHOLE_VALUE_BYTES;
+const REGEX_LINE_BYTES: usize = skyhook_base::limits::WHOLE_VALUE_BYTES;
 
-/// A pageable field: a stored capture, or a value held in memory.
+/// A pageable field the session holds: a stored capture, or a value held in memory.
 pub(super) enum Source {
     Capture(CaptureReader),
     Memory(Cursor<Vec<u8>>),
@@ -34,16 +35,28 @@ impl Read for Source {
     }
 }
 
-/// Reads one capture's chunks on demand, each fetch in a snapshot of its own.
+/// Reads what the session holds of one capture on demand, each fetch in a snapshot of
+/// its own: its chunk rows, or the spill file the session moved them to, which a
+/// reader that began on the rows goes on in at the same offset.
 pub(super) struct CaptureReader {
     reads: crate::session::Reads,
     capture: i64,
     position: u64,
     /// Nothing until the first fetch.
     window: Option<Window>,
+    /// The capture's spill file, once a fetch found it there.
+    file: Option<skyhook_worker::fs::OpenFile>,
+    /// What its target last told of the stream it is keeping, of which the capture
+    /// holds the first bytes.
+    latest: Option<crate::session::LiveTail>,
+    /// Where the snapshot this reads for learns that the capture's spill file failed.
+    lost: Option<Lost>,
 }
 
-/// The chunks a reader holds, and the capture's extent its first fetch observed with
+/// Tells a snapshot of a capture whose spill file failed a reader, and why.
+pub(super) type Lost = std::sync::mpsc::Sender<(i64, saved::Unreadable)>;
+
+/// The bytes a reader holds, and the capture's extent its first fetch observed with
 /// them. It reads no further, so bytes appended later are left for the next reader
 /// and its end needs no fetch of its own.
 struct Window {
@@ -59,7 +72,22 @@ impl CaptureReader {
             capture,
             position: 0,
             window: None,
+            file: None,
+            latest: None,
+            lost: None,
         }
+    }
+
+    /// This reader, telling `lost` of a spill file that fails it.
+    pub(super) fn reporting(mut self, lost: Lost) -> Self {
+        self.lost = Some(lost);
+        self
+    }
+
+    /// This reader, of a capture whose target last told `latest` of its stream.
+    pub(super) fn following(mut self, latest: Option<crate::session::LiveTail>) -> Self {
+        self.latest = latest;
+        self
     }
 
     /// The capture's extent as this reader observes it: what it reads up to.
@@ -74,8 +102,8 @@ impl CaptureReader {
     }
 
     /// The window holding `position`, fetched unless `window` holds it already.
-    fn fetch(&self, window: Option<Window>) -> std::io::Result<Window> {
-        let (extent, chunks) = match window {
+    fn fetch(&mut self, window: Option<Window>) -> std::io::Result<Window> {
+        let observed = match window {
             Some(window)
                 if self.position >= window.extent.bytes
                     || (window.start..window.start + window.data.len() as u64)
@@ -83,17 +111,26 @@ impl CaptureReader {
             {
                 return Ok(window);
             }
-            Some(Window { extent, .. }) => {
-                let chunks = self
-                    .reads
-                    .capture_chunks(self.capture, self.position, READ_AHEAD);
-                (extent, chunks.map_err(std::io::Error::other)?)
-            }
-            None => {
-                let window = self
-                    .reads
-                    .capture_window(self.capture, self.position, READ_AHEAD);
-                window.map_err(std::io::Error::other)?
+            Some(window) => Some(window.extent),
+            None => None,
+        };
+        let (found, stored) = self
+            .reads
+            .capture_window(self.capture, self.position, READ_AHEAD)
+            .map_err(std::io::Error::other)?;
+        let chunks = match stored {
+            crate::session::Stored::Rows(chunks) => chunks,
+            // The file's failures are its spill's, never the session's: its job's
+            // to fail with when it is read to be saved.
+            crate::session::Stored::File(path) => {
+                let data = self.file_window(&path, found.bytes).map_err(|error| {
+                    if let Some(lost) = &self.lost {
+                        // A snapshot that is gone shows nothing of the capture.
+                        let _ = lost.send((self.capture, saved::Unreadable::read(&error)));
+                    }
+                    SpillError::At(error)
+                })?;
+                vec![(self.position, data)]
             }
         };
         let start = chunks.first().map_or(self.position, |(offset, _)| *offset);
@@ -105,15 +142,42 @@ impl CaptureReader {
             data.extend_from_slice(&chunk);
         }
         Ok(Window {
-            extent,
+            extent: observed.unwrap_or(found),
             start,
             data,
         })
     }
 
+    /// The window at `position` of the capture's spill file at `path`, which holds
+    /// `bytes`.
+    fn file_window(&mut self, path: &std::path::Path, bytes: u64) -> std::io::Result<Vec<u8>> {
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                let opened = skyhook_worker::fs::open_regular_blocking(path, u64::MAX);
+                self.file.insert(opened.map_err(|error| match error {
+                    skyhook_worker::op::FsError::Os(error) => (&error).into(),
+                    error => std::io::Error::other(error),
+                })?)
+            }
+        };
+        let mut data = Vec::new();
+        let wanted = (READ_AHEAD as u64).min(bytes.saturating_sub(self.position));
+        std::io::Seek::seek(file, std::io::SeekFrom::Start(self.position))?;
+        file.take(wanted).read_to_end(&mut data)?;
+        if (data.len() as u64) < wanted {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(data)
+    }
+
     /// The last bytes, up to `limit`, of the `bytes` the capture was observed
     /// to hold.
     pub(super) fn end(mut self, bytes: u64, limit: usize) -> std::io::Result<Vec<u8>> {
+        if let Some(latest) = &self.latest {
+            let text = latest.text.as_bytes();
+            return Ok(text[text.len().saturating_sub(limit)..].to_vec());
+        }
         self.position = bytes.saturating_sub(limit as u64);
         let mut end = Vec::new();
         let observed = bytes - self.position;
@@ -121,12 +185,16 @@ impl CaptureReader {
         Ok(end)
     }
 
+    /// What the capture holds: its rows or file, or with a stream its target is
+    /// keeping, all the target has counted of it.
     fn index(&self) -> Result<LineIndex, ToolError> {
-        let extent = (self.reads.capture_extent(self.capture)).map_err(std::io::Error::other)?;
+        let extent = match &self.latest {
+            Some(latest) => latest.extent,
+            None => (self.reads.capture_extent(self.capture)).map_err(std::io::Error::other)?,
+        };
         Ok(LineIndex {
             bytes: extent.bytes,
-            total_lines: usize::try_from(extent.newlines).unwrap_or(usize::MAX)
-                + usize::from(extent.bytes > 0 && !extent.ends_line),
+            total_lines: extent.lines(),
         })
     }
 
@@ -169,12 +237,7 @@ fn changed() -> std::io::Error {
 /// The first line of a capture's last page of up to `limit` lines: its trailing
 /// whole lines that such a page holds, or its last line when that alone is
 /// over one.
-pub(super) fn last_page_start(
-    reads: &crate::session::Reads,
-    capture: i64,
-    limit: usize,
-) -> Result<usize, ToolError> {
-    let reader = CaptureReader::new(reads.clone(), capture);
+pub(super) fn last_page_start(reader: CaptureReader, limit: usize) -> Result<usize, ToolError> {
     let index = reader.index()?;
     // A page's lines take no fewer bytes of it than they have.
     let end = reader.end(index.bytes, CONTENT_BYTES)?;
@@ -236,7 +299,7 @@ struct Text<R> {
     /// Whether the next byte starts a line. A checkpoint may fall inside its line,
     /// but only before the line a page skips to, so this is exact once it matters.
     line_start: bool,
-    /// The field's line count, when its extent was indexed up front.
+    /// The field's line count, when its extent was counted up front.
     total: Option<usize>,
 }
 
@@ -289,7 +352,7 @@ impl<R: BufRead> Text<R> {
         Ok(self.line < line || (self.line_start && self.at_end()?))
     }
 
-    /// The field's line count: as indexed, or read through to the end.
+    /// The field's line count: as counted, or read through to the end.
     fn total(
         &mut self,
         cancellation: &super::super::CancellationToken,
@@ -436,15 +499,45 @@ pub(super) fn page(
     }
 }
 
-/// A page of saved bytes, read no further than the extent `index` observed as the
-/// page started.
-fn observed(
-    mut capture: CaptureReader,
-    index: LineIndex,
+/// A page of a file on the job's target, whose `bytes` start at the first line the
+/// page reads, as its target found it, and whose `lines` its target counted.
+pub(super) fn file_page(
+    bytes: impl Read,
+    lines: usize,
     selection: &Selection,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<LinePage, ToolError> {
+    let reader = BufReader::with_capacity(IO_BUFFER_BYTES, bytes);
+    let text = Text::new(reader, first_line(selection), Some(lines));
+    read(text, selection, terminal, cancellation)
+}
+
+/// A page of saved bytes, read no further than the extent `index` observed as the
+/// page started.
+fn observed(
+    mut capture: CaptureReader,
+    mut index: LineIndex,
+    selection: &Selection,
+    terminal: bool,
+    cancellation: &super::super::CancellationToken,
+) -> Result<LinePage, ToolError> {
+    // Of a stream its target is keeping, the last whole lines are read from what the
+    // target last told, and those before from the rows as far as they hold: what lies
+    // between is on the target until the command ends.
+    if let Some(latest) = capture.latest.take() {
+        let text = latest.text.as_bytes();
+        let whole = latest.extent.bytes == text.len() as u64;
+        let (tail, lines) = preview::trailing_lines(text, whole, usize::MAX, usize::MAX, |_| 0);
+        let first = index.total_lines.saturating_sub(lines) + 1;
+        if lines > 0 && first_line(selection) >= first {
+            let total = Some(index.total_lines);
+            let text = Text::new(Cursor::new(tail.to_vec()), first, total);
+            return read(text, selection, terminal, cancellation);
+        }
+        let held = capture.reads.capture_extent(capture.capture);
+        index.bytes = held.map_err(std::io::Error::other)?.bytes;
+    }
     // Checked against the observed extent before checkpointing: chunks a producer
     // appends later are chosen only for lines past that extent.
     if selection.start > index.total_lines {
@@ -544,7 +637,7 @@ fn beyond(selection: &Selection, total: usize, terminal: bool) -> Result<LinePag
 }
 
 /// The first line a page reads: its start, or with a pattern, its leading context.
-fn first_line(selection: &Selection) -> usize {
+pub(super) fn first_line(selection: &Selection) -> usize {
     match selection.matcher {
         Some(_) => selection.start.saturating_sub(selection.context).max(1),
         None => selection.start,
@@ -690,7 +783,7 @@ mod tests {
             context: 0,
             start,
             offset,
-            limit: DEFAULT_LIMIT.get(),
+            limit: super::args::count(DEFAULT_LIMIT),
         }
     }
 
@@ -701,7 +794,7 @@ mod tests {
         move |stored| {
             Some(if stored {
                 let json = Box::new(Cursor::new(json.clone()));
-                TextField::Stored(super::super::render::JsonField::new(
+                TextField::Stored(super::super::stream::JsonField::new(
                     json,
                     Default::default(),
                 ))
@@ -861,6 +954,126 @@ mod tests {
         }
     }
 
+    /// A capture that passes the saved-field limit moves from its rows to a file of
+    /// its user's alone, where it goes on growing. A reader that began on the rows
+    /// goes on in the file, as far as it first observed; later readers read the file.
+    /// A capture whose file cannot be made keeps the rows it had.
+    #[tokio::test]
+    async fn a_capture_past_the_limit_moves_to_a_file_under_its_readers() {
+        let (root, manager, id) = super::super::tests::fixture(None).await;
+        let mut output = manager.output(id).await;
+        let line = format!("{}\n", "x".repeat(1023));
+        output.spill.bytes = 400 * 1024;
+        let field = FieldPointer::result().property("stdout");
+        let create = |output: &super::super::Output, field: &FieldPointer| {
+            let capture = crate::job::output::create_capture(output, field, CaptureKind::Text);
+            capture.unwrap().open()
+        };
+        let mut writer = create(&output, &field);
+        writer.write_text(&line.repeat(300)).unwrap();
+        let capture = output.test_saved().captures[&field].id;
+        let reader = || CaptureReader::new(output.reads.clone(), capture);
+        let (paging, index) = (reader(), reader().index().unwrap());
+        let mut reading = reader();
+        reading.read_exact(&mut [0; 10]).unwrap();
+
+        writer.write_text(&line.repeat(200)).unwrap();
+        let (extent, stored) = output.reads.capture_window(capture, 0, 1).unwrap();
+        let crate::session::Stored::File(file) = stored else {
+            panic!("the capture is a file")
+        };
+        assert!(file.starts_with(root.path().join("spills")));
+        assert_eq!(extent.bytes, std::fs::metadata(&file).unwrap().len());
+        assert_eq!((extent.bytes, extent.newlines), (500 * 1024, 500));
+        let mode = std::os::unix::fs::PermissionsExt::mode(&file.metadata().unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o600);
+
+        let mut rest = Vec::new();
+        reading.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest.len(), 300 * 1024 - 10);
+        let cancellation = Default::default();
+        let observed = observed(paging, index, &selection(300, 0), false, &cancellation).unwrap();
+        assert_eq!(
+            (observed.lines().len(), observed.total_lines),
+            (1, Some(300))
+        );
+        let later = TextField::Bytes(Source::Capture(reader()));
+        let later = page(Some(later), &selection(500, 0), false, &cancellation).unwrap();
+        assert_eq!(
+            (later.lines(), later.total_lines),
+            (vec![line.trim_end()], Some(500))
+        );
+
+        // No other place is tried: the write that needed the file fails, telling
+        // its tool why.
+        output.spill.root = Some(file.clone());
+        let kept = FieldPointer::result().property("stderr");
+        let mut writer = create(&output, &kept);
+        writer.write_text(&line.repeat(300)).unwrap();
+        let failed = writer.write_text(&line.repeat(200)).unwrap_err();
+        let failed = ToolError::io(failed).to_string();
+        assert_eq!(failed, "execute failed: not a directory (OS error 20)");
+        let held = output.test_bytes("/result/stderr").unwrap();
+        assert!((300 * 1024..=400 * 1024).contains(&held.len()));
+    }
+
+    /// While its target keeps a stream past the capture's rows, the capture reads as
+    /// all the target has counted: its first lines from the rows, its last from what
+    /// the target last told, and nothing yet of the lines between.
+    #[tokio::test]
+    async fn a_stream_its_target_is_keeping_reads_at_both_ends_as_it_runs() {
+        let (_root, _manager, output, capture) = captured(&["one\ntwo\n", "thr"]).await;
+        let latest = crate::session::LiveTail {
+            extent: crate::session::CaptureExtent {
+                bytes: 4096,
+                newlines: 100,
+                ends_line: true,
+            },
+            text: "98\nline 99\nline 100\n".into(),
+        };
+        let reader =
+            || CaptureReader::new(output.reads.clone(), capture).following(Some(latest.clone()));
+        let read = |start| {
+            let field = TextField::Bytes(Source::Capture(reader()));
+            page(
+                Some(field),
+                &selection(start, 0),
+                false,
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        let last = read(99);
+        assert_eq!(last.lines(), ["line 99", "line 100"]);
+        assert_eq!((last.total_lines, last.next_start), (Some(100), Some(101)));
+        let first = read(1);
+        assert_eq!(first.lines(), ["one", "two", "thr"]);
+        assert_eq!((first.total_lines, first.next_start), (Some(100), Some(3)));
+        let between = read(50);
+        assert!(between.lines().is_empty());
+        assert_eq!(
+            (between.total_lines, between.next_start),
+            (Some(100), Some(50))
+        );
+        assert_eq!(last_page_start(reader(), 1).unwrap(), 100);
+
+        // A line longer than what the target last told starts where the rows hold it.
+        let (_root, _manager, output, capture) = captured(&["begins"]).await;
+        let latest = crate::session::LiveTail {
+            extent: crate::session::CaptureExtent {
+                bytes: 4096,
+                newlines: 0,
+                ends_line: false,
+            },
+            text: "latest".into(),
+        };
+        let reader = CaptureReader::new(output.reads.clone(), capture).following(Some(latest));
+        let field = TextField::Bytes(Source::Capture(reader));
+        let line = page(Some(field), &selection(1, 0), false, &Default::default()).unwrap();
+        assert_eq!(line.lines(), ["begins"]);
+        assert_eq!((line.next_start, line.next_offset), (Some(1), Some(6)));
+    }
+
     /// A capture page starts from the checkpoint of the first line it reads, a
     /// search's leading context included, whether chunks end at lines or split them.
     #[tokio::test]
@@ -890,10 +1103,10 @@ mod tests {
                 )
                 .unwrap()
             };
-            let plain = read(3, 0, DEFAULT_LIMIT.get(), false);
+            let plain = read(3, 0, super::args::count(DEFAULT_LIMIT), false);
             assert_eq!(plain.lines(), ["three", "four"]);
             assert_eq!(plain.total_lines, Some(4));
-            let found = read(3, 2, DEFAULT_LIMIT.get(), true);
+            let found = read(3, 2, super::args::count(DEFAULT_LIMIT), true);
             let expected = vec![numbered(3, "three"), numbered(4, "four")];
             assert_eq!(found.lines, PageLines::Numbered(expected));
             let first = read(3, 2, 1, true);

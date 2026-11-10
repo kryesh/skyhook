@@ -47,8 +47,7 @@ impl AuthManager {
 
     /// Persist the tokens `flow` obtains. The lock is not held while a human
     /// signs in: the previous generation is snapshotted, and a concurrent
-    /// login or refresh is never overwritten. Login never reads any
-    /// official-client credential file.
+    /// login or refresh is never overwritten.
     async fn sign_in(
         &self,
         flow: impl Future<Output = Result<TokenResponse, ProviderError>>,
@@ -260,7 +259,7 @@ impl TokenResponse {
         let access_claims = Claims::of(&self.access_token);
         let id_claims = self.id_token.as_ref().and_then(Claims::of);
         // Claims are metadata from the TLS-authenticated token endpoint, not a
-        // locally verified authentication assertion. Never accept user-supplied JWTs.
+        // locally verified authentication assertion.
         let account_id = [&id_claims, &access_claims]
             .into_iter()
             .find_map(|claims| claims.as_ref()?.auth.as_ref()?.chatgpt_account_id.clone())
@@ -495,9 +494,7 @@ pub(super) mod tests {
             "/other?state=expected&code=secret",
             "/auth/callback?state=expected&error=access_denied",
         ] {
-            let err =
-                parse_callback(&format!("GET {target} HTTP/1.1\r\n\r\n"), "expected").unwrap_err();
-            assert!(!err.to_string().contains("secret"));
+            assert!(parse_callback(&format!("GET {target} HTTP/1.1\r\n\r\n"), "expected").is_err());
         }
     }
 

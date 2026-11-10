@@ -2,36 +2,17 @@
 //! and opaque reasoning provenance.
 use std::{collections::BTreeMap, fmt};
 
-use crate::{
-    media::{AttachmentRef, BlobDigest, Image, ImageRef, MediaError, Prepared, TextRef},
-    named_enum::{NamedEnum, named_enum},
-    provider::{
-        ProviderError, ProviderErrorKind,
-        codec::{CodecName, StateRole, ToolNames},
-        protocol::{
-            AssistantItem, Binding, BlockRef, Completion, CutReason, ItemKind, Message,
-            ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope, State,
-            ToolDefinition, UserContent,
-        },
+use crate::provider::{
+    ProviderError, ProviderErrorKind,
+    codec::{CodecName, StateRole},
+    protocol::{
+        AssistantItem, Binding, BlockRef, Completion, CutReason, ItemKind, Message, ModelRequest,
+        Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope, State, UserContent,
     },
 };
 use serde_json::{Map, Value, json};
-
-/// What every family requires of a tool definition: a name the endpoint
-/// accepts and an object schema. A codec adds its own constraints.
-pub(crate) fn check_tool(
-    tool: &ToolDefinition,
-    names: ToolNames,
-    codec: CodecName,
-) -> Result<(), ProviderError> {
-    if names.accepts(&tool.name) && tool.input_schema.is_object() {
-        return Ok(());
-    }
-    Err(ProviderErrorKind::InvalidRequest.error(format!(
-        "{codec} tools require {} and an object JSON Schema",
-        names.rule()
-    )))
-}
+use skyhook_base::enums::NamedEnum;
+use skyhook_media::{AttachmentRef, BlobDigest, Image, ImageRef, LoadError, Prepared, TextRef};
 
 /// Tool-argument text as a JSON object: empty or null is `{}`, and a
 /// double-encoded object is unwrapped. Anything else is `None`.
@@ -89,7 +70,7 @@ pub(crate) fn lenient_u64(value: &Value) -> Option<u64> {
     }
 }
 
-pub(crate) fn blob_error(error: MediaError) -> ProviderError {
+pub(crate) fn blob_error(error: LoadError) -> ProviderError {
     ProviderErrorKind::InvalidRequest.error(format!("attachment: {error}"))
 }
 
@@ -117,7 +98,7 @@ impl<'a> PreparedImages<'a> {
     pub(crate) fn get(self, image: &ImageRef) -> Result<&'a Prepared, ProviderError> {
         self.0
             .get(&image.blob.sha256)
-            .ok_or_else(|| blob_error(MediaError::NotLoaded))
+            .ok_or_else(|| blob_error(LoadError::NotLoaded))
     }
 
     /// `image` as `fitted` encodes the copy sent, or as a `text_type` part saying
@@ -263,16 +244,27 @@ pub(crate) fn delta(index: usize, kind: ItemKind, text: impl Into<String>) -> Re
     }
 }
 
-named_enum! {
-    /// A finish reason as the families spell it, in any case.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) parsed enum StopReason {
-        Normal = "end_turn" | "stop" | "eos" | "stop_sequence" | "tool_use" | "tool_calls",
-        MaxTokens = "max_tokens" | "length" | "max_output_tokens" | "model_length",
-        ContextWindow = "model_context_window_exceeded",
-        Aborted = "aborted" | "abort" | "cancelled" | "canceled",
-        Refusal = "refusal" | "content_filter" | "safety",
-    }
+/// A finish reason as the families spell it, in any case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StopReason {
+    #[serde(
+        rename = "end_turn",
+        alias = "stop",
+        alias = "eos",
+        alias = "stop_sequence",
+        alias = "tool_use",
+        alias = "tool_calls"
+    )]
+    Normal,
+    #[serde(alias = "length", alias = "max_output_tokens", alias = "model_length")]
+    MaxTokens,
+    #[serde(rename = "model_context_window_exceeded")]
+    ContextWindow,
+    #[serde(alias = "abort", alias = "cancelled", alias = "canceled")]
+    Aborted,
+    #[serde(alias = "content_filter", alias = "safety")]
+    Refusal,
 }
 
 impl StopReason {
@@ -461,12 +453,12 @@ pub(crate) fn replay(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::media::{BlobRef, ImageFormat, ImageLimits};
     use crate::provider::http::images::FittedImages;
     use crate::provider::protocol::{
         AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step,
         ToolResult, Usage,
     };
+    use skyhook_media::{BlobRef, ImageFormat, ImageLimits};
 
     /// The scope test decoders issue replay under.
     pub(crate) fn scope() -> Scope {
@@ -670,7 +662,7 @@ pub(crate) mod tests {
     }
 
     /// Limits [`image`] is within.
-    pub(crate) const LIMITS: ImageLimits = ImageLimits::new(64, 1 << 20);
+    pub(crate) const LIMITS: ImageLimits = ImageLimits::new::<64, { 1 << 20 }>();
 
     /// Load [`image`] and [`notes`] into `request`, then fit its images as a
     /// context does.
@@ -723,7 +715,6 @@ pub(crate) mod tests {
     pub(crate) fn request(model: &str) -> ModelRequest {
         ModelRequest {
             context: crate::provider::protocol::entries(vec![user("hello")]),
-            max_output_tokens: std::num::NonZeroU64::new(8192),
             ..ModelRequest::test(model)
         }
     }

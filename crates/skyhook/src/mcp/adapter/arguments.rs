@@ -1,11 +1,8 @@
 //! Preserve upstream JSON Schema semantics while reserving the host job envelope.
-use crate::tool::{
-    AdmissionError,
-    arguments::NoExternalArgumentSchemas,
-    diagnostic::{Effects, Operation, Subject},
-    registry::BACKGROUND,
-};
+use crate::tool::catalog::BACKGROUND;
 use serde_json::{Map, Value, json};
+use skyhook_tools::{arguments::NoExternalArgumentSchemas, error::AdmissionError};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 
 /// An upstream input schema as the registry admits it: the upstream root itself,
 /// or an envelope holding the whole upstream input under `arguments`.
@@ -84,7 +81,7 @@ impl Arguments {
             "$id"
         };
         if embedded.get(id_keyword).is_none() {
-            let hash = crate::sha256_hex(original.to_string().as_bytes());
+            let hash = skyhook_base::hex::Sha256::of(original.to_string());
             embedded[id_keyword] = Value::String(format!("urn:skyhook:mcp-schema:{hash}"));
         }
         let mut schema = json!({
@@ -125,12 +122,9 @@ impl Arguments {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{
-        ToolOptions, ToolOutput, ToolRegistryBuilder, ToolSpec,
-        executor::InvocationKind,
-        policy::CapabilitySet,
-        registry::{AgentLevel, Invocation},
-    };
+    use crate::tool::catalog::{AgentLevel, Invocation, InvocationKind, ToolOptions, ToolSpec};
+    use crate::tool::policy::CapabilitySet;
+    use crate::tool::{ToolOutput, ToolRegistryBuilder};
 
     /// The spec an agent is shown for an upstream tool taking `schema`, and the
     /// adapted schema, registered as the adapter registers it.
@@ -346,7 +340,7 @@ mod tests {
             let error = upstream(&tool, value).unwrap_err();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.subject, Subject::Argument(path.into()));
-            let text = diagnostic.render(&Default::default());
+            let text = diagnostic.render(skyhook_tools::diagnostic::TargetView::Hidden);
             for expectation in expectations {
                 assert!(text.contains(expectation), "{text}");
             }

@@ -9,7 +9,8 @@ use super::{
     protects,
     text::{ends, shorten},
 };
-use crate::job::output::{FieldPointer, OutputTruncation, shape::COLLECTION_MEMBERS};
+use crate::job::output::{OutputTruncation, shape::COLLECTION_MEMBERS};
+use skyhook_tools::output::FieldPointer;
 
 /// How much of each pooled value a fit shows.
 #[derive(Clone, Copy, PartialEq, Eq)]

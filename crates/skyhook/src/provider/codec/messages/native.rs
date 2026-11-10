@@ -1,24 +1,21 @@
 //! Native Anthropic content blocks: their types, and validation and
 //! conversion of tool blocks.
 use super::NATIVE;
-use crate::{
-    named_enum::named_enum,
-    provider::{
-        ProviderError,
-        codec::common::{arguments_field, parse_tool_arguments},
-        protocol::ToolCall,
-    },
+use crate::provider::{
+    ProviderError,
+    codec::common::{arguments_field, parse_tool_arguments},
+    protocol::ToolCall,
 };
 use serde_json::Value;
+use skyhook_base::enums::NamedEnum;
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) parsed enum BlockType {
-        Text = "text",
-        Thinking = "thinking",
-        RedactedThinking = "redacted_thinking",
-        ToolUse = "tool_use",
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum BlockType {
+    Text,
+    Thinking,
+    RedactedThinking,
+    ToolUse,
 }
 
 /// The call's input from the start block and any streamed JSON. A streamed

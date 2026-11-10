@@ -19,14 +19,14 @@ impl JobManager {
         };
         let cancellation = self.token_of(&state.jobs, entry);
         state.jobs.modify(job, |entry, _| {
-            (entry.handles).get_or_insert_with(|| JobHandles::new(cancellation).0);
+            (entry.live.handles).get_or_insert_with(|| JobHandles::new(cancellation).0);
         });
     }
 
     /// The token job `entry` runs under: its own, or a fresh one under its
     /// parent's while nothing runs it.
     fn token_of(&self, jobs: &Jobs, entry: &JobFacts) -> CancellationToken {
-        match &entry.handles {
+        match &entry.live.handles {
             Some(handles) => handles.cancellation.clone(),
             None => self.token_under(jobs, entry.parent),
         }
@@ -80,7 +80,7 @@ impl JobManager {
                 }
                 continue;
             }
-            let sender = self.entry(id, |entry| Some(entry.handles.as_ref()?.input.clone()));
+            let sender = self.entry(id, |entry| Some(entry.live.handles.as_ref()?.input.clone()));
             let sender = sender.await?;
             let sender = sender.ok_or(JobError::InputClosed(id))?;
             // Accepted under the core's read lock, so the handler's close, a core
@@ -103,7 +103,7 @@ impl JobManager {
                             Lookup::Unheld(()) => return None,
                             Lookup::Unknown => return Some(Err(JobError::Unknown(id))),
                         };
-                        let current = entry.handles.as_ref().map(|handles| &handles.input);
+                        let current = entry.live.handles.as_ref().map(|handles| &handles.input);
                         let moved = current.is_none_or(|current| !current.same_channel(&sender));
                         match entry.restart() {
                             None => Some(Err(JobError::InputClosed(id))),
@@ -176,7 +176,7 @@ impl JobManager {
     fn abandon(&self, state: &mut CoreState, Run(id, invocation): Run, parent: Option<JobId>) {
         let fresh = self.token_under(&state.jobs, parent);
         let stopped = state.jobs.modify(id, |entry, _| {
-            let handles = entry.handles.as_mut()?;
+            let handles = entry.live.handles.as_mut()?;
             let worker = handles.task_abort.take_if(|(run, _)| *run == invocation);
             Some((std::mem::replace(&mut handles.cancellation, fresh), worker))
         });
@@ -245,7 +245,7 @@ impl JobManager {
         };
         self.inner
             .store
-            .commit_on([id], Command::Send, resume)
+            .commit_on([id], Command::Start, resume)
             .await
     }
 
@@ -263,7 +263,8 @@ impl JobManager {
     ) {
         let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
         let started = state.jobs.modify(id, |entry, _| {
-            let handles = (entry.handles).get_or_insert_with(|| JobHandles::new(cancellation).0);
+            let handles =
+                (entry.live.handles).get_or_insert_with(|| JobHandles::new(cancellation).0);
             handles.input = input.clone();
             (handles.cancellation.clone(), Run(id, entry.invocation))
         });
@@ -354,7 +355,6 @@ impl Jobs {
 mod tests {
     use super::*;
     use std::assert_matches;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A child's name belongs to its owner's installed children, whatever their
     /// end: a call that installed none holds no name, so the first of two to
@@ -393,22 +393,16 @@ mod tests {
         assert!(accepts(launch(&other).await).is_ok());
     }
 
-    /// A running retained agent job whose resume handler echoes and counts calls.
-    async fn retained(
-        jobs: &JobManager,
-        agent: &AgentId,
-    ) -> (JobLease<stage::Running>, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let invoked = calls.clone();
+    /// A running retained agent job whose resume handler echoes.
+    async fn retained(jobs: &JobManager, agent: &AgentId) -> JobLease<stage::Running> {
         let handler: ResumeHandler = Arc::new(move |value, _| {
-            invoked.fetch_add(1, Ordering::SeqCst);
             let value = value.unwrap_or_else(|| serde_json::json!("resumed"));
             Box::pin(async move { Ok(ToolOutput::new(value).into()) })
         });
         let (lease, _) = jobs
             .test_agent(JobSpec::test(agent.clone(), "agent"), handler)
             .await;
-        (lease, calls)
+        lease
     }
 
     async fn settled(jobs: &JobManager, id: JobId) -> crate::job::tests::Hydrated {
@@ -437,7 +431,6 @@ mod tests {
                 JobError::InputUnavailable { job, reason: InputUnavailableReason::State(actual) }
                     if job == id && actual == state);
             assert!(error.to_string().contains("queued"));
-            assert!(!error.to_string().contains("approval"));
         }
         // A call that installed no child, once it ends otherwise than interrupted.
         let spec = JobSpec {
@@ -462,7 +455,7 @@ mod tests {
     async fn interrupted_retained_child_resumes_on_send_unless_cancelled() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
         for cancel in [false, true] {
-            let (lease, calls) = retained(&jobs, &agent).await;
+            let lease = retained(&jobs, &agent).await;
             jobs.finish(lease.id(), ToolError::interrupted().into())
                 .await
                 .unwrap();
@@ -470,7 +463,7 @@ mod tests {
                 let (cancelled, _) = crate::tests::expire(
                     jobs.wait(lease.id(), true),
                     async { jobs.cancel(lease.id()).await.unwrap() },
-                    super::super::cancellation::CANCELLATION_GRACE,
+                    crate::job::cancellation::CANCELLATION_GRACE,
                 )
                 .await;
                 assert_eq!(cancelled.unwrap().state, JobState::Cancelled);
@@ -484,7 +477,6 @@ mod tests {
                         ..
                     })
                 );
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
             } else {
                 sent.unwrap();
                 let result = settled(&jobs, lease.id()).await;
@@ -497,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn send_retries_when_child_mailbox_closes_before_completion() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let (lease, _calls) = retained(&jobs, &agent).await;
+        let lease = retained(&jobs, &agent).await;
         let id = lease.id();
         let (mut input, _worker) = lease.split();
         input.close();

@@ -24,7 +24,7 @@ binary's command help. `skyhook` itself requires an interactive terminal; `batch
 | `-s, --script PATH` | Run a JavaScript workflow. Mutually exclusive with `--prompt`. |
 | `--image PATH` | Attach an image to the initial prompt; repeat for multiple images. Requires `--prompt`, conflicts with `--script`. |
 | `--mode NAME` | Start the new-session prompt in this configured [mode](../guide/permissions.md#modes) instead of the default. With `--resume`, the next message switches the session to it. |
-| `-a, --approve-all` | Bypass tool approval prompts, not capability gates or authentication prompts. |
+| `-a, --approve-all` | Bypass tool approval prompts, not capability gates. |
 | `-h, --help` | Print command help. |
 | `-V, --version` | Print the version. |
 
@@ -50,7 +50,7 @@ Stdout contains only the session ID and newline, flushed before execution; resul
 session logs. See the [headless guide](../guide/headless.md) for completion, errors, shutdown,
 signals, and interaction restrictions.
 
-Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `ssh_agent`,
+Policy capability names are `read`, `write`, `exec`, `network`, `targets`,
 `agents`, and `mcp`. The terminal supplies `interactive`; a batch job never has it. See
 [permissions](../guide/permissions.md) for resolution and limitations.
 
@@ -174,6 +174,6 @@ See [authentication](../configuration/authentication.md) for credential ownershi
 ## Related settings
 
 The [configuration overview](../configuration/overview.md) describes configuration paths
-and the full example. [Authentication](../configuration/authentication.md#api-keys-and-environment-files)
+and the full example. [Authentication](../configuration/authentication.md#environment-files)
 documents invocation-directory `.env` loading. [Terminal interface](../guide/terminal-interface.md)
 documents slash commands, keybindings, model selection, and saved UI state.

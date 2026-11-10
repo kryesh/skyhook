@@ -1,0 +1,23 @@
+[package]
+name = "skyhook-media"
+description = "Skyhook's images, attachments and content-addressed blob references"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_with.workspace = true
+skyhook-base.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The version image decodes PNGs with, to build fixtures image cannot encode.
+png = "0.18"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

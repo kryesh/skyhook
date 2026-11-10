@@ -1,18 +1,19 @@
 use std::sync::Arc;
 
+use skyhook::identity::{AgentId, SessionId};
 use skyhook::{
     agent::{
         HarnessBuilder, HostEventsFuture, HostState, HostStateFuture, ResumeFuture, ResumeHook,
         SessionHandle,
     },
-    identity::{AgentId, SessionId},
-    session::{ExtensionDb, HostCursor, HostEvent, SessionStore},
+    session::{ExtensionDb, HostCursor, HostEvent},
 };
 
-use cli::{
-    HookFuture, Opening, PreparedSession, SessionContext, SessionExtension, SessionFactory,
+use skyhook::product::{
+    Attendance, Error, HookFuture, Opening, PreparedSession, SessionContext, SessionExtension,
+    SessionFactory,
     form::{Choice, Field, FieldKind, ScopeForm, ScopeReply},
-    page::Disclosed,
+    page::{Disclosed, Page},
 };
 
 use crate::{
@@ -21,14 +22,6 @@ use crate::{
     store::{Coverage, EventId, LivePolicy, RunFacts, RunOptions, RunState, Store},
     tools,
 };
-
-/// What a session starts with: configuration and flags first, then the scope form. A new run
-/// takes its options and its live policy, which it keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Scope {
-    pub options: RunOptions,
-    pub live: LivePolicy,
-}
 
 /// The scope form's pages, in order: a new session is a new run.
 #[derive(Clone, Copy)]
@@ -41,7 +34,7 @@ enum ScopeField {
 impl ScopeField {
     const ALL: [Self; 3] = [Self::Shortlist, Self::Live, Self::Workers];
 
-    fn field(self, scope: &Scope) -> Field {
+    fn field(self, options: &RunOptions) -> Field {
         let choice = |labels: &[&str], selected: usize| {
             let options = labels.iter().map(|label| (*label).to_owned()).collect();
             FieldKind::Choice(Choice::new(options, selected).expect("the selection is listed"))
@@ -58,7 +51,7 @@ impl ScopeField {
                     &Severity::ALL.map(|severity| severity.as_str()),
                     Severity::ALL
                         .iter()
-                        .position(|severity| *severity == scope.options.threshold)
+                        .position(|severity| *severity == options.threshold)
                         .expect("severity is listed"),
                 ),
             },
@@ -69,77 +62,66 @@ impl ScopeField {
                     &LivePolicy::ALL.map(|policy| policy.as_str()),
                     LivePolicy::ALL
                         .iter()
-                        .position(|policy| *policy == scope.live)
+                        .position(|policy| *policy == options.live)
                         .expect("policy is listed"),
                 ),
             },
             Self::Workers => Field {
                 name: "Workers".into(),
                 prompt: "How many agents the orchestrator's scheduler runs at once".into(),
-                kind: integer(scope.options.workers),
+                kind: integer(options.workers),
             },
         }
     }
-}
 
-impl Scope {
-    fn form(&self, title: String, fields: &[ScopeField], message: String) -> ScopeForm {
+    /// The scope form showing `options`.
+    fn form(options: &RunOptions, message: String) -> ScopeForm {
         ScopeForm {
-            title,
-            fields: fields.iter().map(|field| field.field(self)).collect(),
+            title: "Scope".to_owned(),
+            fields: Self::ALL.iter().map(|field| field.field(options)).collect(),
             message,
         }
     }
 
-    /// The scope with a form's answers applied, field by field in form order.
-    fn answered(mut self, fields: &[ScopeField], reply: &ScopeReply) -> Self {
-        for (field, value) in fields.iter().zip(reply) {
+    /// `options` with a form's answers applied, field by field in form order.
+    fn answered(mut options: RunOptions, reply: &ScopeReply) -> RunOptions {
+        for (field, value) in Self::ALL.iter().zip(reply) {
             match field {
-                ScopeField::Shortlist if let Some(index) = value.choice() => {
-                    self.options.threshold = Severity::ALL[index];
+                Self::Shortlist
+                    if let Some(&threshold) =
+                        value.choice().and_then(|at| Severity::ALL.get(at)) =>
+                {
+                    options.threshold = threshold;
                 }
-                ScopeField::Live if let Some(index) = value.choice() => {
-                    self.live = LivePolicy::ALL[index];
+                Self::Live
+                    if let Some(&live) = value.choice().and_then(|at| LivePolicy::ALL.get(at)) =>
+                {
+                    options.live = live;
                 }
-                ScopeField::Workers
+                Self::Workers
                     if let Some(workers) = value.integer().and_then(std::num::NonZeroU16::new) =>
                 {
-                    self.options.workers = workers;
+                    options.workers = workers;
                 }
-                ScopeField::Shortlist | ScopeField::Live | ScopeField::Workers => {}
+                Self::Shortlist | Self::Live | Self::Workers => {}
             }
         }
-        self
+        options
     }
 }
 
 #[derive(Clone)]
-pub struct ResearchFactory {
-    scope: Scope,
+pub(crate) struct ResearchFactory {
+    options: RunOptions,
     /// A worker count the command line set, which resizes a resumed run too.
     resize: Option<std::num::NonZeroU16>,
-    /// The session the launch resumes, with the live policy configuration decided it runs under.
-    resumed: Option<(SessionId, LivePolicy)>,
 }
 
 impl ResearchFactory {
-    /// A factory whose new sessions start from `scope`; a resumed session keeps its run's
-    /// threshold, and its workers unless `resize` sets them.
-    pub fn new(scope: Scope, resize: Option<std::num::NonZeroU16>) -> Self {
-        Self {
-            scope,
-            resize,
-            resumed: None,
-        }
-    }
-
-    /// The factory, opening session `id` under `live`, as [`resumed_policy`] decided it.
-    #[must_use]
-    pub fn resuming(self, id: SessionId, live: LivePolicy) -> Self {
-        Self {
-            resumed: Some((id, live)),
-            ..self
-        }
+    /// A factory whose new sessions start from `options`; a resumed session keeps its run's,
+    /// but for its workers when `resize` sets them.
+    pub(crate) fn new(options: RunOptions, resize: Option<std::num::NonZeroU16>) -> Self {
+        Self { options, resize }
     }
 }
 
@@ -148,9 +130,8 @@ impl SessionFactory for ResearchFactory {
         if let Opening::Resume(_) = context.opening {
             return None;
         }
-        Some(self.scope.form(
-            "Scope".to_owned(),
-            &ScopeField::ALL,
+        Some(ScopeField::form(
+            &self.options,
             "Analyze the workspace.".to_owned(),
         ))
     }
@@ -162,20 +143,20 @@ impl SessionFactory for ResearchFactory {
     ) -> HookFuture<'a, PreparedSession> {
         Box::pin(async move {
             // A new session's form answers, when the terminal sent them, over the defaults.
-            let scope = match context.opening {
-                Opening::New(Some(reply)) => self.scope.answered(&ScopeField::ALL, reply),
-                Opening::New(None) | Opening::Resume(_) => self.scope,
+            let options = match context.opening {
+                Opening::New(Some(reply)) => ScopeField::answered(self.options, reply),
+                Opening::New(None) | Opening::Resume(_) => self.options,
             };
-            let live = match (context.opening, self.resumed) {
-                (Opening::New(_), _) => scope.live,
-                (Opening::Resume(id), Some((resumed, live))) if resumed == id => live,
-                // Another session the terminal opens.
-                (Opening::Resume(id), _) => {
-                    resumed_policy(context.workspace, id, scope.live).await?
-                }
+            // The policy is checked on what the opened run is under.
+            let live = match context.opening {
+                Opening::New(_) => options.live,
+                Opening::Resume(id) => resumed_policy(context.workspace, id, options.live).await?,
             };
+            if context.attendance == Attendance::Batch && live == LivePolicy::Ask {
+                return Err(crate::product::Refused::BatchAsk.into());
+            }
             let research = Arc::new(ResearchSession {
-                scope,
+                options,
                 resize: self.resize,
                 facts: Cached::default(),
                 coverage: Cached::default(),
@@ -198,9 +179,9 @@ impl SessionFactory for ResearchFactory {
 
 /// A security session's resources: the run lives in the session itself, so each hook
 /// reads it from the session it is handed.
-pub struct ResearchSession {
-    /// A new run's threshold, workers and live policy.
-    scope: Scope,
+pub(crate) struct ResearchSession {
+    /// A new run's options.
+    options: RunOptions,
     resize: Option<std::num::NonZeroU16>,
     /// The run's facts the orchestrator's host state or the Research page last read, reused
     /// until research or a job moves on.
@@ -210,7 +191,7 @@ pub struct ResearchSession {
     coverage: Cached<Generation, Coverage>,
     /// The last Research page, with what it was read at and for: an unchanged store,
     /// disclosure and uptime read nothing.
-    page: Cached<(Watermark, Disclosed, research_view::Uptime), cli::page::Page>,
+    page: Cached<(Watermark, Disclosed, research_view::Uptime), Page>,
     opened: research_view::Opened,
     /// Each agent found with nothing to be told at a research generation and cursor: it stays
     /// so until research is written.
@@ -231,8 +212,8 @@ impl<K: PartialEq, T> Cached<K, T> {
     async fn get(
         &self,
         key: K,
-        read: impl Future<Output = Result<T, cli::Error>>,
-    ) -> Result<Arc<T>, cli::Error> {
+        read: impl Future<Output = Result<T, Error>>,
+    ) -> Result<Arc<T>, Error> {
         if let Some((cached, value)) = &*self.0.lock().expect("research cache")
             && *cached == key
         {
@@ -262,25 +243,17 @@ struct Watermark {
 
 impl Watermark {
     /// Read before the snapshot it keys begins, so a value cached under it is never older.
-    async fn of(store: &Store) -> Result<Self, cli::Error> {
+    async fn of(store: &Store) -> Result<Self, Error> {
         let research = Generation {
             session: store.id(),
             generation: store.generation(),
         };
         let reader = store.clone();
         let journal = store
-            .reading(move || reader.journal_mark().map_err(cli::Error::from))
+            .reading(move || reader.journal_mark().map_err(Error::from))
             .await?;
         Ok(Self { research, journal })
     }
-}
-
-/// The research of a session opened by this product's harness.
-fn research(session: &SessionStore) -> Result<Store, cli::Error> {
-    session
-        .extension()
-        .map(Store::of)
-        .ok_or_else(|| "this session keeps no security research".into())
 }
 
 /// Only the orchestrator steers the run; the agents it starts get what their work needs in
@@ -320,15 +293,14 @@ impl HostState for ResearchSession {
                 .map(|cursor| EventId::try_from(cursor.get()))
                 .transpose()?;
             let (reader, actor) = (store.clone(), agent.clone());
-            let read =
-                store.reading(move || reader.changes(&actor, after).map_err(cli::Error::from));
+            let read = store.reading(move || reader.changes(&actor, after).map_err(Error::from));
             match read.await? {
                 Some((through, changes)) => {
                     let serde_json::Value::Object(view) = serde_json::to_value(changes)? else {
                         return Err("research changes are not an object".into());
                     };
                     Ok(Some(HostEvent {
-                        through: HostCursor::try_from(through.get())?,
+                        through: HostCursor::try_from(i64::from(through))?,
                         view: view.try_into()?,
                     }))
                 }
@@ -355,7 +327,7 @@ impl ResumeHook for ResearchSession {
             let store = Store::of(extension);
             store
                 .clone()
-                .writing(move || store.set_workers(workers).map_err(cli::Error::from))
+                .writing(move || store.set_workers(workers).map_err(Error::from))
                 .await
         })
     }
@@ -364,27 +336,24 @@ impl ResumeHook for ResearchSession {
 /// The live policy resumed session `id` of `workspace` runs under: a reopened run keeps the
 /// policy it started under; one whose setup an interruption left undone starts under
 /// `launch`.
-pub async fn resumed_policy(
+async fn resumed_policy(
     workspace: &std::path::Path,
     id: SessionId,
     launch: LivePolicy,
-) -> Result<LivePolicy, cli::Error> {
+) -> Result<LivePolicy, Error> {
     let root = skyhook::config::workspace_session_root(workspace);
     let store = Store::inspect(&root, id).await?;
     let reader = store.clone();
     store
         .reading(move || {
-            let live = match reader.initialized()? {
-                true => reader.run()?.live,
-                false => launch,
-            };
-            Ok::<_, cli::Error>(live)
+            let run = reader.started()?;
+            Ok::<_, Error>(run.map_or(launch, |run| run.options.live))
         })
         .await
 }
 
 impl SessionExtension for ResearchSession {
-    fn views(&self) -> &[cli::ExtensionView] {
+    fn views(&self) -> &[&'static str] {
         research_view::VIEWS
     }
 
@@ -393,9 +362,9 @@ impl SessionExtension for ResearchSession {
         _view: usize,
         session: SessionHandle,
         open: Disclosed,
-    ) -> HookFuture<'_, Arc<cli::page::Page>> {
+    ) -> HookFuture<'_, Arc<Page>> {
         Box::pin(async move {
-            let store = research(session.store())?;
+            let store = Store::of_session(session.store().extension())?;
             let (mark, uptime) = (Watermark::of(&store).await?, self.opened.uptime());
             let read = async {
                 let facts = cached(&self.facts, mark, store.clone(), Store::run_facts).await?;
@@ -414,7 +383,7 @@ impl SessionExtension for ResearchSession {
                             coverage,
                             open_tests: reader.open_tests()?,
                         };
-                        (state.page(&reader, &open, Some(uptime))).map_err(cli::Error::from)
+                        (state.page(&reader, &open, Some(uptime))).map_err(Error::from)
                     })
                     .await
             };
@@ -428,12 +397,13 @@ impl SessionExtension for ResearchSession {
         context: SessionContext<'a>,
     ) -> HookFuture<'a, ()> {
         Box::pin(async move {
-            let store = research(session.store())?;
+            let store = Store::of_session(session.store().extension())?;
             let started = store.clone();
             let reader = store.clone();
             if store
-                .reading(move || reader.initialized().map_err(cli::Error::from))
+                .reading(move || reader.started().map_err(Error::from))
                 .await?
+                .is_some()
             {
                 return Ok(());
             }
@@ -445,11 +415,11 @@ impl SessionExtension for ResearchSession {
                     )
                     .await?;
             }
-            let scope = self.scope;
+            let options = self.options;
             store
                 .writing(move || {
-                    started.start_run(scope.options, scope.live)?;
-                    Ok::<_, cli::Error>(())
+                    started.start_run(options)?;
+                    Ok::<_, Error>(())
                 })
                 .await?;
             Ok(())
@@ -458,32 +428,23 @@ impl SessionExtension for ResearchSession {
 
     fn scope<'a>(&'a self, session: &'a SessionHandle) -> HookFuture<'a, Option<ScopeForm>> {
         Box::pin(async move {
-            let store = research(session.store())?;
+            let store = Store::of_session(session.store().extension())?;
             let reader = store.clone();
             let run = store
-                .reading(move || {
-                    let run = match reader.initialized()? {
-                        true => Some(reader.run()?),
-                        false => None,
-                    };
-                    Ok::<_, cli::Error>(run)
-                })
+                .reading(move || reader.started().map_err(Error::from))
                 .await?;
             // A resize this launch applies once the run's work resumes is shown from the start.
-            let scope = run.map(|run| Scope {
-                options: RunOptions {
-                    workers: self.resize.unwrap_or(run.options.workers),
-                    ..run.options
-                },
-                live: run.live,
+            let options = run.map(|run| RunOptions {
+                workers: self.resize.unwrap_or(run.options.workers),
+                ..run.options
             });
-            Ok(scope.map(|scope| scope.form("Scope".to_owned(), &ScopeField::ALL, String::new())))
+            Ok(options.map(|options| ScopeField::form(&options, String::new())))
         })
     }
 }
 
 impl ResearchSession {
-    async fn root_state(&self, store: Store) -> Result<String, cli::Error> {
+    async fn root_state(&self, store: Store) -> Result<String, Error> {
         let mark = Watermark::of(&store).await?;
         let facts = cached(&self.facts, mark, store, Store::run_facts).await?;
         Ok(facts.state())
@@ -496,9 +457,9 @@ async fn cached<K: PartialEq, T: Send + Sync + 'static>(
     mark: K,
     store: Store,
     read: fn(&Store) -> crate::store::Result<T>,
-) -> Result<Arc<T>, cli::Error> {
+) -> Result<Arc<T>, Error> {
     let reader = store.clone();
-    let read = store.reading(move || read(&reader).map_err(cli::Error::from));
+    let read = store.reading(move || read(&reader).map_err(Error::from));
     cache.get(mark, read).await
 }
 
@@ -513,7 +474,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::tests::{harness as builder, harness_on},
+        store::{
+            Listed,
+            tests::{harness as builder, harness_on},
+        },
         tools::tests::bounded,
     };
 
@@ -521,19 +485,16 @@ mod tests {
         SessionContext {
             workspace,
             opening,
-            headless: false,
-        }
-    }
-
-    fn scope(live: LivePolicy) -> Scope {
-        Scope {
-            options: RunOptions::default(),
-            live,
+            attendance: Attendance::Attended,
         }
     }
 
     fn factory(live: LivePolicy, resize: Option<std::num::NonZeroU16>) -> ResearchFactory {
-        ResearchFactory::new(scope(live), resize)
+        let options = RunOptions {
+            live,
+            ..RunOptions::default()
+        };
+        ResearchFactory::new(options, resize)
     }
 
     async fn open(
@@ -555,7 +516,7 @@ mod tests {
     /// The extension over a session of this product, with nothing read yet.
     fn host() -> ResearchSession {
         ResearchSession {
-            scope: scope(LivePolicy::No),
+            options: RunOptions::default(),
             resize: None,
             facts: Cached::default(),
             coverage: Cached::default(),
@@ -586,18 +547,17 @@ mod tests {
     /// out, from its own tool surface and from a script it runs, new and reopened.
     #[tokio::test]
     async fn the_launched_root_coordinates_the_run() {
-        use cli::Product;
-        use skyhook::{config::Config, tool::policy::Capability};
+        use skyhook::config::Config;
+        use skyhook::product::Product;
+        use skyhook::tool::policy::Capability;
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path();
-        let explicit = workspace.join("security.yaml");
-        std::fs::write(&explicit, "{}").unwrap();
         let mut config = Config::from_yaml("{}").unwrap();
-        let args = crate::product::Args {
+        let args = crate::product::Options {
             live: None,
             shortlist: None,
             workers: None,
-            security_config: Some(explicit),
+            config: Default::default(),
         };
         let new = context(workspace, Opening::New(None));
         let configured = crate::product::Security.configure(&mut config, args, new);
@@ -644,7 +604,7 @@ mod tests {
     }
 
     /// A child is told, as a host event, of the root's change to the work its job began, past
-    /// its cursor once; the root, which has no task, is told nothing.
+    /// its cursor once.
     #[tokio::test]
     async fn a_child_is_told_of_changes_to_its_begun_work() {
         let directory = tempfile::tempdir().unwrap();
@@ -654,22 +614,21 @@ mod tests {
             Opening::New(None),
         )
         .await;
-        let store = research(session.store()).unwrap();
+        let store = Store::of_session(session.store().extension()).unwrap();
         let root = session.root_agent().clone();
         let worker = store.clone();
         let (child, path) = tokio::task::spawn_blocking(move || {
             use crate::store::tests::{begun, component, path, text};
             let decoder = component(&worker, &root, "decoder");
             let stream = path(&worker, &root, "stream", &[decoder]);
-            let (child, _, _) = begun(&worker, &crate::store::Begin::Sweep(vec![stream]));
-            let renamed = crate::store::Upsert::Path(crate::store::Change::Edit(
-                stream,
-                crate::store::Edit {
+            let (child, _, _) = begun(&worker, &crate::store::Begin::Sweep(Listed::of([stream])));
+            let renamed =
+                crate::store::Upsert::Edit(crate::store::NodeEdit::Path(crate::store::PathEdit {
+                    id: stream,
                     title: None,
                     body: Some(text("socket to inflate")),
-                    detail: (),
-                },
-            ));
+                    steps: None,
+                }));
             worker.upsert(&root, &renamed).unwrap();
             (child, stream)
         })
@@ -681,18 +640,12 @@ mod tests {
         assert_eq!(
             serde_json::Value::Object(told.view.fields().clone()),
             serde_json::json!({"research_changes": [{"phase": "sweep", "node": path,
-                "title": "stream", "count": 1, "latest": told.through.get(), "kinds": ["edited"],
-                "recent": [{"id": told.through.get(), "kind": "edited",
+                "title": "stream", "count": 1, "latest": i64::from(told.through), "kinds": ["edited"],
+                "recent": [{"id": i64::from(told.through), "kind": "edited",
                     "nodes": [{"node": path, "title": "stream", "effect": "changed"}]}]}]})
         );
         assert!(
             host.events(research, &child, Some(told.through))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            host.events(research, session.root_agent(), None)
                 .await
                 .unwrap()
                 .is_none()
@@ -731,10 +684,10 @@ mod tests {
         let viewed = prepared.builder.build().await.unwrap();
         let viewed = viewed.resume_session(id).await.unwrap();
         prepared.extension.opened(&viewed, reopening).await.unwrap();
-        let store = research(viewed.store()).unwrap();
+        let store = Store::of_session(viewed.store().extension()).unwrap();
         let settings = |store: &Store| {
-            let run = store.run().unwrap();
-            (run.live, run.options.workers.get())
+            let run = store.started().unwrap().unwrap();
+            (run.options.live, run.options.workers.get())
         };
         let configured = RunOptions::default().workers.get();
         // The terminal reads the scope as it opens the session, before its work resumes: it
@@ -777,8 +730,8 @@ mod tests {
         unset.shutdown().await.unwrap();
         unset.close().await.unwrap();
         let (recovered, _) = open(&asking, workspace, Opening::Resume(id)).await;
-        let store = research(recovered.store()).unwrap();
-        assert!(store.initialized().unwrap());
+        let store = Store::of_session(recovered.store().extension()).unwrap();
+        assert!(store.started().unwrap().is_some());
         recovered.shutdown().await.unwrap();
         recovered.close().await.unwrap();
     }
@@ -810,7 +763,7 @@ mod tests {
     /// write.
     #[tokio::test]
     async fn a_job_ending_moves_the_cached_state_and_page() {
-        use cli::page::Block;
+        use skyhook::product::page::Block;
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path();
         let provider = Gated {
@@ -825,7 +778,7 @@ mod tests {
         let session = session.unwrap();
         prepared.extension.opened(&session, context).await.unwrap();
         let host = host();
-        let store = research(session.store()).unwrap();
+        let store = Store::of_session(session.store().extension()).unwrap();
         let root = session.root_agent().clone();
         let decoder = crate::store::tests::component(&store, &root, "decoder");
         let stream = crate::store::tests::path(&store, &root, "stream", &[decoder]);
@@ -870,7 +823,7 @@ mod tests {
                     )
                 })
                 .unwrap();
-            let sweep = crate::store::Begin::Sweep(vec![stream]);
+            let sweep = crate::store::Begin::Sweep(Listed::of([stream]));
             store.begin(&root.child(index), &sweep).unwrap();
             assert_eq!(plan().await, "plan: nothing owed; 1 running");
             assert_eq!(running().await, "1");

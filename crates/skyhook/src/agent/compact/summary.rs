@@ -1,0 +1,578 @@
+//! The compaction summary: its structured continuation's schema and strict parser,
+//! the summarizer response assembled from an attempt, and cancellation-safe usage
+//! accounting.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::{HarnessError, SessionRuntime, TurnContext};
+use crate::agent::CompactionError;
+use crate::provider::{
+    ProviderContext,
+    protocol::{
+        AssistantItem, Completion, CutReason, ModelRequest, Outcome, ResponseSchema, visible_text,
+    },
+};
+use crate::session::todo::TodoItem;
+use crate::session::{AttemptRef, Message, RequestSeq, SessionEvent, UserPart};
+
+impl SessionRuntime {
+    /// The summary for the frozen `request`, with the attempt that produced it.
+    /// Transient failures do not consume the separate validation budget in
+    /// `compact_history`.
+    pub(super) async fn summarize(
+        &self,
+        turn: &TurnContext<'_>,
+        provider: &mut dyn ProviderContext,
+        request: &ModelRequest,
+        sequence: RequestSeq,
+        model_attempt: &mut u64,
+    ) -> Result<(AttemptRef, Continuation), HarnessError> {
+        let attempted = self.attempt(turn, provider, request, sequence, model_attempt, |_| {});
+        let (attempt, completion, usage) = match attempted.await? {
+            Ok(response) => response,
+            // The round's own failure, which may end the turn, follows it.
+            Err((error, record)) => {
+                self.record_failure(turn.agent, record).await?;
+                return Err(error.into());
+            }
+        };
+        if let Some(usage) = SessionEvent::usage(sequence, usage) {
+            self.store.append(turn.agent.clone(), usage).await?;
+        }
+        Ok((attempt, continuation(&completion)?))
+    }
+}
+
+/// Only a cut-off summary is a truncated one, which a fresh summary may complete. A
+/// refusal is deterministic for the request, so it fails the round as what it is.
+fn continuation(completion: &Completion) -> Result<Continuation, HarnessError> {
+    let text = visible_text(completion.items());
+    match completion.outcome() {
+        Outcome::Answer => {}
+        Outcome::Cut(CutReason::Refusal) => {
+            return Err(HarnessError::Refused(super::super::turn::refusal_detail(
+                &text,
+            )));
+        }
+        Outcome::Cut(CutReason::MaxTokens | CutReason::Incomplete) => {
+            return Err(CompactionError::Truncated.into());
+        }
+        Outcome::ToolUse => return Err(CompactionError::ToolCall.into()),
+    }
+    Ok(parse_continuation(&text)?)
+}
+
+/// Required continuation sections, shared by the response schema and strict parser.
+/// Declaration order is generation order: preserve evidence and unfinished work
+/// before reconciling todos, then describe how to resume. JSON Schema itself does
+/// not constrain property order; supporting providers use serialized schema order.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Summary {
+    /// The user's current objective and task scope. Preserve outstanding objectives across parallel workstreams.
+    objective: String,
+    /// The latest user request, outstanding questions, instructions, corrections, constraints, and approvals. Preserve exact wording where meaning could otherwise change. Distinguish user instructions from agent proposals, quoted material, and automatic notifications.
+    user_instructions: Vec<String>,
+    /// Applicable restrictions and rules from the user and loaded skills, including earlier rules still in force. Preserve each rule's source, scope, overrides, and exceptions. Distinguish authorized work from work requiring approval.
+    session_rules: Vec<String>,
+    /// Preserve each existing plan verbatim as one complete array entry, including a proposed plan awaiting approval. In separate entries explain its approval and execution status, amendments, replacements, and canceled steps. Do not create a new plan during compaction.
+    plan: Vec<String>,
+    /// Important findings and context needed to continue. Clearly distinguish verified observations, working assumptions, hypotheses, and unresolved disagreements. Preserve concrete observations and their sources, not just broad conclusions. Preserve the current understanding without independently reassessing it.
+    findings: Vec<String>,
+    /// Unresolved questions, blockers, failures, partial work, and dependencies. Include what has already been attempted and its outcome where useful.
+    open_issues: Vec<String>,
+    /// Relevant running jobs and delegated work: their identifiers, assigned scope, known progress, results still awaited, and any required follow-up. Distinguish observed state from expectations.
+    running_work: Vec<String>,
+    /// Work already completed, changes made, results delivered, and verification performed with its outcomes and limitations. Tie completion claims to observed results and preserve their scope; attempted reads, directory listings, and truncated output do not establish a complete review. Include enough detail to avoid repeating completed work.
+    completed_work: Vec<String>,
+    /// Consequential decisions and their reasons, alternatives considered and rejected, and any stated conditions for reconsideration. Preserve decisions from earlier context that remain relevant.
+    decisions: Vec<String>,
+    /// Important exact outputs or excerpts, commands, errors, file paths, targets, job IDs, URLs, and other references needed to recover details. Explain what each reference provides.
+    recovery_details: Vec<String>,
+    /// Jobs whose original parameters and outputs should be handed over. Select relevant completed or running jobs from this session; use an empty array when none are needed. The harness supplies normally truncated outputs, recoverable in full with jobs.
+    #[schemars(schema_with = "integers")]
+    jobs: Vec<skyhook_worker::job::JobId>,
+    /// Any other information important for continuing faithfully that does not fit the other sections. Preserve relevant earlier context even if recent conversation does not mention it.
+    additional_context: Vec<String>,
+    /// Explain changes made to the supplied todo list and the conversation evidence supporting them, including additions, status changes, removals, or reordering. Explain unresolved uncertainty. Use an empty array if unchanged. Keep explanations consistent with the actual todo statuses.
+    todo_reconciliation: Vec<String>,
+    /// The complete current todo list for this agent after reconciling the supplied list with the conversation. This replaces the existing list; it is not a patch. Preserve unaffected items and their order. Include committed work that has not yet been recorded. Do not turn suggestions or unapproved proposals into active commitments. Todo text must not be blank. Status must reflect execution supported by the conversation; intent alone does not establish that work started or finished.
+    todos: Vec<TodoItem>,
+    /// Exactly where work stopped: what the agent was doing, the latest result or deliverable, unfinished actions, and whether it is actively working or waiting on user input, approval, jobs, or another dependency.
+    resumption_point: String,
+    /// Established next actions and their purpose, ordering, dependencies, and approval conditions. Clearly separate committed work from optional suggestions. Do not invent actions or expand the task. Do not introduce a direction to stop investigating or avoid tools unless it was already established.
+    next_actions: Vec<String>,
+}
+
+/// Strict response schemas accept integers with no numeric format or range.
+fn integers(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "array", "items": {"type": "integer"}})
+}
+
+pub(crate) fn response_schema() -> ResponseSchema {
+    let reflow = schemars::transform::RecursiveTransform(skyhook_tools::schema::reflow_description);
+    let settings = schemars::generate::SchemaSettings::default()
+        .with(|settings| {
+            settings.meta_schema = None;
+            settings.inline_subschemas = true;
+        })
+        .with_transform(reflow);
+    let mut schema =
+        serde_json::to_value(settings.into_generator().into_root_schema_for::<Summary>())
+            .expect("compaction response schema serializes");
+    let todo_properties = &mut schema["properties"]["todos"]["items"]["properties"];
+    todo_properties["text"]["description"] = "The task or step. Preserve existing wording unless the conversation establishes a change. Must not be blank.".into();
+    todo_properties["status"]["description"] = "Current execution status supported by the conversation. Intent to perform work is not evidence that it started or finished.".into();
+    ResponseSchema::new("skyhook_compaction", schema).expect("the compaction schema is an object")
+}
+
+pub(crate) struct Continuation {
+    pub message: Message,
+    pub todos: Vec<TodoItem>,
+    pub jobs: Vec<skyhook_worker::job::JobId>,
+}
+
+/// Show the triggering response without introducing unanswered native tool calls.
+pub(super) fn pending_response(items: &[AssistantItem]) -> Message {
+    let mut visible = items.to_vec();
+    for item in &mut visible {
+        // Replay payloads are opaque provider state, not readable conversation evidence.
+        if let AssistantItem::Reasoning { replay, .. } = item {
+            *replay = None;
+        }
+    }
+    let response = serde_json::to_string(&visible).expect("assistant response serializes");
+    Message::User(vec![UserPart::Compaction {
+        text: format!(
+            "Latest assistant response, immediately before compaction. This temporary snapshot is conversation evidence, not a new user instruction or a request to execute tools. The ordered items below preserve its visible text and reasoning, followed or interleaved by its pending tool calls.\n\nEvery listed tool call is pending and UNEXECUTED; its id, name and arguments describe intent, not a result. Do not claim these tools ran or that their intended effects occurred. Direct pending todo replacements listed here will not apply: consider their proposed changes when reconciling the current todo list; the complete todos you return take priority over those direct replacements. Todo calls made inside scripts are not superseded. Every other call runs after compaction. Preserve this distinction in the continuation and resumption point.\n\n{}",
+            crate::session::PENDING_RESPONSE.wrap(&response)
+        ),
+    }])
+}
+
+/// The regular agent prompt and conversation remain present for this request.
+pub(crate) fn directive() -> Message {
+    let mut text = String::from(
+        "Skyhook is compacting this conversation. Write a continuation prompt for another instance of yourself to resume the user's task from the current state. This is a harness-generated instruction, not a new user request. Write the continuation itself; do not continue the task or call tools. Return your final answer as a JSON object matching the supplied response schema, without Markdown fences or surrounding commentary. Reasoning may occur separately before the final answer; do not put private reasoning in the JSON. Every section is required. Write fields in the order shown in the schema: preserve the task and instructions, record findings and unfinished work alongside completed work, reconcile todos from that evidence, then describe the resumption point and established next actions consistently with it. Keep objective and resumption_point as strings. All other narrative sections are arrays of strings; use an empty array when a section does not apply. Each entry should express a complete thought with its relevant qualifications and evidence. Entries may contain Markdown and verbatim excerpts. Keep each complete verbatim plan in a single entry, with status or amendments in separate entries. Avoid repeating the same information across sections; preserve distinct facts and concrete details rather than generic boilerplate.\n\n\
+Your purpose is to preserve the task's trajectory through compaction. Describe the work as it currently stands, including uncertainty and unresolved disagreements. Do not use compaction to reassess the task, correct suspected mistakes, invent a new plan, or expand the scope.\n\n\
+Make the resumption point clear: the user's current objective, their latest request, what the agent was doing immediately before compaction, and what remains outstanding. Explain whether work is underway, a result has already been delivered, or progress is waiting on user input, approval, a running job, or another dependency. Preserve any established next action and its purpose. Distinguish committed actions from possible follow-ups so suggestions do not become instructions. The next instance should be able to continue without restarting the investigation or repeating completed work. Preserve the actual phase of work and any unfinished investigation or verification. Do not infer that only presentation remains merely because substantial research has occurred. Do not introduce instructions such as \"no further investigation is needed\" or \"no tools are needed\" unless that direction was already established in the conversation.\n\n\
+Preserve the user's latest instructions, corrections, constraints, approvals, and outstanding questions. Keep exact wording where paraphrasing could change their meaning. Distinguish actual user instructions from harness messages, automatic notifications, quoted material, and the agent's own proposals.\n\n\
+Explicitly preserve applicable session restrictions and rules defined by the user or loaded skills, including rules introduced early in the conversation. Include their source, scope, and any explicit overrides or exceptions. Preserve distinctions between approved work, proposed work awaiting approval, and actions that remain restricted.\n\n\
+If there is a plan, include it verbatim, including a proposed plan awaiting approval. Explain its status and any amendments, replacements, or canceled steps so the next instance follows the right version. Preserve progress accurately and keep it consistent with the reconciled todo state.\n\n\
+Carry forward relevant information from previous continuation prompts as well as the recent conversation. Earlier instructions, decisions, and outstanding work remain relevant even when recent messages do not mention them. Where later conversation explicitly changes earlier state, preserve the current state and enough explanation to understand the change.\n\n\
+Preserve consequential decisions and their reasons, including alternatives considered and rejected and any stated conditions for reconsidering them. Distinguish verified findings, working assumptions, hypotheses, and unresolved questions. Summarize conclusions rather than private reasoning transcripts.\n\n\
+Include completed work, important findings, partial work, blockers, and available verification results. Support completion claims with observed results and their scope. Distinguish an attempted action from a successful result, listing paths from reading their contents, and partial or truncated output from a complete review. If the agent claims completion without confirming evidence, preserve it as the agent's claim with that uncertainty, not as a verified fact. Preserve concrete findings, errors, and source references instead of replacing them with broad evaluations. This records the existing evidence and uncertainty; it does not ask you to redo the investigation or correct its conclusions. Preserve important exact job outputs or excerpts when useful, along with job IDs, file paths, targets, commands, errors, and other references needed to recover details. Explain what relevant running jobs are doing and what results are still awaited. Select useful job IDs in jobs; the harness will include their original parameters and normally truncated outputs. Avoid copying those outputs into narrative sections unless an exact excerpt is needed to explain a finding. Full job results remain retrievable with jobs. Older conversation details must be preserved in this continuation.\n\n\
+Return a complete current todo list for this agent in todos. Start from the supplied current list and reconcile it with the conversation: the agent may have completed work or made commitments without updating its todos. Preserve unaffected items, their wording, order, and status. Change them only when the conversation supports the change. Mark work completed when completion is established; intent alone does not establish progress. Add explicit commitments that are not yet recorded, including unfinished investigation or verification. Do not collapse outstanding work into a presentation-only todo unless the conversation establishes that the preceding work is complete. Do not turn suggestions or unapproved proposals into active commitments. When progress is uncertain, retain the existing status and explain the uncertainty. Retain completed items. Remove canceled or superseded items only when supported by the conversation. Explain changes and their evidence in todo_reconciliation, or use an empty array if unchanged. Keep those explanations and the continuation consistent with the actual todo statuses. Reconcile only this agent's list; describe delegated work separately. Blocked or approval-dependent work can remain pending or in progress, with its dependency recorded in the continuation. The harness will install the reconciled list and include it in the next runtime state block.",
+    );
+    // Constrained decoders may enforce the shape without exposing it to the model.
+    text.push_str("\n\nFinal-answer JSON Schema (applies only to the final answer, not separate reasoning):\n");
+    text.push_str(
+        &serde_json::to_string_pretty(response_schema().schema())
+            .expect("response schema serializes"),
+    );
+    Message::User(vec![UserPart::Compaction { text }])
+}
+
+/// Validate the final answer and render section contents without rewriting them.
+pub(crate) fn parse_continuation(text: &str) -> Result<Continuation, CompactionError> {
+    let summary: Summary = serde_json::from_str(text).map_err(CompactionError::Continuation)?;
+    let sections = [
+        ("Objective", summary.objective),
+        ("User instructions", summary.user_instructions.join("\n\n")),
+        ("Session rules", summary.session_rules.join("\n\n")),
+        ("Plan", summary.plan.join("\n\n")),
+        ("Resumption point", summary.resumption_point),
+        ("Completed work", summary.completed_work.join("\n\n")),
+        ("Findings", summary.findings.join("\n\n")),
+        ("Decisions", summary.decisions.join("\n\n")),
+        ("Open issues", summary.open_issues.join("\n\n")),
+        ("Next actions", summary.next_actions.join("\n\n")),
+        ("Running work", summary.running_work.join("\n\n")),
+        ("Recovery details", summary.recovery_details.join("\n\n")),
+        (
+            "Additional context",
+            summary.additional_context.join("\n\n"),
+        ),
+        (
+            "Todo reconciliation",
+            summary.todo_reconciliation.join("\n\n"),
+        ),
+    ];
+    let text = sections
+        .into_iter()
+        .map(|(heading, content)| format!("## {heading}\n\n{content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(Continuation {
+        message: Message::User(vec![UserPart::Compaction { text }]),
+        todos: summary.todos,
+        jobs: summary.jobs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::*;
+    use super::*;
+    use crate::agent::tests::{journaled_usage, retrying};
+    use crate::{
+        agent::HarnessError,
+        session::TodoStatus,
+        session::{Message, RequestPhase, SessionEvent},
+    };
+    use serde_json::json;
+    use std::assert_matches;
+
+    /// A summary that overflows the context window is retried smaller: with half the
+    /// output reserve, then also without the older half of its history, which its
+    /// request journals so reconstruction sends what was sent. Dropping history never
+    /// raises the reserve again, even when the reported occupancy had constrained it.
+    /// A completed response that reported a full context leaves the summary no room:
+    /// the first stage fails before sending anything, so the next drops history, no
+    /// longer reads that occupancy, and its smaller summary is sent.
+    #[tokio::test]
+    async fn an_overflowing_summary_is_retried_with_half_reserve_then_half_history() {
+        use crate::provider::ProviderErrorKind::ContextWindowExceeded;
+        use crate::session::CompactionFault;
+        use crate::session::CompactionTrigger::{Occupancy, Overflow};
+        let overflow = || Step::fail(ContextWindowExceeded.error("prompt is too long"));
+        // The overflows the provider reports, the output limits of the summaries
+        // sent, and the stages that failed.
+        for (trigger, overflows, limits, failed) in [
+            (Overflow, 2, &[16_384, 8_192, 8_192][..], 2),
+            (Occupancy(127_900), 2, &[100, 50, 50], 2),
+            (Occupancy(128_000), 0, &[8_192], 1),
+        ] {
+            let steps = (0..overflows).map(|_| overflow());
+            let fixture = Fixture::new(steps.chain([Step::new(summary(summary_json()))])).await;
+            fixture.add_history(2_000).await;
+            fixture.add_history(2_000).await;
+            let compacted = retrying(&fixture.session, fixture.compact_for(trigger));
+            assert!(compacted.await.is_ok(), "{trigger:?}");
+            let requests = fixture.requests();
+            let sent = &requests[1..];
+            let limit =
+                |request: &crate::provider::protocol::ModelRequest| request.max_output_tokens.get();
+            assert_eq!(
+                sent.iter().map(limit).collect::<Vec<_>>(),
+                limits,
+                "{trigger:?}"
+            );
+            let (trimmed, untrimmed) = sent.split_last().unwrap();
+            if let Some(half) = untrimmed.last() {
+                let count = half.messages().count();
+                assert!(
+                    untrimmed
+                        .iter()
+                        .all(|sent| sent.messages().count() == count)
+                );
+                assert!(trimmed.messages().count() < count);
+            }
+            let records = fixture.records();
+            let faults =
+                events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+            assert_eq!(
+                faults,
+                vec![CompactionFault::Overflowed; failed],
+                "{trigger:?}"
+            );
+            let requested = events!(&records, SessionEvent::ModelRequested { from, .. } => *from);
+            assert!(requested.last().unwrap().is_some());
+            let last = records
+                .iter()
+                .rev()
+                .find(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
+            let last = last.unwrap().sequence.request();
+            let replayed = fixture
+                .session
+                .runtime
+                .store
+                .reconstruct_model_request(last);
+            let (_, replayed) = replayed.await.unwrap();
+            assert_eq!(&replayed, trimmed);
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
+
+    /// Transient failures resend the frozen request until it succeeds, and do not
+    /// consume the three validation attempts.
+    #[tokio::test]
+    async fn summarizer_retries_frozen_requests_until_success() {
+        let failures = 4;
+        let transient = (0..failures).map(|_| Step::fail(recoverable()));
+        let invalid = (0..2).map(|_| Step::new(summary("not a valid continuation")));
+        let valid = Step::new(summary(summary_json()));
+        let fixture = Fixture::new(transient.chain(invalid).chain([valid])).await;
+        fixture.add_history(20_000).await;
+        retrying(&fixture.session, fixture.compact()).await.unwrap();
+        let requests = fixture.requests();
+        let summaries = &requests[1..];
+        assert_eq!(summaries.len(), failures + 3);
+        assert!(summaries[..=failures].array_windows().all(|[a, b]| a == b));
+        assert_eq!(fixture.script.remaining(), 0);
+        let records = fixture.records();
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
+        let retries = count!(
+            &records,
+            SessionEvent::ModelFailed {
+                failure: crate::session::AttemptFailure::Retrying { .. },
+                ..
+            }
+        );
+        assert_eq!(retries, failures);
+        fixture.session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_usage_is_counted_once_for_each_failed_summary_attempt() {
+        let observed = usage(11, 7, 3);
+        let failures = (0..4).map(|_| failing_stream(Some(observed)));
+        let fixture = Fixture::new(failures.chain([Step::new(summary(summary_json()))])).await;
+        fixture.add_history(20_000).await;
+        assert!(retrying(&fixture.session, fixture.compact()).await.is_ok());
+        assert_eq!(journaled_usage(&fixture.session).await, usage(44, 28, 12));
+        let records = fixture.records();
+        assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 4);
+        let observed_usage =
+            count!(&records, SessionEvent::Usage { usage, .. } if *usage == observed);
+        assert_eq!(observed_usage, 4);
+        fixture.session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_journals_observed_usage_once() {
+        for summary in [false, true] {
+            let observed = usage(11, 7, 3);
+            let fixture = Fixture::new([held_after(observed)]).await;
+            let (store, agent) = (&fixture.session.runtime.store, &fixture.session.root);
+            let mut kept = None;
+            if summary {
+                fixture.add_history(20_000).await;
+                let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
+                store
+                    .replace_todos(agent, todos.clone(), None)
+                    .await
+                    .unwrap();
+                let history = fixture.history(agent).await;
+                kept = Some((history, todos));
+                let (result, ()) = bounded(async {
+                    tokio::join!(fixture.compact(), async {
+                        fixture.script.held(1).await;
+                        assert_eq!(fixture.session.interrupt().await, 1);
+                    })
+                })
+                .await;
+                assert_matches!(result, Err(HarnessError::Interrupted));
+            } else {
+                let (result, ()) = bounded(async {
+                    tokio::join!(fixture.session.prompt("Interrupt this turn."), async {
+                        fixture.script.held(1).await;
+                        fixture.session.interrupt().await;
+                    })
+                })
+                .await;
+                assert!(result.is_err());
+            }
+            let records = fixture.records();
+            let mut requested = records.iter().rev();
+            let requested =
+                requested.find(|r| matches!(r.event, SessionEvent::ModelRequested { .. }));
+            let requested = requested.unwrap().sequence.request();
+            let observed_events = events!(&records, SessionEvent::Usage { request, usage } if *request == requested => *usage);
+            assert_eq!(observed_events, vec![observed]);
+            let ledger = crate::session::tests::ledger(&fixture.session.runtime.store);
+            let phase = &ledger.requests[&requested].phase;
+            let at = phase.settled_at().unwrap();
+            assert_eq!(
+                *phase,
+                RequestPhase::Interrupted {
+                    attempt: Some(1),
+                    at
+                }
+            );
+            assert_eq!(journaled_usage(&fixture.session).await, observed);
+            if let Some((history, todos)) = kept {
+                assert_eq!(fixture.history(agent).await, history);
+                assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+                assert_eq!(store.inspect_todos(agent, None).unwrap(), todos);
+            }
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
+
+    fn text(message: &Message) -> &str {
+        let Message::User(blocks) = message else {
+            panic!("continuation must use the user role");
+        };
+        let [UserPart::Compaction { text }] = blocks.as_slice() else {
+            panic!("continuation must preserve harness provenance");
+        };
+        text
+    }
+
+    fn valid_summary() -> serde_json::Value {
+        json!({
+            "objective": "Continue the task",
+            "user_instructions": ["Read only"],
+            "session_rules": [],
+            "plan": ["  # Current plan\n\n- Preserve `literal` text.\n- Resume step two.\n", "Approved; step two is underway."],
+            "resumption_point": "Wait for job 12",
+            "completed_work": [],
+            "findings": ["Read config.yaml; retries = 3.", "Host output was truncated; health remains uncertain."],
+            "decisions": ["Rejected Y because it loses state."],
+            "open_issues": [],
+            "next_actions": [],
+            "running_work": [],
+            "recovery_details": [],
+            "jobs": [],
+            "additional_context": [],
+            "todo_reconciliation": ["First step completed before the list was updated."],
+            "todos": [
+                {"text": "First step", "status": "completed"},
+                {"text": "Second step", "status": "in_progress"},
+                {"text": "Final step", "status": "pending"}
+            ]
+        })
+    }
+
+    fn with(pointer: &str, value: serde_json::Value) -> serde_json::Value {
+        let mut summary = valid_summary();
+        *summary.pointer_mut(pointer).unwrap() = value;
+        summary
+    }
+
+    #[test]
+    fn pending_response_preserves_visible_items_and_calls_without_opaque_replay() {
+        use crate::provider::{
+            codec::common::tests::envelope,
+            protocol::{Binding, ReplayFormat, ToolCall},
+        };
+        let replay = |binding| {
+            Some(envelope(
+                ReplayFormat::Messages,
+                "test",
+                json!({"private":"opaque-provider-payload"}),
+                binding,
+            ))
+        };
+        let items = vec![
+            AssistantItem::reasoning(
+                "reasoning",
+                0,
+                "Latest visible reasoning",
+                replay(Binding::Conversation),
+            ),
+            AssistantItem::text("text", 1, "Latest assistant finding"),
+            AssistantItem::tool_call(
+                "read",
+                2,
+                ToolCall::new("call-a", "read", json!({"path":"notes\nquoted.txt"})).unwrap(),
+            ),
+            AssistantItem::reasoning(
+                "portable",
+                3,
+                "More visible reasoning",
+                replay(Binding::Free),
+            ),
+            AssistantItem::tool_call(
+                "todo",
+                4,
+                ToolCall::new(
+                    "call-b",
+                    "todo",
+                    json!({"items":[{"text":"Verify finding", "status":"pending"}]}),
+                )
+                .unwrap(),
+            ),
+        ];
+        let snapshot = pending_response(&items);
+        let text = text(&snapshot);
+        let payload = crate::session::PENDING_RESPONSE.body(text).unwrap();
+        let visible: Vec<AssistantItem> = serde_json::from_str(payload).unwrap();
+        let mut expected = items.clone();
+        for item in &mut expected {
+            if let AssistantItem::Reasoning { replay, .. } = item {
+                *replay = None;
+            }
+        }
+        assert_eq!(visible, expected);
+    }
+
+    #[test]
+    fn generated_schema_accepts_continuations_and_rejects_invalid_contract_data() {
+        // Validate after the providers' JSON round trip. Declaration order is a
+        // generation hint: reordered valid responses must still validate and parse.
+        let schema = serde_json::from_str(&response_schema().schema().to_string()).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert_eq!(
+            schema["properties"]["jobs"]["items"],
+            json!({"type": "integer"})
+        );
+        let valid = valid_summary();
+        let reordered = valid.as_object().unwrap().iter().rev();
+        let reordered = reordered.map(|(key, value)| (key.clone(), value.clone()));
+        let reordered = serde_json::Value::Object(reordered.collect());
+        assert!(validator.is_valid(&reordered));
+        let parse =
+            |value: &serde_json::Value| parse_continuation(&value.to_string()).unwrap().message;
+        assert_eq!(parse(&reordered), parse(&valid));
+        // The derive supplies the rest; one case per kind proves it is wired up.
+        let (mut missing, mut unknown) = (valid.clone(), valid.clone());
+        missing.as_object_mut().unwrap().remove("plan");
+        unknown["todos"][0]["unexpected"] = json!(true);
+        let mistyped = with("/todos/0/status", json!("finished"));
+        for invalid in [missing, unknown, mistyped] {
+            assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn continuation_preserves_section_text_and_reconciled_todos() {
+        let value = valid_summary();
+        let continuation = parse_continuation(&value.to_string()).unwrap();
+        let rendered = text(&continuation.message);
+        let plan = |index: usize| value["plan"][index].as_str().unwrap();
+        let expected = format!(
+            "## Plan\n\n{}\n\n{}\n\n## Resumption point",
+            plan(0),
+            plan(1)
+        );
+        assert!(rendered.contains(&expected));
+        for (key, value) in value.as_object().unwrap() {
+            if key == "todos" {
+                continue;
+            }
+            if let Some(entries) = value.as_array() {
+                let entries = entries.iter().map(|entry| entry.as_str().unwrap());
+                assert!(rendered.contains(&entries.collect::<Vec<_>>().join("\n\n")));
+            } else {
+                assert!(rendered.contains(value.as_str().unwrap()));
+            }
+        }
+        let found = serde_json::to_value(continuation.todos).unwrap();
+        assert_eq!(found, value["todos"]);
+    }
+
+    #[test]
+    fn continuation_rejects_invalid_structure_and_todos() {
+        for output in ["", " ", "prose", "```json\n{}\n```", "{}", "[]", "null"] {
+            assert!(parse_continuation(output).is_err(), "accepted {output:?}");
+        }
+        let mut unknown = valid_summary();
+        unknown["unexpected"] = true.into();
+        // Parsing also checks todo text is not blank and job ids are real.
+        let blank_todo = with("/todos/0/text", " \t\n".into());
+        for value in [unknown, blank_todo, with("/jobs", json!([0]))] {
+            let parsed = parse_continuation(&value.to_string());
+            assert!(parsed.is_err(), "accepted {value}");
+        }
+        let empty_todos = with("/todos", json!([]));
+        assert!(
+            parse_continuation(&empty_todos.to_string())
+                .unwrap()
+                .todos
+                .is_empty()
+        );
+    }
+}

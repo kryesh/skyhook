@@ -1,20 +1,28 @@
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroU16,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use skyhook::identity::SessionId;
 use skyhook::{
     db::{Db, DbResult, Dictionaries, Seeding, bytes, enum_column, params},
-    identity::SessionId,
     session::{ExtensionDb, ProductImage, Schema, SessionError},
 };
+use skyhook_base::enums::NamedEnum;
 
 use super::*;
+use crate::cvss::Severity;
 
 /// The research tables every security session keeps beside its journal.
-pub const SCHEMA: Schema = Schema::extended(
+pub(crate) const SCHEMA: Schema = Schema::extended(
     ProductImage::layered(
-        concat!(include_str!("schema.sql"), bearing::derived_views!()),
-        29,
+        concat!(
+            include_str!("schema.sql"),
+            crate::store::ledger::views::derived_views!()
+        ),
+        30,
     ),
     seed,
 );
@@ -22,11 +30,8 @@ pub const SCHEMA: Schema = Schema::extended(
 fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     let dictionaries = Dictionaries(db, seeding);
     dictionaries.names("node_kind", &NodeKind::ALL)?;
-    dictionaries.columns("task_phase", ["subject", "stage"], &Phase::ALL, |phase| {
-        [
-            libsql::Value::Text(phase.subject().as_str().to_owned()),
-            libsql::Value::Integer(phase.stage().into()),
-        ]
+    dictionaries.columns("task_phase", ["subject"], &Phase::ALL, |phase| {
+        [libsql::Value::Text(phase.subject().as_str().to_owned())]
     })?;
     dictionaries.names("location_kind", &LocationKind::ALL)?;
     dictionaries.names("trust_kind", &Trust::ALL)?;
@@ -48,19 +53,16 @@ fn seed(db: &Db, seeding: Seeding) -> DbResult<()> {
     dictionaries.names("live_policy_kind", &LivePolicy::ALL)
 }
 
-/// The run: its session, when it began, its options, and the live policy it started under,
-/// which it keeps.
-#[derive(Clone, Debug, Serialize)]
+/// The run: its session, when it began, and its options.
+#[derive(Clone, Debug)]
 pub struct Run {
     pub id: SessionId,
     pub created: DateTime<Utc>,
-    #[serde(flatten)]
-    pub options: RunOptions,
-    #[serde(skip)]
-    pub live: LivePolicy,
+    pub(crate) options: RunOptions,
 }
 
-pub(super) fn run(db: &Db) -> Result<Run> {
+/// The run, once its session recorded it.
+fn started(db: &Db) -> Result<Option<Run>> {
     optional(
         db,
         "SELECT s.public_id,r.created,r.threshold,r.workers,r.live FROM run r JOIN session s",
@@ -75,12 +77,15 @@ pub(super) fn run(db: &Db) -> Result<Run> {
                         .ok()
                         .and_then(std::num::NonZeroU16::new)
                         .ok_or_else(|| corrupt("invalid stored worker count"))?,
+                    live: enum_column(row, 4)?,
                 },
-                live: enum_column(row, 4)?,
             })
         },
-    )?
-    .ok_or(Error::NotFound {
+    )
+}
+
+pub(super) fn run(db: &Db) -> Result<Run> {
+    started(db)?.ok_or(Error::NotFound {
         record: Record::Run,
         id: None,
     })
@@ -89,8 +94,13 @@ pub(super) fn run(db: &Db) -> Result<Run> {
 impl Store {
     /// The research tables of an open session, which its harness opened with
     /// [`SCHEMA`].
-    pub fn of(db: &ExtensionDb) -> Self {
+    pub(crate) fn of(db: &ExtensionDb) -> Self {
         Self(db.clone())
+    }
+
+    /// The research of a session, when its harness opened it with [`SCHEMA`].
+    pub(crate) fn of_session(db: Option<&ExtensionDb>) -> Result<Self> {
+        db.map(Self::of).ok_or(Error::NoResearch)
     }
 
     /// A security session's research, read-only, whether or not it is open elsewhere.
@@ -99,57 +109,90 @@ impl Store {
     }
 
     /// The session, which is the run.
-    pub fn id(&self) -> SessionId {
+    pub(crate) fn id(&self) -> SessionId {
         self.0.session()
     }
 
     /// The count of research writes committed so far through the owning session: what a
     /// read derives stays current while it holds. An inspected run has none.
-    pub fn generation(&self) -> Option<u64> {
+    pub(crate) fn generation(&self) -> Option<u64> {
         self.0.generation()
     }
 
     /// The session's directory; the run's files live in its subdirectories.
-    pub fn directory(&self) -> &Path {
+    pub(crate) fn directory(&self) -> &Path {
         self.0.directory()
     }
 
     /// Where this run's test artifacts live; test records reference files below it.
-    pub fn artifact_root(&self) -> PathBuf {
+    pub(crate) fn artifact_root(&self) -> PathBuf {
         self.directory().join("artifacts")
     }
 
     /// Where this run's current reports are written, a folder per root flaw.
-    pub fn report_root(&self) -> PathBuf {
+    pub(crate) fn report_root(&self) -> PathBuf {
         self.directory().join("reports")
     }
 
-    /// Whether the run is recorded: setting it up is the session's first write, which an
+    /// The run, once recorded: setting it up is the session's first write, which an
     /// interruption can leave undone.
-    pub fn initialized(&self) -> Result<bool> {
-        self.read(|db| exists(db, "SELECT 1 FROM run", Vec::new()))
+    pub(crate) fn started(&self) -> Result<Option<Run>> {
+        self.read(started)
     }
 
-    /// Record the run as its session opens, under the live policy it keeps.
-    pub fn start_run(&self, options: RunOptions, live: LivePolicy) -> Result<()> {
+    /// Record the run as its session opens.
+    pub(crate) fn start_run(&self, options: RunOptions) -> Result<()> {
         self.write(|db| {
             db.execute(
                 "INSERT INTO run(id,created,threshold,workers,live) VALUES (1,?1,?2,?3,?4)",
-                params![now(), options.threshold, options.workers.get(), live],
+                params![
+                    now(),
+                    options.threshold,
+                    options.workers.get(),
+                    options.live
+                ],
             )?;
             Ok(())
         })
     }
 
     /// Replace the run's worker count: the pool size later fan-out reads.
-    pub fn set_workers(&self, workers: std::num::NonZeroU16) -> Result<()> {
+    pub(crate) fn set_workers(&self, workers: std::num::NonZeroU16) -> Result<()> {
         self.write(|db| {
             db.execute("UPDATE run SET workers=?1", params![workers.get()])?;
             Ok(())
         })
     }
+}
 
-    pub fn run(&self) -> Result<Run> {
-        self.read(run)
+/// Whether a launch works against a running target: probing it in an environment serving its
+/// interfaces and demonstrating validated candidates. Static analysis of binaries is reading,
+/// allowed under any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePolicy {
+    Ask,
+    Yes,
+    No,
+}
+
+/// A run's settings, persisted with it; a later launch may change its workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunOptions {
+    /// The lowest conditional severity a review goes on to judge.
+    pub(crate) threshold: Severity,
+    /// How many agents the orchestrator's scheduler runs at once.
+    pub(crate) workers: NonZeroU16,
+    /// The live policy the run keeps.
+    pub(crate) live: LivePolicy,
+}
+impl Default for RunOptions {
+    /// A run doing no live work.
+    fn default() -> Self {
+        Self {
+            threshold: Severity::High,
+            workers: const { NonZeroU16::new(6).unwrap() },
+            live: LivePolicy::No,
+        }
     }
 }

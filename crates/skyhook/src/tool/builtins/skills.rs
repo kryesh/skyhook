@@ -8,17 +8,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use crate::tool::{
-    AdmissionError, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-    diagnostic::{FailureSite, Operation, PartialContext, Subject, escape_controls},
-    policy::{Capability, CapabilitySet},
-    registry::{Invocation, TARGET, serialized},
+use crate::session::SessionStore;
+use crate::tool::catalog::{Invocation, RegistryError, TARGET, ToolOptions, serialized};
+use crate::tool::policy::{Capability, CapabilitySet};
+use crate::tool::{ToolError, ToolOutput, ToolRegistryBuilder};
+use skyhook_base::limits::MAX_TEXT_BYTES;
+use skyhook_media::{Finished, MAX_IMAGE_BYTES};
+use skyhook_tools::{
+    diagnostic::{FailureSite, PartialContext, escape_controls},
+    error::AdmissionError,
 };
-use crate::{
-    fs::FileKind,
-    media::{Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, MediaError},
-    session::SessionStore,
-};
+use skyhook_worker::diagnostic::{Operation, Subject};
+use skyhook_worker::fs::FileKind;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +89,7 @@ impl HostSkills {
             Err(error) => {
                 warnings.push(host_warning(ToolError::from(error).operation(
                     Operation::Canonicalize,
-                    Subject::working_directory(workspace),
+                    Subject::WorkingDirectory(spelled(workspace)),
                 )));
                 workspace.to_path_buf()
             }
@@ -114,10 +115,13 @@ impl HostSkills {
                 .unwrap_or_else(|error| format!("[cannot render YAML: {error}]"));
             // The canonical root may have been replaced since discovery; links are not followed.
             let listed = match fs::symlink_metadata(&entry.root).await {
-                Ok(metadata) if !metadata.is_dir() => {
-                    Err(ToolError::failed("skill root is no longer a directory")
-                        .operation(Operation::ReadDirectory, Subject::path(&entry.root)))
-                }
+                Ok(metadata) if !metadata.is_dir() => Err(ToolError::failed(
+                    "skill root is no longer a directory",
+                )
+                .operation(
+                    Operation::ReadDirectory,
+                    Subject::Path(spelled(&entry.root)),
+                )),
                 _ => asset_tree(&entry.root, true, Some(&mut unreadable)).await,
             };
             errors.extend(unreadable.drain(..).map(host_warning));
@@ -177,11 +181,18 @@ fn host_warning(error: ToolError) -> String {
     error
         .at(FailureSite::Host)
         .diagnostic()
-        .render(&CapabilitySet::default())
+        .render(CapabilitySet::default().target_view())
+}
+
+/// A skill's path on the session host as the root names its paths. Skills are
+/// read on the host itself, so a name that is not text shows its replacement
+/// characters.
+fn spelled(path: &Path) -> skyhook_worker::op::TargetPath {
+    path.to_string_lossy().as_ref().into()
 }
 
 fn at(operation: Operation, path: &Path) -> PartialContext {
-    PartialContext::new(operation, Subject::path(path))
+    PartialContext::new(operation, Subject::Path(spelled(path)))
 }
 
 async fn scan_root(
@@ -229,7 +240,7 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
         .map_err(ToolError::annotated(at(Operation::Inspect, path)))?;
     if !metadata.is_dir() {
         return Err(ToolError::failed("entry is not a directory")
-            .operation(Operation::Load, Subject::path(path)));
+            .operation(Operation::Load, Subject::Path(spelled(path))));
     }
     let name = path
         .file_name()
@@ -242,7 +253,7 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
         })
         .ok_or_else(|| {
             ToolError::failed("skill directory name is invalid")
-                .operation(Operation::Validate, Subject::path(path))
+                .operation(Operation::Validate, Subject::Path(spelled(path)))
         })?
         .to_owned();
     let root = fs::canonicalize(path)
@@ -259,18 +270,26 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
     if !instruction_path.starts_with(&root) {
         return Err(
             ToolError::failed(format!("{INSTRUCTIONS_FILE} escapes its skill directory"))
-                .operation(Operation::Validate, Subject::path(&instruction_path)),
+                .operation(
+                    Operation::Validate,
+                    Subject::Path(spelled(&instruction_path)),
+                ),
         );
     }
-    let bytes = crate::fs::read_regular(&instruction_path, MAX_TEXT_BYTES)
+    let bytes = skyhook_worker::fs::read_regular(&instruction_path, MAX_TEXT_BYTES)
         .await
         .map_err(ToolError::annotated(at(Operation::Read, &instruction_path)))?;
     let instructions = String::from_utf8(bytes).map_err(|error| {
-        ToolError::failed(error.utf8_error())
-            .operation(Operation::Deserialize, Subject::path(&instruction_path))
+        ToolError::failed(error.utf8_error()).operation(
+            Operation::Deserialize,
+            Subject::Path(spelled(&instruction_path)),
+        )
     })?;
     let (description, frontmatter) = parse_instructions(&instructions).map_err(|error| {
-        ToolError::failed(error).operation(Operation::Deserialize, Subject::path(&instruction_path))
+        ToolError::failed(error).operation(
+            Operation::Deserialize,
+            Subject::Path(spelled(&instruction_path)),
+        )
     })?;
     Ok(SkillEntry {
         name,
@@ -349,10 +368,10 @@ pub(super) fn register(
         ToolOptions::new(vec![Capability::Read])
             .result::<SkillOutput>()
             .conditional_output(
-                crate::target::TargetPath::SCHEMA,
+                skyhook_tools::target::TargetedPath::SCHEMA,
                 TARGET,
                 Capability::Targets,
-                crate::target::TargetPath::target_schema(&schemars::generate::Contract::Serialize),
+                skyhook_tools::target::TargetedPath::target_schema(&schemars::generate::Contract::Serialize),
             ),
         |args: SkillArgs| SkillRequest::try_from(args),
         move |request| {
@@ -396,61 +415,60 @@ async fn inspect_asset(
         });
     }
     // Presentation reads only: larger assets are copied with write's source.
-    let bytes = crate::fs::read_regular(&source, MAX_IMAGE_BYTES.max(MAX_TEXT_BYTES))
+    let bytes = skyhook_worker::fs::read_regular(&source, MAX_IMAGE_BYTES.max(MAX_TEXT_BYTES))
         .await
         .map_err(|error| {
             match error {
-                crate::fs::RegularFileError::TooLarge { limit } => ToolError::failed(format!(
+                skyhook_worker::op::FsError::TooLarge { limit } => ToolError::failed(format!(
                     "skill asset exceeds {limit} bytes; copy it with write's source"
                 )),
                 error => error.into(),
             }
             .context(at(Operation::Read, &source))
         })?;
-    let classified = crate::media::classify(bytes)
-        .await
-        .map_err(|error| match error {
-            MediaError::Task(error) => error.into(),
-            error => {
-                ToolError::failed(error).operation(Operation::Deserialize, Subject::path(&source))
-            }
-        })?;
+    let size = bytes.len();
+    let classified = skyhook_media::classify(bytes).await.map_err(|error| {
+        ToolError::failed(error).operation(Operation::Deserialize, Subject::Path(spelled(&source)))
+    })?;
     match classified {
-        Classified::Image(image) => {
+        Finished::Image(image) => {
             let image = store
                 .store_image(Some(asset.clone()), &image)
                 .await
                 .map_err(ToolError::annotated(at(Operation::StoreImage, &source)))?;
-            Ok(serialized::<ToolOutput>(SkillOutput::Image {
-                image: super::ImageSummary::from(&image),
+            Ok(serialized(SkillOutput::Image {
+                image: skyhook_tools::builtins::ImageSummary::from(&image),
             })?
             .with_images(vec![image]))
         }
-        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => {
-            Err(ToolError::failed(format!(
-                "text skill asset exceeds {MAX_TEXT_BYTES} bytes; copy it with write's source"
-            ))
-            .operation(Operation::Read, Subject::path(&source)))
-        }
-        Classified::Text(content) => serialized(SkillOutput::Text {
+        Finished::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => Err(ToolError::failed(
+            format!("text skill asset exceeds {MAX_TEXT_BYTES} bytes; copy it with write's source"),
+        )
+        .operation(Operation::Read, Subject::Path(spelled(&source)))),
+        Finished::Text(content) => serialized(SkillOutput::Text {
             bytes: content.len(),
             content,
         }),
-        Classified::Binary(bytes) => serialized(SkillOutput::Binary { bytes: bytes.len() }),
+        Finished::Binary => serialized(SkillOutput::Binary { bytes: size }),
     }
 }
 
 /// Skills live on the session host. The target is named only for callers that
 /// can select one; a remote caller without that capability cannot reach the
 /// directory, so it gets no location.
-fn location(context: &crate::tool::ToolContext, root: &Path) -> Option<crate::target::TargetPath> {
+fn location(
+    context: &crate::tool::ToolContext,
+    root: &Path,
+) -> Option<skyhook_tools::target::TargetedPath> {
     let target = context
         .capabilities()
-        .visible_target(&crate::target::TargetRef::Root)
+        .visible_target(&skyhook_tools::target::TargetRef::Root)
         .cloned();
-    (target.is_some() || context.caller_location().is_root()).then(|| crate::target::TargetPath {
-        path: root.to_string_lossy().into_owned(),
-        target,
+    (target.is_some() || context.caller_location().is_root()).then(|| {
+        skyhook_tools::target::TargetedPath {
+            path: spelled(root),
+            target,
+        }
     })
 }
 
@@ -534,8 +552,7 @@ async fn asset_tree(
     Ok(tree)
 }
 
-/// A nonblank relative source with no parent/root/prefix components. This does
-/// not prove existence, file kind, or containment after following symlinks.
+/// A nonblank relative source with no parent/root/prefix components.
 fn check_asset_syntax(asset: &str) -> Result<(), ToolError> {
     if asset.trim().is_empty()
         || Path::new(asset)
@@ -549,7 +566,7 @@ fn check_asset_syntax(asset: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-// Canonicalization checks actual symlink containment at use time; it is not TOCTOU immunity.
+// Canonicalization checks actual symlink containment at use time.
 async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolError> {
     check_asset_syntax(asset)
         .map_err(|error| error.operation(Operation::Validate, Subject::argument(["path"])))?;
@@ -559,7 +576,7 @@ async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolE
         .map_err(ToolError::annotated(at(Operation::Canonicalize, &source)))?;
     if !source.starts_with(&entry.root) {
         return Err(ToolError::failed("skill asset escapes its skill directory")
-            .operation(Operation::Validate, Subject::path(&source)));
+            .operation(Operation::Validate, Subject::Path(spelled(&source))));
     }
     Ok(source)
 }
@@ -579,9 +596,9 @@ enum SkillOutput {
     },
     Skill {
         /// The skill directory, for `read` and `write` sources
-        location: Option<crate::target::TargetPath>,
+        location: Option<skyhook_tools::target::TargetedPath>,
         /// The skill's instructions, never shortened
-        #[schemars(transform = crate::tool::output::complete)]
+        #[schemars(transform = skyhook_tools::output::complete)]
         content: String,
         assets: Option<String>,
     },
@@ -589,7 +606,7 @@ enum SkillOutput {
         assets: Option<String>,
     },
     Image {
-        image: super::ImageSummary,
+        image: skyhook_tools::builtins::ImageSummary,
     },
     Binary {
         bytes: usize,
@@ -612,10 +629,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        tests::TestRuntime,
-        tool::{ToolRegistryBuilder, diagnostic::Cause},
-    };
+    use crate::{tests::TestRuntime, tool::ToolRegistryBuilder};
+    use skyhook_tools::diagnostic::Cause;
 
     #[test]
     fn summary_comes_from_a_string_description_else_the_first_prose() {
@@ -676,12 +691,10 @@ mod tests {
         assert_eq!(diagnostic.context.operation, Operation::Canonicalize);
         assert_eq!(
             diagnostic.context.subject,
-            Subject::path(missing.join("SKILL.md"))
+            Subject::Path(spelled(&missing.join("SKILL.md")))
         );
         let skills = HostSkills::discover_from(temp.path(), None).await;
-        // Discovery is already host-facing; keep the subject without repeating the site.
-        assert_matches!(skills.warnings(), [warning]
-            if warning.contains("SKILL.md") && !warning.contains("session host"));
+        assert_matches!(skills.warnings(), [warning] if warning.contains("SKILL.md"));
         // Without discovered skills the session offers no skill tool at all.
         let runtime = TestRuntime::new().await;
         assert!(builder(&runtime, skills).build().get("skill").is_none());
@@ -874,11 +887,10 @@ mod tests {
         }
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let skills = HostSkills::discover_from(&workspace, Some(&user)).await;
-        let location = crate::execution::ExecutionLocation::root(workspace.clone());
+        let location =
+            skyhook_tools::target::ExecutionLocation::root(crate::tests::text(&workspace));
         let mut builder = builder(&runtime, skills);
-        builder
-            .register_local(crate::tool::builtins::register_local_tools)
-            .unwrap();
+        crate::tool::target_tools::register(&mut builder).unwrap();
         let executor = runtime.executor(builder).with_location(location);
         let skill = async |args| {
             executor
@@ -918,9 +930,9 @@ mod tests {
             location(executor.clone().with_capabilities(targets)).await,
             Some(json!({"path":path, "target":"root"}))
         );
-        let remote = crate::execution::ExecutionLocation {
+        let remote = skyhook_tools::target::ExecutionLocation {
             target: "remote".parse().unwrap(),
-            workspace: workspace.clone(),
+            workspace: crate::tests::text(&workspace),
         };
         assert_eq!(location(executor.clone().with_location(remote)).await, None);
         let source = nearest.join("asset.bin");
@@ -945,7 +957,7 @@ mod tests {
         );
         // An asset too large to present points at the copy instead.
         let large = std::fs::File::create(nearest.join("large.bin")).unwrap();
-        large.set_len(crate::media::MAX_IMAGE_BYTES + 1).unwrap();
+        large.set_len(skyhook_media::MAX_IMAGE_BYTES + 1).unwrap();
         let error = executor
             .run_host(
                 &runtime.agent,

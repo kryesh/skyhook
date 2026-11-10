@@ -4,9 +4,9 @@
 use super::events::Event;
 use super::native::{NativeItem, PartType, is_foreign};
 use super::*;
-use crate::named_enum::NamedEnum;
-use crate::provider::codec::{common::tagged, openai};
-use crate::provider::{ProviderErrorKind, http::errors};
+use crate::provider::ProviderErrorKind;
+use crate::provider::codec::{common::tagged, errors};
+use skyhook_base::enums::NamedEnum;
 
 /// Local item/part indices are produced only by this module's resolution
 /// algorithm; they are not interchangeable with provider-supplied wire indices.
@@ -46,7 +46,7 @@ impl Decoder {
         };
         let signals = self.errors;
         let failure = |native| {
-            let reading = openai::read::<openai::Code>(native);
+            let reading = errors::read::<errors::Code>(native);
             errors::classify(None, native, reading, signals, None)
         };
         match kind {
@@ -192,8 +192,7 @@ impl Decoder {
         Ok(reference)
     }
 
-    /// Resolve omitted wire references once without mutating the vendor event.
-    /// Local indices are never treated as evidence of provider wire indices.
+    /// Resolve omitted wire references once.
     fn resolve_reference(
         &mut self,
         event: &Value,

@@ -9,14 +9,12 @@ use std::{cell::RefCell, collections::HashMap, path::Path};
 use futures_util::FutureExt;
 use libsql::{Builder, Connection, OpenFlags, Row, Statement, Value};
 
-use crate::{media::BlobDigest, named_enum::NamedEnum};
+use skyhook_base::enums::NamedEnum;
+use skyhook_media::BlobDigest;
 
-pub(crate) mod live;
 #[cfg(test)]
 mod memory;
 mod reads;
-#[cfg(test)]
-pub(crate) use reads::CONNECTIONS;
 pub(crate) use reads::{Opener, Own, ReadPool, Turn};
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -60,9 +58,19 @@ pub fn rejected(message: impl Into<String>) -> DbError {
 }
 
 /// Bind a Rust value as an SQLite parameter. Unsigned values saturate at `i64::MAX`.
-pub trait Sql {
+/// `How` keeps the named enums, bound by their spelling, apart from every other value.
+pub trait Sql<How = Plain> {
     fn sql(self) -> Value;
 }
+
+/// How a value binds when it is not a named enum.
+pub enum Plain {}
+
+/// How a named enum binds: as its spelling.
+pub enum Spelled {}
+
+/// How an optional value binds: as its value would, or as NULL.
+pub struct Optional<How>(std::marker::PhantomData<How>);
 
 macro_rules! sql_integer {
     ($($type:ty),*) => {$(
@@ -123,13 +131,13 @@ impl Sql for Value {
     }
 }
 
-impl<T: Sql> Sql for Option<T> {
+impl<How, T: Sql<How>> Sql<Optional<How>> for Option<T> {
     fn sql(self) -> Value {
         self.map_or(Value::Null, Sql::sql)
     }
 }
 
-impl<T: NamedEnum> Sql for T {
+impl<T: NamedEnum> Sql<Spelled> for T {
     fn sql(self) -> Value {
         Value::Text(self.as_str().to_owned())
     }
@@ -294,7 +302,7 @@ pub struct Db {
     conn: Connection,
     _database: libsql::Database,
     /// Last, so the file counts as held until the connection has closed it.
-    _held: Option<live::Held>,
+    _held: Option<skyhook_worker::fs::live::Held>,
 }
 
 /// The text of one SQL statement. Static text is prepared once per connection and
@@ -399,7 +407,7 @@ impl Db {
     pub(crate) fn connect(path: &Path, mode: OpenMode) -> DbResult<Self> {
         // Registered before SQLite opens the file, so it never becomes live under a
         // handle another in-process opener holds.
-        let held = live::Held::new(path, BUSY_TIMEOUT)?;
+        let held = skyhook_worker::fs::live::Held::new(path, BUSY_TIMEOUT)?;
         let flags = match mode {
             OpenMode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
             #[cfg(test)]
@@ -409,7 +417,11 @@ impl Db {
         Self::at(path, flags, Some(held))
     }
 
-    fn at(path: &Path, flags: OpenFlags, held: Option<live::Held>) -> DbResult<Self> {
+    fn at(
+        path: &Path,
+        flags: OpenFlags,
+        held: Option<skyhook_worker::fs::live::Held>,
+    ) -> DbResult<Self> {
         configure_process();
         let database = ready(Builder::new_local(path).flags(flags).build())?;
         let conn = database.connect()?;
@@ -431,7 +443,7 @@ impl Db {
     ) -> DbResult<Self> {
         let db = match place {
             Place::File(path) => {
-                let held = live::Held::new(path, BUSY_TIMEOUT)?;
+                let held = skyhook_worker::fs::live::Held::new(path, BUSY_TIMEOUT)?;
                 // The mode SQLite creates a database with; `create_new` alone would ask 0666.
                 let mut file = std::os::unix::fs::OpenOptionsExt::mode(
                     std::fs::OpenOptions::new().write(true).create_new(true),

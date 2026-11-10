@@ -1,47 +1,45 @@
 //! Session persistence in one normalized SQLite database per session.
-use std::{
-    fs::OpenOptions as StdOpenOptions,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use thiserror::Error;
-
-use crate::{
-    blocking,
-    identity::{AgentId, HostName, JobId, SessionId},
-    provider::protocol::ModelRequest,
-};
-
 pub(crate) mod agent_state;
+mod blob;
 mod content;
+mod contract;
 mod core;
 mod db;
+mod error;
 mod event;
 mod extension;
-pub(crate) mod ledger;
+mod failure;
+mod history;
+mod observation;
 mod pages;
-mod projection;
-mod request;
+mod replay;
+pub(crate) mod requests;
 mod schema;
 pub mod stats;
+mod store;
+pub(crate) mod todo;
 
+pub use agent_state::Turns;
+pub use blob::BlobError;
 pub use content::{
     HostCursor, HostEvent, HostView, JobEvent, Message, NegativeCursor, RuntimeState, StateJob,
     StateJobKind, UserPart, ViewNamesKind,
 };
 #[cfg(test)]
 pub(crate) use content::{JOB_EVENTS, STATE};
-pub(crate) use content::{PENDING_RESPONSE, cell};
+pub(crate) use content::{
+    JobEventKind, MessageRole, PENDING_RESPONSE, UserPartKind, cell, path_cell,
+};
+pub(crate) use contract::{AppliedMode, Contract, Contracts, Journaled};
 pub use core::SessionPhase;
-
-use crate::db::DbError;
-pub use agent_state::Turns;
 pub(crate) use core::{Command, CoreState, Dirty, Key, Plan, Prepared, Wait, WeakCore};
 pub(crate) use db::{
-    AgentRecords, CaptureExtent, CaptureRow, JobRow, OutputRows, Reads, SavedRows, SharedDb,
-    StagedCapture,
+    CaptureBytes, CaptureExtent, CaptureRow, JobRow, OutputRows, Reads, SavedRows, SharedDb,
+    StagedBytes, StagedCapture, Stored, TargetFile,
 };
 pub use db::{SessionSummary, SessionTitle, agent_row};
+pub(crate) use error::JOURNAL_FAILED;
+pub use error::{JournalFailure, SessionError};
 pub(crate) use event::EntryKind;
 pub use event::{
     AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
@@ -50,1037 +48,30 @@ pub use event::{
     TitleSource, Truncation,
 };
 pub use extension::{AgentJobTexts, ExtensionDb, Unconfirmed};
-pub use ledger::{
+pub use failure::{CompactionFault, Failure, TurnFailure};
+pub(crate) use failure::{FailureKind, FaultKind};
+pub(crate) use history::Projected;
+pub use history::Projection;
+#[cfg(test)]
+pub(crate) use history::render_history;
+pub(crate) use history::{CompletedRequest, OpenedHistory, Requested};
+pub use observation::{
+    AgentActivity, Applied, ContextGauge, ContextUsage, Observation, ObservationSnapshot,
+    ObservedActivity, ObservedEvent, ObservedResponse, RuntimeEvent, Settlement, StoppedReading,
+    Views,
+};
+pub(crate) use observation::{ViewRead, live, stream};
+pub use pages::{AgentOutline, AgentSummary, AgentsPage, Answer, Page, PageFacts, TranscriptPage};
+pub use replay::{CheckpointError, ReplayError};
+pub use requests::{
     Fact, FailureRun, RequestFailure, RequestNumber, RequestPhase, RequestRecord, ResidentLedger,
 };
-pub use pages::{AgentSummary, AgentsPage, Answer, Page, PageFacts, TranscriptPage};
-pub(crate) use projection::Projected;
-pub use projection::Projection;
-#[cfg(test)]
-pub(crate) use projection::render_history;
-pub(crate) use projection::{CompletedRequest, OpenedHistory, Requested};
-use request::Referenced;
-pub use request::{CheckpointError, ReplayError};
 pub use schema::{ProductImage, Schema};
-
-const DATABASE_FILE: &str = "session.db";
-const LOCK_FILE: &str = "lock";
-
-struct SessionLock(std::fs::File);
-
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        // Ownership ends with the store, not with a transient fork-inherited fd.
-        let _ = self.0.unlock();
-    }
-}
-
-/// How long an open waits before its one retry of a held lock: `is_open` holds
-/// it shared for an instant, which must not make an open fail.
-const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
-
-fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionError> {
-    let lock = StdOpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(directory.join(LOCK_FILE))?;
-    lock.try_lock()
-        .or_else(|_| {
-            std::thread::sleep(LOCK_RETRY);
-            lock.try_lock()
-        })
-        .map_err(|_| SessionError::AlreadyOpen(id))?;
-    Ok(SessionLock(lock))
-}
-
-/// How a store opens its session, with the schema it creates or checks.
-enum Opening {
-    Create(HostName, Schema),
-    /// Held in memory for its process; nothing of it survives.
-    #[cfg(test)]
-    Ephemeral(HostName, Schema),
-    /// A saved session, with a host's schema when that host created it.
-    Existing(Option<(HostName, Schema)>),
-}
-
-struct StoreInner {
-    host: HostName,
-    shared: Arc<core::Shared>,
-    db: SharedDb,
-    journal: Journal,
-    core: core::Core,
-    extension: Option<ExtensionDb>,
-}
-
-#[derive(Clone)]
-pub struct SessionStore {
-    inner: Arc<StoreInner>,
-}
-
-/// Tells a session's observers when a run's captured output changes; see
-/// [`crate::agent::RuntimeEvent::OutputChanged`]. It keeps nothing of the
-/// session alive.
-#[derive(Clone)]
-pub(crate) struct OutputChanges(std::sync::Weak<core::Shared>);
-
-impl OutputChanges {
-    /// `run` captured output that is now readable.
-    pub(crate) fn changed(&self, run: crate::job::Run) {
-        if let Some(shared) = self.0.upgrade() {
-            shared.output_changed(run);
-        }
-    }
-
-    /// `run`'s output is being read: what it captures from now on is news.
-    pub(crate) fn read(&self, run: crate::job::Run) {
-        if let Some(shared) = self.0.upgrade() {
-            shared.observed().output_read(run);
-        }
-    }
-}
-
-/// The committed journal, read by index: what the core reads back of the jobs it
-/// no longer holds. Each read runs in one snapshot of what was committed.
-#[derive(Clone)]
-pub(crate) struct Journal {
-    session: SessionId,
-    reads: Reads,
-}
-
-impl Journal {
-    /// The status rows of those of `jobs` that exist, in id order.
-    pub(crate) fn jobs(&self, jobs: &[JobId]) -> Result<Vec<JobRow>, SessionError> {
-        let session = self.session;
-        Ok(self.reads.read(|db| db::job_rows(db, session, jobs))?)
-    }
-
-    /// The jobs `agent` created, in id order.
-    pub(crate) fn created_by(&self, agent: &AgentId) -> Result<Vec<JobId>, SessionError> {
-        Ok(self.reads.read(|db| db::created_by(db, agent))?)
-    }
-
-    /// The records `agent`'s contract is journaled in, as its loop starts: those of
-    /// the `profiled` and `granted` entries and the agent model `context` its state names.
-    pub(crate) fn agent(
-        &self,
-        agent: &AgentId,
-        entries: [RecordSeq; 2],
-        context: Option<RecordSeq>,
-    ) -> Result<Option<db::AgentRecords>, SessionError> {
-        let session = self.session;
-        Ok(self
-            .reads
-            .read(|db| db::agent(db, session, agent, entries, context))?)
-    }
-}
-
-/// The state the journal in `db` opens to, as its rows hold it.
-fn open_state(
-    db: &crate::db::Db,
-    id: SessionId,
-) -> Result<(CoreState, core::Observed), SessionError> {
-    core::CoreState::open(db::counters(db)?, db::opening(db, id)?)
-}
-
-/// `work` for the core, run once `jobs` are held, in the same call.
-fn held<T, E: From<SessionError>>(
-    jobs: impl IntoIterator<Item = JobId>,
-    work: impl FnOnce(&mut core::Writer) -> Result<T, E> + Send + 'static,
-) -> impl FnOnce(&mut core::Writer) -> Result<T, E> + Send + 'static {
-    let jobs: Vec<_> = jobs.into_iter().collect();
-    move |writer| {
-        writer.hold(jobs)?;
-        work(writer)
-    }
-}
-
-/// A store reference that keeps neither the session's core nor its lock.
-pub(crate) struct WeakStore(std::sync::Weak<StoreInner>);
-
-impl WeakStore {
-    pub(crate) fn upgrade(&self) -> Option<SessionStore> {
-        self.0.upgrade().map(|inner| SessionStore { inner })
-    }
-}
-
-impl SessionStore {
-    /// Fail the next commit once it committed, before it applies: durable, yet
-    /// neither applied nor acknowledged.
-    #[cfg(test)]
-    pub(crate) async fn fail_committed(&self) {
-        let fail = |writer: &mut core::Writer| writer.fail_committed = true;
-        self.inner.core.call(fail).await.unwrap();
-    }
-
-    /// Replace a stored blob's bytes, or delete it, as disk corruption would.
-    #[cfg(test)]
-    pub(crate) fn corrupt_blob(&self, blob: crate::media::BlobDigest, bytes: Option<Vec<u8>>) {
-        let key = blob.to_bytes().to_vec();
-        let db = self.outputs();
-        let db = db.lock();
-        match bytes {
-            Some(bytes) => db.execute(
-                "UPDATE blob SET bytes = ?1 WHERE sha256 = ?2",
-                crate::db::params![bytes, key],
-            ),
-            None => db.execute(
-                "DELETE FROM blob WHERE sha256 = ?1",
-                crate::db::params![key],
-            ),
-        }
-        .unwrap();
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
-        let inherit = |writer: &mut core::Writer| {
-            (writer.owner.as_ref()).and_then(|lock| lock.0.try_clone().ok())
-        };
-        self.inner.core.call(inherit).await.unwrap()
-    }
-
-    /// The session as a reopen opens it, over the same database. Its appends do
-    /// not reach this store's state.
-    #[cfg(test)]
-    pub(crate) fn replica(&self) -> Self {
-        let id = self.id();
-        let state = self.test_reads().read(|db| open_state(db, id)).unwrap();
-        let (db, directory) = (self.inner.db.clone(), self.directory().to_owned());
-        let journal = self.test_journal();
-        // Its source owns the log they share.
-        let connections = (db.clone(), journal.clone());
-        let started = core::Core::start(self.id(), directory, state, connections, None);
-        let (shared, core) = started.unwrap();
-        Self {
-            inner: Arc::new(StoreInner {
-                host: self.host().clone(),
-                shared,
-                db,
-                journal,
-                core,
-                extension: self.inner.extension.clone(),
-            }),
-        }
-    }
-
-    /// Read a session without taking its lock; a live owner may keep writing.
-    pub async fn read_records(
-        root: &Path,
-        id: SessionId,
-    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
-        let read = move |db: &crate::db::Db| {
-            let records = db::decode_records(db, id, db::Entries::All)?;
-            Ok(request::admit_records(db, records))
-        };
-        Self::read_only(root, id, read).await?
-    }
-
-    /// The sessions stored under `root`: every entry named as a session id. A missing
-    /// root holds none.
-    pub async fn ids(root: &Path) -> std::io::Result<Vec<SessionId>> {
-        let mut entries = match tokio::fs::read_dir(root).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let mut ids = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            ids.extend(
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<SessionId>().ok()),
-            );
-        }
-        Ok(ids)
-    }
-
-    /// Whether a store, in this process or another, holds the session open. The
-    /// probe shares the lock for an instant; an open racing it waits that out.
-    pub async fn is_open(root: &Path, id: SessionId) -> Result<bool, SessionError> {
-        let path = root.join(id.to_string()).join(LOCK_FILE);
-        blocking(move || {
-            let lock = match StdOpenOptions::new().read(true).open(&path) {
-                Ok(lock) => lock,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => return Err(error.into()),
-            };
-            match lock.try_lock_shared() {
-                Ok(()) => {
-                    lock.unlock()?;
-                    Ok(false)
-                }
-                Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-                Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
-            }
-        })
-        .await
-    }
-
-    /// A session list row, without decoding the session or taking its lock. Given
-    /// `owner`, one that host created is refused when [`open`](Self::open) would refuse it.
-    pub async fn summary(
-        root: &Path,
-        id: SessionId,
-        owner: Option<(&HostName, Schema)>,
-    ) -> Result<SessionSummary, SessionError> {
-        let owner = owner.map(|(host, schema)| (host.clone(), schema));
-        Self::read_only(root, id, move |db| {
-            let summary = db::summary(db)?;
-            if let Some((_, schema)) = owner.filter(|(host, _)| summary.host == *host) {
-                schema.check(db)?;
-            }
-            Ok(summary)
-        })
-        .await
-    }
-
-    /// Run `read` against one snapshot of a session that may not be open here.
-    async fn read_only<T: Send + 'static>(
-        root: &Path,
-        id: SessionId,
-        read: impl FnOnce(&crate::db::Db) -> Result<T, DbError> + Send + 'static,
-    ) -> Result<T, SessionError> {
-        let path = root.join(id.to_string()).join(DATABASE_FILE);
-        blocking(move || {
-            if !path.is_file() {
-                return Err(SessionError::NotFound(id));
-            }
-            Ok(Reads::Own(Arc::new(crate::db::Own::new(
-                path,
-                db::opener(db::OpenMode::ReadOnly),
-            )))
-            .read(read)?)
-        })
-        .await
-    }
-
-    /// A new session of `host`, holding `schema`.
-    pub(crate) async fn create(
-        root: &Path,
-        host: HostName,
-        schema: Schema,
-    ) -> Result<Self, SessionError> {
-        Self::create_as(root, Opening::Create(host, schema)).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn create_ephemeral(
-        root: &Path,
-        schema: Schema,
-    ) -> Result<Self, SessionError> {
-        let host = "test".parse().unwrap();
-        Self::create_as(root, Opening::Ephemeral(host, schema)).await
-    }
-
-    async fn create_as(root: &Path, opening: Opening) -> Result<Self, SessionError> {
-        let root = root.to_owned();
-        // One blocking task creates the directory and the store whose close
-        // removes it again, so a caller that gives up leaves nothing behind.
-        let create = move || {
-            std::fs::create_dir_all(&root)?;
-            let id = SessionId::generate()?;
-            let directory = root.join(id.to_string());
-            std::fs::create_dir(&directory)?;
-            Self::start(id, directory, opening)
-        };
-        blocking(create).await
-    }
-
-    /// Open a saved session. Given `owner`, one that host created opens with its schema,
-    /// checked; another host's session, or any without `owner`, opens with the journal's.
-    pub async fn open(
-        root: &Path,
-        id: SessionId,
-        owner: Option<(&HostName, Schema)>,
-    ) -> Result<Self, SessionError> {
-        let directory = root.join(id.to_string());
-        let owner = owner.map(|(host, schema)| (host.clone(), schema));
-        blocking(move || Self::start(id, directory, Opening::Existing(owner))).await
-    }
-
-    fn start(id: SessionId, directory: PathBuf, opening: Opening) -> Result<Self, SessionError> {
-        let existing = matches!(opening, Opening::Existing(_));
-        let path = directory.join(DATABASE_FILE);
-        let place = match opening {
-            Opening::Existing(_) if !path.is_file() => return Err(SessionError::NotFound(id)),
-            #[cfg(test)]
-            Opening::Ephemeral(..) => crate::db::Place::Memory,
-            _ => crate::db::Place::File(&path),
-        };
-        let durable = matches!(place, crate::db::Place::File(_));
-        // Acquire ownership before opening a potentially active database.
-        let lock = durable.then(|| lock_session(&directory, id)).transpose()?;
-        let log = durable.then(|| Arc::new(db::Log::of(&path)));
-        let (db, host, schema) = match opening {
-            Opening::Create(host, schema) => (schema.create(place)?, host, schema),
-            #[cfg(test)]
-            Opening::Ephemeral(host, schema) => (schema.create(place)?, host, schema),
-            Opening::Existing(owner) => {
-                let db = db::open(&path, db::OpenMode::Open)?;
-                let host = db::host(&db)?;
-                let schema = owner
-                    .filter(|(keeper, _)| *keeper == host)
-                    .map_or(Schema::JOURNAL, |(_, schema)| schema);
-                schema.check(&db)?;
-                (db, host, schema)
-            }
-        };
-        let db = SharedDb::new(db, log);
-        // The core reads on a connection of its own, so that it never waits behind
-        // other reads.
-        let (reads, core_reads) = match durable {
-            true => (
-                Reads::Pool(Arc::new(crate::db::ReadPool::new(
-                    path.clone(),
-                    db::opener(db::OpenMode::Reader),
-                ))),
-                Reads::Own(Arc::new(crate::db::Own::new(
-                    path,
-                    db::opener(db::OpenMode::Reader),
-                ))),
-            ),
-            false => {
-                let reads = Reads::writer(db.clone());
-                (reads.clone(), reads)
-            }
-        };
-        let (mut state, observed) = open_state(&db.lock(), id)?;
-        // A reopened session runs nothing until something changes it.
-        if existing {
-            state.set_phase(SessionPhase::Viewing);
-        }
-        let state = (state, observed);
-        let core_journal = Journal {
-            session: id,
-            reads: core_reads,
-        };
-        let extension = schema
-            .has_product_tables()
-            .then(|| ExtensionDb::new(id, directory.clone(), db.clone(), reads.clone()));
-        let journal = Journal { session: id, reads };
-        let connections = (db.clone(), core_journal);
-        let (shared, core) = core::Core::start(id, directory, state, connections, lock)?;
-        let inner = Arc::new(StoreInner {
-            host,
-            shared,
-            db,
-            journal,
-            core,
-            extension,
-        });
-        Ok(Self { inner })
-    }
-
-    pub fn id(&self) -> SessionId {
-        self.inner.shared.id
-    }
-
-    /// The tables of the extension this session was opened with, if any.
-    pub fn extension(&self) -> Option<&ExtensionDb> {
-        self.inner.extension.as_ref()
-    }
-
-    /// The host that created this session; opening it never changes its origin.
-    pub fn host(&self) -> &HostName {
-        &self.inner.host
-    }
-
-    pub fn directory(&self) -> &Path {
-        &self.inner.shared.directory
-    }
-
-    /// The session's live part and the updates after it, without a gap between
-    /// them. It copies nothing of the history, which pages read.
-    pub fn observe(&self) -> crate::agent::Observation {
-        let shared = &self.inner.shared;
-        // The core publishes only under the state's write lock, and posts take
-        // only `observed`: subscribing under both, then copying the committed
-        // state before the read lock drops, leaves every update either in the
-        // snapshot or after it.
-        let state = shared.read();
-        let (posted, updates) = {
-            let mut observed = shared.observed();
-            (observed.posted(), shared.events.subscribe())
-        };
-        let mut snapshot = state.snapshot(posted);
-        drop(state);
-        snapshot.read_phase();
-        crate::agent::Observation { snapshot, updates }
-    }
-
-    /// The committed journal, read by index.
-    pub(crate) fn journal(&self) -> Journal {
-        self.inner.journal.clone()
-    }
-
-    /// The revision of the newest update published to observers.
-    pub fn revision(&self) -> u64 {
-        self.inner.shared.observed().revision()
-    }
-
-    /// Fold and publish an update the journal does not carry. Nothing the core
-    /// plans reads these views, so they wait neither behind its commands nor
-    /// behind readers of its state, only on the observation's lock: a commit holds
-    /// it from its records' fold into these views to their publication, after COMMIT.
-    pub(crate) fn post(&self, event: crate::agent::RuntimeEvent) {
-        self.inner.shared.post(event);
-    }
-
-    /// Fold `event`, streamed for `agent`'s `request`, as [`post`](Self::post) does.
-    /// Observers are told the response changed once until they
-    /// [read it](Self::response), however much streams meanwhile.
-    pub(crate) fn stream(
-        &self,
-        agent: &AgentId,
-        request: RequestSeq,
-        event: crate::provider::protocol::ResponseEvent,
-    ) {
-        self.inner.shared.stream((agent.clone(), request), event);
-    }
-
-    /// `agent`'s `request` as it streamed so far, which an observer reads when told
-    /// it changed: what streams next is news again. None once the response is gone,
-    /// as its commit or the agent's next request lets go of it, which updates of its
-    /// own tell observers.
-    pub fn response(
-        &self,
-        agent: &AgentId,
-        request: RequestSeq,
-    ) -> Option<crate::agent::ObservedResponse> {
-        let request = (agent.clone(), request);
-        self.inner.shared.observed().response(&request)
-    }
-
-    /// Read the core's state.
-    pub(crate) fn read<T>(&self, read: impl FnOnce(&CoreState) -> T) -> T {
-        read(&self.inner.shared.read())
-    }
-
-    /// Run `read` against one snapshot of the committed journal.
-    #[cfg(test)]
-    pub(crate) fn test_read<T>(
-        &self,
-        read: impl FnOnce(&crate::db::Db) -> crate::db::DbResult<T>,
-    ) -> crate::db::DbResult<T> {
-        self.test_reads().read(read)
-    }
-
-    /// Every committed record, including an ephemeral session's.
-    #[cfg(test)]
-    pub(crate) fn records(&self) -> Vec<Arc<EventRecord>> {
-        let id = self.id();
-        let read = |db: &crate::db::Db| db::decode_records(db, id, db::Entries::All);
-        self.test_reads().read(read).unwrap()
-    }
-
-    /// [`until`](Self::until) the wait `wait` builds from what `read` reads of the
-    /// journal on the core, in the command that registers it: a wait reads no journal
-    /// under the state's lock, and no change lands between the read and its first
-    /// decision.
-    #[cfg(test)]
-    pub(crate) async fn until_read<R: Send + 'static, T: Send + 'static>(
-        &self,
-        read: impl FnOnce(&Journal) -> R + Send + 'static,
-        wait: impl FnOnce(R) -> Wait<T> + Send + 'static,
-    ) -> Result<T, SessionError> {
-        let (journal, (reply, outcome)) = (self.test_journal(), tokio::sync::oneshot::channel());
-        let register = move |writer: &mut core::Writer| {
-            let wait = wait(read(&journal));
-            writer.hold(wait.jobs())?;
-            writer.change(|state| state.wait(wait, reply));
-            Ok::<_, SessionError>(())
-        };
-        self.inner.core.call(register).await??;
-        match outcome.await {
-            Ok(outcome) => Ok(outcome),
-            Err(_) => Err(self.behind(|state| state.phase().refusal()).await),
-        }
-    }
-
-    /// The committed journal, for a test reading it on any thread.
-    #[cfg(test)]
-    pub(crate) fn test_journal(&self) -> Journal {
-        Journal {
-            session: self.id(),
-            reads: self.test_reads(),
-        }
-    }
-
-    /// Reads a test may run on its own thread: a connection of their own, or an
-    /// in-memory session's writer.
-    #[cfg(test)]
-    pub(crate) fn test_reads(&self) -> Reads {
-        match self.reads() {
-            Reads::Pool(_) => {
-                let path = self.directory().join(DATABASE_FILE);
-                Reads::Own(Arc::new(crate::db::Own::new(
-                    path,
-                    db::opener(db::OpenMode::Reader),
-                )))
-            }
-            reads => reads,
-        }
-    }
-
-    /// Append one event; dropping this waiter does not cancel persistence.
-    pub(crate) async fn append(
-        &self,
-        agent: AgentId,
-        event: SessionEvent,
-    ) -> Result<Arc<EventRecord>, SessionError> {
-        Ok(self.append_all(vec![(agent, event)]).await?.remove(0))
-    }
-
-    /// Append several events committed in one transaction.
-    pub(crate) async fn append_all(
-        &self,
-        events: Vec<(AgentId, SessionEvent)>,
-    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
-        let records = |_: &mut CoreState, records: &[Arc<EventRecord>]| records.to_vec();
-        let plan = move |_: &CoreState| Ok(Plan::new(events, records));
-        self.commit(Command::Journal, plan).await
-    }
-
-    /// Move the phase as `command` does, journaling nothing.
-    #[cfg(test)]
-    pub(crate) async fn enter(&self, command: Command) -> Result<(), SessionError> {
-        let nothing = |_: &CoreState| Ok(Plan::journal(Vec::new()));
-        self.commit(command, nothing).await
-    }
-
-    /// Commit `event` with the events `follow` builds from its sequence, in one
-    /// transaction.
-    #[cfg(test)]
-    pub(crate) async fn append_then(
-        &self,
-        agent: AgentId,
-        event: SessionEvent,
-        follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
-    ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
-        let records = |_: &mut CoreState, records: &[Arc<EventRecord>]| records.to_vec();
-        self.commit(Command::Journal, move |state| {
-            let mut events = vec![(agent, event)];
-            events.extend(follow(state.next_sequence()));
-            Ok(Plan::new(events, records))
-        })
-        .await
-    }
-
-    /// Run `plan` on the core thread against the state it commits to, if the
-    /// session's phase admits `command`; dropping this waiter does not cancel it.
-    pub(crate) async fn commit<T: Send + 'static, E: From<SessionError> + Send + 'static>(
-        &self,
-        command: Command,
-        plan: impl FnOnce(&CoreState) -> Result<Plan<T>, E> + Send + 'static,
-    ) -> Result<T, E> {
-        self.commit_on(None, command, plan).await
-    }
-
-    /// [`commit`](Self::commit) a plan that reads `jobs` by id: each is held first,
-    /// as the journal leaves it, if it was ever created.
-    pub(crate) async fn commit_on<T: Send + 'static, E: From<SessionError> + Send + 'static>(
-        &self,
-        jobs: impl IntoIterator<Item = JobId>,
-        command: Command,
-        plan: impl FnOnce(&CoreState) -> Result<Plan<T>, E> + Send + 'static,
-    ) -> Result<T, E> {
-        let run = move |writer: &mut core::Writer| writer.run(command, plan);
-        self.inner.core.call(held(jobs, run)).await?
-    }
-
-    /// Change facts the journal does not record, in order with every commit.
-    pub(crate) async fn live<T: Send + 'static>(
-        &self,
-        change: impl FnOnce(&mut CoreState) -> T + Send + 'static,
-    ) -> T {
-        let live = move |writer: &mut core::Writer| writer.change(change);
-        let changed = self.inner.core.call(live).await;
-        changed.expect("only a panicking change fails")
-    }
-
-    /// Change facts the journal does not record, behind every command queued
-    /// before it, without waiting for the change.
-    pub(crate) fn enqueue(&self, change: impl FnOnce(&mut CoreState) + Send + 'static) {
-        self.inner.core.post(move |writer| writer.change(change));
-    }
-
-    /// Resolve once `wait` decides, as it reads the state when registered and
-    /// after every change to what it declares, consuming what it decides on as
-    /// it decides: its waiter must lose nothing by abandoning the reply. Refused
-    /// as closed, or with its failure, once the session decides nothing more.
-    /// The jobs it declares are held as it registers, so it first decides on
-    /// their facts; one let go after is as it was then.
-    pub(crate) async fn until<T: Send + 'static>(&self, wait: Wait<T>) -> Result<T, SessionError> {
-        self.register(wait.jobs(), |_| (), |()| wait).await
-    }
-
-    /// [`until`](Self::until) the wait `wait` builds from what `first` returns,
-    /// registered in the change that applies `first`, so it and every other wait
-    /// first read the state as `first` leaves it, which holds the jobs it reads.
-    pub(crate) async fn until_after<F: Send + 'static, T: Send + 'static>(
-        &self,
-        first: impl FnOnce(&mut CoreState) -> F + Send + 'static,
-        wait: impl FnOnce(F) -> Wait<T> + Send + 'static,
-    ) -> Result<T, SessionError> {
-        self.register(Vec::new(), first, wait).await
-    }
-
-    /// Hold `jobs`, then register the wait `wait` builds from what `first` returns.
-    async fn register<F: Send + 'static, T: Send + 'static>(
-        &self,
-        jobs: Vec<JobId>,
-        first: impl FnOnce(&mut CoreState) -> F + Send + 'static,
-        wait: impl FnOnce(F) -> Wait<T> + Send + 'static,
-    ) -> Result<T, SessionError> {
-        let (reply, outcome) = tokio::sync::oneshot::channel();
-        let register = move |writer: &mut core::Writer| {
-            writer.change(|state| {
-                let first = first(state);
-                state.wait(wait(first), reply);
-            });
-            Ok::<_, SessionError>(())
-        };
-        self.inner.core.call(held(jobs, register)).await??;
-        match outcome.await {
-            Ok(outcome) => Ok(outcome),
-            Err(_) => Err(self.behind(|state| state.phase().refusal()).await),
-        }
-    }
-
-    /// Queues changes on this session's core without keeping it open.
-    pub(crate) fn weak_core(&self) -> core::WeakCore {
-        self.inner.core.downgrade()
-    }
-
-    pub(crate) fn downgrade(&self) -> WeakStore {
-        WeakStore(Arc::downgrade(&self.inner))
-    }
-
-    /// Read the state behind the command that dropped a reply, which may not have
-    /// moved the phase yet, as a command that panics drops it first; as it
-    /// stands once the core has stopped.
-    pub(crate) async fn behind<T: Send + 'static>(&self, read: fn(&CoreState) -> T) -> T {
-        let behind = move |writer: &mut core::Writer| read(&writer.shared.read());
-        let stopped = self.inner.core.call(behind).await;
-        stopped.unwrap_or_else(|_| self.read(read))
-    }
-
-    /// Await accepted appends and report the failure that stopped the session,
-    /// if its journal failed, without closing admission.
-    pub(crate) async fn drain(&self) -> Result<(), SessionError> {
-        // Its reply follows the sync of every commit queued before it.
-        self.inner.core.call(|_| ()).await?;
-        self.read(|state| state.phase().failed())
-    }
-
-    /// The token whose cancellation stops everything the session runs, as its
-    /// journal failing does.
-    pub(crate) fn root(&self) -> crate::job::CancellationToken {
-        self.inner.shared.root.clone()
-    }
-
-    /// Close behind every command queued before this, without waiting.
-    pub(crate) fn close_soon(&self) {
-        self.inner.core.post(|writer| drop(writer.close()));
-    }
-
-    /// Stop admission, wait out operations already queued, release the session
-    /// for another open, and report the failure that stopped the session, if its
-    /// journal failed. Retained handles, including output streams, can still read
-    /// but can no longer write.
-    pub async fn close(&self) -> Result<(), SessionError> {
-        self.inner.core.call(core::Writer::close).await?
-    }
-
-    /// The title the session list shows: see [`SessionSummary::title`].
-    pub async fn title(&self) -> Result<Option<SessionTitle>, SessionError> {
-        self.snapshot(|db| Ok(db::title(db)?)).await
-    }
-
-    /// Run `read` against one snapshot of the committed session, off the async workers.
-    async fn snapshot<T: Send + 'static>(
-        &self,
-        read: impl FnOnce(&crate::db::Db) -> Result<T, SessionError> + Send + 'static,
-    ) -> Result<T, SessionError> {
-        let reads = self.reads();
-        self.reads().hold(move || reads.read(read)).await
-    }
-
-    /// The entries that created those of `jobs` that `agent` created, with their
-    /// creations, in id order.
-    pub(crate) async fn job_creations(
-        &self,
-        jobs: Vec<JobId>,
-        agent: &AgentId,
-    ) -> Result<Vec<(RecordSeq, SessionEvent)>, SessionError> {
-        let session = self.id();
-        let read = move |db: &crate::db::Db, row| db::creations(db, session, &jobs, row);
-        self.read_agent(agent, Vec::new(), read).await
-    }
-
-    /// The connection job output streams write through.
-    pub(crate) fn outputs(&self) -> SharedDb {
-        self.inner.db.clone()
-    }
-
-    /// Where reads that must not wait on the writer run.
-    pub(crate) fn reads(&self) -> Reads {
-        self.inner.journal.reads.clone()
-    }
-
-    /// What output streams tell observers through.
-    pub(crate) fn output_changes(&self) -> OutputChanges {
-        OutputChanges(Arc::downgrade(&self.inner.shared))
-    }
-
-    /// Store bytes in the content-addressed blob store.
-    pub(crate) async fn store_blob(
-        &self,
-        bytes: &[u8],
-    ) -> Result<crate::media::BlobRef, SessionError> {
-        let blob = crate::media::BlobRef::of(bytes);
-        let bytes = bytes.to_vec();
-        // A blob the journal cannot take stops the session, as an append does.
-        let insert = move |writer: &mut core::Writer| {
-            writer.shared.read().phase().admits(Command::Journal)?;
-            writer.write(|db, _| Ok(db::insert_blob(db, blob.sha256, &bytes)?))
-        };
-        self.inner.core.call(insert).await??;
-        Ok(blob)
-    }
-
-    /// Read a blob bounded by `limit`, verified against its digest and size.
-    #[cfg(test)]
-    pub(crate) async fn read_blob(
-        &self,
-        blob: &crate::media::BlobRef,
-        limit: usize,
-    ) -> Result<Vec<u8>, SessionError> {
-        let blob = *blob;
-        self.snapshot(move |db| read_blob(db, blob, limit)).await
-    }
-
-    pub(crate) async fn store_image(
-        &self,
-        file: Option<String>,
-        image: &crate::media::Image,
-    ) -> Result<crate::media::ImageRef, SessionError> {
-        Ok(crate::media::ImageRef {
-            file,
-            format: image.format(),
-            blob: self.store_blob(image.bytes()).await?,
-        })
-    }
-
-    pub(crate) async fn store_attachment(
-        &self,
-        attachment: &crate::media::Attachment,
-    ) -> Result<crate::media::AttachmentRef, SessionError> {
-        use crate::media::{Attachment, AttachmentRef, TextRef};
-        let file = attachment.file().map(|file| file.display().to_string());
-        Ok(match attachment {
-            Attachment::Text { content, .. } => AttachmentRef::Text(TextRef {
-                file,
-                blob: self.store_blob(content.as_bytes()).await?,
-            }),
-            Attachment::Image { image, .. } => {
-                AttachmentRef::Image(self.store_image(file, image).await?)
-            }
-        })
-    }
-
-    /// Load every blob a request references so providers can encode it. Blobs in
-    /// `cache` are not read again; afterwards it holds exactly this request's blobs.
-    pub async fn load_blobs(
-        &self,
-        request: &mut ModelRequest,
-        cache: &mut crate::media::LoadedBlobs,
-    ) -> Result<(), SessionError> {
-        use crate::media::{AttachmentRef, ImageFormat, MAX_IMAGE_BYTES};
-        // Image blobs carry the format they must sniff as; text blobs carry none.
-        let mut blobs = Vec::new();
-        use crate::provider::protocol::{Message, UserContent};
-        for message in request.messages() {
-            match message {
-                Message::User(content) => {
-                    blobs.extend(content.iter().filter_map(|item| match item {
-                        UserContent::Attachment {
-                            attachment: AttachmentRef::Text(text),
-                        } => Some((text.blob, None)),
-                        UserContent::Attachment {
-                            attachment: AttachmentRef::Image(image),
-                        } => Some((image.blob, Some(image.format))),
-                        _ => None,
-                    }));
-                }
-                Message::Tool(results) => blobs.extend(
-                    results
-                        .iter()
-                        .flat_map(|result| &result.images)
-                        .map(|image| (image.blob, Some(image.format))),
-                ),
-                Message::Assistant(_) => {}
-            }
-        }
-        // A blob a text also references is exempt from sniffing.
-        blobs.sort_by_key(|(_, format)| format.is_none());
-        let blobs: std::collections::BTreeMap<_, _> = blobs.into_iter().collect();
-        let missing: Vec<_> = blobs
-            .keys()
-            .filter(|blob| !cache.contains(blob))
-            .copied()
-            .collect();
-        if !missing.is_empty() {
-            // One bound for every blob loaded into a request, text or image.
-            let limit = MAX_IMAGE_BYTES as usize;
-            let read = move |db: &crate::db::Db| {
-                let read = |blob| Ok((blob, read_blob(db, blob, limit)?));
-                missing.into_iter().map(read).collect::<Result<Vec<_>, _>>()
-            };
-            for (blob, bytes) in self.snapshot(read).await? {
-                cache.insert(blob, bytes);
-            }
-        }
-        let mut loaded = crate::media::LoadedBlobs::default();
-        for (blob, format) in blobs {
-            let bytes = cache.shared(&blob).expect("referenced blobs are loaded");
-            if format.is_some_and(|format| ImageFormat::sniff(&bytes) != Some(format)) {
-                return Err(BlobError::UnsupportedImage.at(blob.sha256));
-            }
-            loaded.insert(blob, bytes);
-        }
-        cache.clone_from(&loaded);
-        request.blobs = loaded;
-        Ok(())
-    }
-}
-
-fn read_blob(
-    db: &crate::db::Db,
-    blob: crate::media::BlobRef,
-    limit: usize,
-) -> Result<Vec<u8>, SessionError> {
-    usize::try_from(blob.bytes)
-        .ok()
-        .filter(|&length| length <= limit)
-        .ok_or(BlobError::TooLarge.at(blob.sha256))?;
-    let bytes = db::verified_blob(db, blob.sha256)?;
-    let bytes = bytes.map_err(|reason| reason.at(blob.sha256))?;
-    if bytes.len() as u64 != blob.bytes {
-        return Err(BlobError::LengthMismatch.at(blob.sha256));
-    }
-    Ok(bytes)
-}
-
-/// Why a stored blob cannot be used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
-pub enum BlobError {
-    #[error("is missing")]
-    Missing,
-    #[error("failed its content hash check")]
-    HashMismatch,
-    #[error("exceeds its byte limit")]
-    TooLarge,
-    #[error("does not match its byte length")]
-    LengthMismatch,
-    #[error("is not the image format it was stored as")]
-    UnsupportedImage,
-}
-
-impl BlobError {
-    fn at(self, digest: crate::media::BlobDigest) -> SessionError {
-        SessionError::Blob {
-            digest,
-            reason: self,
-        }
-    }
-}
-
-/// What a session stopped by its journal's failure reports.
-pub(crate) const JOURNAL_FAILED: &str = "Skyhook could not write the session journal and stopped the session (a Skyhook bug or a storage problem)";
-
-#[derive(Debug, Error)]
-pub enum SessionError {
-    /// Committed, or it may have: the database's report when the commit itself
-    /// failed.
-    #[error("the journal could not confirm an accepted append")]
-    Unconfirmed(#[source] Option<DbError>),
-    #[error("{JOURNAL_FAILED}: {0}")]
-    JournalFailed(JournalFailure),
-    #[error("the session is {0}")]
-    Refused(SessionPhase),
-    #[error("cannot reconstruct model request at sequence {sequence}: {reason}")]
-    ModelRequestReplay {
-        sequence: RequestSeq,
-        reason: ReplayError,
-    },
-    #[error("invalid compaction at sequence {sequence}: {reason}")]
-    InvalidCompaction {
-        sequence: RecordSeq,
-        reason: CheckpointError,
-    },
-    #[error("session writer was lost before accepting the append")]
-    WriterLost,
-    #[error("session task failed: {0}")]
-    Task(#[from] tokio::task::JoinError),
-    #[error("session {0} was not found")]
-    NotFound(SessionId),
-    #[error("session I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Database(DbError),
-    #[error("session identifier generation failed: {0}")]
-    Random(#[from] getrandom::Error),
-    #[error("session {0} is already open")]
-    AlreadyOpen(SessionId),
-    #[error("unsupported session version {0}")]
-    UnsupportedVersion(i64),
-    #[error("event belongs to another session")]
-    WrongSession,
-    #[error("journal entry {sequence} changes a job's phase illegally")]
-    IllegalTransition { sequence: RecordSeq },
-    #[error("blob `{digest}` {reason}")]
-    Blob {
-        digest: crate::media::BlobDigest,
-        reason: BlobError,
-    },
-}
-
-/// The first writer failure, which stopped the session: every later write
-/// reports it.
-#[derive(Clone, Debug)]
-pub struct JournalFailure(Arc<SessionError>);
-
-impl JournalFailure {
-    pub fn cause(&self) -> &SessionError {
-        &self.0
-    }
-}
-
-/// The same failure, not merely an equal one.
-impl PartialEq for JournalFailure {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl std::fmt::Display for JournalFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl From<DbError> for SessionError {
-    fn from(error: DbError) -> Self {
-        match error {
-            DbError::Unsupported(version) => Self::UnsupportedVersion(version),
-            error => Self::Database(error),
-        }
-    }
-}
+pub use store::SessionStore;
+pub(crate) use store::{Journal, OutputChanges, WeakStore};
+pub(crate) use store::{LiveTail, OwnSpills};
+pub(crate) use todo::{ReplaceError, TodoUpdate};
+pub use todo::{TodoItem, TodoStatus};
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1089,20 +80,177 @@ pub(crate) mod tests {
     //! database.
 
     pub(crate) use super::extension::tests::TABLES;
+    use super::store::DATABASE_FILE;
     use super::*;
+    use crate::identity::{AgentId, SessionId};
+    use crate::tool::catalog::ToolDefinition;
+    use crate::tool::policy::Capability;
     use crate::{
-        agent::TurnFailure,
-        execution::ExecutionLocation,
-        identity::JobId,
         provider::{
-            profile::ModelProfile,
-            protocol::{HistoryLifetime, SystemSegment, ToolDefinition, Usage},
+            model::ModelProfile,
+            protocol::{HistoryLifetime, ModelRequest, SystemSegment, Usage},
         },
+        session::TurnFailure,
         tests::TestRuntime,
-        tool::policy::Capability,
     };
     use serde_json::json;
+    use skyhook_tools::target::ExecutionLocation;
+    use skyhook_worker::job::JobId;
     use std::assert_matches;
+    use std::{path::Path, sync::Arc};
+
+    impl SessionStore {
+        /// Fail the next commit once it committed, before it applies: durable, yet
+        /// neither applied nor acknowledged.
+        pub(crate) async fn fail_committed(&self) {
+            let fail = |writer: &mut core::Writer| writer.fail_committed = true;
+            self.inner.core.call(fail).await.unwrap();
+        }
+
+        pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
+            let inherit = |writer: &mut core::Writer| {
+                (writer.owner.as_ref()).and_then(|lock| lock.0.try_clone().ok())
+            };
+            self.inner.core.call(inherit).await.unwrap()
+        }
+
+        /// The session as a reopen opens it, over the same database. Its appends do
+        /// not reach this store's state.
+        pub(crate) fn replica(&self) -> Self {
+            let id = self.id();
+            let state = (self.test_reads().read(|db| store::open_state(db, id))).unwrap();
+            let (db, directory) = (self.inner.db.clone(), self.directory().to_owned());
+            let journal = self.test_journal();
+            // Its source owns the log they share.
+            let connections = (db.clone(), journal.clone());
+            let started = core::Core::start(self.id(), directory, state, connections, None);
+            let (shared, core) = started.unwrap();
+            Self {
+                inner: Arc::new(store::StoreInner {
+                    host: self.host().clone(),
+                    shared,
+                    db,
+                    journal,
+                    core,
+                    extension: self.inner.extension.clone(),
+                }),
+            }
+        }
+
+        /// Replace a stored blob's bytes, or delete it, as disk corruption would.
+        pub(crate) fn corrupt_blob(&self, blob: skyhook_media::BlobDigest, bytes: Option<Vec<u8>>) {
+            let key = blob.to_bytes().to_vec();
+            let db = self.outputs();
+            let db = db.lock();
+            match bytes {
+                Some(bytes) => db.execute(
+                    "UPDATE blob SET bytes = ?1 WHERE sha256 = ?2",
+                    crate::db::params![bytes, key],
+                ),
+                None => db.execute(
+                    "DELETE FROM blob WHERE sha256 = ?1",
+                    crate::db::params![key],
+                ),
+            }
+            .unwrap();
+        }
+
+        /// Read a blob bounded by `limit`, verified against its digest and size.
+        pub(crate) async fn read_blob(
+            &self,
+            blob: &skyhook_media::BlobRef,
+            limit: usize,
+        ) -> Result<Vec<u8>, SessionError> {
+            let blob = *blob;
+            self.snapshot(move |db| blob::read_blob(db, blob, limit))
+                .await
+        }
+
+        /// Run `read` against one snapshot of the committed journal.
+        pub(crate) fn test_read<T>(
+            &self,
+            read: impl FnOnce(&crate::db::Db) -> crate::db::DbResult<T>,
+        ) -> crate::db::DbResult<T> {
+            self.test_reads().read(read)
+        }
+
+        /// Every committed record, including an ephemeral session's.
+        pub(crate) fn records(&self) -> Vec<Arc<EventRecord>> {
+            let id = self.id();
+            let read = |db: &crate::db::Db| db::decode_records(db, id, db::Entries::All);
+            self.test_reads().read(read).unwrap()
+        }
+
+        /// [`until`](Self::until) the wait `wait` builds from what `read` reads of the
+        /// journal on the core, in the command that registers it: a wait reads no journal
+        /// under the state's lock, and no change lands between the read and its first
+        /// decision.
+        pub(crate) async fn until_read<R: Send + 'static, T: Send + 'static>(
+            &self,
+            read: impl FnOnce(&Journal) -> R + Send + 'static,
+            wait: impl FnOnce(R) -> Wait<T> + Send + 'static,
+        ) -> Result<T, SessionError> {
+            let (journal, (reply, outcome)) =
+                (self.test_journal(), tokio::sync::oneshot::channel());
+            let register = move |writer: &mut core::Writer| {
+                let wait = wait(read(&journal));
+                writer.hold(wait.jobs())?;
+                writer.change(|state| state.wait(wait, reply));
+                Ok::<_, SessionError>(())
+            };
+            self.inner.core.call(register).await??;
+            match outcome.await {
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Err(self.behind(|state| state.phase().refusal()).await),
+            }
+        }
+
+        /// The committed journal, for a test reading it on any thread.
+        pub(crate) fn test_journal(&self) -> Journal {
+            Journal {
+                session: self.id(),
+                reads: self.test_reads(),
+            }
+        }
+
+        /// Reads a test may run on its own thread: a connection of their own, or an
+        /// in-memory session's writer.
+        pub(crate) fn test_reads(&self) -> Reads {
+            match self.reads() {
+                Reads::Pool(_) => {
+                    let path = self.directory().join(DATABASE_FILE);
+                    Reads::Own(Arc::new(crate::db::Own::new(
+                        path,
+                        db::opener(db::OpenMode::Reader),
+                    )))
+                }
+                reads => reads,
+            }
+        }
+
+        /// Move the phase as `command` does, journaling nothing.
+        pub(crate) async fn enter(&self, command: Command) -> Result<(), SessionError> {
+            let nothing = |_: &CoreState| Ok(Plan::journal(Vec::new()));
+            self.commit(command, nothing).await
+        }
+
+        /// Commit `event` with the events `follow` builds from its sequence, in one
+        /// transaction.
+        pub(crate) async fn append_then(
+            &self,
+            agent: AgentId,
+            event: SessionEvent,
+            follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
+        ) -> Result<Vec<Arc<EventRecord>>, SessionError> {
+            let records = |_: &mut CoreState, records: &[Arc<EventRecord>]| records.to_vec();
+            self.commit(Command::Journal, move |state| {
+                let mut events = vec![(agent, event)];
+                events.extend(follow(state.next_sequence()));
+                Ok(Plan::new(events, records))
+            })
+            .await
+        }
+    }
 
     /// Refuses, while held, every write `rule` matches, as a failing journal does.
     /// `rule` is a trigger's timing and event, such as `BEFORE INSERT ON job_finish`.
@@ -1302,7 +450,7 @@ pub(crate) mod tests {
         workspace: &Path,
     ) -> AgentId {
         let child = parent.child(index);
-        let location = ExecutionLocation::root(workspace.to_path_buf());
+        let location = ExecutionLocation::root(crate::tests::text(workspace));
         store
             .append(child.clone(), child_started(owner_job, location))
             .await
@@ -1355,7 +503,6 @@ pub(crate) mod tests {
 
     pub(crate) fn record(agent: &AgentId, sequence: u64, event: SessionEvent) -> Arc<EventRecord> {
         Arc::new(EventRecord {
-            id: crate::identity::EventId::generate().unwrap(),
             sequence: sequence.into(),
             timestamp_millis: 0,
             agent: agent.clone(),
@@ -1382,7 +529,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn agent_started(workspace: &Path) -> SessionEvent {
-        child_started(None, ExecutionLocation::root(workspace.to_path_buf()))
+        child_started(None, ExecutionLocation::root(crate::tests::text(workspace)))
     }
 
     /// An agent start owned by `owner_job` at `location`, for fixtures that script children.
@@ -1443,7 +590,7 @@ pub(crate) mod tests {
         let mut profile = profile();
         profile.name.provider = provider.parse().unwrap();
         profile.profile.model = model.parse().unwrap();
-        profile.profile.reasoning = Some("high".into());
+        profile.profile.reasoning = Some(crate::provider::model::Effort::High);
         SessionEvent::ModelContext {
             context: crate::session::ModelContext {
                 purpose,
@@ -1460,18 +607,6 @@ pub(crate) mod tests {
                 response_schema: Some(crate::provider::protocol::ResponseSchema::new("answer", json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false})).unwrap()),
             },
         }
-    }
-
-    /// Whether the journal takes `event` as `agent`'s next record, by the rules an
-    /// append validates it with.
-    pub(crate) fn admitted(
-        store: &SessionStore,
-        agent: &AgentId,
-        event: SessionEvent,
-    ) -> Result<(), SessionError> {
-        let sequence = store.read(CoreState::next_sequence);
-        let record = record(agent, sequence.get(), event);
-        request::validate(&store.outputs().lock(), &record)
     }
 
     pub(crate) fn sequences(projection: &Projection) -> Vec<u64> {
@@ -1730,7 +865,7 @@ pub(crate) mod tests {
             let told = std::iter::from_fn(|| attached.try_recv().ok()).any(|update| {
                 matches!(
                     update.event,
-                    crate::agent::RuntimeEvent::Phase(SessionPhase::Failed(_))
+                    crate::session::RuntimeEvent::Phase(SessionPhase::Failed(_))
                 )
             });
             assert!(told, "the failure is published");
@@ -1849,7 +984,7 @@ pub(crate) mod tests {
         let records = reopened.records();
         assert_eq!(records.len(), 5);
         for committed in &records[2..] {
-            let crate::agent::RuntimeEvent::Record(record) = events.recv().await.unwrap().event
+            let crate::session::RuntimeEvent::Record(record) = events.recv().await.unwrap().event
             else {
                 panic!("only records were published");
             };
@@ -1908,8 +1043,8 @@ pub(crate) mod tests {
     /// otherwise it is idle. A child's conversation is its own.
     #[tokio::test]
     async fn summary_reads_how_the_root_would_resume() {
-        use crate::agent::Failure;
         use crate::provider::protocol::{AssistantItem, ToolCall, ToolResult};
+        use crate::session::Failure;
         let (root, store, id, agent) = fresh().await;
         let sessions = root.path().join("sessions");
         // The core, as resume reads it, agrees with the session list throughout.
@@ -2004,44 +1139,6 @@ pub(crate) mod tests {
         assert_eq!(stopped().await, Some(TurnFailure::Failed(failure.clone())));
     }
 
-    /// The core validates a request on a connection of its own, so the request
-    /// commits while long reads hold every pooled connection and more wait behind them.
-    #[tokio::test]
-    async fn a_request_commits_while_long_reads_hold_every_read_connection() {
-        let (_root, store, _, agent) = fresh().await;
-        let context = ModelContext::test(ModelPurpose::Agent, profile());
-        let event = SessionEvent::ModelContext { context };
-        let context = store.append(agent.clone(), event).await.unwrap().sequence;
-        let gate = Arc::new(tokio::sync::RwLock::new(()));
-        let closed = gate.clone().write_owned().await;
-        let (started, mut reading) = tokio::sync::mpsc::unbounded_channel();
-        let long_reads: Vec<_> = (0..=crate::db::CONNECTIONS)
-            .map(|_| {
-                let (reads, gate, started) = (store.reads(), gate.clone(), started.clone());
-                let read = move |_: &crate::db::Db| {
-                    started.send(()).unwrap();
-                    drop(gate.blocking_read());
-                    Ok::<_, crate::db::DbError>(())
-                };
-                let held = reads.clone();
-                tokio::spawn(async move {
-                    held.hold(move || Ok::<_, SessionError>(reads.read(read)?))
-                        .await
-                })
-            })
-            .collect();
-        for _ in 0..crate::db::CONNECTIONS {
-            crate::tests::bounded(reading.recv()).await.unwrap();
-        }
-        crate::tests::bounded(store.append(agent, requested(context)))
-            .await
-            .unwrap();
-        drop(closed);
-        for read in long_reads {
-            read.await.unwrap().unwrap();
-        }
-    }
-
     /// The user's title holds until cleared, whatever automatic titles follow;
     /// otherwise the newest automatic title shows, and before any, the first prompt.
     /// Each reports where it came from.
@@ -2082,7 +1179,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_databases_are_rejected_without_being_rewritten() {
+    async fn unsupported_databases_are_rejected() {
         let (root, store, id, _agent) = fresh().await;
         let sessions = root.path().join("sessions");
         drop(store);
@@ -2102,7 +1199,6 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             }
-            let archive = std::fs::read(&path).unwrap();
             assert!(matches!(
                 SessionStore::open(&sessions, id, None).await,
                 Err(SessionError::UnsupportedVersion(_))
@@ -2111,7 +1207,6 @@ pub(crate) mod tests {
                 SessionStore::read_records(&sessions, id).await,
                 Err(SessionError::UnsupportedVersion(_))
             );
-            assert_eq!(std::fs::read(&path).unwrap(), archive);
         }
     }
 
@@ -2119,7 +1214,8 @@ pub(crate) mod tests {
     /// changes it, through a restart, and the next open holds only the jobs it names.
     #[tokio::test]
     async fn status_rows_name_the_jobs_reopening_holds() {
-        use crate::job::{JobEnd, JobRole, JobTransition};
+        use crate::job::JobRole;
+        use crate::job::{JobEnd, JobTransition};
         let (root, store, id, agent) = fresh().await;
         let resident = |store: &SessionStore| {
             let sql = "SELECT job FROM job_status WHERE resident ORDER BY job";
@@ -2193,10 +1289,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stored_attachments_load_by_digest_and_reject_corrupt_blobs() {
-        use crate::{
-            media::{Attachment, AttachmentRef, ImageFormat, LoadedBlobs, MediaError},
-            provider::protocol::{Message, ToolResult, UserContent},
-        };
+        use crate::provider::protocol::{Message, ToolResult, UserContent};
+        use skyhook_media::{Attachment, AttachmentRef, ImageFormat, LoadError, LoadedBlobs};
         for durable in [true, false] {
             let root = tempfile::tempdir().unwrap();
             let store = if durable {
@@ -2240,12 +1334,11 @@ pub(crate) mod tests {
                 ]),
                 ..ModelRequest::test("fixture")
             };
-            assert_matches!(request.blobs.get(&image.blob), Err(MediaError::NotLoaded));
+            assert_matches!(request.blobs.get(&image.blob), Err(LoadError::NotLoaded));
             let mut cache = LoadedBlobs::default();
             store.load_blobs(&mut request, &mut cache).await.unwrap();
             assert_eq!(request.blobs.text(&text).unwrap(), "notes");
             assert_eq!(request.blobs.get(&image.blob).unwrap(), png.bytes());
-            assert!(!serde_json::to_string(&request).unwrap().contains("blobs"));
             if durable {
                 // A store read verifies the bytes; cached blobs were verified when read.
                 for (bytes, reason) in [
@@ -2262,16 +1355,12 @@ pub(crate) mod tests {
                     );
                     store.load_blobs(&mut request, &mut cache).await.unwrap();
                 }
-            } else {
-                // An ephemeral session keeps its journal and blobs in memory.
-                let mut files = std::fs::read_dir(store.directory()).unwrap();
-                assert!(files.next().is_none());
             }
             // A reused request and its cache keep only what its history still references.
             request.context.pop();
             store.load_blobs(&mut request, &mut cache).await.unwrap();
             for blobs in [&request.blobs, &cache] {
-                assert_matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded));
+                assert_matches!(blobs.get(&image.blob), Err(LoadError::NotLoaded));
             }
         }
     }

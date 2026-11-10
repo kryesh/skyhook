@@ -1,0 +1,38 @@
+[package]
+name = "skyhook-tools"
+description = "Skyhook's tools: their schemas, validation, rendering and admission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+dom_query = "0.29"
+dom_smoothie = "0.19"
+encoding_rs = "0.8"
+# The version dom_query builds its tree with.
+html5ever = "0.40"
+http.workspace = true
+jsonschema.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+serde_path_to_error.workspace = true
+serde_with.workspace = true
+skyhook-base.workspace = true
+skyhook-media.workspace = true
+skyhook-worker.workspace = true
+struson.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+image.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

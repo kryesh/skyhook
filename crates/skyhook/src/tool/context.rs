@@ -1,28 +1,43 @@
 use std::sync::Arc;
 
-use crate::tool::{
-    authorization::AuthorizationError,
-    builtins::workspace::Directories,
-    diagnostic::Subject,
-    invocation::{AdmissionError, JobWorkspace},
+use crate::session::SessionError;
+use skyhook_base::enums::NamedEnum;
+use skyhook_tools::{
+    diagnostic::{Cause, FailureSite, PartialContext, PartialDiagnostic},
+    error::OperationError,
 };
+
+use crate::tool::authorization::AuthorizationError;
 use serde_json::Value;
+use skyhook_tools::{diagnostic, error::AdmissionError, path::JobWorkspace};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{
-    execution::ExecutionLocation,
-    identity::{AgentId, JobId},
-    tool::policy::CapabilitySet,
-};
+use super::target_tools::ExecutionTarget;
+use crate::identity::AgentId;
+use crate::tool::policy::CapabilitySet;
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_worker::job::JobId;
 
+/// What a context may do: an admitted invocation runs on machines and acts on its
+/// caller's authority; a resumed job's context has neither.
 #[derive(Clone)]
 enum Authority {
-    Invocation {
-        coordinator: super::authorization::AuthorizationCoordinator,
-        tool: String,
-        arguments: Arc<super::authorization::AuthorizationArguments>,
-    },
-    UnavailableForResume,
+    Invocation(Invoked),
+    Resumed,
+}
+
+/// What an admitted invocation runs on.
+#[derive(Clone)]
+struct Invoked {
+    /// The machine the call runs on.
+    target: ExecutionTarget,
+    /// The machine the call's job runs on, which creates a workspace it lacks.
+    job_target: ExecutionTarget,
+    /// The opened source argument, when the tool has one.
+    source: Option<skyhook_tools::source::Source>,
+    /// How the call reaches what a job's target holds of its saved output.
+    reach: Arc<dyn crate::job::output::Reach>,
 }
 
 #[derive(Clone)]
@@ -34,14 +49,10 @@ pub struct ToolContext {
     /// it elsewhere, with a local workspace resolved.
     job_location: ExecutionLocation,
     job_workspace: JobWorkspace,
-    /// The zone the connection approved with the call reported for a remote job.
-    job_zone: Option<crate::target::TimeZone>,
-    pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
+    pub(crate) process_environment: skyhook_worker::origin::ProcessEnvironment,
     authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,
-    /// The opened source argument, when the tool has one.
-    source: Option<crate::tool::source::Source>,
     fit: crate::job::output::Fit,
 }
 
@@ -66,16 +77,32 @@ impl ToolContext {
             subject,
             job_location: execution_location.clone(),
             job_workspace: JobWorkspace::Exists,
-            job_zone: None,
             execution_location,
             caller_location,
             process_environment: Default::default(),
-            authority: Authority::UnavailableForResume,
+            authority: Authority::Resumed,
             input: Arc::new(Mutex::new(input)),
             jobs,
-            source: None,
             fit: crate::job::output::Fit::Preview,
         }
+    }
+
+    /// This context as an admitted invocation's, which runs on `target`, whose job
+    /// runs on `job_target`, and which reads what another job's target holds of its
+    /// saved output through `reach`.
+    #[must_use]
+    pub(crate) fn invoked(
+        mut self,
+        (target, job_target): (ExecutionTarget, ExecutionTarget),
+        reach: Arc<dyn crate::job::output::Reach>,
+    ) -> Self {
+        self.authority = Authority::Invocation(Invoked {
+            target,
+            job_target,
+            source: None,
+            reach,
+        });
+        self
     }
 
     /// How much of a finished result this invocation's reads present.
@@ -106,45 +133,38 @@ impl ToolContext {
         self
     }
 
-    #[must_use]
-    pub(crate) fn with_job_zone(mut self, zone: Option<crate::target::TimeZone>) -> Self {
-        self.job_zone = zone;
-        self
-    }
-
-    /// The time zone of the machine its job runs on: the session host's, or a
-    /// remote's as the connection approved with the call reported it.
-    pub(crate) fn job_zone(&self) -> Option<crate::target::TimeZone> {
-        match self.job_location.is_root() {
-            true => Some(crate::target::TimeZone::local()),
-            false => self.job_zone.clone(),
+    fn invocation(&self) -> Result<&Invoked, ToolError> {
+        match &self.authority {
+            Authority::Invocation(invoked) => Ok(invoked),
+            Authority::Resumed => Err(AdmissionError::from(unavailable()).into()),
         }
     }
 
+    /// The machine the call runs on.
+    pub(crate) fn target(&self) -> Result<&ExecutionTarget, ToolError> {
+        Ok(&self.invocation()?.target)
+    }
+
+    /// The machine the call's job runs on.
+    pub(crate) fn job_target(&self) -> Result<&ExecutionTarget, ToolError> {
+        Ok(&self.invocation()?.job_target)
+    }
+
+    /// This invocation, given the source argument it opened.
     #[must_use]
-    pub(crate) fn with_source(mut self, source: Option<crate::tool::source::Source>) -> Self {
-        self.source = source;
+    pub(crate) fn with_source(mut self, opened: Option<skyhook_tools::source::Source>) -> Self {
+        if let Authority::Invocation(invoked) = &mut self.authority {
+            invoked.source = opened;
+        }
         self
     }
 
-    pub(crate) fn source(&self) -> Option<&crate::tool::source::Source> {
-        self.source.as_ref()
+    pub(crate) fn source(&self) -> Option<&skyhook_tools::source::Source> {
+        (self.invocation().ok()).and_then(|invoked| invoked.source.as_ref())
     }
 
-    /// Attach the invocation authority prepared by the executor.
-    #[must_use]
-    pub(crate) fn with_invocation_authority(
-        mut self,
-        coordinator: super::authorization::AuthorizationCoordinator,
-        tool: String,
-        arguments: super::authorization::AuthorizationArguments,
-    ) -> Self {
-        self.authority = Authority::Invocation {
-            coordinator,
-            tool,
-            arguments: Arc::new(arguments),
-        };
-        self
+    pub(crate) fn reach(&self) -> Option<&dyn crate::job::output::Reach> {
+        (self.invocation().ok()).map(|invoked| &*invoked.reach)
     }
 
     /// The tables the session's host keeps in it, when its harness has them.
@@ -154,10 +174,6 @@ impl ToolContext {
 
     pub fn agent(&self) -> &AgentId {
         &self.subject.agent
-    }
-
-    pub(crate) fn process_owner(&self) -> crate::job::ProcessOwner {
-        self.jobs.process_owner(self.job())
     }
 
     pub fn job(&self) -> JobId {
@@ -182,67 +198,42 @@ impl ToolContext {
 
     /// Create the job's workspace its call found missing, once the call has
     /// checked what it can without changing anything.
-    pub(crate) async fn create_job_workspace(&self) -> Result<Directories, ToolError> {
+    pub(crate) async fn create_job_workspace(
+        &self,
+    ) -> Result<skyhook_worker::op::Directories, ToolError> {
         match self.job_workspace {
-            JobWorkspace::Exists => Ok(Directories::Existed),
+            JobWorkspace::Exists => Ok(skyhook_worker::op::Directories::Existed),
             JobWorkspace::Missing => {
+                use skyhook_worker::target::Target as _;
                 let workspace = &self.job_location.workspace;
-                let subject = Subject::working_directory(workspace);
-                Directories::create(workspace, subject).await
+                let context = PartialContext::new(
+                    Operation::CreateDirectories,
+                    Subject::working_directory(workspace),
+                )
+                .effects(Effects::PartialChange);
+                let target = self.job_target()?;
+                let path = workspace.clone();
+                let created = target.call(skyhook_worker::op::CreateDirs { path }).await?;
+                created.map_err(ToolError::annotated(context))
             }
         }
     }
 
-    pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {
-        super::diagnostic::DiagnosticViewer::new(self.capabilities(), self.caller_location())
+    pub(crate) fn diagnostic_viewer(&self) -> diagnostic::DiagnosticViewer<'_> {
+        diagnostic::DiagnosticViewer::new(self.capabilities().target_view(), self.caller_location())
     }
 
-    /// Identity/provenance for legitimate resumed job contexts. This is not
-    /// invocation authority; APIs requiring that must use invocation_subject.
+    /// Identity/provenance of the context's job, resumed or invoked.
     pub(crate) fn job_subject(&self) -> &super::authorization::AuthorizationSubject {
         &self.subject
     }
 
     /// Borrow the admitted invocation identity for an operation that still
-    /// performs its own policy check. A resumed job is deliberately not an
-    /// invocation and cannot silently acquire authorization this way.
+    /// performs its own policy check.
     pub(crate) fn invocation_subject(
         &self,
     ) -> Result<&super::authorization::AuthorizationSubject, ToolError> {
-        match self.authority {
-            Authority::Invocation { .. } => Ok(&self.subject),
-            Authority::UnavailableForResume => Err(AdmissionError::from(unavailable()).into()),
-        }
-    }
-
-    /// Authorize further permissions under this invocation's capabilities and
-    /// authorization arguments, naming the origin a running request moved to,
-    /// for a connection `admitted` at those target revisions.
-    pub(crate) async fn authorize(
-        &self,
-        permissions: Vec<super::policy::PermissionUse>,
-        network_origin: Option<String>,
-        asking: super::authorization::Asking,
-        admitted: &[(crate::target::TargetName, u64)],
-    ) -> Result<(), AuthorizationError> {
-        let Authority::Invocation {
-            coordinator,
-            tool,
-            arguments,
-        } = &self.authority
-        else {
-            return Err(unavailable());
-        };
-        let arguments = arguments.document(network_origin.as_deref());
-        (coordinator.authorize(
-            &self.subject,
-            tool.clone(),
-            permissions,
-            arguments,
-            admitted,
-            asking,
-        ))
-        .await
+        self.invocation().map(|_| &self.subject)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -285,25 +276,127 @@ fn unavailable() -> AuthorizationError {
     AuthorizationError::Denied("runtime authorization is unavailable".to_owned())
 }
 
-/// Whether a producer's streams ran to their end; a timeout cuts them short.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+/// Output the session host holds, its captures imported into the job.
+pub type ToolOutput = skyhook_tools::output::Output<crate::job::output::CompletedCapture>;
+
+#[derive(Clone, Copy, Debug, serde::Serialize, schemars::JsonSchema, PartialEq, Eq, NamedEnum)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StreamEnd {
-    #[default]
-    Finished,
-    Cut,
+pub enum DenialCode {
+    PermissionDenied,
 }
 
-/// Output the session host holds, its captures imported into the job.
-pub type ToolOutput = crate::tool::output::Output<crate::job::output::CompletedCapture>;
-
-crate::named_enum::named_enum! {
-    #[derive(
-        Clone, Copy, Debug, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
-    )]
-    pub enum DenialCode {
-        PermissionDenied = "permission_denied",
+pub type ToolError = OperationError<ToolOutput>;
+/// A session error's facts: its classification, never the detail it may hold.
+impl From<&SessionError> for PartialDiagnostic {
+    fn from(error: &SessionError) -> Self {
+        use Cause::Message;
+        use SessionError::*;
+        let cause = match error {
+            Io(error) => {
+                let mut cause = Cause::io(error);
+                cause.redact_io_detail();
+                cause
+            }
+            Unconfirmed(_) => Message(crate::session::JOURNAL_FAILED.into()),
+            JournalFailed(failure) => return failure.cause().into(),
+            Refused(phase) => Message(format!("the session is {phase}")),
+            Database(_) => Message("session database operation failed".into()),
+            ModelRequestReplay { sequence, reason } => Message(format!(
+                "cannot reconstruct model request at sequence {sequence}: {reason}"
+            )),
+            WriterLost => Message("session writer was lost".into()),
+            NotFound(session) => Message(format!("session {session} was not found")),
+            Random(_) => Message("session identifier generation failed".into()),
+            AlreadyOpen(session) => Message(format!("session {session} is already open")),
+            UnsupportedVersion(version) => {
+                Message(format!("unsupported session version {version}"))
+            }
+            WrongSession => Message("event belongs to another session".into()),
+            IllegalTransition { sequence } => Message(format!(
+                "journal entry {sequence} changes a job's phase illegally"
+            )),
+            Blob { reason, .. } => Message(format!("stored blob {reason}")),
+        };
+        Self::new(PartialContext::default().at(FailureSite::Host), cause)
     }
 }
 
-pub type ToolError = crate::tool::invocation::OperationError<ToolOutput>;
+impl<O> From<&SessionError> for OperationError<O> {
+    fn from(error: &SessionError) -> Self {
+        Self::from_facts(error.into(), None)
+    }
+}
+
+impl<O> From<SessionError> for OperationError<O> {
+    fn from(error: SessionError) -> Self {
+        Self::from(&error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{assert_matches, io};
+
+    use crate::tool::policy::CapabilitySet;
+    use serde_json::json;
+    use skyhook_worker::diagnostic::{Effects, Operation, Subject};
+    use skyhook_worker::job::JobId;
+
+    use super::*;
+
+    #[test]
+    fn session_normalization_preserves_classification_and_redacts_opaque_details() {
+        use crate::{db::DbError, job::JobError};
+
+        const SECRET: &str = "private-session-payload";
+        for (error, message) in [
+            (
+                SessionError::Database(DbError::Corrupt(SECRET.into())),
+                "database operation failed",
+            ),
+            (
+                SessionError::Refused(crate::session::SessionPhase::Closed),
+                "session is closed",
+            ),
+            (
+                SessionError::Unconfirmed(None),
+                crate::session::JOURNAL_FAILED,
+            ),
+        ] {
+            let diagnostic = PartialDiagnostic::from(&error).resolve();
+            assert_matches!(&diagnostic.cause, Cause::Message(text) if text.contains(message));
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            let text = diagnostic.render(CapabilitySet::default().target_view());
+            assert!(!text.contains(SECRET));
+        }
+        let fallback = PartialContext::new(
+            Operation::WriteCapture,
+            Subject::Job(JobId::new(7).unwrap()),
+        )
+        .effects(Effects::OutputIncomplete);
+        let cases: [fn() -> io::Error; 2] = [
+            || io::Error::other(SECRET),
+            || io::Error::from_raw_os_error(13),
+        ];
+        for make in cases {
+            let mut expected = Cause::io(&make());
+            expected.redact_io_detail();
+            for error in [
+                ToolError::from(SessionError::Io(make())),
+                ToolError::from(&*Arc::new(SessionError::Io(make()))),
+                ToolError::from(JobError::from(SessionError::Io(make()))),
+            ] {
+                let (diagnostic, output) = error
+                    .with_result(ToolOutput::new(json!({"partial": true})))
+                    .or(fallback.clone())
+                    .into_parts();
+                assert_eq!(diagnostic.cause, expected);
+                assert_eq!(
+                    diagnostic.context,
+                    fallback.clone().at(FailureSite::Host).resolve()
+                );
+                assert_eq!(output.unwrap().value, json!({"partial": true}));
+            }
+        }
+    }
+}

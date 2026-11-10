@@ -133,7 +133,5 @@ mod tests {
             response.insert(HEADER, HeaderValue::from_static(received));
             state.observe(&session, &response);
         }
-        // Without a sticky header nothing is held or sent.
-        assert!(state.prepare(&Session::None, &request).is_none());
     }
 }

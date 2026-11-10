@@ -1,9 +1,5 @@
 //! Supervised jobs and durable saved output.
-use std::{
-    collections::HashMap,
-    sync::{Arc, PoisonError},
-    time::Duration,
-};
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,75 +8,73 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::AbortHandle};
 pub(crate) use tokio_util::sync::CancellationToken;
 
+use crate::identity::AgentId;
+use crate::tool::policy::CapabilitySet;
 use crate::{
     agent::QuestionOutput,
-    execution::ExecutionLocation,
-    identity::{AgentId, JobId},
-    media::ImageRef,
-    named_enum::named_enum,
     session::{
         Command, CoreState, Key, MessageSeq, Plan, Prepared, RecordSeq, SessionError, SessionEvent,
         SessionStore, Wait,
     },
-    tool::{
-        ToolError, ToolOutput,
-        diagnostic::{Diagnostic, PartialDiagnostic},
-        policy::CapabilitySet,
-        registry::JobName,
-    },
+    tool::{ToolError, ToolOutput},
 };
+use skyhook_base::enums::{Kinds, NamedEnum};
+use skyhook_media::ImageRef;
+use skyhook_tools::diagnostic::{Diagnostic, PartialDiagnostic};
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_worker::job::JobId;
 
-pub(crate) mod output;
-pub use output::{
-    CaptureDescriptor, CaptureKind, Continuation, ElementPage, FieldPointer, LinePage, Match,
-    MatchPage, MemberPage, NextChild, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
-    OutputSelection, OutputTruncation, PageLimit, PageUnit, PresentedOutput, omit_null_fields,
-};
 mod cancellation;
-pub(crate) use cancellation::{CANCELLATION_GRACE, CancelScope};
 mod delivery;
 mod entry;
 mod error;
+mod index;
 mod input;
 mod lifecycle;
 mod messages;
+mod name;
+pub(crate) mod output;
 mod pages;
-mod process;
+mod persistence;
+mod progress;
 mod questions;
+mod supervisor;
 pub(super) mod views;
 
+pub(crate) use cancellation::CancelScope;
 pub(crate) use delivery::{Delivery, Notification};
 use entry::{
-    Answer, CancelState, Child, DeliveryState, Finished, JobChange, JobFacts, JobHandles, Phase,
-    Queued, Rejected, RoleState, Stamps, Start, addressed,
+    Answer, CancelState, Child, DeliveryState, Finished, JobChange, JobFacts, JobHandles, Live,
+    Phase, Queued, Rejected, RoleState, Stamps, Start, addressed,
 };
-pub(crate) use entry::{AnswerKind, Run, WaitFloor};
+pub(crate) use entry::{AnswerKind, AskPhase, Run, WaitFloor};
 pub use entry::{Invocation, RunTiming};
 pub use error::{InputUnavailableReason, JobError};
+use index::Lookup;
+pub(crate) use index::issuing::Issuing;
+pub(crate) use index::{JobSeeds, Jobs};
 pub(crate) use input::Concluding;
 pub(crate) use lifecycle::woken;
+pub(crate) use name::NAME_PATTERN;
+pub use name::{InvalidJobName, JobName};
+pub use output::{
+    CaptureDescriptor, Continuation, ElementPage, FieldFile, LinePage, Match, MatchPage,
+    MemberPage, OutputArgs as JobOutputQuery, OutputPreview, OutputSelection, OutputTruncation,
+    PageLimit, PageUnit, PresentedOutput,
+};
 pub use pages::JobScope;
-pub(crate) use process::{JobProcess, ProcessOwner};
+pub(crate) use persistence::{ChildStatus, JobStatus, Settled};
 pub(crate) use progress::AgentProgress;
 pub(crate) use questions::Asked;
 use questions::Asking;
-pub(crate) use views::{
-    JOB_VIEW_SCHEMAS, JobListing, MoveTrigger, Release, ViewKind, Waiting, release_records,
-};
-pub use views::{JobEnvelope, JobView, Notice, Presentation};
-mod index;
-use index::Lookup;
-#[cfg(feature = "script")]
-pub(crate) use index::issuing::Issuing;
-pub(crate) use index::{JobSeeds, Jobs};
-pub(crate) use persistence::{ChildStatus, JobStatus, Settled};
-mod persistence;
-mod progress;
-mod supervisor;
 #[cfg(test)]
 pub(crate) use supervisor::JobWorker;
 pub(crate) use supervisor::Supervisor;
 pub use supervisor::{JobLease, stage};
+pub(crate) use views::{
+    JOB_VIEW_SCHEMAS, JobListing, MoveTrigger, Release, ViewKind, Waiting, release_records,
+};
+pub use views::{JobEnvelope, JobView, Notice, Presentation};
 
 const JOB_INPUT_CAPACITY: usize = 32;
 
@@ -91,33 +85,18 @@ pub fn nests(parent: Option<JobId>, origin: &Option<crate::session::ModelCallOri
     parent.is_some() && origin.is_none()
 }
 
-named_enum! {
-    /// Semantic execution role, independent of extensible tool names.
-    #[derive(Clone, Copy, Debug, Default, JsonSchema, Serialize, PartialEq, Eq)]
-    pub enum JobRole {
-        #[default]
-        Tool = "tool",
-        Agent = "agent",
-        Script = "script",
-        Question = "question",
-        /// A `wait`: the agent pauses for events rather than doing work.
-        Wait = "wait",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, JsonSchema, Serialize, PartialEq, Eq)]
-    pub enum JobState {
-        Queued = "queued",
-        #[schemars(skip)]
-        AwaitingApproval = "awaiting_approval",
-        Running = "running",
-        WaitingInput = "waiting_input",
-        Completed = "completed",
-        Failed = "failed",
-        Cancelled = "cancelled",
-        Interrupted = "interrupted",
-    }
+#[derive(Clone, Copy, Debug, JsonSchema, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    #[schemars(skip)]
+    AwaitingApproval,
+    Running,
+    WaitingInput,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
 }
 
 impl JobState {
@@ -138,25 +117,23 @@ impl JobState {
     }
 }
 
-named_enum! {
-    /// A live state a job is journaled entering; `Queued` is only ever created into.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum JobTransition {
-        AwaitingApproval = "awaiting_approval",
-        Running = "running",
-        WaitingInput = "waiting_input",
-    }
+/// A live state a job is journaled entering; `Queued` is only ever created into.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JobTransition {
+    AwaitingApproval,
+    Running,
+    WaitingInput,
 }
 
-named_enum! {
-    /// How a job's invocation ended.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum JobEnd {
-        Completed = "completed",
-        Failed = "failed",
-        Cancelled = "cancelled",
-        Interrupted = "interrupted",
-    }
+/// How a job's invocation ended.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JobEnd {
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
 }
 
 impl From<JobTransition> for JobState {
@@ -187,7 +164,7 @@ impl From<JobEnd> for JobState {
 pub struct ChildResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ChildReply>,
-    #[schemars(transform = crate::tool::output::complete)]
+    #[schemars(transform = skyhook_tools::output::complete)]
     pub reply: String,
 }
 
@@ -257,7 +234,7 @@ impl JobOutcome {
     }
 
     fn end(&self) -> JobEnd {
-        use crate::tool::diagnostic::Cause;
+        use skyhook_tools::diagnostic::Cause;
         match self {
             Self::Completed(_) | Self::NoResult => JobEnd::Completed,
             Self::Failed { diagnostic, .. } => match diagnostic.cause {
@@ -310,7 +287,7 @@ pub(crate) trait Restarter: Send + Sync {
     fn resume(self: Arc<Self>, restarting: Restarting) -> Option<Resume>;
 }
 
-/// What restarts a finished agent job; ordinary input-capable tools cannot restart.
+/// What restarts a finished agent job.
 #[derive(Clone)]
 pub(crate) enum Resume {
     /// Runs the installed child again, given its owner's input, if any.
@@ -338,10 +315,9 @@ pub(crate) type ResumeHandler = Arc<
 
 struct JobManagerInner {
     store: SessionStore,
+    spill: output::Spill,
     /// Set once the session's agent runtime is built: without it, nothing restarts.
     restarter: std::sync::OnceLock<std::sync::Weak<dyn Restarter>>,
-    /// The job each attached process belongs to.
-    processes: std::sync::Mutex<HashMap<u32, JobId>>,
     supervisor: Supervisor,
 }
 
@@ -360,6 +336,19 @@ pub struct AgentMessage {
     #[serde(skip)]
     pub message: MessageSeq,
     pub text: String,
+}
+
+/// Semantic execution role, independent of extensible tool names.
+#[derive(Clone, Copy, Debug, Default, JsonSchema, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRole {
+    #[default]
+    Tool,
+    Agent,
+    Script,
+    Question,
+    /// A `wait`: the agent pauses for events rather than doing work.
+    Wait,
 }
 
 #[derive(Clone, Debug)]
@@ -399,14 +388,38 @@ impl JobSpec {
 impl JobManager {
     #[must_use]
     pub fn new(store: SessionStore) -> Self {
+        Self::spilling(store, output::Spill::default())
+    }
+
+    /// The session's jobs, their large output kept in files as `spill` says.
+    pub(crate) fn spilling(store: SessionStore, spill: output::Spill) -> Self {
         Self {
             inner: Arc::new(JobManagerInner {
                 supervisor: Supervisor::new(store.root()),
                 store,
+                spill,
                 restarter: std::sync::OnceLock::new(),
-                processes: std::sync::Mutex::default(),
             }),
         }
+    }
+
+    pub(crate) fn spill(&self) -> &output::Spill {
+        &self.inner.spill
+    }
+
+    /// What job `job`'s call has its target keep in files instead of sending back.
+    pub(crate) fn spills(&self, job: JobId) -> skyhook_tools::spec::Spills {
+        let sizes = (
+            self.inner.spill.bytes,
+            output::STREAM_TAIL_BYTES,
+            output::STREAM_LATEST_EVERY,
+        );
+        skyhook_tools::spec::Spills::new(&self.inner.store.id(), job, sizes)
+    }
+
+    /// The output rows of run `invocation` of job `job`.
+    pub(crate) fn run_output(&self, job: JobId, invocation: Invocation) -> output::Output {
+        output::Output::of(&self.inner.store, &self.inner.spill, job, invocation)
     }
 
     /// Let `restarter` build what runs agent jobs that restart.
@@ -480,7 +493,7 @@ impl JobManager {
                 for job in moved {
                     state
                         .jobs
-                        .modify(job, |entry, _| entry.moved = Some(trigger));
+                        .modify(job, |entry, _| entry.live.moved = Some(trigger));
                 }
             };
             Ok::<_, SessionError>(Plan::new(released, mark))
@@ -501,6 +514,7 @@ impl JobManager {
 pub(crate) mod tests {
     use super::*;
     use crate::session::Message;
+    use std::{collections::HashMap, sync::PoisonError};
 
     pub(super) async fn runtime() -> (tempfile::TempDir, JobManager, AgentId) {
         let runtime = crate::tests::TestRuntime::new().await;
@@ -526,7 +540,9 @@ pub(crate) mod tests {
     /// finish in flight holds it: its own publication waits until let go.
     pub(crate) fn hold_finish(state: &mut CoreState, child: &AgentId, held: bool) {
         let job = state.jobs.launched(child).expect("a launched child");
-        state.jobs.modify(job, |entry, _| entry.finishing = held);
+        state
+            .jobs
+            .modify(job, |entry, _| entry.live.finishing = held);
     }
 
     /// Drain owners, drop the manager, and replay the durable journal of the
@@ -617,7 +633,7 @@ pub(crate) mod tests {
         text: &str,
     ) -> MessageSeq {
         manager
-            .commit_child_message(child, job, progress(text), text.into(), |_| Vec::new())
+            .commit_child_message(child, job, progress(text), |_| Vec::new())
             .await
             .unwrap()
     }
@@ -861,7 +877,7 @@ pub(crate) mod tests {
 
         /// `envelope` with the result its run saved.
         pub(crate) async fn hydrated(&self, envelope: JobEnvelope) -> Result<Hydrated, JobError> {
-            let output = self.saved_result(&envelope).await?;
+            let output = self.saved_result(&envelope, None).await?;
             let output = output.map(|output| output.value);
             Ok(Hydrated { envelope, output })
         }
@@ -878,12 +894,11 @@ pub(crate) mod tests {
             child: &AgentId,
             job: JobId,
             message: crate::session::Message,
-            text: String,
             follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
         ) -> Result<MessageSeq, JobError> {
             let child = child.clone();
             let commit = move |state: &CoreState| {
-                Jobs::message_plan(state, child, message, Some((job, &text)), follow, |_| {})
+                Jobs::message_plan(state, child, message, Some(job), follow, |_| {})
             };
             self.inner
                 .store
@@ -1011,7 +1026,8 @@ pub(crate) mod tests {
 
     impl Shown {
         pub(crate) fn read(journal: &crate::session::Journal, owner: AgentId) -> Self {
-            let created = journal.created_by(&owner).expect("the journal reads");
+            let (created, _) =
+                (journal.newest_jobs(&owner, &[], usize::MAX)).expect("the journal reads");
             let settled = Settled::read(journal, &created).expect("the journal reads");
             let jobs = settled
                 .into_iter()

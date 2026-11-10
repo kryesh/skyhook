@@ -1,0 +1,67 @@
+[package]
+name = "skyhook-worker"
+description = "Skyhook's operations, their server and SSH and WinRM origin, run wherever tools execute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher = "0.1"
+http.workspace = true
+iana-time-zone.workspace = true
+ignore.workspace = true
+picky-asn1 = "0.10"
+picky-asn1-der = "0.5"
+picky-asn1-x509 = "0.15"
+quick-xml = "0.42"
+reqwest.workspace = true
+rmp-serde = "1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
+schemars.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+skyhook-base.workspace = true
+sspi = { version = "0.23.1", default-features = false }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+getrandom.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }

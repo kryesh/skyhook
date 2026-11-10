@@ -2,6 +2,7 @@
 
 mod dispatch;
 mod planning;
+mod resolution;
 mod results;
 
 pub(crate) use dispatch::cancellation_result;
@@ -12,94 +13,55 @@ pub(crate) use results::{Reported, StartedExecution};
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{
-    execution::ExecutionLocation,
-    identity::{AgentId, JobId},
-    job::{JobManager, JobSpec, JobState},
-    remote::RemoteError,
-    target::{Route, TargetRef, TargetRouter},
-    tool::{
-        ToolPlacement,
-        authorization::{
-            Asking, AuthorizationCoordinator, AuthorizationError, AuthorizationSubject,
-        },
-        diagnostic::{
-            Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic, PathFact,
-            Subject,
-        },
-        policy::{Capability, CapabilitySet, PermissionUse, Policy},
-        registry::{Arguments, ExecutionEnvelope, JobLaunch},
-    },
+use crate::identity::AgentId;
+use crate::tool::policy::{Capability, CapabilitySet, PermissionUse};
+use crate::tool::{
+    authorization::{Asking, AuthorizationError},
+    catalog::{ExecutionEnvelope, InvocationKind, JobLaunch, ScriptBinding},
 };
+use crate::{
+    job::{JobManager, JobSpec, JobState},
+    remote::{RemoteError, RemoteFault},
+    target::TargetRouter,
+    tool::authorization::AuthorizationSubject,
+};
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_tools::target::TargetRef;
+use skyhook_tools::{
+    diagnostic,
+    diagnostic::{Cause, FailureSite, PartialContext, PartialDiagnostic},
+};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
+use skyhook_worker::job::JobId;
 
-use super::{ScriptBinding, ToolContext, ToolError, ToolOutput, ToolRegistry};
+use super::catalog::{ToolPlacement, ToolResultPolicy};
+use super::{ToolContext, ToolError, ToolOutput, ToolRegistry};
+use resolution::Admission;
 
-#[derive(Clone, Copy)]
-pub(crate) enum InvocationKind {
-    Host,
-    Model,
-    Script,
+/// A call planned for its job: the call, and how far its paths have resolved.
+struct InvocationPlan {
+    call: PlannedCall,
+    admission: Admission,
 }
 
-struct InvocationPlan {
+struct PlannedCall {
     origin: Option<crate::session::ModelCallOrigin>,
     agent: AgentId,
     tool: Arc<crate::tool::RegisteredTool>,
-    original_arguments: Arguments,
     authorization_arguments: crate::tool::authorization::AuthorizationArguments,
     caller_location: ExecutionLocation,
     execution_location: ExecutionLocation,
     /// Where the job reports it acts: the execution location, unless the input
     /// places it elsewhere, with its workspace as written.
     job_location: ExecutionLocation,
-    /// Where it runs: `job_location`, with a local workspace resolved.
-    job_runs_in: ExecutionLocation,
-    /// Whether its call creates the local workspace it runs in.
-    creates: crate::tool::invocation::JobWorkspace,
-    permissions: Vec<PermissionUse>,
-    path_facts: Vec<PathFact>,
     parent: Option<JobId>,
     launch: JobLaunch,
-    /// Admitted on the host even when a remote destination runs the call.
-    result_policy: super::ToolResultPolicy,
     /// How much of a finished result the call's reads present: a script holds results whole.
     fit: crate::job::output::Fit,
     /// The schema the job's stored result follows.
     output_schema: Option<Value>,
-    dispatch: InvocationDispatch<PlannedRemote>,
-    source: Option<SourcePlan<PlannedRemote>>,
-    /// The remote a host call's input places its job on, approved with the call and
-    /// connected before it runs.
-    job_route: Option<PlannedRemote>,
-    /// How the call fails once authorized, which may not ask anyone, when a
-    /// path it names outside the root does not resolve.
-    unresolved: Option<ToolError>,
-}
-
-/// The read of a tool's source argument, planned and authorized with the call it
-/// feeds. A remote path is resolved and checked by the worker that reads it.
-enum SourcePlan<R> {
-    Local {
-        path: PathBuf,
-        location: ExecutionLocation,
-    },
-    Remote {
-        remote: R,
-        workspace: PathBuf,
-        path: String,
-    },
-}
-
-/// The remote payload is a planned route before authorization and a prepared
-/// connection afterwards; local dispatch is unchanged by that transition.
-enum InvocationDispatch<R> {
-    Local(super::registry::AdmittedInvocation),
-    Remote { remote: R, arguments: Arguments },
-}
-
-struct PlannedRemote {
-    route: Route,
-    router: TargetRouter,
+    /// The call's input, admitted once; its paths resolve in place where it runs.
+    admitted: super::catalog::Admitted,
 }
 
 /// A call planned for its job, before the job exists.
@@ -118,11 +80,6 @@ pub(crate) struct CreatedInvocation {
 }
 
 impl CreatedInvocation {
-    #[cfg(feature = "script")]
-    pub(crate) fn result_policy(&self) -> super::ToolResultPolicy {
-        self.plan.result_policy
-    }
-
     pub(crate) fn job(&self) -> JobId {
         self.lease.id()
     }
@@ -144,44 +101,36 @@ pub struct ToolExecutor {
 #[derive(Clone)]
 struct ExecutorServices {
     registry: ToolRegistry,
-    authorization: AuthorizationCoordinator,
     jobs: JobManager,
     root_location: ExecutionLocation,
-    router: Option<TargetRouter>,
+    /// The session host, which runs calls and resolves paths like any target.
+    root: crate::tool::target_tools::ExecutionTarget,
+    /// The session's targets, whose authorization coordinator approves every call.
+    router: TargetRouter,
 }
 
 impl ToolExecutor {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         registry: ToolRegistry,
-        policy: Arc<dyn Policy>,
         jobs: JobManager,
         workspace: PathBuf,
+        router: TargetRouter,
     ) -> Self {
-        Self::with_authorization(
-            registry,
-            AuthorizationCoordinator::new(policy),
-            jobs,
-            workspace,
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn with_authorization(
-        registry: ToolRegistry,
-        authorization: AuthorizationCoordinator,
-        jobs: JobManager,
-        workspace: PathBuf,
-    ) -> Self {
-        let caller_location = ExecutionLocation::root(workspace.clone());
+        // The session host is one machine: its jobs' spills go where its own do.
+        let local =
+            skyhook_worker::local::Local::new(workspace).spilling_in(jobs.spill().root.clone());
+        // The session host's workspace, its root as it reports it, which is text: a
+        // harness refuses a workspace that is not.
+        let caller_location = ExecutionLocation::root(local.facts().authorization_root);
         Self {
             model_origin: None,
             shared: Arc::new(ExecutorServices {
                 registry,
-                authorization,
                 jobs,
-                root_location: ExecutionLocation::root(workspace),
-                router: None,
+                root: crate::tool::target_tools::ExecutionTarget::Local(local),
+                root_location: caller_location.clone(),
+                router,
             }),
             caller_location,
             capabilities: CapabilitySet::default(),
@@ -206,26 +155,30 @@ impl ToolExecutor {
         self
     }
 
+    /// What the session host reports about itself.
+    pub(crate) fn root_facts(&self) -> skyhook_worker::target::Facts {
+        self.shared.root.facts()
+    }
+
+    /// The session host, in its workspace.
+    pub(crate) fn root_location(&self) -> &ExecutionLocation {
+        &self.shared.root_location
+    }
+
     /// Generate model and JavaScript tools for the receiving agent.
     #[must_use]
-    pub fn surface_for_agent(&self, agent: &AgentId) -> Arc<crate::tool::ToolSurface> {
+    pub fn surface_for_agent(&self, agent: &AgentId) -> Arc<crate::tool::catalog::ToolSurface> {
         self.shared
             .registry
             .surface_for_agent(&self.capabilities, agent)
-    }
-
-    #[must_use]
-    pub(crate) fn with_target_router(mut self, router: TargetRouter) -> Self {
-        Arc::make_mut(&mut self.shared).router = Some(router);
-        self
     }
 
     pub fn registry(&self) -> &ToolRegistry {
         &self.shared.registry
     }
 
-    pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {
-        super::diagnostic::DiagnosticViewer::new(&self.capabilities, &self.caller_location)
+    pub(crate) fn diagnostic_viewer(&self) -> diagnostic::DiagnosticViewer<'_> {
+        diagnostic::DiagnosticViewer::new(self.capabilities.target_view(), &self.caller_location)
     }
 
     pub fn jobs(&self) -> &JobManager {
@@ -296,7 +249,7 @@ impl ToolExecutor {
                         Operation::Validate,
                         Subject::Tool(name.to_owned()),
                     )
-                    .at(FailureSite::bound(&self.caller_location, placement)))
+                    .at(placement.site(&self.caller_location)))
                 })?;
             let spec = self.job_spec(&plan);
             Ok(PlannedInvocation { kind, plan, spec })
@@ -359,6 +312,7 @@ impl ToolExecutor {
         let Reported {
             outcome,
             acknowledges,
+            ..
         } = self.run_reported(created, None).await;
         let acknowledged = self.shared.jobs.acknowledge(acknowledges);
         acknowledged.await.map_err(job_error)?;
@@ -375,15 +329,12 @@ impl ToolExecutor {
     ) -> futures_util::future::BoxFuture<'_, Reported> {
         Box::pin(async move {
             let CreatedInvocation { kind, plan, lease } = created;
-            let result_policy = plan.result_policy;
             let fallback = prepare_fallback(&plan);
             let purpose = match kind {
-                InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
-                    return self.run_model_call(plan, lease, fallback).await;
+                InvocationKind::Model => {
+                    return self.run_model_call(plan, lease, fallback, reader).await;
                 }
-                InvocationKind::Model | InvocationKind::Script => {
-                    results::CollectionPurpose::Public(result_policy)
-                }
+                InvocationKind::Script => results::CollectionPurpose::Public,
                 InvocationKind::Host => results::CollectionPurpose::Native,
             };
             let started = match self.start(plan, lease).await {
@@ -403,6 +354,7 @@ impl ToolExecutor {
         plan: InvocationPlan,
         lease: crate::job::JobLease,
         fallback: PartialContext,
+        reader: Option<JobId>,
     ) -> Reported {
         let started = match movable(&plan) {
             false => self.start(plan, lease).await,
@@ -426,6 +378,11 @@ impl ToolExecutor {
             }
         };
         match started {
+            // Another job's view answers as that job does.
+            Ok(started) if started.policy() == ToolResultPolicy::JobView => {
+                let purpose = results::CollectionPurpose::Public;
+                self.collect_result(started, purpose, reader).await
+            }
             Ok(started) => self.collect_model_started(started).await,
             Err(error) => Err(error.or(fallback)).into(),
         }
@@ -435,9 +392,10 @@ impl ToolExecutor {
 /// Whether `plan`'s call blocks on a job its turn may move to the background: a
 /// foreground call of a tool that can run there, but never a question for a person.
 fn movable(plan: &InvocationPlan) -> bool {
-    !plan.launch.background
-        && plan.tool.supports_background()
-        && plan.tool.job_role() != crate::job::JobRole::Question
+    let call = &plan.call;
+    !call.launch.background
+        && call.tool.supports_background()
+        && call.tool.job_role() != crate::job::JobRole::Question
 }
 
 /// Job state lives on the session host; the caller names the failed stage.
@@ -446,12 +404,10 @@ fn job_error(error: impl std::borrow::Borrow<crate::job::JobError>) -> ToolError
 }
 
 fn prepare_fallback(plan: &InvocationPlan) -> PartialContext {
+    let call = &plan.call;
     PartialContext::new(
         Operation::Prepare,
-        Subject::Tool(plan.tool.name().to_owned()),
+        Subject::Tool(call.tool.name().to_owned()),
     )
-    .at(FailureSite::bound(
-        &plan.execution_location,
-        plan.tool.placement(),
-    ))
+    .at(call.tool.placement().site(&call.execution_location))
 }

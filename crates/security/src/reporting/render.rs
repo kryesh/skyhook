@@ -12,7 +12,7 @@ use super::{
 };
 use crate::store::{ArtifactRole, Hardening, HardeningReason, ReportedTest, TestResult};
 
-/// Flat YAML front matter of scalar `fields`, never read back by tooling.
+/// Flat YAML front matter of scalar `fields`.
 fn front_matter(fields: &[(&str, String)]) -> String {
     let mut text = String::from("---\n");
     for (name, value) in fields {
@@ -137,7 +137,7 @@ pub(super) fn readme(document: &Document) -> String {
             ]
         })
         .collect();
-    cli::Table {
+    skyhook::product::text::Table {
         header,
         numeric_from: header.len(),
         rows,
@@ -196,7 +196,7 @@ pub(super) fn test(document: &Document, folder: &TestFolder) -> String {
             "- [{}]({}), SHA-256 {}, from {}",
             file.path,
             file.path,
-            code(&skyhook::media::BlobDigest::from_bytes(artifact.digest).to_string()),
+            code(&skyhook_media::BlobDigest::from_bytes(artifact.digest).to_string()),
             code(artifact.reference.as_str())
         );
         if image(&file.path) {
@@ -252,7 +252,7 @@ pub(super) fn index(entries: &[IndexEntry], hardening: usize) -> String {
             ]
         })
         .collect();
-    let table = cli::Table {
+    let table = skyhook::product::text::Table {
         header,
         numeric_from: header.len(),
         rows,
@@ -298,7 +298,7 @@ pub(super) fn hardening(flaws: &[Hardening]) -> String {
                 row
             })
             .collect();
-        cli::Table {
+        skyhook::product::text::Table {
             header,
             numeric_from: header.len(),
             rows,

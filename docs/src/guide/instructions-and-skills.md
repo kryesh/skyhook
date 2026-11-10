@@ -43,7 +43,9 @@ Host-owned skills are exposed through the `skill` tool, which is offered only wh
 skill was discovered. Unlike instructions, skill discovery
 reads `~/.agents/skills` and `.agents/skills` directories along the workspace ancestry, with the
 nearest workspace definition winning when names collide. Discovery happens at startup;
-restart Skyhook to discover newly added skills. A skill directory contains `SKILL.md` and optional supporting
+restart Skyhook to discover newly added skills. Skills are discovered and read on the session
+host only: an agent whose location is a remote target is offered the same skills, and
+`.agents/skills` directories on that target are not read. A skill directory contains `SKILL.md` and optional supporting
 files, conventionally grouped in `scripts/`, `references/`, and `assets/`:
 
 ```text

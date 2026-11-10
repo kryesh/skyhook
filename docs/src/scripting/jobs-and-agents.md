@@ -117,8 +117,7 @@ may leave background services running after answering.
 Background-capable tools accept an optional `bg` argument. Calls use the [common JobView
 contract](../reference/javascript.md#jobview-response-contract); a background launch reports
 the job as launched, `running` and without a `result`, even if it has already finished. A loaded
-literal `null` result is `result: null`.
-Cancellation returns target-job metadata in `.result`. A child
+literal `null` result is `result: null`. A child
 question has `state: "waiting_input"`; `jobs({job})` returns its questions, headers included, in
 `presentation.question`, regardless of its size.
 
@@ -163,7 +162,7 @@ agent indefinitely:
   background job of the agent finishing or asking, or input for the agent (your queued message,
   or a parent's follow-up to a child). An event that arrives sooner waits until then; a call
   that ends first returns its result as usual. A child's progress reply is not an event here.
-- After 10 minutes the calls move anyway, except a child agent's, which reports through its own
+- After 3 minutes the calls move anyway, except a child agent's, which reports through its own
   replies and questions.
 
 Every still-running foreground call of the response moves together. Each returns its job ID in

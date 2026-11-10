@@ -3,12 +3,9 @@ use std::sync::{OnceLock, Weak};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::tool::{
-    RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
-    diagnostic::{Effects, Operation, Subject},
-    executor::ToolExecutor,
-    registry::AdmittedInvocation,
-};
+use crate::tool::catalog::{RegistryError, ToolOptions};
+use crate::tool::{ToolError, ToolRegistryBuilder, catalog::Invocation, executor::ToolExecutor};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 
 pub(crate) fn install_script_tool(
     builder: &mut ToolRegistryBuilder,
@@ -26,7 +23,7 @@ pub(crate) fn install_script_tool(
         Ok,
         move |args: ScriptArgs| {
             let executor = executor.clone();
-            AdmittedInvocation::new(move |context| async move {
+            Invocation::new(move |context| async move {
                 let executor = executor
                     .upgrade()
                     .and_then(|slot| slot.get().cloned())
@@ -53,7 +50,7 @@ struct ScriptArgs {
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript function body with top-level await/return to compute over tool results and files. `value` is the returned JSON (null without return), `console` the captured console.log text/JSON, `failure` a thrown error's other properties (such as cause), when it has any; the envelope's state/error report failure. The host is reached only through `tool`: no imports or host globals, and no global `fetch` (use `tool.fetch(...)`). No recursive script execution. Returned values convert to JSON: nested promises/builders are awaited and native values take their JSON form. Conversion runs after the body returns, beyond its try/catch: as in JSON.stringify, undefined members are omitted and undefined array elements become null; functions, symbols, cycles and throwing or rejecting members become null and fail the script, listed by path. Arguments omit undefined properties.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript function body with top-level await/return to compute over tool results and files. `value` is the returned JSON (null without return), `console` the captured console.log text/JSON, `failure` a thrown error's other properties (such as cause), when it has any; the envelope's state/error report failure. The host is reached only through `tool`: no imports or host globals, and no global `fetch` (use `tool.fetch(...)`). Returned values convert to JSON: nested promises/builders are awaited and native values take their JSON form. Conversion runs after the body returns, beyond its try/catch: as in JSON.stringify, undefined members are omitted and undefined array elements become null; functions, symbols, cycles and throwing or rejecting members become null and fail the script, listed by path. Arguments omit undefined properties.
 
 Awaiting a tool call yields its JobView; operational failures are `failed` envelopes, not throws. Read `r.result`, or `r.unwrap()`: the native payload itself (`r.unwrap().stdout`; `null` if none) when completed; otherwise it throws, with `.response`, `.output` (possibly `null`), and `.job` and `.code` when present. Absent optional tool-response fields (`x?`) read as `null`. Example: `const file = (await tool.read({path:"Cargo.toml"})).unwrap();`. Builders also chain: `tool.read().path("Cargo.toml")`, or `.set(key, value)` for any argument name, including dynamic keys; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Builders nested in a returned value run concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. In the body, `await {a:builder}` does not await members: await each builder or use Promise.all.
 

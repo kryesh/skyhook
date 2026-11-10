@@ -4,18 +4,14 @@
 use super::{
     decode::*,
     encode::json,
-    message::{MessageRole, Messages, Scope},
-    request::{PhaseKind, reported_at},
+    message::{Messages, Scope, committed},
+    requests::reported_at,
     *,
 };
-use crate::{
-    identity::SessionId,
-    session::{
-        CompletedRequest, EntryKind, Message, ModelPurpose, Projected, Projection, Referenced,
-    },
+use crate::identity::SessionId;
+use crate::session::{
+    CompletedRequest, EntryKind, Message, MessageRole, Projected, Projection, requests::PhaseKind,
 };
-
-pub(in crate::session) use super::message::committed;
 
 /// The checkpoint a projection opens with.
 #[derive(Clone, Copy)]
@@ -86,7 +82,10 @@ pub(in crate::session) fn project(
 
 /// The checkpoint journaled at `entry`, if one was: its frontier, its summary's message
 /// row and its retained sources, in order.
-fn compaction(db: &Db, entry: RecordSeq) -> DbResult<Option<(RecordSeq, i64, Vec<MessageSeq>)>> {
+pub(in crate::session) fn compaction(
+    db: &Db,
+    entry: RecordSeq,
+) -> DbResult<Option<(RecordSeq, i64, Vec<MessageSeq>)>> {
     let Some((frontier, summary)) = db.query_row(
         "SELECT frontier, message FROM compaction WHERE entry = ?1",
         params![entry],
@@ -155,7 +154,7 @@ pub(in crate::session) fn exchange(
     if role.is_none_or(|role| role == MessageRole::State) {
         return Ok(None);
     }
-    let (results, _) = results(db, agent, origin.into(), through)?;
+    let results = results(db, agent, origin.into(), through)?;
     let members: Vec<_> = std::iter::once(origin).chain(results).collect();
     let mut messages = committed(db, &members)?;
     (members.into_iter())
@@ -169,13 +168,8 @@ pub(in crate::session) fn exchange(
 }
 
 /// The tool results `agent` committed after its commit `call` through `through`: the
-/// run of them up to its next commit, which ends the run if there is one by then.
-pub(in crate::session) fn results(
-    db: &Db,
-    agent: i64,
-    call: RecordSeq,
-    through: RecordSeq,
-) -> DbResult<(Vec<MessageSeq>, Option<RecordSeq>)> {
+/// run of them up to its next commit.
+fn results(db: &Db, agent: i64, call: RecordSeq, through: RecordSeq) -> DbResult<Vec<MessageSeq>> {
     let kind = EntryKind::MessageCommitted;
     let end = db.query_row(
         format!(
@@ -185,100 +179,11 @@ pub(in crate::session) fn results(
         params![agent, kind, call, through, MessageRole::Tool],
         entry,
     )?;
-    let results = db.query(
+    db.query(
         "SELECT seq FROM entry WHERE agent = ?1 AND kind = ?2 AND seq > ?3 AND seq < ?4 \
          ORDER BY seq",
         params![agent, kind, call, end.unwrap_or(through.next())],
         |row| Ok(sequence(row.get(0)?).message()),
-    )?;
-    Ok((results, end))
-}
-
-/// `agent`'s latest commit before `before` that is not a tool result: the one that
-/// opens the exchange of a result committed at `before`.
-pub(in crate::session) fn opener(
-    db: &Db,
-    agent: i64,
-    before: RecordSeq,
-) -> DbResult<Option<RecordSeq>> {
-    db.query_row(
-        format!(
-            "SELECT e.seq {COMMITS} AND e.seq < ?3 AND m.role != ?4 ORDER BY e.seq DESC LIMIT 1"
-        ),
-        params![
-            agent,
-            EntryKind::MessageCommitted,
-            before,
-            MessageRole::Tool
-        ],
-        entry,
-    )
-}
-
-/// Whether `agent` replaced its todos, or compacted, after `after` and before `before`.
-pub(in crate::session) fn todos_changed(
-    db: &Db,
-    agent: i64,
-    after: RecordSeq,
-    before: RecordSeq,
-) -> DbResult<bool> {
-    let changed = db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM entry WHERE agent = ?1 AND kind IN (?2, ?3) \
-         AND seq > ?4 AND seq < ?5)",
-        params![
-            agent,
-            EntryKind::TodosReplaced,
-            EntryKind::Compaction,
-            after,
-            before
-        ],
-        |row| Ok(row.get::<bool>(0)?),
-    )?;
-    Ok(changed.unwrap_or_default())
-}
-
-/// Whether `agent` journaled a model context for `purpose` after `after` and before
-/// `before`.
-pub(in crate::session) fn context_replaced(
-    db: &Db,
-    agent: i64,
-    purpose: ModelPurpose,
-    after: RecordSeq,
-    before: RecordSeq,
-) -> DbResult<bool> {
-    let replaced = db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM entry e JOIN model_context c ON c.entry = e.seq \
-         WHERE e.agent = ?1 AND e.kind = ?2 AND e.seq > ?3 AND e.seq < ?4 AND c.purpose = ?5)",
-        params![agent, EntryKind::ModelContext, after, before, purpose],
-        |row| Ok(row.get::<bool>(0)?),
-    )?;
-    Ok(replaced.unwrap_or_default())
-}
-
-/// The ids of the calls `agent` committed before `before` and since its latest agent
-/// request before it that no result answers yet, in commit order.
-pub(in crate::session) fn unanswered(
-    db: &Db,
-    agent: i64,
-    before: RecordSeq,
-) -> DbResult<Vec<String>> {
-    db.query(
-        format!(
-            "SELECT c.call_id FROM entry e JOIN message_commit m ON m.entry = e.seq \
-             JOIN assistant_item i ON i.message = m.message JOIN tool_call c ON c.item = i.id \
-             WHERE e.agent = ?4 AND e.kind = ?1 AND e.seq < ?5 AND e.seq > {} \
-             AND NOT EXISTS (SELECT 1 FROM tool_result r WHERE r.call = c.item) \
-             ORDER BY e.seq, i.position",
-            since_agent_request("?4", "AND q.seq < ?5")
-        ),
-        params![
-            EntryKind::MessageCommitted,
-            EntryKind::ModelRequested,
-            ModelPurpose::Agent,
-            agent,
-            before
-        ],
-        |row| Ok(row.get::<String>(0)?),
     )
 }
 
@@ -293,45 +198,16 @@ pub(super) fn since_agent_request(agent: &str, bound: &str) -> String {
     )
 }
 
-/// What `agent`'s entry `entry` is, as a record's references need it; None unless the
-/// agent journaled it.
-pub(in crate::session) fn referenced(
+/// The context of the request journaled at `entry`, if one was.
+pub(in crate::session) fn request_context(
     db: &Db,
-    agent: i64,
     entry: RecordSeq,
-) -> DbResult<Option<Referenced>> {
-    let kind = db.query_row(
-        "SELECT kind FROM entry WHERE seq = ?1 AND agent = ?2",
-        params![entry, agent],
-        |row| enum_column::<EntryKind>(row, 0),
-    )?;
-    let missing = || corrupt(format!("entry {entry} has no rows of its kind"));
-    Ok(Some(match kind {
-        None => return Ok(None),
-        Some(EntryKind::ModelContext) => Referenced::Context(
-            db.query_row(
-                "SELECT purpose FROM model_context WHERE entry = ?1",
-                params![entry],
-                |row| enum_column(row, 0),
-            )?
-            .ok_or_else(missing)?,
-        ),
-        Some(EntryKind::ModelRequested) => Referenced::Request {
-            context: db
-                .query_row(
-                    "SELECT context FROM model_request WHERE entry = ?1",
-                    params![entry],
-                    super::decode::entry,
-                )?
-                .ok_or_else(missing)?,
-        },
-        Some(EntryKind::Compaction) => {
-            let (frontier, _, retained) = compaction(db, entry)?.ok_or_else(missing)?;
-            Referenced::Checkpoint { frontier, retained }
-        }
-        Some(EntryKind::MessageCommitted) => Referenced::Commit,
-        Some(_) => Referenced::Other,
-    }))
+) -> DbResult<Option<RecordSeq>> {
+    db.query_row(
+        "SELECT context FROM model_request WHERE entry = ?1",
+        params![entry],
+        super::decode::entry,
+    )
 }
 
 /// The row of the agent that journaled `entry`.

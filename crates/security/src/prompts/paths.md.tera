@@ -30,7 +30,7 @@ Each interface of theirs an environment serves gets a child too.
 {%- endif %}
 
 ```js
-{% if live %}{% include "security/scripts/paths.live.js" %}{% else %}{% include "security/scripts/paths.no-live.js" %}{% endif %}
+{% include "security/scripts/paths.js" %}
 ```
 
 Once every child has finished, reconcile what they recorded into scenarios. The paths of an
@@ -41,8 +41,8 @@ keep, which takes its accesses, premises and place in candidates' actions. Route
 definition through different handling are distinct entries: keep them apart, and when in doubt
 that the handling matches, keep them apart. A function recorded as an entry that only other
 entries reach is a stage: retract its path and link its accesses to theirs, since a stage swept
-without its scenario loses the chains that cross it. Then complete each path with `link`
-`path_step`: insert ahead of its entry the target's code that reaches it, and extend it past the
+without its scenario loses the chains that cross it. Then complete each path's whole `steps`
+in an `upsert`: put ahead of its entry the target's code that reaches it, and extend it past the
 entry through each component the input is handed to, in order, with its location and how.
 
 Children recording one file each record the same storage more than once: `merge` each state

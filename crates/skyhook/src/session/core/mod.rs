@@ -10,12 +10,11 @@ use chrono::Utc;
 use tokio::sync::{broadcast, oneshot};
 
 use super::{
-    EventRecord, JournalFailure, RecordSeq, SessionError, SessionEvent, SessionLock, db, request,
+    EventRecord, JournalFailure, RecordSeq, SessionError, SessionEvent, db, store::SessionLock,
 };
-use crate::{
-    agent::{ObservedEvent, RuntimeEvent},
-    identity::{AgentId, EventId, JobId, SessionId},
-};
+use crate::identity::{AgentId, SessionId};
+use crate::session::{ObservedEvent, RuntimeEvent};
+use skyhook_worker::job::JobId;
 
 mod phase;
 pub(crate) use phase::Command;
@@ -458,7 +457,7 @@ impl Writer {
         let live = move |state: &mut CoreState, records: &[Arc<EventRecord>]| {
             state.set_phase(phase);
             if closes {
-                state.close_waits();
+                state.close();
             }
             live(state, records)
         };
@@ -469,12 +468,12 @@ impl Writer {
         Ok(value)
     }
 
-    /// Journal `entries` with `outputs` in one transaction, validating each record
-    /// against the journal ahead of it and folding it into the state, whose changed
-    /// job, request and agent rows it writes, before COMMIT; then fold them into what
-    /// observers see, publish them and apply `live` in the critical section the fold
-    /// began. What observers see is taken only after COMMIT, so posts never wait for
-    /// the database. A transaction the journal cannot take stops the session.
+    /// Journal `entries` with `outputs` in one transaction, folding each record into
+    /// the state, whose changed job, request and agent rows it writes, before COMMIT;
+    /// then fold them into what observers see, publish them and apply `live` in the
+    /// critical section the fold began. What observers see is taken only after COMMIT,
+    /// so posts never wait for the database. A transaction the journal cannot take
+    /// stops the session.
     fn commit<T>(
         &mut self,
         entries: Vec<(AgentId, SessionEvent)>,
@@ -499,7 +498,6 @@ impl Writer {
             (outputs.into_iter()).try_for_each(|output| output.insert(db))?;
             encoder.start(db, &records)?;
             for record in &records {
-                request::validate(db, record)?;
                 encoder.record(db, record)?;
             }
             // Held through COMMIT, or through the rollback and what its rows reopen to,
@@ -529,7 +527,7 @@ impl Writer {
                 Err(Unfolded(cause, state)) => (cause, state),
             };
             let _ = super::db::close_writes(db);
-            let held = state.map(|state| (state, super::open_state(db, shared.id)));
+            let held = state.map(|state| (state, super::store::open_state(db, shared.id)));
             (cause, held)
         });
         let (state, views) = match written {
@@ -706,7 +704,7 @@ impl Writer {
                 if let Some(failure) = shared.read().phase().failure().cloned() {
                     return failure;
                 }
-                let opened = super::open_state(&db, shared.id);
+                let opened = super::store::open_state(&db, shared.id);
                 drop(db);
                 (shared.write(), opened)
             }
@@ -754,7 +752,7 @@ impl Writer {
                 && let Some(definition) = &mode.definition
             {
                 let latest =
-                    (editions.get(&mode.name)).or_else(|| state.agents.edition(&mode.name));
+                    (editions.get(&mode.name)).or_else(|| state.contracts.edition(&mode.name));
                 if latest == Some(definition) {
                     mode.definition = None;
                 } else {
@@ -762,7 +760,6 @@ impl Writer {
                 }
             }
             records.push(Arc::new(EventRecord {
-                id: EventId::generate()?,
                 sequence: RecordSeq::new(first.get().saturating_add(offset as u64)),
                 timestamp_millis,
                 agent,

@@ -2,13 +2,10 @@
 
 use thiserror::Error;
 
-use crate::{
-    job::JobError,
-    provider::{ProviderError, ProviderErrorKind},
-    session::SessionError,
-    target::TargetError,
-    tool::{RegistryError, ToolError},
-};
+use crate::session::{CompactionFault, Failure, TurnFailure};
+use crate::target::TargetError;
+use crate::tool::catalog::RegistryError;
+use crate::{job::JobError, provider::ProviderError, session::SessionError, tool::ToolError};
 
 #[derive(Debug, Error)]
 pub enum HarnessError {
@@ -28,6 +25,9 @@ pub enum HarnessError {
     Job(JobError),
     #[error("host capability `{0}` has not been declared")]
     UndeclaredHostCapability(crate::tool::policy::HostCapability),
+    /// Tools name the workspace as text, which this one is not.
+    #[error("workspace {} is not valid Unicode", .0.display())]
+    UnspelledWorkspace(std::path::PathBuf),
     #[error("session belongs to host `{session}`, cannot activate as `{host}`")]
     HostMismatch {
         session: crate::identity::HostName,
@@ -36,19 +36,17 @@ pub enum HarnessError {
     #[error("a default model is required")]
     MissingDefaultModel,
     #[error("unknown model `{0}`")]
-    UnknownModel(crate::provider::profile::ModelRef),
+    UnknownModel(crate::provider::model::ModelRef),
     #[error("agent `{0}` has no journaled model to resume under")]
     NoRecordedModel(crate::identity::AgentId),
     #[error("unknown mode `{0}`")]
-    UnknownMode(crate::tool::policy::ModeName),
+    UnknownMode(crate::config::mode::ModeName),
     #[error(transparent)]
     Prompt(#[from] crate::prompts::TemplateError),
-    #[error("mode `{0}` cannot be applied: only the root agent changes mode")]
-    ModeChangeUnsupported(crate::tool::policy::ModeName),
     #[error("invalid model `{model}`: {error}")]
     InvalidModel {
-        model: crate::provider::profile::ModelRef,
-        error: crate::provider::profile::LimitsError,
+        model: crate::provider::model::ModelRef,
+        error: crate::provider::model::LimitsError,
     },
     #[error("compaction failed: {0}")]
     Compaction(#[from] CompactionError),
@@ -56,9 +54,6 @@ pub enum HarnessError {
     AgentStopped,
     #[error("the output limit was reached before any answer or tool call")]
     OutputLimit,
-    /// The model declined to answer. Deterministic for a given request, so the
-    /// runtime never retries it: only a parent agent or a human may retry,
-    /// optionally on another model.
     #[error("the model declined to respond: {0}")]
     Refused(String),
     #[error("agent turn was interrupted")]
@@ -88,16 +83,6 @@ impl HarnessError {
     }
 }
 
-/// A session's refusal reaches the host in one shape, whichever layer met it.
-impl From<ToolError> for HarnessError {
-    fn from(error: ToolError) -> Self {
-        match error.refused() {
-            Some(phase) => Self::Session(SessionError::Refused(phase)),
-            None => Self::Execution(error),
-        }
-    }
-}
-
 /// A session error reaches the host in one shape, whichever layer met it.
 impl From<JobError> for HarnessError {
     fn from(error: JobError) -> Self {
@@ -119,76 +104,15 @@ pub enum CompactionError {
     #[error("invalid structured continuation: {0}")]
     Continuation(#[source] serde_json::Error),
     #[error("unknown handover job {0}")]
-    UnknownJob(crate::identity::JobId),
+    UnknownJob(skyhook_worker::job::JobId),
     #[error("handover job {job} output cannot be presented: {source}")]
     HandoverOutput {
-        job: crate::identity::JobId,
+        job: skyhook_worker::job::JobId,
         #[source]
         source: ToolError,
     },
     #[error(transparent)]
     Checkpoint(#[from] crate::session::CheckpointError),
-}
-
-crate::named_enum::detailed_enum! {
-    /// A compaction round that installed no checkpoint, as journaled by kind. A
-    /// failed summary attempt journals its own failure, which `Summary` names.
-    #[derive(Clone, Debug, PartialEq, Eq, Error, serde::Serialize)]
-    #[serde(tag = "kind", content = "detail")]
-    pub enum CompactionFault / FaultKind {
-        #[error("summarization was truncated")]
-        Truncated = "truncated",
-        #[error("summarizer returned a tool call")]
-        ToolCall = "tool_call",
-        /// The parser's account of the answer it rejected.
-        #[error("invalid structured continuation: {0}")]
-        Continuation(String) = "continuation",
-        #[error("the summary selected an unknown job")]
-        UnknownJob = "unknown_job",
-        #[error("a selected job's output cannot be presented")]
-        HandoverOutput = "handover_output",
-        #[error("{0}")]
-        Checkpoint(crate::session::CheckpointError) = "checkpoint",
-        #[error("compaction was interrupted")]
-        Interrupted = "interrupted",
-        /// The summary request exceeded the model's context window; a smaller one may fit.
-        #[error("the summary exceeded the context window")]
-        Overflowed = "overflowed",
-        #[error("summarization failed: {0}")]
-        Summary(FailureKind) = "summary",
-        /// A failure outside the summary's model attempts, such as journaling it.
-        #[error("{0}")]
-        Other(String) = "other",
-    }
-}
-
-impl CompactionFault {
-    /// Whether a fresh summary can succeed: the model's answer was unusable, or the
-    /// todos it reconciled changed meanwhile. A broken invariant would fail again.
-    pub fn retryable(&self) -> bool {
-        match self {
-            Self::Truncated
-            | Self::ToolCall
-            | Self::Continuation(_)
-            | Self::UnknownJob
-            | Self::HandoverOutput
-            | Self::Overflowed => true,
-            Self::Checkpoint(reason) => *reason == crate::session::CheckpointError::StaleTodos,
-            Self::Interrupted | Self::Summary(_) | Self::Other(_) => false,
-        }
-    }
-
-    /// Whether a round that failed with this fault leaves the compaction need for the
-    /// next request: a round cut short, or one a fresh summary could pass. A summary that
-    /// overflowed already shrank within its round, so the next request decides instead:
-    /// it fits, or its own overflow compacts.
-    pub fn keeps_need(&self) -> bool {
-        match self {
-            Self::Overflowed => false,
-            Self::Interrupted => true,
-            other => other.retryable(),
-        }
-    }
 }
 
 impl From<&HarnessError> for CompactionFault {
@@ -216,44 +140,6 @@ impl From<&HarnessError> for CompactionFault {
     }
 }
 
-crate::named_enum::detailed_enum! {
-    /// Why a model attempt, or the agent turn it ended, failed, as journaled.
-    #[derive(Clone, Debug, PartialEq, Eq, Error, serde::Serialize)]
-    #[serde(into = "FailureReport")]
-    pub enum Failure / FailureKind {
-        #[error("the model declined to respond: {0}")]
-        Refused(String) = "refused",
-        #[error("the output limit was reached before any answer or tool call")]
-        OutputLimit = "output_limit",
-        #[error("{1}: {0}")]
-        Provider(String, ProviderErrorKind) = "provider",
-        #[error("{0}")]
-        Other(String) = "other",
-    }
-}
-
-/// A failure as reported: its kind, a provider failure's class, and its rendered text.
-#[derive(serde::Serialize)]
-struct FailureReport {
-    kind: FailureKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<ProviderErrorKind>,
-    message: String,
-}
-
-impl From<Failure> for FailureReport {
-    fn from(failure: Failure) -> Self {
-        Self {
-            kind: failure.kind(),
-            provider: match failure {
-                Failure::Provider(_, class) => Some(class),
-                _ => None,
-            },
-            message: failure.to_string(),
-        }
-    }
-}
-
 impl From<&ProviderError> for Failure {
     fn from(error: &ProviderError) -> Self {
         Self::Provider(error.message.clone(), error.kind())
@@ -271,18 +157,6 @@ impl From<&HarnessError> for Failure {
     }
 }
 
-/// Why an agent turn ended without an answer. Carried by agent activity, so an
-/// owner recognises an interrupt or refusal without reading rendered messages.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum TurnFailure {
-    #[error("agent turn was interrupted")]
-    Interrupted,
-    #[error("child agent cancelled")]
-    Cancelled,
-    #[error(transparent)]
-    Failed(#[from] Failure),
-}
-
 impl From<&HarnessError> for TurnFailure {
     fn from(error: &HarnessError) -> Self {
         match error {
@@ -294,9 +168,8 @@ impl From<&HarnessError> for TurnFailure {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
+    use crate::session::FailureKind;
 
     #[test]
     fn only_a_model_failure_is_a_summary_fault() {
@@ -306,14 +179,5 @@ mod tests {
         let depth = HarnessError::ChildDepth;
         let other = CompactionFault::from(&depth);
         assert_eq!(other, CompactionFault::Other(depth.to_string()));
-    }
-
-    #[test]
-    fn a_failure_reports_its_kind_provider_class_and_text() {
-        let provider = Failure::Provider("down".into(), ProviderErrorKind::Transport);
-        let report = json!({"kind":"provider","provider":"Transport","message":"Transport: down"});
-        assert_eq!(serde_json::to_value(provider).unwrap(), report);
-        let limit = json!({"kind":"output_limit","message":"the output limit was reached before any answer or tool call"});
-        assert_eq!(serde_json::to_value(Failure::OutputLimit).unwrap(), limit);
     }
 }

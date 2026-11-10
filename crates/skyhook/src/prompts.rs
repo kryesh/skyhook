@@ -12,12 +12,18 @@ use std::{
 
 use serde::Serialize;
 
+use crate::target::TargetDefinition;
+use crate::tool::policy::{Capability, CapabilitySet};
 use crate::{
-    newtype::{Blank, Prose, nonblank, string_newtype},
-    session::cell,
-    target::{TargetDefinition, TargetRef, TimeZone},
-    tool::policy::{Capability, CapabilitySet, Edition, Instructions, Mode, ModeName},
+    config::mode::{Edition, Instructions, Mode, ModeName},
+    session::{cell, path_cell},
 };
+use skyhook_base::{
+    newtype::{Blank, Prose, nonblank},
+    string_newtype,
+};
+use skyhook_tools::target::TargetRef;
+use skyhook_worker::target::Facts;
 
 string_newtype! {
     /// The name a template is registered and included under, such as `skyhook/system.md`.
@@ -75,15 +81,16 @@ impl<H: Serialize> Templates<H> {
     ) -> Result<Self, TemplateError> {
         let section = tera::Context::from_serialize(sample)?;
         let capabilities = CapabilitySet::default();
+        let workspace = skyhook_worker::op::TargetPath::from("");
         let agent = Agent {
             depth: 0,
             available_depth: 0,
             capabilities: &capabilities,
             mode: None,
-            workspace: std::path::Path::new(""),
+            workspace: &workspace,
             target: &TargetRef::Root,
             definition: None,
-            zone: None,
+            facts: None,
         };
         let system = System::new(&agent, None, None, &[]);
         let agent = tera::Context::from_serialize(&system.agent)?;
@@ -248,12 +255,12 @@ pub struct Agent<'a> {
     pub available_depth: usize,
     pub capabilities: &'a CapabilitySet,
     pub mode: Option<&'a ModeName>,
-    pub workspace: &'a std::path::Path,
+    pub workspace: &'a skyhook_worker::op::TargetPath,
     pub target: &'a TargetRef,
     /// The target's definition; None on the session host.
     pub definition: Option<TargetDefinition>,
-    /// The target's time zone, when it is known.
-    pub zone: Option<TimeZone>,
+    /// What the target's machine reported about itself, when it is known.
+    pub facts: Option<Facts>,
 }
 
 /// What the system prompt renders from: the agent's context and the parts around it.
@@ -300,8 +307,8 @@ struct PromptContext {
     /// Every built-in capability by name, whether granted.
     capabilities: BTreeMap<&'static str, bool>,
     mode: Option<ModeName>,
-    /// Its `context` lines: the workspace, the target where it may choose one,
-    /// and the session host's time zone when it is known.
+    /// Its `context` lines: the workspace, the target where it may choose one, and
+    /// its machine's operating system, shell and time zone when they are known.
     context: String,
     /// The type every direct tool result follows.
     job_view: &'static str,
@@ -310,7 +317,7 @@ struct PromptContext {
 impl PromptContext {
     fn new(agent: &Agent<'_>) -> Self {
         let definition = agent.definition.as_ref();
-        let mut context = format!("workspace:{}", cell(&agent.workspace.to_string_lossy()));
+        let mut context = format!("workspace:{}", path_cell(agent.workspace.as_str()));
         if let Some(name) = agent.capabilities.visible_target(agent.target) {
             let host = definition.map_or("localhost", |target| &target.host);
             write!(
@@ -329,13 +336,19 @@ impl PromptContext {
                 }
             }
         }
-        if let Some(zone) = &agent.zone {
+        if let Some(facts) = &agent.facts {
+            let os = facts.platform.os;
+            write!(context, "\nos:{os} shell={}", os.shell()).expect("strings take writes");
+            let zone = &facts.zone;
             let name = zone.name.as_deref().map(|name| format!("{} ", cell(name)));
+            let sign = if zone.offset < 0 { '-' } else { '+' };
+            let seconds = zone.offset.unsigned_abs();
             write!(
                 context,
-                "\ntz:{}{}",
+                "\ntz:{}{sign}{:02}:{:02}",
                 name.unwrap_or_default(),
-                zone.offset()
+                seconds / 3600,
+                seconds % 3600 / 60
             )
             .expect("strings take writes");
         }
@@ -351,7 +364,7 @@ impl PromptContext {
             capabilities: Capability::ALL.iter().map(granted).collect(),
             mode: agent.mode.cloned(),
             context,
-            job_view: crate::tool::job_view_type(),
+            job_view: crate::tool::catalog::job_view_type(),
         }
     }
 }
@@ -359,11 +372,18 @@ impl PromptContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skyhook_worker::{
+        op::TargetPath,
+        target::{Arch, Os, Platform, TimeZone},
+    };
 
     #[derive(Serialize)]
     struct Host {
         live: bool,
     }
+
+    static WORKSPACE: std::sync::LazyLock<skyhook_worker::op::TargetPath> =
+        std::sync::LazyLock::new(|| "/workspace".into());
 
     /// A root on the session host holding `capabilities`, in no mode.
     fn root(capabilities: &CapabilitySet) -> Agent<'_> {
@@ -372,17 +392,17 @@ mod tests {
             available_depth: 0,
             capabilities,
             mode: None,
-            workspace: std::path::Path::new("/workspace"),
+            workspace: &WORKSPACE,
             target: &TargetRef::Root,
             definition: None,
-            zone: None,
+            facts: None,
         }
     }
 
-    /// A bare root's prompt carries no capability-gated fragment and none of the parts it
-    /// is not given, and works its task as a child does until it can ask the user; a child
-    /// given every part carries the fragments its grants open, and its persona, its mode's
-    /// instructions as they render for it, its instruction file and its target, in order.
+    /// A bare root's prompt carries no capability-gated fragment, and works its task as a
+    /// child does until it can ask the user; a child given every part carries the fragments
+    /// its grants open, and its persona, its mode's instructions as they render for it, its
+    /// instruction file and its target, in order.
     #[test]
     fn system_prompts_carry_the_parts_their_agent_is_given() {
         let gated = ["skyhook/targets.md", "skyhook/agents.md"];
@@ -393,7 +413,7 @@ mod tests {
         let library = Prompts::default();
         let text = library.system(&bare, None, &[]).unwrap();
         let fragments = gated.map(|name| library.render(name, &bare).unwrap());
-        for absent in fragments.iter().map(String::as_str).chain(inputs) {
+        for absent in &fragments {
             assert!(!text.contains(absent), "{absent}");
         }
         assert!(text.starts_with(&library.render("skyhook/child.md", &bare).unwrap()));
@@ -417,7 +437,8 @@ mod tests {
         let target = TargetDefinition {
             name: "box".parse().unwrap(),
             host: "box.example".into(),
-            ssh: Default::default(),
+            os: Os::Windows,
+            connection: crate::target::Connection::Ssh(Default::default()),
             workspace: "/remote".into(),
             via: Some("jump".parse().unwrap()),
             origin: None,
@@ -436,12 +457,19 @@ mod tests {
             available_depth: 2,
             capabilities: &capabilities,
             mode: Some(&"look".parse().unwrap()),
-            workspace: std::path::Path::new("/remote/work"),
+            workspace: &"/remote/work".into(),
             target: &TargetRef::Named(target.name.clone()),
             definition: Some(target.clone()),
-            zone: Some(TimeZone {
-                name: Some("Europe/Berlin".into()),
-                offset: 3600,
+            facts: Some(Facts {
+                platform: Platform {
+                    os: Os::Windows,
+                    arch: Arch::X86_64,
+                },
+                zone: TimeZone {
+                    name: Some("America/St_Johns".into()),
+                    offset: -(3 * 3600 + 30 * 60),
+                },
+                authorization_root: TargetPath::new("/remote"),
             }),
         };
         let edition = prompts.edition(&look, &child).unwrap();
@@ -455,10 +483,11 @@ mod tests {
         }
         let positions = inputs.map(|part| text.find(part).unwrap_or_else(|| panic!("{part}")));
         assert!(positions.is_sorted());
-        // The context is plain lines: a visible target's, and its zone when known.
+        // The context is plain lines: a visible target's, and its machine's platform and
+        // zone when known.
         let block = |lines: &str| format!("<context>\n{lines}\n</context>");
-        let remote =
-            "workspace:/remote/work\ntarget:box host=box.example via=jump\ntz:Europe/Berlin +01:00";
+        let remote = "workspace:/remote/work\ntarget:box host=box.example via=jump\n\
+            os:windows shell=powershell-5.1\ntz:America/St_Johns -03:30";
         assert!(text.ends_with(&block(remote)));
         let bare = library.system(&bare, None, &[]).unwrap();
         assert!(bare.ends_with(&block("workspace:/workspace")));

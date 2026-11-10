@@ -191,7 +191,7 @@ impl Decoder {
                 }
             }
         }
-        let digest = crate::media::BlobDigest::from_bytes(hasher.finalize().into());
+        let digest = skyhook_media::BlobDigest::from_bytes(hasher.finalize().into());
         digest.to_string()[..CALL_ID_ORIGIN_LEN].to_owned()
     }
 }
@@ -343,7 +343,7 @@ mod tests {
                 chunk["id"] = json!(response);
             }
             let mut decoder = decoder();
-            decoder.request = crate::media::BlobDigest::of(request.to_string().as_bytes());
+            decoder.request = skyhook_media::BlobDigest::of(request.to_string().as_bytes());
             let mut events = Vec::new();
             for frame in [event(chunk), end("tool_calls"), done()] {
                 events.extend(decoder.decode(&frame).unwrap());
@@ -355,7 +355,7 @@ mod tests {
         let id = derived(Some("chatcmpl-x.y:z"), "{}");
         assert!(id.starts_with("call_") && id.ends_with("_0"), "{id}");
         assert!(
-            id.chars().all(crate::tool::registry::is_tool_name_char),
+            id.chars().all(crate::tool::catalog::is_tool_name_char),
             "{id}"
         );
         assert_eq!(id, derived(Some("chatcmpl-x.y:z"), "{}"));

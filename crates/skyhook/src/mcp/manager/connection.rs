@@ -48,14 +48,12 @@ impl Server {
         // waiter releases the lock but does not lose kill/reap ownership;
         // another caller can still join the same cleanup task.
         let mut state = self.resources.lock().await;
-        if matches!(*state, ResourceState::Running(_)) {
-            let ResourceState::Running(resources) =
-                std::mem::replace(&mut *state, ResourceState::Closed)
-            else {
-                unreachable!()
-            };
-            *state = ResourceState::Closing(tokio::spawn(resources.shutdown()));
-        }
+        *state = match std::mem::replace(&mut *state, ResourceState::Closed) {
+            ResourceState::Running(resources) => {
+                ResourceState::Closing(tokio::spawn(resources.shutdown()))
+            }
+            other => other,
+        };
         if let ResourceState::Closing(task) = &mut *state {
             let _ = task.await;
             *state = ResourceState::Closed;
@@ -108,14 +106,12 @@ pub(super) async fn connect_one(
 #[cfg(test)]
 mod tests {
     use super::super::tests::assert_process_reaped;
-    use super::super::tests::{Fixture, connect, fixture_call, shutdown, wait_for_file};
+    use super::super::tests::{Fixture, connect, fixture_call, server, shutdown, wait_for_file};
     use super::super::{STARTUP_CONCURRENCY, StartupError};
     use super::McpError;
-    use crate::mcp::{
-        config::{McpServerConfig, McpTransport, RawMcpServerConfig},
-        manager::McpManager,
-    };
+    use crate::mcp::manager::McpManager;
     use crate::tests::bounded;
+    use serde_json::{Value, json};
     use std::{collections::BTreeMap, time::Duration};
     use tokio_util::sync::CancellationToken;
 
@@ -185,21 +181,20 @@ os.replace(os.environ['MCP_TEST_READY'] + '.tmp', os.environ['MCP_TEST_READY'])
 server.serve_forever()
 "#;
 
-    fn with_env(mut config: RawMcpServerConfig, name: &str, value: String) -> RawMcpServerConfig {
-        config.env.insert(name.into(), value);
+    fn with_env(mut config: Value, name: &str, value: String) -> Value {
+        config["env"][name] = value.into();
         config
     }
 
-    fn hanging(fixture: &Fixture) -> RawMcpServerConfig {
+    fn hanging(fixture: &Fixture) -> Value {
         with_env(fixture.config(), "MCP_TEST_HANG_INITIALIZE", "1".into())
     }
 
-    fn http_fixture_config(fixture: &Fixture, port: u16) -> RawMcpServerConfig {
+    fn http_fixture_config(fixture: &Fixture, port: u16) -> Value {
         let mut config = fixture.config();
-        config.transport = McpTransport::StreamableHttp;
-        config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
-        let command = ["python3", "-u", "-c", HTTP_FIXTURE];
-        config.start_command = Some(command.map(String::from).to_vec());
+        config["transport"] = json!("streamable_http");
+        config["url"] = json!(format!("http://127.0.0.1:{port}/mcp"));
+        config["start_command"] = json!(["python3", "-u", "-c", HTTP_FIXTURE]);
         let config = with_env(config, "MCP_TEST_PORT", port.to_string());
         with_env(config, "MCP_TEST_READY", fixture.path("ready"))
     }
@@ -207,7 +202,7 @@ server.serve_forever()
     #[tokio::test]
     async fn startup_timeout_reaps_owned_stdio_child() {
         let fixture = Fixture::new();
-        let config: McpServerConfig = hanging(&fixture).try_into().unwrap();
+        let config = server(hanging(&fixture));
         // The deadline expires once the child it must reap is running.
         let pid = fixture.directory.path().join("pid");
         let workspace = std::env::temp_dir();
@@ -252,8 +247,8 @@ server.serve_forever()
                 stream.shutdown().await.unwrap();
             }));
             let mut config = fixture.config();
-            config.transport = McpTransport::StreamableHttp;
-            config.url = Some(format!("http://{address}/mcp"));
+            config["transport"] = json!("streamable_http");
+            config["url"] = json!(format!("http://{address}/mcp"));
             let manager = connect(config).await;
             server.await.expect("HTTP fixture task succeeds");
             assert!(manager.catalog().is_empty(), "{status}");
@@ -302,7 +297,7 @@ server.serve_forever()
         let config = http_fixture_config(&fixture, port.address().port());
         let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
         let config = with_env(config, "MCP_TEST_HTTP_HANG", "1".into());
-        let configs = BTreeMap::from([("fixture".to_owned(), config.try_into().unwrap())]);
+        let configs = BTreeMap::from([("fixture".to_owned(), server(config))]);
         let cancel = CancellationToken::new();
         let capabilities = crate::tool::policy::CapabilitySet::default();
         let workspace = std::env::temp_dir();
@@ -327,10 +322,11 @@ server.serve_forever()
     async fn shutdown_does_not_terminate_an_externally_managed_http_server() {
         let fixture = Fixture::new();
         let mut config = http_fixture_config(&fixture, 0);
-        let argv = config.start_command.as_ref().unwrap();
+        let argv: Vec<String> = serde_json::from_value(config["start_command"].clone()).unwrap();
+        let env: BTreeMap<String, String> = serde_json::from_value(config["env"].clone()).unwrap();
         let mut child = tokio::process::Command::new(&argv[0])
             .args(&argv[1..])
-            .envs(&config.env)
+            .envs(&env)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -341,9 +337,9 @@ server.serve_forever()
             .unwrap()
             .parse()
             .unwrap();
-        config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
+        config["url"] = json!(format!("http://127.0.0.1:{port}/mcp"));
         // If a reachable endpoint incorrectly triggers a launch, it fails visibly.
-        config.start_command = Some(vec![fixture.path("must-not-be-executed")]);
+        config["start_command"] = json!([fixture.path("must-not-be-executed")]);
         let manager = connect(config).await;
         assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
         assert_eq!(manager.catalog().len(), 2);
@@ -354,9 +350,9 @@ server.serve_forever()
         );
         // Establish a fresh session to verify that the external server still works.
         config = http_fixture_config(&fixture, port);
-        config.start_command = None;
-        config.cwd = None;
-        config.env.clear();
+        for launch in ["start_command", "cwd", "env"] {
+            config.as_object_mut().unwrap().remove(launch);
+        }
         let second = connect(config).await;
         assert_eq!(second.catalog().len(), 2, "{:?}", second.warnings());
         shutdown(&second).await;
@@ -377,7 +373,7 @@ server.serve_forever()
         }
         let configs = configs
             .into_iter()
-            .map(|(name, raw)| (name, raw.try_into().unwrap()))
+            .map(|(name, config)| (name, server(config)))
             .collect();
         let cancel = CancellationToken::new();
         let capabilities = crate::tool::policy::CapabilitySet::default();

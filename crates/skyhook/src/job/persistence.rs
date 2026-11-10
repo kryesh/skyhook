@@ -135,7 +135,7 @@ impl Jobs {
     pub(crate) fn unbegun(&self, child: &AgentId) -> Option<JobId> {
         let job = self.launched(child)?;
         let entry = self.get(job)?;
-        let live = entry.end().is_none() && !entry.finishing;
+        let live = entry.end().is_none() && !entry.live.finishing;
         (live && entry.child()?.start != Start::Begun).then_some(job)
     }
 
@@ -245,9 +245,10 @@ impl JobStatus {
         let child = |child: &Child| ChildStatus {
             progress: child.progress,
             answer: child.answer.as_ref().map(|answer| match answer {
-                Answer::Held { reply, .. } => (reply.message, AnswerKind::Held),
-                Answer::Released(message) => (*message, AnswerKind::Released),
-                Answer::Result { reply, .. } => (reply.message, AnswerKind::Result),
+                Answer::Held { reply, .. } | Answer::Result { reply, .. } => {
+                    (reply.message, answer.kind())
+                }
+                Answer::Released(message) => (*message, answer.kind()),
             }),
             replies: (child.messages.iter())
                 .map(|queued| (queued.reply.message, queued.stamp))
@@ -305,14 +306,10 @@ impl JobFacts {
             },
             background: *background,
             location: location.clone(),
-            handles: None,
-            finishing: false,
-            reads: Vec::new(),
-            holds: Vec::new(),
             invocation: Invocation::default(),
             timing: RunTiming::Unstarted,
             cancel: CancelState::Open,
-            moved: None,
+            live: Live::default(),
         };
         Some((*job, entry))
     }
@@ -495,7 +492,8 @@ impl JobManager {
         for (run @ Run(job, _), agent) in running {
             let (change, output) = self
                 .finished(run, ToolError::interrupted().into(), Vec::new())
-                .await?;
+                .await?
+                .expect("an interruption has no output to keep");
             interrupted.push((agent, change.event(job)));
             outputs.extend(output);
         }
@@ -506,14 +504,13 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::ExecutionLocation;
-    use crate::identity::JobId;
+    use crate::job::JobRole;
     use crate::job::tests::reopen;
-    use crate::job::{JOB_VIEW_SCHEMAS, JobOutcome, JobRole, JobState, JobTransition};
-    use crate::{
-        job::output,
-        tool::{ToolOutput, policy::CapabilitySet},
-    };
+    use crate::job::{JOB_VIEW_SCHEMAS, JobOutcome, JobState, JobTransition};
+    use crate::tool::policy::CapabilitySet;
+    use crate::{job::output, tool::ToolOutput};
+    use skyhook_tools::target::ExecutionLocation;
+    use skyhook_worker::job::JobId;
     use std::assert_matches;
 
     /// An on-disk runtime, so `reopen` can open its journal again.
@@ -531,14 +528,11 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_replay_filters_targets_per_viewer() {
-        use crate::tool::{
-            diagnostic::{
-                Cause, Effects, FailureSite, IoKind, Operation, PartialContext, PartialDiagnostic,
-                PathRole, Subject,
-            },
-            policy::Capability,
-        };
+        use crate::tool::policy::Capability;
         use serde_json::json;
+        use skyhook_tools::diagnostic::{Cause, FailureSite, PartialContext, PartialDiagnostic};
+        use skyhook_worker::diagnostic::{Effects, Operation, PathRole, Subject};
+        use skyhook_worker::op::IoKind;
 
         let (root, jobs, agent) = runtime().await;
         let location = ExecutionLocation::named(
@@ -552,11 +546,11 @@ mod tests {
             .path(PathRole::Resolved, "/srv/project/missing.txt");
         let diagnostic = PartialDiagnostic::new(
             context.clone(),
-            Cause::Io {
+            Cause::Io(skyhook_worker::op::OsError {
                 kind: IoKind::NotFound,
                 code: Some(2),
                 detail: None,
-            },
+            }),
         )
         .resolve();
         let payload = json!({"path":"missing.txt", "text":"ordinary output\n"});
@@ -574,7 +568,7 @@ mod tests {
         let views = async |jobs: &JobManager| {
             let mut views = Vec::new();
             for caps in [&privileged, &restricted, &privileged] {
-                for field in [None, Some(crate::job::FieldPointer::root())] {
+                for field in [None, Some(skyhook_tools::output::FieldPointer::root())] {
                     let mut query = output::OutputArgs::new(failed);
                     query.field = field;
                     let view = jobs
@@ -592,7 +586,10 @@ mod tests {
         };
         let live = views(&jobs).await;
         assert_eq!(live[0]["state"], "failed");
-        assert_eq!(live[0]["error"], diagnostic.render(&privileged));
+        assert_eq!(
+            live[0]["error"],
+            diagnostic.render(privileged.target_view())
+        );
         let restored = reopen(jobs, root.path()).await;
         assert_eq!(views(&restored).await, live);
     }
@@ -699,13 +696,13 @@ mod tests {
             (
                 ExecutionLocation::root(".".into()),
                 "/result/stdout",
-                output::CaptureKind::Text,
+                skyhook_tools::output::CaptureKind::Text,
                 "prefix\n",
             ),
             (
                 named.clone(),
                 "/result/custom",
-                output::CaptureKind::Json,
+                skyhook_tools::output::CaptureKind::Json,
                 "{\"partial\":",
             ),
         ] {
@@ -733,7 +730,7 @@ mod tests {
         let crashed = restored.snapshot(JobId::new(3).unwrap()).await.unwrap();
         assert_eq!(crashed.state, JobState::Interrupted);
         let cause = crashed.diagnostic.map(|diagnostic| diagnostic.cause);
-        assert_eq!(cause, Some(crate::tool::diagnostic::Cause::Interrupted));
+        assert_eq!(cause, Some(skyhook_tools::diagnostic::Cause::Interrupted));
         for (job, field, location) in [
             (1, "/result/stdout", ExecutionLocation::root(".".into())),
             (2, "/result/custom", named),
@@ -757,11 +754,11 @@ mod tests {
         assert_eq!(next.id().get(), 4);
     }
 
-    fn outcome_image() -> crate::media::ImageRef {
-        crate::media::ImageRef {
+    fn outcome_image() -> skyhook_media::ImageRef {
+        skyhook_media::ImageRef {
             file: Some("historical-image".into()),
-            format: crate::media::ImageFormat::Png,
-            blob: crate::media::BlobRef::of(OUTCOME_IMAGE),
+            format: skyhook_media::ImageFormat::Png,
+            blob: skyhook_media::BlobRef::of(OUTCOME_IMAGE),
         }
     }
 
@@ -774,7 +771,7 @@ mod tests {
             serde_json::json!({
                 "state": entry.state(),
                 "images": finished.map_or(&[][..], |finished| finished.images.as_slice()),
-                "error": diagnostic.map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
+                "error": diagnostic.map(|diagnostic| diagnostic.render(CapabilitySet::default().target_view())),
                 "denied": diagnostic.is_some_and(|diagnostic| diagnostic.is_denial()),
                 "pending": entry.unacknowledged(),
                 "resumable": entry.restart().is_some(),
@@ -834,7 +831,7 @@ mod tests {
                 let (settled, _) = crate::tests::expire(
                     jobs.wait_settled(id),
                     async { jobs.cancel(id).await.unwrap() },
-                    super::super::cancellation::CANCELLATION_GRACE,
+                    crate::job::cancellation::CANCELLATION_GRACE,
                 )
                 .await;
                 settled.unwrap();

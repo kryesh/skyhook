@@ -4,13 +4,10 @@ use crate::provider::{
     ProviderError,
     codec::{
         common::lenient_u64,
-        openai,
+        errors::{self, ErrorSignals},
         usage::{Observed, Spelling},
     },
-    http::{
-        errors::{self, ErrorSignals},
-        transport::SseEvent,
-    },
+    http::transport::SseEvent,
 };
 use serde_json::Value;
 
@@ -44,7 +41,7 @@ pub(super) fn decode(
     let mut value: Value =
         serde_json::from_str(&event.data).map_err(|_| NATIVE.error("invalid SSE JSON"))?;
     if value.get("error").is_some_and(|value| !value.is_null()) || is_error_event {
-        let reading = openai::read::<openai::Code>(&value);
+        let reading = errors::read::<errors::Code>(&value);
         return Err(errors::classify(None, &value, reading, signals, None));
     }
     // Follow choice zero; servers may omit its index or send extra choices.

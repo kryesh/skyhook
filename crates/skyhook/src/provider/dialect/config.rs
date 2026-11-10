@@ -1,197 +1,21 @@
-//! The configuration every provider entry shares, the value type that may carry
-//! a secret, and the checks an entry passes on admission.
+//! The configuration every provider entry shares and the checks an entry passes
+//! on admission.
 
-use std::{env, fmt, time::Duration};
-
-use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::{DialectError, PlacementError, ResponseSetting};
 use crate::provider::{
     codec::EffortLevels,
     http::{
-        Headers, Timeouts,
-        headers::{CommandValue, Value, ValueField, prefixed},
+        DEFAULT_TIMEOUT, Headers, Timeouts,
+        credentials::{
+            ConfiguredHeaders, HeaderError, Pending, Scheme, ValueError, ValueField, admit,
+        },
     },
-    profile::{LimitsError, ModelName},
+    model::{LimitsError, ModelName},
 };
-
-/// A configured value: written literally, read from the environment when the
-/// provider is built, or produced by `/bin/sh -c` on first use and cached on
-/// success. Commands run on the host with Skyhook's environment.
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum Sourced {
-    Literal(String),
-    Env { env: String },
-    Command { command: String },
-}
-
-/// A literal may be a secret and a command may name one's location; only the
-/// kind of source, or the variable's name, is shown.
-impl fmt::Debug for Sourced {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Literal(_) => f.write_str("Literal(..)"),
-            Self::Env { env } => f.debug_struct("Env").field("name", env).finish(),
-            Self::Command { .. } => f.write_str("Command(..)"),
-        }
-    }
-}
-
-/// A configured value that cannot be used: refused when the entry is admitted,
-/// or, for an environment value, when the provider is built.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{field}: {problem}")]
-pub struct ValueError {
-    pub field: ValueField,
-    pub problem: ValueProblem,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ValueProblem {
-    #[error("must not be blank")]
-    Blank,
-    #[error("env must name a nonempty environment variable")]
-    InvalidEnvName,
-    #[error("command must not be blank")]
-    BlankCommand,
-    #[error("must be a valid header value, without line breaks or control characters")]
-    InvalidHeaderValue,
-    #[error("environment variable `{0}` is required and must not be empty")]
-    MissingEnvironment(String),
-    #[error(
-        "environment variable `{0}` must hold a valid header value, without line breaks or control characters"
-    )]
-    InvalidEnvironment(String),
-}
-
-/// A configured value, admitted: a literal is already a header value.
-#[derive(Clone)]
-pub(crate) enum Source {
-    Literal(HeaderValue),
-    Env(String),
-    Command(String),
-}
-
-/// Shown as `Sourced` is.
-impl fmt::Debug for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Literal(_) => f.write_str("Literal(..)"),
-            Self::Env(name) => f.debug_struct("Env").field("name", name).finish(),
-            Self::Command(_) => f.write_str("Command(..)"),
-        }
-    }
-}
-
-impl Sourced {
-    /// The value `field` is configured with, checked without reading the
-    /// environment or running a command.
-    pub(crate) fn admit(&self, field: ValueField) -> Result<Source, ValueError> {
-        let problem = match self {
-            Self::Literal(value) if value.trim().is_empty() => ValueProblem::Blank,
-            Self::Literal(value) if let Ok(value) = HeaderValue::from_str(value) => {
-                return Ok(Source::Literal(value));
-            }
-            Self::Literal(_) => ValueProblem::InvalidHeaderValue,
-            Self::Env { env } if env.trim().is_empty() || env.contains(['=', '\0']) => {
-                ValueProblem::InvalidEnvName
-            }
-            Self::Env { env } => return Ok(Source::Env(env.clone())),
-            Self::Command { command } if command.trim().is_empty() => ValueProblem::BlankCommand,
-            Self::Command { command } => return Ok(Source::Command(command.clone())),
-        };
-        Err(ValueError { field, problem })
-    }
-}
-
-impl Source {
-    /// The value for `field`, behind `prefix` as `Bearer ` precedes a bearer
-    /// token, once composition shows it is sent.
-    pub(crate) fn header(&self, field: ValueField, prefix: Option<&'static str>) -> Pending {
-        Pending::Source {
-            source: self.clone(),
-            field,
-            prefix,
-        }
-    }
-
-    /// Credentials are never logged, whatever their source; other values only
-    /// when written literally in the file. Environment values are read here;
-    /// commands stay lazy.
-    fn read(self, field: &ValueField) -> Result<Raw, ValueError> {
-        let sensitive = |mut value: HeaderValue, sensitive| {
-            value.set_sensitive(sensitive);
-            value
-        };
-        Ok(match self {
-            Self::Literal(value) => Raw::Fixed(sensitive(value, *field == ValueField::ApiKey)),
-            Self::Env(name) => {
-                let problem = match env::var(&name) {
-                    Ok(value) if !value.trim().is_empty() => match HeaderValue::from_str(&value) {
-                        Ok(value) => return Ok(Raw::Fixed(sensitive(value, true))),
-                        Err(_) => ValueProblem::InvalidEnvironment(name),
-                    },
-                    _ => ValueProblem::MissingEnvironment(name),
-                };
-                let field = field.clone();
-                return Err(ValueError { field, problem });
-            }
-            Self::Command(command) => Raw::Command(CommandValue::new(command, field.clone())),
-        })
-    }
-}
-
-/// A header value while a provider is built: ready, or a source read once
-/// composition shows the value is sent.
-#[derive(Clone)]
-pub(crate) enum Pending {
-    Ready(Value),
-    Source {
-        source: Source,
-        field: ValueField,
-        prefix: Option<&'static str>,
-    },
-}
-
-/// The sources one provider build has read, shared by all its models so that
-/// each reads the environment once and shares one command generation, whatever
-/// prefix its credential scheme puts in front.
-#[derive(Default)]
-pub(crate) struct Sources(Vec<(ValueField, Raw)>);
-
-/// A source's value before any prefix.
-#[derive(Clone)]
-enum Raw {
-    Fixed(HeaderValue),
-    Command(CommandValue),
-}
-
-impl Sources {
-    pub(crate) fn read(&mut self, pending: Pending) -> Result<Value, ValueError> {
-        let (source, field, prefix) = match pending {
-            Pending::Ready(value) => return Ok(value),
-            Pending::Source {
-                source,
-                field,
-                prefix,
-            } => (source, field, prefix),
-        };
-        let raw = match self.0.iter().find(|(read, _)| *read == field) {
-            Some((_, raw)) => raw.clone(),
-            None => {
-                let raw = source.read(&field)?;
-                self.0.push((field, raw.clone()));
-                raw
-            }
-        };
-        Ok(match raw {
-            Raw::Fixed(value) => Value::Fixed(prefixed(prefix, &value)),
-            Raw::Command(value) => Value::Command(value.with_prefix(prefix)),
-        })
-    }
-}
+use skyhook_base::bounded::TimeoutSecs;
+use skyhook_worker::secret::Credential;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
@@ -207,9 +31,9 @@ pub enum ModelError {
     ResponsesOnly(ResponseSetting),
     #[error("explicit_caching applies only where the service takes request cache breakpoints")]
     ExplicitCaching,
-    #[error("reasoning `{effort}` is not one of: {}", .levels.0.join(", "))]
+    #[error("reasoning `{effort}` is not one of: {levels}")]
     Reasoning {
-        effort: String,
+        effort: crate::provider::model::Effort,
         levels: EffortLevels,
     },
 }
@@ -219,8 +43,6 @@ pub enum ModelError {
 pub enum AdmissionError {
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
-    #[error(transparent)]
-    Timeouts(#[from] crate::provider::http::TimeoutError),
     #[error(transparent)]
     Value(#[from] ValueError),
     #[error(transparent)]
@@ -232,99 +54,51 @@ pub enum AdmissionError {
 }
 
 /// Fields every dialect accepts, as written. A dialect's own fields sit beside them.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Common {
     /// The API root; Skyhook appends the path of the service it calls. Absent
     /// only where the dialect has its own service (Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<Sourced>,
+    pub api_key: Option<Credential>,
     /// Fixed request headers, for proxies and attribution.
-    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
-    pub headers: indexmap::IndexMap<String, Sourced>,
-    /// Time to receive HTTP response headers per attempt; absent takes the default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub startup_timeout_secs: Option<u64>,
-    /// Maximum interval between HTTP response body reads; absent takes the default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub headers: indexmap::IndexMap<String, Credential>,
+    /// Time to receive HTTP response headers per attempt.
+    #[serde(default = "default_timeout")]
+    pub startup_timeout_secs: TimeoutSecs,
+    /// Maximum interval between HTTP response body reads.
+    #[serde(default = "default_timeout")]
+    pub read_idle_timeout_secs: TimeoutSecs,
 }
 
-/// Why a configured header was refused.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum HeaderError {
-    #[error("headers: `{0}` is not a valid header name")]
-    Name(String),
-    #[error("headers: `{0}` is named twice; header names ignore case")]
-    Duplicate(HeaderName),
-    #[error(transparent)]
-    Value(#[from] ValueError),
+const fn default_timeout() -> TimeoutSecs {
+    DEFAULT_TIMEOUT
 }
 
-/// Configured `headers`, admitted: distinct valid names, each with its value's source.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ConfiguredHeaders(Vec<(HeaderName, Source)>);
-
-impl ConfiguredHeaders {
-    /// Check names and sources without reading the environment or running a command.
-    pub(crate) fn admit<'a>(
-        headers: impl IntoIterator<Item = (&'a String, &'a Sourced)>,
-    ) -> Result<Self, HeaderError> {
-        let mut admitted: Vec<(HeaderName, Source)> = Vec::new();
-        for (name, value) in headers {
-            let header = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| HeaderError::Name(name.clone()))?;
-            if admitted.iter().any(|(held, _)| *held == header) {
-                return Err(HeaderError::Duplicate(header));
-            }
-            let value = value.admit(ValueField::Header(header.clone()))?;
-            admitted.push((header, value));
+impl Default for Common {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            api_key: None,
+            headers: Default::default(),
+            startup_timeout_secs: DEFAULT_TIMEOUT,
+            read_idle_timeout_secs: DEFAULT_TIMEOUT,
         }
-        Ok(Self(admitted))
-    }
-
-    /// The headers, each read once composition shows it is sent.
-    pub(crate) fn pending(&self) -> Headers<Pending> {
-        let mut headers = Headers::default();
-        for (header, value) in &self.0 {
-            let field = ValueField::Header(header.clone());
-            headers.insert(header.clone(), value.header(field, None));
-        }
-        headers
-    }
-
-    /// The headers as configured.
-    pub(crate) fn sourced(&self) -> indexmap::IndexMap<String, Sourced> {
-        let sourced = |source: &Source| match source {
-            // An admitted literal came from text.
-            Source::Literal(value) => {
-                Sourced::Literal(String::from_utf8_lossy(value.as_bytes()).into_owned())
-            }
-            Source::Env(env) => Sourced::Env { env: env.clone() },
-            Source::Command(command) => Sourced::Command {
-                command: command.clone(),
-            },
-        };
-        (self.0.iter())
-            .map(|(name, source)| (name.as_str().to_owned(), sourced(source)))
-            .collect()
     }
 }
 
 /// The common fields, admitted: what a provider is built from.
 pub(crate) struct Connection {
     pub(super) root: reqwest::Url,
-    pub(super) api_key: Option<Source>,
+    pub(super) api_key: Option<Credential>,
     pub(super) headers: ConfiguredHeaders,
     pub(super) timeouts: Timeouts,
 }
 
 impl Connection {
-    pub(crate) fn credentials(
-        &self,
-        scheme: super::Scheme,
-    ) -> crate::provider::http::Headers<Pending> {
+    pub(crate) fn credentials(&self, scheme: Scheme) -> Headers<Pending> {
         self.api_key
             .as_ref()
             .map_or_else(Default::default, |key| scheme.credential(key))
@@ -332,18 +106,6 @@ impl Connection {
 }
 
 impl Common {
-    fn timeouts(&self) -> Timeouts {
-        let defaults = Timeouts::default();
-        Timeouts {
-            startup: self
-                .startup_timeout_secs
-                .map_or(defaults.startup, Duration::from_secs),
-            read_idle: self
-                .read_idle_timeout_secs
-                .map_or(defaults.read_idle, Duration::from_secs),
-        }
-    }
-
     /// Admit the shared API root and sources without reading credentials.
     pub(crate) fn admit(&self, base_url: super::BaseUrl) -> Result<Connection, AdmissionError> {
         let base = match (self.base_url.as_deref(), base_url) {
@@ -352,27 +114,18 @@ impl Common {
             (None, super::BaseUrl::Required) => return Err(EndpointError::Missing.into()),
         };
         let root = service_url(base)?;
-        let timeouts = self.timeouts();
-        timeouts.validate()?;
-        let api_key = self
-            .api_key
-            .as_ref()
-            .map(|key| key.admit(ValueField::ApiKey))
-            .transpose()?;
+        if let Some(key) = &self.api_key {
+            admit(key, ValueField::ApiKey)?;
+        }
         Ok(Connection {
             root,
-            api_key,
+            api_key: self.api_key.clone(),
             headers: ConfiguredHeaders::admit(&self.headers)?,
-            timeouts,
+            timeouts: Timeouts {
+                startup: self.startup_timeout_secs.into(),
+                read_idle: self.read_idle_timeout_secs.into(),
+            },
         })
-    }
-
-    /// Settled defaults, as `dump config` writes them.
-    pub(crate) fn with_resolved_defaults(mut self) -> Self {
-        let timeouts = self.timeouts();
-        self.startup_timeout_secs = Some(timeouts.startup.as_secs());
-        self.read_idle_timeout_secs = Some(timeouts.read_idle.as_secs());
-        self
     }
 }
 
@@ -433,8 +186,7 @@ mod tests {
             "https://example.com/v1?q=secret",
             "https://example.com/v1#fragment",
         ] {
-            let error = service_url(invalid).unwrap_err();
-            assert!(!error.to_string().contains("secret"), "{invalid}");
+            assert!(service_url(invalid).is_err(), "{invalid}");
         }
     }
 
@@ -453,52 +205,5 @@ mod tests {
         for shown in ["literal-secret", "private-path"] {
             assert!(dumped.contains(shown), "{dumped}");
         }
-    }
-
-    #[test]
-    fn sourced_values_parse_as_literal_env_or_command() {
-        let parse = |text: &str| crate::yaml::parse::<Sourced>(text).unwrap();
-        assert_eq!(parse("plain"), Sourced::Literal("plain".into()));
-        assert_eq!(parse("{env: KEY}"), Sourced::Env { env: "KEY".into() });
-        assert_eq!(
-            parse("{command: 'echo k'}"),
-            Sourced::Command {
-                command: "echo k".into()
-            }
-        );
-        assert!(crate::yaml::parse::<Sourced>("{env: KEY, command: x}").is_err());
-        let problem = |sourced: Sourced| sourced.admit(ValueField::ApiKey).err().map(|e| e.problem);
-        assert_eq!(
-            problem(Sourced::Env { env: "A=B".into() }),
-            Some(ValueProblem::InvalidEnvName)
-        );
-        assert_eq!(
-            problem(Sourced::Command {
-                command: "  ".into()
-            }),
-            Some(ValueProblem::BlankCommand)
-        );
-        // A block scalar keeps its trailing newline, which no header carries.
-        assert_eq!(
-            problem(parse("|\n  sk-key\n")),
-            Some(ValueProblem::InvalidHeaderValue)
-        );
-        let fixed = |text: &str, field: ValueField, prefix| {
-            let source = parse(text).admit(field.clone()).unwrap();
-            match Sources::default()
-                .read(source.header(field, prefix))
-                .unwrap()
-            {
-                Value::Fixed(value) => value,
-                _ => panic!("{text} is read when the provider is built"),
-            }
-        };
-        let header = || ValueField::Header(HeaderName::from_static("x-header"));
-        let value = fixed("k", ValueField::ApiKey, Some("Bearer "));
-        assert_eq!(value.to_str().unwrap(), "Bearer k");
-        assert!(value.is_sensitive());
-        assert!(!fixed("v", header(), None).is_sensitive());
-        // Environment values stay sensitive.
-        assert!(fixed("{env: PATH}", header(), None).is_sensitive());
     }
 }

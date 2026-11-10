@@ -1,94 +1,61 @@
-use std::{fmt, num::NonZeroU64, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
+use skyhook_base::hex::Digest;
 use thiserror::Error;
 
-crate::newtype::string_newtype! {
+skyhook_base::string_newtype! {
     /// The application that created a session, independent of its title or mode.
     #[derive(PartialOrd, Ord)]
-    pub struct HostName(crate::Blank) = |name| crate::newtype::nonblank("host name", name);
+    pub struct HostName(skyhook_base::newtype::Blank) = |name| skyhook_base::newtype::nonblank("host name", name);
 }
 
-/// Exactly `N` bytes of hexadecimal in either case.
-pub(crate) fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    // Radix parsing alone would accept a leading `+`.
-    if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut bytes = [0; N];
-    for (slot, pair) in bytes.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
-        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(bytes)
-}
+/// A session's 16-byte random identifier, displayed and serialized as 32 lowercase hex digits.
+#[derive(
+    Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, SerializeDisplay, DeserializeFromStr,
+)]
+pub struct SessionId(Digest<16>);
 
-pub(crate) fn write_hex(bytes: &[u8], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    bytes
-        .iter()
-        .try_for_each(|byte| write!(formatter, "{byte:02x}"))
-}
-
-/// A 16-byte random identifier displayed and serialized as 32 lowercase hex digits.
-macro_rules! random_id {
-    ($(#[$meta:meta])* $name:ident, $error:expr) => {
-        #[derive(
-            Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, SerializeDisplay, DeserializeFromStr,
-        )]
-        pub struct $name([u8; 16]);
-
-        impl $name {
-            $(#[$meta])*
-            pub fn generate() -> Result<Self, getrandom::Error> {
-                let mut bytes = [0; 16];
-                getrandom::fill(&mut bytes)?;
-                Ok(Self(bytes))
-            }
-
-            #[must_use]
-            pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-                Self(bytes)
-            }
-
-            pub const fn to_bytes(self) -> [u8; 16] {
-                self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write_hex(&self.0, formatter)
-            }
-        }
-
-        impl fmt::Debug for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                fmt::Display::fmt(self, formatter)
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = IdentityError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                decode_hex(value).map(Self).ok_or($error)
-            }
-        }
-
-    };
-}
-
-random_id!(
+impl SessionId {
     /// Creates a cryptographically random session identifier.
-    SessionId,
-    IdentityError::InvalidSessionId
-);
-random_id!(
-    /// Creates a cryptographically random durable event identifier.
-    EventId,
-    IdentityError::InvalidEventId
-);
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0; 16];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self::from_bytes(bytes))
+    }
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Digest::from_bytes(bytes))
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Debug for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = IdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Digest::from_hex(value)
+            .map(Self)
+            .ok_or(IdentityError::InvalidSessionId)
+    }
+}
 
 /// An agent of a session, written as its text everywhere: `<session>:root` for the root,
 /// `<session>:<segment>:…` below it.
@@ -148,6 +115,25 @@ impl AgentId {
         self.path.len()
     }
 
+    /// `root`, or its child indexes such as `1:2`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        if self.path.is_empty() {
+            return "root".into();
+        }
+        let path: Vec<_> = self.path.iter().map(u32::to_string).collect();
+        path.join(":")
+    }
+
+    /// Its name when no job named it.
+    #[must_use]
+    pub fn default_name(&self) -> String {
+        if self.path.is_empty() {
+            return "root".into();
+        }
+        format!("agent {}", self.label())
+    }
+
     pub fn path(&self) -> &[u32] {
         &self.path
     }
@@ -190,57 +176,25 @@ impl FromStr for AgentId {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Hash, Deserialize, JsonSchema, Serialize, PartialEq, Eq, PartialOrd, Ord,
-)]
-#[serde(transparent)]
-pub struct JobId(#[schemars(with = "u64", range(min = 1))] NonZeroU64);
-
-impl JobId {
-    pub fn new(value: u64) -> Result<Self, IdentityError> {
-        NonZeroU64::new(value)
-            .map(Self)
-            .ok_or(IdentityError::ZeroJobId)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
-
-impl fmt::Display for JobId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum IdentityError {
     #[error("invalid session identifier")]
     InvalidSessionId,
-    #[error("invalid event identifier")]
-    InvalidEventId,
     #[error("invalid agent identifier")]
     InvalidAgentId,
-    #[error("job identifiers must be non-zero")]
-    ZeroJobId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Session and event identifiers share one generator and one text form.
     #[test]
     fn random_ids_round_trip() {
-        let event = EventId::generate().unwrap();
         let session = SessionId::from_bytes([0xab; 16]);
-        assert_eq!(event.to_string().parse::<EventId>().unwrap(), event);
         assert_eq!(
             serde_json::from_str::<SessionId>(&serde_json::to_string(&session).unwrap()).unwrap(),
             session
         );
-        assert!("0".parse::<EventId>().is_err());
         assert!("z".repeat(32).parse::<SessionId>().is_err());
         for agent in [
             AgentId::root(session),

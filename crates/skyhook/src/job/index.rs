@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::*;
 use crate::session::Dirty;
 
-#[cfg(feature = "script")]
 pub(super) mod issuing;
 
 /// The resident jobs, with the live facts the core keeps beside them.
@@ -237,7 +236,7 @@ impl Jobs {
         let (before, status) = (Footprint::of(entry), JobStatus::of(entry));
         let changed = change(entry, &self.stamps);
         if entry.end().is_some() && entry.restart().is_none() {
-            entry.handles = None;
+            entry.live.handles = None;
         }
         if JobStatus::of(entry) != status {
             self.changed.insert(id);
@@ -509,11 +508,10 @@ impl Jobs {
     }
 
     /// The ids the next `count` created jobs take, in order.
-    pub(super) fn next_ids(&self, count: usize) -> Result<Vec<JobId>, JobError> {
-        let end = (self.last.checked_add(count as u64)).ok_or(JobError::InvalidId)?;
-        Ok((self.last..end)
+    pub(super) fn next_ids(&self, count: usize) -> Vec<JobId> {
+        (self.last..self.last + count as u64)
             .map(|id| JobId::new(id + 1).expect("ids after the last are nonzero"))
-            .collect())
+            .collect()
     }
 
     /// What every change since the last take touched.
@@ -575,7 +573,7 @@ mod tests {
                 let (running, restart) = manager.continue_resumable(state);
                 Ok::<_, SessionError>(Plan::new(running, move |state, _| restart(state)))
             };
-            jobs.store().commit(Command::Continue, plan).await.unwrap()
+            jobs.store().commit(Command::Start, plan).await.unwrap()
         };
         let running = async |jobs: &JobManager| {
             assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Running);

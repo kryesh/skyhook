@@ -67,14 +67,10 @@ impl<T> Locations<T> {
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.0.iter()
     }
-}
 
-impl<T: PartialEq> Locations<T> {
-    /// These locations and `location`, unless it is already among them.
+    /// These locations and `location`.
     pub(crate) fn with(mut self, location: T) -> Self {
-        if !self.0.contains(&location) {
-            self.0.push(location);
-        }
+        self.0.push(location);
         self
     }
 }

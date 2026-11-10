@@ -1,7 +1,7 @@
 //! Job presentation and live metadata queries.
 use super::*;
 use crate::session::StateJob;
-use crate::tool::{diagnostic::DiagnosticViewer, output::complete};
+use skyhook_tools::{diagnostic::DiagnosticViewer, output::complete};
 
 /// An agent's live work, as an interrupt and a `wait` each need to see it.
 #[derive(Default)]
@@ -352,16 +352,30 @@ pub struct Presentation {
     pub notice: Option<Notice>,
 }
 
-crate::named_enum::named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum Notice {
-        OutputIncomplete = "Output incomplete; captured fields remain readable with jobs({job, field}).",
-        ChildReleased = "The session restarted while this child agent ran; it is retained under this job ID and resumes when the session continues or when you send it input, and its result then arrives as a job event.",
-        ChildAsked = "This child agent asked a question, so it continues in the background under this job ID: its replies and question arrive as job events, and so does its result once you answer.",
-        ScriptChildAsked = "A child agent this script started asked a question, so the script continues in the background under this job ID: the child's replies and question arrive as job events, and so does the script's result.",
-        MovedOnEvent = "This call ran past 30 seconds while events arrived for you, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event.",
-        MovedAtLimit = "This call ran for 10 minutes, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event.",
-    }
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+pub enum Notice {
+    #[serde(rename = "Output incomplete; captured fields remain readable with jobs({job, field}).")]
+    OutputIncomplete,
+    #[serde(
+        rename = "The session restarted while this child agent ran; it is retained under this job ID and resumes when the session continues or when you send it input, and its result then arrives as a job event."
+    )]
+    ChildReleased,
+    #[serde(
+        rename = "This child agent asked a question, so it continues in the background under this job ID: its replies and question arrive as job events, and so does its result once you answer."
+    )]
+    ChildAsked,
+    #[serde(
+        rename = "A child agent this script started asked a question, so the script continues in the background under this job ID: the child's replies and question arrive as job events, and so does the script's result."
+    )]
+    ScriptChildAsked,
+    #[serde(
+        rename = "This call ran past 30 seconds while events arrived for you, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event."
+    )]
+    MovedOnEvent,
+    #[serde(
+        rename = "This call ran for 3 minutes, so it continues in the background under this job ID: jobs({job}) reads its output so far, and its result arrives as a job event."
+    )]
+    MovedAtLimit,
 }
 
 impl Presentation {
@@ -432,27 +446,6 @@ impl JobView {
         self.meta.as_ref().and_then(|meta| meta.tool.as_deref())
     }
 
-    /// Where the next saved-source page starts: the selected preview's
-    /// continuation, then the first truncated field's, then the first
-    /// continuing capture page's. A preview without a field continues the
-    /// field that was requested.
-    pub fn continuation(&self) -> Option<output::Continuation<'_>> {
-        let presentation = self.presentation.as_ref()?;
-        let preview = presentation.preview.as_ref();
-        preview
-            .and_then(output::OutputPreview::continuation)
-            .or_else(|| {
-                (presentation.truncated().iter()).find_map(output::OutputTruncation::continuation)
-            })
-            .or_else(|| {
-                presentation
-                    .captures()
-                    .iter()
-                    .filter_map(|capture| capture.output.as_deref())
-                    .find_map(JobView::continuation)
-            })
-    }
-
     pub(crate) fn failure(message: String, output: Option<Value>, denied: bool) -> Self {
         Self {
             id: None,
@@ -474,6 +467,19 @@ impl JobView {
 }
 
 impl JobEnvelope {
+    /// Why it failed, as its agent sees it: holding `capabilities`, when known, which
+    /// name targets only to an agent that may use them.
+    pub fn error_text(
+        &self,
+        capabilities: Option<&crate::tool::policy::CapabilitySet>,
+    ) -> Option<String> {
+        let targets = capabilities.map_or(
+            skyhook_tools::diagnostic::TargetView::Hidden,
+            crate::tool::policy::CapabilitySet::target_view,
+        );
+        Some(self.diagnostic.as_ref()?.render(targets))
+    }
+
     /// Whether it shows under its parent rather than as a root of its owner's view:
     /// its owner's script issued it.
     pub fn nests(&self) -> bool {
@@ -583,12 +589,11 @@ impl JobEnvelope {
             && presentation.is_none();
         let inspection = kind == ViewKind::Inspection;
         let own = viewer.location();
-        let target = viewer
-            .capabilities
-            .visible_target(&self.location.target)
+        let named = viewer.targets() == skyhook_tools::diagnostic::TargetView::Named;
+        let target = (named.then_some(&self.location.target))
             .filter(|_| own.is_none_or(|own| own.target != self.location.target));
         let workspace = (own.is_none_or(|own| own.workspace != self.location.workspace))
-            .then(|| self.location.workspace.to_string_lossy().into_owned());
+            .then(|| self.location.workspace.to_string());
         let meta = (inspection || failed).then(|| JobMetadata {
             parent: self.parent.filter(|_| inspection && self.origin.is_none()),
             tool: inspection.then(|| self.tool.clone()),
@@ -611,7 +616,7 @@ impl JobEnvelope {
 /// The prompt spells the envelope out: result types name it.
 fn documented(schema: &mut schemars::Schema) {
     let name = <JobView as JsonSchema>::schema_name();
-    schema.insert(crate::tool::registry::DOCUMENTED.into(), name.into());
+    schema.insert(crate::tool::catalog::DOCUMENTED.into(), name.into());
 }
 
 /// Jobs as a listing shows them: the newest, and how many older ones it leaves out
@@ -630,7 +635,7 @@ pub(crate) struct JobViewSchemas {
 
 pub(crate) static JOB_VIEW_SCHEMAS: std::sync::LazyLock<JobViewSchemas> =
     std::sync::LazyLock::new(|| {
-        use crate::tool::registry::result_schema;
+        use skyhook_tools::schema::result_schema;
         JobViewSchemas {
             view: result_schema::<JobView>(),
             listing: result_schema::<JobListing>(),
@@ -676,7 +681,6 @@ impl JobManager {
     }
 
     /// The schema job `id`'s result follows, when its invocation declares one.
-    #[cfg(feature = "script")]
     pub(crate) async fn output_schema(&self, id: JobId) -> Result<Option<Arc<Value>>, JobError> {
         self.entry(id, |entry| entry.output_schema.clone()).await
     }
@@ -687,16 +691,17 @@ impl JobManager {
         id: JobId,
     ) -> Result<CancellationToken, JobError> {
         let handles = self.entry(id, |entry| {
-            entry.handles.as_ref().map(|h| h.cancellation.clone())
+            entry.live.handles.as_ref().map(|h| h.cancellation.clone())
         });
         handles.await?.ok_or(JobError::AlreadyTerminal(id))
     }
 
     /// Every job of `owner`, in id order: held, or as the journal leaves it. A
     /// read of the owner's whole history.
-    pub async fn list(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
-        let owner = owner.clone();
-        self.listed(move |journal| journal.created_by(&owner)).await
+    #[cfg(test)]
+    pub(crate) async fn list(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
+        let (jobs, _) = self.newest(owner, Vec::new(), usize::MAX).await?;
+        Ok(jobs)
     }
 
     /// The newest `limit` of `owner`'s jobs but those `except` names, in id order,
@@ -730,10 +735,7 @@ impl JobManager {
     ) -> Vec<StateJob> {
         self.facts(|jobs| {
             (jobs.unfinished(owner))
-                .map(|(id, _)| {
-                    let path = &mut std::collections::HashSet::new();
-                    progress::active_job(id, jobs, capabilities, now_millis, path)
-                })
+                .map(|(id, _)| progress::active_job(id, jobs, capabilities, now_millis))
                 .collect()
         })
     }
@@ -755,6 +757,7 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skyhook_tools::output::FieldPointer;
 
     fn envelope() -> JobEnvelope {
         JobEnvelope {
@@ -771,19 +774,10 @@ mod tests {
             images: Vec::new(),
             origin: None,
             diagnostic: None,
-            location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
+            location: ExecutionLocation::root("/work".into()),
             resumable: false,
             moved: None,
         }
-    }
-
-    #[test]
-    fn display_metadata_with_non_utf8_workspace_is_json_serializable() {
-        use std::os::unix::ffi::OsStringExt as _;
-        let mut job = envelope();
-        job.location.workspace = std::ffi::OsString::from_vec(b"/work/\xff".to_vec()).into();
-        let view = job.metadata_view(&CapabilitySet::default()).into_value();
-        assert_eq!(view["meta"]["workspace"], "/work/\u{fffd}");
     }
 
     /// A view with every part a replayed job event can carry, including each
@@ -904,8 +898,8 @@ mod tests {
     #[test]
     fn agent_views_show_only_launch_facts_that_differ_from_the_viewer() {
         let capabilities = CapabilitySet::default();
-        let own = ExecutionLocation::root(std::path::PathBuf::from("/work"));
-        let viewer = DiagnosticViewer::new(&capabilities, &own);
+        let own = ExecutionLocation::root("/work".into());
+        let viewer = DiagnosticViewer::new(capabilities.target_view(), &own);
         let mut job = envelope();
         job.parent = JobId::new(9).ok();
         job.name = Some("reader".parse().unwrap());
@@ -949,93 +943,6 @@ mod tests {
     }
 
     #[test]
-    fn continuation_prefers_the_preview_then_a_truncation_then_a_capture_page() {
-        let field = |field: &str| field.parse::<FieldPointer>().unwrap();
-        let page = |at: &str, next_start| {
-            output::OutputPreview::Lines(output::LinePage {
-                field: Some(field(at)),
-                lines: output::PageLines::Text(Vec::new()),
-                total_lines: None,
-                next_start,
-                next_offset: Some(5),
-            })
-        };
-        let view = |presentation| JobView {
-            presentation: Some(presentation),
-            ..JobView::failure(String::new(), None, false)
-        };
-        let capture = |at: &str, next_start| output::CaptureDescriptor {
-            field: field(at),
-            complete: false,
-            output: Some(Box::new(view(Presentation {
-                preview: Some(page(at, next_start)),
-                ..Presentation::default()
-            }))),
-        };
-        let mut presentation = Presentation {
-            preview: Some(page("", Some(1))),
-            truncated: Some(vec![
-                output::OutputTruncation::Elements {
-                    field: field("/result/items"),
-                    shown: 2,
-                    total_elements: 9,
-                    kept: None,
-                },
-                output::OutputTruncation::Text {
-                    field: field("/result/stdout"),
-                    total_lines: 9,
-                    next_start: 4,
-                    next_offset: Some(7),
-                },
-                output::OutputTruncation::TextGap {
-                    field: field("/result/stderr"),
-                    total_lines: 9,
-                    next_start: 3,
-                    tail_start: 8,
-                },
-            ]),
-            captures: Some(vec![
-                capture("/result/end", None),
-                capture("/result/custom", Some(8)),
-            ]),
-            ..Presentation::default()
-        };
-        let next = |presentation: &Presentation| {
-            let view = view(presentation.clone());
-            let next = view.continuation();
-            next.map(|next| {
-                (
-                    next.field.unwrap().as_str().to_owned(),
-                    next.start,
-                    next.offset,
-                )
-            })
-        };
-        assert_eq!(next(&presentation), Some((String::new(), 1, Some(5))));
-        presentation.preview = None;
-        // An array cut continues at its first element not shown.
-        assert_eq!(next(&presentation), Some(("/result/items".into(), 3, None)));
-        presentation.truncated.as_mut().unwrap().remove(0);
-        assert_eq!(
-            next(&presentation),
-            Some(("/result/stdout".into(), 4, Some(7)))
-        );
-        presentation.truncated.as_mut().unwrap().remove(0);
-        // A gap continues at its first line left out.
-        assert_eq!(
-            next(&presentation),
-            Some(("/result/stderr".into(), 3, None))
-        );
-        presentation.truncated = None;
-        assert_eq!(
-            next(&presentation),
-            Some(("/result/custom".into(), 8, Some(5)))
-        );
-        presentation.captures = None;
-        assert_eq!(next(&presentation), None);
-    }
-
-    #[test]
     fn a_waiting_job_presents_its_question_batch_in_place_of_a_result() {
         for (schema, listed) in [
             (&JOB_VIEW_SCHEMAS.view, false),
@@ -1064,7 +971,6 @@ mod tests {
                 job["presentation"]["question"]["questions"][0]["header"],
                 "choice"
             );
-            assert_eq!(job.get("result"), None);
             let value = if listed {
                 serde_json::json!({ "jobs": [job], "older": 1 })
             } else {

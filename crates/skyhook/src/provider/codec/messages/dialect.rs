@@ -2,10 +2,7 @@
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::provider::{
-    codec::{
-        BodyPath, BreakpointBudget, CacheTtl, Identity, NonEmpty, StateRole, ToolNames,
-        UnsignedReasoning, path,
-    },
+    codec::{BodyPath, CacheTtl, Identity, NonEmpty, StateRole, UnsignedReasoning, path},
     http::{Headers, headers::Value},
 };
 
@@ -44,9 +41,7 @@ pub(crate) struct Dialect {
     pub identity: Identity,
     /// Lifetime written on each cache breakpoint; None takes the service default.
     pub cache_ttl: Option<CacheTtl>,
-    pub breakpoints: BreakpointBudget,
     pub thinking_binding: ThinkingBinding,
-    pub tool_names: ToolNames,
     pub state_role: StateRole,
     pub system_state: SystemState,
     /// Thinking without a signature.
@@ -60,10 +55,7 @@ impl Dialect {
             effort: NonEmpty::one(const { path("output_config.effort") }),
             identity: Identity::NONE,
             cache_ttl: None,
-            // The service's cap on cache breakpoints per request.
-            breakpoints: BreakpointBudget::new(4),
             thinking_binding: ThinkingBinding::Unenforced,
-            tool_names: ToolNames::Any,
             state_role: StateRole::User,
             system_state: SystemState::Plain,
             unsigned: UnsignedReasoning::Replayed(()),

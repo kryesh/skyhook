@@ -166,11 +166,8 @@ pub(super) enum RoleState {
     Wait {
         parked: bool,
     },
-    Question {
-        /// Live only: an answer routed through the job asking its question was
-        /// accepted into its mailbox.
-        answered: bool,
-    },
+    /// Live only: how far its question went.
+    Question(AskPhase),
     Agent(Child),
     Script {
         /// What a `wait` hosted by this script last reported, so it is not
@@ -184,7 +181,7 @@ impl RoleState {
         match role {
             JobRole::Tool => Self::Tool,
             JobRole::Wait => Self::Wait { parked: false },
-            JobRole::Question => Self::Question { answered: false },
+            JobRole::Question => Self::Question(AskPhase::Issued),
             JobRole::Agent => Self::Agent(Child::default()),
             JobRole::Script => Self::Script { wait_floor: None },
         }
@@ -194,11 +191,21 @@ impl RoleState {
         match self {
             Self::Tool => JobRole::Tool,
             Self::Wait { .. } => JobRole::Wait,
-            Self::Question { .. } => JobRole::Question,
+            Self::Question(_) => JobRole::Question,
             Self::Agent(_) => JobRole::Agent,
             Self::Script { .. } => JobRole::Script,
         }
     }
+}
+
+/// How far an ask job's question went.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskPhase {
+    Issued,
+    /// It joined a batch of the questions its issuer asks together.
+    Batched,
+    /// An answer routed through the job asking it was accepted into its mailbox.
+    Answered,
 }
 
 /// The agent an agent job launched and the replies it has published.
@@ -256,18 +263,10 @@ impl Queued {
     }
 }
 
-named_enum! {
-    /// Whether a child's answer is held, released, or the result.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) parsed enum AnswerKind {
-        Held = "held",
-        Released = "released",
-        Result = "result",
-    }
-}
-
 /// A child's candidate answer.
-pub(super) enum Answer {
+#[derive(Kinds)]
+#[kinds(name = AnswerKind, serde(rename_all = "snake_case"))]
+pub(crate) enum Answer {
     /// Held until its invocation resolves: any end but completion, a later turn or
     /// `notify_owner` releases it.
     Held { reply: AgentMessage, at: i64 },
@@ -417,23 +416,29 @@ pub(super) struct JobFacts {
     pub(super) delivery: DeliveryState,
     pub(super) background: bool,
     pub(super) location: ExecutionLocation,
-    /// Live only: what it runs with while it can still run. A job created
-    /// here has them until it ends with nothing to restart it; one replayed
-    /// from the journal gets them only once something restarts it.
-    pub(super) handles: Option<JobHandles>,
-    /// Live only: a finish holds the claim until its outcome applies or fails.
-    pub(super) finishing: bool,
-    /// Live only: the pending deliveries its runs read, which its finish
-    /// acknowledges, however it ends.
-    pub(super) reads: Vec<Delivery>,
-    /// Live only: the deliveries its runs captured to present, each held for it
-    /// from the capture until it ends, whether or not the read succeeds.
-    pub(super) holds: Vec<Delivery>,
     pub(super) invocation: Invocation,
     pub(super) timing: RunTiming,
-    /// Live only.
     pub(super) cancel: CancelState,
-    /// Live only: what moved its call to the background, when its turn did.
+    pub(super) live: Live,
+}
+
+/// What a job has only while this process holds it: a job read from the journal
+/// starts with none of it.
+#[derive(Default)]
+pub(super) struct Live {
+    /// What it runs with while it can still run. A job created here has them
+    /// until it ends with nothing to restart it; one replayed from the journal
+    /// gets them only once something restarts it.
+    pub(super) handles: Option<JobHandles>,
+    /// A finish holds the claim until its outcome applies or fails.
+    pub(super) finishing: bool,
+    /// The pending deliveries its runs read, which its finish acknowledges,
+    /// however it ends.
+    pub(super) reads: Vec<Delivery>,
+    /// The deliveries its runs captured to present, each held for it from the
+    /// capture until it ends, whether or not the read succeeds.
+    pub(super) holds: Vec<Delivery>,
+    /// What moved its call to the background, when its turn did.
     pub(super) moved: Option<super::MoveTrigger>,
 }
 
@@ -538,14 +543,11 @@ impl JobFacts {
         }
     }
 
-    /// An ask job an answer was routed to.
-    pub(super) fn answered(&self) -> bool {
-        matches!(self.role, RoleState::Question { answered: true })
-    }
-
-    pub(super) fn answer(&mut self) {
-        if let RoleState::Question { answered } = &mut self.role {
-            *answered = true;
+    /// How far an ask job's question went.
+    pub(super) fn ask(&self) -> Option<AskPhase> {
+        match self.role {
+            RoleState::Question(phase) => Some(phase),
+            _ => None,
         }
     }
 
@@ -618,12 +620,12 @@ impl JobFacts {
             JobChange::Finish(finished) => {
                 let end = finished.end;
                 self.phase = Phase::Finished(finished);
-                self.finishing = false;
+                self.live.finishing = false;
                 // A new delivery even after an earlier question was acknowledged.
                 self.pend_delivery(stamps);
                 // What still works for the invocation it ends stops with it.
                 let ended = self.invocation;
-                let attached = (self.handles.as_mut())
+                let attached = (self.live.handles.as_mut())
                     .and_then(|handles| handles.task_abort.take_if(|(run, _)| *run == ended));
                 if let Some((_, worker)) = attached {
                     worker.abort();
@@ -678,8 +680,7 @@ impl JobFacts {
         self.end() == Some(JobEnd::Interrupted) && self.restart_shape().is_some()
     }
 
-    /// Not finished, or finished but retained for resumption. `active_states`
-    /// deliberately differs: it presents a suspended job by its retained state.
+    /// Not finished, or finished but retained for resumption.
     pub(super) fn live(&self) -> bool {
         self.end().is_none() || self.suspended()
     }
@@ -838,7 +839,7 @@ impl JobFacts {
             diagnostic,
             location: self.location.clone(),
             resumable: self.restart().is_some(),
-            moved: self.moved,
+            moved: self.live.moved,
         }
     }
 }

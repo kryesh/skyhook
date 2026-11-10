@@ -5,7 +5,7 @@ state its code keeps:
 
 - each **entry** defined there (each route, operation, event, message or signal handler, timer,
   background job, exported function, callback, hook, configuration load or CI job) as a path of
-  its own, with one `path_step` at the entry's definition in the component owning it, the note
+  its own, its `steps` one step at the entry's definition in the component owning it, the note
   naming what it calls. A function reached only through another entry, such as an auth check, a
   validator or a helper, is a stage of that entry's path, not an entry, unless an actor reaches it
   directly too.

@@ -1,0 +1,503 @@
+//! Played sessions: real sessions whose model the test plays turn by turn, and
+//! predicates over what they journal.
+
+use super::App;
+use super::tests::{attach, draft_fixture};
+use crate::tests::bounded;
+use serde_json::json;
+use skyhook::agent::SessionHandle;
+use skyhook::agent::{Harness, HarnessBuilder};
+use skyhook::identity::AgentId;
+use skyhook::interaction::Prompt;
+use skyhook::interaction::UiInteraction;
+use skyhook::job::JobTransition;
+use skyhook::launch::Launch;
+use skyhook::provider::protocol::{
+    AssistantItem, BlockRef, Completion, ContextId, ItemKind, ModelRequest, ResponseEvent, ToolCall,
+};
+use skyhook::provider::{Provider, ProviderContext, ProviderError, ResponseStream};
+use skyhook::session::{AgentActivity, Message, ObservationSnapshot, RuntimeEvent};
+use skyhook::session::{EventRecord, RequestSeq, SessionEvent, UserPart};
+use skyhook::tool::policy::{AllowAll, Policy};
+use skyhook_worker::job::JobId;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+/// The model a test plays: each request a played session sends waits for the
+/// response the test streams back through its [`Turn`].
+pub(crate) struct Model {
+    turns: mpsc::UnboundedReceiver<Turn>,
+    refused: Refused,
+}
+
+/// Conversations the played provider no longer opens.
+type Refused = Arc<std::sync::Mutex<std::collections::HashSet<ContextId>>>;
+
+/// One request the played model received, open until the test ends it.
+pub(crate) struct Turn {
+    /// The conversation it continues: the requesting agent's.
+    pub(crate) context: ContextId,
+    events: mpsc::UnboundedSender<Result<ResponseEvent, ProviderError>>,
+}
+
+struct Played {
+    turns: mpsc::UnboundedSender<Turn>,
+    refused: Refused,
+}
+
+struct Conversation {
+    turns: mpsc::UnboundedSender<Turn>,
+    context: ContextId,
+}
+
+impl Provider for Played {
+    fn open_context(&self, context: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
+        if self.refused.lock().unwrap().contains(&context) {
+            let kind = skyhook::provider::ProviderErrorKind::Authentication;
+            return Err(kind.error("the provider no longer opens this conversation"));
+        }
+        let turns = self.turns.clone();
+        Ok(Box::new(Conversation { turns, context }))
+    }
+}
+
+impl ProviderContext for Conversation {
+    fn invoke(&mut self, _: ModelRequest) -> ResponseStream {
+        let (events, received) = mpsc::unbounded_channel();
+        let context = self.context.clone();
+        let _ = self.turns.send(Turn { context, events });
+        Box::pin(futures_util::stream::unfold(
+            received,
+            async |mut received| Some((received.recv().await?, received)),
+        ))
+    }
+}
+
+impl Model {
+    /// The next request the session sends.
+    pub(crate) async fn turn(&mut self) -> Turn {
+        bounded(self.turns.recv())
+            .await
+            .expect("the played session is open")
+    }
+
+    /// Open no further conversation for `agent`.
+    pub(crate) fn refuse(&self, agent: &AgentId) {
+        self.refused.lock().unwrap().insert(ContextId::from(agent));
+    }
+}
+
+/// The next request `agent` sends, answering any other agent's on the way.
+pub(crate) async fn next_turn(model: &mut Model, agent: &AgentId) -> Turn {
+    let context = ContextId::from(agent);
+    loop {
+        let turn = model.turn().await;
+        if turn.context == context {
+            return turn;
+        }
+        turn.answer("noted");
+    }
+}
+
+impl Turn {
+    /// Stream `text` into the single-block item `item`.
+    pub(crate) fn delta(&self, item: &str, kind: ItemKind, text: &str) {
+        let block = BlockRef::single(item);
+        let text = text.into();
+        let _ = self
+            .events
+            .send(Ok(ResponseEvent::Delta { block, kind, text }));
+    }
+
+    pub(crate) fn complete(self, completion: Completion) {
+        let _ = self.events.send(Ok(ResponseEvent::End(completion)));
+    }
+
+    /// End the response with `items`: a normal finish, which runs its calls.
+    pub(crate) fn end(self, items: Vec<AssistantItem>) {
+        self.complete(Completion::finished(items).unwrap());
+    }
+
+    pub(crate) fn answer(self, text: &str) {
+        self.end(vec![AssistantItem::text("text", 0, text)]);
+    }
+
+    pub(crate) fn fail(self, error: ProviderError) {
+        let _ = self.events.send(Err(error));
+    }
+}
+
+/// A tool call item at `position`, its call ID also its item ID.
+pub(crate) fn call(
+    id: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+    position: u32,
+) -> AssistantItem {
+    AssistantItem::tool_call(id, position, ToolCall::new(id, tool, arguments).unwrap())
+}
+
+/// A new session on `launch`'s model, which the test plays.
+pub(crate) async fn played(launch: &Launch) -> (SessionHandle, Model) {
+    played_under(launch, Arc::new(AllowAll)).await
+}
+
+/// [`played`], its operations authorized by `policy`.
+async fn played_under(launch: &Launch, policy: Arc<dyn Policy>) -> (SessionHandle, Model) {
+    let (harness, model) = played_harness(launch, policy, |builder| builder).await;
+    (harness.new_session().await.unwrap(), model)
+}
+
+/// A harness for `launch`'s sessions whose model the test plays, as `configure`
+/// finishes it.
+pub(crate) async fn played_harness(
+    launch: &Launch,
+    policy: Arc<dyn Policy>,
+    configure: impl FnOnce(HarnessBuilder) -> HarnessBuilder,
+) -> (Harness, Model) {
+    let (sender, turns) = mpsc::unbounded_channel();
+    let refused = Refused::default();
+    let played = Played {
+        turns: sender,
+        refused: refused.clone(),
+    };
+    let first = launch.model().profile().clone();
+    // `test/seeing` is `test/first` taking images, which `first` refuses.
+    let seeing = skyhook::provider::model::ModelProfile {
+        supports_images: true,
+        ..first.clone()
+    };
+    let models = [
+        ("first".parse().unwrap(), first),
+        ("seeing".parse().unwrap(), seeing),
+    ];
+    let builder = (HarnessBuilder::configured(
+        launch.model(),
+        launch.workspace(),
+        launch.identity().host.clone(),
+    )
+    .unwrap())
+    .provider("test".parse().unwrap(), Arc::new(played), models)
+    .policy(policy);
+    let harness = configure(builder).build().await.unwrap();
+    (harness, Model { turns, refused })
+}
+
+/// An app open on a played session.
+pub(crate) async fn played_fixture() -> (tempfile::TempDir, App, Model, SessionHandle) {
+    played_fixture_under(Arc::new(AllowAll)).await
+}
+
+/// [`played_fixture`], its operations needing approval asking the returned prompts.
+pub(crate) async fn attended_fixture() -> (
+    tempfile::TempDir,
+    App,
+    Model,
+    SessionHandle,
+    mpsc::UnboundedReceiver<Prompt>,
+) {
+    let (ui, prompts) = UiInteraction::new();
+    let policy = skyhook::interaction::policy::HostApprovalPolicy::Attended(ui);
+    let (root, app, model, session) = played_fixture_under(Arc::new(policy)).await;
+    (root, app, model, session, prompts)
+}
+
+async fn played_fixture_under(
+    policy: Arc<dyn Policy>,
+) -> (tempfile::TempDir, App, Model, SessionHandle) {
+    let (root, mut app) = draft_fixture().await;
+    let (session, model) = played_under(&app.launch, policy).await;
+    attach(&mut app, session.clone()).await;
+    (root, app, model, session)
+}
+
+/// A call that fails before any job starts: an empty command line.
+pub(crate) fn failing_call(id: &str) -> AssistantItem {
+    call(id, "exec", json!({"command": []}), 0)
+}
+
+/// Run a host script on `session` that sleeps until cancelled.
+pub(crate) fn sleeping_script(
+    session: &SessionHandle,
+) -> tokio::task::JoinHandle<Result<skyhook::tool::ToolOutput, skyhook::agent::HarnessError>> {
+    let session = session.clone();
+    tokio::spawn(async move { session.run_script("await sleep(60000);").await })
+}
+
+/// Prompt `session` as a user would; its turn waits on the played model.
+pub(crate) fn ask(
+    session: &SessionHandle,
+    text: &str,
+) -> tokio::task::JoinHandle<Result<String, skyhook::agent::HarnessError>> {
+    let (session, text) = (session.clone(), text.to_owned());
+    tokio::spawn(async move { session.prompt(text).await })
+}
+
+/// Fold the next observed update as the host does, returning it.
+pub(crate) async fn observe_next(app: &mut App) -> RuntimeEvent {
+    let event = bounded(app.recv_observation()).await;
+    let event = event.expect("observation open");
+    let records = app.observe(event.clone());
+    app.observed(records);
+    event.event
+}
+
+/// Fold observed updates as the host does until `done` holds.
+pub(crate) async fn observe_until(app: &mut App, done: impl Fn(&App) -> bool) {
+    observe_find(app, |app| done(app).then_some(())).await;
+}
+
+/// Fold observed updates as the host does until `find` finds something, returning it.
+pub(crate) async fn observe_find<T>(app: &mut App, find: impl Fn(&App) -> Option<T>) -> T {
+    bounded(async {
+        loop {
+            if let Some(found) = find(app) {
+                return found;
+            }
+            observe_next(app).await;
+            app.rebuild_content();
+        }
+    })
+    .await
+}
+
+/// Fold observed updates as the host does until a record whose event `matches` commits.
+pub(crate) async fn observe_record(app: &mut App, matches: impl Fn(&SessionEvent) -> bool) {
+    observe_until(app, |app| recorded(&app.journal, &matches)).await;
+}
+
+/// Prompt `app`'s played session and end its turn with `items`, observing
+/// until the answer commits.
+pub(crate) async fn exchange(
+    app: &mut App,
+    model: &mut Model,
+    prompt: &str,
+    items: Vec<AssistantItem>,
+) {
+    let before = count(&app.journal, answered);
+    let asked = ask(app.session().unwrap(), prompt);
+    model.turn().await.end(items);
+    bounded(asked).await.unwrap().unwrap();
+    observe_until(app, |app| count(&app.journal, answered) > before).await;
+}
+
+/// Have the root of `session` start a child for each of `tasks`, its agent
+/// call's arguments: each child's first request, in the order it arrived.
+pub(crate) async fn delegate(
+    session: &SessionHandle,
+    model: &mut Model,
+    tasks: &[serde_json::Value],
+) -> Vec<Turn> {
+    let _delegating = ask(session, "delegate");
+    let calls = tasks.iter().enumerate().map(|(index, task)| {
+        call(
+            &format!("agent-{index}"),
+            "agent",
+            task.clone(),
+            index as u32,
+        )
+    });
+    model.turn().await.end(calls.collect());
+    let mut turns = Vec::new();
+    for _ in tasks {
+        turns.push(model.turn().await);
+    }
+    turns
+}
+
+/// The call by which a child asks its parent which one.
+pub(crate) fn asking() -> AssistantItem {
+    let question = json!({"header": "pick", "prompt": "Which one?"});
+    call("question", "ask", question, 0)
+}
+
+/// Have the root of `session` start a child for `task` that asks it a
+/// question, and the root end its turn unanswered: the child's agent job
+/// waits for its input.
+pub(crate) async fn asking_child(
+    session: &SessionHandle,
+    model: &mut Model,
+    task: serde_json::Value,
+) {
+    let mut turns = delegate(session, model, &[task]).await;
+    turns.remove(0).end(vec![asking()]);
+    model.turn().await.answer("later");
+}
+
+/// The agents `records` saw start other than the root, in id order, as the
+/// projection lists them: concurrent launches start in any order.
+pub(crate) fn children(records: &[Arc<EventRecord>]) -> Vec<AgentId> {
+    let started = records.iter().filter(|record| {
+        record.agent.parent().is_some() && matches!(record.event, SessionEvent::AgentStarted { .. })
+    });
+    let mut children: Vec<_> = started.map(|record| record.agent.clone()).collect();
+    children.sort_by(|a, b| a.path().cmp(b.path()));
+    children
+}
+
+/// Have the root of `app`'s played session start `count` children, each
+/// holding its first request open: the children, and those requests.
+pub(crate) async fn spawn_children(
+    app: &mut App,
+    model: &mut Model,
+    count: u32,
+) -> (Vec<AgentId>, Vec<Turn>) {
+    let tasks: Vec<_> = (0..count)
+        .map(|index| json!({"prompt": format!("child task {index}")}))
+        .collect();
+    let turns = delegate(app.session().unwrap(), model, &tasks).await;
+    observe_until(app, |app| children(&app.journal).len() == tasks.len()).await;
+    (children(&app.journal), turns)
+}
+
+/// Whether `records` hold one whose event `matches`.
+pub(crate) fn recorded(
+    records: &[Arc<EventRecord>],
+    matches: impl Fn(&SessionEvent) -> bool,
+) -> bool {
+    records.iter().any(|record| matches(&record.event))
+}
+
+/// How many of `records` have an event that `matches`.
+pub(crate) fn count(
+    records: &[Arc<EventRecord>],
+    matches: impl Fn(&SessionEvent) -> bool,
+) -> usize {
+    (records.iter())
+        .filter(|record| matches(&record.event))
+        .count()
+}
+
+/// The timestamp of the `nth` of `records` whose event `matches`.
+pub(crate) fn at(
+    records: &[Arc<EventRecord>],
+    matches: impl Fn(&SessionEvent) -> bool,
+    nth: usize,
+) -> i64 {
+    let mut records = (records.iter()).filter(|record| matches(&record.event));
+    records.nth(nth).unwrap().timestamp_millis
+}
+
+/// Whether an event moves `job` to `state`.
+pub(crate) fn job_state(job: JobId, state: JobTransition) -> impl Fn(&SessionEvent) -> bool {
+    move |event| {
+        matches!(event, SessionEvent::JobStateChanged { job: changed, state: to }
+            if *changed == job && *to == state)
+    }
+}
+
+/// Observe until `job` journals `state`.
+pub(crate) async fn reached(app: &mut App, job: JobId, state: JobTransition) {
+    observe_record(app, job_state(job, state)).await;
+}
+
+/// The job started for the call `id`, once there is one.
+pub(crate) fn job_of_call(records: &[Arc<EventRecord>], id: &str) -> Option<JobId> {
+    records.iter().find_map(|record| match &record.event {
+        SessionEvent::JobCreated {
+            job,
+            origin: Some(origin),
+            ..
+        } if origin.call_id == id => Some(*job),
+        _ => None,
+    })
+}
+
+/// The sequence of the latest `ModelRequested` record.
+pub(crate) fn latest_request(records: &[Arc<EventRecord>]) -> Option<RequestSeq> {
+    let request = records.iter().rev().find(|record| requested(&record.event));
+    request.map(|record| record.sequence.request())
+}
+
+/// The error text of the first tool result `records` hold.
+pub(crate) fn tool_error(records: &[Arc<EventRecord>]) -> &str {
+    let error = records.iter().find_map(|record| match &record.event {
+        SessionEvent::MessageCommitted {
+            message: Message::Tool(result),
+        } => result.result["error"].as_str(),
+        _ => None,
+    });
+    error.unwrap()
+}
+
+/// Whether a response in `snapshot` streamed a block reading `text`.
+pub(crate) fn streamed(snapshot: &ObservationSnapshot, text: &str) -> bool {
+    let mut responses = snapshot.views.responses.values();
+    responses.any(|response| response.blocks().iter().any(|block| block.text == text))
+}
+
+pub(crate) fn requested(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::ModelRequested { .. })
+}
+
+pub(crate) fn completed(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::ResponseCompleted { .. })
+}
+
+pub(crate) fn answered(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::ResponseCompleted { outcome, .. }
+        if *outcome == skyhook::session::CompletedOutcome::Answer)
+}
+
+pub(crate) fn model_failed(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::ModelFailed { .. })
+}
+
+pub(crate) fn status(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::Status { .. })
+}
+
+/// Whether an event commits a message that `kind` accepts.
+pub(crate) fn committed(kind: fn(&Message) -> bool) -> impl Fn(&SessionEvent) -> bool {
+    move |event| matches!(event, SessionEvent::MessageCommitted { message } if kind(message))
+}
+
+pub(crate) fn user(message: &Message) -> bool {
+    matches!(message, Message::User(_))
+}
+
+pub(crate) fn assistant(message: &Message) -> bool {
+    matches!(message, Message::Assistant(_))
+}
+
+pub(crate) fn results(message: &Message) -> bool {
+    matches!(message, Message::Tool(_))
+}
+
+/// Whether `message` delivers job events.
+pub(crate) fn job_events(message: &Message) -> bool {
+    let part = |part: &UserPart| matches!(part, UserPart::JobEvents { .. });
+    matches!(message, Message::User(parts) if parts.iter().any(part))
+}
+
+pub(crate) fn job_ended(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::JobFinished { .. })
+}
+
+/// Whether an event ends `job`.
+pub(crate) fn job_finished(job: JobId) -> impl Fn(&SessionEvent) -> bool {
+    move |event| {
+        matches!(event, SessionEvent::JobFinished { job: finished, .. }
+            if *finished == job)
+    }
+}
+
+/// What `snapshot` shows `agent` doing.
+pub(crate) fn activity<'a>(
+    snapshot: &'a ObservationSnapshot,
+    agent: &AgentId,
+) -> Option<&'a AgentActivity> {
+    snapshot.activity.get(agent).map(|activity| &activity.state)
+}
+
+/// Whether `snapshot` shows `agent` stopped.
+pub(crate) fn stopped(snapshot: &ObservationSnapshot, agent: &AgentId) -> bool {
+    matches!(activity(snapshot, agent), Some(AgentActivity::Stopped(_)))
+}
+
+/// Send the agent job `job` the input `value`, a script expression, as its
+/// owner would.
+pub(crate) async fn answer_child(session: &SessionHandle, job: JobId, value: &str) {
+    let answer = format!("(await tool.control({{job:{job}, send:{value}}})).unwrap();");
+    session.run_script(&answer).await.unwrap();
+}

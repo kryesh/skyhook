@@ -1,17 +1,11 @@
 //! Session-scoped MCP clients and an immutable, startup-discovered tool catalog.
-//!
-//! Only the root runtime constructs a manager. Children share its `Arc`; they
-//! neither initialize servers nor acquire ownership of server processes.
 
 mod catalog;
 mod connection;
 
 use super::config::McpServerConfig;
-use crate::tool::{
-    ToolError,
-    diagnostic::{Effects, Operation, PartialContext, RequestEffects, Subject},
-    policy::{Capability, CapabilitySet},
-};
+use crate::tool::ToolError;
+use crate::tool::policy::{Capability, CapabilitySet};
 pub use catalog::DiscoveryLimit;
 use catalog::bounded_json_size;
 use connection::{Server, connect_one};
@@ -24,6 +18,8 @@ use rmcp::{
     service::{PeerRequestOptions, RequestHandle, ServiceError},
 };
 use serde_json::{Map, Value};
+use skyhook_tools::diagnostic::{PartialContext, RequestEffects};
+use skyhook_worker::diagnostic::{Effects, Operation, Subject};
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +29,7 @@ const STARTUP_CONCURRENCY: usize = 4;
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP {0}")]
-    Header(#[from] crate::provider::dialect::ValueError),
+    Header(crate::provider::http::credentials::ValueError),
     #[error("MCP header command failed: {0}")]
     HeaderCommand(crate::provider::ProviderError),
     #[error("MCP operation cancelled")]
@@ -72,6 +68,16 @@ pub enum McpError {
     SubscriptionLagged,
     #[error("MCP input-required round limit was exceeded")]
     InputRequiredRoundsExceeded,
+}
+
+impl From<crate::provider::http::credentials::BuildError> for McpError {
+    fn from(error: crate::provider::http::credentials::BuildError) -> Self {
+        use crate::provider::http::credentials::BuildError;
+        match error {
+            BuildError::Value(error) => Self::Header(error),
+            BuildError::Provider(error) => Self::HeaderCommand(error),
+        }
+    }
 }
 
 impl From<McpError> for ToolError {
@@ -219,8 +225,7 @@ impl McpManager {
         manager
     }
 
-    /// Frozen for the lifetime of the session. List-changed notifications do not
-    /// alter this catalog or inject new tools into an already running agent.
+    /// Frozen for the lifetime of the session.
     pub fn catalog(&self) -> &[DiscoveredTool] {
         &self.catalog
     }
@@ -254,7 +259,7 @@ impl McpManager {
     }
 
     /// Send exactly one request. Cancellation and timeout report an uncertain
-    /// outcome; neither this manager nor its HTTP transport retries a tool call.
+    /// outcome.
     pub async fn call(
         &self,
         server: &str,
@@ -310,7 +315,7 @@ impl McpManager {
         let _permit = guarded(&self.closed, &cancel, &mut deadline, server.calls.acquire())
             .await?
             .map_err(|_| McpError::Closed)?;
-        if bounded_json_size(&arguments, crate::limits::MODEL_CONTENT_BYTES).is_none() {
+        if bounded_json_size(&arguments, skyhook_base::limits::MODEL_CONTENT_BYTES).is_none() {
             return Err(McpError::ArgumentsTooLarge);
         }
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(
@@ -348,7 +353,6 @@ impl McpManager {
     }
 
     /// Idempotent. Close all sessions, and kill/reap only processes we launched.
-    /// Externally managed HTTP servers never have an OwnedProcess.
     pub async fn shutdown(&self) {
         self.closed.cancel();
         for entry in self.servers.values() {
@@ -402,8 +406,8 @@ mod tests {
     use super::*;
     use crate::mcp::{config::McpServerConfig, manager::McpManager};
     use crate::tests::bounded;
-    use crate::tool::diagnostic::Cause;
     use serde_json::{Map, Value, json};
+    use skyhook_tools::diagnostic::Cause;
     use std::assert_matches;
     use std::{collections::BTreeMap, path::Path, time::Duration};
     use tempfile::TempDir;
@@ -502,7 +506,8 @@ for line in sys.stdin:
             }
         }
 
-        pub(super) fn config(&self) -> crate::mcp::config::RawMcpServerConfig {
+        /// The fixture server's configuration, to edit before [`server`] reads it.
+        pub(super) fn config(&self) -> Value {
             let mut env: BTreeMap<_, _> = ["pid", "started", "cancelled"]
                 .into_iter()
                 .map(|name| (format!("MCP_TEST_{}", name.to_uppercase()), self.path(name)))
@@ -510,11 +515,10 @@ for line in sys.stdin:
             env.insert("MCP_TEST_VALUE".into(), "configured child value".into());
             let frame = crate::mcp::transport::MAX_MESSAGE_BYTES;
             env.insert("MCP_TEST_FRAME".into(), frame.to_string());
-            serde_json::from_value(json!({
+            json!({
                 "transport": "stdio", "start_command": ["python3", "-u", "-c", FIXTURE],
                 "cwd": self.directory.path(), "env": env
-            }))
-            .unwrap()
+            })
         }
 
         pub(super) fn path(&self, name: &str) -> String {
@@ -535,8 +539,12 @@ for line in sys.stdin:
     // Process handles (manager-owned or explicit test Children) have kill-on-drop
     // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
-    pub(super) async fn connect(config: crate::mcp::config::RawMcpServerConfig) -> McpManager {
-        let configs = BTreeMap::from([("fixture".into(), config.try_into().unwrap())]);
+    pub(super) fn server(config: Value) -> McpServerConfig {
+        serde_json::from_value(config).unwrap()
+    }
+
+    pub(super) async fn connect(config: Value) -> McpManager {
+        let configs = BTreeMap::from([("fixture".into(), server(config))]);
         let capabilities = CapabilitySet::default();
         let workspace = std::env::temp_dir();
         let connect = McpManager::connect(
@@ -605,18 +613,15 @@ for line in sys.stdin:
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let mut stdio = fixture.config();
-        stdio.capabilities = vec![Capability::Read, Capability::Exec];
-        let http: McpServerConfig = serde_json::from_value(json!({
-            "transport": "streamable_http", "url": format!("http://{address}/mcp"),
-            "start_command": stdio.start_command,
-            "env": stdio.env, "cwd": stdio.cwd,
-            "capabilities": ["read", "exec"],
-            "headers": {"Authorization": {"env": "SKYHOOK_MCP_TEST_MISSING_HEADER_90212829"}}
-        }))
-        .unwrap();
+        stdio["capabilities"] = json!(["read", "exec"]);
+        let mut http = stdio.clone();
+        http["transport"] = json!("streamable_http");
+        http["url"] = json!(format!("http://{address}/mcp"));
+        let missing = "SKYHOOK_MCP_TEST_MISSING_HEADER_90212829";
+        http["headers"] = json!({"Authorization": {"env": missing}});
         let configs = BTreeMap::from([
-            ("stdio".into(), stdio.try_into().unwrap()),
-            ("http".into(), http),
+            ("stdio".into(), server(stdio)),
+            ("http".into(), server(http)),
         ]);
         for missing in [Capability::Mcp, Capability::Read, Capability::Exec] {
             let mut capabilities = CapabilitySet::default();
@@ -649,19 +654,18 @@ for line in sys.stdin:
         assert_ne!(workspace, process);
         let configured = std::fs::canonicalize(fixture.directory.path()).unwrap();
         let mut omitted = fixture.config();
-        omitted.cwd = None;
+        omitted.as_object_mut().unwrap().remove("cwd");
         // A loaded config's origin is gone by now: an omitted cwd from either
         // layer is `None` and must not inherit Skyhook's own directory.
         // One failed server does not hide a healthy server's tools.
         let mut broken = fixture.config();
-        broken.start_command = Some(vec![fixture.path("nonexistent-executable")]);
-        let broken: Option<(String, McpServerConfig)> =
-            Some(("broken".to_owned(), broken.try_into().unwrap()));
+        broken["start_command"] = json!([fixture.path("nonexistent-executable")]);
+        let broken = Some(("broken".to_owned(), server(broken)));
         for (config, expected, broken) in [
             (fixture.config(), configured, broken),
             (omitted, workspace.clone(), None),
         ] {
-            let configs = std::iter::once(("fixture".to_owned(), config.try_into().unwrap()))
+            let configs = std::iter::once(("fixture".to_owned(), server(config)))
                 .chain(broken)
                 .collect();
             let capabilities = CapabilitySet::default();

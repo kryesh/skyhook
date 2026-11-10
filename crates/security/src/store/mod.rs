@@ -1,6 +1,6 @@
 //! A security session's research as one knowledge graph its agents edit, beside its journal:
 //! nodes of seven kinds, the edges between them, and one audit log of every write with the
-//! nodes it bore on. What each phase owes is derived from it, never stored.
+//! nodes it bore on. What each phase owes is derived from it.
 //!
 //! Calls hold one read snapshot or an immediate write transaction on the session's
 //! connections. Hosts call from a blocking worker: local libsql completes its futures
@@ -10,62 +10,37 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use libsql::Row;
+use skyhook::identity::AgentId;
 use skyhook::{
     db::{Db, DbError, corrupt, params},
-    identity::AgentId,
     session::ExtensionDb,
 };
 
-mod artifacts;
-mod bearing;
-mod changes;
-mod events;
-mod evidence;
-mod findings;
-mod links;
-mod locations;
-mod nodes;
-mod queues;
+mod graph;
+mod ledger;
 mod reads;
-mod review;
 mod runs;
-mod schedule;
-mod scope;
-mod synthesis;
-mod tasks;
-mod testing;
 mod types;
+mod work;
 
-pub use artifacts::{ArtifactFault, Digesting, OpenArtifact, Stopped, admit};
-pub use changes::*;
-pub use events::*;
-pub use evidence::*;
-pub use findings::*;
-pub use links::*;
-pub use locations::*;
-pub use nodes::*;
-pub use queues::{Behind, QueueEntry, SpentWork};
-pub use reads::*;
-pub use review::*;
-pub use runs::*;
-pub use schedule::*;
-pub use scope::{Assumed, Excluded, Outside, Scope, ScopedInterface};
-pub use synthesis::*;
-pub use tasks::*;
-pub use testing::*;
-pub use types::*;
+pub(crate) use graph::*;
+pub(crate) use ledger::*;
+pub(crate) use reads::*;
+pub(crate) use runs::*;
+pub use runs::{LivePolicy, Run};
+pub(crate) use types::*;
+pub(crate) use work::*;
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// The most records one call names.
-pub(crate) const MAX_ATTACHMENTS: usize = 1000;
+const MAX_ATTACHMENTS: usize = 1000;
 
 /// A record a lookup can miss: a node, of a kind when the id was typed with one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Record {
+pub(crate) enum Record {
     Node(Option<NodeKind>),
     Task,
-    Test,
     Environment,
     Run,
 }
@@ -76,29 +51,14 @@ impl fmt::Display for Record {
             Self::Node(None) => "node",
             Self::Node(Some(kind)) => kind.as_str(),
             Self::Task => "task",
-            Self::Test => "test",
             Self::Environment => "environment",
             Self::Run => "run",
         })
     }
 }
 
-/// A bound a request exceeded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bound {
-    Attachments,
-}
-
-impl fmt::Display for Bound {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Attachments => write!(f, "{MAX_ATTACHMENTS} records per call"),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("research database: {0}")]
     Db(#[from] DbError),
     #[error("research database: {0}")]
@@ -123,8 +83,8 @@ pub enum Error {
     Text(#[from] TextError),
     #[error("{0}")]
     Inadmissible(#[from] Inadmissible),
-    #[error("exceeds {0}")]
-    Limit(Bound),
+    #[error("exceeds {MAX_ATTACHMENTS} records per call")]
+    Limit,
     #[error("no {record}{}", id.map_or(String::new(), |id| format!(" with id {id}")))]
     NotFound { record: Record, id: Option<i64> },
     #[error("node {id} is a {found}, not a {expected}")]
@@ -133,7 +93,7 @@ pub enum Error {
         expected: NodeKind,
         found: NodeKind,
     },
-    #[error("a candidate lists at least one {0}")]
+    #[error("the list names at least one {0}")]
     Empty(NodeKind),
     #[error("a node is not merged into itself")]
     SelfMerge,
@@ -162,8 +122,8 @@ pub enum Error {
     NotInput,
     #[error("work is begun by the agent job that does it")]
     TaskNeedsJob,
-    #[error("a task begins with at least one subject")]
-    NoSubjects,
+    #[error("this session keeps no security research")]
+    NoResearch,
 }
 
 impl From<libsql::Error> for Error {
@@ -281,28 +241,30 @@ impl Store {
     /// Run `work` on one of the session's reader threads: every store read it makes
     /// runs on that reader's read-only connection, in a snapshot that sees every write
     /// committed before it began. Waiting for a reader holds no thread.
-    pub async fn reading<T, E>(
+    pub(crate) async fn reading<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
-    ) -> std::result::Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         self.0.reading(work).await
     }
 
     /// Run `work`, which may write, once it is this caller's turn among the research
     /// writers, so that waiting holds no thread.
-    pub async fn writing<T, E>(
+    pub(crate) async fn writing<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
-    ) -> std::result::Result<T, E>
-    where
-        T: Send + 'static,
-        E: From<tokio::task::JoinError> + Send + 'static,
-    {
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         self.0.writing(work).await
+    }
+
+    /// Run `work`, which reads artifacts or writes reports, once it is this caller's turn
+    /// among those who do, unless `stop` comes first.
+    pub(crate) async fn filing<T: Send + 'static, S>(
+        &self,
+        stop: impl Future<Output = S>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> std::result::Result<T, S> {
+        self.0.filing(stop, work).await
     }
 
     /// One read snapshot for every query `f` runs: on the reader inside
@@ -321,9 +283,9 @@ impl Store {
 pub(crate) mod tests {
     use std::sync::Arc;
 
+    use skyhook::identity::AgentId;
     use skyhook::{
         agent::{HarnessBuilder, SessionHandle},
-        identity::AgentId,
         job::JobState,
         provider::{
             Provider, ProviderContext, ProviderError, ResponseStream,
@@ -332,6 +294,20 @@ pub(crate) mod tests {
     };
 
     use super::*;
+
+    /// Every record `read` pages through from the start, in pages of the largest size.
+    pub(crate) fn drain<T>(mut read: impl FnMut(Page) -> Result<Listing<T>>) -> Result<Vec<T>> {
+        let mut page = Page::new(0, skyhook_base::bounded::Bounded::new::<1000>());
+        let mut items = Vec::new();
+        loop {
+            let listing = read(page)?;
+            items.extend(listing.items);
+            match listing.next_after {
+                Some(after) => page.after = after,
+                None => return Ok(items),
+            }
+        }
+    }
 
     /// A provider for sessions whose scripts must never reach a model.
     pub(crate) struct NoRequests;
@@ -359,12 +335,12 @@ pub(crate) mod tests {
         root: &std::path::Path,
         provider: Arc<dyn Provider>,
     ) -> HarnessBuilder {
-        let profile: skyhook::provider::profile::ModelProfile =
+        let profile: skyhook::provider::model::ModelProfile =
             serde_json::from_value(serde_json::json!({
                 "model":"test", "reasoning":null, "max_context":32000, "max_output":1000,
             }))
             .unwrap();
-        let identity = cli::Product::identity(&crate::product::Security);
+        let identity = skyhook::product::Product::identity(&crate::product::Security);
         HarnessBuilder::new(root, identity.host)
             .provider(
                 "test".parse().unwrap(),
@@ -421,7 +397,11 @@ pub(crate) mod tests {
             harness.new_session().await.unwrap()
         });
         let store = Store::of(handle.store().extension().unwrap());
-        store.start_run(RunOptions::default(), live).unwrap();
+        let options = RunOptions {
+            live,
+            ..RunOptions::default()
+        };
+        store.start_run(options).unwrap();
         let actor = handle.root_agent().clone();
         let session = Session {
             handle,
@@ -435,26 +415,26 @@ pub(crate) mod tests {
         I::of(id)
     }
 
-    fn new<D>(title: &str, detail: D) -> New<D> {
-        New {
+    /// Title `title` with the fixture's body.
+    fn titled(title: &str) -> NewText {
+        NewText {
             title: text(title),
             body: text("fixture"),
-            detail,
         }
     }
 
     /// A component owning `<name>/lib.c` and the interface `<name>-api`.
     pub(crate) fn component(store: &Store, actor: &AgentId, name: &str) -> ComponentId {
-        let new = new(
-            name,
-            NewComponent {
-                files: vec![text(&format!("{name}/lib.c"))],
-                interfaces: vec![format!("{name}-api").parse().unwrap()],
-            },
-        );
+        let NewText { title, body } = titled(name);
+        let new = NewComponent {
+            title,
+            body,
+            files: Listed::of([text(&format!("{name}/lib.c"))]),
+            interfaces: Listed::of([format!("{name}-api").parse().unwrap()]),
+        };
         created(
             store
-                .upsert(actor, &Upsert::Component(Change::Create(new)))
+                .upsert(actor, &Upsert::Create(NewNode::Component(new)))
                 .unwrap(),
         )
     }
@@ -483,42 +463,73 @@ pub(crate) mod tests {
         through: &[ComponentId],
         at: Location,
     ) -> PathId {
+        let NewText { title, body } = titled(name);
+        let new = NewPath {
+            title,
+            body,
+            steps: Listed::of(steps(through.iter().map(|component| (*component, "calls")))),
+        };
         let path = created(
             store
-                .upsert(actor, &Upsert::Path(Change::Create(new(name, ()))))
+                .upsert(actor, &Upsert::Create(NewNode::Path(new)))
                 .unwrap(),
         );
-        let detail = NewState::Input {
+        let NewText { title, body } = titled(name);
+        let detail = NewState::Input(NewInput {
+            title,
+            body,
             location: at.clone(),
             trust: Trust::Untrusted,
-        };
+        });
         let input = created(
             store
-                .upsert(actor, &Upsert::State(Change::Create(new(name, detail))))
+                .upsert(actor, &Upsert::Create(NewNode::State(detail)))
                 .unwrap(),
         );
-        let read = access(path, input, Access::Read, at);
-        let steps = (through.iter()).map(|component| Link::PathStep {
-            path,
-            component: *component,
-            location: None,
-            note: text("calls"),
-            position: None,
-        });
-        let links: Vec<Link> = std::iter::once(read).chain(steps).collect();
-        store.link(actor, &links).unwrap();
+        store
+            .link(actor, &[access(path, input, Access::Read, at)])
+            .unwrap();
         path
     }
 
-    /// A state the target keeps, of `detail`'s scope.
-    pub(crate) fn state(store: &Store, actor: &AgentId, detail: NewState) -> StateId {
-        let change = Change::Create(new("decoder state", detail));
-        created(store.upsert(actor, &Upsert::State(change)).unwrap())
+    /// Steps through each component, with its note.
+    fn steps<'a>(steps: impl IntoIterator<Item = (ComponentId, &'a str)>) -> Vec<PathStep> {
+        (steps.into_iter())
+            .map(|(component, note)| PathStep {
+                component,
+                location: None,
+                note: text(note),
+            })
+            .collect()
+    }
+
+    /// Rewrite path `path`'s steps whole: through each component, with its note.
+    pub(crate) fn restep(
+        store: &Store,
+        actor: &AgentId,
+        path: PathId,
+        through: &[(ComponentId, &str)],
+    ) {
+        let edit = PathEdit {
+            id: path,
+            title: None,
+            body: None,
+            steps: Some(Listed::of(steps(through.iter().copied()))),
+        };
+        store
+            .upsert(actor, &Upsert::Edit(NodeEdit::Path(edit)))
+            .unwrap();
+    }
+
+    /// A state the target keeps, of `scope`.
+    pub(crate) fn state(store: &Store, actor: &AgentId, scope: fn(NewText) -> NewState) -> StateId {
+        let change = Upsert::Create(NewNode::State(scope(titled("decoder state"))));
+        created(store.upsert(actor, &change).unwrap())
     }
 
     /// Path `path`'s `access` of `state` at `at`.
-    pub(crate) fn access(path: PathId, state: StateId, access: Access, at: Location) -> Link {
-        Link::PathState {
+    pub(crate) fn access(path: PathId, state: StateId, access: Access, at: Location) -> Edge {
+        Edge::PathState {
             path,
             state,
             access,
@@ -561,28 +572,35 @@ pub(crate) mod tests {
                 })
                 .collect::<Vec<_>>()
                 .try_into()
+                .and_then(Listed::try_into)
                 .unwrap(),
         };
         store.environment(actor, &environment)
     }
 
     pub(crate) fn premise(store: &Store, actor: &AgentId, scope: PremiseScope) -> PremiseId {
-        let detail = NewPremise {
+        let NewText { title, body } = titled("the length is checked");
+        let new = NewPremise {
+            title,
+            body,
             scope,
             location: None,
         };
-        let change = Change::Create(new("the length is checked", detail));
-        created(store.upsert(actor, &Upsert::Premise(change)).unwrap())
+        let change = Upsert::Create(NewNode::Premise(new));
+        created(store.upsert(actor, &change).unwrap())
     }
 
     pub(crate) fn flaw(store: &Store, actor: &AgentId, component: ComponentId) -> FlawId {
-        let detail = NewFlaw {
+        let NewText { title, body } = titled("unbounded copy");
+        let new = NewFlaw {
+            title,
+            body,
             component,
             location: location("lib.c", 7),
             cwe: None,
         };
-        let change = Change::Create(new("unbounded copy", detail));
-        created(store.upsert(actor, &Upsert::Flaw(change)).unwrap())
+        let change = Upsert::Create(NewNode::Flaw(new));
+        created(store.upsert(actor, &change).unwrap())
     }
 
     pub(crate) fn candidate(
@@ -591,12 +609,15 @@ pub(crate) mod tests {
         path: PathId,
         flaws: &[FlawId],
     ) -> CandidateId {
-        let detail = NewCandidate {
+        let NewText { title, body } = titled("overflow");
+        let new = NewCandidate {
+            title,
+            body,
             actions: vec![path].try_into().unwrap(),
             chain: flaws.to_vec().try_into().unwrap(),
         };
-        let change = Change::Create(new("overflow", detail));
-        created(store.upsert(actor, &Upsert::Candidate(change)).unwrap())
+        let change = Upsert::Create(NewNode::Candidate(new));
+        created(store.upsert(actor, &change).unwrap())
     }
 
     /// A candidate of one flaw along a path through the flaw's component.
@@ -632,7 +653,7 @@ pub(crate) mod tests {
 
     /// Assess `id` at `vector` in a review of it.
     pub(crate) fn assess(store: &Store, id: CandidateId, vector: &str) {
-        within(store, &Begin::Review(vec![id]), |agent| {
+        within(store, &Begin::Review(Listed::of([id])), |agent| {
             let vector = vector.parse().unwrap();
             store.assess(agent, id, vector, &text("scored")).unwrap();
         });
@@ -640,12 +661,14 @@ pub(crate) mod tests {
 
     /// Rewrite candidate `id`'s body as `body`.
     pub(crate) fn reword(store: &Store, actor: &AgentId, id: CandidateId, body: &str) {
-        let edit = Edit {
+        let edit = CandidateEdit {
+            id,
             title: None,
             body: Some(text(body)),
-            detail: CandidateEdit::default(),
+            actions: None,
+            chain: None,
         };
-        (store.upsert(actor, &Upsert::Candidate(Change::Edit(id, edit)))).unwrap();
+        (store.upsert(actor, &Upsert::Edit(NodeEdit::Candidate(edit)))).unwrap();
     }
 
     /// Judge `id` in a review of it, which scores it again at its standing vector first.
@@ -655,7 +678,7 @@ pub(crate) mod tests {
             stored(db, sql, params![id], |row| Ok(row.get(0)?))
         }))
         .unwrap();
-        within(store, &Begin::Review(vec![id]), |agent| {
+        within(store, &Begin::Review(Listed::of([id])), |agent| {
             let vector = vector.parse().unwrap();
             store.assess(agent, id, vector, &text("scored")).unwrap();
             store
@@ -673,25 +696,31 @@ pub(crate) mod tests {
 
     /// Decide `premise` in a settle of it.
     pub(crate) fn decide(store: &Store, premise: PremiseId, status: PremiseStatus) {
-        within(store, &Begin::Settle(vec![premise]), |agent| {
-            let change = StatusChange::Premise(premise, status);
+        within(store, &Begin::Settle(Listed::of([premise])), |agent| {
+            let change = StatusChange::Premise {
+                id: premise,
+                status,
+            };
             store.set_status(agent, change, &text("settled")).unwrap();
         });
     }
 
     /// Judge `flaw` in a chain of it.
     pub(crate) fn judge(store: &Store, flaw: FlawId, status: FlawStatus) {
-        within(store, &Begin::Chain(vec![flaw]), |agent| {
-            let change = StatusChange::Flaw(flaw, status);
+        within(store, &Begin::Chain(Listed::of([flaw])), |agent| {
+            let change = StatusChange::Flaw { id: flaw, status };
             store.set_status(agent, change, &text("chained")).unwrap();
         });
     }
 
     /// Check `state` across calls in a check of it, resting on `rests_on`.
     pub(crate) fn check(store: &Store, state: StateId, rests_on: &[PremiseId]) {
-        within(store, &Begin::Check(vec![state]), |agent| {
+        within(store, &Begin::Check(Listed::of([state])), |agent| {
             let rests_on = Some(rests_on.to_vec()).try_into().unwrap();
-            let checked = StatusChange::State(state, StateMark::Checked { rests_on });
+            let checked = StatusChange::State(StateMark::Checked {
+                id: state,
+                rests_on,
+            });
             store.set_status(agent, checked, &text("checked")).unwrap();
         });
     }
@@ -758,8 +787,8 @@ pub(crate) mod tests {
             .write(|db| {
                 let parent = agent_row(db, parent)?;
                 db.execute(
-                    "INSERT INTO entry(public_id,agent,agent_ordinal,created_millis,kind) VALUES \
-                     (randomblob(16),?1,(SELECT coalesce(max(agent_ordinal),-1)+1 FROM entry \
+                    "INSERT INTO entry(agent,agent_ordinal,created_millis,kind) VALUES \
+                     (?1,(SELECT coalesce(max(agent_ordinal),-1)+1 FROM entry \
                      WHERE agent=?1),0,(SELECT name FROM entry_kind WHERE name!='agent_started' \
                      ORDER BY name LIMIT 1))",
                     params![parent],
@@ -772,7 +801,7 @@ pub(crate) mod tests {
                     "INSERT INTO job(id,created,tool,role,arguments,accepts_input,background,\
                      location_target,location_workspace) VALUES ((SELECT coalesce(max(id),0)+1 FROM \
                      job),(SELECT max(seq) FROM entry),'agent','agent','{\"prompt\":\"brief\"}',0,0,\
-                     (SELECT id FROM target WHERE name='local'),x'')",
+                     (SELECT id FROM target WHERE name='local'),'')",
                     Vec::new(),
                 )?;
                 let index = stored(
@@ -818,7 +847,10 @@ pub(crate) mod tests {
 
     /// Mark `path` swept.
     pub(crate) fn sweep(store: &Store, path: PathId) {
-        let swept = StatusChange::Path(path, PathStatus::Swept);
+        let swept = StatusChange::Path {
+            id: path,
+            status: PathStatus::Swept,
+        };
         let actor = AgentId::root(store.id());
         store.set_status(&actor, swept, &text("walked it")).unwrap();
     }
@@ -835,39 +867,6 @@ pub(crate) mod tests {
                 )
             })
             .unwrap()
-    }
-
-    /// A step of a query plan, and the subquery it runs in, if any.
-    pub(crate) struct Step {
-        pub(crate) detail: String,
-        pub(crate) within: Option<String>,
-    }
-
-    /// The steps of `sql`'s query plan.
-    pub(crate) fn plan(store: &Store, sql: &str) -> Vec<Step> {
-        let steps: Vec<(i64, i64, String)> = store
-            .read(|db| {
-                rows(db, format!("EXPLAIN QUERY PLAN {sql}"), Vec::new(), |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(3)?))
-                })
-            })
-            .unwrap();
-        let parents: std::collections::HashMap<i64, (i64, &str)> = (steps.iter())
-            .map(|(id, parent, detail)| (*id, (*parent, detail.as_str())))
-            .collect();
-        let within = |mut parent: i64| loop {
-            let (above, detail) = parents.get(&parent)?;
-            if detail.contains("SUBQUERY") {
-                return Some(detail.to_string());
-            }
-            parent = *above;
-        };
-        (steps.iter())
-            .map(|(_, parent, detail)| Step {
-                detail: detail.clone(),
-                within: within(*parent),
-            })
-            .collect()
     }
 
     /// The latest event.

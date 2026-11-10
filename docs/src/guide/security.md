@@ -44,8 +44,7 @@ live: ask
 
 The first configured orchestrator model is the companion's default model; an explicit `--model`
 or the remembered model takes precedence. The root agent always runs in the `orchestrate` mode:
-`--mode` and batch `--capabilities` are refused, and the terminal offers no mode switch;
-children take their modes from the agent tool.
+the terminal offers no mode switch; children take their modes from the agent tool.
 
 `shortlist` is the CVSS 4.0 severity a candidate's review must score it at to go on to a
 verdict; it defaults to `high`.
@@ -70,7 +69,7 @@ capabilities, which follow the same ceiling and delegation rules as built-ins:
 
 - `security.research` permits recording research: components, states, paths, premises,
   flaws, candidates and their links, evidence, merges, statuses, assessments, and environments.
-- `security.verdict` permits writing reports; together with `security.research`, review
+- `security.verdict` permits writing reports, with `write`; together with `security.research`, review
   verdicts.
 - `security.test` permits recording tests. It is separate so a PoC agent can also record
   research without deciding verdicts.
@@ -108,8 +107,8 @@ cover well; agents may choose otherwise.
 ## Research pipeline
 
 The root orchestrator drives the pipeline through delegated research modes; the research store
-holds one graph of what the agents found and derives the work each part of it still owes;
-nothing is planned. `target` maps the code, binaries and interfaces into components, mapping
+holds one graph of what the agents found and derives the work each part of it still owes.
+`target` maps the code, binaries and interfaces into components, mapping
 what it cannot read by what its material shows, and records the deployment premises your
 request settles, among them one per actor's intended capabilities, per build or configuration
 option and per platform the code branches on, and each interface in scope under a short name;
@@ -163,7 +162,7 @@ waits for it, so one agent works a node at a time and the next starts with its f
 | Check | instance or handed state | no check is recorded, its latest was recorded outside a check of it, or an access, edit or merge came after it outside that check, or a premise its checks rest on was decided failing or contradicted since (one decided holding owes nothing); ready once no path recorded before the state's latest access, edit or merge outside its checks owes a pending sweep, whether or not it accesses the state; a path recorded since does not hold it back, as the accesses its sweep records owe the check again | `check` |
 | Settle | code premise | it is undecided, disputed since its decision (by a differing proposal or contradicting evidence), or decided while a premise it rests on has been decided, either way, or disputed since that decision; and a live flaw, unretracted path or recorded state's check relies on it or on a premise resting on it; the review of a candidate whose chain rests on it decides it as its settle does | `settle` |
 | Chain | flaw | it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate (one not standing disproved or excluded) holds it or it carries a proposal; or it is not refuted, it leaves a recorded state wrong, and no chain of it began since what its chain rests on last changed, an access of that state included, so a reader recorded since owes it one more look whatever its candidates; ready once no path stepping through its component or reading a state it leaves wrong owes a pending sweep or probe, and no such state a pending check | `chain` |
-| Review | candidate | no assessment stands, or one at or above the shortlist does and no verdict stands, or an assessment or verdict recorded outside its review proposes another; one assessed below the shortlist needs no verdict; ready once no premise of its chain is undecided while its settle is pending or the user is asked it | `validate` (each shortlisted candidate traced by a `trace` child) |
+| Review | candidate | no assessment stands, or one at or above the shortlist does and no verdict stands, or an assessment or verdict recorded outside its review proposes another; one assessed below the shortlist needs no verdict; ready once no path it performs owes a pending sweep or probe and no premise of its chain is undecided while its settle is pending or the user is asked it | `validate` (each shortlisted candidate traced by a `trace` child) |
 | Test | candidate | it is validated, not noted, untested or reopened, and leads its root group; or it is unproven, untested or reopened, and an undecided code premise of its chain whose settle is exhausted has no more severe unproven candidate resting on it, or as severe and older, whose test is not exhausted; or its latest test is pending | `poc` |
 | Report | root flaw | its group has a reportable scenario its finding does not report as it stands; ready once no member owes a review or test | `report` |
 
@@ -183,9 +182,7 @@ orchestrator runs one at a time.
 A child beginning a task is told what changed of each subject's work since the subject's
 previous task in that phase, if any, and while it works, with its next request, of what other
 agents changed of what its work rests on since it began: each change once, as a digest per
-changed subject (how many changes, the latest, their kinds, the newest few with their notes
-and the nodes each moved most, and every node the older ones moved), so it can re-read them
-before deciding. A check marks its state with at least one premise its clearing relies on: a
+changed subject, so it can re-read them before deciding. A check marks its state with at least one premise its clearing relies on: a
 recorded one, such as the deployment premise for a documented contract, or a general claim its
 accesses do not show, settled by another agent; a mark naming none is refused. A handed
 state's check also rests, for each value a caller acts on, on a premise naming a condition that
@@ -354,7 +351,7 @@ the instructions extend the analysis, prepare an environment,
 validate, test or rewrite reports. Fresh work is always owed; settled or exhausted work is owed
 again only once something it rests on changed. A resumed run keeps its shortlist threshold,
 live policy and workers; a `--workers` flag resizes it once its work resumes, and `--live`
-applies only to a new session, so it is refused with `--resume`. A headless resume is refused
+and `--shortlist` apply only to a new session, so each is refused with `--resume`. A headless resume is refused
 only when the run's own policy is `ask`, whatever the configuration says. Only the root agent knows the
 live policy, and under `no` every agent's instructions leave out live work. The shortlist
 threshold is applied by the store alone; no agent is told it.
@@ -505,12 +502,20 @@ candidate holds, with why no chain was found, which are not scored or tested; an
 most severe validated candidate is assessed below the run's threshold, with that candidate and
 its severity. None are reported, and `index.json` lists them under `hardening`, each with its
 reason. Every page
-opens with a small front matter its text repeats, and links only by relative path. The
-orchestrator writes `reports/` out with `research` `generate` once it closes the run: a root's folder is replaced in
-one step when what renders has changed, a stale root's folder and anything else placed there is
-removed, and a generation with nothing changed changes nothing. An artifact is copied only while
-it matches the digest its test recorded; one that changed keeps the root out of `reports/` and
-is reported.
+opens with a small front matter its text repeats, and links only by relative path.
+
+The orchestrator writes `reports/` once it closes the run. The directory is the run's own:
+anything else placed there is removed, a root's folder is replaced when what renders has changed,
+and a generation with nothing changed changes nothing. An artifact is copied only while it
+matches the digest its test recorded; one that changed keeps the root out of `reports/` and is
+reported.
+
+These files are guarded by path name, not against another program writing in the session
+directory at the same moment. A replaced folder is moved aside before the new one moves in, so a
+reader in between, or after a crash there, finds that root's folder missing until the next
+generation. An artifact, and `reports/` itself, is refused when reached through a symbolic link,
+but a link put in place between that check and the read or write is followed. Keep other
+programs out of a run's session directory while it runs.
 
 ## Native research tools
 
@@ -518,12 +523,12 @@ Research tools are bound to the session's run. Each call names an `action` and p
 action's arguments beside it; the schema's description of `action` lists each action's
 arguments, marking optional ones with `?`. `upsert`, `set_status` and `list`, whose arguments
 depend on the kind of record, take them inside `record`, tagged by its `kind`; an `upsert` edit
-names the node's `id` and may leave its kind out:
+names the node's `id` too:
 
 ```js
 await tool.research({action: "upsert", record: {kind: "premise", title: "32-bit builds",
   body: "the library is built for 32-bit platforms", scope: "deployment"}});
-await tool.research({action: "upsert", record: {id: 7, title: "64-bit builds"}});
+await tool.research({action: "upsert", record: {kind: "premise", id: 7, title: "64-bit builds"}});
 await tool.research({action: "set_status", record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
 await tool.research({action: "begin", phase: "sweep", subjects: [3]});
 await tool.research_query({action: "list", record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
@@ -538,16 +543,17 @@ computes the CVSS-B score and severity.
 
 | Tool | Actions | Capabilities |
 | --- | --- | --- |
-| `research` | `begin` a task on its phase's subjects; `upsert` a node of any kind (an edit by `id` takes its node's kind), `link` and `unlink` its edges, record `evidence`, `merge` a duplicate `node` into a node of its kind (one already merged into it is left as it is), `set_status` of a premise, flaw, path, state (`checked` too, resting on at least one premise) or component, `assess` a candidate and describe an `environment` and the interfaces it `serves`; with `security.verdict` too, a `verdict`; with `security.test`, a `test`; with `security.verdict` and `write`, a root's `report`; and, for the orchestrator, `generate` the reports. | `security.research`; `security.scheduled` to `begin` |
+| `research` | `begin` a task on its phase's subjects; `upsert` a node of any kind but a finding (a path with its whole list of `steps`), `link` and `unlink` its edges, record `evidence`, `merge` a duplicate `node` into a node of its kind (one already merged into it is left as it is), `set_status` of a premise, flaw, path, state (`checked` too, resting on at least one premise) or component, `assess` a candidate and describe an `environment` and the interfaces it `serves`; with `security.verdict` too, a `verdict`; with `security.test`, a `test`; with `security.verdict` and `write`, a root's `report`; and, for the orchestrator, `generate` the reports. | `security.research`; `security.scheduled` to `begin` |
 | `research_query` | Read a `node` with its neighbourhood and latest tasks, a `task` with its child's brief, reply and records, `list` nodes of a kind (states by scope; or environments and tasks), `search` live nodes by a regex over their own text (not their events' notes) or a code location's file glob, line and function, each with where it matched, the event `history` of the run or a node, and the `synthesis` of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is `startable` next. | `read`; `security.coordinate` for what can start next |
 
 ## Building
 
-The companion is the `security` crate of the workspace:
+The companion is the `skyhook-security` product library, built as the `skyhook-security`
+binary by the workspace's `crates/apps` package:
 
 ```sh
-cargo run -p security -- --help
+cargo run -p skyhook-apps --bin skyhook-security -- --help
 ```
 
-The release build includes both applications; stage shims first when SSH execution is needed
+The release build includes both applications; stage shims first when remote targets are needed
 (see [installation](../getting-started/installation.md)).

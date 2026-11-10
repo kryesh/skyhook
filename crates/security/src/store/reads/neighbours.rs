@@ -1,10 +1,8 @@
 //! Each kind's neighbourhood, read in one snapshot.
 
 use libsql::Row;
-use skyhook::{
-    db::{Db, enum_column, optional_enum_column, params},
-    identity::SessionId,
-};
+use skyhook::db::{Db, enum_column, optional_enum_column, params};
+use skyhook::identity::SessionId;
 
 use super::{super::*, views::*};
 
@@ -107,18 +105,14 @@ pub(super) fn states(db: &Db, path: NodeId) -> Result<Vec<AccessRef>> {
         ),
         params![path],
         |row| {
-            let scope = match enum_column(row, 2)? {
-                StateScope::Input => Scoped::Input {
-                    trust: enum_column(row, 3)?,
-                },
-                StateScope::Handed => Scoped::Handed,
-                StateScope::Instance => Scoped::Instance,
-                StateScope::Stored => Scoped::Stored,
-            };
             Ok(AccessRef {
                 id: StateId(row.get(0)?),
                 title: row.get(1)?,
-                scope,
+                scope: StateScoped::of(enum_column(row, 2)?, || {
+                    Ok(Trusted {
+                        trust: enum_column(row, 3)?,
+                    })
+                })?,
                 status: enum_column(row, 4)?,
                 access: enum_column(row, 5)?,
                 location: located(row, 6)?,
@@ -253,23 +247,26 @@ pub(super) fn state(db: &Db, head: Head) -> Result<StateView> {
         params![id],
         |row| Ok((enum_column(row, 0)?, enum_column(row, 1)?)),
     )?;
-    let input = optional(
-        db,
-        concat!(
-            "SELECT i.trust,",
-            location_columns!(),
-            " FROM input_state i",
-            location_joins!("i.location"),
-            " WHERE i.state=?1"
-        ),
-        params![id],
-        |row| {
-            Ok(InputView {
-                trust: enum_column(row, 0)?,
-                location: located(row, 1)?,
-            })
-        },
-    )?;
+    let scope = StateScoped::of(scope, || {
+        let read = optional(
+            db,
+            concat!(
+                "SELECT i.trust,",
+                location_columns!(),
+                " FROM input_state i",
+                location_joins!("i.location"),
+                " WHERE i.state=?1"
+            ),
+            params![id],
+            |row| {
+                Ok(InputView {
+                    trust: enum_column(row, 0)?,
+                    location: located(row, 1)?,
+                })
+            },
+        )?;
+        Ok(LiveInput { read })
+    })?;
     let accesses = rows(
         db,
         concat!(
@@ -314,7 +311,6 @@ pub(super) fn state(db: &Db, head: Head) -> Result<StateView> {
     Ok(StateView {
         scope,
         status,
-        input,
         accesses,
         flaws: rows(
             db,
@@ -386,7 +382,7 @@ fn proposal<T>(
                 value,
                 event,
                 task,
-                agent: events::agent_id(db, session, agent)?,
+                agent: crate::store::ledger::events::agent_id(db, session, agent)?,
             })
         })
         .transpose()
@@ -437,7 +433,7 @@ pub(super) fn premise(db: &Db, session: SessionId, head: Head) -> Result<Premise
         db,
         concat!(
             "SELECT p.scope,p.status,",
-            bearing::disputed!("p", "decided"),
+            crate::store::ledger::standing::disputed!("p", "decided"),
             ",",
             location_columns!(),
             " FROM premise_standing p",
@@ -516,7 +512,11 @@ pub(in crate::store) fn undecided_premises(db: &Db, candidate: NodeId) -> Result
     rows(
         db,
         premise_refs!(
-            concat!("(", bearing::chain_premises!("?1"), ") x"),
+            concat!(
+                "(",
+                crate::store::ledger::facts::chain_premises!("?1"),
+                ") x"
+            ),
             "p.status='undecided'"
         ),
         params![candidate],
@@ -701,7 +701,7 @@ pub(super) fn candidate(db: &Db, session: SessionId, head: Head) -> Result<Candi
         tests,
         settling_test: stored(
             db,
-            concat!("SELECT ", crate::store::bearing::settling_test!("?1")),
+            concat!("SELECT ", crate::store::ledger::facts::settling_test!("?1")),
             params![id],
             |row| Ok(row.get::<Option<i64>>(0)?.map(TestId)),
         )?,

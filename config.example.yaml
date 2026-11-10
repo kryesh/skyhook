@@ -65,12 +65,12 @@ providers:
     codec: "messages"
     dialect: "anthropic"
     # base_url: "https://api.anthropic.com/v1"
-    # Any value that may hold a secret (api_key or a header) takes one of
-    # three forms: written literally, read from the environment when the provider is
-    # built, or produced by a command run via /bin/sh -c on the first request (trimmed
-    # stdout, cached for this provider and run again after the server refuses it).
+    # Any value that may hold a secret (api_key or a header) takes one of four forms:
+    # written literally, read from the environment when the provider is built, or, on
+    # the first request, printed by a command (shell text, or a program and arguments)
+    # or read from a private file; either is read again after the server refuses it.
     # A literal secret sits in this file in plain text and `skyhook dump config`
-    # prints it; prefer env or command.
+    # prints it; prefer another form.
     api_key:
       env: "ANTHROPIC_API_KEY"
     # api_key: "sk-ant-..."
@@ -106,7 +106,7 @@ providers:
       # Codex's catalog advertises a maximum context of 872000 (default: 272000).
       # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
       # max_output is required profile metadata, but is not sent to the Codex endpoint.
-      # It does not control the 80%-of-context compaction threshold.
+      # Compaction still triggers at 90% of max_context - max_output.
       codex:
         model: "gpt-5.6-sol"
         reasoning: "high"
@@ -171,7 +171,7 @@ providers:
     # reasoning_replay: "reasoning"
     # output_limit: "max_tokens"
     # Fixed request headers apply to every dialect (proxies, attribution); each value
-    # takes the same three forms as api_key:
+    # takes the same forms as api_key:
     # headers:
     #   x-title: "skyhook"
     #   x-proxy-token:
@@ -211,9 +211,10 @@ providers:
 #     via: "bastion"
 #     ssh:
 #       user: "builder"
-#       auth:
-#         kind: "key"
-#         path: "~/.ssh/build_ed25519"
+#       key: "~/.ssh/build_ed25519"
+#       # The key's passphrase; without key, the target's password. Also {command: ...},
+#       # {file: ...} or a literal, read at each connection.
+#       password: {env: "BUILD_KEY_PASSPHRASE"}
 #
 #   # Start SSH on build's shim (using build's key paths and agents), with extra
 #   # ssh_config options. Any via jump must also use origin: "build".
@@ -226,14 +227,31 @@ providers:
 #       options:
 #         ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal"
 #         ServerAliveInterval: "15"
+#
+#   # A Windows host running OpenSSH Server (os defaults to linux); its paths are Windows paths.
+#   winbuild:
+#     type: "ssh"
+#     os: "windows"
+#     host: "winbuild.internal"
+#     workspace: 'C:\src\project'
+#
+#   # A Windows host reached over WinRM (os defaults to windows), with a Kerberos ticket
+#   # from the user's realm over HTTPS. The password is read at each connection.
+#   winapp:
+#     type: "winrm"
+#     host: "winapp.corp.example"
+#     winrm:
+#       user: "deploy@CORP.EXAMPLE"
+#       password: {command: ["pass", "show", "winapp"]}
+#       auth: "kerberos"
 
 # MCP servers are optional; an absent/empty mcp mapping adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,
-# only on the local root/session host, never on a selected SSH target.
+# only on the local root/session host, never on a selected remote target.
 # Global "mcp" capability is required before any server is launched or contacted.
 # A server's tools additionally require ALL listed capabilities; otherwise hidden.
 # Per-server capabilities defaults to [] (global mcp only, no approval prompt).
-# Valid names: read, write, exec, network, targets, ssh_agent, agents, interactive, mcp.
+# Valid names: read, write, exec, network, targets, agents, interactive, mcp.
 # Skyhook imports tools only; discovery is frozen at startup. Failed servers warn
 # and are skipped. Tools are available both directly and inside script. Native
 # input schemas are kept unless open/conflicting, when input uses `arguments`.
@@ -252,7 +270,7 @@ providers:
 #     transport: "streamable_http"
 #     url: "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
 #     capabilities: ["read", "write"]
-#     headers: # A literal, {env: NAME} or {command: "..."}, as a provider's headers.
+#     headers: # Each value takes the same forms as a provider's headers.
 #       Authorization: { env: "MY_MCP_AUTHORIZATION" } # e.g. Bearer ...
 #     # Missing/blank variables and failed commands fail startup.
 #     # Connect first. Start this optional local command ONLY if the endpoint is unreachable,

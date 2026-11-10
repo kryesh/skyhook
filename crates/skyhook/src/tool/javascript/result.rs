@@ -33,7 +33,7 @@ impl JsonSchema for ScriptResult {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        // Keep arbitrary JSON as {}, and retain the existing untitled wire schema.
+        // Arbitrary JSON is `{}`; the schema has no title.
         schemars::json_schema!({
             "type": "object",
             "properties": {

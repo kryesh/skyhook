@@ -2,14 +2,12 @@
 
 use std::{borrow::Cow, collections::BTreeMap};
 
-use crate::{
-    media::{BlobDigest, ImageLimits, Prepared},
-    provider::{
-        ProviderError, ProviderErrorKind,
-        codec::common::{PreparedImages, blob_error},
-        protocol::ModelRequest,
-    },
+use crate::provider::{
+    ProviderError, ProviderErrorKind,
+    codec::common::{PreparedImages, blob_error},
+    protocol::ModelRequest,
 };
+use skyhook_media::{BlobDigest, ImageLimits, Prepared};
 
 /// Prepared copies by stored original. A context sends to one model, so each
 /// original is fitted once while the context still references it, and one that
@@ -56,16 +54,14 @@ impl FittedImages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        media::FitError,
-        provider::{
-            codec::{
-                Codec, chat_completions,
-                common::tests::{LIMITS, image, request, tool_result},
-            },
-            protocol::entries,
+    use crate::provider::{
+        codec::{
+            Codec, chat_completions,
+            common::tests::{LIMITS, image, request, tool_result},
         },
+        protocol::entries,
     };
+    use skyhook_media::FitError;
 
     #[tokio::test]
     async fn images_fit_once_while_referenced() {

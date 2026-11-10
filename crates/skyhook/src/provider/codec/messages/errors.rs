@@ -2,24 +2,29 @@
 //! `{"type": "error", "error": {"type", "message"}}`.
 use serde::Serialize;
 
-use crate::{
-    named_enum::named_enum,
-    provider::{ProviderErrorKind, codec::openai::ErrorCode},
-};
+use crate::provider::{ProviderErrorKind, codec::errors::ErrorCode};
+use skyhook_base::enums::NamedEnum;
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub(crate) enum Code {
-        InvalidRequest = "invalid_request_error",
-        Authentication = "authentication_error",
-        Permission = "permission_error",
-        NotFound = "not_found_error",
-        RequestTooLarge = "request_too_large",
-        RateLimit = "rate_limit_error",
-        Billing = "billing_error",
-        Api = "api_error",
-        Overloaded = "overloaded_error",
-    }
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Code {
+    #[serde(rename = "invalid_request_error")]
+    InvalidRequest,
+    #[serde(rename = "authentication_error")]
+    Authentication,
+    #[serde(rename = "permission_error")]
+    Permission,
+    #[serde(rename = "not_found_error")]
+    NotFound,
+    RequestTooLarge,
+    #[serde(rename = "rate_limit_error")]
+    RateLimit,
+    #[serde(rename = "billing_error")]
+    Billing,
+    #[serde(rename = "api_error")]
+    Api,
+    #[serde(rename = "overloaded_error")]
+    Overloaded,
 }
 
 impl ErrorCode for Code {
@@ -42,10 +47,7 @@ impl ErrorCode for Code {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
-        codec::openai::read,
-        http::errors::{ErrorSignals, classify},
-    };
+    use crate::provider::codec::errors::{ErrorSignals, classify, read};
     use serde_json::json;
 
     #[test]

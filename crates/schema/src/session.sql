@@ -1,8 +1,8 @@
 -- Skyhook session database. The identity below is the one place the journal's format
 -- is set: every image carries it and every open checks it. Tables are STRICT;
 -- subtype rows reference entry(seq), whose kind the decoder requires them to match.
--- db/mod.rs adds append-only triggers to tables outside MUTABLE_TABLES. u64 values
--- saturate to i64::MAX.
+-- The ledger is append-only because its writer offers no update or delete: only the
+-- current-state rows the folds write change. u64 values saturate to i64::MAX.
 --
 -- Skyhook-typed data is normalized. The only JSON text columns hold shapes a model, a
 -- tool's own schema or a provider defines: tool_call.arguments, tool_result.result,
@@ -11,7 +11,7 @@
 -- schemas are JSON blobs, stored once per distinct schema.
 
 PRAGMA application_id = 1397446984; -- 0x534B5948
-PRAGMA user_version = 31;
+PRAGMA user_version = 32;
 
 -- ───────────────────────── Ledger, session, agents ─────────────────────────
 
@@ -25,7 +25,7 @@ CREATE TABLE session (
 -- are recorded as grants and mode editions use them.
 CREATE TABLE capability (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- 'root' is seeded at create; it has no revision rows.
+-- 'root' has no revision rows.
 CREATE TABLE target (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
@@ -50,8 +50,7 @@ CREATE TABLE entry_kind (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE entry (
-  seq INTEGER PRIMARY KEY,                       -- insert NULL ... RETURNING seq
-  public_id BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  seq INTEGER PRIMARY KEY,
   agent INTEGER NOT NULL REFERENCES agent(id),
   -- The entry's place among its agent's entries, counting from 0 without gaps.
   agent_ordinal INTEGER NOT NULL CHECK (agent_ordinal >= 0),
@@ -73,7 +72,7 @@ CREATE TABLE entry_text (
 
 CREATE TABLE title_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- A title_cleared entry drops the user's earlier titles; db/state.rs TITLE applies the rule.
+-- A title_cleared entry drops the user's earlier titles; db/summary.rs TITLE applies the rule.
 CREATE TABLE title (
   entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   source TEXT NOT NULL REFERENCES title_source(name),
@@ -83,9 +82,14 @@ CREATE TABLE title (
 -- ───────────────────────── Targets ─────────────────────────
 
 CREATE TABLE target_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE transport (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE ssh_auth (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE winrm_auth (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE winrm_tls (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE os (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- via/origin NULL means the route starts at root.
+-- via/origin NULL means the route starts at root. The transport's settings are in the
+-- target_ssh or target_winrm row its name selects.
 CREATE TABLE target_revision (
   id INTEGER PRIMARY KEY,
   target INTEGER NOT NULL REFERENCES target(id),
@@ -93,35 +97,83 @@ CREATE TABLE target_revision (
   revision INTEGER NOT NULL CHECK (revision > 0),
   source TEXT NOT NULL REFERENCES target_source(name),
   host TEXT NOT NULL,
-  workspace BLOB NOT NULL,
-  ssh_user TEXT,
-  ssh_port INTEGER CHECK (ssh_port BETWEEN 1 AND 65535),
-  ssh_auth TEXT NOT NULL REFERENCES ssh_auth(name),
-  ssh_key_path BLOB,
-  ssh_external_agent INTEGER NOT NULL CHECK (ssh_external_agent IN (0,1)),
+  os TEXT NOT NULL REFERENCES os(name),
+  workspace TEXT NOT NULL,
+  transport TEXT NOT NULL REFERENCES transport(name),
   via INTEGER REFERENCES target(id),
   origin INTEGER REFERENCES target(id),
-  UNIQUE (target, revision),
-  CHECK ((ssh_auth = 'key') = (ssh_key_path IS NOT NULL))
+  UNIQUE (target, revision)
+) STRICT;
+
+CREATE TABLE target_ssh (
+  revision INTEGER PRIMARY KEY REFERENCES target_revision(id),
+  user TEXT,
+  port INTEGER CHECK (port BETWEEN 1 AND 65535),
+  auth TEXT NOT NULL REFERENCES ssh_auth(name),
+  key_path TEXT,
+  forward_agent INTEGER NOT NULL CHECK (forward_agent IN (0,1)),
+  CHECK ((auth = 'key') = (key_path IS NOT NULL))
 ) STRICT;
 
 CREATE TABLE target_ssh_option (
-  revision INTEGER NOT NULL REFERENCES target_revision(id),
+  revision INTEGER NOT NULL REFERENCES target_ssh(revision),
   key TEXT NOT NULL,
   value TEXT NOT NULL,
   PRIMARY KEY (revision, key)
 ) STRICT, WITHOUT ROWID;
 
+-- A 'kerberos' user is its principal as written; kdc is the KDC as written.
+CREATE TABLE target_winrm (
+  revision INTEGER PRIMARY KEY REFERENCES target_revision(id),
+  user TEXT NOT NULL,
+  auth TEXT NOT NULL REFERENCES winrm_auth(name),
+  kdc TEXT,
+  tls TEXT NOT NULL REFERENCES winrm_tls(name),
+  ca_path TEXT,
+  fingerprint BLOB CHECK (length(fingerprint) = 32),
+  port INTEGER CHECK (port BETWEEN 1 AND 65535),
+  CHECK (auth = 'kerberos' OR kdc IS NULL),
+  CHECK ((tls = 'ca') = (ca_path IS NOT NULL)),
+  CHECK ((tls = 'fingerprint') = (fingerprint IS NOT NULL))
+) STRICT;
+
+CREATE TABLE credential_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- The password a revision reads (an ssh 'password' or a 'key' passphrase, or a winrm
+-- password). A target the configuration defines reads the one the configuration gives
+-- it, which is never copied here: its source is NULL. A target the session added holds
+-- its own as given: the text of a 'literal', the name of an 'env' variable, a
+-- 'command''s shell text, or a 'file''s path. A 'command' without shell text is an
+-- argument vector in target_password_argument.
+CREATE TABLE target_password (
+  revision INTEGER PRIMARY KEY REFERENCES target_revision(id),
+  source TEXT REFERENCES credential_source(name),
+  text TEXT,
+  file TEXT,
+  CHECK (source IS NOT NULL OR (text IS NULL AND file IS NULL)),
+  CHECK ((source IN ('literal', 'env')) <= (text IS NOT NULL)),
+  CHECK (source IN ('literal', 'env', 'command') OR text IS NULL),
+  CHECK ((source = 'file') = (file IS NOT NULL))
+) STRICT;
+
+CREATE TABLE target_password_argument (
+  revision INTEGER NOT NULL REFERENCES target_password(revision),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  value TEXT NOT NULL,
+  PRIMARY KEY (revision, position)
+) STRICT, WITHOUT ROWID;
+
 -- ───────────────────────── Pinned contract ─────────────────────────
 
 CREATE TABLE state_mode (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE reasoning_effort (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_profile (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
   provider TEXT NOT NULL,
   model TEXT NOT NULL,
-  reasoning TEXT,
+  reasoning TEXT REFERENCES reasoning_effort(name),
   max_context INTEGER NOT NULL CHECK (max_context > 0),
   max_output INTEGER NOT NULL CHECK (max_output > 0),
   supports_images INTEGER NOT NULL CHECK (supports_images IN (0,1)),
@@ -136,7 +188,7 @@ CREATE TABLE agent_start (
   entry INTEGER PRIMARY KEY REFERENCES entry(seq),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL
+  location_workspace TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE agent_capability (
@@ -261,7 +313,7 @@ CREATE TABLE message_state (
   message INTEGER PRIMARY KEY REFERENCES message(id),
   time INTEGER NOT NULL,
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL,
+  location_workspace TEXT NOT NULL,
   host TEXT
 ) STRICT;
 
@@ -276,7 +328,7 @@ CREATE TABLE message_state_job (
   name TEXT,
   state TEXT NOT NULL REFERENCES job_state(name),
   target INTEGER REFERENCES target(id),
-  workspace BLOB NOT NULL,
+  workspace TEXT NOT NULL,
   age_seconds INTEGER NOT NULL CHECK (age_seconds >= 0),
   turns INTEGER CHECK (turns >= 0),
   tool_calls INTEGER CHECK (tool_calls >= 0),
@@ -641,7 +693,7 @@ CREATE TABLE job (
   accepts_input INTEGER NOT NULL CHECK (accepts_input IN (0,1)),
   background INTEGER NOT NULL CHECK (background IN (0,1)),
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL,
+  location_workspace TEXT NOT NULL,
   CHECK (origin_call IS NOT NULL OR arguments IS NOT NULL)
 ) STRICT;
 -- A parent's children in id order, a page at a time.
@@ -726,7 +778,9 @@ CREATE TABLE job_capture (
   UNIQUE (id, job, generation)
 ) STRICT;
 
--- first_line = newlines before byte_offset; chunks are contiguous from offset 0.
+-- first_line = newlines before byte_offset; chunks are contiguous from offset 0. A
+-- capture's rows hold at most the saved-field limit: past it the bytes are in a file,
+-- which is never part of the session and which nothing here removes.
 CREATE TABLE job_capture_chunk (
   capture INTEGER NOT NULL REFERENCES job_capture(id) ON DELETE CASCADE,
   byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0),
@@ -740,6 +794,63 @@ CREATE INDEX job_capture_line ON job_capture_chunk(capture, first_line);
 -- them; the finish removes the row, so a row left is a finish that never committed.
 CREATE TABLE job_capture_staged (
   capture INTEGER PRIMARY KEY REFERENCES job_capture(id) ON DELETE CASCADE
+) STRICT;
+
+-- A capture the session moved to a file in its host's spill directory as it passed
+-- the limit, with what it counted; it has no chunk rows.
+CREATE TABLE job_capture_spill (
+  capture INTEGER PRIMARY KEY REFERENCES job_capture(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  bytes INTEGER NOT NULL CHECK (bytes >= 0),
+  newlines INTEGER NOT NULL CHECK (newlines >= 0),
+  ends_line INTEGER NOT NULL CHECK (ends_line IN (0,1))
+) STRICT;
+
+-- The route of the connection a run's operation ran over, outermost target first,
+-- each as it was defined then: the machine that holds the files the run's output
+-- keeps on its target, which are read only where the same route reaches. Only a run
+-- that keeps such a file has rows, and one on the session host has none.
+CREATE TABLE job_output_route (
+  job INTEGER NOT NULL REFERENCES job(id),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  revision INTEGER NOT NULL REFERENCES target_revision(id),
+  PRIMARY KEY (job, generation, position)
+) STRICT, WITHOUT ROWID;
+
+-- A file a run's target created in its spill directory, which the run's result
+-- names: the session's own, read unasked on the run's route. Its path's components
+-- as that target splits them, outermost first; file counts the run's files.
+CREATE TABLE job_output_spill (
+  job INTEGER NOT NULL REFERENCES job(id),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  file INTEGER NOT NULL CHECK (file >= 0),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  component TEXT NOT NULL,
+  PRIMARY KEY (job, generation, file, position)
+) STRICT, WITHOUT ROWID;
+
+-- A capture whose job's target wrote the whole stream to a file in its own spill
+-- directory, with what it counted and the stream's last bytes; its chunk rows hold
+-- the stream's first bytes.
+CREATE TABLE job_capture_written (
+  capture INTEGER PRIMARY KEY REFERENCES job_capture(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  bytes INTEGER NOT NULL CHECK (bytes >= 0),
+  newlines INTEGER NOT NULL CHECK (newlines >= 0),
+  ends_line INTEGER NOT NULL CHECK (ends_line IN (0,1)),
+  tail BLOB NOT NULL CHECK (length(tail) <= 65536)
+) STRICT;
+
+-- A capture that is a file its call named on its job's target, read as it is when
+-- read, with what its target counted of it as the call read it; its chunk rows hold
+-- the first bytes it had then.
+CREATE TABLE job_capture_named (
+  capture INTEGER PRIMARY KEY REFERENCES job_capture(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  bytes INTEGER NOT NULL CHECK (bytes >= 0),
+  newlines INTEGER NOT NULL CHECK (newlines >= 0),
+  ends_line INTEGER NOT NULL CHECK (ends_line IN (0,1))
 ) STRICT;
 
 -- Captures the terminal document references; only these are complete results.
@@ -786,6 +897,8 @@ CREATE TABLE diagnostic_request_effects (name TEXT PRIMARY KEY) STRICT, WITHOUT 
 
 CREATE TABLE diagnostic_cause (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
+CREATE TABLE diagnostic_connection_fault (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
 CREATE TABLE diagnostic_io_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE diagnostic_path_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -794,35 +907,40 @@ CREATE TABLE job_finish_diagnostic (
   finish INTEGER PRIMARY KEY REFERENCES job_finish(entry),
   operation TEXT NOT NULL REFERENCES diagnostic_operation(name),
   subject TEXT NOT NULL REFERENCES diagnostic_subject(name),
-  subject_path BLOB,
+  subject_path TEXT,
   subject_text TEXT,
   -- The subject may be an unsuccessful lookup of a job that does not exist.
   subject_job INTEGER CHECK (subject_job > 0),
   site TEXT NOT NULL REFERENCES diagnostic_site(name),
   location_target INTEGER REFERENCES target(id),
-  location_workspace BLOB,
+  location_workspace TEXT,
   effects TEXT NOT NULL REFERENCES diagnostic_effects(name),
   request TEXT NOT NULL REFERENCES diagnostic_request_effects(name),
   cause TEXT NOT NULL REFERENCES diagnostic_cause(name),
+  connection_fault TEXT REFERENCES diagnostic_connection_fault(name),
   io_kind TEXT REFERENCES diagnostic_io_kind(name),
   io_code INTEGER CHECK (io_code BETWEEN -2147483648 AND 2147483647),
   io_detail TEXT,
   cause_text TEXT,
   cause_job INTEGER CHECK (cause_job > 0),
+  -- A path that is not text, as its target's native bytes.
+  cause_native BLOB,
   CHECK ((subject = 'job') = (subject_job IS NOT NULL)),
   CHECK ((site = 'execution') = (location_target IS NOT NULL)),
   CHECK ((site = 'execution') = (location_workspace IS NOT NULL)),
+  CHECK ((cause = 'connection') = (connection_fault IS NOT NULL)),
   CHECK ((cause = 'io') = (io_kind IS NOT NULL)),
   CHECK (cause = 'io' OR io_code IS NULL),
-  CHECK (cause = 'io' OR io_detail IS NULL)
+  CHECK (cause = 'io' OR io_detail IS NULL),
+  CHECK ((cause = 'unspelled') = (cause_native IS NOT NULL))
 ) STRICT;
 
--- Path facts retain caller order and native bytes separately from the attempted subject.
+-- Path facts retain caller order separately from the attempted subject.
 CREATE TABLE diagnostic_path (
   finish INTEGER NOT NULL REFERENCES job_finish_diagnostic(finish),
   position INTEGER NOT NULL CHECK (position >= 0),
   role TEXT NOT NULL REFERENCES diagnostic_path_role(name),
-  path BLOB NOT NULL,
+  path TEXT NOT NULL,
   PRIMARY KEY (finish, position)
 ) STRICT, WITHOUT ROWID;
 

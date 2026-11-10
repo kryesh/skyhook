@@ -4,65 +4,66 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::identity::AgentId;
+use crate::target::TargetDefinition;
+use crate::tool::policy::CapabilitySet;
 use crate::{
-    agent::{CompactionFault, Failure},
-    execution::ExecutionLocation,
-    identity::{AgentId, EventId, JobId},
-    job::{JobEnd, JobRole, JobTransition},
-    media::ImageRef,
-    named_enum::named_enum,
+    job::{JobEnd, JobTransition},
     provider::{
         ProviderErrorKind,
-        profile::{ModelProfile, ModelRef},
+        model::{ModelProfile, ModelRef},
         protocol::{
-            CutReason, HistoryLifetime, ModelRequest, Outcome, ResponseSchema, SystemSegment,
-            ToolDefinition, Usage,
+            CutReason, HistoryLifetime, ModelRequest, Outcome, ResponseSchema, SystemSegment, Usage,
         },
     },
     session::Message,
-    target::TargetDefinition,
-    tool::{policy::CapabilitySet, registry::JobName},
+    session::{CompactionFault, Failure},
 };
+use crate::{
+    job::{JobName, JobRole},
+    tool::catalog::ToolDefinition,
+};
+use skyhook_base::enums::{Kinds, NamedEnum};
+use skyhook_media::ImageRef;
+use skyhook_tools::target::ExecutionLocation;
+use skyhook_worker::job::JobId;
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
-    pub enum ModelPurpose {
-        Agent = "agent",
-        Compaction = "compaction",
-    }
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPurpose {
+    Agent,
+    Compaction,
 }
 
-named_enum! {
-    /// Where a session title came from. A title the user set is never replaced by
-    /// an automatic one.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum TitleSource {
-        /// The session's first prompt.
-        Prompt = "prompt",
-        User = "user",
-        /// A summary of the conversation.
-        Generated = "generated",
-    }
+/// Where a session title came from. A title the user set is never replaced by
+/// an automatic one.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// The session's first prompt.
+    Prompt,
+    User,
+    /// A summary of the conversation.
+    Generated,
 }
 
-named_enum! {
-    /// Why a completed response ended early. A refusal fails the turn instead, so it
-    /// is never journaled as a completed response.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum Truncation {
-        MaxTokens = "max_tokens",
-        Incomplete = "incomplete",
-    }
+/// Why a completed response ended early. A refusal fails the turn instead, so it
+/// is never journaled as a completed response.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Truncation {
+    MaxTokens,
+    Incomplete,
 }
 
-crate::named_enum::detailed_enum! {
-    /// How a response that completed the turn ended.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum CompletedOutcome / ResponseOutcome {
-        Answer = "answer",
-        ToolUse = "tool_use",
-        Cut(Truncation) = "cut",
-    }
+/// How a response that completed the turn ended.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Kinds)]
+#[serde(rename_all = "snake_case")]
+#[kinds(name = ResponseOutcome)]
+pub enum CompletedOutcome {
+    Answer,
+    ToolUse,
+    Cut(Truncation),
 }
 
 /// The model refused: the cut that fails the turn instead of completing it.
@@ -260,7 +261,7 @@ pub struct CompactionCheckpoint {
     pub frontier: RecordSeq,
     pub message: Message,
     /// Reconciled owner todos, activated atomically with this history replacement.
-    pub todos: Vec<crate::agent::TodoItem>,
+    pub todos: Vec<crate::session::TodoItem>,
     pub retained: Vec<MessageSeq>,
     /// The summary attempt that produced this checkpoint.
     pub attempt: AttemptRef,
@@ -318,8 +319,8 @@ impl ModelContext {
             history_lifetime: HistoryLifetime::default(),
             tools: self.tools.clone(),
             response_schema: self.response_schema.clone(),
-            reasoning: profile.reasoning.clone(),
-            max_output_tokens: Some(profile.max_output),
+            reasoning: profile.reasoning,
+            max_output_tokens: profile.max_output,
             blobs: Default::default(),
         }
     }
@@ -330,13 +331,17 @@ impl ModelContext {
 /// the configured definitions, so earlier editions only show what entries ran under.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModeSelection {
-    pub name: crate::tool::policy::ModeName,
+    pub name: crate::config::mode::ModeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definition: Option<crate::tool::policy::Edition>,
+    pub definition: Option<crate::config::mode::Edition>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Kinds)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[kinds(
+    name = EntryKind,
+    doc = "The journal's name for each event, also the entry's subtype table selector."
+)]
 pub enum SessionEvent {
     /// The creating host and the session's pinned target definitions.
     SessionStarted {
@@ -363,10 +368,15 @@ pub enum SessionEvent {
         capabilities: CapabilitySet,
         location: ExecutionLocation,
     },
-    TodosReplaced {
-        items: Vec<crate::agent::TodoItem>,
+    AgentCompleted,
+    AgentInterrupted,
+    /// A turn ended in a terminal failure that retains the agent for an external
+    /// retry. Journaled so a resumed session re-arms its retry affordance instead
+    /// of appearing idle; the agent itself never retries on this signal.
+    AgentFailed {
+        failure: Failure,
     },
-    /// Model applied to a submitted user turn; never a pending UI selection.
+    /// Model applied to a submitted user turn.
     ModelChanged {
         profile: ProfileSnapshot,
     },
@@ -374,6 +384,9 @@ pub enum SessionEvent {
     ModeChanged {
         mode: ModeSelection,
         capabilities: CapabilitySet,
+    },
+    TodosReplaced {
+        items: Vec<crate::session::TodoItem>,
     },
     MessageCommitted {
         message: Message,
@@ -400,35 +413,31 @@ pub enum SessionEvent {
         tail: Vec<Message>,
         history_lifetime: HistoryLifetime,
     },
-    Compaction {
-        checkpoint: CompactionCheckpoint,
-    },
     /// A new attempt starts for an existing frozen logical request. This resets
     /// its live output in host projections without changing model history.
     ModelAttemptStarted(AttemptRef),
-    /// A refusal is never retried automatically: it is deterministic for a given
-    /// request, so only a parent agent or a human may retry it.
     ModelFailed {
         attempt: AttemptRef,
         failure: AttemptFailure,
     },
     /// An attempt ended without an outcome: cancelled, or open when the session stopped.
     ModelAttemptInterrupted(AttemptRef),
-    /// A refusal fails the turn before this point and is recorded by `ModelFailed`
-    /// instead.
     ResponseCompleted {
         attempt: AttemptRef,
         /// The committed assistant message this response produced.
         message: MessageSeq,
         outcome: CompletedOutcome,
     },
-    CompactionFailed {
-        failure: CompactionFailure,
-        error: CompactionFault,
-    },
     Usage {
         request: RequestSeq,
         usage: Usage,
+    },
+    Compaction {
+        checkpoint: CompactionCheckpoint,
+    },
+    CompactionFailed {
+        failure: CompactionFailure,
+        error: CompactionFault,
     },
     JobCreated {
         job: JobId,
@@ -452,7 +461,7 @@ pub enum SessionEvent {
         job: JobId,
         state: JobEnd,
         #[serde(skip_serializing_if = "Option::is_none")]
-        diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+        diagnostic: Option<skyhook_tools::diagnostic::Diagnostic>,
         images: Vec<ImageRef>,
     },
     JobClaimed {
@@ -482,52 +491,6 @@ pub enum SessionEvent {
         source: MessageSeq,
         notification: Option<MessageSeq>,
     },
-    AgentCompleted,
-    AgentInterrupted,
-    /// A turn ended in a terminal failure that retains the agent for an external
-    /// retry. Journaled so a resumed session re-arms its retry affordance instead
-    /// of appearing idle; the agent itself never retries on this signal.
-    AgentFailed {
-        failure: Failure,
-    },
-}
-
-named_enum! {
-    /// The journal's name for each event, also the entry's subtype table selector.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub(crate) enum EntryKind {
-        SessionStarted = "session_started",
-        TitleSet = "title_set",
-        TitleCleared = "title_cleared",
-        TargetsUpserted = "targets_upserted",
-        AgentStarted = "agent_started",
-        AgentCompleted = "agent_completed",
-        AgentInterrupted = "agent_interrupted",
-        AgentFailed = "agent_failed",
-        ModelChanged = "model_changed",
-        ModeChanged = "mode_changed",
-        TodosReplaced = "todos_replaced",
-        MessageCommitted = "message_committed",
-        Status = "status",
-        ModelContext = "model_context",
-        ModelRequested = "model_requested",
-        ModelAttemptStarted = "model_attempt_started",
-        ModelFailed = "model_failed",
-        ModelAttemptInterrupted = "model_attempt_interrupted",
-        ResponseCompleted = "response_completed",
-        Usage = "usage",
-        Compaction = "compaction",
-        CompactionFailed = "compaction_failed",
-        JobCreated = "job_created",
-        JobStateChanged = "job_state_changed",
-        JobFinished = "job_finished",
-        JobClaimed = "job_claimed",
-        JobCancelRequested = "job_cancel_requested",
-        JobReleased = "job_released",
-        JobMessageReleased = "job_message_released",
-        JobInjected = "job_injected",
-        JobMessageDelivered = "job_message_delivered",
-    }
 }
 
 impl EntryKind {
@@ -560,47 +523,10 @@ impl SessionEvent {
     pub fn is_activity(&self) -> bool {
         self.kind().is_activity()
     }
-
-    pub(crate) fn kind(&self) -> EntryKind {
-        match self {
-            Self::SessionStarted { .. } => EntryKind::SessionStarted,
-            Self::TitleSet { .. } => EntryKind::TitleSet,
-            Self::TitleCleared => EntryKind::TitleCleared,
-            Self::TargetsUpserted { .. } => EntryKind::TargetsUpserted,
-            Self::AgentStarted { .. } => EntryKind::AgentStarted,
-            Self::TodosReplaced { .. } => EntryKind::TodosReplaced,
-            Self::ModelChanged { .. } => EntryKind::ModelChanged,
-            Self::ModeChanged { .. } => EntryKind::ModeChanged,
-            Self::MessageCommitted { .. } => EntryKind::MessageCommitted,
-            Self::Status { .. } => EntryKind::Status,
-            Self::ModelContext { .. } => EntryKind::ModelContext,
-            Self::ModelRequested { .. } => EntryKind::ModelRequested,
-            Self::Compaction { .. } => EntryKind::Compaction,
-            Self::ModelAttemptStarted { .. } => EntryKind::ModelAttemptStarted,
-            Self::ModelFailed { .. } => EntryKind::ModelFailed,
-            Self::ModelAttemptInterrupted { .. } => EntryKind::ModelAttemptInterrupted,
-            Self::ResponseCompleted { .. } => EntryKind::ResponseCompleted,
-            Self::CompactionFailed { .. } => EntryKind::CompactionFailed,
-            Self::Usage { .. } => EntryKind::Usage,
-            Self::JobCreated { .. } => EntryKind::JobCreated,
-            Self::JobStateChanged { .. } => EntryKind::JobStateChanged,
-            Self::JobFinished { .. } => EntryKind::JobFinished,
-            Self::JobClaimed { .. } => EntryKind::JobClaimed,
-            Self::JobCancelRequested { .. } => EntryKind::JobCancelRequested,
-            Self::JobReleased { .. } => EntryKind::JobReleased,
-            Self::JobMessageReleased { .. } => EntryKind::JobMessageReleased,
-            Self::JobInjected { .. } => EntryKind::JobInjected,
-            Self::JobMessageDelivered { .. } => EntryKind::JobMessageDelivered,
-            Self::AgentCompleted => EntryKind::AgentCompleted,
-            Self::AgentInterrupted => EntryKind::AgentInterrupted,
-            Self::AgentFailed { .. } => EntryKind::AgentFailed,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EventRecord {
-    pub id: EventId,
     pub sequence: RecordSeq,
     pub timestamp_millis: i64,
     pub agent: AgentId,

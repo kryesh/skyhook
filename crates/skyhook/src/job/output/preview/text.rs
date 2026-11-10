@@ -2,7 +2,8 @@
 use serde_json::Value;
 
 use super::{HEAD_SHARE, TEXT_BYTES, TEXT_LINES, pool::Text};
-use crate::job::output::{FieldPointer, OutputTruncation};
+use crate::job::output::OutputTruncation;
+use skyhook_tools::output::FieldPointer;
 
 /// The prefix of `text` kept within `bytes` (and `lines`, preferring whole lines
 /// there), and its record when it is shorter than the string.
@@ -45,7 +46,7 @@ pub(super) fn shorten(
         (prefix[..end].iter().rposition(|&byte| byte == b'\n')).map_or(end, |last| end - last - 1);
     let record = OutputTruncation::Text {
         field: field.clone(),
-        total_lines: total_lines(text),
+        total_lines: text.lines,
         next_start: line,
         next_offset: (offset != 0).then_some(offset),
     };
@@ -61,7 +62,7 @@ pub(super) fn ends(text: &Text, field: &FieldPointer) -> (Value, Option<OutputTr
     if record.is_none() {
         return (head_only, record);
     }
-    let total_lines = total_lines(text);
+    let total_lines = text.lines;
     let share = |limit: usize| limit * HEAD_SHARE.0 / HEAD_SHARE.1;
     let (head, head_lines) = leading_lines(&text.prefix, share(TEXT_LINES), share(TEXT_BYTES));
     let (tail, tail_lines) = trailing_lines(
@@ -88,10 +89,6 @@ pub(super) fn ends(text: &Text, field: &FieldPointer) -> (Value, Option<OutputTr
         tail_start,
     };
     (kept.into(), Some(record))
-}
-
-fn total_lines(text: &Text) -> usize {
-    text.newlines + usize::from(text.bytes > 0 && !text.ends_line)
 }
 
 /// The leading whole lines of `prefix` within `lines` and `bytes`, and their count.

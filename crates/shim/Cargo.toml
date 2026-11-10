@@ -1,5 +1,5 @@
 [package]
-name = "shim"
+name = "skyhook-shim"
 description = "Skyhook remote worker shim"
 version.workspace = true
 edition.workspace = true
@@ -10,11 +10,20 @@ repository.workspace = true
 [[bin]]
 name = "shim"
 path = "src/main.rs"
-test = false
+test = true
 bench = false
 doc = false
 
 [dependencies]
-skyhook = { path = "../skyhook", default-features = false }
-mimalloc.workspace = true
+skyhook-worker.workspace = true
 tokio.workspace = true
+
+# Windows keeps its system allocator.
+[target.'cfg(not(windows))'.dependencies]
+mimalloc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
