@@ -313,7 +313,8 @@ mod tests {
                 .filter_map(model::Entry::job_id)
                 .count()
         };
-        assert_eq!(jobs(&app), budget.list_page);
+        // Its latest pages, as far as the rows above the view reach.
+        assert!((budget.list_page..=budget.kept).contains(&jobs(&app)));
         let earlier = model::EntryKey::Gap(model::Gap::Earlier);
         assert_eq!(app.entries()[0].key(), &earlier);
         app.focus = super::super::Pane::Content;

@@ -39,8 +39,9 @@ build:
 
 # Static release applications for `target`; embed whatever is in target/shims at compile time.
 build-release target=host_target:
-    # rust-embed cannot see newly added files; force the embedding module to rebuild.
-    touch crates/apps/src/shims.rs
+    # The applications' build script watches this directory; cargo rebuilds them on every
+    # run while it is missing.
+    mkdir -p target/shims
     v8=$(scripts/v8-archive.sh {{ quote(target) }}); \
     RUSTY_V8_ARCHIVE="$v8/librusty_v8.a" RUSTY_V8_SRC_BINDING_PATH="$v8/src_binding.rs" \
         cargo zigbuild --locked --release -p skyhook-apps --target {{ quote(target) }} {{ release_features }}
@@ -103,5 +104,5 @@ _shim_targets profile dir features="":
         os="${triple#*-*-}"; os="${os%%-*}"; \
         exe=""; [ "$os" = windows ] && exe=.exe; \
         cargo zigbuild --locked --profile {{ profile }} -p skyhook-shim --target "$triple" {{ features }}; \
-        install -Dm 755 "target/$triple/{{ dir }}/shim$exe" "target/shims/$os-${triple%%-*}"; \
+        install -CDm 755 "target/$triple/{{ dir }}/shim$exe" "target/shims/$os-${triple%%-*}"; \
     done

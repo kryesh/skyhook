@@ -18,6 +18,9 @@ const MAX_LINE: usize = 16 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Plain,
+    /// What a header says of its call's arguments: the part that gives way when the
+    /// header is wider than its row.
+    Detail,
     ToolName,
     Indicator,
     Target,
@@ -38,7 +41,7 @@ impl Role {
     pub fn color(self) -> Color {
         let theme = theme();
         match self {
-            Self::Plain | Self::ToolName => theme.ui.fg,
+            Self::Plain | Self::Detail | Self::ToolName => theme.ui.fg,
             Self::Indicator | Self::Heading => theme.ui.emphasis,
             Self::Target => theme.ui.accent,
             Self::Success => theme.ui.success,
@@ -86,6 +89,21 @@ pub fn header_line(runs: &[Run]) -> Line<'static> {
             .map(|run| Span::styled(run.text.to_string(), run.role.style()))
             .collect::<Vec<_>>(),
     )
+}
+
+/// A header's runs as a line of `width` cells where cutting its detail makes it one:
+/// what follows the detail, how the call went and which job it was, stays whole.
+pub fn fitted_header(runs: &[Run], width: usize) -> Line<'static> {
+    let mut line = header_line(runs);
+    let over = line.width().saturating_sub(width);
+    let detail = runs.iter().position(|run| run.role == Role::Detail);
+    if let Some(detail) = detail.filter(|_| over > 0) {
+        let span = std::mem::take(&mut line.spans[detail]);
+        let room = span.width().saturating_sub(over);
+        let cut = crate::tui::wrapping::clipped(Line::from(span), room);
+        line.spans.splice(detail..=detail, cut.spans);
+    }
+    line
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

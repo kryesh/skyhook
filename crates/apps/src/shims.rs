@@ -3,7 +3,7 @@
 use skyhook::remote::{ArtifactError, EmbeddedShimCatalog};
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../../target/shims/"]
+#[folder = "$SKYHOOK_SHIMS"]
 #[allow_missing = true]
 #[include = "*-*"]
 #[exclude = ".*"]

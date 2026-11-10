@@ -1,7 +1,8 @@
 //! Entry geometry and layout.
 
 use super::super::tool_view::{
-    Document, DocumentBlock, DocumentLine, HighlightCache, Role, Run, Wrap, header_line,
+    Document, DocumentBlock, DocumentLine, HighlightCache, Role, Run, Wrap, fitted_header,
+    header_line,
 };
 use super::columns::RequestColumns;
 use super::row::Row;
@@ -286,9 +287,11 @@ pub(super) fn update_entry_rows(
     if let Some(header) = entry.header() {
         let glyph = entry.disclosure().map(model::Disclosure::glyph);
         let glyph = glyph.map(|glyph| Run::new(glyph, Role::Indicator));
+        let lead = header_line(&Vec::from_iter(glyph));
+        let room = usize::from(geometry.text_width(true)).saturating_sub(lead.width());
         let line = DocumentLine {
-            lead: header_line(&Vec::from_iter(glyph)),
-            text: header_line(header),
+            lead,
+            text: fitted_header(header, room),
             wrap: Wrap::Hard,
         };
         let body = entry
@@ -585,13 +588,18 @@ mod tests {
         let header = vec![
             Run::new("read ", Role::ToolName),
             Run::new("@remote", Role::Target),
-            Run::new(" a long path ", Role::Plain),
+            Run::new(" a long path ", Role::Detail),
             Run::new("· ", Role::Muted),
             Run::new("Completed", Role::Success),
             Run::new(" · #42", Role::Muted),
         ];
         let key = model::EntryKey::UnsavedStatus(1);
         let entry = model::Entry::card(key.clone(), header.clone(), None);
+        // A row too narrow for the header cuts its detail and keeps the rest whole.
+        let rows = layout(&entry, 40);
+        let texts = rows.iter().map(|row| row.text().to_string());
+        let texts: Vec<_> = texts.filter(|text| !text.is_empty()).collect();
+        assert_eq!(texts, ["read @remote a …· Completed · #42"]);
         // The glyph leads the entry's text, but is drawn as decoration.
         let header_text = header_line(entry.header().unwrap()).to_string();
         assert_eq!(entry.text(), format!("▸ {header_text}"));

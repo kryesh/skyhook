@@ -51,7 +51,7 @@ pub(super) fn job_event_entries(
                         .map(|name| name.as_str());
                     if let Some(name) = name {
                         header.push(Run::new(" · ", Role::Muted));
-                        header.push(Run::new(brief(&clean(name), HEADER_DETAIL), Role::Plain));
+                        header.push(Run::new(brief(&clean(name), HEADER_DETAIL), Role::Detail));
                     }
                     header.push(Run::new(" · ", Role::Muted));
                     header.push(Run::new(

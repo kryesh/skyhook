@@ -46,6 +46,7 @@ ratatui = { version = "0.30", default-features = false, features = [
 rust-embed = { version = "8", features = [
     "include-exclude",
     "deterministic-timestamps",
+    "interpolate-folder-path",
 ] }
 serde.workspace = true
 serde_json.workspace = true

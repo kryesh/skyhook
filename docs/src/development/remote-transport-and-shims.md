@@ -198,8 +198,9 @@ Debug builds (`just build`) read the directory live, so rebuilding shims needs n
 applications; a running application keeps one read of each shim. A staged shim built from
 other sources than the application fails its connection at the first frame either end cannot
 decode, so rebuild the shims after changing the protocol. Release builds (`just build-release`)
-include the bytes at compile time and are self-contained. Debug shim artifacts are substantially
-larger than release artifacts.
+include the bytes at compile time and are self-contained; they rebuild the applications when a
+staged shim's bytes change or the set of staged shims does. Debug shim artifacts are
+substantially larger than release artifacts.
 
 Of the staged files named `*-*`, one with an extension is skipped, and any other must name a
 supported platform as `<os>-<arch>` or the catalog fails. A missing or empty staging directory yields

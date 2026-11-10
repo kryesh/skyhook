@@ -137,7 +137,7 @@ pub(super) fn job_entry(
         Run::new(requested_suffix(projection.job_target(job)), Role::Target),
         Run::new(
             format!(" {}", brief(&hints.summary(), HEADER_DETAIL)),
-            Role::Plain,
+            Role::Detail,
         ),
         Run::new(" · ", Role::Muted),
         Run::new(state_name(job.state), state_role(job.state)),
