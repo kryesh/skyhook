@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -184,17 +184,40 @@
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
 <li>Rust 1.99 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
-<li><a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) <strong>only for
-building the SSH shims</strong>.</li>
+<li><a href="https://ziglang.org/download/">Zig</a> 0.15 or newer on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) for release
+builds and the remote shims; debug builds and tests do not need it.</li>
 <li><code>python3</code> on <code>PATH</code> for the test suite, whose MCP tests run a scripted server.</li>
 </ul>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
 just setup
 </code></pre>
-<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components and both musl targets, and installs
-<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. See
+<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components, every shim target, and this machine’s release
+target, and installs <code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. See
 <a href="remote-transport-and-shims.html">remote transport and shims</a> for shim profiles and artifacts.</p>
+<h2 id="release-builds"><a class="header" href="#release-builds">Release builds</a></h2>
+<p><code>just build-release</code> compiles V8 from source the first time it builds a <code>v8</code> version for a
+target, and reuses that build afterwards. It needs, on <code>PATH</code>:</p>
+<ul>
+<li><code>clang</code> (with <code>ld.lld</code>, <code>llvm-ar</code> and the compiler-rt builtins) at least as new as the clang major
+that V8 version’s Chromium build pins, and <code>llvm-config</code> for its libclang; the build stops with
+the required version if the installed one is older;</li>
+<li><code>gn</code>, <code>ninja</code>, <code>git</code>, <code>python3</code>, and <code>unshare</code> (util-linux); <code>ccache</code> is used when present;</li>
+<li>a nightly Rust toolchain as this repository’s active toolchain, since V8’s own build passes
+unstable flags to <code>rustc</code>.</li>
+</ul>
+<p>The first build for a version clones the rusty_v8 source with its submodules and
+fetches crates.io sources, then compiles without network access: nothing else is downloaded, and a
+build step that tries to fails. That first build takes several CPU-hours and a few gigabytes of
+disk under <code>target/v8</code>, and more for each further target; later builds of the same version and
+target reuse the archive. To build offline, keep <code>target/v8</code> and the cargo registry
+from an earlier build.</p>
+<p>To upgrade V8, bump <code>v8</code> in <code>crates/skyhook/Cargo.toml</code>, run <code>cargo update -p v8</code>, and run
+<code>just build-release</code> as usual.</p>
+<p>Release targets are the musl targets of the architectures <code>scripts/v8-archive.sh</code> maps to V8’s
+build names, <code>x86_64-unknown-linux-musl</code> and <code>aarch64-unknown-linux-musl</code>; a target of any other
+architecture fails before building. The build host can be any Linux host whose own architecture is
+mapped; only x86_64 hosts have been tested, not aarch64.</p>
 <h2 id="common-tasks"><a class="header" href="#common-tasks">Common tasks</a></h2>
 <p>Run these commands from the repository root:</p>
 <div class="table-wrapper">
@@ -203,13 +226,13 @@ just setup
 <tr><th>Command</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><code>just setup</code></td><td>Install the Rust-side tooling and shim targets.</td></tr>
-<tr><td><code>just build-shims</code></td><td>Cross-compile debug SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
-<tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just setup</code></td><td>Install the Rust-side tooling, shim targets, and this machine’s release target.</td></tr>
+<tr><td><code>just build-shims</code></td><td>Cross-compile debug shims for every Linux and Windows shim target into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised shims into <code>target/shims</code>; requires Zig.</td></tr>
 <tr><td><code>just build</code></td><td>Debug builds of both applications; they read <code>target/shims</code> live at runtime.</td></tr>
-<tr><td><code>just build-release</code></td><td>Release builds of both applications, embedding the current contents of <code>target/shims</code>.</td></tr>
-<tr><td><code>just build-full</code></td><td>Release shims, then release applications that embed them.</td></tr>
-<tr><td><code>just install</code></td><td><code>build-full</code>, then install both applications into <code>~/.local/bin</code>.</td></tr>
+<tr><td><code>just build-release [target]</code></td><td>Release builds of both applications in <code>target/&lt;target&gt;/release</code>, embedding the current contents of <code>target/shims</code>; <code>target</code> defaults to the static musl target of this Linux machine’s architecture (<code>just --evaluate host_target</code> prints it).</td></tr>
+<tr><td><code>just build-full [target]</code></td><td>Release shims, then release applications for <code>target</code> that embed them.</td></tr>
+<tr><td><code>just install</code></td><td><code>build-full</code> for this machine, then install both applications into <code>~/.local/bin</code>.</td></tr>
 <tr><td><code>just run [args]</code>, <code>just run-security [args]</code></td><td>Run a debug application.</td></tr>
 <tr><td><code>just test</code></td><td>Nextest suite over the workspace and all targets.</td></tr>
 <tr><td><code>just lint</code></td><td>Clippy over the workspace and all targets with warnings denied.</td></tr>
@@ -221,10 +244,9 @@ just setup
 </tbody>
 </table>
 </div>
-<p>There is no build script and no cargo feature. A plain <code>cargo build</code> builds the two
-applications; pass <code>-p linux-ssh</code> to build the shim.
-Shims are only ever built by the <code>build-shims*</code> recipes; a CLI built without them reports an
-explicit missing-shim error if asked to use SSH.</p>
+<p>A plain <code>cargo build</code> builds the two applications; pass <code>-p skyhook-shim</code> to build the shim.
+Shims are only ever built by the <code>build-shims*</code> recipes; an application built without them reports
+an explicit missing-shim error when asked to connect to a remote target.</p>
 <h2 id="verification"><a class="header" href="#verification">Verification</a></h2>
 <p>Follow the repository policy in <a href="https://github.com/kryesh/skyhook/blob/main/AGENTS.md">AGENTS.md</a>.
 The standard checks are:</p>
@@ -241,10 +263,10 @@ cargo nextest run --locked --workspace --all-targets
 when changing Rust documentation examples. For book changes, run <code>just docs</code> and check the
 rendered pages and links. <code>AGENTS.md</code> also covers test policy, including stress runs for tests
 that coordinate gated provider steps.</p>
-<p>The workspace holds the <code>skyhook</code> library, the <code>skyhook-cli</code> host with the <code>skyhook</code> binary, the
-<code>skyhook-security</code> binary and the <code>linux-ssh</code> shim under <code>crates/</code>. See
-<a href="architecture.html">architecture</a> and <a href="embedding.html">embedding</a> for the library boundaries.
-<a href="documentation.html">Documentation and publishing</a> covers local preview and manual GitHub Pages
+<p>These checks compile and test for the build machine only. Windows code is compiled by
+<code>just build-shims</code> alone, so run it after changing anything under <code>cfg(windows)</code>.</p>
+<p>See <a href="architecture.html#crate-layout">architecture</a> for the crates and
+<a href="documentation.html">documentation and publishing</a> for local preview and manual GitHub Pages
 publishing.</p>
 
                     </main>

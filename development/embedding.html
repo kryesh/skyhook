@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -184,107 +184,120 @@
 <p>The <code>skyhook</code> crate is the Rust library. Hosts supply configuration,
 a workspace, model selection, and interaction handlers rather than depending on terminal UI
 state. See <a href="architecture.html">library architecture</a> for responsibility boundaries and the internal
-request lifecycle.</p>
-<h2 id="layered-host-configuration-and-model-hints"><a class="header" href="#layered-host-configuration-and-model-hints">Layered host configuration and model hints</a></h2>
-<p><code>Config::resolve(workspace, explicit).await</code> loads the main <code>config.yaml</code> without building
-providers or looking up credentials. Hosts with another YAML schema use the same loader through
-<code>config::resolve_layers::&lt;T&gt;(workspace, explicit).await</code>, implementing <code>config::LayeredConfig</code>
-on their own deserializable type:</p>
-<pre><code class="language-rust ignore">use std::{collections::BTreeMap, convert::Infallible};
-use serde::Deserialize;
-use skyhook::config::{LayeredConfig, resolve_layers};
+request lifecycle. Session and agent identifiers are <code>skyhook::identity</code>. The tools’
+vocabulary, such as diagnostics, target names and execution locations, comes from
+<code>skyhook-tools</code>, types the library shares with the remote shim, such as operations, credentials
+and job identifiers, from <code>skyhook-worker</code>, and generic primitives, such as <code>enums::NamedEnum</code> and
+<code>bounded::Bounded</code>, from <code>skyhook-base</code>; a host depends on them beside <code>skyhook</code>.</p>
+<h2 id="configuration-and-model-hints"><a class="header" href="#configuration-and-model-hints">Configuration and model hints</a></h2>
+<p><code>skyhook::config::Config</code> is the configuration: public sections a host parses or builds, then
+seals with <code>into_runtime()</code>. The library reads no configuration file; where a configuration
+comes from is the host’s own.</p>
+<ul>
+<li><code>Config::from_yaml(text)</code> parses and admits one document the host holds, naming the field it
+refuses. Each section also deserializes on its own (<code>RawProviderConfig</code>, <code>Mode</code>,
+<code>TargetConfig</code>, <code>McpServerConfig</code>), from any serde format.</li>
+<li><code>Config::builder()</code> builds one in code from <code>Config::default()</code>, what an empty document
+configures. It declares the named entries (<code>provider</code>, <code>mode</code>, <code>target</code>) and selects among
+them (<code>default_model</code>, <code>default_mode</code>); <code>build()</code> admits the result as <code>from_yaml</code> admits a
+document. Every other setting (<code>mcp</code>, <code>max_child_depth</code>) is a public field.</li>
+<li><code>Config::validate()</code> runs the same admission on a configuration a host edited or merged.</li>
+</ul>
+<pre><code class="language-rust ignore">use skyhook::config::{Config, mode::Mode};
+use skyhook::provider::dialect::RawProviderConfig;
 
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct HostConfig {
-    profiles: BTreeMap&lt;String, Profile&gt;,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Profile {
-    description: String,
-}
-
-impl LayeredConfig for HostConfig {
-    type Error = Infallible;
-    const FILE_NAME: &amp;'static str = "host.yaml";
-    const NAMED_ENTRIES: &amp;'static [&amp;'static str] = &amp;["profiles"];
-
-    fn missing() -&gt; Option&lt;Self&gt; {
-        Some(Self::default())
-    }
-}
-
-let loaded = resolve_layers::&lt;HostConfig&gt;(workspace, explicit_host_config).await?;
-let host_config = loaded.config;</code></pre>
-<p>Discovery selects the first usable user file: <code>$XDG_CONFIG_HOME/skyhook/&lt;FILE_NAME&gt;</code>, then
-<code>$HOME/.config/skyhook/&lt;FILE_NAME&gt;</code>. Rejected candidates remain in <code>loaded.report</code>; their fields
-never enter the configuration. The workspace’s <code>.skyhook/&lt;FILE_NAME&gt;</code> overlays that file, or can
-stand alone. A malformed workspace file is fatal. An explicit path disables all discovery, even
-workspace resolution, and must exist.</p>
-<p><code>NAMED_ENTRIES</code> lists top-level maps whose entries replace same-named entries whole while keeping
-other names; every other top-level value is replaced whole, and defaults apply after merging. A
-schema’s <code>admit_layer</code> validates each candidate file and the effective document; <code>LayerSources::entry</code>
-names the file behind a named entry for source-relative paths. The generic loader does not
-interpret <code>providers</code> or <code>mcp</code>; those belong to the main <code>Config</code> schema.</p>
-<p>Omitting <code>missing()</code> requires a discovered file. Returning defaults permits absent discovered
-files, but never hides rejected files or a missing explicit path; the defaults still undergo
-admission. Empty YAML, <code>null</code>, and non-mapping documents are always invalid.
-<code>LayerResolutionError</code> names the schema file and retains its <code>ConfigReport</code> through <code>report()</code>.</p>
+let local: RawProviderConfig = serde_json::from_value(serde_json::json!({
+    "dialect": "compatible",
+    "codec": "chat_completions",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "models": {"main": {"model": "served-name", "max_context": 128000, "max_output": 4096}},
+}))?;
+let review: Mode = serde_json::from_value(serde_json::json!({"capabilities": ["read"]}))?;
+let mut config = Config::builder()
+    .provider("local".parse()?, local)
+    .mode("review".parse()?, review)
+    .default_model("local/main".parse()?)
+    .build()?;
+config.max_child_depth = 2;
+let runtime = config.into_runtime()?;</code></pre>
+<p>A provider entry’s public <code>home</code> (<code>ConfigHome</code>) says where it was defined: <code>File(path)</code> keeps
+its Skyhook-managed credentials in <code>credentials/</code> beside that file and names the file in login
+hints; <code>Unfiled</code>, what parsing and building leave, keeps them in the user’s Skyhook
+configuration directory. An MCP server’s relative <code>cwd</code> is the host’s to place, with
+<code>McpServerConfig::resolve_cwd(base)</code>.</p>
 <p>Before sealing a <code>Config</code>, hosts can edit a configured model’s profile through
 <code>model_profile_mut(&amp;ModelRef)</code>, which returns <code>ConfigError::Model</code> for an unknown provider or
 model. Clearing a hint removes that model from the choices offered to agents, not from the
 configured catalog. Hosts can also assign the public <code>default_model: Option&lt;ModelRef&gt;</code> before
 calling <code>into_runtime()</code>, which validates the selection. Edits affect the new runtime generation
 only, not previously sealed configurations.</p>
-<h2 id="sharing-the-cli-and-terminal"><a class="header" href="#sharing-the-cli-and-terminal">Sharing the CLI and terminal</a></h2>
-<p>The <code>skyhook-cli</code> crate is the shared host. A product implements <code>Product</code> with an <code>Args</code> type
-implementing <code>clap::Args</code>, a <code>Command</code> implementing <code>clap::Subcommand</code> (<code>NoArgs</code> and
-<code>NoCommand</code> for unused extension points), and an <code>Identity</code>: the <code>HostName</code> its sessions are
-tagged with, the <code>tables</code> it keeps in them (see below), display name, about text, the
-placeholder shown in an empty conversation, a <code>state_file</code> path relative to <code>.skyhook</code> for that
-product’s remembered model, mode and sidebar setting, a <code>RootMode</code> (<code>Switchable</code>, or <code>Fixed</code> to keep the root in the configured default mode
-and refuse <code>--mode</code>), a <code>Theme</code>, and the <code>HostCapabilityDeclaration</code>s its modes grant, which
-the host declares on every session the product opens, another host’s included. A theme is a UI palette of semantic roles (surfaces,
-emphasis, strong, accent, success/warning/error) plus a syntax palette of explicit <code>Rgb</code>
-colours for highlighted code; a
-product usually supplies its own UI palette and keeps <code>SyntaxPalette::DEFAULT</code> so code reads the
-same in every product. Its session arguments work at the root, under <code>batch</code> and for
-<code>dump config</code>; shared <code>auth</code>, <code>dump skills</code> and <code>stats</code>, and its extra commands take only their
-own arguments. Session history is always <code>.skyhook/sessions</code>. The host reads <code>approve_all</code> from
-<code>config.yaml</code> itself (<code>HostConfig</code>); it is not a library setting.</p>
-<p>A thin binary retains its own global allocator and starts in this order:</p>
-<pre><code class="language-rust ignore">fn main() {
-    skyhook::remote::askpass_main();
-    // SAFETY: no threads or runtime have been started.
-    unsafe { skyhook_cli::main(MyProduct) }
-}</code></pre>
-<p><code>main</code> is <code>unsafe</code> because it loads the invocation directory’s <code>.env</code> before starting Tokio, so
-the process must still be single-threaded; help and version need no <code>.env</code> or configuration.</p>
+<h2 id="products-and-launching-their-sessions"><a class="header" href="#products-and-launching-their-sessions">Products and launching their sessions</a></h2>
+<p>A product is a library on <code>skyhook</code> alone. It implements <code>skyhook::product::Product</code> with its
+own <code>Options</code> type for what a launch takes beside the configuration, any settings of its own
+included as the host parsed them, and an <code>Identity</code>: the
+<code>HostName</code> its sessions are tagged with, the <code>schema</code> of those sessions (see below), display
+name, a <code>RootMode</code> (<code>Switchable</code>, or <code>Fixed</code> to keep the root in the configured default
+mode), and the <code>HostCapabilityDeclaration</code>s its modes grant, which every
+session the product opens declares, another host’s included. <code>skyhook::product::Skyhook</code> is the
+plain coding-agent product. Any host can serve it.</p>
+<p>A front end opens a product’s sessions through <code>skyhook::launch</code>:</p>
+<ul>
+<li><code>launch::configure(&amp;product, options, HostConfig, workspace, &amp;ExecutionRequest, Attendance)</code>
+takes the configuration the front end read or built (<code>launch::config::HostConfig</code>: a <code>Config</code>
+with the launch’s <code>approve_all</code>, which also deserializes from a document carrying that key),
+applies the product’s edit and canonicalizes the workspace. The request
+(<code>launch::request::ExecutionRequest</code>) names a session to resume and an explicit root model.
+The returned host’s <code>warnings</code> are what the product said of its configuration, for the front
+end to show.</li>
+<li><code>launch::startup::prepare(host, &amp;request, &amp;PermissionRequest, remembered, catalog)</code> admits the
+configuration and selects the root’s model and
+mode: the explicit ones, else the front end’s <code>remembered</code> choices while configured, else the
+configured defaults. <code>PermissionRequest</code> is a mode or a batch job’s exact capabilities;
+<code>catalog</code> is the shim catalog remote targets bootstrap with. Persisting the remembered choices
+is the front end’s own.</li>
+<li><code>Launch::create(Opening, &amp;Interface)</code> creates or resumes a session in the workspace’s
+<code>.skyhook/sessions</code>, with the product’s factory for its own sessions and view-only for another
+host’s. <code>Interface::Batch</code> denies whatever needs approval; <code>Interface::Attended</code> carries a
+<code>skyhook::interaction::UiInteraction</code>, whose receiver gets each approval, question batch and
+rename as a <code>Prompt</code> with a one-shot reply.</li>
+<li><code>skyhook::attachment::read_attachment</code> reads a workspace file as a prompt attachment, and
+<code>SessionStore::read_each</code> reads every saved session of a workspace a few at a time, for a
+session list.</li>
+</ul>
+<p>The <code>skyhook</code> and <code>skyhook-security</code> binaries are thin front ends over these, in the
+<code>skyhook-apps</code> package; product options join their shared command line at the root, under
+<code>batch</code> and for <code>dump config</code>.</p>
 <p>The extension points are:</p>
 <ul>
-<li><code>Product::configure(&amp;self, &amp;mut Config, Args, SessionContext&lt;'_&gt;)</code> returns <code>Configured</code>: the
-product’s own <code>ConfigReport</code>, which the host renders beside the main configuration’s, and an
-<code>Arc&lt;dyn SessionFactory&gt;</code>. It edits the resolved configuration before runtime admission
-(product settings, model defaults, modes, MCP entries); <code>dump config</code> serializes the result and
-a session runs with it. <code>command</code> handles the product’s own subcommands.</li>
+<li><code>Product::configure(&amp;self, &amp;mut Config, Options, SessionContext&lt;'_&gt;).await</code> returns <code>Configured</code>:
+the product’s <code>warnings</code> of the configuration it was handed, each complete as a host shows it,
+and an <code>Arc&lt;dyn SessionFactory&gt;</code>. It edits the configuration before runtime admission (product
+settings, model defaults, modes, MCP entries); a product’s own settings arrive parsed in its
+<code>Options</code>. A front end that inspects configuration calls it directly and
+serializes the result, as <code>dump config</code> does; a session runs with it.</li>
 <li><code>SessionFactory::form(&amp;self, SessionContext&lt;'_&gt;) -&gt; Option&lt;ScopeForm&gt;</code> is the scope a new
-session’s draft is written with (<code>cli::form</code>): choice and integer fields with defaults, and a
+session’s draft is written with (<code>skyhook::product::form</code>): choice and integer fields with defaults, and a
 message used when the draft is submitted empty. The terminal shows it at the top of the root’s
 conversation beside the composer, sends its values with the first message and freezes it once
 the session starts; a failed start leaves it editable. The values reach <code>prepare</code> in the
 context’s <code>Opening::New</code>. Batch runs pass no form.</li>
 <li><code>SessionFactory::prepare(&amp;self, HarnessBuilder, SessionContext&lt;'_&gt;)</code> returns
 <code>HookFuture&lt;'_, PreparedSession&gt;</code>: the customized builder and an <code>Arc&lt;dyn SessionExtension&gt;</code>.
-<code>SessionContext</code> holds the canonical workspace, <code>headless</code>, and its <code>Opening</code>: <code>New</code> with the
+<code>SessionContext</code> holds the canonical workspace, its <code>attendance</code> (<code>Attended</code> at a terminal,
+<code>Batch</code> with nobody to ask), and its <code>Opening</code>: <code>New</code> with the
 form’s answers, if any, or <code>Resume(SessionId)</code>. A draft calls it on first submission; the host
-tags the builder with the product’s host name and tables and calls it only for the product’s
+tags the builder with the product’s host name and schema and calls it only for the product’s
 own sessions, so a foreign session opens view-only with no extension.</li>
 <li><code>SessionExtension::opened(&amp;self, &amp;SessionHandle, SessionContext&lt;'_&gt;) -&gt; HookFuture&lt;'_, ()&gt;</code>
 runs before the first input; associate a new session with its product resources here, and
 finish a setup an interruption left undone. A reopened session may only be viewed, so change
 nothing else. Failure shuts the session down.</li>
+<li><code>SessionExtension::scope(&amp;self, &amp;SessionHandle) -&gt; HookFuture&lt;'_, Option&lt;ScopeForm&gt;&gt;</code> is the
+scope a session runs under in this launch, as the factory’s form holding those values,
+including what a resume hook changes once its work begins. The terminal
+reads it after <code>opened</code> for a session it opens rather than starts from a draft (a resume, or a
+switch to another session) and shows it frozen at the top of the root’s conversation. The
+default is none.</li>
 <li>What this launch changes about a reopened session’s work (as the security product applies its
 <code>--workers</code>) goes in a <code>skyhook::agent::ResumeHook</code> registered on the prepared
 builder with <code>HarnessBuilder::resume_hook</code>; the library runs it before that session’s first
@@ -296,13 +309,9 @@ session ID first. A product that keeps its own data in each session declares it 
 harness creates every session from it and checks the tables’ format on every one of its own it
 reopens. <code>Schema::extended(image, seed)</code> takes the tables as a <code>ProductImage</code> and a function that
 fills their dictionaries in a new session (<code>Seeding::Fill</code>) and checks them on an open
-(<code>Seeding::Check</code>). <code>skyhook_schema::image!(format = N, file = "src/schema.sql")</code> builds the
-image at compile time: the journal’s schema with the product’s DDL layered on it and the format
-recorded, from <code>sql = "…"</code> literals and <code>file = "…"</code> paths relative to the crate’s manifest, in
-order. A changed file rebuilds the crate. The macro sees its arguments unexpanded, so they must
-be literals or file paths, not <code>concat!</code>, <code>include_str!</code> or another macro’s output; DDL only
-available that way goes through <code>ProductImage::layered(ddl, format)</code>, which runs it over the
-journal’s image as each session is created. A plain host passes <code>Schema::JOURNAL</code>.
+(<code>Seeding::Check</code>). <code>ProductImage::layered(ddl, format)</code> runs the product’s DDL over the
+journal’s image as each session is created and records the format. A plain host passes
+<code>Schema::JOURNAL</code>.
 <code>SessionStore::summary</code>, given the host and its schema, refuses one of the host’s own sessions that check would refuse, so the
 session switcher leaves it out and <code>--resume</code> refuses it before <code>prepare</code>, as for an earlier
 session format; other hosts’ sessions are still listed, view-only. The harness hands host state
@@ -310,16 +319,18 @@ and the resume hook the tables as an <code>ExtensionDb</code> on the session’s
 tools reach them through <code>ToolContext::extension()</code>, and the extension’s terminal hooks through
 the session (<code>SessionStore::extension()</code>); a write whose commit failed reports <code>Unconfirmed</code>, since it may have committed. Another host’s harness opens such a session without them; <code>ExtensionDb::inspect</code> reads
 them read-only without opening it. Files of the product’s own go in subdirectories of the
-session directory. <code>HookFuture</code> is a boxed <code>Send</code> future returning <code>Result&lt;T, cli::Error&gt;</code>.</p>
-<h3 id="per-session-terminal-views-and-actions"><a class="header" href="#per-session-terminal-views-and-actions">Per-session terminal views and actions</a></h3>
-<p><code>SessionExtension::views()</code> returns a stable slice of <code>ExtensionView { title, frame }</code>. These
-tabs follow Conversation, Requests, and Jobs and share their keyboard cycling and clickable
-headers. <code>ViewFrame::Session</code> draws a view inside the session’s chrome; <code>ViewFrame::Page { agents }</code>
-gives it the frame below the tab strip, keeping only the footer, any prompt awaiting an answer
-and, with <code>AgentPane::Live</code>, the live agents: a column beside the page on a terminal at least 100
-columns wide, the usual band below it on a narrower one. <code>AgentPane::Hidden</code> leaves them out.</p>
-<p><code>refresh(view, SessionHandle, Disclosed) -&gt; HookFuture&lt;'_, page::Page&gt;</code> loads <code>views()[view]</code>
-off the UI thread, as the extension’s own session sees it. A <code>Page</code> is a list of typed blocks:
+session directory, whose work takes turns through <code>ExtensionDb::filing</code> as the tables’ writers
+do through <code>writing</code>. <code>HookFuture</code> is a boxed <code>Send</code> future returning
+<code>Result&lt;T, skyhook::product::Error&gt;</code>.</p>
+<h3 id="per-session-views-and-actions"><a class="header" href="#per-session-views-and-actions">Per-session views and actions</a></h3>
+<p><code>SessionExtension::views()</code> returns the stable titles of the session’s read-only views. In the
+terminal they are tabs after Conversation, Requests, and Jobs, sharing their keyboard cycling and
+clickable headers, and each takes the frame below the tab strip, keeping only the footer, any
+prompt awaiting an answer and the live agents: a column beside the page on a terminal at least
+100 columns wide, the usual band below it on a narrower one.</p>
+<p><code>refresh(view, SessionHandle, Disclosed) -&gt; HookFuture&lt;'_, Arc&lt;page::Page&gt;&gt;</code> loads
+<code>views()[view]</code> off the UI thread, as the extension’s own session sees it; returning the same
+<code>Arc</code> for an unchanged page spares the host laying it out again. A <code>Page</code> is a list of typed blocks:
 <code>Facts</code> (label and value pairs), a <code>Pipeline</code> of stages, <code>Panels</code> of labelled values and
 meters, and <code>Section</code>s, collapsible tables of records that each open to their detail. Cells
 carry a <code>Tone</code> and a <code>Weight</code>, not a colour or a font. The host lays the page out with its own
@@ -382,21 +393,20 @@ leaves the session untitled. <code>rename(Some(title))</code> sets the user’s 
 <code>title().await</code> reads the title the session list shows, as a <code>SessionTitle</code> with its text and
 <code>TitleSource</code>: the user’s newest title unless cleared since, otherwise the newest <code>Prompt</code> or
 <code>Generated</code> title, otherwise the first text the user sent the root agent, as a <code>Prompt</code> title.</p>
-<p>Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
-and an embedded shim catalog. A <code>Policy</code> answers <code>Approval::Decided</code> for what it settles by itself
+<p>Before building, hosts can supply policy and question handlers, additional tools, and an embedded
+shim catalog. A <code>Policy</code> answers <code>Approval::Decided</code> for what it settles by itself
 and <code>Approval::Ask</code> for what it asks someone, asking nothing until that future is polled. A call
 that may not ask anyone, because a path it names outside the workspace does not exist, drops an
 <code>Ask</code> unpolled and is refused with <code>PolicyDecision::refused()</code>, the reason a person’s denial
-should carry so the two cannot be told apart. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
-<code>PromptAnswer</code>: <code>Secret</code> for passwords, passphrases and keyboard-interactive prompts, and
-<code>Confirmed</code> or <code>Rejected</code> for the confirmation kinds (<code>SensitivePromptKind::is_confirmation</code>), which
-cover host keys and agent key use. A handler error means no answer could be obtained; <code>Rejected</code> is a
-decision, and so is an answer of the wrong shape for the prompt’s kind. Core <code>Config</code> loading does not load <code>.env</code>; environment setup belongs
+should carry so the two cannot be told apart. A remote call whose paths would need nothing of their
+own inside the workspace is requested before they resolve, as it would be once they resolve inside
+it, without asking anyone: a <code>Decided</code> allowance starts its operation in the flight that resolves
+them, saving a round trip, and should they resolve outside, the call is requested again with what
+they need. Core <code>Config</code> loading does not load <code>.env</code>; environment setup belongs
 to the host (the CLI performs its own startup loading).</p>
-<p>The builder defaults to <code>&lt;workspace&gt;/.skyhook/sessions</code>. <code>HarnessBuilder::session_root</code>, including
-an override supplied by <code>Config::session_root</code>, is passed through unchanged: a relative path is
-relative to the process working directory, not the workspace or configuration file. The CLI selects
-its own workspace-local session root.</p>
+<p>The builder defaults to <code>&lt;workspace&gt;/.skyhook/sessions</code>. <code>HarnessBuilder::session_root</code> is passed
+through unchanged: a relative path is relative to the process working directory, not the
+workspace.</p>
 <h2 id="persona-and-prompt-templates"><a class="header" href="#persona-and-prompt-templates">Persona and prompt templates</a></h2>
 <p>A host keeps its persona and mode instructions as embedded Tera templates, which the library
 renders for each agent. <code>skyhook::templates!</code> embeds each named file from the invoking crate’s
@@ -411,7 +421,7 @@ prompt after the built-in role text and before the runtime’s workspace, tool, 
 mode instructions. Templates are named by a <code>TemplateName</code>, the name they are registered under.
 A mode whose <code>instructions</code> is <code>Instructions::Template(name)</code> is told that template; configuration spells only text, and <code>dump config</code> leaves a template out. Each template
 renders from the agent’s context (<code>role</code>, <code>available_depth</code>, <code>capabilities</code>, <code>mode</code>,
-<code>location</code>, <code>job_view</code>) with the section’s fields as top-level names, when the agent’s contract
+<code>context</code>, <code>job_view</code>) with the section’s fields as top-level names, when the agent’s contract
 is fixed: <code>Prompts::edition</code> renders a mode’s instructions for an agent entering it.</p>
 <p>The journal keeps what rendered: a mode’s edition records its instructions’ text, and an
 agent’s prompt as sent. A resumed agent keeps its recorded prompt until a mode change rebuilds
@@ -551,12 +561,13 @@ snapshot holds them where it holds them, and as their page read them otherwise; 
 when the session lets a job go may have read it before its final view, which <code>apply</code> hands over in
 <code>unheld</code>, as it hands over a request a newer one replaced in <code>superseded</code>.</p>
 <h3 id="inspection-and-host-records"><a class="header" href="#inspection-and-host-records">Inspection and host records</a></h3>
-<p><code>inspect_output_with_captures</code> and <code>jobs().inspect_output_fields</code> are host inspection APIs. They do not
-claim jobs or consume agent notifications. <code>cancel_job</code> is the separate operation that requests
+<p><code>inspect_output_with_captures</code> is the host inspection API. It does not
+claim jobs or consume agent notifications. Its <code>files</code> name each file a field of the job is kept
+in. <code>cancel_job</code> is the separate operation that requests
 cancellation. <code>warnings</code> and <code>mcp_servers</code> expose startup diagnostics and MCP
 discovery outcomes without inserting diagnostics into model context or writing directly to a
 terminal. <code>record_status</code> likewise records host-facing status, not a user message.</p>
-<p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
+<p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::session</code>. Hosts projecting
 checklists from records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
@@ -624,8 +635,8 @@ replaces the model, as does <code>SessionHandle::activate_on</code>, which a vie
 commit that activates it. Job deliveries that would wake the root before then begin a turn that
 fails as any failed turn does, journaled, and stay pending for the input that names a model. A child whose own model is gone restarts
 on the root’s, journaled as a model change; with the root’s gone too, its restart fails alone.</p>
-<p>Session database formats are clean breaks (the current one is named in
-<a href="architecture.html">architecture</a>): earlier formats are not migrated and cannot be resumed; retain a
+<p>Session database formats are clean breaks (<code>crates/schema/src/session.sql</code> sets the current
+one, 32): earlier formats are not migrated and cannot be resumed; retain a
 compatible Skyhook version to inspect them, or start a new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. It interrupts
@@ -650,12 +661,14 @@ A session belongs to the Tokio runtime that created or resumed it: use it only f
 and keep the runtime running until the session is closed.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
 <p>The library’s shim catalog is empty by default. Supply <code>remote::EmbeddedShimCatalog</code> through
-<code>HarnessBuilder::shim_catalog</code> to enable remote execution. The CLI supplies its own catalog, but
-library hosts do not inherit the CLI’s artifacts.</p>
-<p><code>EmbeddedShimCatalog::from_embedded_assets</code> accepts names of the form <code>platform-protocol-arch</code>
-(for example, <code>linux-ssh-aarch64</code>) and a loader that returns a named artifact’s bytes, called only
-for the artifact being deployed. Selection uses the destination’s protocol, platform, and
-architecture. A missing matching artifact produces an explicit deployment error.
+<code>HarnessBuilder::shim_catalog</code>, or to <code>launch::startup::prepare</code>, to enable remote execution.
+The binaries embed their own catalog; library hosts do not inherit their artifacts.</p>
+<p><code>EmbeddedShimCatalog::from_embedded_assets</code> accepts names of the form <code>platform-arch</code> (for
+example, <code>linux-aarch64</code>), skipping names with an extension and refusing any other, and a loader
+that returns a named artifact’s bytes. The catalog calls the loader when a connection first
+needs an artifact, and keeps one read of it: each artifact of the destination’s declared <code>os</code>, to learn what may be
+installed there, and the one for the destination’s platform and architecture, which it deploys as
+read. A missing matching artifact produces an explicit deployment error.
 See <a href="remote-transport-and-shims.html">remote transport and shims</a> for build, packaging, and deployment
 behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
@@ -664,8 +677,9 @@ read-only database snapshot without acquiring the session’s writer lock: an ex
 whole journal. A live owner may continue writing; archive inspection neither takes ownership nor
 resumes unfinished work. <code>SessionStore::is_open(root, id).await</code> reports whether a store in any
 process holds the session. It takes the session lock shared for an instant; an open racing it
-retries once before failing with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id).await</code> reads a
-session list row without decoding the session, including its title as <code>SessionStore::title</code>
+retries once before failing with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id, owner).await</code>
+reads a session list row without decoding the session, checking a product’s own tables when
+<code>owner</code> names the session’s host and schema, including its title as <code>SessionStore::title</code>
 reads it, in <code>last_millis</code> the time of its newest record that <code>SessionEvent::is_activity</code> (closing
 a session is not), and, in <code>stopped</code>, the failed or interrupted turn that resuming the root agent
 would continue, if any. <code>stopped</code> reads only the root’s journaled turns, so a session that closed
@@ -725,9 +739,9 @@ replay of the external call.</p>
 See <a href="architecture.html#history-transient-state-and-caching">history, transient state, and caching</a>
 for their semantics and provider rationale.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/config/runtime.rs">configuration admission</a>,
-<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/agent/runtime/session.rs">session handle</a>,
-<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/agent/observation.rs">observation</a>, and
-<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/session/request.rs">request reconstruction</a>.</p>
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/agent/handle.rs">session handle</a>,
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/session/observation.rs">observation</a>, and
+<a href="https://github.com/kryesh/skyhook/blob/main/crates/skyhook/src/session/replay.rs">request reconstruction</a>.</p>
 
                     </main>
 

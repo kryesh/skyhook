@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -191,7 +191,8 @@ provider is used.</p>
 <p>Every provider names a <strong>dialect</strong>, the server’s wire conventions. Each model selects a <strong>codec</strong>,
 either directly or from its provider’s defaults: <code>chat_completions</code>, <code>responses</code>, or <code>messages</code>.
 The codec is the API family; <code>base_url</code> names the shared API root and Skyhook appends
-<code>/chat/completions</code>, <code>/responses</code>, or <code>/messages</code> for the selected model.
+<code>/chat/completions</code>, <code>/responses</code>, or <code>/messages</code> for the selected model
+(<code>/codex/responses</code> for a <code>codex</code> provider).
 Different models on one provider may use different supported codecs:</p>
 <div class="table-wrapper">
 <table>
@@ -214,8 +215,7 @@ dialect accepts fixed request <code>headers</code> for proxies or attribution, t
 <code>anthropic-beta</code> adds to the betas Skyhook announces rather than replacing them. The credential
 header and header placements (<code>cache_key: {header: …}</code>, or a dialect’s own) replace an entry
 header of the same name; so does <code>Accept</code>, which is always <code>text/event-stream</code>. A shadowed
-header’s command does not run for that request. There are no model aliases or automatic vendor
-detection: <code>model</code> is the identifier sent on the wire.</p>
+header’s command does not run for that request.</p>
 <h2 id="provider-defaults-and-model-settings"><a class="header" href="#provider-defaults-and-model-settings">Provider defaults and model settings</a></h2>
 <p>Request settings are flat: put shared defaults beside <code>models</code>, and model-specific values
 directly beside <code>model</code>.</p>
@@ -243,8 +243,7 @@ organization header, <code>routing: null</code> removes routing preferences, <co
 requests no summaries, and a placement selection of <code>null</code> places nothing. A setting that always
 sends something, such as <code>state_role</code> or <code>reasoning_effort</code>, refuses <code>null</code>; leave it out to take
 its default. Lists, such as LiteLLM’s <code>tags</code>, refuse <code>null</code> too: <code>[]</code> is the empty list. A
-placement selection’s list of locations is never empty; <code>null</code> is how it places nothing.
-Provider-only settings differ: <code>startup_timeout_secs: null</code>, for one, takes the default.</p>
+placement selection’s list of locations is never empty; <code>null</code> is how it places nothing.</p>
 <p>Every model must have <code>codec</code>, and LiteLLM models must also have <code>upstream</code>, <strong>after inheritance</strong>.
 A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
 each effective model, not to the provider defaults in isolation. Unknown fields, provider-only
@@ -279,7 +278,7 @@ reasoning conventions to use for each alias.</p>
 <h3 id="service-tier"><a class="header" href="#service-tier">Service tier</a></h3>
 <p><code>service_tier</code> selects the backend’s tier ID, such as <code>priority</code>, <code>flex</code>, or <code>ultrafast</code>, on any
 dialect and codec, as a provider default or beside <code>model</code>. It is unset by default and sent
-exactly as written: Skyhook does not translate client aliases such as <code>fast</code>. Check that the
+exactly as written. Check that the
 endpoint and model accept the tier before selecting it. Faster tiers can cost more or use more of
 a subscription; see <a href="https://learn.chatgpt.com/docs/agent-configuration/speed">ChatGPT speed</a>.</p>
 <h3 id="responses-settings"><a class="header" href="#responses-settings">Responses settings</a></h3>
@@ -348,8 +347,8 @@ proceeds. Each dialect sets defaults:</p>
 </div>
 <p><code>image_limits</code> replaces either limit, as a provider default or beside <code>model</code>; a limit left out
 keeps the default, and <code>image_limits: null</code> restores both. <code>max_bytes</code> is at most 8 MiB, since no
-image is stored larger, and <code>max_edge</code> at most 65535 px, the largest JPEG; a larger value reads
-as that maximum. The limits are per image: a service
+image is stored larger, and <code>max_edge</code> at most 65535 px, the largest JPEG; a larger value is
+refused. The limits are per image: a service
 rule that depends on how many images a request holds, or on their total pixel area, is not
 applied. Changing a model’s limits from its dialect’s defaults changes the images earlier
 reasoning saw, so signed reasoning from before the change is not replayed afterward.</p>
@@ -401,7 +400,7 @@ limit, so <code>output_limit: null</code> is refused there, as is <code>reasonin
 <code>max_output</code> must be smaller than <code>max_context</code>. Prompt/history, reasoning, and generated
 text share the context window. Automatic <a href="../guide/sessions-and-context.html#conversation-compaction">compaction</a>
 is triggered by a response whose reported input, cached input, and output tokens reach
-90% of <code>max_context - max_output</code>; it does not estimate the next request. Compaction precedes
+90% of <code>max_context - max_output</code>. Compaction precedes
 tool execution, or, after a final answer, the agent’s next request. The summarizer sees the
 pending calls, and their results reach the first post-compaction request intact; a pending <code>todo</code>
 replacement is superseded by its reconciled list.
@@ -427,8 +426,7 @@ previous one’s, and a provider that reuses only where an earlier request ended
 then reuses little of the history. <code>none</code> sends no runtime state, except to a
 compaction summary, which needs the current todo list to reconcile it. See
 <a href="../reference/runtime-state.html">runtime state</a> for what the model receives.</p>
-<p>Runtime state is the harness speaking, so it never appears as tool output. A dialect’s
-<code>state_role</code> selects how it is sent:</p>
+<p>A dialect’s <code>state_role</code> selects how runtime state is sent:</p>
 <ul>
 <li><code>system</code> uses the protocol’s harness role: a system message on <code>messages</code>, a system or
 developer message on <code>chat_completions</code>, and a developer message on <code>responses</code>. Through
@@ -517,8 +515,8 @@ for server options.</p>
 <h2 id="model-failure-recovery"><a class="header" href="#model-failure-recovery">Model failure recovery</a></h2>
 <p>For every provider, <strong>transient/network failures retry until success or cancellation</strong>,
 with no attempt limit. This includes connection failures, interrupted streams, timeouts,
-rate limits, temporary server errors, an expired command-sourced credential
-(<a href="authentication.html#api-keys-and-environment-files">authentication</a>), and a response with
+rate limits, temporary server errors, an expired credential from a command or file
+(<a href="authentication.html#api-keys">authentication</a>), and a response with
 neither visible text nor a tool call, such as reasoning alone. Other authentication, billing
 (exhausted quota, credit, or spend limit, however the service reports it), invalid-request, and
 malformed-response errors stop the request instead of retrying. So do refusals, and a response
@@ -563,8 +561,7 @@ reasoning from the model appears in the context; from then on only that is sent.
 accept only reasoning they signed or encrypted never get the rest: <code>anthropic</code>, <code>openai</code> and
 <code>codex</code> on <code>responses</code>, and <code>litellm</code> behind Anthropic and on <code>responses</code>.</p>
 <p>Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
-replay their returned reasoning under <strong><code>reasoning_content</code> by default</strong>. Ordinary Chat responses
-without reasoning do not acquire an invented reasoning field.
+replay their returned reasoning under <strong><code>reasoning_content</code> by default</strong>.
 A server that spells the key differently selects it with <code>reasoning_replay: "reasoning"</code>; <code>reasoning_replay: null</code> keeps reasoning local. The <code>openai</code> dialect never
 replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> behind an
 <code>anthropic</code> or <code>bedrock</code> upstream replays the thinking blocks the proxy returns, and <code>openrouter</code> replays its
@@ -576,14 +573,14 @@ thinking blocks are sent, a turn’s <code>reasoning_details</code> are sent who
 is signed, and plain-text reasoning stays local. Responses and Messages replay native reasoning
 automatically; a Responses reasoning item that restates its summary as content, or the reverse,
 is kept once, as its final item states.</p>
-<p>Reasoning is replayed with its owning assistant turn, including turns that only call tools;
-it is never merged into answer text or fabricated <code>&lt;think&gt;</code> tags. Server-side tool and reasoning
-parsers/templates must be configured appropriately; Skyhook does not infer them from model names.
+<p>Reasoning is replayed with its owning assistant turn, including turns that only call tools.
+Server-side tool and reasoning parsers/templates must be configured appropriately.
 Chat requests send <code>max_output</code> as <code>max_completion_tokens</code>; a server that only honours
 <code>max_tokens</code> sets <code>output_limit: "max_tokens"</code>.</p>
 <h2 id="connection-timeouts"><a class="header" href="#connection-timeouts">Connection timeouts</a></h2>
-<p>Every provider accepts positive <code>startup_timeout_secs</code> and <code>read_idle_timeout_secs</code> settings
-(both default to 600 seconds). Startup is a deadline for each HTTP attempt, while read-idle resets
+<p>Every provider accepts <code>startup_timeout_secs</code> and <code>read_idle_timeout_secs</code> settings, each a
+whole number of seconds from 1 through 86400 (both default to 600 seconds); <code>null</code> is refused, so
+leave one out to take its default. Startup is a deadline for each HTTP attempt, while read-idle resets
 after each response-body chunk. For example:</p>
 <pre><code class="language-yaml">providers:
   local:

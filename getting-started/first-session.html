@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -219,8 +219,7 @@ skyhook --prompt "inspect this repository"
 for inspection and follow-up input after the work finishes. These interface modes require an
 interactive terminal. Use <code>skyhook batch</code> with <code>-p/--prompt</code> or <code>-s/--script</code> for headless execution
 with redirected input/output support and automatic exit; see <a href="../guide/headless.html">Headless execution</a>.</p>
-<p>An unused startup draft creates no saved session. The first sent message or explicitly run
-script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
+<p>The first sent message or explicitly run script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
 <code>&lt;workspace&gt;/.skyhook/config.yaml</code> overlays the selected user configuration, entry by entry. Use
 <code>--config path.yaml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
 See <a href="../configuration/overview.html#file-selection-and-layering">configuration layering</a>, including
@@ -235,7 +234,7 @@ See <a href="../reference/cli.html#dump">dump</a> for compatible options. After 
 (see <a href="../reference/cli.html#stats">stats</a>).</p>
 <p>Actions with effects outside the workspace require approval. See
 <a href="../guide/permissions.html">permissions and capabilities</a> before using <code>--approve-all</code>; it bypasses
-tool approvals, not authentication prompts.</p>
+tool approvals, not capability gates.</p>
 <p>Next, learn the <a href="../guide/terminal-interface.html">terminal interface</a>,
 <a href="../guide/sessions-and-context.html">session and context behavior</a>, or
 <a href="../guide/headless.html">headless execution</a>. All command-line options are summarized in the

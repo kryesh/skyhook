@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -184,7 +184,7 @@
 <p>Include <code>"targets"</code> in a <a href="permissions.html#modes">mode</a>’s <code>capabilities</code> (or a batch job’s
 <code>--capabilities</code> allowlist) to grant the target capability. It is not enabled by default.
 Without it, agents cannot use target-management tools or select another target, including from
-JavaScript. The <code>external_agent</code> example below also requires <code>ssh_agent</code>; see <a href="#agents">agents</a>.</p>
+JavaScript.</p>
 <p>Targets are named entries in the top-level <code>targets</code> mapping, and session tools can add or replace
 targets without modifying YAML. Skyhook never reads SSH configuration files: a target’s host, user, port,
 authentication, and options come only from its own definition. Aliases, <code>ProxyJump</code>, identities,
@@ -199,7 +199,6 @@ required settings in the replacement entry.</p>
     host: "bastion.example.com"
     ssh:
       user: "gateway"
-      external_agent: true
 
   build:
     type: "ssh"
@@ -207,9 +206,16 @@ required settings in the replacement entry.</p>
     workspace: "/srv/project"
     via: "bastion"
     ssh:
-      auth:
-        kind: "key"
-        path: "~/.ssh/build_ed25519"
+      key: "~/.ssh/build_ed25519"
+      password: {env: "BUILD_KEY_PASSPHRASE"}
+      forward_agent: true
+
+  legacy:
+    type: "ssh"
+    host: "legacy.internal"
+    ssh:
+      user: "deploy"
+      password: {command: ["pass", "show", "legacy"]}
 
   database:
     type: "ssh"
@@ -221,25 +227,40 @@ required settings in the replacement entry.</p>
 </code></pre>
 <p>The built-in <code>root</code> is the session host—the machine running the main Skyhook process. It is not
 configured as a target and always identifies that machine, including when an agent’s current
-target is remote. Named targets declare their transport with <code>type</code>; <code>"ssh"</code> is the only transport.</p>
+target is remote. Named targets declare their transport with <code>type</code>: <code>"ssh"</code>, configured under
+<code>ssh</code>, or <code>"winrm"</code>, configured under <code>winrm</code> (see <a href="#winrm-targets">WinRM targets</a>). A target’s
+<code>os</code> declares its operating system, <code>"linux"</code> or <code>"windows"</code>, by default <code>"linux"</code> for <code>ssh</code> and
+<code>"windows"</code> for <code>winrm</code>; see <a href="#windows-targets">Windows targets</a>. Skyhook starts the target with
+the commands of the system declared, so declare it correctly. A target whose shell runs them and
+names the other system, such as a Windows host whose SSH default shell is a POSIX one declared
+<code>"linux"</code>, fails to connect with <code>the target declares os linux but runs windows</code>; one whose
+shell cannot run them fails with that shell’s own error.</p>
 <h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
 <ul>
-<li><code>origin</code> names the target that starts the SSH connection; it defaults to <code>root</code>.
-Key paths and agents belong to the origin.</li>
-<li><code>via</code> names a target to jump through with native <code>ProxyJump</code>, within that same connection. Jump
-hosts need no shim. A <code>via</code> target must have the same <code>origin</code>, so its key paths are never
-interpreted on another machine. Omit <code>via</code>, rather than naming the origin, to connect directly
-from the origin.</li>
+<li><code>origin</code> names the target that starts the SSH or WinRM connection; it defaults to <code>root</code>.
+Key paths, CA files, password sources and agents belong to the origin.</li>
+<li><code>via</code> names an SSH target to jump through with native <code>ProxyJump</code>, within that same
+connection. Jump hosts need no shim. A <code>via</code> target must have the same <code>origin</code>, so its key
+paths are never interpreted on another machine. Omit <code>via</code>, rather than naming the origin, to
+connect directly from the origin. A WinRM target is never a jump and takes no <code>via</code>: it
+connects directly from its origin.</li>
+<li>One SSH connection types at most one <a href="#passwords">password</a>: of a target and the targets it
+reaches through <code>via</code>, only one may set <code>password</code>. A route needing two is refused when the
+target is configured or added. Use <code>origin</code> instead of <code>via</code> for the later of the two, or a
+target between them: every target can be an origin, and each origin starts SSH connections of
+its own.</li>
 </ul>
 <p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
 where <code>gateway</code> also has <code>origin: "build"</code>.</p>
 <p>Registering targets never connects to them; registrations are session-wide.</p>
 <pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
-  ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
+  ssh: {key: "~/.ssh/database"}});
 </code></pre>
 <h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
 <p>SSH settings live under <code>ssh</code>. Every setting is optional. <code>options</code> values must be strings;
-quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>.</p>
+quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>. Each host is given 30
+seconds to connect, after which OpenSSH’s own error is the connection error, unless the
+target’s <code>options</code> set <code>ConnectTimeout</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -247,40 +268,165 @@ quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>
 </thead>
 <tbody>
 <tr><td><code>user</code>, <code>port</code></td><td>Remote user (default: the origin’s username) and port (1–65535, default 22).</td></tr>
-<tr><td><code>auth</code></td><td><code>default</code> offers OpenSSH’s default key files (<code>~/.ssh/id_*</code>); <code>agent</code> offers only keys already in the agent; <code>key</code> with <code>path</code> offers one private key on the SSH origin.</td></tr>
-<tr><td><code>external_agent</code></td><td>Authenticate with, and forward, the agent the origin inherited in <code>SSH_AUTH_SOCK</code> instead of a private agent Skyhook runs on the origin. Keys are never added to it. Requires the <code>ssh_agent</code> capability; see <a href="#agents">agents</a>.</td></tr>
-<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
+<tr><td><code>key</code></td><td>A private-key file on the SSH origin, the only key offered.</td></tr>
+<tr><td><code>password</code></td><td>With <code>key</code>, that key’s passphrase. Without <code>key</code>, the target authenticates with a password and offers no keys. See <a href="#passwords">passwords</a>.</td></tr>
+<tr><td><code>forward_agent</code></td><td>Forward the agent the connection authenticated with, so remote commands receive <code>SSH_AUTH_SOCK</code>. Default <code>false</code>. See <a href="#agents">agents</a>.</td></tr>
+<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>KbdInteractiveAuthentication</code>, <code>ChallengeResponseAuthentication</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<p>How a target authenticates follows from <code>key</code> and <code>password</code>:</p>
+<ul>
+<li><code>password</code> without <code>key</code>: OpenSSH’s password authentication; no keys are offered. A server
+that allows only keyboard-interactive authentication, as some PAM setups do, cannot be reached
+with a password.</li>
+<li><code>key</code>, with an optional <code>password</code> for an encrypted key: that key alone.</li>
+<li>neither, including a target with no <code>ssh</code> settings at all: only keys already in the origin’s SSH
+agent: the one it inherited or was forwarded, otherwise Skyhook’s private agent there if an
+earlier connection started it, or on Windows the agent service. The connection fails if there
+is none; see <a href="#agents">agents</a>.</li>
+</ul>
+<p>OpenSSH’s default key files (<code>~/.ssh/id_*</code>) are never offered.</p>
+<h3 id="passwords"><a class="header" href="#passwords">Passwords</a></h3>
+<p>A <code>password</code> takes any <a href="../configuration/authentication.html#credentials">credential form</a>: a
+literal, <code>{env: NAME}</code>, <code>{command: "..."}</code> or <code>{command: ["program", "arg"]}</code>, or <code>{file: path}</code>:</p>
+<pre><code class="language-yaml">ssh:
+  user: deploy
+  password:
+    command: ["pass", "show", "deploy"]
+</code></pre>
+<p>The source is read on the target’s origin, the machine that starts its SSH connection: an
+environment variable is that machine’s, and a command runs, or a file is read, there, exactly as
+key paths are interpreted there. It is read again for every connection and never kept.</p>
+<p>A password is never included in tool results. A resumed session reads a configured target’s
+password from the configuration again, and warns of a target the configuration no longer defines
+as the session started with it, whose connections fail until it does. A target added with
+<code>target_add</code> is saved in the session log with its password as given, so a literal one is stored
+there in plain text; prefer another form.</p>
+<p>A connection’s password is given once, to OpenSSH on the origin, which never asks about a host
+key, so it reaches no server but the target’s. A rejected password fails the connection with
+OpenSSH’s own reason, and any later prompt fails it, reporting the prompt that was answered. A
+password that cannot be read fails the connection with an error naming the
+target and the source’s problem, never the password. On a Windows origin with OpenSSH for
+Windows 8.1, a password or passphrase with non-ASCII characters may not be typed reliably.</p>
+<p>Tools run as the same user as Skyhook, so they can read a password file or run a password
+command too. Keep password files out of workspaces, and give them mode 600: Skyhook refuses a file
+other users can read. On a Windows origin, the file’s access list must allow only you, SYSTEM and
+Administrators, as for an OpenSSH private key there; see
+<a href="../configuration/authentication.html#credentials">credentials</a>.</p>
+<h2 id="winrm-targets"><a class="header" href="#winrm-targets">WinRM targets</a></h2>
+<p>A <code>winrm</code> target is a Windows host reached through Windows Remote Management.</p>
+<pre><code class="language-yaml">targets:
+  winapp:
+    type: "winrm"
+    host: "winapp.corp.example"
+    workspace: 'C:\deploy'
+    winrm:
+      user: "deploy@CORP.EXAMPLE"
+      password: {command: ["pass", "show", "winapp"]}
+      auth: "kerberos"
+
+  lab:
+    type: "winrm"
+    host: "10.0.0.20"
+    origin: "build"
+    winrm:
+      user: 'LAB\operator'
+      password: {env: "LAB_PASSWORD"}
+      tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>user</code></td><td>The account to log on as: <code>user</code>, <code>DOMAIN\user</code> or <code>user@REALM</code>. Required.</td></tr>
+<tr><td><code>password</code></td><td>Its password, in any <a href="../configuration/authentication.html#credentials">credential form</a>, read on the target’s origin at each connection as an SSH <a href="#passwords">password</a> is. Required for every <code>auth</code>.</td></tr>
+<tr><td><code>auth</code></td><td><code>negotiate</code> (NTLM), <code>basic</code> (the user and password with every request), or <code>kerberos</code> (a ticket for <code>HTTP/&lt;host&gt;</code> from the user’s realm). Default <code>negotiate</code>.</td></tr>
+<tr><td><code>tls</code></td><td><code>system</code> (HTTPS, trusting the Mozilla roots and the origin’s certificate store), <code>{ca: path}</code> (HTTPS, trusting the Mozilla roots and the PEM certificates in that file on the origin; <code>~/</code> is the home directory there), <code>{fingerprint: hex}</code> (HTTPS, trusting exactly the certificate whose SHA-256 fingerprint this is, in 64 hexadecimal digits, colons between pairs allowed), <code>insecure</code> (HTTPS, accepting any certificate, so it does not authenticate the server), or <code>off</code> (plain HTTP). Default <code>system</code>.</td></tr>
+<tr><td><code>port</code></td><td>The listener’s port; 5986 with TLS and 5985 with <code>tls: off</code> by default.</td></tr>
+<tr><td><code>kdc</code></td><td>With <code>kerberos</code>, the KDC as <code>host</code> or <code>host:port</code> (port 88 by default). Without it, the KDC is the one the origin’s Kerberos configuration names, else the one the realm’s DNS SRV records (<code>_kerberos._tcp.&lt;REALM&gt;</code>, then <code>_kerberos._udp.&lt;REALM&gt;</code>) name, looked up with the origin’s resolver.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>auth</code> and <code>tls</code> are independent. With <code>tls: off</code>, <code>negotiate</code> and <code>kerberos</code> encrypt every
+message with the keys their logon derived; <code>basic</code> does not, so a <code>basic</code> target with
+<code>tls: off</code> sends its user and password, and everything it exchanges, unencrypted, and Windows
+accepts it only where its WinRM service allows unencrypted traffic. As with literal secrets in
+configuration, choosing that is up to you.</p>
+<p>Kerberos takes its realm from the user, uppercased, so write the user as <code>user@REALM</code> with the
+realm’s DNS name, and <code>host</code> as the name its <code>HTTP/&lt;host&gt;</code> service principal is registered
+under, normally the host’s DNS name rather than an address. Kerberos reads no ticket cache: it
+logs on with the password each time.</p>
+<p>A certificate that <code>tls</code> does not trust fails the connection with the certificate’s SHA-256
+fingerprint. To pin a self-signed listener, put that fingerprint in
+<code>tls: {fingerprint: ...}</code>. A rejected credential fails the connection with the
+authentication schemes the listener offers.</p>
+<p>The account needs permission to use WinRM’s command shell. Administrators have it. Other
+accounts need <strong>Execute</strong> in the WinRM service’s root security descriptor (its <code>RootSDDL</code>);
+membership of Remote Management Users alone is not enough. To grant that group Execute, add the
+ACE <code>(A;;GX;;;S-1-5-32-580)</code> to the descriptor, for example in an elevated PowerShell:</p>
+<pre><code class="language-powershell">$sddl = (Get-Item WSMan:\localhost\Service\RootSDDL).Value
+Set-Item WSMan:\localhost\Service\RootSDDL -Value ($sddl -replace 'S:', '(A;;GX;;;S-1-5-32-580)S:') -Force
+</code></pre>
+<p><code>winrm configSDDL default</code> edits the same descriptor in a dialog.</p>
+<p>A WinRM target connects from its <code>origin</code>, root by default, which can be any target, including
+a Windows or Linux SSH target or another WinRM target; it is never a <code>via</code> jump and takes none.
+A Windows origin finds a Kerberos KDC with its own DNS client. WinRM delivers output in batches
+about half a second apart, so a tool call takes noticeably longer over WinRM than over SSH.</p>
+<h2 id="windows-targets"><a class="header" href="#windows-targets">Windows targets</a></h2>
+<p>A target with <code>os: "windows"</code> runs Windows 10 1809, Windows Server 2019 or later. Over SSH it
+runs OpenSSH Server with its default shell, cmd.exe; over <a href="#winrm-targets">WinRM</a> its WinRM
+service. Skyhook needs Windows PowerShell 5.1 there, which those releases include.</p>
+<pre><code class="language-yaml">targets:
+  winbuild:
+    type: "ssh"
+    os: "windows"
+    host: "winbuild.internal"
+    workspace: 'C:\src\project'
+    ssh:
+      user: "builder"
+</code></pre>
+<p>Paths on a Windows target are Windows paths, such as <code>C:\src\main.rs</code>, and tools accept <code>/</code> or
+<code>\</code> between their parts. A relative <code>workspace</code> is in the user’s profile directory
+(<code>%USERPROFILE%</code>). An <code>exec</code> command given as a string runs in Windows PowerShell 5.1 without a
+profile; an argument list runs its program directly.</p>
 <h2 id="agents"><a class="header" href="#agents">Agents</a></h2>
-<p>By default, Skyhook uses a private SSH agent on each origin for keys loaded during the session.
-An <code>external_agent</code> target instead uses the agent its origin inherited in <code>SSH_AUTH_SOCK</code>: on root,
-the one Skyhook was started with; on a remote origin, the agent forwarded to that origin’s
-connection. A chain of <code>external_agent</code> targets therefore keeps using the same external agent.</p>
-<p>Each connection forwards the agent it authenticated with, so remote Skyhook commands receive it in
-<code>SSH_AUTH_SOCK</code>, allowing commands such as <code>git</code>, <code>ssh</code>, and <code>ssh-add</code> to use the same identities.
-Private agent state is discarded when its origin’s session or connection ends and is not restored
-when resuming a session.</p>
-<p>Targets whose route includes an <code>external_agent</code> hop, including configured ones, require the
-<code>ssh_agent</code> capability. Without it they are invisible: <code>targets</code> omits them, selecting them or
-naming them in <code>via</code> or <code>origin</code> fails as an unknown target, <code>target_add</code> cannot replace them, and
-<code>target_add</code> does not offer <code>ssh.external_agent</code>. With it, connecting requires approval of that
-route (listing its origin and <code>external_agent</code> hops). Adding an <code>external_agent</code> target with
-<code>target_add</code> is approved separately from later connecting to it.</p>
+<p>Each origin authenticates with the SSH agent it already has: on root, the one Skyhook inherited in
+<code>SSH_AUTH_SOCK</code>; on a remote origin, the agent forwarded to it, if its own connection forwards one.
+Only an origin without one gets a private agent that Skyhook starts there when a connection needs
+it, and keys from <code>key</code> targets are loaded into that private agent as they are used. An inherited
+or forwarded agent is never modified: a key is offered directly and not added to it. On root,
+<code>exec</code> receives the private agent’s <code>SSH_AUTH_SOCK</code> only when Skyhook inherited none. Private
+agent state is discarded when its origin’s session or connection ends and is not restored when
+resuming a session.</p>
+<p>A Windows origin uses the agent in its <code>SSH_AUTH_SOCK</code>, or else the OpenSSH Authentication Agent
+service while it runs, and never starts a private agent there: that service keeps the keys added to
+it across logons, so Skyhook adds none. Without either, a target offering only agent keys, or one
+that sets <code>forward_agent</code>, fails to connect from that origin, while <code>key</code> and <code>password</code> targets
+connect as usual. A Windows origin connects with OpenSSH’s <code>ssh.exe</code>, which must be on its search
+path.</p>
+<p>The agent service does not sign for a logon made with an SSH key rather than a password. From a
+Windows origin reached that way, targets offering only agent keys fail while the service runs,
+and so does a <code>key</code> target whose key the service also holds.</p>
+<p>A connection forwards its agent only when its target sets <code>forward_agent: true</code>; remote commands
+then receive <code>SSH_AUTH_SOCK</code>, so commands such as <code>git</code>, <code>ssh</code> and <code>ssh-add</code> can use the same
+identities. Without it remote commands get no agent from Skyhook.</p>
 <p><code>target_add</code> requires the <code>write</code> capability as well as <code>targets</code>. It also requires the <code>exec</code>
-capability and its approval when it sets <code>ssh.options</code>,
-because options such as <code>ProxyCommand</code> can run commands. Configuration files are trusted like MCP
-commands.</p>
-<p>Passwords, key passphrases, keyboard-interactive challenges, host confirmations, and agent
-confirmations appear in Skyhook’s interface, including prompts from SSH started on a remote
-origin; each names the target being connected to and, when it is remote, that origin.
-Target configuration cannot enable prompts in a noninteractive session.
-<code>skyhook batch</code> has no authentication prompts; invocations without an interactive terminal
-must use it and fail operations that require input; <code>--approve-all</code> does not approve
-authentication prompts. Secrets are never included in tool results or session logs.</p>
+capability and its approval when it sets <code>ssh.options</code>, which can run commands, or a <code>password</code>
+that is not a literal: an environment variable, a file and a command are all read on the origin,
+outside any workspace. Configuration files are trusted like MCP commands.</p>
+<p>Host keys are checked against the origin user’s <code>~/.ssh/known_hosts</code> and the system-wide
+<code>/etc/ssh/ssh_known_hosts</code>, so record each host’s key there before connecting; <code>options</code> can
+name another file with <code>UserKnownHostsFile</code>, or accept unknown keys with
+<code>StrictHostKeyChecking: accept-new</code>, or any key with <code>no</code>. An unknown host key fails the
+connection with OpenSSH’s reason, such as <code>Host key verification failed.</code>:
+<code>StrictHostKeyChecking: ask</code>, OpenSSH’s default, acts as <code>yes</code>, and <code>UpdateHostKeys: ask</code> as
+<code>no</code>.</p>
 <h2 id="using-targets"><a class="header" href="#using-targets">Using targets</a></h2>
-<p>Use <code>targets</code> to list each target’s host, type, <code>via</code>, and <code>origin</code> without connecting.
+<p>Use <code>targets</code> to list each target’s host, type, <code>os</code>, <code>via</code>, <code>origin</code> and how it authenticates
+without connecting.
 Registering a target does not change the agent’s location.</p>
 <p>Target-aware tools, including <code>agent</code>, use these rules:</p>
 <ul>
@@ -301,14 +447,19 @@ A working-directory override is separate from the target’s configured workspac
 <code>cwd</code> must exist on the selected machine, not on the session host. A connection, session-storage,
 or saved-output inspection failure is not necessarily a failure of the command on the remote
 machine.</p>
-<p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs an SSH route requests
-approval before any probe, authentication, or shim deployment. A
+<p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs a route requests
+approval before any probe, authentication, or shim deployment. The request shows every target
+the connection passes through, origins and jumps first, each with its host and the user it logs
+in as. A
 <a href="permissions.html#approval-policy">route grant</a> applies across tools and workspaces, so
 reconnecting an unchanged route needs no new approval. Changing a target or any hop in its route
-invalidates every grant naming it, whatever the resource, and stops connections still starting
-over the old route; an operation waiting for approval or a connection is planned again and asks
-about the new definition. An operation already running over the old route finishes there, but any
-further approval it asks for is refused.</p>
+invalidates every grant naming it: an operation still waiting for approval or a connection asks
+again about the new definition, and one already running over the old route finishes there, but
+any further approval it asks for is refused.</p>
+<p>Tools run on a target through Skyhook’s shim, a program the first connection installs there as
+<code>~/.cache/skyhook/shims/&lt;sha256&gt;</code>, or under <code>$XDG_CACHE_HOME</code> when that is set (on Windows, <code>%LOCALAPPDATA%\skyhook\shims\&lt;sha256&gt;.exe</code>). A
+shim that starts removes the others there that nothing has used for a day. A session keeps one
+connection to each target, shared by every call there.</p>
 <p>JavaScript orchestration and the session log stay on the host; nested tool calls use the
 selected target and workspace. For remote execution internals and shim builds, see
 <a href="../development/remote-transport-and-shims.html">remote transport and shims</a>.</p>

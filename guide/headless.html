@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -195,12 +195,14 @@ external programs locate and follow the normal session logs under <code>&lt;work
 Headless mode uses only the selected workspace’s history, just like the terminal UI.
 Resumed runs print the existing session ID.</p>
 <p>Assistant output, script console output/results, startup warnings, and execution diagnostics remain
-in the session logs; they are not printed to stdout or stderr. The process exits successfully when
+in the session logs; they are not printed to stdout or stderr. Warnings about the configuration
+itself, such as a skipped config file, are the exception: they go to stderr, before any error
+that stops startup. The process exits successfully when
 the submitted operation and shutdown succeed. On failure or interruption it exits nonzero and
 prints the error to stderr; stdout still carries only the session ID. A failure before a session
 can be opened produces no session-ID line. If Skyhook cannot write the session journal, the session
 stops as if the process had crashed: the error says so, and no final status is recorded. Explicit <code>--help</code> and <code>--version</code>
-retain their normal output. Headless mode is not a line-oriented conversation over stdin.</p>
+retain their normal output.</p>
 <p>The submitted root turn or workflow defines completion. A workflow must explicitly await background
 work it needs completed; outstanding jobs are cancelled, and child agents interrupted, during
 shutdown. Interrupt and termination signals also trigger cleanup and journaled status rather than
@@ -210,14 +212,10 @@ can still ask their owning parent agent. The root is instructed as a delegated a
 prompt’s task and returns the result, answering its children’s questions itself rather than ending
 its turn to ask. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
-bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
-confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
+bypasses tool approvals but does not enable questions.</p>
 <p><code>exec</code> never has stdin connected or a controlling terminal, so ordinary <code>/dev/tty</code> prompts cannot
-stop the job waiting for terminal input. SSH and <code>sudo</code> password prompts are rejected even when
-inherited <code>SSH_ASKPASS</code> or <code>SUDO_ASKPASS</code> settings request another prompt helper or the <code>targets</code>
-capability is disabled. Existing <code>SSH_AUTH_SOCK</code> credentials are preserved unless
-the configured target-authentication setup replaces them. Remote commands apply the same
-capability restrictions. This is still not an OS sandbox against deliberately programmed
+stop the job waiting for terminal input. An inherited <code>SSH_AUTH_SOCK</code> is preserved.
+Remote commands apply the same capability restrictions. This is still not an OS sandbox against deliberately programmed
 subprocesses that establish their own external interaction mechanisms.</p>
 <p>See the <a href="../reference/cli.html">CLI reference</a> for argument combinations and
 <a href="permissions.html">permissions</a> for the capability/approval distinction.</p>

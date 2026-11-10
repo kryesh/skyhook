@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -205,7 +205,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><td><code>-s, --script PATH</code></td><td>Run a JavaScript workflow. Mutually exclusive with <code>--prompt</code>.</td></tr>
 <tr><td><code>--image PATH</code></td><td>Attach an image to the initial prompt; repeat for multiple images. Requires <code>--prompt</code>, conflicts with <code>--script</code>.</td></tr>
 <tr><td><code>--mode NAME</code></td><td>Start the new-session prompt in this configured <a href="../guide/permissions.html#modes">mode</a> instead of the default. With <code>--resume</code>, the next message switches the session to it.</td></tr>
-<tr><td><code>-a, --approve-all</code></td><td>Bypass tool approval prompts, not capability gates or authentication prompts.</td></tr>
+<tr><td><code>-a, --approve-all</code></td><td>Bypass tool approval prompts, not capability gates.</td></tr>
 <tr><td><code>-h, --help</code></td><td>Print command help.</td></tr>
 <tr><td><code>-V, --version</code></td><td>Print the version.</td></tr>
 </tbody>
@@ -235,7 +235,7 @@ recorded model is no longer configured needs <code>--model</code> to run either.
 <p>Stdout contains only the session ID and newline, flushed before execution; results remain in
 session logs. See the <a href="../guide/headless.html">headless guide</a> for completion, errors, shutdown,
 signals, and interaction restrictions.</p>
-<p>Policy capability names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>, <code>targets</code>, <code>ssh_agent</code>,
+<p>Policy capability names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>, <code>targets</code>,
 <code>agents</code>, and <code>mcp</code>. The terminal supplies <code>interactive</code>; a batch job never has it. See
 <a href="../guide/permissions.html">permissions</a> for resolution and limitations.</p>
 <h2 id="dump"><a class="header" href="#dump">Dump</a></h2>
@@ -348,7 +348,7 @@ quota, and fails unless the provider is logged in and the service accepts them. 
 See <a href="../configuration/authentication.html">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="../configuration/overview.html">configuration overview</a> describes configuration paths
-and the full example. <a href="../configuration/authentication.html#api-keys-and-environment-files">Authentication</a>
+and the full example. <a href="../configuration/authentication.html#environment-files">Authentication</a>
 documents invocation-directory <code>.env</code> loading. <a href="../guide/terminal-interface.html">Terminal interface</a>
 documents slash commands, keybindings, model selection, and saved UI state.</p>
 

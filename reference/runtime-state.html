@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -184,7 +184,8 @@
 <h2 id="todo-lists"><a class="header" href="#todo-lists">Todo lists</a></h2>
 <p>Every agent has an ordered advisory todo list. <code>todo()</code> reads the caller’s list;
 <code>todo({items:[...]})</code> replaces the whole list and completes without a result; an empty array
-clears it.
+clears it. <code>todo({status:[...]})</code> sets every item’s status, one per item in list order, keeping
+the text; it must give exactly as many statuses as the list has items.
 Each item has <code>text</code> and a <code>status</code> of <code>pending</code>, <code>in_progress</code>, or <code>completed</code>. Multiple items may
 be in progress. Unfinished items do not prevent an agent from finishing.</p>
 <p>Any agent allowed to delegate can seed a child with <code>agent.todos</code>. The task <code>prompt</code> remains
@@ -202,7 +203,7 @@ child’s runtime state before its first model request:</p>
 });
 </code></pre>
 <p>The child owns subsequent edits. Ancestors can inspect a descendant with <code>todo({job: childJobId})</code>,
-including after it finishes; <code>items</code> and <code>job</code> cannot be combined. Inspection is available once
+including after it finishes; <code>items</code>, <code>status</code> and <code>job</code> are exclusive. Inspection is available once
 the child has initialized; a queued launch may not have a list yet. Reads return <code>{items}</code>.
 An agent without todos has an empty list. Inside the child, progress can be updated with the
 same tool:</p>
@@ -212,13 +213,29 @@ same tool:</p>
   {text: "Run relevant checks", status: "pending"}
 ]});
 </code></pre>
+<p>or, keeping the text, with only the statuses:</p>
+<pre><code class="language-js">return tool.todo({status: ["completed", "in_progress", "pending"]});
+</code></pre>
 <p>Lists persist with the session, including completed and interrupted child lists. Resume preserves
 recorded statuses. For Rust host observation, see
 <a href="../development/embedding.html#host-observation-api">embedding</a>.</p>
+<h2 id="prompt-context"><a class="header" href="#prompt-context">Prompt context</a></h2>
+<p>Each agent’s system prompt ends with a <code>&lt;context&gt;</code> block of <code>key:value</code> lines: its <code>workspace</code>;
+its <code>target</code>, with that machine’s <code>host</code> and any <code>via</code> and <code>origin</code>, when it may choose targets;
+<code>os</code>, the operating system of the machine its target names, with the <code>shell</code> its shell commands
+run in, <code>os:linux shell=sh</code> or <code>os:windows shell=powershell-5.1</code>; and <code>tz</code>, that machine’s time
+zone, with the zone’s offset from UTC when the prompt was built, such as <code>tz:Europe/Berlin +01:00</code>. The zone is the one that machine’s clock
+follows: the zone its <code>TZ</code> names, else its system zone; a <code>TZ</code> that gives a rule rather than a
+zone name shows only the offset, such as <code>tz:+09:00</code>.</p>
+<p>Launching a child on a remote target connects to it first, approved like any tool call on that
+target: a denied or unreachable target fails the <code>agent</code> call without starting a child. Every
+timestamp an agent sees, such as the state’s <code>time</code> and a child reply’s time, is in UTC, and scripts
+compute in UTC.</p>
 <h2 id="per-request-state-snapshot"><a class="header" href="#per-request-state-snapshot">Per-request state snapshot</a></h2>
 <p>The model profile’s <a href="../configuration/providers-and-models.html#context-and-output-budgets"><code>state_mode</code></a>
-controls whether and how the model receives a fresh <code>&lt;skyhook_state&gt;</code> snapshot with each request.</p>
-<p>The snapshot shows the host’s current local date, active jobs, and the caller’s todo list.
+controls whether and how the model receives a fresh <code>&lt;state&gt;</code> snapshot with each request.</p>
+<p>The snapshot shows the current time in UTC, to the second, active jobs, and the caller’s todo
+list.
 Empty job and todo sections are omitted. This is a compact model-facing view, not the JSON
 returned by job or todo tools; scripts should use those tools to inspect state.
 Dynamic snapshots are still recorded with model requests; this mode is not a data-retention
@@ -242,23 +259,22 @@ owned by its descendants.</li>
 <li>Counters remain cumulative across retained-child follow-ups and session resume.</li>
 </ul>
 <p>Todos retain their original order, including completed items. For example:</p>
-<pre><code class="language-text">&lt;skyhook_state&gt;
-date:2026-09-05
-jobs: job parent tool name state age_s turns tool_calls
+<pre><code class="language-text">&lt;state&gt;
+time:2026-09-05T09:41:22Z
+in_progress:
+  Make the change
+pending:
+  Run relevant checks
+job parent tool name state age_s turns tool_calls
 7 - exec run-tests running 12 - -
 8 - agent review running 9 2 3 workspace="/home/user/review"
 9 8 agent - waiting_input 4 1 0
-todos:
-completed:
-  "Inspect the implementation"
-in_progress:
-  "Make the change"
-pending:
-  "Run relevant checks"
-&lt;/skyhook_state&gt;
+&lt;/state&gt;
 </code></pre>
-<p>Here, job 9 uses the snapshot’s current location, not job 8’s workspace override. With no
-active jobs or todos, only the date remains.</p>
+<p>Here, job 9 uses the snapshot’s current location, not job 8’s workspace override. Only
+unfinished todos appear; <code>todo</code> reads the whole list. With no active jobs or unfinished todos,
+only the time remains. A todo’s text is shown as written unless it would break a line or read as
+a heading or the job table’s column line, when it is quoted as a JSON string.</p>
 
                     </main>
 

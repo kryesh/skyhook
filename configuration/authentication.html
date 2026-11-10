@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -181,10 +181,36 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
-<h2 id="api-keys-and-environment-files"><a class="header" href="#api-keys-and-environment-files">API keys and environment files</a></h2>
-<p>Any configured value that may hold a secret—<code>api_key</code> and an entry’s fixed <code>headers</code>—takes one
-of three forms: a literal, <code>env: NAME</code> to read an environment variable, or <code>command: "..."</code> to
-run a command:</p>
+<h2 id="credentials"><a class="header" href="#credentials">Credentials</a></h2>
+<p>A configured value that may hold a secret—a provider’s <code>api_key</code> and fixed <code>headers</code>, MCP
+<a href="mcp.html"><code>headers</code></a>, and an SSH or WinRM target’s
+<a href="../guide/execution-targets.html#passwords"><code>password</code></a>—is a credential. It takes one of these forms:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Form</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>"text"</code></td><td>The text itself.</td></tr>
+<tr><td><code>{env: NAME}</code></td><td>The environment variable <code>NAME</code>, which must be set and nonempty.</td></tr>
+<tr><td><code>{command: "..."}</code></td><td>The standard output of shell text run with the shell of the machine that uses the credential: <code>/bin/sh -c</code>, or Windows PowerShell 5.1 on Windows.</td></tr>
+<tr><td><code>{command: ["program", "arg"]}</code></td><td>The standard output of a program run directly, without a shell.</td></tr>
+<tr><td><code>{file: path}</code></td><td>A file’s contents.</td></tr>
+</tbody>
+</table>
+</div>
+<p>A map names exactly one source. A command’s output and a file’s contents lose one trailing line
+ending (<code>\n</code>, then <code>\r</code>). A command runs with standard input closed and standard error
+discarded; its standard output is limited to 64 KiB, and it must exit successfully with UTF-8
+output that is not blank. A file path is absolute on the machine that reads it (<code>/</code> on Linux; a
+drive root such as <code>C:\</code>, or a <code>\\server\share</code> path, on Windows) or starts with <code>~/</code> (your home
+directory); the file must be a regular file of at most 4 KiB, owned by you and accessible to
+nobody else (<code>chmod 600</code>), and hold UTF-8 text that is not blank. On Windows, as OpenSSH for
+Windows requires of private keys, the file’s owner and everyone its access list allows must be
+you, SYSTEM, Administrators or TrustedInstaller. Errors name the setting, the kind of source
+(and an environment variable’s name) and its problem, such as
+<code>api_key from env PROXY_TOKEN: not set</code>, never the value, a command’s text or output, or a file’s
+contents.</p>
 <pre><code class="language-yaml">providers:
   anthropic:
     codec: "messages"
@@ -196,37 +222,39 @@ run a command:</p>
     # api_key: "sk-ant-..."
     # api_key:
     #   command: "op read 'op://Private/Anthropic/api-key'"
+    # api_key:
+    #   command: ["pass", "show", "anthropic"]
+    # api_key:
+    #   file: "~/.config/skyhook/anthropic-key"
     headers:
       x-title: "skyhook"
       x-proxy-token:
         env: "PROXY_TOKEN"
 </code></pre>
 <p>A literal secret is stored in plain text in the configuration file, and <code>skyhook dump config</code>
-prints it. Prefer <code>env</code> or <code>command</code> for secrets. <code>api_key</code> and <code>headers</code> are provider-only:
-all models in that provider instance share their credential resources, even when their codecs or
-request settings differ. A LiteLLM virtual key is sent as a bearer token for every codec,
-including <code>messages</code>.</p>
+prints it. Prefer another form for secrets. Commands are trusted host configuration, executed
+on the machine that uses the credential with Skyhook’s environment there; they do not run through
+tool approval. Use a noninteractive secret-manager command that writes only the secret to stdout.
+Do not put literal secrets in command strings or commit them to configuration files.</p>
+<h2 id="api-keys"><a class="header" href="#api-keys">API keys</a></h2>
+<p><code>api_key</code> and <code>headers</code> are provider-only: all models in that provider instance share their
+credential resources, even when their codecs or request settings differ. A LiteLLM virtual key is
+sent as a bearer token for every codec, including <code>messages</code>.</p>
 <p>Environment-variable values the provider sends are resolved when it is built and must be present
 and nonblank. They are used as they are, not trimmed: a value with a trailing newline fails,
-naming the provider and field. A command runs only on the first model request that sends its value, not when
-configuration is loaded or a conversation is opened. A successful command’s stdout is decoded as
-UTF-8 and trimmed of leading/trailing whitespace and newlines, then cached in memory for that
-provider instance. All its models, concurrent requests, and child conversations share the cache;
-a new process or provider instance resolves the value again. Failed commands are not cached and
-may be retried on a subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
-and the next request runs the command again. If the refused value had been accepted before, as
+naming the provider and field. A command runs, and a file is read, only on the first model request
+that sends its value, not when configuration is loaded or a conversation is opened. The value is
+trimmed of leading and trailing whitespace and newlines, then kept in memory for the provider’s
+models to share; a failure is not kept, so the next request tries again.
+When the server refuses a kept value with HTTP 401, the value is discarded and the next request
+runs the command, or reads the file, again. If the refused value had been accepted before, as
 when a short-lived token expires, the model request is retried automatically; a value refused on
-its first use fails the request. Empty output, invalid UTF-8, output that is not a valid header
-value, and nonzero exits fail the request without including command output in the error. Stdout
-is limited to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command
-timeout.
-Cancelling the invocation terminates the command’s immediate child process, but does not guarantee
-termination of any descendants it launched.</p>
-<p>Commands are trusted host configuration, executed with <code>/bin/sh -c</code>, inheriting Skyhook’s process
-working directory and environment, not an agent’s workspace or remote target. They do not run
-through tool approval. Standard input is closed and standard error is discarded; use a noninteractive
-secret-manager command that writes only the key to stdout. Do not put literal secrets in command
-strings or commit them to configuration files.</p>
+its first use fails the request. A value that is empty or not a valid header value fails the
+request without including it in the error. A command has no timeout of its own and runs before
+the HTTP startup timeout begins. Cancelling the request terminates the command’s own process,
+not necessarily its descendants. Provider commands run in Skyhook’s process working directory,
+not an agent’s workspace or remote target.</p>
+<h2 id="environment-files"><a class="header" href="#environment-files">Environment files</a></h2>
 <p>At CLI startup, Skyhook loads <strong><code>.env</code> in the invocation directory</strong> before constructing providers.
 Existing process environment variables take precedence. A missing file is ignored; Skyhook does
 not search parent directories, the <code>--workspace</code> directory, or the configuration file’s directory.
@@ -264,9 +292,7 @@ provider, as <code>&lt;provider&gt;.json</code>. For a provider in the user conf
 <code>~/.config/skyhook/credentials/</code> (or under <code>$XDG_CONFIG_HOME/skyhook</code>). For a provider the workspace
 configuration defines, it is <code>&lt;workspace&gt;/.skyhook/credentials/</code>; keep that directory out of version
 control. For <code>--config path.yaml</code>, it is beside that file. Skyhook creates the directory when you
-first log in, readable only by you, and refuses to use one that grants any access to other users.
-Checking status or starting a session creates nothing there, except a missing lock file beside saved
-credentials.</p>
+first log in, readable only by you, and refuses to use one that grants any access to other users.</p>
 <p>To sign a provider out, delete its <code>credentials/&lt;provider&gt;.json</code> while no session is using it.
 Nothing is revoked on the server, so this is also how to clear credentials for a provider you have
 removed from your configuration.</p>

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -219,9 +219,9 @@ live: ask
 </code></pre>
 <p>The first configured orchestrator model is the companion’s default model; an explicit <code>--model</code>
 or the remembered model takes precedence. The root agent always runs in the <code>orchestrate</code> mode:
-<code>--mode</code> and batch <code>--capabilities</code> are refused, and the terminal offers no mode switch;
-children take their modes from the agent tool.</p>
-<p><code>shortlist</code> is the CVSS 4.0 severity a candidate needs to enter review; it defaults to <code>high</code>.
+the terminal offers no mode switch; children take their modes from the agent tool.</p>
+<p><code>shortlist</code> is the CVSS 4.0 severity a candidate’s review must score it at to go on to a
+verdict; it defaults to <code>high</code>.
 CVSS keeps an authenticated-user flaw with limited impact below that line, so set <code>shortlist: medium</code>
 for web and other logic-heavy targets where such findings matter. The severity a candidate is
 assessed at is the impact if its unresolved conditions hold, so uncertainty never lowers it.
@@ -242,7 +242,7 @@ capabilities, which follow the same ceiling and delegation rules as built-ins:</
 <ul>
 <li><code>security.research</code> permits recording research: components, states, paths, premises,
 flaws, candidates and their links, evidence, merges, statuses, assessments, and environments.</li>
-<li><code>security.verdict</code> permits writing reports; together with <code>security.research</code>, review
+<li><code>security.verdict</code> permits writing reports, with <code>write</code>; together with <code>security.research</code>, review
 verdicts.</li>
 <li><code>security.test</code> permits recording tests. It is separate so a PoC agent can also record
 research without deciding verdicts.</li>
@@ -259,10 +259,10 @@ the modes it launches, and <code>orchestrate</code>, which launches them, hold i
 <tbody>
 <tr><td><code>orchestrate</code> (root)</td><td>every security capability</td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>target</code></td><td><code>security.research</code></td><td><code>network</code></td></tr>
-<tr><td><code>question</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>settle</code>, <code>chain</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>sweep-part</code></td><td><code>security.research</code></td><td>none</td></tr>
-<tr><td><code>paths</code>, <code>entries</code></td><td><code>security.research</code></td><td><code>exec</code>, <code>network</code></td></tr>
-<tr><td><code>sweep</code>, <code>check</code>, <code>assess</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td>none</td></tr>
+<tr><td><code>paths</code>, <code>entries</code>, <code>trace</code></td><td><code>security.research</code></td><td><code>exec</code>, <code>network</code></td></tr>
+<tr><td><code>sweep</code>, <code>check</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td>none</td></tr>
 <tr><td><code>probe</code></td><td><code>security.research</code>, <code>security.scheduled</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>validate</code></td><td><code>security.research</code>, <code>security.scheduled</code>, <code>security.verdict</code></td><td><code>exec</code>, <code>network</code></td></tr>
 <tr><td><code>environment</code></td><td><code>security.research</code></td><td><code>write</code>, <code>exec</code>, <code>network</code></td></tr>
@@ -273,7 +273,7 @@ the modes it launches, and <code>orchestrate</code>, which launches them, hold i
 </div>
 <p><code>entries</code> holds <code>exec</code> and <code>network</code> for binary images and live enumeration, which most
 <code>entries</code> agents, reading one code file, never use; <code>paths</code> holds them to launch <code>entries</code>. A
-<code>question</code> agent settling a premise the code alone
+<code>settle</code> agent deciding a premise the code alone
 cannot decide may, under a live policy, run a bounded experiment or measurement in a recorded
 environment, or have a child run it, and decide the premise from what it observed against its
 control.</p>
@@ -283,12 +283,13 @@ coordinators (<code>sweep</code>, <code>check</code>, <code>probe</code>, <code>
 cover well; agents may choose otherwise.</p>
 <h2 id="research-pipeline"><a class="header" href="#research-pipeline">Research pipeline</a></h2>
 <p>The root orchestrator drives the pipeline through delegated research modes; the research store
-holds one graph of what the agents found and derives the work each part of it still owes;
-nothing is planned. <code>target</code> maps the code, binaries and interfaces into components, mapping
+holds one graph of what the agents found and derives the work each part of it still owes.
+<code>target</code> maps the code, binaries and interfaces into components, mapping
 what it cannot read by what its material shows, and records the deployment premises your
-request settles, each actor’s intended capabilities among them, and each interface in scope
-under a short name; when your scope includes dependencies, it records each locked version a
-published advisory affects as a flaw at its manifest entry. Under a live policy, when the map
+request settles, among them one per actor’s intended capabilities, per build or configuration
+option and per platform the code branches on, and each interface in scope under a short name;
+when your scope includes dependencies, it records each locked version a published advisory
+affects as a flaw at its manifest entry. Under a live policy, when the map
 records interfaces, the orchestrator arranges an environment serving them before <code>paths</code>, under
 <code>ask</code> once you approve its scope. <code>paths</code> has an <code>entries</code> child record the entries of each file
 and of each interface an environment serves as paths, the input states taken in there, and the
@@ -299,8 +300,10 @@ handles it.</p>
 <p>The components recorded outside scheduled work, by <code>target</code> and <code>paths</code> with its <code>entries</code>
 children, are the run’s <strong>scope</strong>. A path is in scope while its entry step lies in one of them,
 by the step’s component or the component owning its file. <code>target</code> records the exclusions in
-your request as failing deployment premises and maps none of the excluded code, and a check
-records no path for a caller it finds outside the scope, such as a language binding. What later
+your request as failing deployment premises and maps none of the excluded code. Every task
+begins with the scope: the mapped components, their interfaces, and the deployment premises,
+failing ones as excluded, and records no component, path or candidate for a route entering
+outside it, such as a language binding. What later
 work records beyond the scope anyway stays recorded but owes nothing, and neither does what only
 such paths reach: a state only they access, a flaw only they step through that no candidate
 starting in scope holds, a premise only such work relies on, and a candidate whose first action
@@ -309,14 +312,17 @@ accesses too is checked as before. The synthesis and the Research page count the
 candidates outside the scope.</p>
 <p>After <code>paths</code>, one scheduler runs every phase together within <code>workers</code>: each subject starts as
 soon as its own prerequisites are met rather than when a whole phase ends. Ready work starts in
-pipeline order — sweeps, probes and checks, settles and chains, assessments, reviews, tests,
-reports — and later work waits only on earlier-stage work, ready or running, that touches it;
-unrelated later work fills the remaining slots. Sweeps, settles, chains and reviews go out in
-bundles, one child each: the sweeps of the paths keyed on the same state, a path’s key being the handed state it reads
+pipeline order — sweeps, probes and checks, settles and chains, reviews, tests, reports — and
+later work waits only on earlier-stage work, ready or running, that touches it;
+unrelated later work fills the remaining slots. Sweeps, checks, settles, chains and reviews go
+out in bundles, one child each: the sweeps of the paths keyed on the same state, a path’s key being the handed state it reads
 or writes that the most paths access (the instance handle its caller supplies or receives), else
 the instance state the most paths access, ties going to the lowest-numbered, so every call on one
 instance goes together (a path accessing neither is swept alone, and paths sharing only another
-state stay in their own bundles); a path’s settles (its own premises, those of the
+state stay in their own bundles); the checks of a handed state and of the instance states
+written on the paths accessing it, so a value handed back is checked with what its producers
+leave in the instance the next call resumes from (an instance state goes with the handed state
+its writer paths access that the most paths access, and alone when they access none); a path’s settles (its own premises, those of the
 flaws on it, and what each rests on) or chains, where work on a stage several paths share goes
 with the lowest-numbered one and a premise goes with the path of the premises resting on it; and
 the reviews of one root flaw’s candidates. Work on a node that running
@@ -330,13 +336,12 @@ waits for it, so one agent works a node at a time and the next starts with its f
 <tbody>
 <tr><td>Sweep</td><td>path</td><td>it is unswept and one of its reads of a recorded input or handed state (what its caller supplies, such as an instance handle) sits in code; a path is swept once, and a later correction of its steps owes nothing; marking it unswept offers its sweep again</td><td><code>sweep</code> (long paths in <code>sweep-part</code> stretches)</td></tr>
 <tr><td>Probe</td><td>path</td><td>it is unswept, it reads a recorded input or handed state but none in code, and the launch does live work and an environment for any candidate serves each interface it reads one on, or it reads them only in binaries; a new environment for any candidate serving one of those interfaces (any one, for binaries only), unless recorded within a probe, gives an unswept probe fresh tries</td><td><code>probe</code></td></tr>
-<tr><td>Check</td><td>instance or handed state</td><td>no check is recorded, its latest was recorded outside a check of it, or an access, edit or merge came after it outside that check; ready once no path recorded before the state’s latest access, edit or merge outside its checks owes a pending sweep, whether or not it accesses the state; a path recorded since does not hold it back, as the accesses its sweep records owe the check again</td><td><code>check</code></td></tr>
-<tr><td>Settle</td><td>code premise</td><td>it is undecided, disputed since its decision (by a differing proposal or contradicting evidence), or decided while a premise it rests on has been decided, either way, or disputed since that decision; and a live flaw or unretracted path relies on it or on a premise resting on it</td><td><code>question</code></td></tr>
-<tr><td>Chain</td><td>flaw</td><td>it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate holds it or it carries a proposal; or it is not refuted, it leaves a recorded state wrong, and no chain of it began since what its chain rests on last changed, an access of that state included, so a reader recorded since owes it one more look whatever its candidates; ready once no path stepping through its component or reading a state it leaves wrong owes a pending sweep or probe, and no such state a pending check</td><td><code>question</code></td></tr>
-<tr><td>Assess</td><td>candidate</td><td>no assessment stands at what it rests on (its own, its chain’s, its flaws’ or its paths’ material changes), or one recorded outside it proposes another</td><td><code>assess</code></td></tr>
-<tr><td>Review</td><td>candidate</td><td>it is assessed at or above the shortlist and no verdict stands, or one recorded outside it proposes another; ready once its assessment is not pending and no premise of its chain is undecided while its settle is pending or the user is asked it</td><td><code>validate</code></td></tr>
+<tr><td>Check</td><td>instance or handed state</td><td>no check is recorded, its latest was recorded outside a check of it, or an access, edit or merge came after it outside that check, or a premise its checks rest on was decided failing or contradicted since (one decided holding owes nothing); ready once no path recorded before the state’s latest access, edit or merge outside its checks owes a pending sweep, whether or not it accesses the state; a path recorded since does not hold it back, as the accesses its sweep records owe the check again</td><td><code>check</code></td></tr>
+<tr><td>Settle</td><td>code premise</td><td>it is undecided, disputed since its decision (by a differing proposal or contradicting evidence), or decided while a premise it rests on has been decided, either way, or disputed since that decision; and a live flaw, unretracted path or recorded state’s check relies on it or on a premise resting on it; the review of a candidate whose chain rests on it decides it as its settle does</td><td><code>settle</code></td></tr>
+<tr><td>Chain</td><td>flaw</td><td>it is suspected, or refuted but disputed, or confirmed and something it rests on changed, and no live candidate (one not standing disproved or excluded) holds it or it carries a proposal; or it is not refuted, it leaves a recorded state wrong, and no chain of it began since what its chain rests on last changed, an access of that state included, so a reader recorded since owes it one more look whatever its candidates; ready once no path stepping through its component or reading a state it leaves wrong owes a pending sweep or probe, and no such state a pending check</td><td><code>chain</code></td></tr>
+<tr><td>Review</td><td>candidate</td><td>no assessment stands, or one at or above the shortlist does and no verdict stands, or an assessment or verdict recorded outside its review proposes another; one assessed below the shortlist needs no verdict; ready once no path it performs owes a pending sweep or probe and no premise of its chain is undecided while its settle is pending or the user is asked it</td><td><code>validate</code> (each shortlisted candidate traced by a <code>trace</code> child)</td></tr>
 <tr><td>Test</td><td>candidate</td><td>it is validated, not noted, untested or reopened, and leads its root group; or it is unproven, untested or reopened, and an undecided code premise of its chain whose settle is exhausted has no more severe unproven candidate resting on it, or as severe and older, whose test is not exhausted; or its latest test is pending</td><td><code>poc</code></td></tr>
-<tr><td>Report</td><td>root flaw</td><td>its group has a reportable scenario its finding does not report as it stands; ready once no member owes an assessment, review or test</td><td><code>report</code></td></tr>
+<tr><td>Report</td><td>root flaw</td><td>its group has a reportable scenario its finding does not report as it stands; ready once no member owes a review or test</td><td><code>report</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -355,10 +360,14 @@ orchestrator runs one at a time.</p>
 <p>A child beginning a task is told what changed of each subject’s work since the subject’s
 previous task in that phase, if any, and while it works, with its next request, of what other
 agents changed of what its work rests on since it began: each change once, as a digest per
-changed subject (how many changes, the latest, their kinds, the newest few with their notes
-and the nodes each moved most, and every node the older ones moved), so it can re-read them
-before deciding. A check of a state checked before examines only the accesses changed since, and
-the whole state again after an edit or a merge into it. Its own changes and its helpers’ are left out,
+changed subject, so it can re-read them before deciding. A check marks its state with at least one premise its clearing relies on: a
+recorded one, such as the deployment premise for a documented contract, or a general claim its
+accesses do not show, settled by another agent; a mark naming none is refused. A handed
+state’s check also rests, for each value a caller acts on, on a premise naming a condition that
+yields it beyond the one its name suggests, since a write site does not show every condition
+upstream that leads there. A check of a state checked before
+examines only the accesses changed since and the pairs cleared on a premise that failed or was
+contradicted, and the whole state again after an edit or a merge into it. Its own changes and its helpers’ are left out,
 and the root, which works no task, is told nothing. A task also names, for each subject, the
 result of its phase proposed outside it (below), for it to decide, and a check the decided
 premises of the flaws leaving its state wrong, each with the task deciding it and how much
@@ -392,10 +401,11 @@ relied on, each a premise of its own, settled apart.</li>
 <li>A <strong>flaw</strong> is a local defect at a location in a component, with an optional CWE, the
 premises it depends on, the states it leaves wrong (a status reported wrongly leaves its
 handed state wrong), and a status: suspected, confirmed (a verified defect with no chain to
-an observable consequence found so far) or refuted. An invariant the target relies on but enforces only by an assertion
-or an internal convention (a bound, a progress guarantee, a status meaning, a lifetime) is a
-suspected flaw, its premise that something can violate it, worked like any other; a documented
-caller obligation is a flaw only in a caller that skips it.</li>
+an observable consequence found so far) or refuted. An invariant enforced only where it may not run in deployment (a
+debug assertion, client-side validation) or only by convention (a bound, a progress guarantee,
+a status meaning, a lifetime) is a suspected flaw, its premise that something can violate it,
+worked like any other; an obligation documented for a trusted caller is a flaw only in a caller
+that skips it, while a check left to an untrusted client or peer is the target’s flaw.</li>
 <li>A <strong>candidate</strong> is an ordered chain of flaws to an observable vulnerability, its first flaw
 its root, through its <strong>actions</strong>: the paths its scenario performs, in order, the first where
 the attacker starts. A path may repeat, as in a race with itself. Candidates sharing a root
@@ -409,9 +419,9 @@ interface’s own terms (a route template, a method, a message type), at one of 
 narrower. A location names an interface, never an address, so it stays the same across
 deployments. <strong>Evidence</strong> is a location with a stance on one node: it supports, contradicts or
 gives context; one made in an environment names it.
-Each result is decided by the work owning it: a code premise’s status by its settle, a
-deployment premise’s by you, recorded outside every scheduled task, a flaw’s by its chain, and a
-candidate’s assessment and verdict by its assessment and review. Work belongs to the outermost
+Each result is decided by the work owning it: a code premise’s status by its settle or by the
+review of a candidate whose chain rests on it, a deployment premise’s by you, recorded outside every scheduled task, a flaw’s by its chain, and a
+candidate’s assessment and verdict by its review. Work belongs to the outermost
 task it was recorded within, so a helper’s records count as its parent’s. Recorded anywhere else,
 a status, assessment or verdict is a <strong>proposal</strong>: the decided one keeps standing, a proposal that
 differs from it disputes it and owes its owner’s work again, and one that agrees changes nothing,
@@ -429,9 +439,17 @@ count, and the premises a retracted path relies on stand in no candidate’s cha
 <code>recorded</code> (a path <code>unswept</code>) again. Retracting or restoring a path owes the reviews and reports
 of the candidates performing it again.</p>
 <p>Candidates are assessed with a CVSS 4.0 base vector (CVSS-B) scored for the impact if every
-premise of its chain holds; the native scorer applies the shortlist threshold. A build option,
-configuration or deployment other than the default, or a race window the attacker must win,
-makes Attack Requirements present and is a premise. Attack Vector, Privileges Required and the
+premise of its chain holds; the native scorer applies the shortlist threshold. A candidate’s
+review scores it first: one scored below the threshold needs no verdict, and one a review moves
+below it keeps its verdict, but no report covers either. The review has a <code>trace</code> child, which
+neither begins work nor judges, trace each shortlisted candidate through the source, from the
+attacker’s entry along every action to the stated effect, recording each check, branch or bound
+that stops the input as contradicting evidence, or as an undecided code premise when it rests on
+a general claim; a returning review traces only the steps whose records changed. The review
+decides each code premise its verdict needs. A build option,
+configuration or deployment other than the default, behaviour of the caller, client or
+deployment beyond supplying attacker input, or a race window the attacker must win, makes Attack
+Requirements present and is a premise. Attack Vector, Privileges Required and the
 other exploitability metrics come from what the attacker must hold or face before the first
 action, plus anything a later action needs that no earlier action supplied; access or privilege
 gained during the scenario is never a prerequisite. A score rests only on what the candidate’s
@@ -440,24 +458,35 @@ chain with that condition as a premise, so the root’s report leads with whiche
 review records <strong>validated</strong> (every
 premise holds), <strong>disproved</strong> (a chain flaw is refuted or a code premise fails), <strong>excluded</strong> (a
 deployment premise fails, so the deployment keeps a real finding out of reports) or <strong>unproven</strong>
-(a premise stays undecided). A verdict counts while nothing it judged changed after it and the
-statuses it claims stand: none of its chain’s premises undecided or failing and no chain flaw
-refuted for validated, a code premise failing or a chain flaw refuted for disproved, a deployment
-premise failing for excluded, and a premise undecided for unproven. A premise decision or
-contradicting evidence owes the review again, and a material change of the candidate, its chain, a path it performs or a
-state that path accesses owes the assessment again too; another path’s access recorded on a
-state its paths share owes neither. A candidate’s confidence is <strong>conjectured</strong>
+(a premise stays undecided). An assessment counts until the candidate itself is edited or merged
+outside its review, or a proposal disputes it. A verdict counts
+while nothing its review rests on changed after it and the statuses it claims stand: none of its
+chain’s premises undecided or failing and no chain flaw refuted for validated, a code premise
+failing or a chain flaw refuted for disproved, a deployment premise failing for excluded, and a
+premise undecided for unproven. A premise decision, contradicting evidence or a material change
+of the candidate, its chain, a path it performs or a state that path accesses owes the verdict
+again, unless made within its review, as does an access recorded or removed of a state its flaws
+leave wrong or its paths read where one of its flaws sits (in that flaw’s function, or at its
+location when it names none); an access of any other state, on its paths or another’s, owes
+nothing, and neither a decision nor an access re-scores a candidate. A candidate’s confidence is <strong>conjectured</strong>
 while a premise of its chain is undecided or contradicts it, <strong>established</strong> otherwise,
 <strong>confirmed</strong> while a positive verdict stands, and <strong>demonstrated</strong> once its settling test (its
 latest test that is not pending, recorded at its standing verdict) is confirmed and its chain
 uncontradicted. A validated candidate no more severe than a demonstrated one of its group is
 <strong>noted</strong> rather than tested.</p>
 <p><strong>Deployment premises</strong> stand for what only you can answer. <code>target</code> records the ones your
-request settles as holding or failing. One raised later and left undecided is never settled by
-an agent: it holds back the reviews resting on it and is listed in the synthesis as asked. A
-status an agent sets on one within scheduled work only proposes it, and is asked too. When
-the scheduler returns, the orchestrator puts the asked premises, and those an unproven candidate
-rests on, to you as one question, records each answer as the premise holding or failing, which
+request settles as holding or failing, among them the obligations the target’s documentation
+places on a trusted caller such as an embedding application: a broad request admits what that
+documented contract permits, and anything an untrusted client or peer can send, so breaking a
+trusted caller’s documented obligation fails unless you include it, and what the documentation
+leaves unsaid holds. In an interactive run the orchestrator then puts that profile to you as one
+question before research starts and records your answers; while a question to you is open, the
+scheduler starts no reviews, and the rest of the work goes on. Agents rest a deployment
+condition on each recorded premise it combines, raising a new one only for a single condition
+none covers. One raised later and left undecided is never settled by an agent: it holds back the
+reviews resting on it and is listed in the synthesis as asked. A status an agent sets on one within scheduled work
+only proposes it, and is asked too. When the scheduler returns, the orchestrator puts the asked
+premises, and those an unproven candidate rests on, to you as one question, records each answer as the premise holding or failing, which
 sends their candidates back to review, and runs the scheduler again. A batch run has no one to
 ask: the orchestrator answers its agents’ scope questions from your request, and the premises it
 leaves undecided stay asked and are listed in its final summary.</p>
@@ -465,7 +494,7 @@ leaves undecided stay asked and are listed in its final summary.</p>
 exhausted subject with its last agent’s reply, the deployment premises asked of you, the
 candidates left unproven with their undecided premises, the components no path reaches, the
 interfaces paths without code wait on an environment for (under <code>live: no</code>, every interface such
-a path enters on), and how many paths and candidates lie outside the scope. After each return the orchestrator also has a <code>question</code> agent review the loose
+a path enters on), and how many paths and candidates lie outside the scope. After each return the orchestrator also has a <code>settle</code> agent review the loose
 ends it lists, the premises of exhausted settles and those an unproven candidate rests on: each
 gets a proposed status, what would settle it, or what reopens it. Exhausted work is terminal: the orchestrator
 closes the run once a pass changes nothing, with nothing owed or held, every answer you gave
@@ -491,7 +520,7 @@ the instructions extend the analysis, prepare an environment,
 validate, test or rewrite reports. Fresh work is always owed; settled or exhausted work is owed
 again only once something it rests on changed. A resumed run keeps its shortlist threshold,
 live policy and workers; a <code>--workers</code> flag resizes it once its work resumes, and <code>--live</code>
-applies only to a new session, so it is refused with <code>--resume</code>. A headless resume is refused
+and <code>--shortlist</code> apply only to a new session, so each is refused with <code>--resume</code>. A headless resume is refused
 only when the run’s own policy is <code>ask</code>, whatever the configuration says. Only the root agent knows the
 live policy, and under <code>no</code> every agent’s instructions leave out live work. The shortlist
 threshold is applied by the store alone; no agent is told it.</p>
@@ -501,24 +530,28 @@ root agent’s conversation: the shortlist threshold, the live policy, and the w
 instructions in the composer: <code>Shift+Tab</code> moves between the fields and the composer, <code>←</code>/<code>→</code>
 change a choice, digits edit the workers. The first message sends the panel’s values with it; with
 no instructions the session starts with “Analyze the workspace.” Once the run has started the
-panel stays in view, frozen; a session that fails to start leaves it editable for the next try.</p>
+panel stays in view, frozen; a session that fails to start leaves it editable for the next try.
+A reopened session shows the panel frozen with the values its run runs under, including a
+<code>--workers</code> resize that applies once its work resumes.</p>
 <p>The Research tab (<code>]</code> from Jobs, or click its header) takes the whole screen below the tab
-strip and views the root agent again, so the status beside it is the session’s own. It opens on a dashboard of the run: its threshold, live policy and workers, the synthesis,
+strip and views the root agent again, so the status beside it is the session’s own. It opens on a dashboard of the run: its threshold, live policy and workers, when this
+window opened the session and how long ago (reopening starts it again), the synthesis,
 a pipeline showing where each phase stands (what it owes, has running and has exhausted), and
 panels for coverage (states, paths swept and unswept, uncovered interfaces, paths outside the
 scope, components reached or mapped only,
 premises undecided, asked and disputed, flaws by status), candidates by status, and the tasks
 running and exhausted in each phase. Below it, sections list the candidates, findings, paths,
-tasks, flaws, premises, components and states, each most relevant first: candidates by standing
+running tasks, task history, flaws, premises, components and states, each most relevant first: candidates by standing
 (demonstrated, validated, shortlisted, unproven, unassessed, then the rest); findings by their best
 score; paths unswept first; flaws confirmed first; premises awaiting your answer first; states
 checked across calls (instance and handed) first. Within each group, rows with work running come
 first, then work owed, then work exhausted, then none; candidates and flaws then by score. Each
 path, state, premise, flaw and
-candidate shows what it owes and its last task, and opens to its latest tasks. Tasks are listed
-running first, then queued, failed and cancelled ones, each newest first, with their phase,
-subjects, state (as their agent’s job stands), and when they began and ended; a task opens to its brief, its agent’s
-reply and the records the agent wrote. Click a section’s header, or choose it with <code>↑</code>/<code>↓</code> and
+candidate shows what it owes and its last task, and opens to its latest tasks. Running tasks
+(their agent’s job still live) and the task history (jobs that ended) are listed apart, each newest
+first, with their phase, state (as their agent’s job stands), when they began or ended, subjects
+and the first line of their brief; a task opens to its whole brief, its agent’s reply and the
+records the agent wrote. Click a section’s header, or choose it with <code>↑</code>/<code>↓</code> and
 press <code>Enter</code>, to open it; a record opens the same way to its detail, a candidate to its whole
 scenario: actions, chain, premises, assessment, verdict, tests and evidence, with an assessment
 or verdict that no longer stands marked stale. A candidate whose assessment or verdict no longer
@@ -602,7 +635,7 @@ regular file under the run’s <code>artifacts/</code> directory reached without
 shows a confirmation that lacks one. Execution uses ordinary approvals and capabilities: prefer
 a disposable container or a deliberately configured target, and keep live validation within the
 authorized environment.</p>
-<p>A root flaw is reported once its group owes no assessment, review or test, by a <code>report</code> agent
+<p>A root flaw is reported once its group owes no review or test, by a <code>report</code> agent
 who writes one markdown report: summary, analysis, impact, remediation, reproduction citing
 test ids and artifacts, and a section per other scenario. The report is owed again whenever
 what its scenarios rest on changes after it was written, or its group’s reportable scenarios
@@ -626,21 +659,27 @@ candidate holds, with why no chain was found, which are not scored or tested; an
 most severe validated candidate is assessed below the run’s threshold, with that candidate and
 its severity. None are reported, and <code>index.json</code> lists them under <code>hardening</code>, each with its
 reason. Every page
-opens with a small front matter its text repeats, and links only by relative path. The
-orchestrator writes <code>reports/</code> out with <code>research</code> <code>generate</code> once it closes the run: a root’s folder is replaced in
-one step when what renders has changed, a stale root’s folder and anything else placed there is
-removed, and a generation with nothing changed changes nothing. An artifact is copied only while
-it matches the digest its test recorded; one that changed keeps the root out of <code>reports/</code> and
-is reported.</p>
+opens with a small front matter its text repeats, and links only by relative path.</p>
+<p>The orchestrator writes <code>reports/</code> once it closes the run. The directory is the run’s own:
+anything else placed there is removed, a root’s folder is replaced when what renders has changed,
+and a generation with nothing changed changes nothing. An artifact is copied only while it
+matches the digest its test recorded; one that changed keeps the root out of <code>reports/</code> and is
+reported.</p>
+<p>These files are guarded by path name, not against another program writing in the session
+directory at the same moment. A replaced folder is moved aside before the new one moves in, so a
+reader in between, or after a crash there, finds that root’s folder missing until the next
+generation. An artifact, and <code>reports/</code> itself, is refused when reached through a symbolic link,
+but a link put in place between that check and the read or write is followed. Keep other
+programs out of a run’s session directory while it runs.</p>
 <h2 id="native-research-tools"><a class="header" href="#native-research-tools">Native research tools</a></h2>
 <p>Research tools are bound to the session’s run. Each call names an <code>action</code> and passes that
 action’s arguments beside it; the schema’s description of <code>action</code> lists each action’s
 arguments, marking optional ones with <code>?</code>. <code>upsert</code>, <code>set_status</code> and <code>list</code>, whose arguments
 depend on the kind of record, take them inside <code>record</code>, tagged by its <code>kind</code>; an <code>upsert</code> edit
-names the node’s <code>id</code> and may leave its kind out:</p>
+names the node’s <code>id</code> too:</p>
 <pre><code class="language-js">await tool.research({action: "upsert", record: {kind: "premise", title: "32-bit builds",
   body: "the library is built for 32-bit platforms", scope: "deployment"}});
-await tool.research({action: "upsert", record: {id: 7, title: "64-bit builds"}});
+await tool.research({action: "upsert", record: {kind: "premise", id: 7, title: "64-bit builds"}});
 await tool.research({action: "set_status", record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
 await tool.research({action: "begin", phase: "sweep", subjects: [3]});
 await tool.research_query({action: "list", record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
@@ -657,16 +696,17 @@ computes the CVSS-B score and severity.</p>
 <tr><th>Tool</th><th>Actions</th><th>Capabilities</th></tr>
 </thead>
 <tbody>
-<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind (an edit by <code>id</code> takes its node’s kind), <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate <code>node</code> into a node of its kind (one already merged into it is left as it is), <code>set_status</code> of a premise, flaw, path, state (<code>checked</code> too) or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
+<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind but a finding (a path with its whole list of <code>steps</code>), <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate <code>node</code> into a node of its kind (one already merged into it is left as it is), <code>set_status</code> of a premise, flaw, path, state (<code>checked</code> too, resting on at least one premise) or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
 <tr><td><code>research_query</code></td><td>Read a <code>node</code> with its neighbourhood and latest tasks, a <code>task</code> with its child’s brief, reply and records, <code>list</code> nodes of a kind (states by scope; or environments and tasks), <code>search</code> live nodes by a regex over their own text (not their events’ notes) or a code location’s file glob, line and function, each with where it matched, the event <code>history</code> of the run or a node, and the <code>synthesis</code> of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is <code>startable</code> next.</td><td><code>read</code>; <code>security.coordinate</code> for what can start next</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="building"><a class="header" href="#building">Building</a></h2>
-<p>The companion is the <code>skyhook-security</code> crate of the workspace:</p>
-<pre><code class="language-sh">cargo run -p skyhook-security -- --help
+<p>The companion is the <code>skyhook-security</code> product library, built as the <code>skyhook-security</code>
+binary by the workspace’s <code>crates/apps</code> package:</p>
+<pre><code class="language-sh">cargo run -p skyhook-apps --bin skyhook-security -- --help
 </code></pre>
-<p>The release build includes both applications; stage shims first when SSH execution is needed
+<p>The release build includes both applications; stage shims first when remote targets are needed
 (see <a href="../getting-started/installation.html">installation</a>).</p>
 
                     </main>

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2efac103.js";
+            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -182,18 +182,39 @@
                     <main>
                         <h1 id="javascript-runtime"><a class="header" href="#javascript-runtime">JavaScript runtime</a></h1>
 <h2 id="supported-globals-and-concurrency"><a class="header" href="#supported-globals-and-concurrency">Supported globals and concurrency</a></h2>
-<p>The runtime exposes:</p>
+<p>Scripts run in V8 with the standard ECMAScript built-ins, including <code>Intl</code>, <code>Temporal</code> and
+<code>Uint8Array.fromBase64</code>, <code>.fromHex</code>, <code>.toBase64()</code>, and <code>.toHex()</code>. <code>WebAssembly</code> and
+<code>Atomics.waitAsync</code> are not available. Scripts compute in UTC whatever the host’s time zone, so
+local-time <code>Date</code> methods and <code>Intl</code> and <code>Temporal</code> defaults use UTC; an explicit <code>timeZone</code>
+still applies. The runtime adds:</p>
 <ul>
-<li><code>Date</code>, <code>RegExp</code>, <code>Map</code>/<code>Set</code>, <code>Proxy</code>/<code>Reflect</code>, and <code>BigInt</code>;</li>
-<li><code>ArrayBuffer</code>, <code>DataView</code>, and typed arrays, including <code>Uint8Array.fromBase64</code>,
-<code>.fromHex</code>, <code>.toBase64()</code>, and <code>.toHex()</code>;</li>
 <li><code>performance.now()</code> for measuring elapsed milliseconds;</li>
+<li><code>queueMicrotask(callback)</code>, which ignores the callback’s return value;</li>
 <li><code>await sleep(ms)</code> for asynchronous waits, resolving to <code>undefined</code>. The delay must be a number
-of milliseconds from 0 to 2147483647, as for JavaScript timers; fractional values are accepted,
-and any other value throws a <code>TypeError</code> at the call.
+of milliseconds from 0 to 1800000 (30 minutes); fractional values are accepted, and any other
+value throws a <code>TypeError</code> at the call.
 Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;</li>
+<li><code>setTimeout</code>, <code>setInterval</code>, <code>clearTimeout</code> and <code>clearInterval</code>, passing extra arguments to the
+callback. A missing, negative or <code>NaN</code> delay is 0; a delay above 30 minutes throws the same
+<code>TypeError</code> as <code>sleep</code> rather than firing early. Timers due at the same time run in the order
+they were set. Pending timers do not keep the script alive. An exception a timer or
+<code>queueMicrotask</code> callback throws, or a rejection of the promise an async one returns, is
+written to the console as <code>Uncaught …</code> without ending the script;</li>
+<li><code>TextEncoder</code> and <code>TextDecoder</code>, for UTF-8 only: encoding writes an unpaired surrogate as U+FFFD,
+and a decoder for any other label throws a <code>RangeError</code>. <code>{fatal: true}</code> makes malformed input a
+<code>TypeError</code>, and <code>ignoreBOM</code> keeps a leading byte-order mark; <code>{stream: true}</code> is not supported;</li>
+<li><code>atob</code> and <code>btoa</code>, which throw an error named <code>InvalidCharacterError</code> for input that is not
+base64, or for characters above U+00FF, and a <code>TypeError</code> without an argument;</li>
+<li><code>structuredClone(value)</code> for values V8 can serialize, cycles included, such as <code>Map</code>, <code>Set</code>,
+<code>Date</code>, <code>RegExp</code>, errors, <code>ArrayBuffer</code> and typed arrays. Functions, symbols, the runtime’s own
+objects (<code>URL</code>, <code>URLSearchParams</code>, <code>TextEncoder</code>, <code>TextDecoder</code> and <code>WorkPool</code>) and other values
+it cannot clone throw an error named <code>DataCloneError</code>, as does a non-empty <code>transfer</code> option, and
+a copy whose buffers exceed the ArrayBuffer storage limit throws a <code>RangeError</code>;</li>
+<li><code>URL</code>, with <code>URL.canParse</code> and <code>URL.parse</code>, and <code>URLSearchParams</code>, following the WHATWG URL
+standard: an invalid URL throws a <code>TypeError</code>, as does a missing required argument, and a URL’s
+<code>searchParams</code> and <code>search</code> stay in step;</li>
 <li><code>new WorkPool(concurrency).map(items, worker)</code> and <code>.run([fn1, fn2, ...])</code> as async iterables
-yielding <code>{index, value}</code> results in completion order, or <code>{index, error}</code> for a task that
+yielding <code>{index, value}</code> results in completion order, or <code>{index, error}</code> with the thrown value for a task that
 threw; remaining items continue. <code>run</code> requires exactly one array of functions, each called
 with no arguments—not variadic arguments. Invalid <code>run</code> arguments, and a <code>map</code> worker that is
 not a function, throw before any task starts. Early iterator closure stops scheduling and
@@ -207,7 +228,7 @@ and <code>next</code> starts nothing. An optional <code>wake</code> function (su
 runs and raced alongside it: each value it resolves yields <code>{wake: value}</code>. A wake still pending
 when the feed ends is released, so the input it would have taken goes to the next <code>receive()</code>;</li>
 <li><code>await receive()</code> waits for the next JSON value sent to the script’s own job ID with
-<code>tool.job(scriptJobId).send({value})</code>; the script must be launched with <code>bg: true</code>. Values
+<code>control({job: scriptJobId, send: value})</code>; the script must be launched with <code>bg: true</code>. Values
 arrive in order. Calling <code>release()</code> on a receive you no longer await hands its value, taken or
 not, to the next <code>receive()</code>.
 This is script input, not child-agent input: agents receive owner updates automatically.</li>
@@ -224,13 +245,14 @@ for await (const {index, value} of new WorkPool(2).run([
 return results;
 </code></pre>
 <h2 id="memory-limit"><a class="header" href="#memory-limit">Memory limit</a></h2>
-<p>Each script call has a <strong>512 MiB (536,870,912-byte) QuickJS allocation limit</strong>. This covers
-runtime-managed memory, including JavaScript objects, strings, and JavaScript-created
-ArrayBuffer and typed-array storage. Freed memory restores capacity; the limit is not a
-cumulative allocation, execution-time, or token budget.</p>
-<p>An allocation that exceeds the limit throws an out-of-memory error. Scripts can catch it;
-an uncaught error fails the call. Keep headroom for temporary allocations during result
-conversion and serialization.</p>
+<p>Each script call has a <strong>512 MiB JavaScript heap limit</strong> for its objects and strings, and
+separately up to 512 MiB of ArrayBuffer and typed-array storage at once. Freed memory restores
+capacity; neither is a cumulative allocation, execution-time, or token budget.</p>
+<p>An ArrayBuffer or typed-array allocation beyond its limit throws a <code>RangeError</code>, which scripts can
+catch. Exceeding the heap limit ends the script, which cannot catch it, with the error
+“JavaScript heap limit (512 MiB) exceeded”,
+and the call fails even if the script went on to return. Keep headroom for temporary allocations
+during result conversion and serialization.</p>
 <p>This is not a total process-memory limit. Rust-side tool results, host bookkeeping, and
 other native allocations are outside the budget, and concurrent script calls each have
 their own allowance.</p>
@@ -260,7 +282,7 @@ inside a paged <code>jobs({job})</code> result are not filled, since a page may 
 <p>A completed call with nothing more to read or resume (no truncation, page, capture, question,
 notice, or retained child that input resumes) omits <code>id</code> and <code>state</code>. <code>result</code> is the native tool payload. It is present exactly when the job
 has a result, and a loaded literal <code>null</code> result stays <code>result: null</code>. A tool with nothing to
-return, such as <code>tool.job(id).send</code>, completes without a result. <code>meta</code> is absent on an ordinary
+return, such as <code>tool.control({job: id, send: value})</code>, completes without a result. <code>meta</code> is absent on an ordinary
 successful foreground call. Background handles, listings, inspections, and failures carry <code>meta</code>
 with what the caller does not already know: <code>tool</code> and <code>name</code> except in the response to the
 caller’s own foreground call, <code>parent</code>, <code>target</code>, and <code>workspace</code> only when they differ from the
@@ -278,7 +300,9 @@ background so that agent can answer (see
 <a href="../scripting/jobs-and-agents.html#delegation-and-child-input">delegation</a>).
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
-<a href="job-output.html#automatic-previews">saved job output</a>. A returned tool response keeps its own
+<a href="job-output.html#automatic-previews">saved job output</a>. A field kept in a
+<a href="job-output.html#spill-files">spill file</a> is read whole into the script like any other, so a large
+one counts against the heap limit. A returned tool response keeps its own
 fields whole in the script’s own preview, and its result is previewed as a direct read of that
 result would be; a page a <code>jobs</code> read returns is a presentation already and stays whole.
 A value taken out of a response, such as <code>response.result</code>, is shortened like any other returned
@@ -295,18 +319,15 @@ Tool descriptions give a call’s response as <code>JobView&lt;T&gt;</code>: the
 or <code>null</code> when the job has no result, and throws for failed or pending responses; the thrown error has <code>error.response</code> containing the envelope and <code>error.output</code> equal to its
 <code>.result</code>, plus <code>error.job</code> and <code>error.code</code> when the response has an <code>id</code> or denial <code>code</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
-<code>receive()</code> values are not decorated, and there is no built-in <code>tool.unwrap</code> helper.</p>
+<code>receive()</code> values are not decorated.</p>
 <p><code>jobs({job})</code> reads already return views, so read their <code>result</code>, <code>presentation.preview</code>,
 <code>presentation.captures</code>, or pagination rather than unwrapping them. A script’s whole-output
 <code>jobs({job})</code> read holds the target’s complete result, never a preview: previews apply only to
 what reaches the model, such as the script’s own returned value. Operational tool failures are
 failed views rather than JavaScript throws; programmer, serialization, <code>receive</code>, and sleep errors
 still throw.</p>
-<p>Before returning results, convert <code>BigInt</code> values to strings, dates with <code>.toISOString()</code>, and
-typed arrays with <code>Array.from(bytes)</code>, <code>.toBase64()</code>, or <code>.toHex()</code>; they fail with their path
-otherwise. The runtime does not provide
-Node.js APIs, <code>fetch</code>, <code>URL</code>, <code>TextEncoder</code>/<code>TextDecoder</code>, or <code>setTimeout</code>/<code>setInterval</code>. Scripts
-cannot import modules, including the runtime’s own.</p>
+<p>The runtime does not provide Node.js APIs or <code>fetch</code>. Scripts cannot import modules, including
+the runtime’s own.</p>
 <h2 id="script-results-and-failures"><a class="header" href="#script-results-and-failures">Script results and failures</a></h2>
 <p>Every script result payload is <code>{value: &lt;JavaScript return&gt;, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>.
 Scripts without a return have <code>value: null</code>, silent scripts have no <code>console</code>, and <code>failure</code> is
@@ -324,31 +345,40 @@ source</strong>, not console capture.</p>
 where <code>value</code> is <code>null</code> unless only the returned value’s conversion failed;
 the enclosing JobView is <code>failed</code> and carries its <code>error</code>: the thrown error’s message and stack,
 or the JSON of any other thrown value. The message leads with the error’s name unless it is
-plain <code>Error</code>. Stack frames are <code>skyhook-script:line:column</code> positions in the submitted body, or
-<code>end of source</code> for a syntax error where input ended early; frames outside the body are left
-out. Console text belongs to the script result, not job metadata.</p>
+plain <code>Error</code>. Stack frames are <code>line L:C</code> positions in the submitted body’s own
+lines and columns, or <code>end of source</code> for a syntax error where input ended early; frames outside
+the body are left out, and the callers an <code>await</code> resumed are shown as <code>at async</code> frames. Console text belongs to the script result, not job metadata.</p>
 <p><code>failure</code> holds a thrown error’s other properties: its <code>cause</code> and enumerable properties, such as
 the <code>job</code> and <code>code</code> of an unwrapped failed response, whose full view <code>tool.jobs({job})</code> reads.
 It is absent when there are none, so use the enclosing JobView’s <code>state</code> and <code>error</code> to determine
 whether execution failed. Automatic previews can shorten it.</p>
 <p>Returned values convert to JSON:</p>
 <ul>
-<li>As in <code>JSON.stringify</code>, an <code>undefined</code> member is omitted, and a top-level <code>undefined</code> or an
-<code>undefined</code> array element becomes <code>null</code>.</li>
+<li>As in <code>JSON.stringify</code>, an <code>undefined</code> member is omitted, a top-level <code>undefined</code>, an
+<code>undefined</code> array element or a non-finite number becomes <code>null</code>, a <code>toJSON</code> method’s result
+stands in for its object (a date becomes its ISO string, a <code>URL</code> its <code>href</code>), and other objects
+become their own enumerable string-keyed properties.</li>
+<li>Where <code>JSON.stringify</code> would throw or lose data, a value takes its natural form: a <code>BigInt</code>
+becomes its decimal string, a typed array an array of its elements, an <code>ArrayBuffer</code>,
+<code>SharedArrayBuffer</code> or <code>DataView</code> an array of its bytes, a <code>Set</code> an array in insertion order, a
+<code>RegExp</code> its text such as <code>"/x+/g"</code>, and a boxed primitive its value. A <code>Map</code> becomes an object
+when its keys are strings or finite numbers that stay distinct as names, and an array of
+<code>[key, value]</code> entries otherwise.</li>
 <li>Promises, builders and other thenables anywhere in the value are awaited.</li>
 <li>An <code>Error</code> becomes an object of its <code>name</code>, <code>message</code>, <code>cause</code> and other properties.</li>
 <li>An unpaired surrogate in a string becomes U+FFFD.</li>
-<li>Anything else that is not JSON is a problem at its path, such as <code>$.items[2]</code>: non-finite
-numbers, <code>BigInt</code>s, functions, symbols, cycles, objects other than plain objects and arrays, unpaired surrogates in keys, nesting deeper than 100, and
-a member whose getter throws or whose promise rejects, reported with its error’s message.</li>
+<li>Anything else is a problem at its path, such as <code>$.items[2]</code>: functions, symbols, <code>WeakMap</code>,
+<code>WeakSet</code>, <code>WeakRef</code> and <code>FinalizationRegistry</code> objects, cycles, unpaired surrogates in keys,
+nesting deeper than 100, and a member whose getter or <code>toJSON</code> throws or whose promise rejects,
+reported with its error’s message.</li>
 </ul>
 <p>Conversion runs after the body returns, so the body’s own <code>try</code>/<code>catch</code> cannot catch its problems.
 A value with problems still fails the script, with an error listing them by path, but its saved
 <code>value</code> keeps everything else, with <code>null</code> in place of each problem; captured console text is
 kept as on any failure.</p>
-<p>Tool arguments convert the same way when the builder is made, so a failure throws at the call:
-<code>undefined</code> properties are omitted, while <code>undefined</code> array elements, promises, builders, <code>Error</code>s
-and unpaired surrogates fail.</p>
+<p>Tool arguments convert the same way when the builder is made, so a problem throws at the call:
+<code>undefined</code> properties are omitted, while <code>undefined</code> array elements, promises, builders and
+unpaired surrogates are problems too. The converted argument must be an object.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
 <p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
 normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
