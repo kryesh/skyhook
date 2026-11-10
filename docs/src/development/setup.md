@@ -14,7 +14,8 @@ just setup
 ```
 
 `just setup` adds the `rustfmt` and `clippy` components, every shim target, and this machine's release
-target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. See
+target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. It then
+checks for Zig and what [release builds](#release-builds) need, and names whatever is missing. See
 [remote transport and shims](remote-transport-and-shims.md) for shim profiles and artifacts.
 
 ## Release builds
@@ -22,9 +23,11 @@ target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo i
 `just build-release` compiles V8 from source the first time it builds a `v8` version for a
 target, and reuses that build afterwards. It needs, on `PATH`:
 
-- `clang` (with `ld.lld`, `llvm-ar` and the compiler-rt builtins) at least as new as the clang major
-  that V8 version's Chromium build pins, and `llvm-config` for its libclang; the build stops with
-  the required version if the installed one is older;
+- `clang` and `clang++` at least as new as the clang major that V8 version's Chromium build pins,
+  with their compiler-rt builtins; the build stops with the required version if the installed one
+  is older;
+- from the same LLVM, `ld.lld`, `llvm-ar`, `llvm-nm`, `llvm-readelf` and `llvm-objcopy`, and
+  `llvm-config` for its `libclang.so`;
 - `gn`, `ninja`, `git`, `python3`, and `unshare` (util-linux); `ccache` is used when present;
 - a nightly Rust toolchain as this repository's active toolchain, since V8's own build passes
   unstable flags to `rustc`.

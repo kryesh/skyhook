@@ -29,13 +29,6 @@ host_names=$(names "$host")
 read -r _ target_debian target_headers <<<"$target_names"
 read -r host_cpu host_debian _ <<<"$host_names"
 zig=${CARGO_ZIGBUILD_ZIG_PATH:-zig}
-# `zig env` prints the ZON this script reads from Zig 0.15 on.
-zig_version=$("$zig" version)
-IFS=. read -r zig_major zig_minor _ <<<"$zig_version"
-if ! [[ $zig_major$zig_minor =~ ^[0-9]+$ ]] || { [ "$zig_major" -eq 0 ] && [ "$zig_minor" -lt 15 ]; }; then
-  echo "release builds need Zig 0.15 or newer; $zig is $zig_version" >&2
-  exit 1
-fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 cache=$root/target/v8
 gn_args='v8_enable_webassembly=false symbol_level=0 exclude_unwind_tables=true'
@@ -49,6 +42,7 @@ if [ -s "$out/librusty_v8.a" ] && [ -s "$out/src_binding.rs" ]; then
   echo "$out"
   exit
 fi
+"$root/scripts/build-tools.sh"
 
 src=$cache/rusty_v8-$version
 if [ ! -d "$src/.git" ]; then

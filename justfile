@@ -15,11 +15,13 @@ release_features := "--features mimalloc/override"
 # Default release target for this machine: releases are static musl builds for Linux.
 host_target := if os() == "linux" { arch() + "-unknown-linux-musl" } else { error("release builds need a Linux host, not " + os()) }
 
-# Install Rust-side tooling, shim targets, and the host release target (Zig must be installed separately).
+# Install Rust-side tooling, shim targets, and the host release target, then check for the
+# compilers and build tools that are installed separately.
 setup:
     rustup component add clippy rustfmt
     rustup target add {{ shim_targets }} {{ host_target }}
     cargo install --locked cargo-zigbuild cargo-nextest mdbook
+    scripts/build-tools.sh
 
 # Debug CLI; reads whatever is in target/shims live from disk.
 [positional-arguments]
