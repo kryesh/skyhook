@@ -101,7 +101,10 @@ impl App {
             Command::Copy => self.copy(),
             Command::CancelJob => {
                 let row = self.selected_entry();
-                if let Some(job) = row.and_then(|row| self.entries()[row].job_id()) {
+                let job = row.and_then(|row| self.entries()[row].job_id());
+                let held = &self.snapshot.jobs;
+                let running = |job: &_| held.get(job).is_some_and(|job| !job.state.is_terminal());
+                if let Some(job) = job.filter(running) {
                     self.confirm(ConfirmAction::CancelJob(job));
                 }
             }

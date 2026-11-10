@@ -166,7 +166,9 @@ pub(super) fn job_entry(
         } else {
             body.line("Loading output…", Role::Muted);
         }
-        body.line("[c] cancel job", Role::Muted);
+        if !job.state.is_terminal() {
+            body.line("[c] cancel job", Role::Muted);
+        }
         body
     });
     let mut entry = Entry::card(key, header, document);
@@ -253,6 +255,11 @@ mod tests {
                 "{state}"
             );
             assert!(started.is_none_or(|started| expanded.contains(&started)));
+            assert_eq!(
+                expanded.contains("[c] cancel job"),
+                !job.state.is_terminal(),
+                "{state}"
+            );
             assert_eq!(entry(false).timing, timing);
         }
         let _ = crate::tests::bounded(script).await.unwrap();
