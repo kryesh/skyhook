@@ -519,32 +519,35 @@ programs out of a run's session directory while it runs.
 
 ## Native research tools
 
-Research tools are bound to the session's run. Each call names an `action` and passes that
-action's arguments beside it; the schema's description of `action` lists each action's
-arguments, marking optional ones with `?`. `upsert`, `set_status` and `list`, whose arguments
-depend on the kind of record, take them inside `record`, tagged by its `kind`; an `upsert` edit
-names the node's `id` too:
+Research tools are bound to the session's run, one tool per action. `research_upsert`,
+`research_set_status` and `research_list`, whose arguments depend on the kind of record, take
+them inside `record`, tagged by its `kind`; a `research_upsert` edit names the node's `id` too:
 
 ```js
-await tool.research({action: "upsert", record: {kind: "premise", title: "32-bit builds",
+await tool.research_upsert({record: {kind: "premise", title: "32-bit builds",
   body: "the library is built for 32-bit platforms", scope: "deployment"}});
-await tool.research({action: "upsert", record: {kind: "premise", id: 7, title: "64-bit builds"}});
-await tool.research({action: "set_status", record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
-await tool.research({action: "begin", phase: "sweep", subjects: [3]});
-await tool.research_query({action: "list", record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
-await tool.research_query({action: "node", id: 7});
-await tool.research_query({action: "search", file: "c/dec/*.c", line: 1189, kinds: ["state", "flaw"]});
-await tool.research_query({action: "synthesis"});
+await tool.research_upsert({record: {kind: "premise", id: 7, title: "64-bit builds"}});
+await tool.research_set_status({record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
+await tool.research_begin({phase: "sweep", subjects: [3]});
+await tool.research_list({record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
+await tool.research_node({id: 7});
+await tool.research_search({file: "c/dec/*.c", line: 1189, kinds: ["state", "flaw"]});
+await tool.research_synthesis();
 ```
 
-A tool offers only the actions the agent's capabilities allow. Lists are cursor pages: follow
+An agent is offered only the tools its capabilities allow. Lists are cursor pages: follow
 `next_after` until it is absent. CVSS input is a complete 4.0 base vector; the native scorer
 computes the CVSS-B score and severity.
 
-| Tool | Actions | Capabilities |
+| Tools | Do | Capabilities |
 | --- | --- | --- |
-| `research` | `begin` a task on its phase's subjects; `upsert` a node of any kind but a finding (a path with its whole list of `steps`), `link` and `unlink` its edges, record `evidence`, `merge` a duplicate `node` into a node of its kind (one already merged into it is left as it is), `set_status` of a premise, flaw, path, state (`checked` too, resting on at least one premise) or component, `assess` a candidate and describe an `environment` and the interfaces it `serves`; with `security.verdict` too, a `verdict`; with `security.test`, a `test`; with `security.verdict` and `write`, a root's `report`; and, for the orchestrator, `generate` the reports. | `security.research`; `security.scheduled` to `begin` |
-| `research_query` | Read a `node` with its neighbourhood and latest tasks, a `task` with its child's brief, reply and records, `list` nodes of a kind (states by scope; or environments and tasks), `search` live nodes by a regex over their own text (not their events' notes) or a code location's file glob, line and function, each with where it matched, the event `history` of the run or a node, and the `synthesis` of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is `startable` next. | `read`; `security.coordinate` for what can start next |
+| `research_begin` | Begin a task on its phase's subjects. | `security.scheduled` |
+| `research_upsert`, `research_link`, `research_evidence`, `research_merge`, `research_set_status`, `research_assess`, `research_environment` | Create or edit a node of any kind but a finding (a path with its whole list of `steps`), add and remove its edges, record evidence, merge a duplicate `node` into a node of its kind (one already merged into it is left as it is), set the status of a premise, flaw, path, state (`checked` too, resting on at least one premise) or component, assess a candidate, and describe an environment and the interfaces it `serves`. | `security.research` |
+| `research_verdict` | Record a candidate's verdict. | `security.research`, `security.verdict` |
+| `research_test` | Record a candidate's test. | `security.test` |
+| `research_report` | Record a root's report. | `security.verdict`, `write` |
+| `research_node`, `research_task`, `research_list`, `research_search`, `research_history`, `research_synthesis` | Read a node with its neighbourhood and latest tasks, a task with its child's brief, reply and records, the nodes of a kind (states by scope; or environments and tasks), live nodes by a regex over their own text (not their events' notes) or a code location's file glob, line and function, each with where it matched, the event history of the run or a node, and the synthesis of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces. | `read` |
+| `research_startable`, `research_generate` | For the orchestrator: what can start next, and writing the reports out. | `security.coordinate` |
 
 ## Building
 

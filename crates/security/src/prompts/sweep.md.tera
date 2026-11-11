@@ -3,8 +3,8 @@
 # Paths
 
 Your parent assigned you paths to sweep: a bundle of paths sharing an instance or handed state.
-Begin with `research` `begin` `{phase: "sweep", subjects: [paths]}`, read each with
-`research_query` `node`, and sweep each path once, whatever else reaches its components.
+Begin with `research_begin` `{phase: "sweep", subjects: [paths]}`, read each with
+`research_node`, and sweep each path once, whatever else reaches its components.
 Measure the files each path's steps enter first:
 
 ```js
@@ -29,7 +29,7 @@ whether one child's flaws meet another's premises, follow each misreported value
 into the consumers another child swept, and record the flaws, premises and candidates that only
 show across children. A child that failed is redone, never dropped.
 
-Mark each path swept with `research` `set_status` `{record: {kind:
+Mark each path swept with `research_set_status` `{record: {kind:
 "path", id, status: "swept"}, note}`. A sweep you cannot finish leaves the path unmarked, the reason recorded
 as context evidence on it and in your reply. Do not wait for further instructions. Return the IDs
 you and your children recorded and anything left open, each also recorded.

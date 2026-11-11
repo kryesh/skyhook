@@ -258,7 +258,7 @@ mod tests {
                 premise: loose,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let settle = || queued(&store, Phase::Settle);
         assert_eq!(settle(), [NodeId::from(code), loose.into()]);
         judge(&store, lone, FlawStatus::Refuted);
@@ -271,7 +271,7 @@ mod tests {
             path: scenario.path,
             premise: loose,
         };
-        store.link(&actor, &[path_premise]).unwrap();
+        store.relink(&actor, &[path_premise], &[]).unwrap();
         assert_eq!(
             settle(),
             [NodeId::from(code), loose.into()],
@@ -363,7 +363,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: code,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         decide(&store, code, PremiseStatus::Holds);
         let settle = || queued(&store, Phase::Settle);
         let view = || {
@@ -482,7 +482,7 @@ mod tests {
                 rests_on: sub,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let settle = || queued(&store, Phase::Settle);
         let decide = |premise, status| decide(&store, premise, status);
         assert_eq!(settle(), [NodeId::from(parent), sub.into()]);
@@ -556,7 +556,7 @@ mod tests {
             flaw: loose,
             state: window,
         };
-        store.link(&actor, &[read, wrong]).unwrap();
+        store.relink(&actor, &[read, wrong], &[]).unwrap();
         assert!(
             chain().is_empty(),
             "a reader of the state it leaves wrong is unswept"
@@ -570,7 +570,7 @@ mod tests {
             flaw: loose,
             state: window,
         };
-        store.unlink(&actor, &[unwrong]).unwrap();
+        store.relink(&actor, &[], &[unwrong]).unwrap();
         let held = candidate(&store, &actor, scenario.path, &[loose]);
         assert!(chain().is_empty());
         let deployed = premise(&store, &actor, PremiseScope::Deployment);
@@ -578,7 +578,7 @@ mod tests {
             flaw: loose,
             premise: deployed,
         };
-        store.link(&actor, &[needs]).unwrap();
+        store.relink(&actor, &[needs], &[]).unwrap();
         let answered = StatusChange::Premise {
             id: deployed,
             status: PremiseStatus::Fails,
@@ -598,7 +598,7 @@ mod tests {
             flaw: loose,
             premise: gone,
         };
-        store.link(&actor, &[needs]).unwrap();
+        store.relink(&actor, &[needs], &[]).unwrap();
         decide(&store, gone, PremiseStatus::Fails);
         verdict(&store, held, Verdict::Disproved);
         assert_eq!(
@@ -634,7 +634,7 @@ mod tests {
             flaw: apart,
             premise: premise(&store, &actor, PremiseScope::Code),
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         store
             .set_status(&questioner, confirmed, &text("no consequence"))
             .unwrap();
@@ -656,7 +656,7 @@ mod tests {
             flaw,
             premise: code,
         });
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         judge(confirmed, FlawStatus::Confirmed);
         judge(refuted, FlawStatus::Refuted);
         judge(apart, FlawStatus::Confirmed);
@@ -750,7 +750,7 @@ mod tests {
         let mut links = vec![access(writer, window, Access::Write, at.clone())];
         links
             .extend([first, second].map(|reader| access(reader, window, Access::Read, at.clone())));
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         for path in [writer, first, second, later] {
             sweep(&store, path);
         }
@@ -764,13 +764,13 @@ mod tests {
             flaw: stale,
             state: window,
         };
-        store.link(&actor, &[wrong]).unwrap();
+        store.relink(&actor, &[wrong], &[]).unwrap();
         assert_eq!(chain(), [NodeId::from(stale)]);
         let (_, job, _) = begun(&store, &Begin::Chain(Listed::of([stale])));
         end_job(&store, job);
         assert!(chain().is_empty(), "its chain began at its basis");
         let read = access(later, window, Access::Read, at);
-        store.link(&actor, &[read]).unwrap();
+        store.relink(&actor, &[read], &[]).unwrap();
         check(&store, window, &[basis]);
         assert_eq!(chain(), [NodeId::from(stale)], "a reader recorded since");
         judge(&store, stale, FlawStatus::Refuted);

@@ -2,7 +2,7 @@
 
 Prepare or describe a running instance for the live work your brief names; it is not an implicit
 permission to exploit. Read the candidates and interfaces your brief names and the existing
-environments (`research_query` `list` `{record: {kind: "environment"}}`). Confirm the needed services, build options, identities and roles, network
+environments (`research_list` `{record: {kind: "environment"}}`). Confirm the needed services, build options, identities and roles, network
 exposure, test data, observable success and failure signals, and for a race the cores,
 instrumented build and second actor it needs, and flag deployment differences that would change
 reachability, severity or reproducibility. Request an unavailable capability or approved
@@ -16,7 +16,7 @@ them. Use synthetic data and minimally
 privileged test identities, and leave production state alone. Verify readiness with
 non-exploitative checks, recording what was observed versus still assumed.
 
-Record it with `research` `environment`: instructions covering the revision and build, the
+Record it with `research_environment`: instructions covering the revision and build, the
 container or target, startup and readiness checks, endpoints, configuration, resource ownership
 and stop procedure, and in `serves` each interface at its address. For a deployment the user
 approved, the instructions are its rules of engagement as approved, never broader: addresses,

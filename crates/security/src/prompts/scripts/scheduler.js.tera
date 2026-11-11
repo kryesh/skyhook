@@ -14,7 +14,7 @@ const next = async (running, free) => {
   const busy = [...running.values()].flatMap(nodes), ready = [], asked = await asking();
   let deferred = held = false;
   for (let after = null; ready.length < free;) {
-    const page = (await tool.research_query({action: "startable", running: busy, spent: keys(), {% if live %}live: {approved, unblocked}, {% endif %}after, limit: asked ? 1000 : Math.min(free - ready.length, 1000)})).unwrap();
+    const page = (await tool.research_startable({running: busy, spent: keys(), {% if live %}live: {approved, unblocked}, {% endif %}after, limit: asked ? 1000 : Math.min(free - ready.length, 1000)})).unwrap();
     held ||= page.held;
     for (const head of page.items) {
       if (asked && head.phase === "review") { deferred = true; continue; }
@@ -42,6 +42,6 @@ for await (const r of new WorkPool(workers).feed(next, async ({key, phase, entri
     if (replies.length > 1) spent.set(`${phase}:${e.node}`, {phase, node: e.node, basis: e.basis, replies});
   }
 }
-const synthesis = (await tool.research_query({action: "synthesis", spent: keys()})).unwrap();
+const synthesis = (await tool.research_synthesis({spent: keys()})).unwrap();
 for (const e of synthesis.exhausted) e.reply ??= spent.get(`${e.phase}:${e.node}`)?.replies.at(-1);
 return {synthesis, held: held && !stopped};

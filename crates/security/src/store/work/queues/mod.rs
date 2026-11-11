@@ -568,7 +568,7 @@ pub(in crate::store) mod tests {
                 premise: on_path,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         assess(&store, candidate, HIGH);
 
         let (reviewer, review, _) = begun(&store, &Begin::Review(Listed::of([candidate])));
@@ -671,7 +671,7 @@ pub(in crate::store) mod tests {
                 flaw: scenario.flaw,
                 premise,
             };
-            store.link(agent, &[link]).unwrap();
+            store.relink(agent, &[link], &[]).unwrap();
         };
         for _ in 0..2 {
             let (reviewer, job, _) = begun(&store, &Begin::Review(Listed::of([id])));

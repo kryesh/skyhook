@@ -337,9 +337,9 @@ mod tests {
             access: read.access,
             location: read.location.clone(),
         };
-        store.unlink(&actor, &[unlink]).unwrap();
+        store.relink(&actor, &[], &[unlink]).unwrap();
         let read = access(scenario.path, read.id, read.access, read.location.clone());
-        store.link(&actor, &[read]).unwrap();
+        store.relink(&actor, &[read], &[]).unwrap();
         assert!(
             queued(&store, Phase::Sweep).is_empty(),
             "a path reading no input owes no sweep"
@@ -348,9 +348,10 @@ mod tests {
         let [inner, handle] =
             [NewState::Instance, NewState::Handed].map(|scope| state(&store, &actor, scope));
         store
-            .link(
+            .relink(
                 &actor,
                 &[access(duplicate, inner, Access::Read, at.clone())],
+                &[],
             )
             .unwrap();
         assert!(
@@ -358,7 +359,7 @@ mod tests {
             "a path reading only its instance's state owes no sweep"
         );
         store
-            .link(&actor, &[access(duplicate, handle, Access::Read, at)])
+            .relink(&actor, &[access(duplicate, handle, Access::Read, at)], &[])
             .unwrap();
         assert_eq!(
             queued(&store, Phase::Sweep),
@@ -384,7 +385,7 @@ mod tests {
             path: scenario.path,
             premise,
         });
-        store.link(&actor, &relies).unwrap();
+        store.relink(&actor, &relies, &[]).unwrap();
         exhaust(&store, &Begin::Sweep(Listed::of([scenario.path])));
         assess(&store, scenario.candidate, HIGH);
         let relied = || {
@@ -449,7 +450,7 @@ mod tests {
             let at = location("decoder/lib.c", line);
             [window, session].map(|state| access(stream, state, Access::Write, at.clone()))
         };
-        store.link(&actor, &write(3)).unwrap();
+        store.relink(&actor, &write(3), &[]).unwrap();
         let later = path(&store, &actor, "later", &[decoder]);
         let check = || queued(&store, Phase::Check);
         assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Check), 1);
@@ -461,7 +462,7 @@ mod tests {
         sweep(&store, apart);
         assert_eq!(check(), [NodeId::from(window)], "a path recorded since");
         let (checker, job, _) = begun(&store, &Begin::Check(Listed::of([window])));
-        store.link(&checker, &write(4)).unwrap();
+        store.relink(&checker, &write(4), &[]).unwrap();
         let basis = premise(&store, &checker, PremiseScope::Code);
         let checked = StateMark::Checked {
             id: window,
@@ -476,7 +477,7 @@ mod tests {
             .unwrap();
         end_job(&store, job);
         assert!(check().is_empty(), "its own check's accesses");
-        store.link(&actor, &write(5)).unwrap();
+        store.relink(&actor, &write(5), &[]).unwrap();
         assert!(check().is_empty(), "a later access, past the unswept path");
         sweep(&store, later);
         assert_eq!(check(), [NodeId::from(window)]);
@@ -492,7 +493,7 @@ mod tests {
         let stream = path(&store, &actor, "stream", &[decoder]);
         let window = state(&store, &actor, NewState::Instance);
         let write = access(stream, window, Access::Write, location("decoder/lib.c", 3));
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         sweep(&store, stream);
         let [holding, failing] = [(); 2].map(|_| premise(&store, &actor, PremiseScope::Code));
         assert!(queued(&store, Phase::Settle).is_empty());
@@ -530,7 +531,7 @@ mod tests {
         let stream = path(&store, &actor, "stream", &[decoder]);
         let window = state(&store, &actor, NewState::Instance);
         let write = access(stream, window, Access::Write, location("decoder/lib.c", 3));
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         sweep(&store, stream);
         let [rested, restated, kept] = [(); 3].map(|_| {
             let premise = premise(&store, &actor, PremiseScope::Code);
@@ -589,7 +590,7 @@ mod tests {
         };
         let read = &view.states[0];
         let link = access(mixed, read.id, read.access, read.location.clone());
-        store.link(&actor, &[link]).unwrap();
+        store.relink(&actor, &[link], &[]).unwrap();
         let owed = |phase| queued(&store, phase);
         assert_eq!(
             owed(Phase::Sweep),
@@ -630,7 +631,7 @@ mod tests {
             .try_into()
             .unwrap();
         let link = access(exhausted, admin, Access::Read, operation("admin-api"));
-        store.link(&actor, &[link]).unwrap();
+        store.relink(&actor, &[link], &[]).unwrap();
         let retracted = StatusChange::State(StateMark::Retracted { id: admin });
         store
             .set_status(&actor, retracted, &text("in error"))

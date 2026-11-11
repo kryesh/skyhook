@@ -594,7 +594,7 @@ mod tests {
                 rests_on: sub,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let (settler, job) = child_agent(&store, JobState::Running);
         let first = store
             .begin(&settler, &Begin::Settle(Listed::of([parent])))
@@ -651,7 +651,7 @@ mod tests {
             flaw: scenario.flaw,
             premise,
         }));
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let settle = within(&store, &Begin::Settle(Listed::of([decided])), |settler| {
             let holds = StatusChange::Premise {
                 id: decided,

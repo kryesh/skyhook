@@ -581,17 +581,15 @@ mod tests {
             };
             prepared.extension.opened(&session, context).await.unwrap();
             assert!(session.prompt("start").await.is_err());
-            let offered = |tool: &str, action: &str| {
+            let offered = |tool: &str| {
                 let requests = requests.0.lock().unwrap();
                 let tools = &requests.last().unwrap().tools;
-                let tool = tools.iter().find(|offered| offered.name == tool).unwrap();
-                let actions = tool.input_schema["properties"]["action"]["enum"].as_array();
-                actions.unwrap().iter().any(|offered| offered == action)
+                tools.iter().any(|offered| offered.name == tool)
             };
-            assert!(offered("research_query", "startable"));
-            assert!(offered("research", "generate"));
+            assert!(offered("research_startable"));
+            assert!(offered("research_generate"));
             let script = session.run_script(
-                "return [await tool.research_query({action: 'startable', limit: 1}), await tool.research({action: 'generate'})].map(r => r.error);",
+                "return [await tool.research_startable({limit: 1}), await tool.research_generate()].map(r => r.error);",
             );
             assert_eq!(
                 script.await.unwrap().value["value"],

@@ -5,7 +5,7 @@ bear on it. A loose-end review begins no task, so what it records reopens work: 
 premise's status, or record what would settle it or the evidence or edit that reopens its
 settling. {% include "security/question.md" %}
 
-Settle each premise from the code or a binary's disassembly: `set_status` `holds` or `fails`,
+Settle each premise from the code or a binary's disassembly: `research_set_status` `holds` or `fails`,
 with evidence at every site the answer rests on.
 {%- if live %}
 A bounded experiment or measurement in a recorded environment may decide what the code alone

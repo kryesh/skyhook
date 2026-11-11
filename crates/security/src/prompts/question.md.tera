@@ -1,5 +1,5 @@
-Begin with `research` `begin`: your phase and every id in your brief. Read them together with
-`research_query` `node`, but answer each one, and before deciding read what each bears on, with
+Begin with `research_begin`: your phase and every id in your brief. Read them together with
+`research_node`, but answer each one, and before deciding read what each bears on, with
 its evidence and latest checks. Read source code for the missing fact, not to sweep again. Record
 the flaws, premises and candidates you find along the way, none for a route entering through code
 outside the components in the run's scope. Do not wait for further instructions.

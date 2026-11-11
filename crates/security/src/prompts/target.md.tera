@@ -12,7 +12,7 @@ Establish:
   under a short name in the `interfaces` of the component exposing it.
 - The assumed deployment: process boundaries, exposed interfaces, outbound reach,
   authentication, privileges, and relevant configuration or feature choices.
-- The deployment premises later reviews rest on, each `upsert` `{record: {kind: "premise",
+- The deployment premises later reviews rest on, each `research_upsert` `{record: {kind: "premise",
   scope: "deployment"}}`, one statement each: one per option the inventory finds in build and
   configuration files and per platform the code branches on (OS, architecture, runtime and its
   version), actor (each role, tenant or other identity: what it may do and reach), caller
@@ -21,7 +21,7 @@ Establish:
   counts, lengths the deployment allows), and each obligation the target's documentation places
   on a trusted caller of an interface in scope, such as an embedding application (call order,
   concurrency, lifetimes, input it must check first, configuration), phrased as the condition a chain would rest on, with evidence at
-  its source. Set each one the user's request settles with `set_status`: `holds` when it admits
+  its source. Set each one the user's request settles with `research_set_status`: `holds` when it admits
   the condition, `fails` when it excludes it. A broad request ("any caller", "any configuration")
   admits what the target's documented interface contract permits a trusted caller to do, stated
   one by one, and anything an untrusted client or peer can send: breaking a trusted caller's

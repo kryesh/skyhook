@@ -252,7 +252,7 @@ mod tests {
             flaw,
             premise: code,
         };
-        store.link(&root, &[link]).unwrap();
+        store.relink(&root, &[link], &[]).unwrap();
         assess(&store, candidate, HIGH);
         let (reviewer, _, _) = begun(&store, &Begin::Review(Listed::of([candidate])));
         assert_eq!(store.changes(&reviewer, None).unwrap(), None);
@@ -318,7 +318,7 @@ mod tests {
             path: decoder.path,
             premise: premise(&store, &root, PremiseScope::Code),
         };
-        store.link(&root, &[relied]).unwrap();
+        store.relink(&root, &[relied], &[]).unwrap();
         assert_eq!(store.changes(&sweeper, None).unwrap(), None);
         let edit = Upsert::Edit(NodeEdit::Path(PathEdit {
             id: decoder.path,

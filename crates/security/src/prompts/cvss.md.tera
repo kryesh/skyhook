@@ -1,4 +1,4 @@
-A candidate's review scores it: `research` `assess` records its vector and returns its score and
+A candidate's review scores it: `research_assess` records its vector and returns its score and
 severity; never compute or delegate scoring. Score the impact were every premise to hold, the
 note giving the rationale for each metric, the assumed deployment, the attacker's privileges and
 the input states the chain needs. A condition the scenario needs is a premise on a chain flaw or

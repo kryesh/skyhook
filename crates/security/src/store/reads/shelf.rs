@@ -445,7 +445,7 @@ mod tests {
             flaw: severe.flaw,
             premise,
         });
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         decide(&store, decided, PremiseStatus::Holds);
         assert_eq!(
             order(NodeKind::Premise),
@@ -464,7 +464,7 @@ mod tests {
             flaw: decoder.flaw,
             premise,
         });
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         crate::store::work::queues::tests::exhaust(&store, &Begin::Settle(Listed::of([exhausted])));
         let order: Vec<NodeId> = (store.shelf(NodeKind::Premise, 10).unwrap().rows.iter())
             .map(|row| row.node.id)
@@ -506,7 +506,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: code,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         assess(&store, id, HIGH);
         verdict(&store, id, Verdict::Unproven);
         test(&store, &actor, id, TestResult::Confirmed);

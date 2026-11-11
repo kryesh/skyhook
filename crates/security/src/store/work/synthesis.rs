@@ -296,7 +296,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: deployment,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         let answer = |agent: &AgentId, status| {
             let change = StatusChange::Premise {
                 id: deployment,
@@ -342,7 +342,7 @@ mod tests {
             flaw: scenario.flaw,
             premise,
         });
-        store.link(&actor, &rests).unwrap();
+        store.relink(&actor, &rests, &[]).unwrap();
         let holds = StatusChange::Premise {
             id: decided,
             status: PremiseStatus::Holds,

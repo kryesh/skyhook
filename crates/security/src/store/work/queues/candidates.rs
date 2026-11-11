@@ -379,7 +379,7 @@ mod tests {
         let window = state(&store, &actor, NewState::Instance);
         let at = location("decoder/lib.c", 3);
         let write = access(scenario.path, window, Access::Write, at.clone());
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         let owed = || queued(&store, Phase::Review) == [NodeId::from(id)];
         assert!(!owed(), "its path's sweep comes first");
         sweep(&store, scenario.path);
@@ -390,7 +390,7 @@ mod tests {
         assert!(!owed());
         let other = path(&store, &actor, "consumer", &[scenario.component]);
         let read = access(other, window, Access::Read, at.clone());
-        store.link(&actor, &[read]).unwrap();
+        store.relink(&actor, &[read], &[]).unwrap();
         assert_eq!(
             store.run_facts().unwrap().summary.owed(Phase::Review),
             0,
@@ -398,7 +398,7 @@ mod tests {
         );
         let untouched = state(&store, &actor, NewState::Instance);
         let read = access(scenario.path, untouched, Access::Read, at.clone());
-        store.link(&actor, &[read]).unwrap();
+        store.relink(&actor, &[read], &[]).unwrap();
         assert!(
             !owed(),
             "its path's access of a state its flaw does not touch"
@@ -407,11 +407,11 @@ mod tests {
             flaw: scenario.flaw,
             state: window,
         };
-        store.link(&actor, &[wrong]).unwrap();
+        store.relink(&actor, &[wrong], &[]).unwrap();
         assert!(owed(), "its flaw's standing");
         verdict(&store, id, Verdict::Validated);
         let write = access(other, window, Access::Write, at);
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         assert_eq!(
             (owed(), status(&store, id)),
             (true, Status::Shortlisted),
@@ -420,7 +420,7 @@ mod tests {
         verdict(&store, id, Verdict::Validated);
         let sits = state(&store, &actor, NewState::Instance);
         let read = access(scenario.path, sits, Access::Read, location("lib.c", 7));
-        store.link(&actor, &[read]).unwrap();
+        store.relink(&actor, &[read], &[]).unwrap();
         assert!(owed(), "its path's read where its flaw sits");
         verdict(&store, id, Verdict::Validated);
 
@@ -429,7 +429,7 @@ mod tests {
             flaw: scenario.flaw,
             premise,
         };
-        store.link(&actor, &[rests(code)]).unwrap();
+        store.relink(&actor, &[rests(code)], &[]).unwrap();
         assert!(!owed(), "the settling look comes first");
         assert_eq!(store.run_facts().unwrap().summary.owed(Phase::Review), 1);
         exhaust(&store, &Begin::Settle(Listed::of([code])));
@@ -485,7 +485,7 @@ mod tests {
         verdict(&store, id, Verdict::Validated);
 
         let deployment = premise(&store, &actor, PremiseScope::Deployment);
-        store.link(&actor, &[rests(deployment)]).unwrap();
+        store.relink(&actor, &[rests(deployment)], &[]).unwrap();
         assert!(!owed(), "the user is asked first");
         let asked = store.synthesis(&[]).unwrap().asked;
         assert_eq!(
@@ -581,7 +581,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: code,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         store
             .verdict(&reviewer, id, Verdict::Validated, &text("reviewed"))
             .unwrap();
@@ -602,7 +602,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: code,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         exhaust(&store, &Begin::Settle(Listed::of([code])));
         let (reviewer, job, _) = begun(&store, &Begin::Review(Listed::of([id])));
         let vector = HIGH.parse().unwrap();
@@ -693,7 +693,7 @@ mod tests {
         let tested = || queued(&store, Phase::Test);
         let owed = || store.run_facts().unwrap().summary.owed(Phase::Test);
         let deployment = premise(&store, &actor, PremiseScope::Deployment);
-        store.link(&actor, &[rests(deployment)]).unwrap();
+        store.relink(&actor, &[rests(deployment)], &[]).unwrap();
         unproven();
         assert_eq!(owed(), 0, "the user is asked");
         let answered = StatusChange::Premise {
@@ -704,7 +704,7 @@ mod tests {
             .set_status(&actor, answered, &text("the user runs it"))
             .unwrap();
         let code = premise(&store, &actor, PremiseScope::Code);
-        store.link(&actor, &[rests(code)]).unwrap();
+        store.relink(&actor, &[rests(code)], &[]).unwrap();
         unproven();
         assert_eq!(owed(), 0, "its settle comes first");
         exhaust(&store, &Begin::Settle(Listed::of([code])));
@@ -816,7 +816,7 @@ mod tests {
             flaw: scenario.flaw,
             premise: code,
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         decide(&store, code, PremiseStatus::Holds);
         verdict(&store, id, Verdict::Validated);
         assert!(

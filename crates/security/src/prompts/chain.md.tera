@@ -5,7 +5,7 @@ on it. {% include "security/question.md" %}
 
 Chain each flaw: follow its effect to what an attacker observes, including through state it
 leaves for a later action or another flow. Read the readers of each state it leaves wrong (the
-state's `node` lists them; `begin`'s changes name those recorded since its last chain) and follow
+state's `research_node` lists them; `research_begin`'s changes name those recorded since its last chain) and follow
 the ones that matter: where the wrong state continues, record the candidate that performs that
 path after the flaw's action; a reader you rule out may get `context` evidence on the flaw saying
 why, where worth noting.

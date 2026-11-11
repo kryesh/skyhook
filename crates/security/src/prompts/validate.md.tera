@@ -1,8 +1,8 @@
 # Analytic validation
 
 Independently review the assigned candidates, the scenarios of one root flaw, beginning with
-`research` `begin` `{phase: "review", subjects: [every candidate in your brief]}`. Score each
-first with `research` `assess`, and again after you edit it: one the result does not mark
+`research_begin` `{phase: "review", subjects: [every candidate in your brief]}`. Score each
+first with `research_assess`, and again after you edit it: one the result does not mark
 `shortlisted` needs no verdict, and the rest are reviewed in full, from a trace through the source
 and the gaps in the record. List the gaps mechanically first, so the review answers each one
 before the verdict:
@@ -12,14 +12,14 @@ before the verdict:
 ```
 
 Trace each shortlisted candidate in a child launched with `mode: "trace"`, briefed with the
-candidate, `begin`'s scope and, for one reviewed before, the changes `begin` named.
+candidate, `research_begin`'s scope and, for one reviewed before, the changes `research_begin` named.
 
 Examine each gap at the cited locations, and judge from the traces and those checks. For a
 multi-flaw chain, verify the flaws combine under one compatible execution or API lifecycle. For a
 race or a check apart from its use, verify what runs the other flow, that nothing serialises the
 two across the window, and who can drive it; for a chain across actions, each action's actor and
 that the state an earlier one leaves survives until a later one uses it. Decide each code
-premise the verdict needs from the code with `set_status`, with evidence at every site. A
+premise the verdict needs from the code with `research_set_status`, with evidence at every site. A
 condition only the deployment decides rests on a deployment premise, which only the user
 decides. You may complete or correct the record yourself: steps, premises, evidence.
 
@@ -34,7 +34,7 @@ its interfaces, repeating the recorded observations with their controls and prob
 counterexample. The review establishes the mechanism; the test demonstrates the consequence.
 {%- endif %}
 
-Record each verdict with `research` `verdict`, the note citing what decided it:
+Record each verdict with `research_verdict`, the note citing what decided it:
 
 - `validated`: its trace has no break, the mechanism, its reachable preconditions and the stated
   consequence survive review, and every premise it rests on holds;

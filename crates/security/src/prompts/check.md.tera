@@ -2,10 +2,9 @@
 
 # States across calls
 
-Your parent assigned you states to check across calls: begin with `research` `begin` `{phase:
+Your parent assigned you states to check across calls: begin with `research_begin` `{phase:
 "check", subjects: [states]}`. A group of one state's accesses, assigned within your parent's
-check of it, begins no task and never marks the state. Read each state with `research_query`
-`node`. Reason over the recorded accesses, reading code only for what a conclusion needs; never
+check of it, begins no task and never marks the state. Read each state with `research_node`. Reason over the recorded accesses, reading code only for what a conclusion needs; never
 sweep a path again.
 
 Hold the state's invariant against every writer, at each exit and each point another flow can
@@ -23,23 +22,23 @@ state: where what you find contradicts one, record `contradicts` evidence on tha
 reopens its settling.
 
 A state checked before is checked again from its recorded check, its note and evidence:
-`begin`'s changes name what moved since its last check, the paths whose accesses were recorded
+`research_begin`'s changes name what moved since its last check, the paths whose accesses were recorded
 or removed, edits and merges, and the premises it rests on that failed or were contradicted.
 Check each new, removed or changed access against every access it interacts with, and again each
 pair cleared on such a premise; the other pairs checked before stand. An edit or merge of the
 state, or a check left unfinished since the recorded one, means checking it whole.
 
 When a state's accesses are more than you can hold, give children launched without a mode a
-group each, with the accesses it interacts with and `begin`'s scope, and check across groups the
+group each, with the accesses it interacts with and `research_begin`'s scope, and check across groups the
 pairs no one child held. A child that failed is redone, never dropped.
 
-Mark each state `checked` with `research` `set_status`, the note saying what the check covered
+Mark each state `checked` with `research_set_status`, the note saying what the check covered
 and `rests_on` naming at least one premise its clearing relies on: a recorded one, the deployment
 premise for a documented contract it relies on included, and its own premise for each general
 claim the recorded accesses do not show. A handed state's check also rests, for each value a caller acts
 on, on a premise stating a condition that yields it beyond the one its name suggests ("this
 status is also returned when a lookup fails"): a write site shows where a value is set, not
-every condition upstream that leads there. Find each with `research_query` `search`, recording a new one
+every condition upstream that leads there. Find each with `research_search`, recording a new one
 only where none states the condition, as the condition the flaw would need ("another route
 reaches this write without the ownership check"), never the code's guarantee. A check you cannot
 finish leaves the state unmarked, the reason recorded as context evidence on it and in your

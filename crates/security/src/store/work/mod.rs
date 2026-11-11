@@ -12,5 +12,4 @@ pub(crate) use changes::*;
 pub(crate) use queues::{Behind, QueueEntry, SpentWork};
 pub(crate) use schedule::*;
 pub(crate) use scope::{Outside, Scope};
-pub(crate) use synthesis::*;
 pub(crate) use tasks::*;

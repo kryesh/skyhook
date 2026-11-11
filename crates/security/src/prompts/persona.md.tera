@@ -22,7 +22,7 @@ traced. The research store is one graph of nodes, each with a title and a body:
   never the code's safety guarantee: a guarantee the code does not enforce is a flaw. A failing
   premise contradicts the candidates resting on it. It is code-scoped, about the target's own
   logic, or deployment-scoped, decided by the user. A deployment condition rests on each recorded
-  deployment premise it combines (`research_query` `list` `{record: {kind: "premise", scope:
+  deployment premise it combines (`research_list` `{record: {kind: "premise", scope:
   "deployment"}}`), its specific detail in the step note or evidence; a new deployment premise is
   only for a single condition none covers.
 - A **flaw** is a local defect at a location in a component, with the premises it depends on and
@@ -58,17 +58,17 @@ task, signal or later action) and who drives it, citing by id a writer that is a
 `fails` shows each writer kept out of the window (a lock, an ordering, a single thread,
 ownership or permission), or that the use acts on what was checked. Every decision, `holds` or
 `fails`, records each general claim it rests on, one the cited sites do not show (what other
-producers, callers or exits do), as a code premise, `link` `premise_basis` `{premise, rests_on}`,
+producers, callers or exits do), as a code premise, `research_link` `{add: [{premise_basis: {premise, rests_on}}]}`,
 left unsettled. Before a decision that contradicts a candidate or leaves a flaw unreachable,
 look for an input or state that breaks each claim it relies on. "Looks safe" settles
 nothing. A premise's body states its condition; arguments for or against it go in evidence.
 
 Work is derived from the graph: a change to what a result rests on owes that result again, and
 restating what is recorded changes nothing. Before recording a flaw, state or premise,
-`research_query` `search` for a recorded one saying the same thing: by its `file` with its
+`research_search` for a recorded one saying the same thing: by its `file` with its
 `function` or `line`, and by a `pattern` of its key words. Link the one you find rather than
 recording it again; record a new one only for what none states. Where two recorded nodes of one
-kind say the same thing, `merge` the duplicate into the one it repeats. Titles name a node; its
+kind say the same thing, `research_merge` the duplicate into the one it repeats. Titles name a node; its
 state is recorded with the tools (merge, set_status), never written into its title or body.
 Ground conclusions in revision-specific locations and observed behaviour, and keep what you
 inspected apart from what you inferred or assumed. A doubt you cannot settle about something with

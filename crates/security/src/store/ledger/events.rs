@@ -411,7 +411,7 @@ mod tests {
                 premise: on_path,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let concerns = |node: NodeId| (node, EventEffect::Concerns);
         let standing = |node: NodeId| (node, EventEffect::Standing);
         let changed = |node: NodeId| (node, EventEffect::Changed);
@@ -494,7 +494,7 @@ mod tests {
         );
         let kept = state(&store, &actor, NewState::Instance);
         let write = access(path, kept, Access::Write, location("decoder/lib.c", 3));
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         assert_eq!(
             marks(&store, last_event(&store)),
             [standing(path.into()), standing(kept.into())]
@@ -550,7 +550,7 @@ mod tests {
             access(kept, window, Access::Write, at.clone()),
             access(other, window, Access::Read, at),
         ];
-        store.link(&actor, &accesses).unwrap();
+        store.relink(&actor, &accesses, &[]).unwrap();
         for path in [kept, other] {
             sweep(&store, path);
         }
@@ -612,7 +612,7 @@ mod tests {
             path: later,
             premise: held,
         };
-        store.link(&actor, &[on_later]).unwrap();
+        store.relink(&actor, &[on_later], &[]).unwrap();
         assess(&store, first.candidate, HIGH);
         assert_eq!(
             view().confidence,

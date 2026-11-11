@@ -295,7 +295,7 @@ mod tests {
             flaw: scenario.flaw,
             premise,
         });
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let [first, second] = premises.map(NodeId::from);
         let started = |running: &[NodeId]| {
             let page = store
@@ -369,7 +369,7 @@ mod tests {
                 rests_on: deeper,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         assert_eq!(
             bundles(&store, Phase::Settle),
             [
@@ -422,7 +422,7 @@ mod tests {
             access(second, ring, Access::Write, at.clone()),
             access(shared, ring, Access::Read, at),
         ];
-        store.link(&actor, &accesses).unwrap();
+        store.relink(&actor, &accesses, &[]).unwrap();
         let started = || {
             let page = store
                 .startable(&[], &[], &Live::default(), None, Bounded::new::<10>())
@@ -478,7 +478,7 @@ mod tests {
             Access::Write,
             location("decoder/lib.c", 3),
         );
-        store.link(&actor, &[write]).unwrap();
+        store.relink(&actor, &[write], &[]).unwrap();
         for path in [first.path, other.path] {
             sweep(&store, path);
         }
@@ -499,7 +499,7 @@ mod tests {
             flaw: next,
             state: window,
         };
-        store.link(&actor, &[wrong]).unwrap();
+        store.relink(&actor, &[wrong], &[]).unwrap();
         let started = |after| {
             let page = store
                 .startable(&[], &[], &Live::default(), after, Bounded::new::<10>())
@@ -540,7 +540,7 @@ mod tests {
             flaw: kept.flaw,
             premise: code,
         };
-        store.link(&actor, &[link]).unwrap();
+        store.relink(&actor, &[link], &[]).unwrap();
         let (_, job, _) = begun(&store, &Begin::Review(Listed::of([merged.candidate])));
         let merge = Merge {
             node: merged.candidate.into(),

@@ -107,15 +107,15 @@ mod tests {
     /// Records one input state, component and path reading it, a flaw on the component and a
     /// candidate of it along the path, assessed critical; binds their ids.
     const DISCOVER: &str = r#"
-        const research = async action => (await tool.research(action)).unwrap();
+        const research = async (action, args) => (await tool['research_' + action](args)).unwrap();
         const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
-        const component = await research({action:'upsert',record:{kind:'component',title:'parser',body:'request parser',files:['input.c']}});
-        const input = await research({action:'upsert',record:{kind:'state',scope:'input',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'}});
-        const path = await research({action:'upsert',record:{kind:'path',title:'request parsing',body:'raw request parsing',steps:[{component,note:'parse is called on every request'}]}});
-        await research({action:'link',links:[{path_state:{path,state:input,access:'read',location:at('input.c',1)}}]});
-        const flaw = await research({action:'upsert',record:{kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120}});
-        const candidate = await research({action:'upsert',record:{kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]}});
-        await research({action:'assess',candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',note:'unauthenticated request controls memory corruption'});
+        const component = await research('upsert', {record:{kind:'component',title:'parser',body:'request parser',files:['input.c']}});
+        const input = await research('upsert', {record:{kind:'state',scope:'input',title:'request',body:'raw request bytes',location:at('input.c',1),trust:'untrusted'}});
+        const path = await research('upsert', {record:{kind:'path',title:'request parsing',body:'raw request parsing',steps:[{component,note:'parse is called on every request'}]}});
+        await research('link', {add:[{path_state:{path,state:input,access:'read',location:at('input.c',1)}}]});
+        const flaw = await research('upsert', {record:{kind:'flaw',title:'Unchecked copy',body:'the request length is copied into a fixed buffer',component,location:at('input.c',8),cwe:120}});
+        const candidate = await research('upsert', {record:{kind:'candidate',title:'Unchecked copy',body:'request length overflows a fixed buffer',paths:[path],flaws:[flaw]}});
+        await research('assess', {candidate,vector:'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N',note:'unauthenticated request controls memory corruption'});
     "#;
 
     impl Fixture {
@@ -178,13 +178,17 @@ mod tests {
         let fixture = Fixture::with_children(LivePolicy::Yes, scripted).await;
         let ids = fixture.discover().await;
         let candidate = ids["candidate"].clone();
-        let test =
-            json!({"action":"test","candidate":candidate,"result":"failed","note":"no crash"});
+        let test = json!({"candidate":candidate,"result":"failed","note":"no crash"});
         fixture.validate(&candidate).await;
-        fixture.success("research", test.clone()).await;
+        fixture.success("research_test", test.clone()).await;
         fixture.validate(&candidate).await;
-        let settling = fixture.success("research", test).await;
-        fixture.success("research", json!({"action":"test","candidate":candidate,"result":"pending","note":"needs a board"})).await;
+        let settling = fixture.success("research_test", test).await;
+        fixture
+            .success(
+                "research_test",
+                json!({"candidate":candidate,"result":"pending","note":"needs a board"}),
+            )
+            .await;
         let body = script("report-scenarios.js", LivePolicy::Yes);
         let script = format!("const root = {};\n{body}", ids["flaw"]);
         let first = fixture.script(script.clone()).await;
@@ -194,8 +198,8 @@ mod tests {
             "the test the report states: {first}"
         );
         assert_eq!(first["previous"], Value::Null, "{first}");
-        let report = json!({"action":"report","root":ids["flaw"],"title":"Unchecked copy","body":"## Summary\n\nAny request overflows."});
-        let finding = fixture.success("research", report).await;
+        let report = json!({"root":ids["flaw"],"title":"Unchecked copy","body":"## Summary\n\nAny request overflows."});
+        let finding = fixture.success("research_report", report).await;
         let again = fixture.script(script).await;
         assert_eq!(
             (&again["previous"]["id"], &again["previous"]["current"]),
@@ -213,10 +217,10 @@ mod tests {
         let fixture = Fixture::new(all_capabilities()).await;
         let ids = fixture.discover().await;
         let premise = fixture
-            .success("research", json!({"action":"upsert","record":{"kind":"premise","title":"the listener is enabled","body":"set at startup","scope":"code"}}))
+            .success("research_upsert", json!({"record":{"kind":"premise","title":"the listener is enabled","body":"set at startup","scope":"code"}}))
             .await;
-        let link = json!({"action":"link","links":[{"flaw_premise":{"flaw":ids["flaw"],"premise":premise}}]});
-        fixture.success("research", link).await;
+        let link = json!({"add":[{"flaw_premise":{"flaw":ids["flaw"],"premise":premise}}]});
+        fixture.success("research_link", link).await;
         let body = script("validate-gaps.js", LivePolicy::Yes);
         let gaps = async || {
             let result = fixture
@@ -233,14 +237,14 @@ mod tests {
         );
         assert_eq!(gaps().await, json!([undecided]));
         let later = fixture.script(format!(r#"
-            const research = async action => (await tool.research(action)).unwrap();
+            const research = async (action, args) => (await tool['research_' + action](args)).unwrap();
             const at = (file, line) => ({{code: {{file, start_line: line, end_line: line}}}});
-            const component = await research({{action:'upsert',record:{{kind:'component',title:'store',body:'session store',files:['store.c']}}}});
-            const input = await research({{action:'upsert',record:{{kind:'state',scope:'input',title:'login',body:'login form',location:at('store.c',1),trust:'untrusted'}}}});
-            const path = await research({{action:'upsert',record:{{kind:'path',title:'login',body:'login writes the session',steps:[{{component,note:'writes'}}]}}}});
-            await research({{action:'link',links:[{{path_state:{{path,state:input,access:'read',location:at('store.c',1)}}}}]}});
-            const flaw = await research({{action:'upsert',record:{{kind:'flaw',title:'Stale session',body:'kept after logout',component,location:at('store.c',4)}}}});
-            await research({{action:'upsert',record:{{kind:'candidate',id:{candidate},flaws:[{root},flaw]}}}});
+            const component = await research('upsert', {{record:{{kind:'component',title:'store',body:'session store',files:['store.c']}}}});
+            const input = await research('upsert', {{record:{{kind:'state',scope:'input',title:'login',body:'login form',location:at('store.c',1),trust:'untrusted'}}}});
+            const path = await research('upsert', {{record:{{kind:'path',title:'login',body:'login writes the session',steps:[{{component,note:'writes'}}]}}}});
+            await research('link', {{add:[{{path_state:{{path,state:input,access:'read',location:at('store.c',1)}}}}]}});
+            const flaw = await research('upsert', {{record:{{kind:'flaw',title:'Stale session',body:'kept after logout',component,location:at('store.c',4)}}}});
+            await research('upsert', {{record:{{kind:'candidate',id:{candidate},flaws:[{root},flaw]}}}});
             return {{path, flaw}};
         "#, candidate = ids["candidate"], root = ids["flaw"])).await;
         let off = format!(
@@ -248,13 +252,13 @@ mod tests {
             later["flaw"]
         );
         assert_eq!(gaps().await, json!([undecided, off]));
-        let actions = json!({"action":"upsert","record":{"kind":"candidate","id":ids["candidate"],"paths":[ids["path"],later["path"]]}});
-        fixture.success("research", actions).await;
+        let actions = json!({"record":{"kind":"candidate","id":ids["candidate"],"paths":[ids["path"],later["path"]]}});
+        fixture.success("research_upsert", actions).await;
         assert_eq!(gaps().await, json!([undecided]));
-        let link = json!({"action":"link","links":[{"path_premise":{"path":later["path"],"premise":premise}}]});
-        fixture.success("research", link).await;
-        let repeated = json!({"action":"upsert","record":{"kind":"candidate","id":ids["candidate"],"paths":[later["path"],ids["path"],later["path"]]}});
-        fixture.success("research", repeated).await;
+        let link = json!({"add":[{"path_premise":{"path":later["path"],"premise":premise}}]});
+        fixture.success("research_link", link).await;
+        let repeated = json!({"record":{"kind":"candidate","id":ids["candidate"],"paths":[later["path"],ids["path"],later["path"]]}});
+        fixture.success("research_upsert", repeated).await;
         let on_path = format!(
             "code premise {premise} of path {} is undecided: the listener is enabled",
             later["path"]
@@ -278,8 +282,8 @@ mod tests {
         let result = fixture.script(format!("const map = {map};\n{body}")).await;
         let mut files = Vec::new();
         for id in result["components"].as_array().unwrap() {
-            let node = json!({"action":"node","id":id});
-            files.push(fixture.success("research_query", node).await["files"].clone());
+            let node = json!({"id":id});
+            files.push(fixture.success("research_node", node).await["files"].clone());
         }
         assert_eq!(
             files,
@@ -299,20 +303,20 @@ mod tests {
     async fn the_paths_script_groups_entries_and_lists_unlinked_inputs() {
         let fixture = Fixture::new(capabilities([SecurityCapability::Research.capability()])).await;
         let result = fixture.script(r#"
-            const research = async action => (await tool.research(action)).unwrap();
+            const research = async (action, args) => (await tool['research_' + action](args)).unwrap();
             const at = (file, line) => ({code: {file, start_line: line, end_line: line}});
-            const parser = await research({action:'upsert',record:{kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']}});
-            const decoder = await research({action:'upsert',record:{kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']}});
+            const parser = await research('upsert', {record:{kind:'component',title:'parser',body:'parses',files:['src/a b:c.c']}});
+            const decoder = await research('upsert', {record:{kind:'component',title:'decoder',body:'decodes',files:['vendor/x.c']}});
             const paths = [];
             for (const steps of [[[parser, 9]], [[parser, 9]], [[decoder, 4]], [], [[parser, 1], [decoder, 4]], [[parser, 2], [decoder, 4]]]) {
                 const through = steps.map(([component, line]) => ({component,location:at(component === parser ? 'src/a b:c.c' : 'vendor/x.c', line),note:'calls'}));
-                const path = await research({action:'upsert',record:{kind:'path',title:`entry ${paths.length}`,body:'request',steps:through}});
+                const path = await research('upsert', {record:{kind:'path',title:`entry ${paths.length}`,body:'request',steps:through}});
                 paths.push(path);
             }
-            const linked = await research({action:'upsert',record:{kind:'state',scope:'input',title:'cookie',body:'session cookie',location:at('src/a b:c.c',1),trust:'untrusted'}});
-            await research({action:'link',links:[{path_state:{path:paths[4],state:linked,access:'read',location:at('src/a b:c.c',1)}}]});
-            const unlinked = await research({action:'upsert',record:{kind:'state',scope:'input',title:'body',body:'request body',location:at('vendor/x.c',2),trust:'authenticated'}});
-            await research({action:'upsert',record:{kind:'state',scope:'instance',title:'parser',body:'parser state'}});
+            const linked = await research('upsert', {record:{kind:'state',scope:'input',title:'cookie',body:'session cookie',location:at('src/a b:c.c',1),trust:'untrusted'}});
+            await research('link', {add:[{path_state:{path:paths[4],state:linked,access:'read',location:at('src/a b:c.c',1)}}]});
+            const unlinked = await research('upsert', {record:{kind:'state',scope:'input',title:'body',body:'request body',location:at('vendor/x.c',2),trust:'authenticated'}});
+            await research('upsert', {record:{kind:'state',scope:'instance',title:'parser',body:'parser state'}});
             return {parser, decoder, paths, unlinked};
         "#).await;
         let paths = script("paths.js", LivePolicy::Yes);
@@ -349,10 +353,10 @@ mod tests {
             std::fs::write(path, "x".repeat(bytes)).unwrap();
         }
         let path = fixture.script(r#"
-            const research = async action => (await tool.research(action)).unwrap();
-            const parser = await research({action:'upsert',record:{kind:'component',title:'parser',body:'parses',files:['src/a.c','src/b.c']}});
-            const main = await research({action:'upsert',record:{kind:'component',title:'main',body:'starts',files:['main.c']}});
-            const path = await research({action:'upsert',record:{kind:'path',title:'request',body:'request',steps:[{component:main,note:'reads'},{component:parser,note:'parses'}]}});
+            const research = async (action, args) => (await tool['research_' + action](args)).unwrap();
+            const parser = await research('upsert', {record:{kind:'component',title:'parser',body:'parses',files:['src/a.c','src/b.c']}});
+            const main = await research('upsert', {record:{kind:'component',title:'main',body:'starts',files:['main.c']}});
+            const path = await research('upsert', {record:{kind:'path',title:'request',body:'request',steps:[{component:main,note:'reads'},{component:parser,note:'parses'}]}});
             return path;
         "#).await;
         let body = script("sweep-measure.js", LivePolicy::Yes);
@@ -384,32 +388,40 @@ mod tests {
         Fail,
         /// Fails before it begins.
         Unbegun,
-        /// Records the `research` actions made of the first subject it began, one a response,
-        /// then replies.
-        Record(fn(&Value) -> Vec<Value>),
+        /// Makes the research calls, each a tool and its arguments, of the first subject it
+        /// began, one a response, then replies.
+        Record(fn(&Value) -> Vec<(&'static str, Value)>),
         /// Runs until it is cancelled.
         Hang,
     }
 
     /// Marks the path it began swept.
     const SWEEP: Then = Then::Record(|path| {
-        vec![
-            json!({"action": "set_status", "record": {"kind": "path", "id": path, "status": "swept"}, "note": "walked it"}),
-        ]
+        vec![(
+            "research_set_status",
+            json!({"record": {"kind": "path", "id": path, "status": "swept"}, "note": "walked it"}),
+        )]
     });
 
     /// Confirms the flaw it began.
     const CONFIRM: Then = Then::Record(|flaw| {
-        vec![
-            json!({"action": "set_status", "record": {"kind": "flaw", "id": flaw, "status": "confirmed"}, "note": "no consequence"}),
-        ]
+        vec![(
+            "research_set_status",
+            json!({"record": {"kind": "flaw", "id": flaw, "status": "confirmed"}, "note": "no consequence"}),
+        )]
     });
 
     /// Scores the candidate it began, then validates it.
     const VALIDATE: Then = Then::Record(|candidate| {
         vec![
-            json!({"action": "assess", "candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"}),
-            json!({"action": "verdict", "candidate": candidate, "verdict": "validated", "note": "reviewed the path"}),
+            (
+                "research_assess",
+                json!({"candidate": candidate, "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "note": "unauthenticated request controls memory corruption"}),
+            ),
+            (
+                "research_verdict",
+                json!({"candidate": candidate, "verdict": "validated", "note": "reviewed the path"}),
+            ),
         ]
     });
 
@@ -492,22 +504,20 @@ mod tests {
             self.responses += 1;
             let completion = match (self.responses, (self.then)(&brief)) {
                 (1, Then::Unbegun) => failed(),
-                (1, _) => call("research", work),
+                (1, _) => call("research_begin", work),
                 (2, Then::Fail) => failed(),
                 (2, Then::Hang) => return futures_util::stream::pending().boxed(),
-                (made, Then::Record(actions)) => {
-                    match actions(&work["subjects"][0]).get(made - 2) {
-                        Some(action) => call("research", action.clone()),
-                        None => answer(),
-                    }
-                }
+                (made, Then::Record(calls)) => match calls(&work["subjects"][0]).get(made - 2) {
+                    Some((tool, arguments)) => call(tool, arguments.clone()),
+                    None => answer(),
+                },
                 _ => answer(),
             };
             futures_util::stream::iter([completion.map(ResponseEvent::End)]).boxed()
         }
     }
 
-    /// The `research` `begin` call a brief's first work asks for, from the phase and the node
+    /// The `research_begin` arguments a brief's first work asks for, from the phase and the node
     /// ids the scheduler names in it: "Settle premises 4, 5.".
     fn begin(brief: &str) -> Value {
         let work = brief.split(['.']).next().unwrap();
@@ -523,14 +533,15 @@ mod tests {
             other => panic!("no phase is briefed as {other:?}"),
         };
         let subjects: Vec<u64> = ids.split(", ").map(|id| id.parse().unwrap()).collect();
-        json!({"action": "begin", "phase": phase, "subjects": subjects})
+        json!({"phase": phase, "subjects": subjects})
     }
 
     /// Stubs recording each launch's brief before the real child runs, and a `receive` no
     /// steering reaches.
     const RECORDING: &str = "const started = [], real = globalThis.tool;
         const tool = {
-            jobs: real.jobs, research: real.research, research_query: real.research_query,
+            jobs: real.jobs, research_startable: real.research_startable,
+            research_synthesis: real.research_synthesis,
             agent: args => (started.push(args.prompt), real.agent(args)),
         };
         const receive = () => new Promise(() => {});";
@@ -579,10 +590,10 @@ mod tests {
             const held = [], real = globalThis.tool;
             const others = new Promise(resolve => begin = resolve);
             const tool = {
-                jobs: real.jobs, research: real.research,
-                research_query: async action => {
-                    if (action.action === 'startable' && waiting !== null) held.push(action.running.includes(waiting));
-                    return real.research_query(action);
+                jobs: real.jobs, research_synthesis: real.research_synthesis,
+                research_startable: async args => {
+                    if (waiting !== null) held.push(args.running.includes(waiting));
+                    return real.research_startable(args);
                 },
                 agent: async args => {
                     if (++launched === 3) begin();
@@ -628,7 +639,7 @@ mod tests {
         let stubs = format!(
             "let rows = 0;
             {RECORDING}
-            tool.research_query = async action => {{ const result = await real.research_query(action); if (action.action === 'startable') rows += result.unwrap().items.length; return result; }};
+            tool.research_startable = async args => {{ const result = await real.research_startable(args); rows += result.unwrap().items.length; return result; }};
             const workers = 1, artifacts = 'artifacts', source = '.';"
         );
         let returned = format!(
@@ -684,15 +695,18 @@ mod tests {
     async fn a_finished_tasks_reply_is_read_by_the_id_its_exhaustion_names() {
         let fixture = Fixture::with_children(LivePolicy::No, |_| {
             Then::Record(|path| {
-                vec![json!({"action": "evidence", "node": path, "items": [{"stance": "context", "note": "looked"}]})]
+                vec![(
+                    "research_evidence",
+                    json!({"node": path, "items": [{"stance": "context", "note": "looked"}]}),
+                )]
             })
         })
         .await;
         let path = sweeps(&fixture, 0..1).await[0];
         let result = fixture.script(format!(r#"
             for (let i = 0; i < 2; i++) await tool.agent({{mode: "sweep", depth: 1, name: `sweep-${{i}}`, prompt: "Sweep path {path}."}});
-            const [exhausted] = (await tool.research_query({{action: "synthesis"}})).unwrap().exhausted;
-            const task = (await tool.research_query({{action: "task", id: exhausted.tasks.at(-1)}})).unwrap();
+            const [exhausted] = (await tool.research_synthesis()).unwrap().exhausted;
+            const task = (await tool.research_task({{id: exhausted.tasks.at(-1)}})).unwrap();
             return {{tasks: exhausted.tasks.length, subjects: task.subjects, state: task.state, reply: task.reply}};
         "#)).await;
         assert_eq!(
@@ -713,8 +727,8 @@ mod tests {
         let stubs = "let reads = 0;
             const started = [], real = globalThis.tool;
             const tool = {
-                jobs: real.jobs, research: real.research,
-                research_query: action => (action.action === 'startable' && reads++, real.research_query(action)),
+                jobs: real.jobs, research_synthesis: real.research_synthesis,
+                research_startable: args => (reads++, real.research_startable(args)),
                 agent: args => (started.push(args.prompt), real.agent(args)),
             };
             const receive = () => new Promise(() => {});
@@ -770,7 +784,8 @@ mod tests {
             const question = (await real.ask({header: 'profile', prompt: 'Which deployment?', bg: true})).id;
             const sleep = async () => { await done; if (open) { open = false; await real.control({job: question, cancel: true}); } };
             const tool = {
-                jobs: real.jobs, research: real.research, research_query: real.research_query,
+                jobs: real.jobs, research_startable: real.research_startable,
+            research_synthesis: real.research_synthesis,
                 agent: async args => {
                     started.push([args.prompt.split('. ')[0], open]);
                     const result = await real.agent(args);

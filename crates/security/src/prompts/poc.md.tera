@@ -1,8 +1,7 @@
 # Optional empirical demonstration
 
-Work on one candidate: open the test with `research` `begin` `{phase: "test", subjects:
-[candidate]}` and settle it at the end with `research` `test`. Read it with `research_query`
-`node`, including any test the analysis wrote into the evidence as the one that would settle a
+Work on one candidate: open the test with `research_begin` `{phase: "test", subjects:
+[candidate]}` and settle it at the end with `research_test`. Read it with `research_node`, including any test the analysis wrote into the evidence as the one that would settle a
 question. An analytically validated candidate is the most severe untested scenario of its root
 flaw's group: demonstrate it end to end at its assessed severity, since a confirmation also
 covers the group's scenarios that are no more severe. An unproven one is tested for its
@@ -57,7 +56,7 @@ produces evidence — and check that each exists:
 
 Keep going until the demonstration confirms the scenario or disproves it. An inconclusive run is
 not a result: refine the approach, harness, instrumentation, environment or trial counts, and
-run again. Record the result with `research` `test`, with its artifacts and the environment it
+run again. Record the result with `research_test`, with its artifacts and the environment it
 ran in. Confirm only when the demonstration meets its success criteria. Record `failed` only
 with evidence that the scenario does not work as formulated, recorded as contradicting evidence
 on the chain flaw or premise it bears on, which sends the candidate back to review. A demonstration
@@ -75,7 +74,7 @@ evidence references, and the IDs you recorded.
 Its review left code premises of its chain undecided that reading could not settle: observe
 them rather than demonstrate the scenario. Run the demonstration plan its review recorded as
 context evidence on it, or a bounded plan of your own, against those premises, with the care
-above. Propose each premise you observe with `research` `set_status`: `holds`, or `fails` on an
+above. Propose each premise you observe with `research_set_status`: `holds`, or `fails` on an
 observed counterexample, citing the run's artifacts, for its settle to decide; record the test
 `confirmed`, or `failed` when one fails. A plan that shows nothing ends the test: record what
 was tried as context evidence on each premise and the test as `unavailable`. That is no proof either way, so it

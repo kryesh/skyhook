@@ -1,242 +1,104 @@
-//! Host-placed research tools. A tool's argument schema is the set of actions the
-//! agent's capabilities permit, so admission against that schema is the authorization.
+//! Host-placed research tools, one per action on the session's research graph. A tool is
+//! offered to the agents whose capabilities permit it, so the tools an agent holds are what
+//! it may do.
 
-/// A tool's input and the internal enum it admits into. The input is an object: `action`
-/// names one action, documented by the entry's doc, and that action's arguments sit beside
-/// it. An action declared with one type, `name => Variant(Type)`, takes that type's fields;
-/// one declared with fields, `name => Variant { fields }`, takes those. Actions give one
-/// name different types only where `unions` lists it. `-> Result` names what the action
-/// returns, which its handler serializes through `output::<result::Variant>`.
-macro_rules! actions {
-    (
-        enum $Enum:ident {
-            $( $(#[doc = $doc:literal])* $name:ident => $Variant:ident $arguments:tt -> $Result:ty ),* $(,)?
-        }
-        $( unions: [$($union:ident),* $(,)?] )?
-    ) => {
-        mod payload {
-            #[allow(unused_imports)]
-            use super::*;
-            $( actions!(@payload $Variant $arguments); )*
-        }
-
-        mod result {
-            $( pub(super) struct $Variant; )*
-        }
-
-        $( impl super::Returns for result::$Variant {
-            type Value = $Result;
-        } )*
-
-        enum $Enum {
-            $( $Variant(payload::$Variant), )*
-        }
-
-        #[derive(Clone, Copy, serde::Deserialize)]
-        #[allow(non_camel_case_types)]
-        enum Name {
-            $( $name, )*
-        }
-
-        impl super::Actions for Name {
-            const ALL: &[Self] = &[$( Self::$name, )*];
-            const UNIONS: &[&str] = &[$($( stringify!($union), )*)?];
-
-            fn name(self) -> &'static str {
-                match self {
-                    $( Self::$name => stringify!($name), )*
-                }
-            }
-
-            fn doc(self) -> &'static str {
-                match self {
-                    $( Self::$name => concat!($($doc),*), )*
-                }
-            }
-
-            fn arguments(self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-                match self {
-                    $( Self::$name => <payload::$Variant as schemars::JsonSchema>::json_schema(generator), )*
-                }
-            }
-
-            fn result(self) -> serde_json::Value {
-                match self {
-                    $( Self::$name => skyhook_tools::schema::result_schema::<<result::$Variant as super::Returns>::Value>(), )*
-                }
-            }
-
-            fn catalog() -> &'static super::Catalog {
-                static CATALOG: std::sync::LazyLock<super::Catalog> =
-                    std::sync::LazyLock::new(super::Catalog::new::<Name>);
-                &CATALOG
-            }
-        }
-
-        impl super::Admitted for $Enum {
-            type Name = Name;
-
-            fn action(&self) -> Name {
-                match self {
-                    $( Self::$Variant(_) => Name::$name, )*
-                }
-            }
-        }
-
-        impl TryFrom<super::Input<Name>> for $Enum {
-            type Error = skyhook_tools::error::AdmissionError;
-
-            fn try_from(input: super::Input<Name>) -> Result<Self, Self::Error> {
-                Ok(match input.action {
-                    $( Name::$name => Self::$Variant(input.arguments()?), )*
-                })
-            }
-        }
-    };
-    (@payload $Variant:ident ($Type:ty)) => {
-        pub(super) type $Variant = $Type;
-    };
-    (@payload $Variant:ident { $( $(#[$meta:meta])* $field:ident : $Type:ty ),* $(,)? }) => {
-        #[derive(serde::Deserialize, schemars::JsonSchema)]
-        #[serde(deny_unknown_fields)]
-        pub(super) struct $Variant {
-            $( $(#[$meta])* pub(super) $field: $Type, )*
-        }
-    };
-}
-
-mod input;
 mod query;
 mod research;
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::Value;
 use skyhook::tool::catalog::ToolPlacement;
 use skyhook::tool::catalog::{RegistryError, ToolOptions};
-use skyhook::tool::policy::{Capability, CapabilitySet, ResourceId};
+use skyhook::tool::policy::{Capability, ResourceId};
 use skyhook::tool::{ToolContext, ToolError, ToolRegistry, ToolRegistryBuilder};
-use skyhook_tools::error::AdmissionError;
 
 use crate::store::Store;
-use input::{Catalog, Input};
 use skyhook::identity::AgentId;
 
-/// A tool's closed set of actions: the values of its input's `action`.
-trait Actions: Copy + DeserializeOwned + 'static {
-    const ALL: &'static [Self];
-    /// The argument names whose type differs between actions.
-    const UNIONS: &'static [&'static str];
-
-    fn name(self) -> &'static str;
-
-    fn doc(self) -> &'static str;
-
-    /// The schema of the action's arguments: an object, or alternative objects.
-    fn arguments(self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema;
-
-    /// The schema of what the action returns.
-    fn result(self) -> Value;
-
-    fn catalog() -> &'static Catalog;
-}
-
-/// A tool's internal enum, admitted from its input: each value takes one action.
-trait Admitted: TryFrom<Input<Self::Name>, Error = AdmissionError> + Send + 'static {
-    type Name: Actions;
-
-    fn action(&self) -> Self::Name;
-}
-
-trait Action: Admitted {
-    /// Whether an agent with `capabilities` may take this action. Every tool already
-    /// requires Read to be offered at all.
-    fn permitted(action: Self::Name, capabilities: &CapabilitySet) -> bool;
-
-    fn placement(&self) -> Placement {
-        Placement::Writer
-    }
-}
-
-/// Where an action's work runs.
+/// Where a tool's work runs.
+#[derive(Clone, Copy)]
 enum Placement {
-    /// On a reader beside the writer: the action only reads.
+    /// On a reader beside the writer: the tool only reads.
     Reader,
-    /// In the writer's turn: the action's work is its transactions.
+    /// In the writer's turn: the tool's work is its transactions.
     Writer,
-    /// In the session's files turn, outside the writer's: most of the action's work is
+    /// In the session's files turn, outside the writer's: most of the tool's work is
     /// outside the database (artifact and report files), so it must not keep other
     /// writers waiting; each transaction it makes still has the writer's connection to
     /// itself.
     Outside,
 }
 
-fn holds(capabilities: &CapabilitySet, required: impl IntoIterator<Item = Capability>) -> bool {
-    (required.into_iter()).all(|capability| capabilities.contains(&capability))
+/// Where a tool's description gives its result.
+enum Documented {
+    /// In the `Result:` line generated from its type.
+    Generated,
+    /// In its own words, where the generated type would outrun them.
+    Described,
 }
 
-/// Internal bookkeeping needs capability authority, not a second human approval:
-/// Read is the execution capability, and the session's run is the approval resource.
-fn options<A: Action>() -> ToolOptions<A> {
-    ToolOptions::new(vec![Capability::Read])
-        .placement(ToolPlacement::Host)
-        .permission_resource(ResourceId::Session {
-            name: "security.run".to_owned(),
-        })
-        .computed_schema(input::schema::<A>)
-        .internal_result(|action: &A| A::Name::catalog().result(action.action()))
+/// One research tool, offered to agents holding `requires`.
+struct Tool<'a> {
+    name: &'a str,
+    description: &'a str,
+    requires: &'a [Capability],
+    placement: Placement,
+    documented: Documented,
 }
 
-fn register<A: Action>(
-    builder: &mut ToolRegistryBuilder,
-    name: &str,
-    description: &str,
-    options: ToolOptions<A>,
-    execute: impl Fn(&Store, &AgentId, &ToolContext, A) -> Result<Value, ToolError>
-    + Send
-    + Sync
-    + 'static,
-) -> Result<(), RegistryError> {
-    let execute = Arc::new(execute);
-    builder.register_admitted(
-        name,
-        description,
-        options,
-        A::try_from,
-        move |context: ToolContext, action: A| {
-            let execute = execute.clone();
-            async move {
-                let store = Store::of_session(context.extension()).map_err(ToolError::failed)?;
-                let placement = action.placement();
-                let (worker, waiting) = (store.clone(), context.clone());
-                let work = move || {
-                    let actor = context.agent().clone();
-                    execute(&worker, &actor, &context, action)
-                };
-                match placement {
-                    Placement::Reader => store.reading(work).await,
-                    Placement::Writer => store.writing(work).await,
-                    Placement::Outside => (store.filing(waiting.cancelled(), work).await)
-                        .unwrap_or_else(|()| Err(ToolError::cancelled())),
+impl Tool<'_> {
+    /// Internal bookkeeping needs capability authority, not a second human approval:
+    /// Read is the execution capability, and the session's run is the approval resource.
+    fn register<I, O, E>(
+        self,
+        builder: &mut ToolRegistryBuilder,
+        work: impl Fn(&Store, &AgentId, &ToolContext, I) -> Result<O, E> + Send + Sync + 'static,
+    ) -> Result<(), RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: Serialize + JsonSchema + Send + 'static,
+        E: Display,
+    {
+        let mut options = ToolOptions::new(vec![Capability::Read])
+            .placement(ToolPlacement::Host)
+            .permission_resource(ResourceId::Session {
+                name: "security.run".to_owned(),
+            });
+        for capability in self.requires {
+            options = options.requires(capability.clone());
+        }
+        if let Documented::Described = self.documented {
+            options = options.internal_result(|_| skyhook_tools::schema::result_schema::<O>());
+        }
+        let placement = self.placement;
+        let work = Arc::new(work);
+        builder.register(
+            self.name,
+            self.description,
+            options,
+            move |context: ToolContext, input: I| {
+                let work = work.clone();
+                async move {
+                    let store =
+                        Store::of_session(context.extension()).map_err(ToolError::failed)?;
+                    let (worker, waiting) = (store.clone(), context.clone());
+                    let work = move || {
+                        let actor = context.agent().clone();
+                        work(&worker, &actor, &context, input).map_err(ToolError::failed)
+                    };
+                    match placement {
+                        Placement::Reader => store.reading(work).await,
+                        Placement::Writer => store.writing(work).await,
+                        Placement::Outside => (store.filing(waiting.cancelled(), work).await)
+                            .unwrap_or_else(|()| Err(ToolError::cancelled())),
+                    }
                 }
-            }
-        },
-    )?;
-    Ok(())
-}
-
-/// What an action returns, named by its `result::Variant`.
-trait Returns {
-    type Value: Serialize + JsonSchema;
-}
-
-/// The action `R`'s result as the tool's output document.
-fn output<R: Returns>(
-    result: Result<R::Value, impl std::fmt::Display>,
-) -> Result<Value, ToolError> {
-    serde_json::to_value(result.map_err(ToolError::failed)?).map_err(ToolError::failed)
+            },
+        )?;
+        Ok(())
+    }
 }
 
 /// The research tools, which act on the tables of the session that calls them.
@@ -251,8 +113,9 @@ pub(crate) fn registry() -> Result<ToolRegistry, RegistryError> {
 pub(crate) mod tests {
     use std::{future::Future, sync::Arc, time::Duration};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use skyhook::agent::SessionHandle;
+    use skyhook::tool::policy::CapabilitySet;
 
     use super::*;
     use crate::{
@@ -326,86 +189,64 @@ pub(crate) mod tests {
         }
     }
 
-    /// The input schema `tool` surfaces to an agent holding `capabilities`, if it surfaces.
-    pub(crate) fn schema(
-        registry: &ToolRegistry,
-        capabilities: &CapabilitySet,
-        tool: &str,
-    ) -> Option<Value> {
+    /// The research tools surfaced to an agent holding `capabilities`, without their prefix,
+    /// sorted.
+    pub(crate) fn offered(registry: &ToolRegistry, capabilities: &CapabilitySet) -> Vec<String> {
         let agent = AgentId::root(skyhook::identity::SessionId::from_bytes([0; 16]));
         let surface = registry.surface_for_agent(capabilities, &agent);
-        Some(surface.get(tool)?.input_schema.clone())
-    }
-
-    /// The actions `tool` surfaces to an agent holding `capabilities`, sorted.
-    pub(crate) fn actions(
-        registry: &ToolRegistry,
-        capabilities: &CapabilitySet,
-        tool: &str,
-    ) -> Option<Vec<String>> {
-        let schema = schema(registry, capabilities, tool)?;
-        let actions = schema["properties"]["action"]["enum"].as_array()?;
-        let mut names: Vec<_> = (actions.iter())
-            .map(|name| name.as_str().unwrap().to_owned())
+        let names = surface.specs().map(|spec| spec.name.as_str());
+        let mut names: Vec<_> = (names.filter_map(|name| name.strip_prefix("research_")))
+            .map(str::to_owned)
             .collect();
         names.sort();
-        Some(names)
+        names
     }
 
     pub(crate) fn capabilities(extra: impl IntoIterator<Item = Capability>) -> CapabilitySet {
         [Capability::Read].into_iter().chain(extra).collect()
     }
 
-    /// Each capability admits its action group at the surface, and the executor refuses an
-    /// action outside the surfaced schema before it reaches the store, as it does a field its
-    /// action does not define at any depth, so a misspelt or renamed field is an error rather
-    /// than silently dropped, another action's argument, even null, a missing one, and a status
+    /// Each capability admits its tools at the surface, and the executor refuses a field a
+    /// tool does not define at any depth before the call reaches the store, so a misspelt or
+    /// renamed field is an error rather than silently dropped, a missing one, and a status
     /// its node's kind does not take.
     #[tokio::test]
-    async fn actions_follow_capabilities_at_the_surface_and_the_executor() {
+    async fn tools_follow_capabilities_at_the_surface_and_the_executor() {
         use SecurityCapability::{Coordinate, Research, Scheduled, Test, Verdict};
         let [research, verdict, test, scheduled, coordinate] =
             [Research, Verdict, Test, Scheduled, Coordinate].map(SecurityCapability::capability);
         let registry = registry().unwrap();
-        let read = capabilities([]);
         let researcher = capabilities([research.clone()]);
-        let actions_of = |granted: &CapabilitySet, tool: &str| actions(&registry, granted, tool);
-        let owned = |actions: &[&str]| Some(actions.iter().map(|a| a.to_string()).collect());
-        for (granted, tool, actions) in [
-            (&read, "research", None),
+        let offered = |granted: &CapabilitySet| offered(&registry, granted);
+        let reads = ["history", "list", "node", "search", "synthesis", "task"];
+        let with = |extra: &[&str]| {
+            let mut names: Vec<_> = reads.iter().chain(extra).map(|n| n.to_string()).collect();
+            names.sort();
+            names
+        };
+        for (granted, writes) in [
+            (capabilities([]), &[][..]),
+            (capabilities([verdict.clone()]), &[]),
             (
-                &read,
-                "research_query",
-                owned(&["history", "list", "node", "search", "synthesis", "task"]),
+                capabilities([verdict.clone(), Capability::Write]),
+                &["report"],
             ),
-            (&capabilities([verdict.clone()]), "research", None),
-            (
-                &capabilities([verdict.clone(), Capability::Write]),
-                "research",
-                owned(&["report"]),
-            ),
-            (&capabilities([test.clone()]), "research", owned(&["test"])),
-            (&capabilities([scheduled]), "research", owned(&["begin"])),
-            (
-                &capabilities([coordinate]),
-                "research",
-                owned(&["generate"]),
-            ),
+            (capabilities([test.clone()]), &["test"]),
+            (capabilities([scheduled]), &["begin"]),
+            (capabilities([coordinate]), &["generate", "startable"]),
         ] {
-            assert_eq!(actions_of(granted, tool), actions, "{tool}");
+            assert_eq!(offered(&granted), with(writes));
         }
         // Only the root mode schedules the run and writes its reports out, and only a mode
         // the scheduler launches, whose instructions begin its work, can begin work.
         for (mode, preset) in crate::modes::tests::editions(LivePolicy::Yes) {
             let granted: CapabilitySet = preset.capabilities.into();
-            let offers = |tool, action| {
-                (actions_of(&granted, tool).unwrap_or_default().iter()).any(|a| a == action)
-            };
+            let offers = |tool: &str| offered(&granted).iter().any(|name| name == tool);
             let root = mode == crate::modes::root();
-            assert_eq!(offers("research_query", "startable"), root, "{mode}");
-            assert_eq!(offers("research", "generate"), root, "{mode}");
-            let begins = (preset.instructions.unwrap().as_str()).contains("`research` `begin`");
-            assert_eq!(offers("research", "begin"), root || begins, "{mode}");
+            assert_eq!(offers("startable"), root, "{mode}");
+            assert_eq!(offers("generate"), root, "{mode}");
+            let begins = (preset.instructions.unwrap().as_str()).contains("`research_begin`");
+            assert_eq!(offers("begin"), root || begins, "{mode}");
         }
         // A validator decides verdicts; a tester records what it observes, but never decides
         // verdicts.
@@ -426,36 +267,31 @@ pub(crate) mod tests {
                 &["verdict", "begin"],
             ),
         ] {
-            let actions = actions_of(granted, "research").unwrap();
+            let tools = offered(granted);
             assert!(
-                with.iter().all(|a| actions.iter().any(|b| b == a))
-                    && !without.iter().any(|a| actions.iter().any(|b| b == a)),
-                "{actions:?}"
+                with.iter().all(|a| tools.iter().any(|b| b == a))
+                    && !without.iter().any(|a| tools.iter().any(|b| b == a)),
+                "{tools:?}"
             );
         }
 
         let fixture = Fixture::new(researcher).await;
-        let history = || fixture.success("research_query", json!({"action":"history"}));
+        let history = || fixture.success("research_history", json!({}));
         let before = history().await["items"].clone();
-        let component = json!({"action":"upsert","record":{"kind":"component","title":"parser","body":"parses"}});
+        let component = json!({"record":{"kind":"component","title":"parser","body":"parses"}});
         let mut unknown = component.clone();
         unknown["priority"] = json!("high");
         for (tool, call) in [
+            ("research_upsert", unknown),
+            ("research_node", json!({})),
+            ("research_synthesis", json!({"page":{}})),
             (
-                "research",
-                json!({"action":"verdict","candidate":1,"verdict":"unproven","note":"x"}),
-            ),
-            ("research", unknown),
-            ("research_query", json!({"action":"node"})),
-            ("research_query", json!({"action":"synthesis","page":{}})),
-            ("research_query", json!({"action":"synthesis","page":null})),
-            (
-                "research",
-                json!({"action":"set_status","record":{"kind":"premise","id":1,"status":"swept"},"note":"n"}),
+                "research_set_status",
+                json!({"record":{"kind":"premise","id":1,"status":"swept"},"note":"n"}),
             ),
             (
-                "research_query",
-                json!({"action":"list","record":{"kind":"flaw","status":"holds"}}),
+                "research_list",
+                json!({"record":{"kind":"flaw","status":"holds"}}),
             ),
         ] {
             let refused = fixture.call(tool, call.clone()).await;
@@ -464,25 +300,19 @@ pub(crate) mod tests {
         assert_eq!(
             history().await["items"],
             before,
-            "refused actions must not write audit records"
+            "refused calls must not write audit records"
         );
         // An edit names its node's kind: what the kind takes is admitted, and nothing else.
-        let id = fixture.success("research", component).await;
-        let edit = json!({"action":"upsert","record":{"kind":"component","id":id,"title":"request parser"}});
-        fixture.success("research", edit).await;
-        let foreign =
-            json!({"action":"upsert","record":{"kind":"component","id":id,"scope":"code"}});
-        let refused = fixture.call("research", foreign).await;
+        let id = fixture.success("research_upsert", component).await;
+        let edit = json!({"record":{"kind":"component","id":id,"title":"request parser"}});
+        fixture.success("research_upsert", edit).await;
+        let foreign = json!({"record":{"kind":"component","id":id,"scope":"code"}});
+        let refused = fixture.call("research_upsert", foreign).await;
         let error = refused["error"].as_str().unwrap();
         assert!(
             error.contains("`/record` failed: property `scope`"),
             "{error}"
         );
-        // A record's field left beside it is pointed inside.
-        let beside = json!({"action":"upsert","kind":"path","title":"t","body":"b"});
-        let refused = fixture.call("research", beside).await;
-        let error = refused["error"].as_str().unwrap();
-        assert!(error.contains("goes inside `record`"), "{error}");
         // A check names at least one premise it rests on, missing and empty alike: the schema
         // refuses it, and the record read without it says what to name.
         let mut record = json!({"kind":"state","id":1,"status":"checked"});
@@ -496,8 +326,8 @@ pub(crate) mod tests {
             if let Some(rests_on) = rests_on {
                 record["rests_on"] = rests_on;
             }
-            let unrested = json!({"action":"set_status","record":record,"note":"n"});
-            let refused = fixture.call("research", unrested).await;
+            let unrested = json!({"record":record,"note":"n"});
+            let refused = fixture.call("research_set_status", unrested).await;
             let error = refused["error"].as_str().unwrap();
             assert!(error.contains(refusal), "{error}");
             let read = serde_json::from_value::<StatusChange>(record.clone());

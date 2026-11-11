@@ -13,7 +13,7 @@ Record:
   path in order, the attacker's first, its body naming who performs each.
 
 Link and chain the recorded flaws your work reaches: read those on the components the code you
-read belongs to (`research_query` `list` `{record: {kind: "flaw", component}}`) and the premises
+read belongs to (`research_list` `{record: {kind: "flaw", component}}`) and the premises
 they need. A route entering through code outside the components in the run's scope is out of
 scope: record no component, path or candidate for it.
 
@@ -21,7 +21,7 @@ A dangerous-looking operation alone is not a flaw, and a check a documented cont
 a trusted caller is not a flaw in the callee (a caller that skips it is); one left to an
 untrusted client or peer is the callee's flaw.
 
-Shared state is also reached by the other paths accessing it (its `node` lists them), a path run
+Shared state is also reached by the other paths accessing it (its `research_node` lists them), a path run
 concurrently with itself, and the threads, tasks or signal handlers a component's body names;
 concurrent access is a flaw only where these let two flows reach it. An unsynchronised access
 another flow can interleave with, a lock order it inverts, or a handler re-entering work it

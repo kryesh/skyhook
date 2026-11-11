@@ -179,20 +179,20 @@ the bearing relation after the task began and after the agent's cursor, leaving 
 agent or one beneath it recorded. Nothing is stored for this: the subscription is the task log.
 Beginning a task returns the same digests for each subject a task of that phase worked before.
 
-**Reported.** `reports/` is a projection of the store, which the `generate` action renders from
+**Reported.** `reports/` is a projection of the store, which `research_generate` renders from
 the store alone: a folder for each root flaw whose finding reports its scenarios as they stand,
 replaced as a whole when what renders changed, with a folder for each test the report states
 whose artifacts are copied only while they match the digest the test recorded, beside a
 hardening list of the confirmed flaws no finding's scenario holds.
 
-**Permitted.** The host capabilities gate the research tool's actions: `security.research`
-recording research, with `security.verdict` a verdict; `security.verdict` with Write a report;
-`security.test` a test; `security.scheduled` beginning assigned work; and `security.coordinate`
-scheduling (`startable`) and report generation. The store refuses nothing but boundary parsing,
-unknown ids and integrity, so unwanted work is prevented by not scheduling it. Read-only tool
-actions, the host state and host events read beside the session's one writer; an action whose
-work is mostly files (recording a test, generating reports) takes the session's files turn
-rather than the writer's.
+**Permitted.** Each research action is a tool, and the host capabilities gate which an agent
+is offered: `security.research` recording research, with `security.verdict` a verdict;
+`security.verdict` with Write a report; `security.test` a test; `security.scheduled` beginning
+assigned work; and `security.coordinate` scheduling (`research_startable`) and report
+generation. The store refuses nothing but boundary parsing, unknown ids and integrity, so
+unwanted work is prevented by not scheduling it. Read-only tools, the host state and host
+events read beside the session's one writer; a tool whose work is mostly files (recording a
+test, generating reports) takes the session's files turn rather than the writer's.
 
 ## Configuration and provider entries
 

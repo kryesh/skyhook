@@ -36,22 +36,22 @@ Each interface of theirs an environment serves gets a child too.
 Once every child has finished, reconcile what they recorded into scenarios. The paths of an
 entry group share their entry's definition: they are one entry recorded more than once (an alias
 or a thin wrapper of one route, say) only when the handling ahead of it is the same too, the same
-routing, checks and input states at the same trust. `merge` each such path into the one you
+routing, checks and input states at the same trust. `research_merge` each such path into the one you
 keep, which takes its accesses, premises and place in candidates' actions. Routes that reach one
 definition through different handling are distinct entries: keep them apart, and when in doubt
 that the handling matches, keep them apart. A function recorded as an entry that only other
 entries reach is a stage: retract its path and link its accesses to theirs, since a stage swept
 without its scenario loses the chains that cross it. Then complete each path's whole `steps`
-in an `upsert`: put ahead of its entry the target's code that reaches it, and extend it past the
+in a `research_upsert`: put ahead of its entry the target's code that reaches it, and extend it past the
 entry through each component the input is handed to, in order, with its location and how.
 
-Children recording one file each record the same storage more than once: `merge` each state
+Children recording one file each record the same storage more than once: `research_merge` each state
 into the one it duplicates, one state per storage one invariant relates. A state relating
 several invariants is several states: record one per invariant, move its accesses to them and
 retract it. Link each unlinked
 input state with `path_state` to every path whose steps reach the stage reading it, and record a
 path for an entry no child placed. Every input state is read on a path, and every input has an
-outcome. Retract a state or path recorded in error with `set_status` `retracted`.
+outcome. Retract a state or path recorded in error with `research_set_status` `retracted`.
 
 Return the path IDs, the inputs that had no entries, the unserved interfaces, and what you could
 not resolve, such as dynamic registration or generated dispatch, also recorded as context

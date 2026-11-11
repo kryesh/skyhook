@@ -21,10 +21,10 @@ input, cancel it and start a fresh child under a new name, or report the blocker
 ## Scheduling
 
 Every phase after `paths` runs in one scheduler, the template below, keeping up to `workers`
-children on what `research_query` `startable` offers. A node two children left owed is
+children on what `research_startable` offers. A node two children left owed is
 exhausted until something it rests on changes; a child that ends without beginning its task
 counts toward those two for this run (`spent`). The scheduler returns once nothing it could
-start is left, with the `synthesis`. Tell the user about exhausted work, such as children that
+start is left, with the `research_synthesis`. Tell the user about exhausted work, such as children that
 failed before starting, rather than running the scheduler again unchanged.
 Run it with `bg: true`; while it runs, start no other script that launches children. Every
 scheduling fact is in the store, so running it again picks up where it stopped.
@@ -42,8 +42,7 @@ for it.
    component map and the interfaces in scope.
 {%- if role == "root" %}
    Before research starts, put the deployment premises it recorded to the user as one batch,
-   each as it holds, fails or stays undecided, and record each answer with `research`
-   `set_status`.
+   each as it holds, fails or stays undecided, and record each answer with `research_set_status`.
 {%- endif %}
    What the user's request and answers leave open stays an undecided deployment premise.
 {%- if live %}
@@ -84,10 +83,10 @@ offers each root group's most severe untested scenario first; one no more severe
 demonstrated scenario of its group is noted instead of tested. It also offers an unproven candidate
 whose code premise reading left undecided, the most severe one per premise, to observe it for
 its settle. Under `ask`, run the scheduler with the IDs of the queued candidates the user
-approves for demonstration in `approved`; record each one they turn down with `research` `test`
+approves for demonstration in `approved`; record each one they turn down with `research_test`
 result `declined` and their reason. Under `yes`, and for approved candidates, the scheduler runs
 the tests. A test blocked on the user is `pending` and stays owed: resolve the blocker, then
-add that test's id (the candidate's latest in `node` `tests`) to `unblocked`; a later pending
+add that test's id (the candidate's latest in `research_node` `tests`) to `unblocked`; a later pending
 test needs its own. An `unavailable` test is offered again after a new environment; a `failed`
 one carries contradicting evidence that sends its candidate back to review, and its scenario is
 reported by the verdict that review records, while the group's next most severe untested
@@ -98,14 +97,13 @@ new verdict.
 {% endif -%}
 ## Closure
 
-An empty queue is not finished analysis. Each time the scheduler returns, read `research_query`
-`synthesis` (`owed`, `running`, `exhausted`, `asked`, `unproven`, `unreached`, `uncovered`) and
+An empty queue is not finished analysis. Each time the scheduler returns, read `research_synthesis` (`owed`, `running`, `exhausted`, `asked`, `unproven`, `unreached`, `uncovered`) and
 the findings, then:
 
 {%- if role == "root" %}
 - Merge duplicate `asked` deployment premises into one and collect them with the undecided
   deployment premises of `unproven` candidates into one batch for the user. Record each answer
-  with `research` `set_status` (`holds` or `fails`), which sends their candidates back to review;
+  with `research_set_status` (`holds` or `fails`), which sends their candidates back to review;
   one without an answer stays asked.
 {%- endif %}
 {%- if live %}
@@ -118,14 +116,14 @@ the findings, then:
 
 Exhausted work is terminal: close once a pass through these steps changes nothing, with
 nothing owed or held, every answer the user gave recorded, and the last loose-end review moving
-nothing. At close, always call `research` `generate` to write the current reports to `reports/`,
+nothing. At close, always call `research_generate` to write the current reports to `reports/`,
 and summarize: the deployment premises still asked, the components no path reaches, the
 interfaces left uncovered, the plan's line as the research state shows it, every exhausted node
-as incomplete, with its last child's reply (`task` reads an earlier try's by id), every unproven
+as incomplete, with its last child's reply (`research_task` reads an earlier try's by id), every unproven
 candidate with each undecided code premise and what would settle it,
 {%- if live %}
 a test the scheduler returned `held` with what it waits on, the candidates whose latest test in
-`node` `tests` is pending,
+`research_node` `tests` is pending,
 {%- endif %}
 then findings per root flaw and their reports (`reports/<root>/`, listed in `reports/index.md`),
 naming each root without a current report as having none,

@@ -421,29 +421,26 @@ fn fold(
 }
 
 impl Store {
-    /// Add edges, as one event; an edge already there is restated.
-    pub(crate) fn link(&self, actor: &AgentId, edges: &[Edge]) -> Result<()> {
-        self.edges(actor, Verb::Link, edges)
-    }
-
-    /// Remove edges, as one event; an edge not there is restated absent.
-    pub(crate) fn unlink(&self, actor: &AgentId, edges: &[Edge]) -> Result<()> {
-        self.edges(actor, Verb::Unlink, edges)
-    }
-
-    fn edges(&self, actor: &AgentId, verb: Verb, edges: &[Edge]) -> Result<()> {
-        let kind = match verb {
-            Verb::Link => EventKind::Linked,
-            Verb::Unlink => EventKind::Unlinked,
-        };
+    /// Remove edges, then add edges: each list one event, and both written or neither. An
+    /// edge already there is restated, as one not there is restated absent.
+    pub(crate) fn relink(&self, actor: &AgentId, add: &[Edge], remove: &[Edge]) -> Result<()> {
         self.write(|db| {
-            audit(db, actor, kind, None, |_| {
-                let mut marks = Marks::default();
-                for each in edges {
-                    edge(db, verb, each, &mut marks)?;
+            for (verb, kind, edges) in [
+                (Verb::Unlink, EventKind::Unlinked, remove),
+                (Verb::Link, EventKind::Linked, add),
+            ] {
+                if edges.is_empty() {
+                    continue;
                 }
-                Ok(((), marks))
-            })
+                audit(db, actor, kind, None, |_| {
+                    let mut marks = Marks::default();
+                    for each in edges {
+                        edge(db, verb, each, &mut marks)?;
+                    }
+                    Ok(((), marks))
+                })?;
+            }
+            Ok(())
         })
     }
 
@@ -585,7 +582,7 @@ mod tests {
             [(); 3].map(|_| premise(&store, &actor, PremiseScope::Code));
         let rests = |premise, rests_on| Edge::PremiseBasis { premise, rests_on };
         assert_matches!(
-            store.link(&actor, &[rests(resting, resting)]),
+            store.relink(&actor, &[rests(resting, resting)], &[]),
             Err(Error::SelfBasis)
         );
         let links = [
@@ -608,7 +605,7 @@ mod tests {
                 premise: second_premise,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
         let between = flaw(&store, &actor, two.component);
         let both = candidate(&store, &actor, two.path, &[one.flaw, between, two.flaw]);
         let rekeyed = store
@@ -946,7 +943,7 @@ mod tests {
             path: one.path,
             premise: relied,
         };
-        store.link(&actor, &[link]).unwrap();
+        store.relink(&actor, &[link], &[]).unwrap();
         let counts = || {
             let coverage = store.coverage().unwrap();
             let unreached = store.synthesis(&[]).unwrap().unreached;
@@ -984,7 +981,7 @@ mod tests {
             flaw: one.flaw,
             state: merged_input,
         };
-        store.link(&actor, &[wrong]).unwrap();
+        store.relink(&actor, &[wrong], &[]).unwrap();
         let adopt = |location: &Location| {
             let edit = StateEdit {
                 id: kept_input,

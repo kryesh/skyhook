@@ -1,6 +1,6 @@
 # One report per root flaw
 
-Begin with `research` `begin` `{phase: "report", subjects: [root]}`, then write the assigned root
+Begin with `research_begin` `{phase: "report", subjects: [root]}`, then write the assigned root
 flaw's report from the research as it stands. Every candidate of the root's group that stands
 validated or noted is one of its scenarios; the report renders a table of them with their
 paths, chains, vectors, scores, statuses, confidence and the test each stands on from the store,
@@ -10,7 +10,7 @@ so you write the prose around it. Read the scenarios and the previous report:
 {% include "security/scripts/report-scenarios.js" %}
 ```
 
-Read each scenario with `node` as you write. Record the report with `research` `report`: a
+Read each scenario with `research_node` as you write. Record the report with `research_report`: a
 `title` naming the defect and its consequence in the project's own terms, and a markdown `body`
 with these sections:
 

@@ -19,14 +19,14 @@ state its code keeps:
   its body that invariant and its writers and readers; fields kept to different invariants (a
   state machine, its cached results, its error) are different states, and a per-call temporary
   is not a state.
-- each **access**: link with `path_state` each recorded path (`research_query` `list` `{record:
+- each **access**: link with `path_state` each recorded path (`research_list` `{record:
   {kind: "path"}}`) whose flow reads or writes one of these states here, an entry here or one another
   child recorded, with `read` or `write` at the access's location. An input state no path you
   see reaches stays unlinked, its body naming the entries you see reaching it, for your parent
   to link.
 
-Reuse an existing path or state (`list` `{record: {kind: "state"}}`) rather than recording a duplicate,
-and retract one recorded in error with `set_status` `retracted`.
+Reuse an existing path or state (`research_list` `{record: {kind: "state"}}`) rather than recording a duplicate,
+and retract one recorded in error with `research_set_status` `retracted`.
 
 An entry, input or state with code is recorded at its definition, not a declaration. An
 interface description, capture or documentation yields an entry per operation it shows, at that

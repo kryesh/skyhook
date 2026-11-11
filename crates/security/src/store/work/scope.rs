@@ -276,7 +276,7 @@ mod tests {
                 premise: held,
             },
         ];
-        store.link(&actor, &links).unwrap();
+        store.relink(&actor, &links, &[]).unwrap();
 
         let (checker, job, _) = begun(&store, &Begin::Check(Listed::of([shared])));
         let binding = component(&store, &checker, "binding");
@@ -293,7 +293,7 @@ mod tests {
                 premise: assumed,
             },
         ];
-        store.link(&checker, &links).unwrap();
+        store.relink(&checker, &links, &[]).unwrap();
         candidate(&store, &checker, entry, &[decoder.flaw]);
         end_job(&store, job);
 

@@ -15,5 +15,4 @@ pub(crate) use evidence::*;
 pub(crate) use links::*;
 pub(crate) use locations::*;
 pub(crate) use nodes::*;
-pub(crate) use review::*;
 pub(crate) use testing::*;

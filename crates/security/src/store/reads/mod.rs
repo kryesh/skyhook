@@ -99,7 +99,7 @@ mod tests {
                 location("decoder/lib.c", line),
             )
         };
-        store.link(&actor, &[write(3)]).unwrap();
+        store.relink(&actor, &[write(3)], &[]).unwrap();
         sweep(&store, stream);
         let basis = premise(&store, &actor, PremiseScope::Code);
         check(&store, window, &[basis]);
@@ -110,7 +110,7 @@ mod tests {
             view.check.expect("a check").current
         };
         assert!(current());
-        store.link(&actor, &[write(4)]).unwrap();
+        store.relink(&actor, &[write(4)], &[]).unwrap();
         assert!(!current());
         let retracted = StatusChange::State(StateMark::Retracted { id: window });
         store.set_status(&actor, retracted, &text("gone")).unwrap();

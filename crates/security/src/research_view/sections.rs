@@ -871,7 +871,7 @@ mod tests {
             flaw: second.flaw,
             premise: premise(&store, &actor, PremiseScope::Code),
         };
-        store.link(&actor, &[rests]).unwrap();
+        store.relink(&actor, &[rests], &[]).unwrap();
         let candidates = ShelfKind::Nodes(NodeKind::Candidate);
         let mut open = Disclosed::default();
         open.apply(&Toggle::Section(candidates.key()));

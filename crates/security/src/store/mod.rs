@@ -486,7 +486,7 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         store
-            .link(actor, &[access(path, input, Access::Read, at)])
+            .relink(actor, &[access(path, input, Access::Read, at)], &[])
             .unwrap();
         path
     }
