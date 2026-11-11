@@ -384,7 +384,7 @@ mod tests {
         workspace.configure(&format!("{CONFIG}default_mode: missing\n"));
         let (result, id, warned) = workspace.batch_as(&product, &["-s", &script]).await;
         let error = result.unwrap_err().to_string();
-        assert!(error.contains("missing") && id.is_none(), "{error}");
+        assert!(error.contains("default_mode") && id.is_none(), "{error}");
         assert_eq!(warned, expected);
     }
 }

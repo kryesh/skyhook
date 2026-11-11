@@ -101,33 +101,41 @@ pub(crate) fn replaces(redefined: &[TargetDefinition], revisions: &[(TargetName,
 
 /// Every target is valid, and has a route.
 fn validate_graph(entries: &Entries) -> Result<(), TargetError> {
-    for (name, target) in entries {
-        target.validate()?;
-        route(entries, name, &mut BTreeSet::new())?;
-    }
-    validate_passwords(entries)
+    entries
+        .keys()
+        .try_for_each(|name| validate_entry(entries, name))
 }
 
-/// Every password a definition gives is admitted for the machine that reads it, the
+/// The target `name` of `entries` is valid, gives a password its origin can read, and
+/// has a route through the others. The route is last: what precedes it holds whether or
+/// not every target the route names is defined yet.
+pub(super) fn validate_entry(entries: &Entries, name: &TargetName) -> Result<(), TargetError> {
+    let target = &entries[name];
+    target.validate()?;
+    validate_password(entries, target)?;
+    route(entries, name, &mut BTreeSet::new()).map(drop)
+}
+
+/// The password `target` gives is admitted for the machine that reads it, the
 /// target's origin (root is this host); one whose origin is not yet defined is
 /// admitted once it is.
-pub(super) fn validate_passwords(entries: &Entries) -> Result<(), TargetError> {
-    for target in entries.values() {
-        let reader = match &target.origin {
-            None => Some(skyhook_worker::target::Platform::current().os),
-            Some(origin) => entries.get(origin).map(|origin| origin.os),
-        };
-        let password = (target.connection.password()).and_then(Password::given);
-        if let (Some(reader), Some(password)) = (reader, password) {
-            let transport = target.connection.kind();
-            (password.admit(reader))
-                .map_err(|problem| TargetError::InvalidPassword { transport, problem })?;
-        }
+fn validate_password(entries: &Entries, target: &TargetDefinition) -> Result<(), TargetError> {
+    let reader = match &target.origin {
+        None => Some(skyhook_worker::target::Platform::current().os),
+        Some(origin) => entries.get(origin).map(|origin| origin.os),
+    };
+    let password = (target.connection.password()).and_then(Password::given);
+    if let (Some(reader), Some(password)) = (reader, password) {
+        let transport = target.connection.kind();
+        (password.admit(reader))
+            .map_err(|problem| TargetError::InvalidPassword { transport, problem })?;
     }
     Ok(())
 }
 
-/// The route to `name`, which no target on it already `visited`. Jumps belong to the
+/// The route to `name`, which no target on it already `visited`. An error names the
+/// target whose setting it refuses: a jump, where the jump's own route is at fault.
+/// Jumps belong to the
 /// connection their destination's origin starts, so a jump's key paths and agent are
 /// never reinterpreted on another machine: each is an SSH target of that origin. That
 /// connection's one terminal shows every prompt, so at most one of its targets has a
@@ -160,12 +168,12 @@ fn route<'a>(
             .connection
             .ssh()
             .ok_or_else(|| TargetError::WinrmJump {
-                target: name.clone(),
+                target: from.name.clone(),
                 jump: jump.name.clone(),
             })?;
         if jump.origin != destination.origin {
             return Err(TargetError::OriginMismatch {
-                target: name.clone(),
+                target: from.name.clone(),
                 jump: jump.name.clone(),
                 origin: origin_of(destination),
                 jump_origin: origin_of(jump),
@@ -187,7 +195,6 @@ fn route<'a>(
         .collect();
     if let [first, second, ..] = secrets[..] {
         return Err(TargetError::SecretsInOneConnection {
-            target: name.clone(),
             first: first.clone(),
             second: second.clone(),
         });
@@ -204,24 +211,6 @@ fn route<'a>(
         jumps,
         destination: destination.clone(),
     })
-}
-
-/// Validate known route edges while permitting references supplied at runtime.
-pub(super) fn validate_route_cycles(entries: &Entries) -> Result<(), TargetError> {
-    for name in entries.keys() {
-        let mut current = name;
-        let mut visited = BTreeSet::new();
-        while let Some(target) = entries.get(current) {
-            if !visited.insert(current) {
-                return Err(TargetError::Cycle(current.clone()));
-            }
-            let Some(parent) = target.via.as_ref().or(target.origin.as_ref()) else {
-                break;
-            };
-            current = parent;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -299,8 +288,8 @@ mod tests {
         let Err(error) = TargetRegistry::from_definitions(two) else {
             panic!("two secrets were accepted");
         };
-        assert_matches!(&error, TargetError::SecretsInOneConnection { target, first, second }
-            if *target == name("build") && *first == name("gateway") && *second == name("build"));
+        assert_matches!(&error, TargetError::SecretsInOneConnection { first, second }
+            if *first == name("gateway") && *second == name("build"));
         assert!(error.to_string().contains("with `origin` instead of `via`"));
         let registry = TargetRegistry::from_definitions([secret("gateway", None)]).unwrap();
         let added = registry.upsert(secret("build", Some("gateway")));

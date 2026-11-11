@@ -1,7 +1,8 @@
 //! The configuration every provider entry shares and the checks an entry passes
 //! on admission.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use skyhook_base::decode::Segment;
 
 use super::{DialectError, PlacementError, ResponseSetting};
 use crate::provider::{
@@ -51,10 +52,66 @@ pub enum AdmissionError {
     Dialect(#[from] DialectError),
     #[error("models.{model}: {error}")]
     Model { model: ModelName, error: ModelError },
+    #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    Unset(Vec<Unset>),
+}
+
+/// A setting the entry's models need that neither the entry nor they set.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "missing required setting `{setting}` (needed by {} {}); set it here or on each model",
+    if self.models.len() == 1 { "model" } else { "models" },
+    skyhook_base::decode::one_of(&self.models)
+)]
+pub struct Unset {
+    pub setting: &'static str,
+    pub models: Vec<ModelName>,
+}
+
+impl AdmissionError {
+    /// Where in the entry each refused setting is, and why it is refused.
+    pub(crate) fn refusals(&self) -> Vec<(Vec<Segment>, String)> {
+        let key = |key: &str| Segment::Key(key.to_owned());
+        let header = |name: &str, message| (vec![key("headers"), key(name)], message);
+        let dialect = |error: &DialectError| match error {
+            DialectError::UnsupportedCodec { .. } => vec![key("codec")],
+            DialectError::ManagedLogin { .. } => vec![key("api_key")],
+        };
+        let refusal = match self {
+            Self::Endpoint(error) => (vec![key("base_url")], error.to_string()),
+            Self::Value(error) => match &error.field {
+                ValueField::ApiKey => (vec![key("api_key")], error.problem.to_string()),
+                ValueField::Header(name) => header(name.as_str(), error.problem.to_string()),
+            },
+            Self::Header(error) => {
+                let (name, message) = error.refusal();
+                header(name, message)
+            }
+            Self::Dialect(error) => (dialect(error), error.to_string()),
+            Self::Unset(unset) => {
+                let unset = unset.iter().map(|unset| (Vec::new(), unset.to_string()));
+                return unset.collect();
+            }
+            Self::Model { model, error } => {
+                let field = match error {
+                    ModelError::Dialect(error) => dialect(error),
+                    ModelError::Limits(_) => vec![key("max_output")],
+                    ModelError::ResponsesOnly(setting) => vec![key(setting.as_str())],
+                    ModelError::ExplicitCaching => vec![key("explicit_caching")],
+                    ModelError::Reasoning { .. } => vec![key("reasoning")],
+                    ModelError::Settings(_) | ModelError::Placement(_) => Vec::new(),
+                };
+                let mut path = vec![key("models"), key(model.as_str())];
+                path.extend(field);
+                (path, error.to_string())
+            }
+        };
+        vec![refusal]
+    }
 }
 
 /// Fields every dialect accepts, as written. A dialect's own fields sit beside them.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, skyhook_base::decode::Decode)]
 pub struct Common {
     /// The API root; Skyhook appends the path of the service it calls. Absent
     /// only where the dialect has its own service (Codex).

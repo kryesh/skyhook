@@ -39,6 +39,28 @@ pub fn deserialize<'de, T: NamedEnum, D: Deserializer<'de>>(
     deserializer.deserialize_str(Names(PhantomData))
 }
 
+/// Decodes a [`NamedEnum`] from a string node, refusing anything else with the spellings.
+pub fn decode<T: NamedEnum>(
+    node: &crate::decode::Node,
+    cx: &mut crate::decode::Context,
+) -> Option<T> {
+    let names = || crate::decode::one_of(T::NAMES);
+    let Some(value) = node.as_str() else {
+        cx.expected(node, &format!("one of {}", names()));
+        return None;
+    };
+    let refused = |cx: &mut crate::decode::Context| {
+        cx.error(
+            node,
+            format_args!("unknown variant `{value}`, expected one of {}", names()),
+        )
+    };
+    T::parse(value).or_else(|| {
+        refused(cx);
+        None
+    })
+}
+
 /// A name outside an enum's spellings.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind} {value:?}; expected one of {expected}")]

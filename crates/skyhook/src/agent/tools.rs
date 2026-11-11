@@ -199,7 +199,7 @@ for line in sys.stdin:
 "#;
 
     fn stdio_config(root: &Path, capabilities: Vec<Capability>) -> McpServerConfig {
-        serde_json::from_value(json!({
+        crate::tests::decode(json!({
             "transport":"stdio",
             "start_command":["python3", "-u", "-c", FIXTURE],
             "env":{"MCP_RUNTIME_MARKER":root.join("launched")},
@@ -253,7 +253,7 @@ for line in sys.stdin:
             let root = tempfile::tempdir().unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
-            let http = serde_json::from_value(json!({
+            let http = crate::tests::decode(json!({
                 "transport":"streamable_http",
                 "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
                 "capabilities":required
@@ -407,7 +407,7 @@ for line in sys.stdin:
         let missing = root.path().join("nonexistent-mcp");
         let failing = json!({"transport": "stdio", "start_command": [missing.to_string_lossy()]});
         let mut mcp = servers(stdio_config(root.path(), vec![]));
-        mcp.insert("failing".into(), serde_json::from_value(failing).unwrap());
+        mcp.insert("failing".into(), crate::tests::decode(failing).unwrap());
         let harness = builder(root.path(), Requests::default())
             .mcp(mcp)
             .build()

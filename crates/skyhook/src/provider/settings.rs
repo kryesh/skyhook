@@ -9,7 +9,8 @@
 
 use std::fmt::Debug;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
+use serde::{Serialize, Serializer};
+use skyhook_base::decode::{Context, Decode, Fields, Node, Value};
 
 pub trait Settings: Sized {
     type Patch: Patch;
@@ -17,10 +18,7 @@ pub trait Settings: Sized {
     fn resolve(patch: &Self::Patch) -> Result<Self, MissingSetting>;
 }
 
-pub trait Patch: Clone + Debug + Default + Serialize + DeserializeOwned {
-    /// The serialized field names, flattened groups included.
-    const FIELDS: &'static [&'static str];
-
+pub trait Patch: Clone + Debug + Default + Serialize + Decode + Fields {
     /// Apply the higher-precedence partial settings without resolving defaults.
     fn overlay(&self, higher: &Self) -> Self;
 }
@@ -107,9 +105,13 @@ impl<T: Serialize> Serialize for Setting<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Setting<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize(deserializer).map(Self::Set)
+impl<T: Decode> Decode for Setting<T> {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        T::decode(node, cx).map(Self::Set)
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Inherit)
     }
 }
 
@@ -152,27 +154,17 @@ impl<T: Serialize> Serialize for Nullable<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Nullable<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Option::<T>::deserialize(deserializer)?.map_or(Self::Null, Self::Value))
-    }
-}
-
-/// Join the field names of flattened settings without maintaining another list.
-pub(crate) const fn fields<const N: usize>(groups: &[&[&'static str]]) -> [&'static str; N] {
-    let mut fields = [""; N];
-    let mut offset = 0;
-    let mut group = 0;
-    while group < groups.len() {
-        let mut field = 0;
-        while field < groups[group].len() {
-            fields[offset] = groups[group][field];
-            offset += 1;
-            field += 1;
+impl<T: Decode> Decode for Nullable<T> {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        match node.value {
+            Value::Null => Some(Self::Null),
+            _ => T::decode(node, cx).map(Self::Value),
         }
-        group += 1;
     }
-    fields
+
+    fn absent() -> Option<Self> {
+        Some(Self::Default)
+    }
 }
 
 /// Declare resolved settings and their presence-preserving patch together.
@@ -190,15 +182,13 @@ macro_rules! settings {
         }
     ) => {
         $(#[$attr])*
-        #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-        #[serde(deny_unknown_fields)]
+        #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq, skyhook_base::decode::Decode)]
         $vis struct $config {
             $($(#[serde(flatten)] $flat_vis $flat: $flat_ty,)*)?
             $($(#[$field_attr])* $field_vis $field: $ty,)*
         }
 
-        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-        #[serde(deny_unknown_fields)]
+        #[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq, skyhook_base::decode::Decode)]
         $vis struct $patch {
             $($(#[serde(flatten)] $flat_vis $flat: <$flat_ty as $crate::provider::settings::Settings>::Patch,)*)?
             $(
@@ -208,16 +198,6 @@ macro_rules! settings {
         }
 
         impl $crate::provider::settings::Patch for $patch {
-            const FIELDS: &'static [&'static str] = &{
-                $crate::provider::settings::fields::<{
-                    0 $($(+ <<$flat_ty as $crate::provider::settings::Settings>::Patch as $crate::provider::settings::Patch>::FIELDS.len())*)?
-                        $(+ { let _ = stringify!($field); 1 })*
-                }>(&[
-                    $($(<<$flat_ty as $crate::provider::settings::Settings>::Patch as $crate::provider::settings::Patch>::FIELDS,)*)?
-                    &[$(stringify!($field),)*],
-                ])
-            };
-
             fn overlay(&self, _higher: &Self) -> Self {
                 Self {
                     $($($flat: $crate::provider::settings::Patch::overlay(&self.$flat, &_higher.$flat),)*)?
@@ -303,10 +283,10 @@ mod tests {
             json!({"name": null}),
             json!({"unknown": true}),
         ] {
-            assert!(serde_json::from_value::<ExamplePatch>(input).is_err());
+            assert!(crate::tests::decode::<ExamplePatch>(input).is_err());
         }
         // A settings type without fields is an empty object, not an open map.
-        assert!(serde_json::from_value::<EmptyPatch>(json!({"extra": 1})).is_err());
+        assert!(crate::tests::decode::<EmptyPatch>(json!({"extra": 1})).is_err());
         assert_eq!(Empty::resolve(&EmptyPatch::default()).unwrap(), Empty {});
         let lower: ExamplePatch = crate::yaml::parse("level: null").unwrap();
         let higher: ExamplePatch = crate::yaml::parse("level: concise").unwrap();
@@ -329,12 +309,12 @@ mod tests {
 
     #[test]
     fn presence_survives_roundtrip_and_resolution_waits_for_overlay() {
-        let lower: ExamplePatch = serde_json::from_value(json!({
+        let lower: ExamplePatch = crate::tests::decode(json!({
             "name": "inherited", "enabled": true, "tags": ["old"], "tenant": "old"
         }))
         .unwrap();
         let explicit = json!({"enabled": false, "tags": [], "tenant": null});
-        let higher: ExamplePatch = serde_json::from_value(explicit.clone()).unwrap();
+        let higher: ExamplePatch = crate::tests::decode(explicit.clone()).unwrap();
         assert_eq!(serde_json::to_value(&higher).unwrap(), explicit);
         assert_eq!(Example::resolve(&higher).unwrap_err().name, "name");
         let merged = lower.overlay(&higher);

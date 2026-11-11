@@ -1,6 +1,7 @@
 //! Modes: named permission presets, as configured and as an agent runs them.
 use serde::{Deserialize, Serialize};
 use skyhook_base::{
+    decode::Decode,
     newtype::{Blank, Prose, nonblank},
     string_newtype,
 };
@@ -31,16 +32,20 @@ impl std::str::FromStr for Instructions {
 }
 
 /// Configuration spells only text.
-impl<'de> Deserialize<'de> for Instructions {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Prose::deserialize(deserializer).map(Self::Text)
+impl Decode for Instructions {
+    fn decode(
+        node: &skyhook_base::decode::Node,
+        cx: &mut skyhook_base::decode::Context,
+    ) -> Option<Self> {
+        Prose::decode(node, cx).map(Self::Text)
     }
 }
 
 /// A named permission preset. Interaction is supplied by the runtime host, never listed.
 /// Configured, its instructions may be a host template; an agent runs its [`Edition`].
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Decode)]
 #[serde(deny_unknown_fields, bound(deserialize = "I: Deserialize<'de>"))]
+#[decode(bound = "I: Decode")]
 pub struct Mode<I = Instructions> {
     pub capabilities: ModeCapabilities,
     /// Added to the system prompt of an agent running in the mode.

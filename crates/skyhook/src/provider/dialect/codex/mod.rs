@@ -193,7 +193,7 @@ mod tests {
     use crate::provider::{
         Provider,
         codec::common::tests::reduce,
-        dialect::{AdmissionError, Common, ModelError},
+        dialect::{Common, ModelError},
         http::tests::reasoning_tool_request,
         protocol::Outcome,
     };
@@ -316,11 +316,12 @@ mod tests {
         // A key is refused at the service or a mirror.
         for base_url in ["", "base_url: https://api.example/codex\n"] {
             let yaml = format!("dialect: codex\n{base_url}api_key: k");
-            let entry = crate::yaml::parse::<super::super::RawProviderConfig>(&yaml).unwrap();
-            assert!(matches!(
-                entry.admit(),
-                Err(AdmissionError::Dialect(DialectError::ManagedLogin { .. }))
-            ));
+            let refused = crate::yaml::parse::<super::super::RawProviderConfig>(&yaml).unwrap_err();
+            let refused = refused.to_string();
+            assert!(
+                refused.contains("`api_key`: api_key does not apply to codex"),
+                "{refused}"
+            );
         }
         let mirror = |url: &str| crate::yaml::parse::<Options>(&format!("auth_url: '{url}'"));
         // OAuth paths join beneath a mirror's path prefix.

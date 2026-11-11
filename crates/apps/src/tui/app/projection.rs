@@ -276,21 +276,26 @@ impl App {
             let panel = self.scope.as_ref().filter(|_| shown);
             let scope = panel.map(|panel| move || panel.entry());
             let view = self.views.get_mut(&self.selected, self.tab);
-            self.content_cache.update(
-                &self.snapshot,
+            let mut changed = self.projection.take_changes();
+            changed.extend(window.take_changes());
+            let presentation = model::EntryView {
+                agent: &self.selected,
+                tab: self.tab,
+                view,
+                all_details: self.details,
+                today: self.clock.day(),
+                scope: scope.as_ref().map(|scope| scope as &dyn Fn() -> Entry),
+            };
+            let inputs = model::Inputs {
+                live: &self.snapshot,
                 window,
-                &mut self.projection,
-                model::EntryView {
-                    agent: &self.selected,
-                    tab: self.tab,
-                    view,
-                    all_details: self.details,
-                    today: self.clock.day(),
-                    scope: scope.as_ref().map(|scope| scope as &dyn Fn() -> Entry),
-                },
-                &self.outputs,
-                &self.unsaved_status,
-            );
+                projection: &self.projection,
+                presentation,
+                outputs: &self.outputs,
+                unsaved: &self.unsaved_status,
+                config: self.launch.model().config(),
+            };
+            self.content_cache.update(inputs, changed);
             self.content_dirty = false;
         }
     }

@@ -2,15 +2,12 @@
 use super::super::theme;
 use super::CodeKey;
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
 };
 use std::sync::OnceLock;
 use syntect::{
-    easy::HighlightLines,
-    highlighting::{FontStyle, Theme},
-    parsing::SyntaxSet,
-    util::LinesWithEndings,
+    easy::HighlightLines, highlighting::Theme, parsing::SyntaxSet, util::LinesWithEndings,
 };
 
 pub(super) struct SyntaxResources {
@@ -46,20 +43,11 @@ pub(super) fn highlight_code(key: &CodeKey) -> Option<Vec<Line<'static>>> {
         };
         let mut spans = Vec::new();
         for (style, text) in tokens {
-            let mut rendered = Style::default().fg(Color::Rgb(
+            let rendered = Style::default().fg(Color::Rgb(
                 style.foreground.r,
                 style.foreground.g,
                 style.foreground.b,
             ));
-            for (font, modifier) in [
-                (FontStyle::BOLD, Modifier::BOLD),
-                (FontStyle::ITALIC, Modifier::ITALIC),
-                (FontStyle::UNDERLINE, Modifier::UNDERLINED),
-            ] {
-                if style.font_style.contains(font) {
-                    rendered = rendered.add_modifier(modifier);
-                }
-            }
             spans.push(Span::styled(
                 text.strip_suffix('\n').unwrap_or(text).to_owned(),
                 rendered,

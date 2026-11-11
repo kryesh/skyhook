@@ -7,25 +7,43 @@ use skyhook_base::enums::Kinds;
 use skyhook_worker::{op::TargetPath, secret::Credential, target::Os};
 
 use super::{SshAuth, SshOptions, TargetDefinition, TargetRegistry, WinrmOptions};
-use crate::target::TargetError;
-use skyhook_tools::target::TargetName;
+use crate::config::Refused;
+use crate::target::{TargetEdge, TargetError};
+use skyhook_base::decode::{Decode, Expected, Segment};
+use skyhook_tools::target::{TargetName, TargetRef};
 
 /// Named targets. A later configuration layer replaces a same-named target whole.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Decode)]
 #[serde(transparent)]
 pub struct TargetsConfig {
     pub entries: BTreeMap<String, TargetConfig>,
 }
 
 impl TargetsConfig {
-    /// Validate only the supplied definitions.
-    /// Missing route references may be supplied by later config layers or at runtime.
-    pub(crate) fn validate_structure(&self) -> Result<(), TargetError> {
-        let definitions = (self.definitions()?.into_iter())
-            .map(|definition| (definition.name.clone(), definition))
-            .collect();
-        super::registry::validate_route_cycles(&definitions)?;
-        super::registry::validate_passwords(&definitions)
+    /// Every refusal of the configured targets, by the path of the setting refused: each
+    /// target's own settings, then its route through the others. What a route refuses of
+    /// another target is refused once, at that target. Only a `complete` configuration
+    /// refuses a route through a target it does not define.
+    pub(crate) fn refusals(&self, complete: bool) -> Vec<Refused> {
+        let mut refusals = Vec::new();
+        let mut definitions = BTreeMap::new();
+        for (name, config) in &self.entries {
+            match TargetDefinition::from_config(name.clone(), config.clone()) {
+                Ok(definition) => {
+                    definitions.insert(definition.name.clone(), definition);
+                }
+                Err(error) => refusals.push(refusal(name, &error, &definitions)),
+            }
+        }
+        for name in definitions.keys() {
+            match super::registry::validate_entry(&definitions, name) {
+                Err(TargetError::UnknownReference { .. }) if !complete => {}
+                Err(error) if error.target().is_some_and(|target| target != name) => {}
+                Err(error) => refusals.push(refusal(name.as_str(), &error, &definitions)),
+                Ok(()) => {}
+            }
+        }
+        refusals
     }
 
     pub(crate) fn definitions(&self) -> Result<Vec<TargetDefinition>, TargetError> {
@@ -36,7 +54,7 @@ impl TargetsConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Decode)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub r#type: ConnectionKind,
@@ -173,6 +191,15 @@ pub enum Password {
 }
 
 /// Every written password is a credential.
+impl Decode for Password {
+    fn decode(
+        node: &skyhook_base::decode::Node,
+        cx: &mut skyhook_base::decode::Context,
+    ) -> Option<Self> {
+        Credential::decode(node, cx).map(Self::Given)
+    }
+}
+
 impl<'de> Deserialize<'de> for Password {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Credential::deserialize(deserializer).map(Self::Given)
@@ -247,6 +274,36 @@ impl ConfiguredPasswords {
     }
 }
 
+/// `error` of the target `name`, at the setting it refuses; an unknown reference lists
+/// the names the reference could take instead.
+fn refusal(
+    name: &str,
+    error: &TargetError,
+    definitions: &BTreeMap<TargetName, TargetDefinition>,
+) -> Refused {
+    let mut path = vec![Segment::Key("targets".into()), Segment::Key(name.into())];
+    let field = error.field().into_iter();
+    path.extend(field.map(|key| Segment::Key(key.into())));
+    match error {
+        TargetError::UnknownReference {
+            edge, reference, ..
+        } => {
+            let root = (*edge == TargetEdge::Origin).then_some(TargetRef::Root);
+            let others = (definitions.keys()).filter(|other| other.as_str() != name);
+            let valid = root
+                .into_iter()
+                .chain(others.cloned().map(TargetRef::Named));
+            let message = format!("{error}, {}", Expected(valid.collect()));
+            let about = vec![
+                Segment::Key("targets".into()),
+                Segment::Key(reference.to_string()),
+            ];
+            Refused::new(path, message).about(about)
+        }
+        error => Refused::new(path, error),
+    }
+}
+
 fn default_workspace() -> TargetPath {
     ".".into()
 }
@@ -255,20 +312,65 @@ fn default_workspace() -> TargetPath {
 mod tests {
     use super::*;
 
+    fn refusals(text: &str) -> Vec<String> {
+        let targets = crate::yaml::parse::<TargetsConfig>(text).unwrap();
+        let refusals = targets.refusals(true).into_iter();
+        refusals
+            .map(|refused| format!("{}: {}", refused.path, refused.message))
+            .collect()
+    }
+
     #[test]
     fn root_is_implicit() {
-        let valid = |text: &str| {
-            crate::yaml::parse::<TargetsConfig>(text)
-                .is_ok_and(|config| config.validate_structure().is_ok())
-        };
         for text in [
             "root:\n  type: ssh\n  host: root",
             "a:\n  type: ssh\n  host: a\n  via: root",
         ] {
-            assert!(!valid(text), "{text}");
+            assert_eq!(refusals(text).len(), 1, "{text}");
         }
-        assert!(valid("a:\n  type: ssh\n  host: a"));
-        // A later layer or the runtime may supply a missing name.
-        assert!(valid("a:\n  type: ssh\n  host: a\n  via: b"));
+        assert!(refusals("a:\n  type: ssh\n  host: a\n  origin: root").is_empty());
+    }
+
+    /// A refusal names the target's setting it refuses, and a reference refused lists
+    /// what it could name instead.
+    #[test]
+    fn refusals_name_the_setting_and_references_name_configured_targets() {
+        let two = "a:\n  type: ssh\n  host: a\nb:\n  type: ssh\n  host: b\n";
+        assert_eq!(
+            refusals(&format!("{two}  via: c")),
+            ["targets.b.via: target `b` references unknown via target `c`, expected one of `a`"]
+        );
+        assert_eq!(
+            refusals(&format!("{two}  origin: c")),
+            [
+                "targets.b.origin: target `b` references unknown origin target `c`, expected one \
+              of `root`, `a`"
+            ]
+        );
+        for valid in ["via: a", "origin: a", "origin: root"] {
+            assert!(refusals(&format!("{two}  {valid}")).is_empty(), "{valid}");
+        }
+        assert_eq!(
+            refusals("w:\n  type: winrm\n  host: w"),
+            [
+                "targets.w.winrm: a winrm target needs its connection settings; add a `winrm` \
+              mapping beside `type`"
+            ]
+        );
+        // A route through another target's bad setting is that target's refusal alone.
+        let gateway =
+            "app:\n  type: ssh\n  host: app\n  origin: gateway\ngateway:\n  type: ssh\n  host: g\n";
+        assert_eq!(
+            refusals(&format!("{gateway}  via: missing")),
+            [
+                "targets.gateway.via: target `gateway` references unknown via target `missing`, \
+              expected one of `app`"
+            ]
+        );
+        let missing = crate::yaml::parse::<TargetsConfig>("w:\n  os: windows").unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "2:3: `w`: missing required fields `type`, `host`"
+        );
     }
 }

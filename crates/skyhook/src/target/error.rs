@@ -53,7 +53,7 @@ pub enum TargetError {
         transport: ConnectionKind,
         problem: skyhook_worker::secret::SourceProblem,
     },
-    #[error("a {0} target needs its {0} settings")]
+    #[error("a {0} target needs its connection settings; add a `{0}` mapping beside `type`")]
     MissingSettings(ConnectionKind),
     #[error("a {transport} target takes no {settings} settings")]
     ForeignSettings {
@@ -86,91 +86,109 @@ pub enum TargetError {
     #[error("`root` cannot be used as a jump target")]
     RootCannotBeJump,
     #[error(
-        "target `{target}` needs the secrets of both `{first}` and `{second}` in one SSH connection, which types only one; reach `{second}` from `{first}`, or a target after it, with `origin` instead of `via`"
+        "target `{second}` needs the secrets of both `{first}` and itself in one SSH connection, which types only one; reach `{second}` from `{first}`, or a target after it, with `origin` instead of `via`"
     )]
     SecretsInOneConnection {
-        target: TargetName,
         first: TargetName,
         second: TargetName,
     },
+}
+
+impl TargetError {
+    /// The target whose setting the error refuses, where a route says: a route crosses
+    /// other targets, and what it refuses of one is that target's to answer for.
+    pub(crate) fn target(&self) -> Option<&TargetName> {
+        match self {
+            Self::OriginMismatch { target, .. }
+            | Self::WinrmJump { target, .. }
+            | Self::UnknownReference { target, .. }
+            | Self::SecretsInOneConnection { second: target, .. }
+            | Self::Cycle(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// The setting the error refuses, as the keys to it from the target's own fields; none
+    /// refuses the target as a whole.
+    pub(crate) fn field(&self) -> Vec<&'static str> {
+        let field = match self {
+            Self::InvalidHost(_) => "host",
+            Self::ReservedSshOption(_)
+            | Self::InvalidHostKeyChecking(_)
+            | Self::InvalidHostKeyUpdates(_)
+            | Self::DedicatedSshOption(..)
+            | Self::ProxyCommandWithVia(_) => return vec!["ssh", "options"],
+            Self::ViaIsOrigin(_) | Self::WinrmVia(_) | Self::WinrmJump { .. } => "via",
+            Self::RootCannotBeJump => "via",
+            Self::OriginMismatch { .. } => "origin",
+            Self::InvalidPassword { transport, .. } => {
+                return vec![transport.as_str(), "password"];
+            }
+            Self::MissingSettings(transport) => transport.as_str(),
+            Self::ForeignSettings { settings, .. } => settings.as_str(),
+            Self::InvalidReference { edge } | Self::UnknownReference { edge, .. } => edge.as_str(),
+            Self::Name(_)
+            | Self::Unknown(_)
+            | Self::Cycle(_)
+            | Self::SecretsInOneConnection { .. } => return Vec::new(),
+        };
+        vec![field]
+    }
 }
 
 /// Agent-facing reasons never carry aliases or submitted values: a saved
 /// diagnostic can later be read with fewer capabilities than its first reader.
 impl<O> From<TargetError> for OperationError<O> {
     fn from(error: TargetError) -> Self {
-        let argument = |name: &str| Subject::argument(name.split('.'));
         let fixed = |reason: &'static str| Some(Cow::Borrowed(reason));
-        let (subject, reason) = match &error {
-            TargetError::Name(_) => (argument("name"), None),
-            TargetError::InvalidHost(_) => (
-                argument("host"),
-                fixed("hostname must be nonempty and contain no whitespace or control characters"),
+        let reason = match &error {
+            TargetError::InvalidHost(_) => {
+                fixed("hostname must be nonempty and contain no whitespace or control characters")
+            }
+            TargetError::ReservedSshOption(_) => fixed("SSH option is reserved by Skyhook"),
+            TargetError::InvalidHostKeyChecking(_) => {
+                fixed("StrictHostKeyChecking must be yes, ask, accept-new or no")
+            }
+            TargetError::InvalidHostKeyUpdates(_) => fixed("UpdateHostKeys must be yes, ask or no"),
+            TargetError::DedicatedSshOption(_, field) => Some(
+                format!("SSH option must be set through the {field} field, not ssh.options").into(),
             ),
-            TargetError::ReservedSshOption(_) => (
-                argument("ssh.options"),
-                fixed("SSH option is reserved by Skyhook"),
+            TargetError::ProxyCommandWithVia(_) => {
+                fixed("ProxyCommand cannot be combined with via")
+            }
+            TargetError::ViaIsOrigin(_) => fixed(
+                "via cannot be the connection origin; omit via to connect directly from the origin",
             ),
-            TargetError::InvalidHostKeyChecking(_) => (
-                argument("ssh.options"),
-                fixed("StrictHostKeyChecking must be yes, ask, accept-new or no"),
-            ),
-            TargetError::InvalidHostKeyUpdates(_) => (
-                argument("ssh.options"),
-                fixed("UpdateHostKeys must be yes, ask or no"),
-            ),
-            TargetError::DedicatedSshOption(_, field) => (
-                argument("ssh.options"),
-                Some(
-                    format!("SSH option must be set through the {field} field, not ssh.options")
-                        .into(),
-                ),
-            ),
-            TargetError::ProxyCommandWithVia(_) => (
-                argument("ssh.options"),
-                fixed("ProxyCommand cannot be combined with via"),
-            ),
-            TargetError::ViaIsOrigin(_) => (
-                argument("via"),
-                fixed(
-                    "via cannot be the connection origin; omit via to connect directly from the origin",
-                ),
-            ),
-            TargetError::OriginMismatch { .. } => (
-                argument("origin"),
-                fixed("target and its jump must start SSH from the same origin"),
-            ),
-            TargetError::InvalidPassword { transport, problem } => (
-                argument(&format!("{transport}.password")),
-                Some(problem.to_string().into()),
-            ),
-            TargetError::MissingSettings(transport) => (argument(transport.as_str()), None),
-            TargetError::ForeignSettings { settings, .. } => (argument(settings.as_str()), None),
-            TargetError::WinrmVia(_) => (
-                argument("via"),
-                fixed("a WinRM target has no jumps; reach it from an origin instead of via"),
-            ),
-            TargetError::WinrmJump { .. } => (
-                argument("via"),
-                fixed("a jump must be an SSH target, not a WinRM one"),
-            ),
-            TargetError::Unknown(_) => (argument("target"), fixed("unknown target")),
-            TargetError::InvalidReference { edge } => (argument(&edge.to_string()), None),
+            TargetError::OriginMismatch { .. } => {
+                fixed("target and its jump must start SSH from the same origin")
+            }
+            TargetError::InvalidPassword { problem, .. } => Some(problem.to_string().into()),
+            TargetError::WinrmVia(_) => {
+                fixed("a WinRM target has no jumps; reach it from an origin instead of via")
+            }
+            TargetError::WinrmJump { .. } => fixed("a jump must be an SSH target, not a WinRM one"),
+            TargetError::Unknown(_) => fixed("unknown target"),
             TargetError::UnknownReference { edge, .. } => match edge {
-                TargetEdge::Origin => (argument("origin"), fixed("unknown origin target")),
-                TargetEdge::Via => (argument("via"), fixed("unknown jump target")),
+                TargetEdge::Origin => fixed("unknown origin target"),
+                TargetEdge::Via => fixed("unknown jump target"),
             },
-            TargetError::Cycle(_) => (
-                Subject::Label("target route".into()),
-                fixed("target route contains a cycle"),
+            TargetError::Cycle(_) => fixed("target route contains a cycle"),
+            TargetError::SecretsInOneConnection { .. } => fixed(
+                "one SSH connection types only one password or key passphrase; reach the later target from the earlier, or a target after it, with origin instead of via",
             ),
-            TargetError::RootCannotBeJump => (argument("via"), None),
-            TargetError::SecretsInOneConnection { .. } => (
-                Subject::Label("target route".into()),
-                fixed(
-                    "one SSH connection types only one password or key passphrase; reach the later target from the earlier, or a target after it, with origin instead of via",
-                ),
-            ),
+            TargetError::Name(_)
+            | TargetError::MissingSettings(_)
+            | TargetError::ForeignSettings { .. }
+            | TargetError::InvalidReference { .. }
+            | TargetError::RootCannotBeJump => None,
+        };
+        let subject = match &error {
+            TargetError::Name(_) => Subject::argument(["name"]),
+            TargetError::Unknown(_) => Subject::argument(["target"]),
+            TargetError::Cycle(_) | TargetError::SecretsInOneConnection { .. } => {
+                Subject::Label("target route".into())
+            }
+            error => Subject::argument(error.field()),
         };
         // Variants without a payload render nothing private.
         Self::invalid_arguments(reason.unwrap_or_else(|| error.to_string().into()))

@@ -107,6 +107,7 @@ mod tests {
     };
     use crate::tui::model::Surface;
     use serde_json::json;
+    use skyhook::config::RuntimeConfig;
     use skyhook::job::JobTransition;
     use skyhook::session::RecordSeq;
 
@@ -120,6 +121,7 @@ mod tests {
         live: &ObservationSnapshot,
         view: &View,
         all: bool,
+        config: &RuntimeConfig,
     ) -> Vec<Entry> {
         let agent = root(1);
         let window = Window::empty(
@@ -147,6 +149,7 @@ mod tests {
             presentation,
             outputs: &outputs,
             unsaved: &[],
+            config,
         };
         job_event_entries(RecordSeq::default(), 0, events, inputs, view, all)
     }
@@ -154,6 +157,7 @@ mod tests {
     #[tokio::test]
     async fn intermediate_agent_messages_are_historical_expandable_job_events() {
         let (_root, mut app, mut model, session) = played_fixture().await;
+        let config = app.launch.model().config().clone();
         let task = json!({"prompt": "ask", "name": "current-name"});
         asking_child(&session, &mut model, task).await;
         let job = observe_find(&mut app, |app| job_of_call(&app.journal, "agent-0")).await;
@@ -167,7 +171,7 @@ mod tests {
         })];
         let mut view = View::default();
         let unknown = ObservationSnapshot::default();
-        let collapsed = events(&reply, &unknown, &view, false);
+        let collapsed = events(&reply, &unknown, &view, false, &config);
         assert_eq!(collapsed.len(), 1);
         let card = &collapsed[0];
         assert_eq!(
@@ -183,7 +187,7 @@ mod tests {
         let header = format!("Job event · agent #{job} · implement-native-replay · message #0");
         assert!(card.text().contains(&header));
         view.set_expanded(key.clone(), true);
-        let expanded = events(&reply, &unknown, &view, false);
+        let expanded = events(&reply, &unknown, &view, false, &config);
         assert!(expanded[0].document().is_some());
         let expanded = expanded[0].text();
         assert!(expanded.contains(message));
@@ -193,7 +197,7 @@ mod tests {
             "presentation": {"question": {"questions": [{"header": "pick", "prompt": "Which one?"}]}}});
         let question = [JobEvent::Job(serde_json::from_value(question).unwrap())];
         let headed = |snapshot: &ObservationSnapshot, state: &str| {
-            let text = events(&question, snapshot, &view, false)[0]
+            let text = events(&question, snapshot, &view, false, &config)[0]
                 .text()
                 .to_owned();
             assert!(
@@ -209,11 +213,11 @@ mod tests {
         headed(&app.snapshot, "Completed");
         // Its terminal snapshot, under another name, must not relabel or replace
         // the historical message.
-        let after_completion = events(&reply, &app.snapshot, &view, false);
+        let after_completion = events(&reply, &app.snapshot, &view, false, &config);
         assert_eq!(after_completion[0].text(), expanded);
         view.set_expanded(key, false);
         assert!(
-            events(&reply, &app.snapshot, &view, true)[0]
+            events(&reply, &app.snapshot, &view, true, &config)[0]
                 .document()
                 .is_none()
         );

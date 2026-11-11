@@ -10,7 +10,8 @@ mod capability;
 mod resource;
 
 pub use capability::{
-    Capability, CapabilitySet, HostCapability, HostCapabilityDeclaration, InvalidHostCapability,
+    Capability, CapabilitySet, HostCapability, HostCapabilityDeclaration, InvalidCapability,
+    InvalidHostCapability, UnknownCapability, undeclared,
 };
 pub use resource::{ApprovalCoverage, ApprovalGrant, PermissionUse, ResourceId, ResourceKind};
 
@@ -87,6 +88,8 @@ impl TryFrom<CapabilitySet> for ModeCapabilities {
         }
     }
 }
+
+skyhook_base::decode_via!(ModeCapabilities => CapabilitySet);
 
 impl From<ModeCapabilities> for CapabilitySet {
     fn from(capabilities: ModeCapabilities) -> Self {

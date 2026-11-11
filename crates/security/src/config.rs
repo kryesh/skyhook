@@ -9,14 +9,18 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use skyhook::{
     config::mode::{Mode, ModeName},
     config::{Config, ConfigError},
     mcp::config::McpServerConfig,
     provider::model::ModelRef,
 };
-use skyhook_base::{enums::NamedEnum, newtype::Prose};
+use skyhook_base::{
+    decode::{Decode, Diagnostic, Path as Steps, Segment, Source},
+    enums::NamedEnum,
+    newtype::Prose,
+};
 
 use crate::{
     cvss::Severity,
@@ -35,37 +39,31 @@ pub enum ModelRole {
     Reporter,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, Decode)]
 pub struct ModelAssignment {
     pub roles: IndexSet<ModelRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<Prose>,
-    /// Where the host read the assignment, named when it is refused.
+    /// Where the assignment is written, named when it is refused.
     #[serde(skip)]
-    pub file: Option<PathBuf>,
+    #[decode(source)]
+    pub at: Source,
 }
 
 /// The product's own settings as a host read them; a document that sets none is the
 /// default.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Serialize, Decode)]
+#[serde(default)]
 pub struct SecurityConfig {
-    #[serde(default)]
     pub models: IndexMap<ModelRef, ModelAssignment>,
-    #[serde(default)]
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Named entries replace the embedded mode of the same name whole.
-    #[serde(default)]
     pub modes: IndexMap<ModeName, Mode>,
     /// How many agents a new run's scheduler runs at once; the run persists what it starts
     /// with.
-    #[serde(default)]
     pub workers: Option<NonZeroU16>,
-    #[serde(default)]
     pub shortlist: Option<Severity>,
     /// Absence is distinct from an explicit ask: a batch job defaults to no.
-    #[serde(default)]
     pub live: Option<LivePolicy>,
     /// Where the host read the settings, named in what the product warns of them.
     #[serde(skip)]
@@ -74,13 +72,9 @@ pub struct SecurityConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    #[error("{}", named(.file.as_deref(), format_args!("models.{model}: {error}")))]
-    ModelAssignment {
-        file: Option<PathBuf>,
-        model: ModelRef,
-        #[source]
-        error: Box<ConfigError>,
-    },
+    /// An assignment naming no configured model, where it is written.
+    #[error("{0}")]
+    ModelAssignment(Diagnostic),
     #[error(transparent)]
     Shared(#[from] ConfigError),
 }
@@ -125,13 +119,20 @@ impl SecurityConfig {
     /// offers. Nothing changes when an assigned model is not configured.
     pub(crate) fn apply(&self, config: &mut Config) -> Result<(), Error> {
         for (model, assignment) in &self.models {
-            config
-                .model_profile(model)
-                .map_err(|error| Error::ModelAssignment {
-                    file: assignment.file.clone(),
-                    model: model.clone(),
-                    error: Box::new(error),
-                })?;
+            if let Err(ConfigError::Model {
+                error, configured, ..
+            }) = config.model_profile(model)
+            {
+                let path = vec![
+                    Segment::Key("models".into()),
+                    Segment::Key(model.to_string()),
+                ];
+                return Err(Error::ModelAssignment(Diagnostic {
+                    at: assignment.at.clone(),
+                    path: Steps(path),
+                    message: format!("{error}, {configured}"),
+                }));
+            }
         }
         if let Some((model, _)) = self
             .models
@@ -181,9 +182,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn shared() -> Config {
-        Config::from_yaml(
-            r#"
+    const SHARED: &str = r#"
 providers:
   test:
     dialect: compatible
@@ -205,13 +204,24 @@ providers:
         max_context: 4096
         max_output: 512
         hint: Not offered.
-"#,
-        )
-        .unwrap()
+"#;
+
+    fn shared() -> Config {
+        Config::from_yaml(SHARED).unwrap()
+    }
+
+    /// The shared configuration may start sessions in a mode the product installs.
+    #[test]
+    fn a_default_mode_the_product_installs_loads_and_seals() {
+        let text = format!("default_mode: {}\n{SHARED}", modes::root());
+        let mut config = Config::from_yaml(&text).unwrap();
+        SecurityConfig::default().apply(&mut config).unwrap();
+        config.into_runtime().unwrap();
     }
 
     fn parse(value: serde_json::Value) -> SecurityConfig {
-        serde_json::from_value(value).unwrap()
+        let text = serde_json::to_string(&value).unwrap();
+        skyhook::yaml::parse(&text).unwrap()
     }
 
     #[test]
@@ -281,15 +291,18 @@ providers:
         assert!(modes.contains_key("orchestrate"));
         let mut config = shared();
         let before = serde_json::to_value(&config).unwrap();
-        let refusal = "models.test/missing: invalid model `test/missing`: model is not configured";
+        let configured = skyhook_base::decode::one_of(config.models().map(|(model, _)| model));
+        let refusal = format!(
+            "1:27: `models.test/missing`: model is not configured, expected one of {configured}"
+        );
         assert_eq!(
             security.apply(&mut config).unwrap_err().to_string(),
             refusal
         );
-        security.models[0].file = Some("/user/security.yaml".into());
+        security.models[0].at.file = Some(std::path::Path::new("/user/security.yaml").into());
         let error = security.apply(&mut config).unwrap_err();
-        assert_matches!(&error, Error::ModelAssignment { .. });
-        assert_eq!(error.to_string(), format!("/user/security.yaml: {refusal}"));
+        assert_matches!(&error, Error::ModelAssignment(_));
+        assert_eq!(error.to_string(), format!("/user/security.yaml:{refusal}"));
         assert_eq!(serde_json::to_value(&config).unwrap(), before);
         security.models.clear();
         security.apply(&mut config).unwrap();

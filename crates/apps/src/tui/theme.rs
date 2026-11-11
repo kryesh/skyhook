@@ -7,7 +7,7 @@
 pub use ratatui::style::Color;
 use std::sync::OnceLock;
 use syntect::highlighting::{
-    Color as SyntaxColor, FontStyle, StyleModifier, Theme as SyntaxTheme, ThemeItem, ThemeSettings,
+    Color as SyntaxColor, StyleModifier, Theme as SyntaxTheme, ThemeItem, ThemeSettings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,32 +136,30 @@ impl SyntaxPalette {
             ..SyntaxTheme::default()
         };
         // More specific selectors override their containing string/keyword scope.
-        for (scope, color, font_style) in [
-            ("variable", self.text, FontStyle::empty()),
-            ("comment", self.comment, FontStyle::empty()),
+        for (scope, color) in [
+            ("variable", self.text),
+            ("comment", self.comment),
             (
                 "keyword, storage, entity.name, support, constant, variable.function",
                 self.keyword,
-                FontStyle::empty(),
             ),
-            ("constant.language", self.literal, FontStyle::empty()),
-            ("constant.numeric", self.number, FontStyle::empty()),
-            ("string", self.string, FontStyle::empty()),
-            ("entity.name.label", self.label, FontStyle::empty()),
-            ("string.regexp", self.regexp, FontStyle::empty()),
-            ("keyword.operator", self.operator, FontStyle::empty()),
-            ("invalid", self.operator, FontStyle::empty()),
-            ("markup.heading", self.heading, FontStyle::BOLD),
-            ("markup.bold, markup.italic", self.string, FontStyle::BOLD),
-            ("markup.inserted", self.string, FontStyle::empty()),
-            ("markup.deleted", self.operator, FontStyle::empty()),
-            ("markup.changed", self.regexp, FontStyle::empty()),
+            ("constant.language", self.literal),
+            ("constant.numeric", self.number),
+            ("string", self.string),
+            ("entity.name.label", self.label),
+            ("string.regexp", self.regexp),
+            ("keyword.operator", self.operator),
+            ("invalid", self.operator),
+            ("markup.heading", self.heading),
+            ("markup.bold, markup.italic", self.string),
+            ("markup.inserted", self.string),
+            ("markup.deleted", self.operator),
+            ("markup.changed", self.regexp),
         ] {
             theme.scopes.push(ThemeItem {
                 scope: scope.parse().expect("valid built-in syntax selector"),
                 style: StyleModifier {
                     foreground: Some(syntax_color(color)),
-                    font_style: Some(font_style),
                     ..StyleModifier::default()
                 },
             });

@@ -224,7 +224,7 @@ crate::provider::settings::settings! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, skyhook_base::enums::NamedEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DataCollection {
     Allow,
@@ -346,7 +346,7 @@ mod tests {
         use crate::provider::settings::{Patch as _, Settings};
         use serde_json::json;
 
-        let lower: Patch = serde_json::from_value(json!({"routing": {
+        let lower: Patch = crate::tests::decode(json!({"routing": {
             "order": ["first"], "only": ["first", "second"], "allow_fallbacks": true,
             "require_parameters": true, "fallback_models": ["fallback"]
         }}))
@@ -354,7 +354,7 @@ mod tests {
         let higher_json = json!({"routing": {
             "order": [], "ignore": ["third"], "allow_fallbacks": false, "require_parameters": null
         }});
-        let higher: Patch = serde_json::from_value(higher_json.clone()).unwrap();
+        let higher: Patch = crate::tests::decode(higher_json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&higher).unwrap(), higher_json);
         let merged = lower.overlay(&higher);
         let config = Config::resolve(&merged).unwrap();
@@ -366,16 +366,16 @@ mod tests {
         assert_eq!(routing.provider.require_parameters, None);
         assert_eq!(routing.fallback_models, ["fallback"]);
 
-        let clear: Patch = serde_json::from_value(json!({"routing": null})).unwrap();
+        let clear: Patch = crate::tests::decode(json!({"routing": null})).unwrap();
         let cleared = merged.overlay(&clear);
         assert_eq!(Config::resolve(&cleared).unwrap().routing, None);
-        let empty: Patch = serde_json::from_value(json!({"routing": {}})).unwrap();
+        let empty: Patch = crate::tests::decode(json!({"routing": {}})).unwrap();
         assert_eq!(
             Config::resolve(&cleared.overlay(&empty)).unwrap().routing,
             Some(Routing::default())
         );
         assert_eq!(lower.overlay(&empty), lower);
-        assert!(serde_json::from_value::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
+        assert!(crate::tests::decode::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
     }
 
     /// Every codec's body carries the preferences and fallbacks; a response

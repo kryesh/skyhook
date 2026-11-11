@@ -94,13 +94,19 @@ command line, and the security binary adds its options, its `security.yaml`, its
 and its look.
 
 Configuration files are the applications' own (`skyhook_apps::config`): discovery of the user
-and workspace files or the one a command line names, their layering, the diagnostics of files
-passed over, and the values that follow a file. Typed `LayeredConfig` schemas share one loader
-for discovery, whole-entry merging and diagnostics: `config.yaml` is `HostConfig`, whose
-admission stamps every provider with its defining file (`ConfigHome`), beside which its
-Skyhook-managed credentials live, and a product's file is a schema its binary declares. Any
-schema holding MCP servers resolves each server's relative `cwd` against the file that declared
-it.
+and workspace files or the one a command line names, their layering, and the diagnostics of
+files passed over. Typed `LayeredConfig` schemas share one loader: `config.yaml` is
+`HostConfig`, checked against the host capabilities of the product it is loaded to run, and a
+product's file is a schema its binary declares.
+
+Each file is read into a tree of nodes (`skyhook_base::decode`) that places every value at its
+file, line and column, and layers merge on those trees. One pass then decodes the merged tree
+through the `Decode` trait and collects every refusal at the position of the value it refuses.
+A type's own validation and the checks of what the parts say of each other (target routes,
+undeclared host capabilities) run in that same pass; the default mode and model are checked
+when the configuration is sealed, after the product's edits. A type that also
+crosses a serde boundary, such as a target's settings as a tool's arguments, keeps its serde
+form for that boundary.
 
 Sessions carry the creating host's name; another host's session opens view-only, and the library
 refuses to activate it. All products share `.skyhook/sessions`, the shims and the capability
@@ -190,9 +196,9 @@ rather than the writer's.
 
 ## Configuration and provider entries
 
-`config` is the configuration a host parses from text it holds (`Config::from_yaml`) or builds
-in code (`Config::builder`); it admits it, resolves model selections, and builds the model
-catalog. It does not interpret provider entries. An entry's
+`config` is the configuration a host parses from text it holds (`Config::from_yaml`), decodes
+from a tree (`config::process`) or builds in code (`Config::builder`); it admits it, resolves
+model selections, and builds the model catalog. It does not interpret provider entries. An entry's
 `ConfigHome` is where the host says it was defined, beside which its Skyhook-managed
 credentials live; one a host leaves unfiled keeps them in the user's Skyhook directory.
 `provider::dialect` owns the entries

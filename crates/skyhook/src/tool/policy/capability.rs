@@ -31,6 +31,33 @@ string_newtype! {
         .ok_or(InvalidHostCapability);
 }
 
+/// A name that is neither a built-in capability nor one of the host's, with every
+/// capability valid in its place.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown capability `{name}`, expected one of {}", skyhook_base::decode::one_of(self.valid()))]
+pub struct UnknownCapability {
+    pub name: String,
+    /// The host capabilities valid in its place.
+    pub declared: Vec<HostCapability>,
+}
+
+impl UnknownCapability {
+    fn valid(&self) -> impl Iterator<Item = &str> {
+        let builtin = Capability::ALL.iter().map(Capability::as_str);
+        builtin.chain(self.declared.iter().map(HostCapability::as_str))
+    }
+}
+
+/// Why a name is not a capability. Every host capability's name has a namespace,
+/// so a name without one is a built-in capability or none.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidCapability {
+    #[error(transparent)]
+    Unknown(#[from] UnknownCapability),
+    #[error(transparent)]
+    Host(#[from] InvalidHostCapability),
+}
+
 /// A host capability and the title the user sees it under; see [`Capability::title`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCapabilityDeclaration {
@@ -99,19 +126,31 @@ impl Capability {
     }
 }
 
+skyhook_base::decode_from_str!(Capability);
+
 impl FromStr for Capability {
-    type Err = InvalidHostCapability;
+    type Err = InvalidCapability;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        Self::ALL
+        if let Some(builtin) = Self::ALL
             .into_iter()
-            .find(|capability| capability.as_str() == name)
-            .map_or_else(|| name.parse().map(Self::Host), Ok)
+            .find(|builtin| builtin.as_str() == name)
+        {
+            return Ok(builtin);
+        }
+        match name.contains('.') {
+            true => Ok(Self::Host(name.parse()?)),
+            false => Err(UnknownCapability {
+                name: name.to_owned(),
+                declared: Vec::new(),
+            }
+            .into()),
+        }
     }
 }
 
 impl TryFrom<String> for Capability {
-    type Error = InvalidHostCapability;
+    type Error = InvalidCapability;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
         name.parse()
@@ -133,8 +172,21 @@ impl fmt::Display for Capability {
     }
 }
 
+/// The host capabilities among `capabilities` that `declared` does not name.
+pub fn undeclared<'a>(
+    capabilities: impl IntoIterator<Item = &'a Capability>,
+    declared: impl Fn(&HostCapability) -> bool,
+) -> impl Iterator<Item = &'a HostCapability> {
+    (capabilities.into_iter()).filter_map(move |capability| match capability {
+        Capability::Host(name) if !declared(name) => Some(name),
+        _ => None,
+    })
+}
+
 /// A set of capabilities; it serialises as its sorted list.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, skyhook_base::decode::Decode,
+)]
 #[serde(transparent)]
 pub struct CapabilitySet(BTreeSet<Capability>);
 
@@ -252,6 +304,31 @@ mod tests {
         ] {
             assert!(name.parse::<HostCapability>().is_err(), "{name:?}");
         }
-        assert!(serde_json::from_str::<Capability>("\"unknown\"").is_err());
+    }
+
+    /// A name without a namespace can only be a built-in capability, so one that is
+    /// not is unknown rather than a malformed host capability.
+    #[test]
+    fn a_plain_name_is_built_in_or_unknown_and_a_dotted_one_is_a_host_capability() {
+        for name in ["wirte", "Read", ""] {
+            assert_eq!(
+                name.parse::<Capability>(),
+                Err(InvalidCapability::Unknown(UnknownCapability {
+                    name: name.into(),
+                    declared: Vec::new(),
+                }))
+            );
+        }
+        let builtins = skyhook_base::decode::one_of(Capability::ALL.iter().map(Capability::as_str));
+        assert_eq!(
+            "wirte".parse::<Capability>().unwrap_err().to_string(),
+            format!("unknown capability `wirte`, expected one of {builtins}")
+        );
+        for name in ["read.", "Host.name", "host.name.more"] {
+            assert_eq!(
+                name.parse::<Capability>(),
+                Err(InvalidCapability::Host(InvalidHostCapability))
+            );
+        }
     }
 }

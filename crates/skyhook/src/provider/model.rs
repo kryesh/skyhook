@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroU64, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::provider::protocol::WireModel;
 use skyhook_base::{enums::NamedEnum, newtype::Prose, string_newtype};
@@ -67,6 +67,8 @@ impl ModelRef {
     }
 }
 
+skyhook_base::decode_from_str!(ModelRef);
+
 impl FromStr for ModelRef {
     type Err = ModelRefError;
 
@@ -85,8 +87,7 @@ impl fmt::Display for ModelRef {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, skyhook_base::decode::Decode)]
 pub struct ModelProfile {
     pub model: WireModel,
     pub reasoning: Option<Effort>,
@@ -188,22 +189,21 @@ mod tests {
             assert_eq!(profile.validate_limits(), Err(LimitsError));
         }
         let raw = serde_json::json!({"model":"unlisted:model/version", "reasoning":"xhigh", "max_context":4096, "max_output":512, "supports_images":false, "state_mode":"persist"});
-        let profile: ModelProfile = serde_json::from_value(raw.clone()).unwrap();
+        let profile: ModelProfile = crate::tests::decode(raw.clone()).unwrap();
         assert!(profile.validate_limits().is_ok());
         assert_eq!(serde_json::to_value(profile).unwrap(), raw);
         // An effort no codec names is refused as it is read.
         let unknown =
             serde_json::json!({"model":"m", "reasoning":"turbo", "max_context":2, "max_output":1});
-        let error = serde_json::from_value::<ModelProfile>(unknown).unwrap_err();
-        assert!(
-            error.to_string().starts_with(
-                "unknown variant `turbo`, expected one of `none`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `adaptive`"
-            ),
-            "{error}"
+        let error = crate::tests::decode::<ModelProfile>(unknown).unwrap_err();
+        let efforts = skyhook_base::decode::one_of(Effort::NAMES);
+        assert_eq!(
+            error.to_string(),
+            format!("1:26: `reasoning`: unknown variant `turbo`, expected one of {efforts}")
         );
         let minimal =
             serde_json::json!({"model":"m", "reasoning":null, "max_context":2, "max_output":1});
-        let profile: ModelProfile = serde_json::from_value(minimal).unwrap();
+        let profile: ModelProfile = crate::tests::decode(minimal).unwrap();
         assert_eq!(profile.state_mode, StateMode::Dynamic);
     }
 

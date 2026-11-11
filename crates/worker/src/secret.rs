@@ -13,7 +13,10 @@ use crate::{
     process::{CommandLine, InvalidCommand, Shell},
     target::{Os, Platform},
 };
-use skyhook_base::enums::Kinds;
+use skyhook_base::{
+    decode::{self, Context, Decode, Node, one_of},
+    enums::{Kinds, NamedEnum},
+};
 
 #[cfg(windows)]
 mod windows;
@@ -42,6 +45,41 @@ pub enum Credential {
     /// The value itself
     #[serde(untagged)]
     Literal(String),
+}
+
+/// The sources a credential mapping can name: every kind but the literal value.
+fn sources() -> impl Iterator<Item = CredentialKind> {
+    (CredentialKind::ALL.into_iter()).filter(|kind| *kind != CredentialKind::Literal)
+}
+
+/// A string is the value itself; a mapping names exactly one source, each refusal
+/// where it is written.
+impl Decode for Credential {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        if let Some(text) = node.as_str() {
+            return Some(Self::Literal(text.to_owned()));
+        }
+        let names = Vec::from_iter(sources().map(CredentialKind::as_str));
+        if node.as_map().is_none() {
+            let expected = one_of(&names);
+            cx.expected(
+                node,
+                &format!("a literal string or a mapping with one of {expected}"),
+            );
+            return None;
+        }
+        decode::variant(
+            node,
+            cx,
+            &names,
+            |key, value, cx| match CredentialKind::parse(key)? {
+                CredentialKind::Env => String::decode(value, cx).map(Self::Env),
+                CredentialKind::Command => CommandLine::decode(value, cx).map(Self::Command),
+                CredentialKind::File => TargetPath::decode(value, cx).map(Self::File),
+                CredentialKind::Literal => unreachable!("a mapping names no literal"),
+            },
+        )
+    }
 }
 
 /// A literal may be a secret and a command may name one's location; only the kind

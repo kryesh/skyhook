@@ -8,34 +8,37 @@ use crate::{
     config::mode::{Mode, ModeName},
     mcp::config::McpServerConfig,
     provider::{
-        dialect::{AdmissionError, AdmittedProvider, Login, LoginError, RawProviderConfig},
+        dialect::{AdmittedProvider, Login, LoginError, RawProviderConfig},
         model::{ModelProfile, ModelRef, ProviderName},
     },
     target::TargetsConfig,
     tool::policy::ModeCapabilities,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use skyhook_base::decode::{Context, Decode, Diagnostics, Expected, Node};
 use thiserror::Error;
 
 mod builder;
+mod check;
 pub mod mode;
 mod paths;
 mod runtime;
 
 pub use builder::ConfigBuilder;
+pub use check::{Refused, process, undeclared_capabilities};
 pub use runtime::{ConfiguredModel, RuntimeConfig, SelectionError};
 
 pub(crate) use paths::user_config_directory;
 pub use paths::{user_config_directories, workspace_directory, workspace_session_root};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, Decode)]
+#[serde(default)]
 pub struct Config {
     /// The mode a new session starts in: `general` or a declared mode.
     pub default_mode: ModeName,
     /// Named permission presets in declaration order, after the built-in `general`
     /// unless that name is declared.
-    #[serde(deserialize_with = "deserialize_modes")]
+    #[decode(with = "declared_modes")]
     pub modes: indexmap::IndexMap<ModeName, Mode>,
     /// Providers in declaration order, each with the models served through it.
     pub providers: indexmap::IndexMap<ProviderName, RawProviderConfig>,
@@ -72,17 +75,11 @@ fn default_mode() -> ModeName {
         .expect("the built-in mode name is nonblank")
 }
 
-fn deserialize_modes<'de, D>(
-    deserializer: D,
-) -> Result<indexmap::IndexMap<ModeName, Mode>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+/// Declared modes follow the built-in `general`, unless they declare it.
+fn declared_modes(node: &Node, cx: &mut Context) -> Option<indexmap::IndexMap<ModeName, Mode>> {
     let mut modes = default_modes();
-    modes.extend(indexmap::IndexMap::<ModeName, Mode>::deserialize(
-        deserializer,
-    )?);
-    Ok(modes)
+    modes.extend(indexmap::IndexMap::decode(node, cx)?);
+    Some(modes)
 }
 
 fn default_modes() -> indexmap::IndexMap<ModeName, Mode> {
@@ -113,31 +110,33 @@ impl Config {
         crate::yaml::to_string(self).map_err(ConfigError::Serialize)
     }
 
-    /// Parse and admit a single YAML document: typed extraction naming the offending
-    /// field, then admission.
+    /// Parse a single YAML document, refusing every bad value where it is written. The
+    /// mode and model new sessions start with are checked by [`Config::into_runtime`].
     pub fn from_yaml(text: &str) -> Result<Self, ConfigError> {
-        let value = crate::yaml::from_str(text).map_err(ConfigError::Syntax)?;
-        let config: Self =
-            serde_path_to_error::deserialize(value).map_err(ConfigError::Structure)?;
-        config.validate()?;
-        Ok(config)
+        let node = crate::yaml::read(text, None).map_err(ConfigError::Syntax)?;
+        process(&node, |config: &Self| config.refusals(None, true)).map_err(ConfigError::Invalid)
     }
 
-    /// Check targets and every provider entry as sealing admits them, without model
-    /// selection or external resources.
+    /// Check what sealing refuses: every provider entry, and what the configuration's
+    /// parts say of each other, without external resources.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.admit().map(drop)
+        self.admit()?;
+        self.sealable().map(drop).map_err(ConfigError::Refused)
     }
 
-    /// Admit targets and every provider entry; sealing keeps the admitted entries.
+    /// Admit every provider entry; sealing keeps the admitted entries.
     fn admit(&self) -> Result<indexmap::IndexMap<ProviderName, AdmittedProvider>, ConfigError> {
-        self.targets.validate_structure()?;
         self.providers
             .iter()
             .map(|(name, entry)| {
-                let provider = entry.admit().map_err(|error| ConfigError::Admission {
-                    provider: name.clone(),
-                    error,
+                let provider = entry.admit().map_err(|error| {
+                    let (within, message) = error.refusals().swap_remove(0);
+                    let mut path = vec![
+                        skyhook_base::decode::Segment::Key("providers".into()),
+                        skyhook_base::decode::Segment::Key(name.to_string()),
+                    ];
+                    path.extend(within);
+                    ConfigError::Refused(Refused::new(path, message))
                 })?;
                 Ok((name.clone(), provider))
             })
@@ -173,40 +172,43 @@ impl Config {
         })
     }
 
+    /// The model `name` selects, and where its provider and it are declared.
+    pub(crate) fn selected(
+        &self,
+        name: &ModelRef,
+    ) -> Result<((usize, usize), &ModelProfile), SelectionError> {
+        let provider = self.providers.get_full(&name.provider);
+        let (index, _, provider) = provider.ok_or(SelectionError::UnknownProvider)?;
+        let model = provider.settings.model_profile(&name.model);
+        let (model, profile) = model.ok_or(SelectionError::UnknownModel)?;
+        Ok(((index, model), profile))
+    }
+
     /// The profile of a configured model; an unknown provider or model is
     /// [`ConfigError::Model`].
     pub fn model_profile(&self, name: &ModelRef) -> Result<&ModelProfile, ConfigError> {
-        let provider = self.providers.get(&name.provider);
-        provider
-            .ok_or(SelectionError::UnknownProvider)
-            .and_then(|provider| {
-                provider
-                    .settings
-                    .model_profile(&name.model)
-                    .ok_or(SelectionError::UnknownModel)
-            })
-            .map_err(|error| ConfigError::Model {
-                name: name.clone(),
-                error,
-            })
+        let selected = self.selected(name).map(|(_, profile)| profile);
+        selected.map_err(|error| ConfigError::Model {
+            name: name.clone(),
+            error,
+            configured: self.configured_models(),
+        })
     }
 
     /// Edit a configured model's profile without changing its settings or provider
     /// provenance. Seal with [`Config::into_runtime`] to use the edit.
     pub fn model_profile_mut(&mut self, name: &ModelRef) -> Result<&mut ModelProfile, ConfigError> {
+        let configured = self.configured_models();
         let provider = self.providers.get_mut(&name.provider);
-        provider
-            .ok_or(SelectionError::UnknownProvider)
-            .and_then(|provider| {
-                provider
-                    .settings
-                    .model_profile_mut(&name.model)
-                    .ok_or(SelectionError::UnknownModel)
-            })
-            .map_err(|error| ConfigError::Model {
-                name: name.clone(),
-                error,
-            })
+        let provider = provider.ok_or(SelectionError::UnknownProvider);
+        let profile = provider.and_then(|provider| {
+            (provider.settings.model_profile_mut(&name.model)).ok_or(SelectionError::UnknownModel)
+        });
+        profile.map_err(|error| ConfigError::Model {
+            name: name.clone(),
+            error,
+            configured,
+        })
     }
 }
 
@@ -216,20 +218,12 @@ pub enum ConfigError {
     Serialize(crate::yaml::YamlError),
     #[error("invalid configuration: invalid YAML: {0}")]
     Syntax(serde_saphyr::Error),
-    #[error("invalid configuration: {}", located(.0))]
-    Structure(serde_path_to_error::Error<serde_json::Error>),
-    #[error("invalid configuration: `mcp.{name}`: {error}")]
-    Mcp {
-        name: String,
-        error: crate::mcp::config::McpConfigError,
-    },
-    #[error("invalid configuration: `providers.{provider}`: {error}")]
-    Admission {
-        provider: ProviderName,
-        error: AdmissionError,
-    },
+    /// Every value a document refuses, where it is written.
+    #[error("invalid configuration:\n{0}")]
+    Invalid(Diagnostics),
+    /// A setting of a configuration built in code, by its path.
     #[error("invalid configuration: {0}")]
-    Targets(#[from] crate::target::TargetError),
+    Refused(Refused),
     #[error("provider `{provider}` could not be initialized: {error}")]
     Provider {
         provider: ProviderName,
@@ -237,42 +231,24 @@ pub enum ConfigError {
     },
     #[error("No models configured. Add a named entry under a provider's models in your config.")]
     NoModels,
-    #[error("invalid model `{name}`: {error}")]
+    #[error("invalid model `{name}`: {error}, {configured}")]
     Model {
         name: ModelRef,
         error: SelectionError,
+        configured: Expected<ModelRef>,
     },
-    #[error("invalid default_model `{model}`: {error}")]
-    DefaultModel {
-        model: ModelRef,
-        error: SelectionError,
+    #[error("invalid mode `{name}`: mode is not configured, {declared}")]
+    Mode {
+        name: ModeName,
+        declared: Expected<ModeName>,
     },
-    #[error("invalid mode `{name}`: {error}")]
-    Mode { name: ModeName, error: ModeError },
-}
-
-/// A rejected value reads `` `providers.local.models.main.max_context`: ... ``.
-/// A deserialization error prefixed with the field path it names.
-pub fn located(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
-    match error.path().to_string().as_str() {
-        "." => error.inner().to_string(),
-        path => format!("`{path}`: {}", error.inner()),
-    }
-}
-
-/// Why a mode name selects no configured mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ModeError {
-    #[error("default_mode is not a declared mode")]
-    Undeclared,
-    #[error("mode is not configured")]
-    Unknown,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::policy::Capability;
+    use crate::tool::policy::{Capability, HostCapabilityDeclaration};
+    use skyhook_base::enums::NamedEnum;
     use std::assert_matches;
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
@@ -385,10 +361,13 @@ providers:
         );
         assert_matches!(
             config.select_mode(Some(&name("missing"))),
-            Err(ConfigError::Mode {
-                error: ModeError::Unknown,
-                ..
-            })
+            Err(ConfigError::Mode { .. })
+        );
+        let refused = runtime("default_mode: missing", two).err().unwrap();
+        assert_eq!(
+            refused.to_string(),
+            "invalid configuration: `default_mode`: default_mode is not a declared mode, \
+             expected one of `general`, `first`, `second`"
         );
         // `general` stays the default, and declared, until the config says otherwise.
         for (top, modes) in [("", ""), ("", two), ("modes: {}", "")] {
@@ -404,5 +383,78 @@ providers:
         ] {
             assert!(runtime(top, modes).is_err(), "{top} {modes}");
         }
+    }
+
+    /// Refused against the product it configures, a host capability no product
+    /// declares is refused where it is listed, with every capability it could be.
+    #[test]
+    fn host_capabilities_must_be_declared_by_the_product() {
+        let declared = [HostCapabilityDeclaration {
+            name: "host.review".parse().unwrap(),
+            title: "Review",
+        }];
+        let valid = skyhook_base::decode::one_of(
+            (Capability::ALL.iter().map(Capability::as_str)).chain(["host.review"]),
+        );
+        let refused = |text: &str, declared: &[HostCapabilityDeclaration]| {
+            let node = crate::yaml::read(text, None).unwrap();
+            let checked = process(&node, |config: &Config| {
+                config.refusals(Some(declared), true)
+            });
+            checked.map(drop).map_err(|refused| refused.to_string())
+        };
+        let mcp = "mcp:\n  s:\n    transport: stdio\n    start_command: [server]\n";
+        for (text, at) in [
+            (
+                "modes:\n  m:\n    capabilities: [read, host.revew]",
+                "3:26: `modes.m.capabilities[1]`",
+            ),
+            (
+                &format!("{mcp}    capabilities: [host.revew]") as &str,
+                "5:20: `mcp.s.capabilities[0]`",
+            ),
+        ] {
+            assert_eq!(
+                refused(text, &declared),
+                Err(format!(
+                    "{at}: unknown capability `host.revew`, expected one of {valid}"
+                ))
+            );
+            assert!(refused(&text.replace("revew", "review"), &[]).is_err());
+            refused(&text.replace("revew", "review"), &declared).unwrap();
+        }
+    }
+
+    /// One run refuses every bad value of a document and every reference to something
+    /// that decoded, each where it is written and in the order written.
+    #[test]
+    fn a_document_is_refused_once_with_every_refusal_where_it_is_written() {
+        let text = "providers:\n  p:\n    dialect: compatible\n    codec: chat\n    \
+                    base_url: http://h/v1\n    models:\n      m: {model: x}\n      n: {model: x, \
+                    max_context: 2, max_output: 2}\ntargets:\n  t:\n    type: ssh\n    host: h\n    \
+                    via: nope\nmodes:\n  m:\n    capabilities: [wirte]\n";
+        let refused = Config::from_yaml(text).unwrap_err().to_string();
+        let lines = Vec::from_iter(refused.lines().skip(1));
+        let codecs = skyhook_base::decode::one_of(crate::provider::codec::CodecName::NAMES);
+        let capabilities =
+            skyhook_base::decode::one_of(Capability::ALL.iter().map(Capability::as_str));
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "4:12: `providers.p.codec`: unknown variant `chat`, expected one of {codecs}"
+                ),
+                "7:10: `providers.p.models.m`: missing required fields `max_context`, `max_output`"
+                    .into(),
+                "13:10: `targets.t.via`: target `t` references unknown via target `nope`, and \
+                 none is configured"
+                    .into(),
+                format!(
+                    "16:20: `modes.m.capabilities[0]`: unknown capability `wirte`, expected one \
+                     of {capabilities}"
+                ),
+            ],
+            "{refused}"
+        );
     }
 }

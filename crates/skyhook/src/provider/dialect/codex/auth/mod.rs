@@ -46,6 +46,8 @@ pub struct Issuer(reqwest::Url);
 )]
 pub struct InvalidIssuer;
 
+skyhook_base::decode_via!(Issuer => String);
+
 impl Issuer {
     pub fn parse(text: &str) -> Result<Self, InvalidIssuer> {
         let mut url = super::super::config::service_url(text).map_err(|_| InvalidIssuer)?;

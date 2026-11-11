@@ -3,13 +3,12 @@ use std::io;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 
-use skyhook::config::{ConfigError, workspace_session_root};
+use skyhook::config::{Refused, undeclared_capabilities, workspace_session_root};
 use skyhook::identity::SessionId;
 use skyhook::product::{Error, Identity, Product, text::Table};
+use skyhook::tool::policy::HostCapabilityDeclaration;
 use skyhook_apps::args::{self, Invocation, ProductArgs, named};
-use skyhook_apps::config::{
-    LayerResolutionError, LayerSources, LayeredConfig, ResolvedConfig, resolve_cwds, resolve_layers,
-};
+use skyhook_apps::config::{LayerResolutionError, LayeredConfig, ResolvedConfig, resolve_layers};
 use skyhook_apps::tui::{self, Color, Look, Palette, SyntaxPalette, Theme};
 use skyhook_apps::{auth, batch, dump, exit_on, stats, text};
 use skyhook_security::{
@@ -94,7 +93,9 @@ struct Args {
 
 impl ProductArgs<Options> for Args {
     async fn load(self, workspace: &Path) -> Result<ResolvedConfig<Options>, LayerResolutionError> {
-        let resolved = resolve_layers::<File>(workspace, self.security_config.as_deref()).await?;
+        let declared = Security.identity().capabilities;
+        let explicit = self.security_config.as_deref();
+        let resolved = resolve_layers::<File>(workspace, explicit, &declared).await?;
         let (File(mut config), report) = (resolved.config, resolved.report);
         let last = report.sources.last().cloned();
         config.file = Some(last.unwrap_or_else(|| File::FILE_NAME.into()));
@@ -112,28 +113,20 @@ impl ProductArgs<Options> for Args {
 }
 
 /// `security.yaml`, layered as `config.yaml` is: the product's settings, each MCP server
-/// working where its file says and each model assignment naming the file it came from.
-#[derive(serde::Deserialize)]
-#[serde(transparent)]
+/// working where its file says and each model assignment where it is written.
+#[derive(skyhook_base::decode::Decode)]
+#[decode(transparent)]
 struct File(SecurityConfig);
 
 impl LayeredConfig for File {
-    type Error = ConfigError;
+    type Context<'a> = &'a [HostCapabilityDeclaration];
 
     const FILE_NAME: &'static str = "security.yaml";
     const NAMED_ENTRIES: &'static [&'static str] = &["models", "modes", "mcp"];
+    const OPTIONAL: bool = true;
 
-    fn missing() -> Option<Self> {
-        Some(Self(SecurityConfig::default()))
-    }
-
-    fn admit_layer(&mut self, sources: &LayerSources) -> Result<(), ConfigError> {
-        resolve_cwds(&mut self.0.mcp, sources)?;
-        for (model, assignment) in &mut self.0.models {
-            let file = sources.entry("models", &model.to_string());
-            assignment.file = file.map(Path::to_path_buf);
-        }
-        Ok(())
+    fn check(&self, declared: Self::Context<'_>, _complete: bool) -> Vec<Refused> {
+        undeclared_capabilities(&self.0.modes, &self.0.mcp, declared)
     }
 }
 

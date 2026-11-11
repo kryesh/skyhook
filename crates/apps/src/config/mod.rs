@@ -3,18 +3,17 @@
 //! launch as values.
 
 mod layer;
+mod layers;
 mod loader;
 
-pub use layer::resolve_cwds;
-pub use loader::{
-    LayerResolutionError, LayerSources, LayeredConfig, ResolvedConfig, resolve_layers,
-};
+pub use loader::{LayerResolutionError, LayeredConfig, ResolvedConfig, resolve_layers};
 
 use crate::args::{ConfigArgs, ProductArgs};
 use skyhook::launch::{
     self, ConfiguredHost, LaunchError, config::HostConfig, request::ExecutionRequest,
 };
 use skyhook::product::{Attendance, Product};
+use skyhook::tool::policy::HostCapabilityDeclaration;
 use std::path::Path;
 
 /// The main configuration with `request`'s policy, and `args` read into the product's
@@ -23,9 +22,11 @@ pub(crate) async fn load<O>(
     request: &ConfigArgs,
     args: impl ProductArgs<O>,
     workspace: &Path,
+    declared: &[HostCapabilityDeclaration],
 ) -> Result<(ResolvedConfig<HostConfig>, O), LayerResolutionError> {
     let source = &request.source;
-    let resolved = resolve_layers::<HostConfig>(&source.workspace, source.config.as_deref());
+    let explicit = source.config.as_deref();
+    let resolved = resolve_layers::<HostConfig>(&source.workspace, explicit, Some(declared));
     let mut resolved = resolved.await?;
     resolved.config.approve_all |= request.approve_all;
     let product = args.load(workspace).await?;
@@ -58,7 +59,8 @@ pub(crate) async fn configure<P: Product>(
     let workspace = tokio::fs::canonicalize(&request.source.workspace)
         .await
         .map_err(LaunchError::Workspace)?;
-    let (resolved, options) = load(request, args, &workspace).await?;
+    let declared = product.identity().capabilities;
+    let (resolved, options) = load(request, args, &workspace, &declared).await?;
     let host = resolved.config;
     let mut host =
         launch::configure(product, options, host, &workspace, execution, attendance).await?;

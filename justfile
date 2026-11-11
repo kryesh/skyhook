@@ -1,6 +1,6 @@
 # Use the installed Rust toolchain, Zig, and just; `just setup` installs the cargo tools.
 set shell := ["bash", "-euo", "pipefail", "-c"]
-# Evaluate host_target only for recipes that use it, so the rest work on an OS it does not map.
+# Evaluate native_target only for recipes that use it, so the rest run without rustc.
 set lazy
 
 # List common development and documentation commands.
@@ -10,16 +10,19 @@ default:
 # Remote shim targets; each is staged as target/shims/<os>-<arch>.
 shim_targets := "x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu"
 
-# Release builds route C and C++ allocations through mimalloc as well as Rust's.
+# Cross-compiled release builds route C and C++ allocations through mimalloc as well as Rust's.
 release_features := "--features mimalloc/override"
-# Default release target for this machine: releases are static musl builds for Linux.
-host_target := if os() == "linux" { arch() + "-unknown-linux-musl" } else { error("release builds need a Linux host, not " + os()) }
+# This machine's own target, the default for release builds. It is linked by the system
+# toolchain against the system C library, so it uses that library's name resolution, and builds
+# without release_features: with the override, a binary dynamically linked against glibc crashes
+# in `free` at startup.
+native_target := `rustc -vV | sed -n 's/^host: //p'`
 
-# Install Rust-side tooling, shim targets, and the host release target, then check for the
-# compilers and build tools that are installed separately.
+# Install Rust-side tooling and the shim targets, which include the static release targets, then
+# check for the compilers and build tools that are installed separately.
 setup:
     rustup component add clippy rustfmt
-    rustup target add {{ shim_targets }} {{ host_target }}
+    rustup target add {{ shim_targets }}
     cargo install --locked cargo-zigbuild cargo-nextest mdbook
     scripts/build-tools.sh
 
@@ -37,14 +40,12 @@ run-security *args:
 build:
     cargo build --locked -p skyhook-apps
 
-# Static release applications for `target`; embed whatever is in target/shims at compile time.
-build-release target=host_target:
-    # The applications' build script watches this directory; cargo rebuilds them on every
-    # run while it is missing.
+# Release applications for `target` (default: native; <arch>-unknown-linux-musl is static), embedding target/shims.
+build-release target=native_target:
     mkdir -p target/shims
     v8=$(scripts/v8-archive.sh {{ quote(target) }}); \
     RUSTY_V8_ARCHIVE="$v8/librusty_v8.a" RUSTY_V8_SRC_BINDING_PATH="$v8/src_binding.rs" \
-        cargo zigbuild --locked --release -p skyhook-apps --target {{ quote(target) }} {{ release_features }}
+        cargo {{ if target == native_target { "build" } else { "zigbuild " + release_features } }} --locked --release -p skyhook-apps --target {{ quote(target) }}
 
 # Debug builds of every shim, staged into target/shims.
 build-shims: (_shims "dev")
@@ -53,12 +54,12 @@ build-shims: (_shims "dev")
 build-shims-release: (_shims "release")
 
 # Release shims, then release applications for `target` that embed them.
-build-full target=host_target: build-shims-release (build-release target)
+build-full target=native_target: build-shims-release (build-release target)
 
-# Build everything for this machine and install both applications into ~/.local/bin.
-install: build-full
-    install -Dm 755 target/{{ host_target }}/release/skyhook ~/.local/bin/skyhook
-    install -Dm 755 target/{{ host_target }}/release/skyhook-security ~/.local/bin/skyhook-security
+# Build everything for `target` (default: native) and install both applications into ~/.local/bin.
+install target=native_target: (build-full target)
+    install -Dm 755 target/{{ target }}/release/skyhook ~/.local/bin/skyhook
+    install -Dm 755 target/{{ target }}/release/skyhook-security ~/.local/bin/skyhook-security
 
 # Run the test suite with nextest.
 test:

@@ -131,7 +131,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn registration_dispatch_capabilities_and_permissions() {
         let runtime = TestRuntime::new().await;
-        let config = serde_json::from_value(json!({
+        let config = crate::tests::decode(json!({
             "transport":"stdio", "start_command":["python3","-u","-c",FIXTURE],
             "capabilities":["read","exec"]
         }))

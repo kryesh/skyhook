@@ -387,7 +387,7 @@ mod tests {
             matches!(event, skyhook::session::SessionEvent::AgentFailed { .. })
         };
         observe_record(&mut app, ended).await;
-        let whole = read(&session, &root).await;
+        let whole = read(&app, &session, &root).await;
         let outputs = OutputStore::default();
         // History alone, its spacing between siblings aside: entries read alone have
         // no neighbours to sit tight against.
@@ -429,6 +429,7 @@ mod tests {
                 live: whole.live.clone(),
                 window,
                 projection: whole.projection.clone(),
+                config: whole.config.clone(),
             });
         }
         for details in [false, true] {

@@ -32,6 +32,12 @@ impl<const MIN: u64, const MAX: u64> TryFrom<u64> for Bounded<MIN, MAX> {
     }
 }
 
+impl<const MIN: u64, const MAX: u64> crate::decode::Decode for Bounded<MIN, MAX> {
+    fn decode(node: &crate::decode::Node, cx: &mut crate::decode::Context) -> Option<Self> {
+        crate::decode::via::<u64, Self>(node, cx)
+    }
+}
+
 impl<const MIN: u64, const MAX: u64> From<Bounded<MIN, MAX>> for u64 {
     fn from(value: Bounded<MIN, MAX>) -> Self {
         value.0
@@ -57,7 +63,15 @@ impl<const MIN: u64, const MAX: u64> schemars::JsonSchema for Bounded<MIN, MAX> 
 
 /// A timeout in whole seconds, from one second through a day.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+    crate::decode::Decode,
 )]
 #[serde(transparent)]
 #[schemars(transparent)]

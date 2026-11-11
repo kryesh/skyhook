@@ -3,12 +3,16 @@
 use super::entries::Inputs;
 use super::{Entry, EntryKey, Surface, View};
 use crate::tui::commands::Command;
-use crate::tui::format::Timing;
+use crate::tui::format::{Timing, model_label};
+use skyhook::config::RuntimeConfig;
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::ItemKind;
 use skyhook::provider::{ProviderError, ProviderErrorKind};
 use skyhook::session::Failure;
-use skyhook::session::{FailureRun, RequestFailure, RequestPhase, RequestSeq};
+use skyhook::session::{
+    FailureRun, ModelPurpose, ProfileSnapshot, RequestFailure, RequestPhase, RequestRecord,
+    RequestSeq,
+};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
@@ -95,15 +99,18 @@ impl Report {
         title
     }
 
-    /// The message, or each of `runs` once more than one attempt failed, then
-    /// `between` and the hint, each when present.
-    fn body(&self, runs: &[Run], between: &[&str]) -> String {
+    /// `sent`, then the message, or each of `runs` once more than one attempt failed,
+    /// then `between` and the hint, each when present.
+    fn body(&self, sent: &[String], runs: &[Run], between: &[&str]) -> String {
         let failures = match runs {
             [] => Cow::Borrowed(self.message.as_str()),
             [run] if run.first == run.last => Cow::Borrowed(self.message.as_str()),
             runs => Cow::Owned(listing(runs)),
         };
-        let lines = std::iter::once(&*failures)
+        let lines = sent
+            .iter()
+            .map(String::as_str)
+            .chain([&*failures])
             .chain(between.iter().copied())
             .chain(self.hint.as_deref());
         let lines: Vec<_> = lines.filter(|line| !line.is_empty()).collect();
@@ -134,12 +141,29 @@ fn listing(runs: &[Run]) -> String {
     listed.join("\n")
 }
 
+/// What its card's title leaves unsaid of where `record` was sent: its purpose and
+/// reasoning effort, then the API root and codec its model is configured with now,
+/// while it still is.
+fn sent(record: &RequestRecord, config: &RuntimeConfig) -> [String; 2] {
+    let ProfileSnapshot { name, profile } = &record.profile;
+    let compaction = (record.purpose == ModelPurpose::Compaction).then(|| "compaction".to_owned());
+    let reasoning = profile
+        .reasoning
+        .map(|effort| format!("reasoning {effort}"));
+    let request: Vec<_> = compaction.into_iter().chain(reasoning).collect();
+    let endpoint = config.endpoint(name);
+    let endpoint = endpoint.map(|(root, codec)| format!("{root} · {codec}"));
+    [request.join(" · "), endpoint.unwrap_or_default()]
+}
+
 /// A failed turn no request's card reports.
 pub(super) fn failure_entry(key: EntryKey, failure: &Failure, view: &View) -> Entry {
     let report = Report::from(failure);
     let open = view.is_expanded(&key, true);
     let title = report.title("Turn failed", None);
-    Entry::disclosed(key, title, open, Surface::Status, || report.body(&[], &[]))
+    Entry::disclosed(key, title, open, Surface::Error, || {
+        report.body(&[], &[], &[])
+    })
 }
 
 pub(super) fn retry_entry(
@@ -157,35 +181,41 @@ pub(super) fn retry_entry(
         | RequestPhase::Open { .. }
         | RequestPhase::Completed { .. }
         | RequestPhase::Interrupted { attempt: None, .. } => return None,
-        // An interrupted attempt's partial response renders at its journal position.
+        // The failures retried before the interrupt stay its details.
         RequestPhase::Interrupted {
             attempt: Some(attempt),
             ..
         } => {
-            let text = format!("Interrupted · attempt {attempt}");
-            return Some(Entry::new(key, text, Surface::Status));
-        }
-        // The headline names the refusal; the body is the model's account of it.
-        RequestPhase::Failed {
-            attempt,
-            failure: RequestFailure::Model(failure @ Failure::Refused(detail)),
-            ..
-        } => {
-            let report = Report {
-                message: detail.clone(),
-                ..Report::from(failure)
+            let title = format!("Interrupted · attempt {attempt}");
+            let Some(run) = record.retried.last() else {
+                return Some(Entry::new(key, title, Surface::Status));
             };
-            let title = report.title("Model declined to respond", *attempt);
-            let open = view.is_expanded(&key, true);
-            (title, report, *attempt, open, Surface::Error)
+            let open = view.is_expanded(&key, inputs.presentation.all_details);
+            (
+                title,
+                Report::from(&run.failure),
+                None,
+                open,
+                Surface::Status,
+            )
         }
         RequestPhase::Failed {
             attempt, failure, ..
         } => {
-            let report = Report::from(failure);
-            let title = report.title("Request failed", *attempt);
+            let (headline, report) = match failure {
+                // The headline names the refusal; the body is the model's account of it.
+                RequestFailure::Model(failure @ Failure::Refused(detail)) => (
+                    "Model declined to respond",
+                    Report {
+                        message: detail.clone(),
+                        ..Report::from(failure)
+                    },
+                ),
+                failure => ("Request failed", Report::from(failure)),
+            };
+            let title = report.title(headline, *attempt);
             let open = view.is_expanded(&key, true);
-            (title, report, *attempt, open, Surface::Status)
+            (title, report, *attempt, open, Surface::Error)
         }
         RequestPhase::Retrying {
             attempt,
@@ -200,8 +230,14 @@ pub(super) fn retry_entry(
             (title, report, None, open, Surface::Status)
         }
     };
+    let profile = &record.profile;
+    let model = model_label(&profile.name, Some(&profile.profile.model));
+    let title = format!("{title} · {model}");
     let body = || {
-        let response = inputs.live.views.responses.get(&(agent.clone(), request));
+        // A partial response settled in place renders at its journal position instead.
+        let response = (!super::live::settled_in_place(&record.phase))
+            .then(|| inputs.live.views.responses.get(&(agent.clone(), request)))
+            .flatten();
         let partial = response.into_iter().flat_map(|response| response.blocks());
         let partial: Vec<_> = partial
             .filter(|block| block.kind == ItemKind::Text && !block.text.trim().is_empty())
@@ -214,7 +250,7 @@ pub(super) fn retry_entry(
             report: report.clone(),
         }));
         // The hint follows any partial response, so it is not buried.
-        report.body(&runs, &partial)
+        report.body(&sent(record, inputs.config), &runs, &partial)
     };
     let mut entry = Entry::disclosed(key, title, open, surface, body);
     entry.timing = timing;

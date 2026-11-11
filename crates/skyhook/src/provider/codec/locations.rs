@@ -4,13 +4,9 @@
 //! Configuration spells locations as one location or a list; a single location is
 //! written back as itself.
 
-use std::fmt;
-
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, IntoDeserializer, value},
-};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
+use skyhook_base::decode::{Context, Decode, Node, Value as DecodedValue};
 
 use super::BodyPath;
 use crate::provider::ProviderError;
@@ -114,34 +110,18 @@ impl<T: Serialize> Serialize for NonEmpty<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de> + PartialEq> Deserialize<'de> for NonEmpty<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(Spelling(std::marker::PhantomData))
-    }
-}
-
-/// Reads one location in whatever form the location takes, or a list of them. Each
-/// location reads through its own type, so its errors stand.
-struct Spelling<T>(std::marker::PhantomData<T>);
-
-impl<'de, T: Deserialize<'de> + PartialEq> de::Visitor<'de> for Spelling<T> {
-    type Value = NonEmpty<T>;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a location or a list of distinct locations")
-    }
-
-    fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
-        T::deserialize(text.into_deserializer()).map(NonEmpty::one)
-    }
-
-    fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-        T::deserialize(value::MapAccessDeserializer::new(map)).map(NonEmpty::one)
-    }
-
-    fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-        let locations = Vec::<T>::deserialize(value::SeqAccessDeserializer::new(seq))?;
-        NonEmpty::new(locations).map_err(de::Error::custom)
+/// One location in whatever form the location takes, or a list of distinct ones.
+impl<T: Decode + PartialEq> Decode for NonEmpty<T> {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        match node.value {
+            DecodedValue::Seq(_) => {
+                let locations = Vec::decode(node, cx)?;
+                Self::new(locations)
+                    .map_err(|error| cx.error(node, error))
+                    .ok()
+            }
+            _ => T::decode(node, cx).map(Self::one),
+        }
     }
 }
 

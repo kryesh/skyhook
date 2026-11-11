@@ -3,23 +3,21 @@
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
 use indexmap::IndexMap;
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, DeserializeOwned},
-};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
+use skyhook_base::decode::{Context, Decode, Fields, Node};
 
 use super::{
-    self as dialect, AdmissionError, BuildError, Common, Connection, Dialect, DialectConfig,
-    DialectError, Login, ModelError, ModelSpec, Request, RequestSettings, Wire, anthropic, codex,
-    compatible, litellm, openai, openrouter,
+    self as dialect, AdmissionError, BuildError, CodecName, Common, Connection, Dialect,
+    DialectConfig, DialectError, Login, ModelError, ModelSpec, Request, RequestSettings, Unset,
+    Wire, anthropic, codex, compatible, litellm, openai, openrouter,
 };
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::Authentication,
     dialect::LoginCommand,
     model::{ModelName, ModelProfile, ProviderName},
-    settings::{Empty, Patch, Settings},
+    settings::{Empty, MissingSetting, Patch, Settings},
 };
 use crate::{identity::HostName, yaml};
 
@@ -34,7 +32,7 @@ pub(crate) enum KeySource {
 
 /// Provider-only options own connection rules and authentication.
 pub(crate) trait ProviderOptions:
-    Settings + Clone + Debug + Serialize + DeserializeOwned
+    Settings + Clone + Debug + Serialize + Decode + Fields
 {
     const KEY: KeySource = KeySource::ApiKey;
 
@@ -51,38 +49,18 @@ pub(crate) trait ProviderOptions:
 
 impl ProviderOptions for Empty {}
 
-/// An entry's `models`, read under its own name so a refusal's path names it.
-#[derive(Deserialize)]
-#[serde(bound = "P: Patch")]
-struct Models<P> {
-    #[serde(default)]
-    models: IndexMap<ModelName, ModelSpec<P>>,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Decode)]
+#[decode(bound = "P: Patch, O: ProviderOptions")]
 pub struct ProviderModels<P, O> {
+    #[decode(flatten)]
     pub options: O,
+    #[decode(flatten)]
     pub defaults: RequestSettings<P>,
+    #[decode(default)]
     pub models: IndexMap<ModelName, ModelSpec<P>>,
 }
 
 impl<P: Patch, O> ProviderModels<P, O> {
-    fn parse<E: de::Error>(mut fields: Map<String, Value>) -> Result<Self, E>
-    where
-        O: ProviderOptions,
-    {
-        let models = fields.remove_entry("models").into_iter().collect();
-        let (options, defaults) = fields
-            .into_iter()
-            .partition(|(key, _)| <O::Patch as Patch>::FIELDS.contains(&key.as_str()));
-        let Models { models } = yaml::located(models)?;
-        Ok(Self {
-            options: yaml::located(options)?,
-            defaults: yaml::located(defaults)?,
-            models,
-        })
-    }
-
     fn fields(&self) -> Map<String, Value>
     where
         O: Serialize,
@@ -107,28 +85,45 @@ impl<P: Patch, O> ProviderModels<P, O> {
             return Err(DialectError::ManagedLogin { dialect }.into());
         }
         let connection = common.admit(C::base_url())?;
-        let models = self
-            .models
-            .iter()
-            .map(|(name, model)| {
-                let admit = || -> Result<AdmittedModel, ModelError> {
-                    let settings = self.defaults.overlay(&model.settings);
-                    let request = Request::resolve(&settings.request)?;
-                    let wire = C::resolve(&settings.dialect)?.admit(request.codec)?;
-                    let wire = request.apply(wire)?;
-                    model.validate(&wire)?;
-                    Ok(AdmittedModel {
-                        profile: model.profile.clone(),
-                        wire,
-                    })
-                };
-                let admitted = admit().map_err(|error| AdmissionError::Model {
-                    model: name.clone(),
-                    error,
-                })?;
-                Ok((name.clone(), admitted))
+        let admit = |model: &ModelSpec<P>| -> Result<AdmittedModel, ModelError> {
+            let settings = self.defaults.overlay(&model.settings);
+            let request = Request::resolve(&settings.request)?;
+            let wire = C::resolve(&settings.dialect)?.admit(request.codec)?;
+            let wire = request.apply(wire)?;
+            model.validate(&wire)?;
+            Ok(AdmittedModel {
+                profile: model.profile.clone(),
+                wire,
             })
-            .collect::<Result<_, AdmissionError>>()?;
+        };
+        let (mut models, mut unset, mut refused) = (IndexMap::new(), Vec::<Unset>::new(), None);
+        for (name, model) in &self.models {
+            match admit(model) {
+                Ok(admitted) => {
+                    models.insert(name.clone(), admitted);
+                }
+                // Settings no model sets are the entry's to set, for every model at once.
+                Err(ModelError::Settings(MissingSetting { name: setting })) => {
+                    match unset.iter_mut().find(|unset| unset.setting == setting) {
+                        Some(unset) => unset.models.push(name.clone()),
+                        None => unset.push(Unset {
+                            setting,
+                            models: vec![name.clone()],
+                        }),
+                    }
+                }
+                Err(error) => {
+                    let model = name.clone();
+                    refused = refused.or(Some(AdmissionError::Model { model, error }));
+                }
+            }
+        }
+        if !unset.is_empty() {
+            return Err(AdmissionError::Unset(unset));
+        }
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
         Ok(AdmittedEntry {
             connection,
             models,
@@ -141,7 +136,8 @@ impl<P: Patch, O> ProviderModels<P, O> {
 macro_rules! providers {
     ($($variant:ident => $module:ident),+ $(,)?) => {
         /// Each variant binds defaults, models, and provider options to one dialect.
-        #[derive(Clone, Debug)]
+        #[derive(Clone, Debug, Decode)]
+        #[decode(tag = "dialect", rename_all = "snake_case")]
         pub enum ProviderSettings {
             $($variant(ProviderModels<$module::Patch, $module::Options>)),+
         }
@@ -151,9 +147,10 @@ macro_rules! providers {
                 match self { $(Self::$variant(_) => Dialect::$variant),+ }
             }
 
-            pub(crate) fn model_profile(&self, name: &ModelName) -> Option<&ModelProfile> {
+            /// The model `name` and where it is declared among the entry's models.
+            pub(crate) fn model_profile(&self, name: &ModelName) -> Option<(usize, &ModelProfile)> {
                 match self {
-                    $(Self::$variant(entry) => entry.models.get(name).map(|model| &model.profile)),+
+                    $(Self::$variant(entry) => entry.models.get_full(name).map(|(index, _, model)| (index, &model.profile))),+
                 }
             }
 
@@ -167,12 +164,6 @@ macro_rules! providers {
                 match self {
                     $(Self::$variant(entry) => Box::new(entry.models.iter().map(|(name, model)| (name, &model.profile)))),+
                 }
-            }
-
-            fn parse<E: de::Error>(dialect: Dialect, fields: Map<String, Value>) -> Result<Self, E> {
-                Ok(match dialect {
-                    $(Dialect::$variant => Self::$variant(ProviderModels::parse(fields)?)),+
-                })
             }
 
             fn fields(&self) -> Map<String, Value> {
@@ -195,6 +186,11 @@ macro_rules! providers {
         impl AdmittedProvider {
             pub(crate) fn models(&self) -> &IndexMap<ModelName, AdmittedModel> {
                 match self { $(Self::$variant(entry) => &entry.models),+ }
+            }
+
+            /// The API root: the entry's, else the dialect's own.
+            pub(crate) fn root(&self) -> &str {
+                match self { $(Self::$variant(entry) => entry.connection.root.as_str().trim_end_matches('/')),+ }
             }
 
             /// `program` is the host command that manages managed logins.
@@ -242,29 +238,18 @@ impl ConfigHome {
     }
 }
 
-/// Mutable declarations; model inheritance is resolved only on admission.
-#[derive(Clone, Debug)]
+/// Mutable declarations; model inheritance is resolved only on admission, which
+/// decoding runs to refuse the entry where it is written.
+#[derive(Clone, Debug, Decode)]
+#[decode(check = "RawProviderConfig::admitted")]
 pub struct RawProviderConfig {
+    #[decode(flatten)]
     pub common: Common,
+    #[decode(flatten)]
     pub settings: ProviderSettings,
+    /// The file that defines the entry.
+    #[decode(skip)]
     pub home: ConfigHome,
-}
-
-impl<'de> Deserialize<'de> for RawProviderConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut fields = Map::new();
-        let common = yaml::split(deserializer, &mut fields)?;
-        let dialect = fields
-            .remove("dialect")
-            .ok_or_else(|| de::Error::missing_field("dialect"))?;
-        let dialect = Dialect::deserialize(dialect).map_err(de::Error::custom)?;
-        let settings = ProviderSettings::parse(dialect, fields)?;
-        Ok(Self {
-            common,
-            settings,
-            home: ConfigHome::default(),
-        })
-    }
 }
 
 impl Serialize for RawProviderConfig {
@@ -283,6 +268,16 @@ impl RawProviderConfig {
     pub(crate) fn admit(&self) -> Result<AdmittedProvider, AdmissionError> {
         self.settings.admit(&self.common, &self.home)
     }
+
+    fn admitted(&mut self, node: &Node, cx: &mut Context) {
+        if let Some(file) = &node.at.file {
+            self.home = ConfigHome::File(file.to_path_buf());
+        }
+        let refusals = self.admit().err().map(|error| error.refusals());
+        for (path, message) in refusals.into_iter().flatten() {
+            cx.error_within(node, path, message);
+        }
+    }
 }
 
 pub(crate) struct AdmittedEntry<O> {
@@ -300,6 +295,10 @@ pub(crate) struct AdmittedModel {
 impl AdmittedModel {
     pub(crate) fn profile(&self) -> &ModelProfile {
         &self.profile
+    }
+
+    pub(crate) fn codec(&self) -> CodecName {
+        self.wire.codec.name()
     }
 }
 
@@ -467,8 +466,77 @@ providers:
         );
         let error = config.into_runtime().err().unwrap().to_string();
         assert!(
-            error.contains("`providers.local`: headers: `bad header`"),
+            error.contains("`providers.local.headers.bad header`: `bad header` is not"),
             "{error}"
+        );
+    }
+
+    /// An entry and each model are read as several declarations; an unknown key
+    /// is refused with every key the mapping takes, whichever declaration owns it.
+    #[test]
+    fn unknown_keys_are_refused_with_every_key_their_mapping_takes() {
+        let codex = "providers:\n  local:\n    dialect: codex\n    models:";
+        for (text, refused, offered) in [
+            (
+                with(LOCAL, "    api_kye: x"),
+                "`providers.local.api_kye`: unknown field `api_kye`,",
+                &[
+                    "base_url",
+                    "api_key",
+                    "dialect",
+                    "models",
+                    "codec",
+                    "state_role",
+                ][..],
+            ),
+            (
+                LOCAL.replace("max_output: 512", "max_output: 512\n        max_ouput: 3"),
+                "`providers.local.models.local.max_ouput`: unknown field `max_ouput`,",
+                &["model", "max_output", "codec", "image_limits", "state_role"],
+            ),
+            (
+                format!(
+                    "{codex}\n      m: {{model: x, max_context: 2, max_output: 1}}\n    authurl: x"
+                ),
+                "`providers.local.authurl`: unknown field `authurl`,",
+                &["auth_url", "base_url", "codec"],
+            ),
+        ] {
+            let error = error(&text);
+            let (located, keys) = error.split_once(" expected one of ").unwrap();
+            assert!(located.ends_with(refused), "{error}");
+            let keys = Vec::from_iter(keys.split(", ").map(|key| key.trim_matches('`')));
+            for key in offered {
+                assert!(keys.contains(key), "{key} missing from {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_missing_field_is_named_at_once() {
+        let profile = "        max_context: 4096\n        max_output: 512\n";
+        assert_eq!(
+            error(&LOCAL.replace(profile, "")),
+            "invalid configuration:\n9:9: `providers.local.models.local`: missing required \
+             fields `max_context`, `max_output`"
+        );
+        assert_eq!(
+            error(&LOCAL.replace("    dialect: compatible\n", "")),
+            "invalid configuration:\n4:5: `providers.local`: missing required field `dialect`"
+        );
+        // A setting no model sets is the entry's, refused once for every model needing it.
+        let models = "      a: {model: a, max_context: 2, max_output: 1}\n      \
+                      b: {model: b, max_context: 2, max_output: 1, codec: messages}\n      \
+                      c: {model: c, max_context: 2, max_output: 1}\n";
+        let text = LOCAL.replace("    codec: chat_completions\n", "").replace(
+            "      local:\n        model: local-model\n        max_context: 4096\n        \
+             max_output: 512\n",
+            models,
+        );
+        assert_eq!(
+            error(&text),
+            "invalid configuration:\n4:5: `providers.local`: missing required setting `codec` \
+             (needed by models `a`, `c`); set it here or on each model"
         );
     }
 
@@ -477,7 +545,7 @@ providers:
         for (field, expected) in [
             (
                 "    headers: {x-title: \"a\\nb\"}\n",
-                "`providers.local`: headers.x-title: literal is not a valid header value",
+                "`providers.local.headers.x-title`: literal is not a valid header value",
             ),
             (
                 "    headers: {x-count: 1}\n",
@@ -485,17 +553,29 @@ providers:
             ),
             (
                 "    headers: {X-Title: a, x-title: b}\n",
-                "`providers.local`: headers: `x-title` is named twice",
+                "`providers.local.headers.x-title`: `x-title` is named twice",
             ),
         ] {
             let refused = error(&with(LOCAL, field.trim_end()));
             assert!(refused.contains(expected), "{field}: {refused}");
         }
-        let located = error(&LOCAL.replace("max_context: 4096", "max_context: large"));
-        assert!(
-            located.contains("providers.local") && located.contains("models.local.max_context"),
-            "{located}"
-        );
+        for (text, path) in [
+            (
+                LOCAL.replace("max_context: 4096", "max_context: large"),
+                "`providers.local.models.local.max_context`: ",
+            ),
+            (
+                LOCAL.replace("dialect: compatible", "dialect: openia"),
+                "`providers.local.dialect`: ",
+            ),
+            (
+                LOCAL.replace("codec: chat_completions", "codec: chat"),
+                "`providers.local.codec`: ",
+            ),
+        ] {
+            let located = error(&text);
+            assert!(located.contains(path), "{located}");
+        }
         // Admission checks a model's limits.
         let limits = "max_context: 4096\n        max_output: 512";
         let refused = error(&LOCAL.replace(limits, "max_context: 4096\n        max_output: 4096"));
@@ -513,7 +593,9 @@ providers:
             );
         let refused = error(&adaptive);
         assert!(
-            refused.contains("`providers.local`: models.local: reasoning `adaptive` is not one of"),
+            refused.contains(
+                "`providers.local.models.local.reasoning`: reasoning `adaptive` is not one of"
+            ),
             "{refused}"
         );
         assert!(builds(&adaptive.replace("adaptive", "high")));
@@ -692,10 +774,10 @@ providers:
             let missing = PROXY.replace(&format!("        {field}: {value}\n"), "");
             let refused = error(&missing);
             assert!(
-                refused.contains("providers.local")
-                    && refused.contains("models.openai")
-                    && refused.contains(field)
-                    && refused.contains("missing"),
+                refused.ends_with(&format!(
+                    "`providers.local`: missing required setting `{field}` (needed by model \
+                     `openai`); set it here or on each model"
+                )),
                 "{refused}"
             );
             let supplied = with(&missing, &format!("    {field}: {value}"));

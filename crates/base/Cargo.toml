@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 schemars.workspace = true
+indexmap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 skyhook-macros.workspace = true
 thiserror.workspace = true

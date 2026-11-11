@@ -15,7 +15,7 @@ pub fn nonblank(what: &'static str, value: &str) -> Result<(), Blank> {
 }
 
 /// Declare a `String` newtype whose values passed `$check`, a `fn(&str) ->
-/// Result<(), $error>`. Serde, a string schema, `TryFrom<String>`, `FromStr`,
+/// Result<(), $error>`. Serde, configuration decoding, a string schema, `TryFrom<String>`, `FromStr`,
 /// `Display`, `as_str` and `From<Self> for String` come with it; add further derives such
 /// as `Ord` as attributes. `schema = ...` states a narrower schema than a plain string, which
 /// the type's doc comment describes unless the schema has a description of its own; it is one
@@ -77,6 +77,15 @@ macro_rules! string_newtype {
 
             fn from_str(value: &str) -> ::std::result::Result<Self, $error> {
                 Self::try_from(value.to_owned())
+            }
+        }
+
+        impl $crate::decode::Decode for $name {
+            fn decode(
+                node: &$crate::decode::Node,
+                cx: &mut $crate::decode::Context,
+            ) -> ::std::option::Option<Self> {
+                $crate::decode::parse(node, cx)
             }
         }
 

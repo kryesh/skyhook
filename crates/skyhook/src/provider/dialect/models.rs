@@ -1,7 +1,8 @@
 //! Flat model declarations. Partial settings retain inheritance until admission.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value, json};
+use skyhook_base::decode::Decode;
 
 use super::{ModelError, Placements, Wire};
 use crate::provider::{
@@ -123,9 +124,12 @@ impl Request {
 }
 
 /// Request settings as a provider or model declares them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Decode)]
+#[decode(bound = "P: Patch")]
 pub struct RequestSettings<P> {
+    #[decode(flatten)]
     pub request: RequestPatch,
+    #[decode(flatten)]
     pub dialect: P,
 }
 
@@ -144,39 +148,19 @@ impl<P: Patch> RequestSettings<P> {
     }
 }
 
-impl<'de, P: Patch> Deserialize<'de> for RequestSettings<P> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let fields = Map::<String, Value>::deserialize(deserializer)?;
-        let (request, dialect) = fields
-            .into_iter()
-            .partition(|(key, _)| RequestPatch::FIELDS.contains(&key.as_str()));
-        Ok(Self {
-            request: yaml::located(request)?,
-            dialect: yaml::located(dialect)?,
-        })
-    }
-}
-
 impl<P: Patch> Serialize for RequestSettings<P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.fields().serialize(serializer)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Decode)]
+#[decode(bound = "P: Patch")]
 pub struct ModelSpec<P> {
+    #[decode(flatten)]
     pub profile: ModelProfile,
+    #[decode(flatten)]
     pub settings: RequestSettings<P>,
-}
-
-impl<'de, P: Patch> Deserialize<'de> for ModelSpec<P> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut fields = Map::new();
-        let profile = yaml::split(deserializer, &mut fields)?;
-        let settings =
-            RequestSettings::deserialize(Value::Object(fields)).map_err(de::Error::custom)?;
-        Ok(Self { profile, settings })
-    }
 }
 
 impl<P: Patch> Serialize for ModelSpec<P> {

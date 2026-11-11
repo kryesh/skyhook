@@ -1,27 +1,26 @@
 //! Layer selection, schema-directed merging, and side-effect-free admission.
 
 use std::{
-    collections::HashMap,
     fmt,
     path::{Path, PathBuf},
 };
 
-use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
-use tokio::fs;
+use skyhook::config::{Refused, user_config_directories, workspace_directory};
+use skyhook_base::decode::{Decode, Diagnostics};
+use skyhook_tools::diagnostic::escape_controls;
 
-use skyhook::config::{located, user_config_directories, workspace_directory};
-use skyhook::yaml::{self, YamlError};
+use super::layers::{Merged, read_layer};
 
-/// A typed schema loaded by [`resolve_layers`]. The loader merges only source
-/// values, not deserialization defaults, then extracts and admits this type.
+/// A typed schema loaded by [`resolve_layers`]. The loader merges only the values files
+/// write, never decoding defaults, then decodes this type and checks it.
 ///
-/// Admission also runs on each user candidate before selection. Workspace layers
-/// may be partial: they are admitted only as part of the effective document.
+/// Each user candidate is decoded and checked before it is selected. Workspace layers
+/// may be partial: they are decoded only as part of the effective document.
 /// Implementations must not read credentials, run commands, or otherwise perform
-/// external work during admission.
-pub trait LayeredConfig: DeserializeOwned {
-    type Error: std::error::Error + Send + Sync + 'static;
+/// external work while decoding or checking.
+pub trait LayeredConfig: Decode {
+    /// What the host knows that checking the configuration needs.
+    type Context<'a>: Copy;
 
     /// File name within each user configuration directory and `.skyhook`.
     const FILE_NAME: &'static str;
@@ -31,77 +30,104 @@ pub trait LayeredConfig: DeserializeOwned {
     /// top-level values, including maps, are replaced whole.
     const NAMED_ENTRIES: &'static [&'static str] = &[];
 
-    /// Policy when no discovered file exists. `None` requires a file, and refuses
-    /// an empty effective document or user candidate as configuring nothing; `Some`
-    /// supplies defaults, which are admitted like a loaded configuration. This
-    /// never hides rejected candidates or a missing explicit file.
-    fn missing() -> Option<Self> {
-        None
-    }
+    /// Whether no discovered file configures the schema's defaults. Otherwise a file is
+    /// required, and an empty effective document or user candidate configures nothing.
+    /// This never hides rejected candidates or a missing explicit file.
+    const OPTIONAL: bool = false;
 
-    /// Validate the typed configuration and resolve any source-relative values.
-    /// Changes made here never become input to merging another layer.
-    fn admit_layer(&mut self, _sources: &LayerSources) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-/// Absolute source files for the named entries of an effective document.
-/// Only maps declared in [`LayeredConfig::NAMED_ENTRIES`] have entry provenance.
-#[derive(Clone, Debug, Default)]
-pub struct LayerSources(HashMap<String, HashMap<String, PathBuf>>);
-
-impl LayerSources {
-    /// The file supplying this whole entry, or `None` for an entry supplied by
-    /// schema defaults rather than a file. Paths are absolute, not canonicalized.
-    pub fn entry(&self, field: &str, name: &str) -> Option<&Path> {
-        self.0.get(field)?.get(name).map(PathBuf::as_path)
+    /// What the configuration's parts refuse of each other, given `context`. A user
+    /// candidate is not `complete`: a workspace layer may define what it names.
+    fn check(&self, _context: Self::Context<'_>, _complete: bool) -> Vec<Refused> {
+        Vec::new()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum LayerError {
+pub(super) enum LayerError {
     #[error("file not found")]
     Missing,
     #[error("could not read configuration: {0}")]
     Read(std::io::Error),
     #[error(transparent)]
-    Yaml(YamlError),
-    #[error("configuration must be a mapping")]
-    NotMapping,
+    Yaml(skyhook::yaml::YamlError),
+    #[error("the file contains no settings")]
+    Blank,
+    #[error("configuration must be a mapping of settings, not {0}")]
+    NotMapping(&'static str),
     #[error("invalid configuration: configuration is empty")]
     Empty,
-    #[error("invalid configuration: {}", located(.0))]
-    Structure(serde_path_to_error::Error<serde_json::Error>),
-    #[error(transparent)]
-    Admission(Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Invalid(Diagnostics),
+}
+
+impl LayerError {
+    /// The error as diagnostics: one per refused value, at the file that wrote it, else
+    /// one of `path`.
+    fn diagnostics(self, path: &Path) -> Vec<ConfigDiagnostic> {
+        match self {
+            Self::Invalid(diagnostics) => (diagnostics.0.into_iter())
+                .map(|diagnostic| {
+                    let file = diagnostic.at.file.as_deref().unwrap_or(path);
+                    ConfigDiagnostic {
+                        path: file.to_path_buf(),
+                        position: Some((diagnostic.at.line, diagnostic.at.column)),
+                        message: diagnostic.located(),
+                    }
+                })
+                .collect(),
+            error => vec![diagnostic(path, error.to_string())],
+        }
+    }
 }
 
 /// Where resolution stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolutionStage {
-    #[error("explicit configuration failed")]
     Explicit,
-    #[error("could not resolve workspace")]
     Workspace,
-    #[error("workspace configuration failed")]
     WorkspaceLayer,
-    #[error("no usable Skyhook config found")]
     NoUsableLayer,
-    #[error("effective configuration failed")]
     Effective,
+}
+
+impl ResolutionStage {
+    /// What failed, as the line above the report's diagnostics.
+    fn headline(self, file_name: &str, report: &ConfigReport) -> String {
+        match self {
+            Self::Explicit => "could not load the selected configuration file".into(),
+            Self::Workspace => "could not resolve the workspace".into(),
+            Self::WorkspaceLayer => format!("could not load the workspace {file_name}"),
+            Self::NoUsableLayer => format!("no usable {file_name}; every file found was refused"),
+            Self::Effective if report.sources.is_empty() => {
+                format!("the default {file_name} is invalid")
+            }
+            Self::Effective => {
+                let sources = report.sources.iter().map(|path| path.display().to_string());
+                let sources = sources.collect::<Vec<_>>().join(", ");
+                format!("the {file_name} merged from {sources} is invalid")
+            }
+        }
+    }
 }
 
 /// A rejected candidate or fatal layer error. Never includes YAML source excerpts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigDiagnostic {
     pub path: PathBuf,
+    /// The line and column of the refused value, when the refusal names one.
+    pub position: Option<(u64, u64)>,
     pub message: String,
 }
 
+/// One line: controls in the path or message, newlines included, are escaped so that
+/// only the report's own line breaks separate diagnostics.
 impl fmt::Display for ConfigDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.path.display(), self.message)
+        write!(f, "{}", escape_controls(self.path.display()))?;
+        if let Some((line, column)) = self.position {
+            write!(f, ":{line}:{column}")?;
+        }
+        write!(f, ": {}", escape_controls(&self.message))
     }
 }
 
@@ -131,7 +157,7 @@ pub struct ResolvedConfig<T> {
 /// Failure to discover or admit a schema's layered configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerResolutionError {
-    #[error("{file_name}: {stage}{report}")]
+    #[error("{}{report}", .stage.headline(.file_name, .report))]
     Resolution {
         file_name: &'static str,
         stage: ResolutionStage,
@@ -164,11 +190,12 @@ impl LayerResolutionError {
 /// Invalid workspace files are fatal. A schema may explicitly allow defaults
 /// when all discovered files are absent; explicit files are always required.
 ///
-/// YAML must be a mapping, with string keys and no duplicates. Admission and
+/// YAML must be a mapping, with string keys and no duplicates. Checking and
 /// whole-entry map policy belong to `T`; no provider-specific work runs here.
 pub async fn resolve_layers<T: LayeredConfig>(
     workspace: &Path,
     explicit: Option<&Path>,
+    context: T::Context<'_>,
 ) -> Result<ResolvedConfig<T>, LayerResolutionError> {
     // Do not even inspect environment roots or workspace for explicit selection.
     let candidates = if explicit.is_some() {
@@ -179,27 +206,28 @@ pub async fn resolve_layers<T: LayeredConfig>(
             .map(|directory| directory.join(T::FILE_NAME))
             .collect()
     };
-    resolve_paths(workspace, explicit, candidates).await
+    resolve_paths(workspace, explicit, candidates, context).await
 }
 
 pub(super) async fn resolve_paths<T: LayeredConfig>(
     workspace: &Path,
     explicit: Option<&Path>,
     candidates: Vec<PathBuf>,
+    context: T::Context<'_>,
 ) -> Result<ResolvedConfig<T>, LayerResolutionError> {
     let mut report = ConfigReport::default();
     let mut merged = Merged::default();
     if let Some(path) = explicit {
-        let explicit = |report: &mut ConfigReport, message: String| {
-            failure::<T>(report, ResolutionStage::Explicit, diagnostic(path, message))
+        let explicit = |report: &mut ConfigReport, error: LayerError| {
+            failure::<T>(report, ResolutionStage::Explicit, error.diagnostics(path))
         };
         let layer = read_layer(path)
             .await
-            .map_err(|error| explicit(&mut report, error.to_string()))?;
+            .map_err(|error| explicit(&mut report, error))?;
         merged.overlay::<T>(layer);
         let config = merged
-            .deserialize::<T>()
-            .map_err(|error| explicit(&mut report, error.to_string()))?;
+            .decode::<T>(context, true)
+            .map_err(|error| explicit(&mut report, error))?;
         report.sources.push(path.to_path_buf());
         return Ok(ResolvedConfig { config, report });
     }
@@ -217,28 +245,27 @@ pub(super) async fn resolve_paths<T: LayeredConfig>(
                 let mut candidate = Merged::default();
                 candidate.overlay::<T>(layer);
                 candidate
-                    .deserialize::<T>()
+                    .decode::<T>(context, false)
                     .map(|_| candidate)
-                    .map_err(|error| diagnostic(&path, error.to_string()))
+                    .map_err(|error| error.diagnostics(&path))
             }
             // An absent candidate is the ordinary case, not a diagnostic.
             Err(LayerError::Missing) => continue,
-            Err(error) => Err(diagnostic(&path, error.to_string())),
+            Err(error) => Err(error.diagnostics(&path)),
         };
         match loaded {
             Ok(candidate) => {
-                // Only actual source values participate in the layer merge.
                 merged = candidate;
                 report.sources.push(path);
                 break;
             }
-            Err(diagnostic) => report.diagnostics.push(diagnostic),
+            Err(diagnostics) => report.diagnostics.extend(diagnostics),
         }
     }
 
-    let workspace = fs::canonicalize(workspace).await.map_err(|error| {
-        let diagnostic = diagnostic(workspace, error.to_string());
-        failure::<T>(&mut report, ResolutionStage::Workspace, diagnostic)
+    let workspace = tokio::fs::canonicalize(workspace).await.map_err(|error| {
+        let diagnostics = vec![diagnostic(workspace, error.to_string())];
+        failure::<T>(&mut report, ResolutionStage::Workspace, diagnostics)
     })?;
     let workspace_path = workspace_directory(&workspace).join(T::FILE_NAME);
     match read_layer(&workspace_path).await {
@@ -248,15 +275,15 @@ pub(super) async fn resolve_paths<T: LayeredConfig>(
         }
         Err(LayerError::Missing) => {}
         Err(error) => {
-            let diagnostic = diagnostic(&workspace_path, error.to_string());
+            let diagnostics = error.diagnostics(&workspace_path);
             return Err(failure::<T>(
                 &mut report,
                 ResolutionStage::WorkspaceLayer,
-                diagnostic,
+                diagnostics,
             ));
         }
     }
-    let config = if report.sources.is_empty() {
+    if report.sources.is_empty() {
         if !report.diagnostics.is_empty() {
             return Err(LayerResolutionError::Resolution {
                 file_name: T::FILE_NAME,
@@ -264,23 +291,17 @@ pub(super) async fn resolve_paths<T: LayeredConfig>(
                 report,
             });
         }
-        let Some(mut config) = T::missing() else {
+        if !T::OPTIONAL {
             return Err(LayerResolutionError::Missing {
                 file_name: T::FILE_NAME,
                 report,
             });
-        };
-        config
-            .admit_layer(&merged.sources)
-            .map(|()| config)
-            .map_err(|error| LayerError::Admission(Box::new(error)))
-    } else {
-        merged.deserialize::<T>()
+        }
     }
-    .map_err(|error| {
+    let config = merged.decode::<T>(context, true).map_err(|error| {
         let path = report.sources.last().unwrap_or(&workspace_path);
-        let diagnostic = diagnostic(path, error.to_string());
-        failure::<T>(&mut report, ResolutionStage::Effective, diagnostic)
+        let diagnostics = error.diagnostics(path);
+        failure::<T>(&mut report, ResolutionStage::Effective, diagnostics)
     })?;
     Ok(ResolvedConfig { config, report })
 }
@@ -288,9 +309,9 @@ pub(super) async fn resolve_paths<T: LayeredConfig>(
 fn failure<T: LayeredConfig>(
     report: &mut ConfigReport,
     stage: ResolutionStage,
-    diagnostic: ConfigDiagnostic,
+    diagnostics: Vec<ConfigDiagnostic>,
 ) -> LayerResolutionError {
-    report.diagnostics.push(diagnostic);
+    report.diagnostics.extend(diagnostics);
     LayerResolutionError::Resolution {
         file_name: T::FILE_NAME,
         stage,
@@ -301,76 +322,8 @@ fn failure<T: LayeredConfig>(
 fn diagnostic(path: &Path, message: impl Into<String>) -> ConfigDiagnostic {
     ConfigDiagnostic {
         path: path.to_path_buf(),
+        position: None,
         message: message.into(),
-    }
-}
-
-async fn read_layer(path: &Path) -> Result<Layer, LayerError> {
-    let text = fs::read_to_string(path)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => LayerError::Missing,
-            _ => LayerError::Read(error),
-        })?;
-    let Value::Object(value) = yaml::parse(&text).map_err(LayerError::Yaml)? else {
-        return Err(LayerError::NotMapping);
-    };
-    let file = std::path::absolute(path).map_err(LayerError::Read)?;
-    Ok(Layer { value, file })
-}
-
-struct Layer {
-    value: Map<String, Value>,
-    file: PathBuf,
-}
-
-#[derive(Default)]
-struct Merged {
-    value: Map<String, Value>,
-    sources: LayerSources,
-}
-
-impl Merged {
-    fn overlay<T: LayeredConfig>(&mut self, layer: Layer) {
-        for (key, value) in layer.value {
-            let named = T::NAMED_ENTRIES.contains(&key.as_str());
-            if named {
-                match &value {
-                    Value::Object(entries) => {
-                        let sources = self.sources.0.entry(key.clone()).or_default();
-                        for name in entries.keys() {
-                            sources.insert(name.clone(), layer.file.clone());
-                        }
-                    }
-                    _ => {
-                        self.sources.0.remove(&key);
-                    }
-                }
-            }
-            match (self.value.get_mut(&key), value) {
-                (Some(Value::Object(entries)), Value::Object(overlay)) if named => {
-                    entries.extend(overlay);
-                }
-                (_, value) => {
-                    self.value.insert(key, value);
-                }
-            }
-        }
-    }
-
-    /// An empty document configures nothing, so a schema that requires a file
-    /// refuses it as it would no file at all; one with defaults admits them.
-    fn deserialize<T: LayeredConfig>(&self) -> Result<T, LayerError> {
-        let mut config: T = match self.value.is_empty() {
-            true => T::missing().ok_or(LayerError::Empty)?,
-            false => {
-                serde_path_to_error::deserialize(&self.value).map_err(LayerError::Structure)?
-            }
-        };
-        config
-            .admit_layer(&self.sources)
-            .map_err(|error| LayerError::Admission(Box::new(error)))?;
-        Ok(config)
     }
 }
 
@@ -378,12 +331,12 @@ impl Merged {
 pub(super) mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use serde::Deserialize;
     use skyhook::launch::config::HostConfig;
+    use skyhook_base::decode::{Segment, Source};
     use std::assert_matches;
 
-    #[derive(Debug, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
+    #[derive(Debug, Decode)]
+    #[serde(default)]
     struct ExampleConfig {
         models: IndexMap<String, Entry>,
         roles: IndexMap<String, Entry>,
@@ -404,44 +357,40 @@ pub(super) mod tests {
         }
     }
 
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
+    #[derive(Debug, Decode)]
     struct Entry {
         value: usize,
         note: Option<String>,
         cwd: Option<PathBuf>,
-        #[serde(skip)]
-        source: Option<PathBuf>,
+        #[decode(source)]
+        source: Source,
     }
 
-    #[derive(Debug, thiserror::Error)]
-    #[error("model count exceeds limit")]
-    struct TooManyModels;
+    impl ExampleConfig {
+        fn limited(&self) -> Vec<Refused> {
+            match self.models.len() > self.limit {
+                true => vec![Refused::new(
+                    vec![Segment::Key("models".into())],
+                    "model count exceeds limit",
+                )],
+                false => Vec::new(),
+            }
+        }
+    }
 
     impl LayeredConfig for ExampleConfig {
-        type Error = TooManyModels;
+        type Context<'a> = ();
         const FILE_NAME: &'static str = "example.yaml";
         const NAMED_ENTRIES: &'static [&'static str] = &["models", "roles", "mcp"];
+        const OPTIONAL: bool = true;
 
-        fn missing() -> Option<Self> {
-            Some(Self::default())
+        fn check(&self, (): (), _complete: bool) -> Vec<Refused> {
+            self.limited()
         }
+    }
 
-        fn admit_layer(&mut self, sources: &LayerSources) -> Result<(), Self::Error> {
-            if self.models.len() > self.limit {
-                return Err(TooManyModels);
-            }
-            for (field, entries) in [
-                ("models", &mut self.models),
-                ("roles", &mut self.roles),
-                ("mcp", &mut self.mcp),
-            ] {
-                for (name, entry) in entries {
-                    entry.source = sources.entry(field, name).map(Path::to_path_buf);
-                }
-            }
-            Ok(())
-        }
+    fn written(entry: &Entry) -> Option<&Path> {
+        entry.source.file.as_deref()
     }
 
     /// A workspace with `C`'s user candidates (XDG, then home) and its workspace file,
@@ -477,11 +426,13 @@ pub(super) mod tests {
 
         pub(in crate::config) async fn resolve(
             &self,
+            context: C::Context<'_>,
         ) -> Result<ResolvedConfig<C>, LayerResolutionError> {
             resolve_paths(
                 &self.workspace,
                 None,
                 vec![self.xdg.clone(), self.home.clone()],
+                context,
             )
             .await
         }
@@ -526,7 +477,7 @@ providers:
   replacement: {value: 70}
 "#,
         );
-        let resolved = f.resolve().await.unwrap();
+        let resolved = f.resolve(()).await.unwrap();
         assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
         assert!(resolved.report.diagnostics.is_empty());
         let config = resolved.config;
@@ -539,11 +490,8 @@ providers:
         for (entries, expected) in [(&config.models, 20), (&config.roles, 40), (&config.mcp, 60)] {
             assert_eq!(entries["changed"].value, expected);
             assert!(entries["changed"].note.is_none());
-            assert_eq!(
-                entries["changed"].source.as_deref(),
-                Some(f.local.as_path())
-            );
-            assert_eq!(entries["retained"].source.as_deref(), Some(f.xdg.as_path()));
+            assert_eq!(written(&entries["changed"]), Some(f.local.as_path()));
+            assert_eq!(written(&entries["retained"]), Some(f.xdg.as_path()));
         }
         assert_eq!(
             config
@@ -553,7 +501,10 @@ providers:
                 .collect::<Vec<_>>(),
             ["replacement"]
         );
-        assert!(config.providers["replacement"].source.is_none());
+        assert_eq!(
+            written(&config.providers["replacement"]),
+            Some(f.local.as_path())
+        );
         assert_eq!(
             config.mcp["retained"].cwd.as_deref(),
             Some(Path::new("relative-user"))
@@ -568,45 +519,44 @@ providers:
     /// or a required schema never fall back to.
     #[tokio::test]
     async fn missing_files_use_admitted_defaults() {
-        #[derive(Debug, Deserialize)]
-        struct LimitedDefaults(ExampleConfig);
+        #[derive(Debug, Decode)]
+        #[serde(default)]
+        struct LimitedDefaults {
+            models: IndexMap<String, usize>,
+        }
+
+        impl Default for LimitedDefaults {
+            fn default() -> Self {
+                Self {
+                    models: [("model".into(), 1)].into(),
+                }
+            }
+        }
 
         impl LayeredConfig for LimitedDefaults {
-            type Error = TooManyModels;
+            type Context<'a> = ();
             const FILE_NAME: &'static str = "defaults.yaml";
+            const OPTIONAL: bool = true;
 
-            fn missing() -> Option<Self> {
-                Some(Self(ExampleConfig {
-                    models: [(
-                        "model".into(),
-                        Entry {
-                            value: 1,
-                            note: None,
-                            cwd: None,
-                            source: None,
-                        },
-                    )]
-                    .into(),
-                    limit: 0,
-                    ..ExampleConfig::default()
-                }))
-            }
-
-            fn admit_layer(&mut self, sources: &LayerSources) -> Result<(), Self::Error> {
-                self.0.admit_layer(sources)
+            fn check(&self, (): (), _complete: bool) -> Vec<Refused> {
+                let path = vec![Segment::Key("models".into())];
+                vec![Refused::new(
+                    path,
+                    format!("{} models exceed the limit", self.models.len()),
+                )]
             }
         }
 
         let f = Fixture::<ExampleConfig>::new();
-        let resolved = f.resolve().await.unwrap();
+        let resolved = f.resolve(()).await.unwrap();
         assert!(resolved.report.sources.is_empty());
         // Absent candidates are the ordinary case and raise no diagnostic.
         assert!(resolved.report.diagnostics.is_empty());
         assert_eq!(resolved.config.limit, 1);
         write(&f.local, "{}");
-        assert_eq!(f.resolve().await.unwrap().config.limit, 1);
+        assert_eq!(f.resolve(()).await.unwrap().config.limit, 1);
 
-        let missing = resolve_paths::<HostConfig>(&f.workspace, None, Vec::new())
+        let missing = resolve_paths::<HostConfig>(&f.workspace, None, Vec::new(), None)
             .await
             .unwrap_err();
         assert_matches!(
@@ -616,7 +566,7 @@ providers:
                 ..
             }
         );
-        let error = resolve_paths::<LimitedDefaults>(&f.workspace, None, Vec::new())
+        let error = resolve_paths::<LimitedDefaults>(&f.workspace, None, Vec::new(), ())
             .await
             .unwrap_err();
         assert_matches!(
@@ -631,10 +581,10 @@ providers:
             error.report().diagnostics[0].path,
             f.local.with_file_name("defaults.yaml")
         );
-        assert!(error.to_string().contains("model count exceeds limit"));
+        assert!(error.to_string().contains("1 models exceed the limit"));
 
         let explicit = f.home.with_file_name("override.yaml");
-        let error = resolve_layers::<ExampleConfig>(&f.workspace, Some(&explicit))
+        let error = resolve_layers::<ExampleConfig>(&f.workspace, Some(&explicit), ())
             .await
             .unwrap_err();
         assert_matches!(
@@ -647,6 +597,76 @@ providers:
         assert_eq!(error.report().diagnostics[0].path, explicit);
     }
 
+    /// A refusal reads as a headline over one line per diagnostic, each naming the file
+    /// read; a refused root says what it was, and controls inside a diagnostic, its
+    /// newlines among them, cannot start a line of their own.
+    #[tokio::test]
+    async fn refusals_render_one_line_per_diagnostic() {
+        let f = Fixture::<ExampleConfig>::new();
+        for (text, message) in [
+            ("", "the file contains no settings"),
+            ("# only a comment\n", "the file contains no settings"),
+            (
+                "[a, b]",
+                "configuration must be a mapping of settings, not a list",
+            ),
+            (
+                "plain",
+                "configuration must be a mapping of settings, not a string",
+            ),
+            (
+                "\"bad\\nkey\\u001b\": 1",
+                "unknown field `bad\\nkey\\u{1b}`",
+            ),
+        ] {
+            write(&f.xdg, text);
+            let error = resolve_layers::<ExampleConfig>(&f.workspace, Some(&f.xdg), ())
+                .await
+                .unwrap_err();
+            let rendered = error.to_string();
+            let lines = rendered.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2, "{rendered}");
+            assert_eq!(lines[0], "could not load the selected configuration file");
+            let diagnostic = lines[1].strip_prefix("  ").unwrap();
+            let diagnostic = diagnostic.strip_prefix(f.xdg.to_str().unwrap()).unwrap();
+            assert!(diagnostic.contains(message), "{text:?}: {diagnostic}");
+        }
+    }
+
+    /// A refused value is reported at the line and column of the file that wrote it,
+    /// a merged entry at its own file's, and the report quotes no text around it.
+    #[tokio::test]
+    async fn refusals_name_where_the_refused_value_is_written() {
+        let f = Fixture::<ExampleConfig>::new();
+        write(
+            &f.xdg,
+            "limit: 4\nmodels:\n  user: {value: 1, note: do-not-leak}\n",
+        );
+        let refused = async |text: &str| {
+            write(&f.local, text);
+            let error = f.resolve(()).await.unwrap_err();
+            assert!(!error.to_string().contains("do-not-leak"), "{error}");
+            let diagnostic = error.report().diagnostics.last().unwrap().clone();
+            (diagnostic.path, diagnostic.position)
+        };
+        let nested = "roles:\n  r:\n    value: 1\n    cwd: [x]\n";
+        assert_eq!(refused(nested).await, (f.local.clone(), Some((4, 10))));
+        let entry = "models:\n  workspace: {value: one}\n";
+        assert_eq!(refused(entry).await, (f.local.clone(), Some((2, 22))));
+        let top = "# leading comment\nlimit: [1]\n";
+        assert_eq!(refused(top).await, (f.local.clone(), Some((2, 8))));
+        write(&f.xdg, "\n\nmodels:\n  user: {value: 1, notes: x}\n");
+        let error = resolve_layers::<ExampleConfig>(&f.workspace, Some(&f.xdg), ())
+            .await
+            .unwrap_err();
+        let diagnostic = &error.report().diagnostics[0];
+        assert_eq!(diagnostic.position, Some((4, 20)));
+        assert!(
+            (diagnostic.to_string()).starts_with(&format!("{}:4:20: ", f.xdg.display())),
+            "{diagnostic}"
+        );
+    }
+
     /// Discovery takes the first usable candidate: an absent one is silent, a
     /// refused one is reported once, and with none usable the workspace file alone
     /// configures.
@@ -655,16 +675,16 @@ providers:
         let f = Fixture::<ExampleConfig>::new();
         write(&f.home, "models:\n  kept: {value: 1}\n");
         let candidates = vec![f.xdg.clone(), f.xdg.clone(), f.home.clone()];
-        let resolve = || resolve_paths::<ExampleConfig>(&f.workspace, None, candidates.clone());
+        let resolve = || resolve_paths::<ExampleConfig>(&f.workspace, None, candidates.clone(), ());
         let refusals: [Option<&[u8]>; 8] = [
             None,
             Some(b"DIRECTORY"), // read failure, works even when tests run as root
             Some(b"\xff\xfe"),  // invalid UTF-8
             Some(b""),          // not a mapping
             Some(b"malformed: ["), // YAML
-            Some(b"limit: bad"), // serde type
-            Some(b"unrecognized: 1"), // serde unknown field
-            Some(b"limit: 0\nmodels:\n  a: {value: 1}"), // admission
+            Some(b"limit: bad"), // type
+            Some(b"unrecognized: 1"), // unknown field
+            Some(b"limit: 0\nmodels:\n  a: {value: 1}"), // check
         ];
         for refused in refusals {
             if f.xdg.is_dir() {
@@ -696,7 +716,7 @@ providers:
         std::fs::remove_file(&f.home).unwrap();
         write(&f.local, "models:\n  local: {value: 2}\n");
         for (candidates, diagnostics) in [(candidates.clone(), 1), (Vec::new(), 0)] {
-            let resolved = resolve_paths::<ExampleConfig>(&f.workspace, None, candidates)
+            let resolved = resolve_paths::<ExampleConfig>(&f.workspace, None, candidates, ())
                 .await
                 .unwrap();
             assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));

@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use super::{Config, ConfigError, ModeError};
+use super::{Config, ConfigError};
 use crate::{
     config::mode::ModeName,
     identity::HostName,
     provider::{
-        dialect::AdmittedProvider,
+        dialect::{AdmittedProvider, CodecName},
         model::{ModelEntry, ModelProfile, ModelRef, ProviderName},
     },
 };
@@ -51,48 +51,24 @@ pub struct ConfiguredModel {
 }
 
 impl Config {
-    /// Seal the configuration, caller edits included. Targets, modes and every
-    /// provider entry are admitted before the catalog; all admission and
-    /// selection errors precede credential lookup, provider contexts, or
-    /// workspace access.
+    /// Seal the configuration, caller edits included: its one admission. Targets, modes
+    /// and every provider entry are admitted, and the default model resolved, before the
+    /// catalog; all admission and selection errors precede credential lookup, provider
+    /// contexts, or workspace access.
     pub fn into_runtime(self) -> Result<RuntimeConfig, ConfigError> {
         let providers = self.admit()?;
+        let default = self.sealable().map_err(ConfigError::Refused)?;
         let first = providers
             .values()
             .position(|provider| !provider.models().is_empty())
             .ok_or(ConfigError::NoModels)?;
-        if !self.modes.contains_key(&self.default_mode) {
-            return Err(ConfigError::Mode {
-                name: self.default_mode.clone(),
-                error: ModeError::Undeclared,
-            });
-        }
-        let default = match &self.default_model {
-            Some(model) => {
-                locate(&providers, model).map_err(|error| ConfigError::DefaultModel {
-                    model: model.clone(),
-                    error,
-                })?
-            }
-            None => (first, 0),
-        };
+        let default = default.unwrap_or((first, 0));
         Ok(RuntimeConfig(Arc::new(Admitted {
             config: self,
             providers,
             default,
         })))
     }
-}
-
-fn locate(
-    providers: &IndexMap<ProviderName, AdmittedProvider>,
-    model: &ModelRef,
-) -> Result<(usize, usize), SelectionError> {
-    let (provider, _, config) = providers
-        .get_full(&model.provider)
-        .ok_or(SelectionError::UnknownProvider)?;
-    let model = (config.models().get_index_of(&model.model)).ok_or(SelectionError::UnknownModel)?;
-    Ok((provider, model))
 }
 
 impl RuntimeConfig {
@@ -131,11 +107,12 @@ impl RuntimeConfig {
     /// Admit an external or persisted `provider/model` name against this
     /// configuration generation.
     pub fn select_model(&self, name: &ModelRef) -> Result<ConfiguredModel, ConfigError> {
-        let (provider, model) =
-            locate(&self.0.providers, name).map_err(|error| ConfigError::Model {
-                name: name.clone(),
-                error,
-            })?;
+        let selected = self.config().selected(name).map(|(index, _)| index);
+        let (provider, model) = selected.map_err(|error| ConfigError::Model {
+            name: name.clone(),
+            error,
+            configured: self.config().configured_models(),
+        })?;
         Ok(ConfiguredModel {
             config: self.clone(),
             provider,
@@ -147,6 +124,13 @@ impl RuntimeConfig {
     pub fn model(&self, name: &ModelRef) -> Option<&ModelProfile> {
         let provider = self.0.providers.get(&name.provider)?;
         Some(provider.models().get(&name.model)?.profile())
+    }
+
+    /// Where a configured model's requests go: its provider's API root and the codec
+    /// it speaks there.
+    pub fn endpoint(&self, name: &ModelRef) -> Option<(&str, CodecName)> {
+        let provider = self.0.providers.get(&name.provider)?;
+        Some((provider.root(), provider.models().get(&name.model)?.codec()))
     }
 
     /// Every configured model in declaration order, qualified by its provider.
@@ -170,7 +154,7 @@ impl RuntimeConfig {
         let known = modes.get_key_value(name).map(|(name, _)| name);
         known.ok_or_else(|| ConfigError::Mode {
             name: name.clone(),
-            error: ModeError::Unknown,
+            declared: self.config().declared_modes(),
         })
     }
 
@@ -282,7 +266,7 @@ mod tests {
         ] {
             let unknown = name(unknown);
             assert!(
-                matches!(runtime.select_model(&unknown), Err(ConfigError::Model { name, error }) if name == unknown && error == reason),
+                matches!(runtime.select_model(&unknown), Err(ConfigError::Model { name, error, .. }) if name == unknown && error == reason),
                 "{unknown}"
             );
         }
@@ -321,12 +305,15 @@ mod tests {
             text("http://127.0.0.1:1/v1", "", MODELS)
         );
         let error = Config::from_yaml(&missing).unwrap().into_runtime().err();
-        assert_matches!(
-            &error,
-            Some(ConfigError::DefaultModel { model, error: SelectionError::UnknownModel })
-                if model.to_string() == "vendor 任意/missing"
+        assert_matches!(&error, Some(ConfigError::Refused(_)));
+        let configured = skyhook_base::decode::one_of(runtime.models().map(|(name, _)| name));
+        assert_eq!(
+            error.unwrap().to_string(),
+            format!(
+                "invalid configuration: `default_model`: model is not configured, expected one \
+                 of {configured}"
+            )
         );
-        assert!(error.unwrap().to_string().contains("default_model"));
         assert!(Config::from_yaml("default_model: unqualified").is_err());
         // An earlier provider without models does not supply the default.
         let two = format!(
@@ -372,7 +359,7 @@ mod tests {
         raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
         assert!(matches!(
             raw.clone().into_runtime(),
-            Err(ConfigError::Targets(_))
+            Err(ConfigError::Refused(_))
         ));
         raw.targets.entries.clear();
         assert!(matches!(raw.into_runtime(), Err(ConfigError::NoModels)));

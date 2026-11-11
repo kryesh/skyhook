@@ -237,6 +237,8 @@ pub(super) fn computer_name() -> String {
     }
 }
 
+skyhook_base::decode_from_str!(Kdc);
+
 #[cfg(test)]
 mod tests {
     use super::*;

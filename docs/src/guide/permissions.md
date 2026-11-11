@@ -76,7 +76,9 @@ none. A host capability name is `<namespace>.<name>` (lowercase ASCII letters, d
 underscores, each component starting with a letter).
 
 A capability list is exact; `[]` grants no policy capabilities. Undeclared names are errors in
-a mode and in `--capabilities`, and `interactive` in a mode. The host supplies `interactive`
+a mode, an MCP server's `capabilities` and `--capabilities`, and `interactive` in a mode. A
+configuration naming a host capability the running application does not declare is refused
+when it loads, with every capability that application accepts. The host supplies `interactive`
 independently of the list: the terminal always has it and `skyhook batch` never does, so an
 empty list does not disable the terminal interface or root questions. Per-agent depth
 restrictions narrow the result. Enable target support by including `"targets"` in a mode.

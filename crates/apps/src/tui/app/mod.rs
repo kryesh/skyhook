@@ -381,6 +381,7 @@ pub(super) mod tests {
     pub(super) use serde_json::json;
     use skyhook::agent::SessionHandle;
     pub(super) use skyhook::agent::{Question, QuestionAnswer, QuestionOption, QuestionReply};
+    use skyhook::config::RuntimeConfig;
     use skyhook::interaction::Prompt;
     use skyhook::interaction::PromptKind;
     use skyhook::session::RuntimeEvent;
@@ -601,6 +602,7 @@ pub(super) mod tests {
         pub(crate) live: skyhook::session::ObservationSnapshot,
         pub(crate) window: model::Window,
         pub(crate) projection: Projection,
+        pub(crate) config: RuntimeConfig,
     }
 
     impl Whole {
@@ -630,19 +632,21 @@ pub(super) mod tests {
                 presentation,
                 outputs,
                 unsaved: &[],
+                config: &self.config,
             }
         }
     }
 
     /// What the app shows of `agent`'s conversation, read whole from `session`'s store:
     /// its live slice, every page of it, and every agent's summary.
-    pub(crate) async fn read(session: &SessionHandle, agent: &AgentId) -> Whole {
+    pub(crate) async fn read(app: &App, session: &SessionHandle, agent: &AgentId) -> Whole {
         crate::tests::bounded(async {
             let prepared = prepared(session.clone()).await;
             Whole {
                 live: *prepared.shown.snapshot,
                 window: pages::whole(session, agent).await.unwrap(),
                 projection: *prepared.shown.projection,
+                config: app.launch.model().config().clone(),
             }
         })
         .await
@@ -655,7 +659,7 @@ pub(super) mod tests {
         let newest = journal(&session).await.last().map(|record| record.sequence);
         let applied = |app: &App| Some(app.snapshot.applied) >= newest;
         played::observe_until(app, applied).await;
-        let mut read = read(&session, &app.selected).await;
+        let mut read = read(app, &session, &app.selected).await;
         read.live = app.snapshot.clone();
         read.entries(&app.outputs, details)
     }
@@ -719,6 +723,7 @@ pub(super) mod tests {
             presentation,
             outputs: &app.outputs,
             unsaved: &app.unsaved_status,
+            config: app.launch.model().config(),
         };
         model::entries(inputs, true)
     }

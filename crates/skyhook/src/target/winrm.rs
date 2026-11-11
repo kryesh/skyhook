@@ -3,6 +3,7 @@ use std::num::NonZeroU16;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use skyhook_base::decode::Decode;
 use skyhook_worker::{
     origin::winrm::{Auth, AuthKind, Kdc, PrincipalError, Tls},
     secret::Credential,
@@ -22,7 +23,7 @@ pub struct WinrmOptions {
 
 // `WinrmOptions` as written.
 #[serde_with::skip_serializing_none]
-#[derive(Deserialize, JsonSchema, Serialize)]
+#[derive(Deserialize, JsonSchema, Serialize, Decode)]
 #[serde(deny_unknown_fields, rename = "WinrmOptions")]
 #[schemars(rename = "WinrmOptions")]
 struct RawWinrmOptions {
@@ -59,6 +60,8 @@ enum WinrmOptionsError {
     #[error("kdc applies only to kerberos")]
     Kdc,
 }
+
+skyhook_base::decode_via!(WinrmOptions => RawWinrmOptions);
 
 impl TryFrom<RawWinrmOptions> for WinrmOptions {
     type Error = WinrmOptionsError;
@@ -157,6 +160,8 @@ mod tests {
             "{user: alice, auth: negotiate, tls: system}",
             "{user: '', password: pw, auth: basic, tls: {ca: ~/ca.pem}}",
             "{user: alice, password: pw, auth: negotiate, tls: {fingerprint: ab}}",
+            "{user: alice, password: pw, tls: ca}",
+            "{user: alice, password: pw, tls: {system: null}}",
         ] {
             assert!(parse(invalid).is_err(), "{invalid}");
         }

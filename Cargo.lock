@@ -4390,7 +4390,6 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "serde_json_path",
- "serde_path_to_error",
  "serde_with",
  "sha2",
  "skyhook-base",
@@ -4430,7 +4429,6 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
- "serde_path_to_error",
  "skyhook",
  "skyhook-base",
  "skyhook-media",
@@ -4451,6 +4449,7 @@ dependencies = [
 name = "skyhook-base"
 version = "0.7.0"
 dependencies = [
+ "indexmap",
  "schemars",
  "serde",
  "serde_json",

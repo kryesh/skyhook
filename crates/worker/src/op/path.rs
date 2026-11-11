@@ -183,6 +183,8 @@ pub enum Protected {
     Workspace,
 }
 
+skyhook_base::decode_via!(TargetPath => String);
+
 #[cfg(test)]
 mod tests {
     use super::*;

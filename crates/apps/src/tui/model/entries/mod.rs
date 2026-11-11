@@ -14,6 +14,7 @@ use super::changes::Changes;
 use super::live::{live_tail, live_tail_responses};
 use super::window::{Content, Window};
 use super::{Entry, EntryKey, EntryView, Focus, Gap, Projection, Surface, Tab, UnsavedStatus};
+use skyhook::config::RuntimeConfig;
 use skyhook::job::JobEnvelope;
 use skyhook::job::JobRole;
 use skyhook::session::ObservationSnapshot;
@@ -146,6 +147,8 @@ pub struct Inputs<'a> {
     pub presentation: EntryView<'a>,
     pub outputs: &'a OutputStore,
     pub unsaved: &'a [UnsavedStatus],
+    /// The configuration requests are sent under now.
+    pub config: &'a RuntimeConfig,
 }
 
 impl<'a> Inputs<'a> {
@@ -570,7 +573,7 @@ pub fn entries(inputs: Inputs<'_>, include_live: bool) -> Vec<Entry> {
 mod tests {
     use super::super::tests::replay;
     use super::*;
-    use crate::tests::bounded;
+    use crate::tests::{CONFIG, bounded};
     use crate::tui::app::{
         App,
         played::{
@@ -716,13 +719,13 @@ mod tests {
         let card = failed(&mut app, 1).await;
         assert_eq!(card.surface, Surface::Error);
         assert!(card.text().contains(&super::super::retry::refusal_hint()));
-        // An ordinary failure keeps the muted presentation.
+        // An ordinary failure is an error too.
         let asked = ask(&session, "again");
         let rejected = ProviderErrorKind::Protocol.error("rejected");
         model.turn().await.fail(rejected);
         let _ = bounded(asked).await.unwrap();
         let card = failed(&mut app, 2).await;
-        assert_eq!(card.surface, Surface::Status);
+        assert_eq!(card.surface, Surface::Error);
     }
 
     /// A partial attempt shows where it settled until its agent's next turn begins,
@@ -788,7 +791,8 @@ mod tests {
         assert!(last.unwrap().text().contains("current stream"));
     }
 
-    /// An open retrying card lists its attempts' whole failures, a run per change.
+    /// An open retrying card lists its attempts' whole failures, a run per change,
+    /// and still discloses them once an interrupt ends the retry.
     #[tokio::test]
     async fn retry_card_lists_each_attempts_whole_failure() {
         let (_root, mut app, mut model, session) = played_fixture().await;
@@ -815,14 +819,15 @@ mod tests {
         observe_until(&mut app, |app| count(&app.journal, scheduled) == 3).await;
         let request = latest_request(&app.journal).unwrap();
         let key = EntryKey::Retry(request);
-        let title = "Retrying · attempt 4 · RateLimited";
+        let title = "Retrying · attempt 4 · RateLimited · test/first (fixture)";
         // Safe to paint: the escape is cleaned away.
-        let whole = format!(
+        let failures = format!(
             "attempts 1–2  Unavailable: upstream busy\n\
              attempt 3     RateLimited: HTTP 429 slow down\n{:14}[31m{}",
             "",
             "x".repeat(1000)
         );
+        let whole = format!("http://127.0.0.1:1 · chat_completions\n{failures}");
         let cards = whole_entries(&mut app, false).await;
         let mut retries = cards.iter().filter(|card| card.key() == &key);
         assert_eq!(retries.next().unwrap().text(), format!("▸ {title}"));
@@ -841,8 +846,19 @@ mod tests {
         session.interrupt().await;
         let ended = |event: &SessionEvent| matches!(event, SessionEvent::AgentInterrupted);
         observe_until(&mut app, |app| recorded(&app.journal, ended)).await;
+        let title = "Interrupted · attempt 3 · test/first (fixture)";
         let cards = whole_entries(&mut app, false).await;
-        let card = cards.iter().find(|card| card.key() == &key);
-        assert_eq!(card.unwrap().text(), "Interrupted · attempt 3");
+        let card = cards.iter().find(|card| card.key() == &key).unwrap();
+        assert_eq!(card.text(), format!("▸ {title}"));
+        let shown = app.entries().iter().find(|card| card.key() == &key);
+        assert!(shown.unwrap().expandable());
+        let cards = whole_entries(&mut app, true).await;
+        let card = cards.iter().find(|card| card.key() == &key).unwrap();
+        assert_eq!(card.text(), format!("▾ {title}\n{whole}"));
+        // A model the configuration no longer has was sent nowhere it can name.
+        app.reconfigure(&CONFIG.replace("first:", "other:")).await;
+        let cards = whole_entries(&mut app, true).await;
+        let card = cards.iter().find(|card| card.key() == &key).unwrap();
+        assert_eq!(card.body(), failures);
     }
 }

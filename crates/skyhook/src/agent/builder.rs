@@ -12,9 +12,7 @@ use crate::tool::ToolRegistry;
 use crate::tool::builtins::HostSkills;
 use crate::{
     config::mode::{Mode, ModeName},
-    tool::policy::{
-        AllowAll, Capability, CapabilitySet, HostCapability, HostCapabilityDeclaration, Policy,
-    },
+    tool::policy::{AllowAll, CapabilitySet, HostCapability, HostCapabilityDeclaration, Policy},
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -361,12 +359,9 @@ impl HarnessBuilder {
                     .values()
                     .flat_map(|server| server.capabilities().iter()),
             );
-        for capability in configured {
-            if let Capability::Host(host) = capability
-                && !self.host_capabilities.contains(host)
-            {
-                return Err(HarnessError::UndeclaredHostCapability(host.clone()));
-            }
+        let declared = |host: &HostCapability| self.host_capabilities.contains(host);
+        if let Some(host) = crate::tool::policy::undeclared(configured, declared).next() {
+            return Err(HarnessError::UndeclaredHostCapability(host.clone()));
         }
         let session_root = self
             .session_root
@@ -632,7 +627,7 @@ mod tests {
                 base().mcp(
                     [(
                         "research".to_owned(),
-                        serde_json::from_value(json!({
+                        crate::tests::decode(json!({
                             "transport": "stdio",
                             "start_command": ["never-started"],
                             "capabilities": [capability],

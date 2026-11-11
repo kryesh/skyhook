@@ -1,11 +1,10 @@
 use super::changes::Changes;
 use super::entries::{Dep, History, Inputs};
 use super::live::{live_tail, live_tail_responses};
-use super::{Entry, EntryKey, EntryView, Projection, Tab, UnsavedStatus, Window};
-use crate::tui::model::OutputStore;
+use super::{Entry, EntryKey, EntryView, Tab};
 use skyhook::identity::AgentId;
 use skyhook::session::RequestSeq;
-use skyhook::session::{ObservationSnapshot, RuntimeEvent};
+use skyhook::session::RuntimeEvent;
 use skyhook_worker::job::JobId;
 use std::collections::HashSet;
 
@@ -88,29 +87,19 @@ impl ContentCache {
         std::mem::take(&mut self.changes)
     }
 
-    /// Bring the entries up to date with `window`, noting what changed for the renderer.
-    pub fn update(
-        &mut self,
-        live: &ObservationSnapshot,
-        window: &mut Window,
-        projection: &mut Projection,
-        presentation: EntryView<'_>,
-        outputs: &OutputStore,
-        unsaved: &[UnsavedStatus],
-    ) {
+    /// Bring the entries up to date with `inputs`, of which `changed` did since the last
+    /// call, noting what changed for the renderer.
+    pub fn update(&mut self, inputs: Inputs<'_>, mut changed: HashSet<Dep>) {
         let entries = &mut self.entries;
-        let mut changed = projection.take_changes();
-        changed.extend(window.take_changes());
-        let (projection, window) = (&*projection, &*window);
         let EntryView {
             agent,
             tab,
             all_details,
             today,
             ..
-        } = presentation;
+        } = inputs.presentation;
         let identity = BuiltFor {
-            window: window.id,
+            window: inputs.window.id,
             agent: agent.clone(),
             tab,
             all_details,
@@ -119,14 +108,6 @@ impl ContentCache {
         let dirty_responses = std::mem::take(&mut self.dirty_responses);
         changed.extend(dirty_responses.iter().copied().map(Dep::Request));
         changed.extend(self.invalid.drain());
-        let inputs = Inputs {
-            live,
-            window,
-            projection,
-            presentation,
-            outputs,
-            unsaved,
-        };
         let rebuild = self.identity.as_ref() != Some(&identity);
         let old = if rebuild {
             self.identity = Some(identity);

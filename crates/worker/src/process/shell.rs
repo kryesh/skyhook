@@ -4,6 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use skyhook_base::decode::{Context, Decode, Node, Value};
+
 use crate::op::Program;
 
 // A command: shell text, or a program and its arguments.
@@ -119,4 +121,18 @@ pub fn powershell_script(text: &str) -> String {
         if ($LASTEXITCODE) { exit $LASTEXITCODE }\n\
         exit 1";
     format!("{PREAMBLE}{text}{EPILOGUE}")
+}
+
+/// Shell text as a string, a program and its arguments as a list.
+impl Decode for CommandLine {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        match node.value {
+            Value::Str(_) => String::decode(node, cx).map(Self::Shell),
+            Value::Seq(_) => Vec::decode(node, cx).map(Self::Argv),
+            _ => {
+                cx.expected(node, "shell text or a list of a program and its arguments");
+                None
+            }
+        }
+    }
 }

@@ -765,7 +765,7 @@ mod tests {
     async fn shown(app: &App, text: &str) -> usize {
         app.status.flush().await;
         let session = app.session().unwrap();
-        let read = read(session, app.root_agent()).await;
+        let read = read(app, session, app.root_agent()).await;
         let entries = read.entries(&app.outputs, false);
         entries
             .iter()

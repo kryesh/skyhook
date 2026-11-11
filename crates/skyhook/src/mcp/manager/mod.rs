@@ -540,7 +540,7 @@ for line in sys.stdin:
     // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
     pub(super) fn server(config: Value) -> McpServerConfig {
-        serde_json::from_value(config).unwrap()
+        crate::tests::decode(config).unwrap()
     }
 
     pub(super) async fn connect(config: Value) -> McpManager {

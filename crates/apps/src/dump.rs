@@ -24,7 +24,9 @@ pub async fn run<P: Product>(
     match request {
         DumpRequest::Config(request, args) => {
             let workspace = &request.source.workspace;
-            let (mut resolved, options) = crate::config::load(&request, args, workspace).await?;
+            let declared = &identity.capabilities;
+            let (mut resolved, options) =
+                crate::config::load(&request, args, workspace, declared).await?;
             let context = SessionContext {
                 workspace,
                 opening: Opening::New(None),
@@ -89,7 +91,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, {}]\ntargets:\n  remote:\n    type: ssh\n    host: remote.test\n    via: defined-later\n",
+                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, {}]\ntargets:\n  hop:\n    type: ssh\n    host: hop.test\n  remote:\n    type: ssh\n    host: remote.test\n    via: hop\n",
                 quoted(format!("{}; printf key", ran("CREDENTIAL_RAN"))),
                 quoted(ran("MCP_RAN")),
             ),
@@ -111,11 +113,7 @@ mod tests {
         )
         .unwrap();
         assert!(dumped.approve_all);
-        assert!(
-            std::str::from_utf8(&output)
-                .unwrap()
-                .contains("via: defined-later")
-        );
+        assert!(std::str::from_utf8(&output).unwrap().contains("via: hop"));
         assert!(!workspace.exists());
         for path in ["CREDENTIAL_RAN", "MCP_RAN", ".skyhook"] {
             assert!(

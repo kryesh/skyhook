@@ -335,11 +335,10 @@ pub(crate) mod tests {
         root: &std::path::Path,
         provider: Arc<dyn Provider>,
     ) -> HarnessBuilder {
-        let profile: skyhook::provider::model::ModelProfile =
-            serde_json::from_value(serde_json::json!({
-                "model":"test", "reasoning":null, "max_context":32000, "max_output":1000,
-            }))
-            .unwrap();
+        let profile: skyhook::provider::model::ModelProfile = skyhook::yaml::parse(
+            "{model: test, reasoning: null, max_context: 32000, max_output: 1000}",
+        )
+        .unwrap();
         let identity = skyhook::product::Product::identity(&crate::product::Security);
         HarnessBuilder::new(root, identity.host)
             .provider(

@@ -294,7 +294,7 @@ mod tests {
         // If view-only startup were to connect MCP, this command would write a
         // marker even though it is not an MCP server.
         let marker = root.path().join("foreign-mcp-started");
-        let mcp = serde_json::from_value(json!({
+        let mcp = crate::tests::decode(json!({
             "transport": "stdio",
             "start_command": ["touch", marker],
             "capabilities": [],
@@ -1655,7 +1655,7 @@ mod tests {
             });
             let provider = scripted_provider(&Requests::default(), [answer("done")]);
             test_builder(root.path(), &sessions, provider, false)
-                .targets_config(serde_json::from_value(targets).unwrap())
+                .targets_config(crate::tests::decode(targets).unwrap())
                 .build()
         };
         let password = |session: &SessionHandle| {

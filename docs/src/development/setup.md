@@ -13,15 +13,26 @@ cd skyhook
 just setup
 ```
 
-`just setup` adds the `rustfmt` and `clippy` components, every shim target, and this machine's release
-target, and installs `cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. It then
-checks for Zig and what [release builds](#release-builds) need, and names whatever is missing. See
+`just setup` adds the `rustfmt` and `clippy` components and every shim target, and installs
+`cargo-zigbuild`, `cargo-nextest`, and mdBook with `cargo install`. It then checks for Zig and what
+[release builds](#release-builds) need, and names whatever is missing. See
 [remote transport and shims](remote-transport-and-shims.md) for shim profiles and artifacts.
 
 ## Release builds
 
-`just build-release` compiles V8 from source the first time it builds a `v8` version for a
-target, and reuses that build afterwards. It needs, on `PATH`:
+`just build-release [target]` builds both applications into `target/<target>/release` on a Linux
+host; only x86_64 hosts have been tested.
+
+- Without `target`, it builds for this machine's own target (`just --evaluate native_target`
+  prints it), using the host's C library and name resolution.
+- `just build-release x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` builds a static
+  binary with musl's own resolver.
+
+Targets of other architectures fail before building.
+
+The first build for a `v8` version and target compiles V8 from source, taking several CPU-hours
+and a few gigabytes under `target/v8`; later builds reuse it. To build offline, keep `target/v8`
+and the cargo registry from an earlier build. The build needs, on `PATH`:
 
 - `clang` and `clang++` at least as new as the clang major that V8 version's Chromium build pins,
   with their compiler-rt builtins; the build stops with the required version if the installed one
@@ -29,23 +40,10 @@ target, and reuses that build afterwards. It needs, on `PATH`:
 - from the same LLVM, `ld.lld`, `llvm-ar`, `llvm-nm`, `llvm-readelf` and `llvm-objcopy`, and
   `llvm-config` for its `libclang.so`;
 - `gn`, `ninja`, `git`, `python3`, and `unshare` (util-linux); `ccache` is used when present;
-- a nightly Rust toolchain as this repository's active toolchain, since V8's own build passes
-  unstable flags to `rustc`.
-
-The first build for a version clones the rusty_v8 source with its submodules and
-fetches crates.io sources, then compiles without network access: nothing else is downloaded, and a
-build step that tries to fails. That first build takes several CPU-hours and a few gigabytes of
-disk under `target/v8`, and more for each further target; later builds of the same version and
-target reuse the archive. To build offline, keep `target/v8` and the cargo registry
-from an earlier build.
+- a nightly Rust toolchain as this repository's active toolchain.
 
 To upgrade V8, bump `v8` in `crates/skyhook/Cargo.toml`, run `cargo update -p v8`, and run
 `just build-release` as usual.
-
-Release targets are the musl targets of the architectures `scripts/v8-archive.sh` maps to V8's
-build names, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`; a target of any other
-architecture fails before building. The build host can be any Linux host whose own architecture is
-mapped; only x86_64 hosts have been tested, not aarch64.
 
 ## Common tasks
 
@@ -53,13 +51,13 @@ Run these commands from the repository root:
 
 | Command | Purpose |
 | --- | --- |
-| `just setup` | Install the Rust-side tooling, shim targets, and this machine's release target. |
+| `just setup` | Install the Rust-side tooling and shim targets, and check for the other build tools. |
 | `just build-shims` | Cross-compile debug shims for every Linux and Windows shim target into `target/shims`; requires Zig. |
 | `just build-shims-release` | Cross-compile size-optimised shims into `target/shims`; requires Zig. |
 | `just build` | Debug builds of both applications; they read `target/shims` live at runtime. |
-| `just build-release [target]` | Release builds of both applications in `target/<target>/release`, embedding the current contents of `target/shims`; `target` defaults to the static musl target of this Linux machine's architecture (`just --evaluate host_target` prints it). |
+| `just build-release [target]` | Release builds of both applications in `target/<target>/release`, embedding the current contents of `target/shims`; see [release builds](#release-builds) for `target`. |
 | `just build-full [target]` | Release shims, then release applications for `target` that embed them. |
-| `just install` | `build-full` for this machine, then install both applications into `~/.local/bin`. |
+| `just install [target]` | `build-full` for `target`, then install both applications into `~/.local/bin`. |
 | `just run [args]`, `just run-security [args]` | Run a debug application. |
 | `just test` | Nextest suite over the workspace and all targets. |
 | `just lint` | Clippy over the workspace and all targets with warnings denied. |

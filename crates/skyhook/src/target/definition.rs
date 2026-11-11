@@ -305,7 +305,6 @@ mod tests {
             },
             TargetError::Cycle(named()),
             TargetError::SecretsInOneConnection {
-                target: named(),
                 first: named(),
                 second: named(),
             },

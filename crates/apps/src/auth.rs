@@ -33,9 +33,11 @@ pub async fn run(command: AuthCommand, identity: &Identity) -> Result<(), AuthEr
     let (AuthCommand::Login { target, .. } | AuthCommand::Status { target, .. }) = &command;
     let (provider, source) = (&target.provider, &target.source);
     // Host layers may carry host settings such as `approve_all`, which the library refuses.
+    // No product runs here, so none's capability declarations bear on what the file grants.
     let config = crate::config::resolve_layers::<skyhook::launch::config::HostConfig>(
         &source.workspace,
         source.config.as_deref(),
+        None,
     )
     .await?
     .config

@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
 use serde::Serialize;
 
 use crate::provider::{
-    codec::{Codec, CodecName, StateRole},
+    codec::{Codec, StateRole},
     http::{
         Headers, HttpProvider, Transport, headers::Value, reasoning_scope, transport::EVENT_STREAM,
     },
@@ -29,6 +29,7 @@ pub mod openai;
 pub mod openrouter;
 mod placements;
 
+pub use crate::provider::codec::CodecName;
 use crate::provider::http::credentials::{Pending, Scheme, Sources};
 pub use crate::provider::http::{
     credentials::{BuildError, HeaderError, ValueError, ValueField, ValueProblem},
@@ -36,7 +37,7 @@ pub use crate::provider::http::{
 };
 pub use crate::provider::settings::{MissingSetting, Setting};
 pub(crate) use config::Connection;
-pub use config::{AdmissionError, Common, EndpointError, ModelError};
+pub use config::{AdmissionError, Common, EndpointError, ModelError, Unset};
 pub(crate) use entry::AdmittedProvider;
 pub use entry::{ConfigHome, ProviderModels, ProviderSettings, RawProviderConfig};
 pub use login::{
@@ -289,7 +290,7 @@ pub(crate) mod tests {
     /// The replay scope `yaml` settings admit under `codec`.
     pub(crate) fn replay_scope<C>(yaml: &str, codec: CodecName) -> String
     where
-        C: DialectConfig + serde::de::DeserializeOwned,
+        C: DialectConfig + skyhook_base::decode::Decode,
     {
         let settings = crate::yaml::parse::<C>(yaml).unwrap();
         settings.admit(codec).unwrap().scope

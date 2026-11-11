@@ -1,5 +1,7 @@
-//! Derives for Skyhook's enums, which `skyhook_base::enums` exports beside the trait
-//! they implement.
+//! Derives for Skyhook's enums and configuration types, which `skyhook_base` exports
+//! beside the traits they implement.
+
+mod decode;
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
@@ -13,7 +15,8 @@ use syn::{
 /// deserializes to its variant but is never emitted. It generates `ALL`, `as_str`, the
 /// `NamedEnum` trait, `FromStr`, `Deserialize`, which lists the spellings when it refuses a
 /// value, and `Display`, unless variants carry `#[error]` messages to display instead.
-/// `Serialize` and `JsonSchema` derive as usual from the same attributes.
+/// It decodes from configuration as it deserializes. `Serialize` and `JsonSchema` derive as
+/// usual from the same attributes.
 ///
 /// ```ignore
 /// #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, NamedEnum)]
@@ -29,6 +32,24 @@ use syn::{
 pub fn named_enum(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
     named(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// A configuration type decoded from a mapping: its keys, each read as its field's type,
+/// the rest refused with every key it takes, and every key it requires and lacks refused
+/// together. serde's `rename`, `default`, `flatten` and `skip` spell a field as they do for
+/// `Serialize`, and the container's `default` takes a left-out field from `Default`.
+/// `#[decode(source)]` gives a `Source` field where the mapping is written,
+/// `#[decode(with = "path")]` reads a field by `fn(&Node, &mut Context) -> Option<T>`,
+/// `#[decode(check = "path")]` runs `fn(&mut Self, &Node, &mut Context)` on the value, and
+/// `#[decode(bound = "...")]` bounds the impls. An enum is read by its `tag`, as serde or
+/// `#[decode(tag = "key")]` names it, whose value names the variant: one flattened value or
+/// its own fields. A `transparent` struct decodes as its one field.
+#[proc_macro_derive(Decode, attributes(decode, serde))]
+pub fn decode(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    decode::derive(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -241,6 +262,15 @@ fn named(input: &DeriveInput) -> syn::Result<TokenStream> {
             }
         }
 
+        impl ::skyhook_base::decode::Decode for #name {
+            fn decode(
+                node: &::skyhook_base::decode::Node,
+                cx: &mut ::skyhook_base::decode::Context,
+            ) -> ::std::option::Option<Self> {
+                #base::decode(node, cx)
+            }
+        }
+
         impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D: ::serde::Deserializer<'de>>(
                 deserializer: D,
@@ -258,7 +288,7 @@ fn serde(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
 }
 
 /// `name` as serde's `snake_case` rule spells a variant.
-fn snake(name: &str) -> String {
+pub(crate) fn snake(name: &str) -> String {
     let mut snake = String::new();
     for (index, ch) in name.char_indices() {
         if index > 0 && ch.is_uppercase() {

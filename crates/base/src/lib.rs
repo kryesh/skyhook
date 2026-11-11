@@ -5,6 +5,7 @@
 extern crate self as skyhook_base;
 
 pub mod bounded;
+pub mod decode;
 pub mod enums;
 pub mod hex;
 pub mod limits;

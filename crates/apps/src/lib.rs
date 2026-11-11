@@ -40,10 +40,19 @@ impl OperationError {
 /// terminal controls escaped.
 pub fn exit_on<T>(label: &str, result: Result<T, impl std::fmt::Display>) -> T {
     result.unwrap_or_else(|error| {
-        let error = skyhook_tools::diagnostic::escape_controls(error);
-        eprintln!("{label}: {error}");
+        eprintln!("{label}: {}", escape_lines(error));
         std::process::exit(1)
     })
+}
+
+/// `text` with every terminal control escaped but its line breaks, which multi-line
+/// reports such as a configuration's diagnostics use as structure.
+fn escape_lines(text: impl std::fmt::Display) -> String {
+    let text = text.to_string();
+    let lines = text
+        .split('\n')
+        .map(skyhook_tools::diagnostic::escape_controls);
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 /// Load the invocation's `.env`, then start the async runtime; either failing exits under
@@ -76,6 +85,14 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("test synchronization timed out at {caller}"))
         }
+    }
+
+    #[test]
+    fn exit_reports_keep_line_breaks_but_escape_other_controls() {
+        assert_eq!(
+            super::escape_lines("headline\n  file: \u{1b}[2Jtext\r"),
+            "headline\n  file: \\u{1b}[2Jtext\\r"
+        );
     }
 
     /// A configuration with one model, `test/first`, on an unreachable server. Its models

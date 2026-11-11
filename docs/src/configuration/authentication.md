@@ -14,7 +14,8 @@ A configured value that may hold a secret—a provider's `api_key` and fixed `he
 | `{command: ["program", "arg"]}` | The standard output of a program run directly, without a shell. |
 | `{file: path}` | A file's contents. |
 
-A map names exactly one source. A command's output and a file's contents lose one trailing line
+A map names exactly one source; any other key, or a second source, is refused with the
+sources a map can name. A command's output and a file's contents lose one trailing line
 ending (`\n`, then `\r`). A command runs with standard input closed and standard error
 discarded; its standard output is limited to 64 KiB, and it must exit successfully with UTF-8
 output that is not blank. A file path is absolute on the machine that reads it (`/` on Linux; a

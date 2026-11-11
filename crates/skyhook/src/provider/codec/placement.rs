@@ -4,8 +4,12 @@
 use std::{borrow::Cow, fmt};
 
 use reqwest::header::HeaderName;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
+use skyhook_base::{
+    decode::{Context, Decode, Node},
+    enums::NamedEnum,
+};
 
 use super::Locations;
 use crate::provider::{
@@ -26,9 +30,10 @@ impl Serialize for BodyPath {
     }
 }
 
-impl<'de> Deserialize<'de> for BodyPath {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+impl Decode for BodyPath {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        let path = String::decode(node, cx)?;
+        Self::new(path).map_err(|error| cx.error(node, error)).ok()
     }
 }
 
@@ -119,11 +124,30 @@ impl BodyPath {
 /// A place the stable context identity travels: the one dimension that may be a
 /// header, since some services derive cache affinity from one. Configuration
 /// spells it `{header: name}` or `{body: path}`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheKey {
-    Header(#[serde(with = "header_name")] HeaderName),
+    Header(#[serde(serialize_with = "header_name::serialize")] HeaderName),
     Body(BodyPath),
+}
+
+/// A mapping naming `header` or `body`, and nothing else.
+impl Decode for CacheKey {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        let decode = |key: &str, value: &Node, cx: &mut Context| match key {
+            "header" => {
+                let name = String::decode(value, cx)?;
+                let refused =
+                    |_| cx.error(value, format_args!("`{name}` is not a valid header name"));
+                HeaderName::from_bytes(name.as_bytes())
+                    .map(Self::Header)
+                    .map_err(refused)
+                    .ok()
+            }
+            _ => BodyPath::decode(value, cx).map(Self::Body),
+        };
+        skyhook_base::decode::variant(node, cx, &["header", "body"], decode)
+    }
 }
 
 /// Where the context identity travels: cache affinity, and user isolation on
@@ -148,21 +172,15 @@ pub(crate) const fn header(name: &'static str) -> CacheKey {
 
 mod header_name {
     use reqwest::header::HeaderName;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Serializer;
 
     pub fn serialize<S: Serializer>(name: &HeaderName, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(name.as_str())
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HeaderName, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| serde::de::Error::custom(format!("`{name}` is not a valid header name")))
-    }
 }
 
 /// Cache breakpoint lifetime; the hour costs more to write.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, NamedEnum)]
 pub enum CacheTtl {
     #[serde(rename = "5m")]
     FiveMinutes,
@@ -300,6 +318,6 @@ mod tests {
             crate::provider::ProviderErrorKind::InvalidRequest
         );
         assert_eq!(serde_json::to_value(path("x.y")).unwrap(), "x.y");
-        assert!(serde_json::from_value::<BodyPath>(json!("x..y")).is_err());
+        assert!(crate::tests::decode::<BodyPath>(json!("x..y")).is_err());
     }
 }

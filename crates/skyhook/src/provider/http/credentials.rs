@@ -160,28 +160,51 @@ fn read(credential: Credential, field: &ValueField) -> Result<Raw, ValueError> {
 /// Why a configured header was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderError {
-    #[error("headers: `{0}` is not a valid header name")]
+    #[error("`{0}` is not a valid header name")]
     Name(String),
-    #[error("headers: `{0}` is named twice; header names ignore case")]
+    #[error("`{0}` is named twice; header names ignore case")]
     Duplicate(HeaderName),
-    #[error(transparent)]
-    Value(#[from] ValueError),
+    #[error("{}", ValueError { field: ValueField::Header(name.clone()), problem: problem.clone() })]
+    Value {
+        name: HeaderName,
+        problem: ValueProblem,
+    },
+}
+
+impl HeaderError {
+    /// The header refused, and why, as said at that header.
+    pub(crate) fn refusal(&self) -> (&str, String) {
+        match self {
+            Self::Name(name) => (name, self.to_string()),
+            Self::Duplicate(name) => (name.as_str(), self.to_string()),
+            Self::Value { name, problem } => (name.as_str(), problem.to_string()),
+        }
+    }
 }
 
 /// Configured `headers`, admitted: distinct valid names, each with its credential.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-#[serde(try_from = "Configured", into = "Configured")]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(into = "Configured")]
 pub(crate) struct ConfiguredHeaders(Vec<(HeaderName, Credential)>);
 
-type Configured = indexmap::IndexMap<String, Credential>;
-
-impl TryFrom<Configured> for ConfiguredHeaders {
-    type Error = HeaderError;
-
-    fn try_from(headers: Configured) -> Result<Self, HeaderError> {
+/// Each refusal at the header it names.
+impl skyhook_base::decode::Decode for ConfiguredHeaders {
+    fn decode(
+        node: &skyhook_base::decode::Node,
+        cx: &mut skyhook_base::decode::Context,
+    ) -> Option<Self> {
+        let headers = Configured::decode(node, cx)?;
         Self::admit(&headers)
+            .map_err(|error| {
+                let (name, message) = error.refusal();
+                let path = vec![skyhook_base::decode::Segment::Key(name.to_owned())];
+                cx.error_within(node, path, message);
+            })
+            .ok()
     }
 }
+
+type Configured = indexmap::IndexMap<String, Credential>;
 
 /// The headers as configured.
 impl From<ConfiguredHeaders> for Configured {
@@ -204,7 +227,10 @@ impl ConfiguredHeaders {
             if admitted.iter().any(|(held, _)| *held == header) {
                 return Err(HeaderError::Duplicate(header));
             }
-            admit(credential, ValueField::Header(header.clone()))?;
+            admit(credential, ValueField::Header(header.clone())).map_err(|error| {
+                let (name, problem) = (header.clone(), error.problem);
+                HeaderError::Value { name, problem }
+            })?;
             admitted.push((header, credential.clone()));
         }
         Ok(Self(admitted))

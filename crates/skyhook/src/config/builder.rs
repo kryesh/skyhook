@@ -47,7 +47,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// The configuration, refused for what [`Config::from_yaml`] refuses its document.
+    /// The configuration, refused for what [`Config::into_runtime`] refuses.
     pub fn build(self) -> Result<Config, ConfigError> {
         self.0.validate()?;
         Ok(self.0)
@@ -66,17 +66,19 @@ mod tests {
         const PROVIDER: &str = "{dialect: compatible, codec: chat_completions, base_url: 'http://127.0.0.1:1/v1', models: {main: {model: served, max_context: 4096, max_output: 512}}}";
         const MODE: &str = "{capabilities: [read], hint: Reads}";
         const TARGET: &str = "{type: ssh, host: box.test, via: hop}";
+        const HOP: &str = "{type: ssh, host: hop.test}";
         let review: ModeName = "review".parse().unwrap();
         let builder = || {
             Config::builder()
                 .provider("local".parse().unwrap(), parse(PROVIDER).unwrap())
                 .mode(review.clone(), parse(MODE).unwrap())
                 .target("box", parse(TARGET).unwrap())
+                .target("hop", parse(HOP).unwrap())
                 .default_model("local/main".parse().unwrap())
                 .default_mode(review.clone())
         };
         let document = format!(
-            "default_mode: review\nmodes: {{review: {MODE}}}\nproviders: {{local: {PROVIDER}}}\ndefault_model: local/main\ntargets: {{box: {TARGET}}}\n"
+            "default_mode: review\nmodes: {{review: {MODE}}}\nproviders: {{local: {PROVIDER}}}\ndefault_model: local/main\ntargets: {{box: {TARGET}, hop: {HOP}}}\n"
         );
         let built = builder().build().unwrap();
         let parsed = Config::from_yaml(&document).unwrap();
@@ -84,6 +86,6 @@ mod tests {
         built.into_runtime().unwrap();
         let looped = parse("{type: ssh, host: hop.test, via: box}").unwrap();
         let refused = builder().target("hop", looped).build();
-        assert!(matches!(refused, Err(ConfigError::Targets(_))));
+        assert!(matches!(refused, Err(ConfigError::Refused(_))));
     }
 }

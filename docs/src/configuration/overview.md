@@ -150,6 +150,29 @@ starting MCP servers, or making network requests. Exit status is zero for a vali
 nonzero if valid configuration cannot be produced. See [dump](../reference/cli.md#dump)
 for selectors and incompatible options.
 
+## Configuration errors
+
+A refused configuration is reported in full: a line saying which stage of loading failed, then
+one line for each refused value, in the order the files write them. Each line starts with
+`file:line:column`, at the file that wrote the value, which for a merged configuration may be
+the user file or the workspace one, and names the value by its full path from the document
+root, such as `providers.openai.models.default.max_context` or
+`modes.readonly.capabilities[1]`.
+
+- An unknown key is refused with every key valid in its place, and an unknown value with every
+  value it could be.
+- A mapping missing required keys is refused with every one it is missing.
+- A name that selects nothing configured, such as a target's `via` or `origin`, or a host
+  capability the running application does not declare, is refused where it is written, with
+  the names it could be instead. A user file may name what the workspace file defines; the
+  merged configuration must define it.
+- A `default_mode` or `default_model` that names nothing is refused once the application has
+  finished configuring itself, with the names it could be instead and no file position: an
+  application may add modes of its own, which `default_mode` may name.
+
+Diagnostics never quote the file, so they cannot reveal credentials written beside the
+refused value.
+
 ## Configuration areas
 
 - [Providers and models](providers-and-models.md): named API connections, full model IDs,

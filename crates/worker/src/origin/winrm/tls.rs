@@ -23,7 +23,13 @@ use rustls::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
-use skyhook_base::{enums::Kinds, hex::Sha256};
+use skyhook_base::{
+    decode::{self, Context, Decode, Node},
+    enums::{Kinds, NamedEnum},
+    hex::Sha256,
+};
+
+use crate::op::TargetPath;
 use thiserror::Error;
 
 /// The most of a CA file read.
@@ -373,6 +379,36 @@ impl Hash {
             Self::Sha256 => sha2::Sha256::digest(data).to_vec(),
             Self::Sha384 => sha2::Sha384::digest(data).to_vec(),
             Self::Sha512 => sha2::Sha512::digest(data).to_vec(),
+        }
+    }
+}
+
+skyhook_base::decode_from_str!(Fingerprint);
+
+/// A kind without a value by its name, `ca` and `fingerprint` as a mapping of the name to it.
+impl Decode for Tls {
+    fn decode(node: &Node, cx: &mut Context) -> Option<Self> {
+        let Some(name) = node.as_str() else {
+            let valued = [TlsKind::Ca.as_str(), TlsKind::Fingerprint.as_str()];
+            return decode::variant(node, cx, &valued, |key, value, cx| {
+                match TlsKind::parse(key) {
+                    Some(TlsKind::Ca) => TargetPath::decode(value, cx).map(Self::Ca),
+                    _ => Fingerprint::decode(value, cx).map(Self::Fingerprint),
+                }
+            });
+        };
+        match TlsKind::parse(name) {
+            Some(TlsKind::System) => Some(Self::System),
+            Some(TlsKind::Insecure) => Some(Self::Insecure),
+            Some(TlsKind::Off) => Some(Self::Off),
+            _ => {
+                let kinds = decode::one_of(TlsKind::NAMES);
+                cx.error(
+                    node,
+                    format_args!("unknown variant `{name}`, expected one of {kinds}"),
+                );
+                None
+            }
         }
     }
 }

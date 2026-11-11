@@ -98,6 +98,13 @@ mod tests {
         tokio::time::resume();
     }
 
+    /// `value` decoded as configuration is.
+    pub(crate) fn decode<T: skyhook_base::decode::Decode>(
+        value: serde_json::Value,
+    ) -> Result<T, crate::YamlError> {
+        crate::yaml::parse(&value.to_string())
+    }
+
     pub(crate) fn limit(tokens: u64) -> std::num::NonZeroU64 {
         std::num::NonZeroU64::new(tokens).unwrap()
     }

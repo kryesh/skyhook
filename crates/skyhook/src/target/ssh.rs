@@ -44,7 +44,7 @@ pub enum SshAuth {
 
 // `SshOptions` as written.
 #[serde_with::skip_serializing_none]
-#[derive(Deserialize, JsonSchema, Serialize)]
+#[derive(Deserialize, JsonSchema, Serialize, skyhook_base::decode::Decode)]
 #[serde(deny_unknown_fields, rename = "SshOptions")]
 #[schemars(rename = "SshOptions")]
 struct RawSshOptions {
@@ -83,6 +83,8 @@ fn optional_password(generator: &mut schemars::SchemaGenerator) -> schemars::Sch
     }
     schema
 }
+
+skyhook_base::decode_via!(SshOptions => RawSshOptions);
 
 impl From<RawSshOptions> for SshOptions {
     fn from(raw: RawSshOptions) -> Self {

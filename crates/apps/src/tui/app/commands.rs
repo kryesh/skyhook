@@ -300,6 +300,7 @@ impl App {
             .directory()
             .join(format!("conversation-{label}.md"));
         let (tx, exporting) = (self.tx.clone(), self.tasks.clone());
+        let config = self.launch.model().config().clone();
         tokio::spawn(async move {
             let window = match super::pages::whole(&session, &agent).await {
                 Ok(window) => window,
@@ -337,6 +338,7 @@ impl App {
                     presentation: view,
                     outputs: &outputs,
                     unsaved: &[],
+                    config: &config,
                 };
                 let entries = model::entries(inputs, true);
                 let text = entries.iter().map(|entry| entry.text());

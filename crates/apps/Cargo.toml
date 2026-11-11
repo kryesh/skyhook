@@ -50,7 +50,6 @@ rust-embed = { version = "8", features = [
 ] }
 serde.workspace = true
 serde_json.workspace = true
-serde_path_to_error.workspace = true
 syntect = { version = "5", default-features = false, features = [
     "default-fancy",
 ] }

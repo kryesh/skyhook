@@ -24,16 +24,18 @@ workflows, or embed its Rust core in your own application.
 
 ## Install
 
-Requires **Rust 1.99 or newer** and [just](https://github.com/casey/just). Release builds are
-static musl binaries on Linux and embed the remote shims (Linux x86_64 and aarch64, Windows
-x86_64); both are cross-compiled with [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
+Requires **Rust 1.99 or newer**, [just](https://github.com/casey/just) and
+[Zig](https://ziglang.org/download/) on `PATH`:
 
 ```sh
 git clone https://github.com/kryesh/skyhook.git && cd skyhook
-just setup                 # cargo-zigbuild, cargo-nextest, mdBook, Rust targets
-just build-shims-release   # omit for a local-only build without remote targets
-just build-release         # produces target/<host target>/release/skyhook
+just setup     # Rust-side tooling and targets; names any missing build tool
+just install   # release shims and both applications, into ~/.local/bin
 ```
+
+The first build compiles V8 from source and takes a while. The
+[installation guide](docs/src/getting-started/installation.md) covers the build tools it needs and
+static builds.
 
 Configure a provider and model, then start a session. If you already have a
 configuration, keep it rather than downloading over it:
@@ -46,11 +48,10 @@ curl -fsSL https://raw.githubusercontent.com/kryesh/skyhook/main/config.example.
 # Edit config.yaml: remove unused providers along with the models under them.
 # Set credentials for every remaining provider; for OpenAI:
 export OPENAI_API_KEY=...
-./target/"$(just --evaluate host_target)"/release/skyhook --prompt "inspect this repository"
+~/.local/bin/skyhook --prompt "inspect this repository"
 ```
 
-See the [installation guide](docs/src/getting-started/installation.md),
-[first session](docs/src/getting-started/first-session.md), and
+See [first session](docs/src/getting-started/first-session.md) and the
 [configuration guide](docs/src/configuration/overview.md) for details.
 For automation, see [headless execution](docs/src/guide/headless.md) and
 [JavaScript workflows](docs/src/scripting/introduction.md).

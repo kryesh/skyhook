@@ -74,6 +74,9 @@ shell cannot run them fails with that shell's own error.
   target is configured or added. Use `origin` instead of `via` for the later of the two, or a
   target between them: every target can be an origin, and each origin starts SSH connections of
   its own.
+- A configured `origin` or `via` names another configured target, from any configuration file
+  merged into the effective configuration; one naming no configured target is refused when the
+  configuration loads, with the names it could take instead.
 
 Both may be set: `origin: "build"` with `via: "gateway"` makes `build` run SSH through `gateway`,
 where `gateway` also has `origin: "build"`.

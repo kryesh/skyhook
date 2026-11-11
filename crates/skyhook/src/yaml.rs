@@ -1,16 +1,17 @@
-//! YAML is an input format, not a second runtime value model. Keep the JSON
-//! boundary explicit: no coerced mapping keys, lossy tags, merge keys, or
-//! non-finite numbers. Parser budgets remain enabled, and diagnostics must not
-//! include surrounding source text that may contain credentials.
+//! YAML is an input format, not a second runtime value model. Each document is read into
+//! a [`Node`] tree, every value placed where it is written, which configuration decodes;
+//! keep that boundary explicit: no coerced mapping keys, lossy tags, merge keys, or
+//! non-finite numbers. Parser budgets remain enabled, and diagnostics must not include
+//! surrounding source text that may contain credentials.
 
-use std::fmt;
+use std::{fmt, path::Path, sync::Arc};
 
 use serde::{
     Deserialize, Deserializer,
-    de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
 };
-use serde_json::{Map, Number, Value, map::Entry};
-use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy, Options, Tagged};
+use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy, Options, Spanned, Tagged};
+use skyhook_base::decode::{Context, Decode, Diagnostics, Entry, Map, Node, Number, Source, Value};
 
 fn options() -> Options {
     serde_saphyr::options! {
@@ -26,19 +27,49 @@ fn options() -> Options {
 pub enum YamlError {
     #[error("invalid YAML: {0}")]
     Syntax(#[from] serde_saphyr::Error),
+    #[error("{0}")]
+    Invalid(#[from] Diagnostics),
     #[error(transparent)]
     Value(#[from] serde_json::Error),
     #[error(transparent)]
     Emit(#[from] serde_saphyr::ser::Error),
 }
 
-pub fn from_str(text: &str) -> Result<Value, serde_saphyr::Error> {
-    serde_saphyr::from_str_with_options::<JsonValue>(text, options()).map(|value| value.0)
+/// A document's values, each placed where `file` writes it.
+pub fn read(text: &str, file: Option<Arc<Path>>) -> Result<Node, serde_saphyr::Error> {
+    let mut node = serde_saphyr::from_str_with_options::<Spanned<Read>>(text, options())
+        .map(|spanned| placed(spanned, None))?;
+    if file.is_some() {
+        filed(&mut node, &file);
+    }
+    Ok(node)
 }
 
-/// Typed extraction through the JSON value tree, exactly as config loading does.
-pub fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, YamlError> {
-    Ok(serde_json::from_value(from_str(text)?)?)
+fn filed(node: &mut Node, file: &Option<Arc<Path>>) {
+    node.at.file.clone_from(file);
+    match &mut node.value {
+        Value::Seq(items) => items.iter_mut().for_each(|item| filed(item, file)),
+        Value::Map(map) => {
+            for entry in map.iter_mut() {
+                entry.at.file.clone_from(file);
+                filed(&mut entry.value, file);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Str(_) => {}
+    }
+}
+
+/// A document's values as JSON, for YAML that is not configuration.
+pub fn from_str(text: &str) -> Result<serde_json::Value, serde_saphyr::Error> {
+    read(text, None).map(|node| skyhook_base::decode::json(&node))
+}
+
+/// A document held as text, decoded as configuration is.
+pub fn parse<T: Decode>(text: &str) -> Result<T, YamlError> {
+    let node = read(text, None)?;
+    let mut cx = Context::default();
+    let value = T::decode(&node, &mut cx);
+    Ok(cx.finish(value)?)
 }
 
 /// Preserve the serialized JSON shape, including explicit `null` values.
@@ -46,16 +77,43 @@ pub fn to_string(value: &impl serde::Serialize) -> Result<String, YamlError> {
     Ok(serde_saphyr::to_string(&serde_json::to_value(value)?)?)
 }
 
+/// The fields `value` serializes as.
+pub(crate) fn object(value: &impl serde::Serialize) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::to_value(value).expect("configuration serializes") {
+        serde_json::Value::Object(fields) => fields,
+        _ => unreachable!("configuration fields serialize as a mapping"),
+    }
+}
+
+/// `spanned` placed where it is written; serde's buffering loses a span, so such a value
+/// is placed where `enclosing` is.
+fn placed(spanned: Spanned<Read>, enclosing: Option<&Source>) -> Node {
+    let location = Some(spanned.referenced).filter(|location| location.line() > 0);
+    let at = match (location, enclosing) {
+        (Some(location), _) => Source {
+            file: None,
+            line: location.line(),
+            column: location.column(),
+        },
+        (None, Some(enclosing)) => enclosing.clone(),
+        (None, None) => Source::START,
+    };
+    Node {
+        value: spanned.value.0,
+        at,
+    }
+}
+
 // serde_json's ordinary visitor requests String keys, allowing the YAML
 // deserializer to coerce non-string scalars before they can be checked. This
 // boundary visitor builds the same JSON values but validates keys before insertion.
-struct JsonValue(Value);
+struct Read(Value);
 
-impl<'de> Deserialize<'de> for JsonValue {
+impl<'de> Deserialize<'de> for Read {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct JsonVisitor;
+        struct Values;
 
-        impl<'de> Visitor<'de> for JsonVisitor {
+        impl<'de> Visitor<'de> for Values {
             type Value = Value;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -71,17 +129,21 @@ impl<'de> Deserialize<'de> for JsonValue {
             }
 
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
-                Ok(Value::Number(value.into()))
+                Ok(match u64::try_from(value) {
+                    Ok(value) => Value::Number(Number::Unsigned(value)),
+                    Err(_) => Value::Number(Number::Signed(value)),
+                })
             }
 
             fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
-                Ok(Value::Number(value.into()))
+                Ok(Value::Number(Number::Unsigned(value)))
             }
 
             fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-                Number::from_f64(value)
-                    .map(Value::Number)
-                    .ok_or_else(|| E::custom("YAML numbers must be finite"))
+                match value.is_finite() {
+                    true => Ok(Value::Number(Number::Float(value))),
+                    false => Err(E::custom("YAML numbers must be finite")),
+                }
             }
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
@@ -89,35 +151,40 @@ impl<'de> Deserialize<'de> for JsonValue {
             }
 
             fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
-                Ok(Value::String(value))
+                Ok(Value::Str(value))
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(JsonValue(value)) = sequence.next_element()? {
-                    values.push(value);
+                let mut items = Vec::new();
+                while let Some(item) = sequence.next_element()? {
+                    items.push(placed(item, None));
                 }
-                Ok(Value::Array(values))
+                Ok(Value::Seq(items))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut mapping: A) -> Result<Value, A::Error> {
-                let mut values = Map::new();
-                while let Some(StringKey(key)) = mapping.next_key()? {
-                    match values.entry(key) {
-                        Entry::Vacant(entry) => {
-                            let JsonValue(value) = mapping.next_value()?;
-                            entry.insert(value);
-                        }
-                        Entry::Occupied(_) => {
-                            return Err(de::Error::custom("duplicate mapping key"));
-                        }
+                let mut map = Map::default();
+                while let Some(key) = mapping.next_key::<Spanned<StringKey>>()? {
+                    if map.contains(&key.value.0) {
+                        return Err(de::Error::custom("duplicate mapping key"));
                     }
+                    let at = Source {
+                        file: None,
+                        line: key.referenced.line(),
+                        column: key.referenced.column(),
+                    };
+                    let value = placed(mapping.next_value()?, Some(&at));
+                    map.insert(Entry {
+                        key: key.value.0,
+                        at,
+                        value,
+                    });
                 }
-                Ok(Value::Object(values))
+                Ok(Value::Map(map))
             }
         }
 
-        deserializer.deserialize_any(JsonVisitor).map(Self)
+        deserializer.deserialize_any(Values).map(Self)
     }
 }
 
@@ -128,110 +195,13 @@ impl<'de> Deserialize<'de> for StringKey {
         // Infer keys exactly like values rather than asking for a coerced String.
         // Retain the resolved tag too: !!binary and !!timestamp can otherwise
         // deserialize as strings despite not being YAML string keys.
-        let Tagged(value, tag) = Tagged::<Value>::deserialize(deserializer)?;
+        let Tagged(value, tag) = Tagged::<serde_json::Value>::deserialize(deserializer)?;
         match (value, tag.as_deref()) {
-            (Value::String(key), None | Some("!" | "tag:yaml.org,2002:str")) => Ok(Self(key)),
+            (serde_json::Value::String(key), None | Some("!" | "tag:yaml.org,2002:str")) => {
+                Ok(Self(key))
+            }
             _ => Err(de::Error::custom("YAML mapping keys must be strings")),
         }
-    }
-}
-
-/// Deserialize `fields` as `T`, a refusal naming the path of the value it refused.
-pub fn located<T: serde::de::DeserializeOwned, E: de::Error>(
-    fields: Map<String, Value>,
-) -> Result<T, E> {
-    serde_path_to_error::deserialize(Value::Object(fields)).map_err(E::custom)
-}
-
-/// The fields `value` serializes as.
-pub(crate) fn object(value: &impl serde::Serialize) -> Map<String, Value> {
-    match serde_json::to_value(value).expect("configuration serializes") {
-        Value::Object(fields) => fields,
-        _ => unreachable!("configuration fields serialize as a mapping"),
-    }
-}
-
-/// Deserialize a struct from a mapping it shares: the keys `T` names are read
-/// in place, so their errors keep their path, and `rest` receives every other key.
-/// A structural alternative to `#[serde(flatten)]`, which loses the path.
-pub fn split<'de, T, D>(deserializer: D, rest: &mut Map<String, Value>) -> Result<T, D::Error>
-where
-    T: Deserialize<'de>,
-    D: Deserializer<'de>,
-{
-    struct Mapping<'r, T>(&'r mut Map<String, Value>, std::marker::PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for Mapping<'_, T> {
-        type Value = T;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a mapping")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
-            T::deserialize(Split { map, rest: self.0 })
-        }
-    }
-
-    deserializer.deserialize_map(Mapping(rest, std::marker::PhantomData))
-}
-
-struct Split<'r, A> {
-    map: A,
-    rest: &'r mut Map<String, Value>,
-}
-
-impl<'de, A: MapAccess<'de>> Deserializer<'de> for Split<'_, A> {
-    type Error = A::Error;
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, A::Error> {
-        visitor.visit_map(Fields {
-            map: self.map,
-            fields,
-            rest: self.rest,
-        })
-    }
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, A::Error> {
-        self.deserialize_struct("", &[], visitor)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
-        byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
-        enum identifier ignored_any
-    }
-}
-
-struct Fields<'r, A> {
-    map: A,
-    fields: &'static [&'static str],
-    rest: &'r mut Map<String, Value>,
-}
-
-impl<'de, A: MapAccess<'de>> MapAccess<'de> for Fields<'_, A> {
-    type Error = A::Error;
-
-    fn next_key_seed<K: DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, A::Error> {
-        while let Some(key) = self.map.next_key::<String>()? {
-            if self.fields.contains(&key.as_str()) {
-                return seed.deserialize(key.into_deserializer()).map(Some);
-            }
-            self.rest.insert(key, self.map.next_value()?);
-        }
-        Ok(None)
-    }
-
-    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
-        self.map.next_value_seed(seed)
     }
 }
 
@@ -242,13 +212,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn values_are_placed_where_their_file_writes_them() {
+        let file: Arc<Path> = Path::new("/c.yaml").into();
+        let node = read(
+            "a:\n  b: [1, x]\nshared: &s {d: 1}\nalias: *s\n",
+            Some(file),
+        )
+        .unwrap();
+        let at = |path: &[&str]| {
+            let mut node = &node;
+            for key in path {
+                node = match key.parse::<usize>() {
+                    Ok(index) => match &node.value {
+                        Value::Seq(items) => &items[index],
+                        _ => unreachable!(),
+                    },
+                    Err(_) => node.as_map().unwrap().get(key).unwrap(),
+                };
+            }
+            node.at.to_string()
+        };
+        assert_eq!(at(&["a", "b", "1"]), "/c.yaml:2:10");
+        assert_eq!(at(&["a", "b"]), "/c.yaml:2:6");
+        // An alias is placed where it is used, not where its anchor is defined.
+        assert_eq!(at(&["alias"]), "/c.yaml:4:8");
+        let key = &node.as_map().unwrap().entry("shared").unwrap().at;
+        assert_eq!(key.to_string(), "/c.yaml:3:1");
+    }
+
+    #[test]
     fn serialization_preserves_nulls_and_respects_declared_omission() {
         #[derive(serde::Serialize)]
         struct Written {
             #[serde(skip_serializing_if = "Option::is_none")]
             omitted: Option<bool>,
             clear: Option<bool>,
-            nested: Value,
+            nested: serde_json::Value,
         }
         let written = Written {
             omitted: None,
@@ -285,8 +284,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["z", "a", "strings"]
         );
-        assert_eq!(from_str("").unwrap(), Value::Null);
-        assert_eq!(from_str("# comment only\n").unwrap(), Value::Null);
+        assert_eq!(from_str("").unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            from_str("# comment only\n").unwrap(),
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -395,32 +397,6 @@ mod tests {
             from_str("min: -9223372036854775808\nmax: 18446744073709551615\n").unwrap(),
             json!({"min": i64::MIN, "max": u64::MAX})
         );
-    }
-
-    #[test]
-    fn split_keeps_nested_paths_and_hands_other_keys_to_the_rest() {
-        #[derive(Deserialize)]
-        struct Inner {
-            count: u64,
-        }
-        #[derive(Deserialize)]
-        struct Named {
-            inner: Inner,
-        }
-        struct Shared(Named, Map<String, Value>);
-        impl<'de> Deserialize<'de> for Shared {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let mut rest = Map::new();
-                let named = split(deserializer, &mut rest)?;
-                Ok(Self(named, rest))
-            }
-        }
-        let read = |text| serde_path_to_error::deserialize::<_, Shared>(from_str(text).unwrap());
-        let Shared(named, rest) = read("extra: 1\ninner: {count: 2}\nmore: x\n").unwrap();
-        assert_eq!(named.inner.count, 2);
-        assert_eq!(Value::Object(rest), json!({"extra": 1, "more": "x"}));
-        let error = read("extra: 1\ninner: {count: two}\n").err().unwrap();
-        assert_eq!(error.path().to_string(), "inner.count");
     }
 
     #[test]
