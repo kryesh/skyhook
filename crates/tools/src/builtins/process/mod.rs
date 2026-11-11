@@ -172,7 +172,7 @@ fn started(operation: Operation, subject: Subject) -> PartialContext {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecArgs {
-    /// Text runs with the target's shell; an array runs directly
+    /// Text runs with the target's shell; an array such as ["git","status"] runs directly
     command: CommandLine,
     /// Working directory
     #[serde(default = "super::default_dot")]

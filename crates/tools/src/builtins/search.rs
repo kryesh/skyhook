@@ -347,26 +347,26 @@ pub fn excerpt(line: &[u8], found: Option<std::ops::Range<usize>>) -> String {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchArgs {
-    /// Rust-regex pattern, using ripgrep syntax
+    /// Regex
     pattern: String,
     /// File or directory to search
     #[serde(default = "super::default_dot")]
     path: op::TargetPath,
-    /// Ripgrep-style include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones
+    /// Include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones
     #[serde(default)]
     glob: super::OneOrMany<String>,
-    /// Treat `pattern` as literal text instead of a regular expression (`rg -F`)
+    /// Treat `pattern` as literal text
     #[serde(default)]
     fixed: bool,
     #[serde(default)]
     case: Case,
-    /// Require whole-word matches (`rg -w`)
+    /// Require whole-word matches
     #[serde(default)]
     word: bool,
-    /// Include hidden files and directories (`rg --hidden`)
+    /// Include hidden files and directories
     #[serde(default)]
     hidden: bool,
-    /// Ignore .gitignore and related ignore files (`rg --no-ignore`)
+    /// Ignore .gitignore and related ignore files
     #[serde(default)]
     no_ignore: bool,
 }
@@ -382,7 +382,7 @@ struct SearchOutput {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GlobArgs {
-    /// Ripgrep-style file glob, such as `src/**/*.rs`
+    /// File glob, such as `src/**/*.md`
     pattern: String,
     /// Directory to enumerate
     #[serde(default = "super::default_dot")]

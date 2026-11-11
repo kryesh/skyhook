@@ -120,21 +120,20 @@ pub(in crate::session) fn opening(db: &Db, session: SessionId) -> DbResult<Openi
         .map(|record| (record.sequence, &**record))
         .collect();
     let mut todos = BTreeMap::new();
-    for (row, owner_job, reconciled) in db.query(
-        "SELECT a.id, a.owner_job, c.frontier FROM agent_state s JOIN agent a ON a.id = s.agent \
+    for (row, reconciled) in db.query(
+        "SELECT s.agent, c.frontier FROM agent_state s \
          LEFT JOIN compaction c ON c.entry = s.checkpoint",
         Vec::new(),
         |row| {
-            let owner_job = row.get::<Option<i64>>(1)?.map(job).transpose()?;
-            let frontier = row.get::<Option<i64>>(2)?.map(sequence).unwrap_or_default();
-            Ok((row.get::<i64>(0)?, owner_job, frontier))
+            let frontier = row.get::<Option<i64>>(1)?.map(sequence).unwrap_or_default();
+            Ok((row.get::<i64>(0)?, frontier))
         },
     )? {
         let agent = agent(row)?;
         let set = states
             .get(&agent)
             .and_then(|state| by_seq.get(&state.todos?));
-        todos.insert(agent, AgentTodos::opened(owner_job, reconciled));
+        todos.insert(agent, AgentTodos::opened(reconciled));
         set.into_iter()
             .for_each(|record| todo::apply(&mut todos, record));
     }

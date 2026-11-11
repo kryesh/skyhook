@@ -111,12 +111,9 @@ pub const SHOWN_LINES: usize = 10;
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Replace {
-    /// UTF-8 text file to edit
     pub path: TargetPath,
-    /// Exact text to find
     #[schemars(length(min = 1))]
     pub old: String,
-    /// Replacement text
     pub new: String,
     /// Required number of matches. The edit fails if the actual count differs
     #[serde(default = "one")]
@@ -132,7 +129,6 @@ const fn one() -> usize {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Remove {
-    /// File or directory to remove
     pub path: TargetPath,
     /// Required for non-empty directory trees
     #[serde(default)]

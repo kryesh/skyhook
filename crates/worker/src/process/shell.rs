@@ -13,10 +13,8 @@ use crate::op::Program;
 #[serde(untagged)]
 #[schemars(inline)]
 pub enum CommandLine {
-    /// Shell text
     #[schemars(extend("minLength" = 1))]
     Shell(String),
-    /// Program and arguments without shell parsing, for example `["cargo","test"]`
     #[schemars(extend("minItems" = 1))]
     Argv(Vec<String>),
 }

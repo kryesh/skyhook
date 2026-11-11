@@ -598,7 +598,7 @@ mod tests {
             let requests = fixture.requests().len() - 1;
             let unchanged = fixture.history(agent).await == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
-            let kept_todos = todos.inspect_todos(agent, None).unwrap() == old_todos;
+            let kept_todos = todos.inspect_todos(agent) == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);
             assert_eq!(outcome, (attempts, true, 0, true), "{fault}");
             fixture.session.shutdown().await.unwrap();

@@ -35,7 +35,7 @@ use thiserror::Error;
 /// The most of a CA file read.
 const MAX_CA_BYTES: u64 = 1024 * 1024;
 
-/// The listener and what is trusted of its certificate: HTTPS, by default on port 5986, or plain HTTP on 5985
+/// The listener and what is trusted of its certificate
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, Kinds)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[kinds(name = TlsKind)]

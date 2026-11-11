@@ -55,9 +55,8 @@ struct RawSshOptions {
     /// Private-key path on the SSH origin, the only key offered. Without key or password, only keys in the origin's SSH agent are offered
     key: Option<TargetPath>,
     /// With key, its passphrase; without, password authentication offering no keys. Read on the SSH origin at each connection
-    // A default keeps the field optional, which `schema_with` alone would require.
     #[serde(default)]
-    #[schemars(schema_with = "optional_password")]
+    #[schemars(with = "Option<Credential>")]
     password: Option<Password>,
     /// Forward the SSH agent the connection authenticated with, so remote commands receive SSH_AUTH_SOCK
     #[serde(default)]
@@ -72,16 +71,6 @@ struct RawSshOptions {
 /// The schema leaves a default implicit, as for any other omitted setting.
 fn undocumented_default(schema: &mut schemars::Schema) {
     schema.remove("default");
-}
-
-/// An optional credential's schema: its forms and `null` in one flat `anyOf`, where
-/// `Option` would nest them.
-fn optional_password(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    let mut schema = <Credential as JsonSchema>::json_schema(generator);
-    if let Some(forms) = (schema.get_mut("anyOf")).and_then(serde_json::Value::as_array_mut) {
-        forms.push(serde_json::json!({"type": "null"}));
-    }
-    schema
 }
 
 skyhook_base::decode_via!(SshOptions => RawSshOptions);

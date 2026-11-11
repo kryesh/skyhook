@@ -26,9 +26,7 @@ return tool.agent({
 });
 ```
 
-The child owns subsequent edits. Ancestors can inspect a descendant with `todo({job: childJobId})`,
-including after it finishes; `items`, `status` and `job` are exclusive. Inspection is available once
-the child has initialized; a queued launch may not have a list yet. Reads return `{items}`.
+The child owns subsequent edits; `items` and `status` are exclusive. Reads return `{items}`.
 An agent without todos has an empty list. Inside the child, progress can be updated with the
 same tool:
 

@@ -154,9 +154,8 @@ async fn list(
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobsArgs {
-    /// Job whose saved output to read; omit to list jobs
     job: Option<JobId>,
-    /// Listing only: include finished jobs as well as active ones
+    /// Listing only: include finished jobs
     #[serde(default)]
     all: bool,
     /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console

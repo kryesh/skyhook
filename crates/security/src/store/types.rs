@@ -18,8 +18,7 @@ macro_rules! ids {
         #[serde(try_from = "i64", into = "i64")]
         pub(crate) struct $name(pub(super) i64);
         impl JsonSchema for $name {
-            fn inline_schema() -> bool { true }
-            fn schema_name() -> std::borrow::Cow<'static, str> { stringify!($name).into() }
+            fn schema_name() -> std::borrow::Cow<'static, str> { "Id".into() }
             fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
                 schemars::json_schema!({"type": "integer", "minimum": 1})
             }

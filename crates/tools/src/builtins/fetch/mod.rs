@@ -48,17 +48,14 @@ const fn default_redirects() -> MaxRedirects {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FetchArgs {
-    /// HTTP(S)
     url: String,
     #[serde(default = "default_method")]
     method: String,
     /// Appends to the URL query
     #[serde(default)]
     query: Vec<(String, String)>,
-    /// Request headers to send
     #[serde(default)]
     headers: BTreeMap<String, OneOrMany<String>>,
-    /// Include response headers in the result
     #[serde(default)]
     include_headers: bool,
     body: Option<RequestBody>,

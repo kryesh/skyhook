@@ -7,7 +7,7 @@ use skyhook_base::bounded::Bounded;
 
 use super::super::*;
 
-/// Records of one kind, filtered: live nodes, environments or tasks
+// Records of one kind, filtered: live nodes, environments or tasks.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ListQuery {
@@ -193,7 +193,7 @@ impl Store {
     }
 }
 
-/// A keyset page: records after `after`, at most `limit` of them
+// A keyset page: records after `after`, at most `limit` of them.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Page {

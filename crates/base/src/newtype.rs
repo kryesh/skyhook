@@ -125,7 +125,6 @@ macro_rules! string_newtype {
 }
 
 string_newtype! {
-    /// Text written for a reader
     pub struct Prose(Blank) = |text| nonblank("text", text),
         schema = schemars::json_schema!({"type": "string", "pattern": "\\S"});
 }

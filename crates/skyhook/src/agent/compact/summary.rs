@@ -395,7 +395,7 @@ mod tests {
             if let Some((history, todos)) = kept {
                 assert_eq!(fixture.history(agent).await, history);
                 assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-                assert_eq!(store.inspect_todos(agent, None).unwrap(), todos);
+                assert_eq!(store.inspect_todos(agent), todos);
             }
             fixture.session.shutdown().await.unwrap();
         }

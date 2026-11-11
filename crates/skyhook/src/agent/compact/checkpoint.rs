@@ -518,7 +518,7 @@ mod tests {
         };
         assert!(text.contains("Verify the fresh finding") && text.contains("in_progress"));
         assert!(!text.contains("root-research"));
-        let found = runtime.store.inspect_todos(agent, None).unwrap();
+        let found = runtime.store.inspect_todos(agent);
         assert_eq!(found, updated);
         let summaries = records
             .iter()
@@ -575,9 +575,9 @@ mod tests {
             matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserPart::Compaction { text } if text.contains(markdown))))
         );
         assert_eq!(checkpoint.todos, reconciled);
-        let found = runtime.store.inspect_todos(agent, None).unwrap();
+        let found = runtime.store.inspect_todos(agent);
         assert_eq!(found, reconciled);
-        let found = runtime.store.inspect_todos(&child, None).unwrap();
+        let found = runtime.store.inspect_todos(&child);
         assert_eq!(found, child_todos);
         let later = records.iter().filter(|r| r.sequence > before_sequence);
         assert_eq!(count!(later, SessionEvent::TodosReplaced { .. }), 0);
@@ -611,7 +611,7 @@ mod tests {
         let request = fixture.script.request(1).await;
         let sent = crate::agent::tests::rendered(&request);
         assert!(sent.contains("Keep the stateless todo") && sent.contains("Seeded and finished"));
-        let found = runtime.store.inspect_todos(agent, None).unwrap();
+        let found = runtime.store.inspect_todos(agent);
         assert_eq!(found, current);
         fixture.session.shutdown().await.unwrap();
     }

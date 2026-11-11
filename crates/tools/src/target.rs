@@ -11,7 +11,6 @@ use skyhook_worker::op::TargetPath;
 pub const MAX_TARGET_NAME_BYTES: usize = 128;
 
 string_newtype! {
-    /// The name of a configured or session-added target
     #[derive(PartialOrd, Ord)]
     pub struct TargetName(TargetNameError) = |name| {
         if name == TargetName::RESERVED {
@@ -162,7 +161,6 @@ impl ExecutionLocation {
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "TargetPath")]
 pub struct TargetedPath {
-    /// File path
     pub path: TargetPath,
     #[serde(default)]
     #[schemars(skip)]

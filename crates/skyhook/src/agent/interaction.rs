@@ -36,15 +36,16 @@ skyhook_base::string_newtype! {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
-    /// Short answer label, returned as the answer when chosen
+    /// Short answer label
     pub label: skyhook_base::newtype::Prose,
     /// What choosing it means: its effect or tradeoff
     pub description: skyhook_base::newtype::Prose,
     /// The option you recommend: at most one, unless the question takes several
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recommended: bool,
-    /// Markdown shown beside this option while it is focused: a short concrete artifact the
-    /// user compares across options, such as a code or config snippet (fenced, with a
+    /// Only when comparing concrete artifacts beats reading descriptions. Markdown shown
+    /// beside this option while it is focused: a short concrete artifact the user compares
+    /// across options, such as a code or config snippet (fenced, with a
     /// language), a data shape, or a small ASCII mockup. Show only what differs from the
     /// other options, in the same framing for each; keep it under about 20 lines and 60
     /// columns. Give every option a preview or none

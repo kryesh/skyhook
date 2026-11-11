@@ -23,7 +23,7 @@ struct TargetsArgs {}
 #[derive(JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TargetAddArgs {
-    /// Session-wide name to add or replace; root is reserved
+    /// Session-wide name; root is reserved
     name: skyhook_tools::target::TargetName,
     #[serde(flatten)]
     config: TargetConfig,

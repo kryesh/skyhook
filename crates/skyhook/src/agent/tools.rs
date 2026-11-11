@@ -57,7 +57,7 @@ pub(super) fn register(
     );
     builder.register_checked(
         "wait",
-        "Wait for any notification or input relevant to this agent. Use jobs to inspect saved output. Cancellation fails the wait with reason `cancelled`. A timeout ends this wait, not background work; wait again if still dependent on it",
+        "Wait for any notification or input relevant to this agent. Cancellation fails the wait with reason `cancelled`. A timeout ends this wait, not background work; wait again if still dependent on it",
         ToolOptions::default().job_role(crate::job::JobRole::Wait).result::<super::wait::WaitOutput>(),
         Ok,
         move |args: super::wait::WaitArgs| {
@@ -69,7 +69,7 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together, each under its own header. Offer the real choices as options; never add a catch-all option that expects the user to type. Add `preview` only when comparing concrete artifacts beats reading descriptions. Use bg:true to continue independent work while awaiting an answer",
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together, each under its own header. Offer the real choices as options; never add a catch-all option that expects the user to type. Use bg:true to continue independent work while awaiting an answer",
         ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive).result::<Value>(),
         |question: Question| match question.refusal() {
             None => Ok(question),
@@ -86,34 +86,51 @@ pub(super) fn register(
     )?;
     builder.register_checked(
         "todo",
-        "Read or edit your list, or read a descendant's. Give at most one of items, status and job; edits return no result",
+        "Read or edit your list. Give at most one of items and status; edits return no result",
         ToolOptions::default().result::<TodoList>(),
-        |TodoArgs { items, status, job }| match (items, status, job) {
-            (Some(items), None, None) => Ok(TodoRequest::Replace(items)),
-            (None, Some(status), None) => Ok(TodoRequest::Status(status)),
-            (None, None, job) => Ok(TodoRequest::Inspect(job)),
-            (items, _, _) => Err(AdmissionError::invalid_arguments("give at most one of items, status and job")
-                .operation(Operation::Validate, Subject::argument([if items.is_some() { "items" } else { "status" }])).effects(Effects::NotStarted)),
+        |TodoArgs { items, status }| match (items, status) {
+            (Some(items), None) => Ok(TodoRequest::Replace(items)),
+            (None, Some(status)) => Ok(TodoRequest::Status(status)),
+            (None, None) => Ok(TodoRequest::Inspect),
+            (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments(
+                "give at most one of items and status",
+            )
+            .operation(Operation::Validate, Subject::argument(["items"]))
+            .effects(Effects::NotStarted)),
         },
         move |request| {
             let runtime = todo.get().and_then(Weak::upgrade);
             let update = match request {
                 TodoRequest::Replace(items) => TodoUpdate::Items(items),
                 TodoRequest::Status(statuses) => TodoUpdate::Statuses(statuses),
-                TodoRequest::Inspect(job) => return catalog::Invocation::new(move |context| async move {
-                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                    crate::tool::catalog::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
-                }),
+                TodoRequest::Inspect => {
+                    return catalog::Invocation::new(move |context| async move {
+                        let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                        crate::tool::catalog::serialized(TodoList {
+                            items: runtime.store.inspect_todos(context.agent()),
+                        })
+                    });
+                }
             };
             catalog::Invocation::unit(move |context| async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let issued_by = runtime.jobs.call_origin(context.job()).await;
                 let subject = Subject::Label(format!("todos for agent {}", context.agent()));
-                runtime.store.replace_todos(context.agent(), update, issued_by).await.map_err(|error| match error {
-                    ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
-                    ReplaceError::Statuses { .. } => ToolError::invalid_arguments(error).operation(Operation::Validate, Subject::argument(["status"])).effects(Effects::Unchanged),
-                    ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
-                })
+                runtime
+                    .store
+                    .replace_todos(context.agent(), update, issued_by)
+                    .await
+                    .map_err(|error| match error {
+                        ReplaceError::Superseded => ToolError::failed(error)
+                            .operation(Operation::Save, subject)
+                            .effects(Effects::Unchanged),
+                        ReplaceError::Statuses { .. } => ToolError::invalid_arguments(error)
+                            .operation(Operation::Validate, Subject::argument(["status"]))
+                            .effects(Effects::Unchanged),
+                        ReplaceError::Session(error) => harness_error(error.into())
+                            .operation(Operation::Save, subject)
+                            .effects(Effects::Unknown),
+                    })
             })
         },
     )?;
@@ -127,14 +144,12 @@ struct TodoArgs {
     items: Option<Vec<TodoItem>>,
     /// Set every item's status, one per item in list order, keeping their text
     status: Option<Vec<TodoStatus>>,
-    /// A descendant's agent job ID whose list to read; omit for your own
-    job: Option<skyhook_worker::job::JobId>,
 }
 
 enum TodoRequest {
     Replace(Vec<TodoItem>),
     Status(Vec<TodoStatus>),
-    Inspect(Option<skyhook_worker::job::JobId>),
+    Inspect,
 }
 
 #[derive(Serialize, JsonSchema)]

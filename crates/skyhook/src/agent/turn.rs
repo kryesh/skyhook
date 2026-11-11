@@ -485,10 +485,7 @@ impl SessionRuntime {
             },
             _ => None,
         };
-        let todos = self
-            .store
-            .inspect_todos(turn.agent, None)
-            .expect("own todo list is always readable");
+        let todos = self.store.inspect_todos(turn.agent);
         // The journal keeps milliseconds, so a replayed state is the one sent.
         let now = Utc::now().trunc_subsecs(3);
         Ok(RuntimeState {

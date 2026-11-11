@@ -6,15 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::AgentId;
-use crate::{
-    session::{
-        Command, EventRecord, MessageSeq, Plan, RecordSeq, SessionError, SessionEvent, SessionStore,
-    },
-    tool::ToolError,
+use crate::session::{
+    Command, EventRecord, MessageSeq, Plan, RecordSeq, SessionError, SessionEvent, SessionStore,
 };
 use skyhook_base::{enums::NamedEnum, newtype::Prose};
-use skyhook_worker::diagnostic::{Operation, Subject};
-use skyhook_worker::job::JobId;
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq, NamedEnum)]
 #[serde(rename_all = "snake_case")]
@@ -35,7 +30,6 @@ pub struct TodoItem {
 /// One agent's list as the core folds it.
 #[derive(Default)]
 pub(crate) struct AgentTodos {
-    owner_job: Option<JobId>,
     items: Vec<TodoItem>,
     /// The latest checkpoint's frontier: its summary reconciled every response up to it.
     reconciled: RecordSeq,
@@ -44,11 +38,10 @@ pub(crate) struct AgentTodos {
 }
 
 impl AgentTodos {
-    /// The empty list of an agent `owner_job` owns, whose latest checkpoint reconciled
-    /// every response up to `reconciled`, to fold the record that last set it into.
-    pub(crate) fn opened(owner_job: Option<JobId>, reconciled: RecordSeq) -> Self {
+    /// The empty list of an agent whose latest checkpoint reconciled every response up
+    /// to `reconciled`, to fold the record that last set it into.
+    pub(crate) fn opened(reconciled: RecordSeq) -> Self {
         Self {
-            owner_job,
             reconciled,
             ..Self::default()
         }
@@ -59,9 +52,6 @@ impl AgentTodos {
 pub(crate) fn apply(agents: &mut BTreeMap<AgentId, AgentTodos>, record: &EventRecord) {
     let agent = record.agent.clone();
     match &record.event {
-        SessionEvent::AgentStarted { owner_job, .. } => {
-            agents.entry(agent).or_default().owner_job = *owner_job;
-        }
         SessionEvent::TodosReplaced { items } => {
             let state = agents.entry(agent).or_default();
             state.items.clone_from(items);
@@ -157,37 +147,10 @@ impl SessionStore {
         .await
     }
 
-    /// The caller's own list, or with `job` the list of the descendant it launched.
-    pub(crate) fn inspect_todos(
-        &self,
-        caller: &AgentId,
-        job: Option<JobId>,
-    ) -> Result<Vec<TodoItem>, ToolError> {
+    /// `agent`'s list.
+    pub(crate) fn inspect_todos(&self, agent: &AgentId) -> Vec<TodoItem> {
         self.read(|state| {
-            let agents = &state.todos;
-            let agent = if let Some(job) = job {
-                let agent = agents
-                    .iter()
-                    .find_map(|(agent, state)| (state.owner_job == Some(job)).then_some(agent))
-                    .ok_or_else(|| {
-                        ToolError::invalid_arguments(
-                            "job does not identify an initialized child agent",
-                        )
-                        .operation(Operation::Lookup, Subject::Job(job))
-                    })?;
-                if agent == caller || !agent.is_within(caller) {
-                    return Err(ToolError::invalid_arguments(
-                        "todo inspection is limited to descendants",
-                    )
-                    .operation(Operation::Inspect, Subject::Job(job)));
-                }
-                agent
-            } else {
-                caller
-            };
-            Ok(agents
-                .get(agent)
-                .map_or_else(Vec::new, |state| state.items.clone()))
+            (state.todos.get(agent)).map_or_else(Vec::new, |state| state.items.clone())
         })
     }
 }
@@ -195,30 +158,6 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn rejections_identify_the_rejected_job() {
-        let fixture = crate::tests::TestRuntime::new().await;
-        let (todos, jobs) = (&fixture.store, &fixture.jobs);
-        let spec = crate::job::JobSpec {
-            role: crate::job::JobRole::Agent,
-            ..crate::job::JobSpec::test(fixture.agent.clone(), "agent")
-        };
-        let job = jobs.create(spec).await.unwrap().into_test_id();
-        let missing = todos.inspect_todos(&fixture.agent, Some(job)).unwrap_err();
-        let workspace = fixture.root.path();
-        crate::session::tests::start_child(todos, &fixture.agent, 1, Some(job), workspace).await;
-        let sibling = fixture.agent.child(2);
-        let forbidden = todos.inspect_todos(&sibling, Some(job)).unwrap_err();
-        for (error, operation) in [
-            (missing, Operation::Lookup),
-            (forbidden, Operation::Inspect),
-        ] {
-            let context = error.diagnostic().context;
-            assert_eq!(context.operation, operation);
-            assert_eq!(context.subject, Subject::Job(job));
-        }
-    }
 
     #[tokio::test]
     async fn statuses_restatus_the_list_in_order_and_must_cover_it() {
@@ -245,11 +184,11 @@ mod tests {
                 listed: 2
             }
         ));
-        assert_eq!(store.inspect_todos(agent, None).unwrap(), listed);
+        assert_eq!(store.inspect_todos(agent), listed);
         let statuses = TodoUpdate::Statuses(vec![TodoStatus::Completed, TodoStatus::InProgress]);
         store.replace_todos(agent, statuses, None).await.unwrap();
         assert_eq!(
-            store.inspect_todos(agent, None).unwrap(),
+            store.inspect_todos(agent),
             [
                 item("Inspect", TodoStatus::Completed),
                 item("Change", TodoStatus::InProgress)

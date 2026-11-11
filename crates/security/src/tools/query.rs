@@ -82,14 +82,11 @@ actions! {
             after: Option<Cursor>,
             limit: Bounded<1, 1000>,
         } -> Startables,
-        /// What each phase owes, what runs, what two tasks tried without settling (with their
-        /// ids and the last child's reply), counting the `spent` entries among
-        /// them, the deployment premises the user is asked, the unproven candidates,
-        /// the components no path reaches, and the interfaces whose paths wait on an environment.
-        /// → {owed, running,
-        /// exhausted: [{phase, node, title, tasks?, reply?}], asked: [{premise, title}],
-        /// unproven: [{candidate, title, premises}], unreached: component ids, uncovered:
-        /// [{interface, paths}], outside: {paths, candidates} counts outside the scope}
+        /// → {owed: per phase, running, exhausted: [{phase, node, title, tasks?, reply?}] (two
+        /// tasks tried without settling, `spent` entries included), asked: [{premise, title}]
+        /// (deployment premises put to the user), unproven: [{candidate, title, premises}],
+        /// unreached: component ids no path reaches, uncovered: [{interface, paths}] (waiting
+        /// on an environment), outside: {paths, candidates} counts outside the scope}
         synthesis => Synthesis {
             #[serde(default)]
             spent: Vec<SpentWork>,
@@ -158,7 +155,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     super::register(
         builder,
         "research_query",
-        "Read the run's research graph and the work it owes. Every list is a keyset page {items: T[], next_after?: integer}: continue with page.after = next_after until it is absent, even when a page is empty. Result: JobView<T>, T as each action gives after →",
+        "Read the run's research graph and the work it owes. list, search and history return a keyset page {items: T[], next_after?: integer}: continue with page.after = next_after until it is absent, even when a page is empty. startable continues with after = next. Result: JobView<T>, T as each action gives after →",
         options::<Query>(),
         |store, _, _, query| query.execute(store),
     )

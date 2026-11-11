@@ -530,7 +530,7 @@ mod tests {
             assert!(runtime.agents(|agents| agents.get(&agent).is_none()));
             if !committed {
                 assert!(runtime.jobs.child_agent(job).await.is_none());
-                let seeded = runtime.store.inspect_todos(&agent, None).unwrap();
+                let seeded = runtime.store.inspect_todos(&agent);
                 assert!(seeded.is_empty());
             }
             let visible = runtime.store.observe().snapshot;
@@ -566,7 +566,7 @@ mod tests {
         );
         let seeded: Vec<crate::session::TodoItem> = serde_json::from_value(todos).unwrap();
         let child = session.root.child(1);
-        let journaled = session.runtime.store.inspect_todos(&child, None).unwrap();
+        let journaled = session.runtime.store.inspect_todos(&child);
         assert_eq!(journaled, seeded);
     }
 

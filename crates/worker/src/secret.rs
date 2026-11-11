@@ -33,7 +33,6 @@ const MAX_FILE_BYTES: u64 = 4096;
 // A configured credential and where it is read from.
 #[derive(Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Kinds)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-#[schemars(inline)]
 #[kinds(name = CredentialKind)]
 pub enum Credential {
     /// Environment variable holding the value

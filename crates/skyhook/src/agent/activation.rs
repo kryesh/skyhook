@@ -2029,9 +2029,9 @@ mod tests {
 
         let resumed = harness.resume_session(id).await.unwrap();
         let todos = &resumed.runtime.store;
-        let found = todos.inspect_todos(&resumed.root, None).unwrap();
+        let found = todos.inspect_todos(&resumed.root);
         assert_eq!(found, reconciled);
-        let found = todos.inspect_todos(&child, None).unwrap();
+        let found = todos.inspect_todos(&child);
         assert_eq!(found, child_todos);
         assert_eq!(resumed.prompt("Continue.").await.unwrap(), "resumed");
         {

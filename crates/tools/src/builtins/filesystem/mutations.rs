@@ -178,11 +178,9 @@ fn unchanged(operation: Operation, path: &op::TargetPath) -> PartialContext {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteArgs {
-    /// File path
     path: op::TargetPath,
     /// Complete replacement file contents
     content: Option<String>,
-    /// File whose bytes to copy instead of `content`
     source: Option<crate::target::TargetedPath>,
 }
 
