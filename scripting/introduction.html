@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -188,8 +188,7 @@ executes it once, while constructing an equivalent new builder creates a new cal
 const packageFile = (await tool.read({ path: "Cargo.toml" })).unwrap();
 const matches = (await tool.search({ pattern: "TODO", path: "src" })).unwrap();
 
-// Fluent setters accept the same arguments; each setter returns a new builder.
-const readme = (await tool.read().path("README.md")).unwrap();
+const readme = (await tool.read({ path: "README.md" })).unwrap();
 
 // Builders can be awaited independently (and can still be batched with Promise.all).
 return { packageFile, matches, readme };

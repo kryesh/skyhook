@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -380,10 +380,8 @@ kept as on any failure.</p>
 <code>undefined</code> properties are omitted, while <code>undefined</code> array elements, promises, builders and
 unpaired surrogates are problems too. The converted argument must be an object.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
-<p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
-normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
-<code>tool.read().set("path", "README.md")</code>. Unknown <code>.set</code> keys throw a <code>TypeError</code>; calling a
-nonexistent fluent setter produces the usual JavaScript method-call error.</p>
+<p>A builder takes its tool’s arguments as one object; omitted values receive the tool’s normal
+defaults.</p>
 <p>Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Only returned values expand: inside the body, <code>await {a: builder}</code>
 awaits the object, not its members, so await each builder or use <code>Promise.all</code>. Calls use the same capabilities, approvals, path access checks,

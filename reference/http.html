@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -304,7 +304,8 @@ server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures are ordinary failed jobs with no result: in scripts, a failed
 JobView rather than a rejected promise. The error names the operation in progress (for example
 <code>send HTTP GET https://example.com</code>, <code>receive HTTP response body</code>, or the download path), then the
-cause: an I/O kind with its OS error code when the failure carries one (such as <code>connection refused (OS error 111)</code>), or a fixed message such as <code>the TLS handshake failed</code> or <code>response exceeds max_bytes</code>. A failure after the request was sent notes that the request may have executed; a
+cause: an I/O kind (such as <code>connection refused</code>), with its OS error code when the system classified
+it no further, or a fixed message such as <code>the TLS handshake failed</code> or <code>response exceeds max_bytes</code>. A failure after the request was sent notes that the request may have executed; a
 <code>save_to</code> failure that left its destination untouched also reports that it is unchanged, unless it
 created directories to hold it, which remain.
 Failure messages never copy underlying error text, query strings, credentials, headers, or bodies;

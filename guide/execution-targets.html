@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -195,40 +195,41 @@ authentication, or routing settings. Targets with other names are retained. Repe
 required settings in the replacement entry.</p>
 <pre><code class="language-yaml">targets:
   bastion:
-    type: "ssh"
     host: "bastion.example.com"
-    ssh:
-      user: "gateway"
+    transport:
+      ssh:
+        user: "gateway"
 
   build:
-    type: "ssh"
     host: "build.internal"
     workspace: "/srv/project"
     via: "bastion"
-    ssh:
-      key: "~/.ssh/build_ed25519"
-      password: {env: "BUILD_KEY_PASSPHRASE"}
-      forward_agent: true
+    transport:
+      ssh:
+        key: "~/.ssh/build_ed25519"
+        password: {env: "BUILD_KEY_PASSPHRASE"}
+        forward_agent: true
 
   legacy:
-    type: "ssh"
     host: "legacy.internal"
-    ssh:
-      user: "deploy"
-      password: {command: ["pass", "show", "legacy"]}
+    transport:
+      ssh:
+        user: "deploy"
+        password: {command: ["pass", "show", "legacy"]}
 
   database:
-    type: "ssh"
     host: "db.internal"
     origin: "build"
-    ssh:
-      # Reach the host through a gateway using the deploy user's own SSH key on build.
-      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+    transport:
+      ssh:
+        # Reach the host through a gateway using the deploy user's own SSH key on build.
+        options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
 <p>The built-in <code>root</code> is the session host—the machine running the main Skyhook process. It is not
 configured as a target and always identifies that machine, including when an agent’s current
-target is remote. Named targets declare their transport with <code>type</code>: <code>"ssh"</code>, configured under
-<code>ssh</code>, or <code>"winrm"</code>, configured under <code>winrm</code> (see <a href="#winrm-targets">WinRM targets</a>). A target’s
+target is remote. Named targets give their transport and its settings under <code>transport</code>: <code>ssh</code>, or
+<code>winrm</code> (see <a href="#winrm-targets">WinRM targets</a>); an SSH target with no settings is written
+<code>transport: {ssh: {}}</code>. A target’s
 <code>os</code> declares its operating system, <code>"linux"</code> or <code>"windows"</code>, by default <code>"linux"</code> for <code>ssh</code> and
 <code>"windows"</code> for <code>winrm</code>; see <a href="#windows-targets">Windows targets</a>. Skyhook starts the target with
 the commands of the system declared, so declare it correctly. A target whose shell runs them and
@@ -256,11 +257,11 @@ configuration loads, with the names it could take instead.</li>
 <p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
 where <code>gateway</code> also has <code>origin: "build"</code>.</p>
 <p>Registering targets never connects to them; registrations are session-wide.</p>
-<pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
-  ssh: {key: "~/.ssh/database"}});
+<pre><code class="language-javascript">await tool.target_add({name: "database", host: "db.internal", origin: "build",
+  transport: {ssh: {key: "~/.ssh/database"}}});
 </code></pre>
 <h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
-<p>SSH settings live under <code>ssh</code>. Every setting is optional. <code>options</code> values must be strings;
+<p>SSH settings live under <code>transport.ssh</code>. Every setting is optional. <code>options</code> values must be strings;
 quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>. Each host is given 30
 seconds to connect, after which OpenSSH’s own error is the connection error, unless the
 target’s <code>options</code> set <code>ConnectTimeout</code>.</p>
@@ -284,7 +285,7 @@ target’s <code>options</code> set <code>ConnectTimeout</code>.</p>
 that allows only keyboard-interactive authentication, as some PAM setups do, cannot be reached
 with a password.</li>
 <li><code>key</code>, with an optional <code>password</code> for an encrypted key: that key alone.</li>
-<li>neither, including a target with no <code>ssh</code> settings at all: only keys already in the origin’s SSH
+<li>neither, including a target with no SSH settings at all: only keys already in the origin’s SSH
 agent: the one it inherited or was forwarded, otherwise Skyhook’s private agent there if an
 earlier connection started it, or on Windows the agent service. The connection fails if there
 is none; see <a href="#agents">agents</a>.</li>
@@ -321,22 +322,22 @@ Administrators, as for an OpenSSH private key there; see
 <p>A <code>winrm</code> target is a Windows host reached through Windows Remote Management.</p>
 <pre><code class="language-yaml">targets:
   winapp:
-    type: "winrm"
     host: "winapp.corp.example"
     workspace: 'C:\deploy'
-    winrm:
-      user: "deploy@CORP.EXAMPLE"
-      password: {command: ["pass", "show", "winapp"]}
-      auth: "kerberos"
+    transport:
+      winrm:
+        user: "deploy@CORP.EXAMPLE"
+        password: {command: ["pass", "show", "winapp"]}
+        auth: "kerberos"
 
   lab:
-    type: "winrm"
     host: "10.0.0.20"
     origin: "build"
-    winrm:
-      user: 'LAB\operator'
-      password: {env: "LAB_PASSWORD"}
-      tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
+    transport:
+      winrm:
+        user: 'LAB\operator'
+        password: {env: "LAB_PASSWORD"}
+        tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -384,12 +385,12 @@ runs OpenSSH Server with its default shell, cmd.exe; over <a href="#winrm-target
 service. Skyhook needs Windows PowerShell 5.1 there, which those releases include.</p>
 <pre><code class="language-yaml">targets:
   winbuild:
-    type: "ssh"
     os: "windows"
     host: "winbuild.internal"
     workspace: 'C:\src\project'
-    ssh:
-      user: "builder"
+    transport:
+      ssh:
+        user: "builder"
 </code></pre>
 <p>Paths on a Windows target are Windows paths, such as <code>C:\src\main.rs</code>, and tools accept <code>/</code> or
 <code>\</code> between their parts. A relative <code>workspace</code> is in the user’s profile directory

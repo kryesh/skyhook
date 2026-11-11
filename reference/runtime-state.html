@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -202,9 +202,7 @@ child’s runtime state before its first model request:</p>
   bg: true
 });
 </code></pre>
-<p>The child owns subsequent edits. Ancestors can inspect a descendant with <code>todo({job: childJobId})</code>,
-including after it finishes; <code>items</code>, <code>status</code> and <code>job</code> are exclusive. Inspection is available once
-the child has initialized; a queued launch may not have a list yet. Reads return <code>{items}</code>.
+<p>The child owns subsequent edits; <code>items</code> and <code>status</code> are exclusive. Reads return <code>{items}</code>.
 An agent without todos has an empty list. Inside the child, progress can be updated with the
 same tool:</p>
 <pre><code class="language-js">return tool.todo({items: [

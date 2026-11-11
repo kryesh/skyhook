@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "../searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -347,19 +347,19 @@ to its subjects as a host event: one bounded digest for each changed subject, of
 the bearing relation after the task began and after the agent’s cursor, leaving out those the
 agent or one beneath it recorded. Nothing is stored for this: the subscription is the task log.
 Beginning a task returns the same digests for each subject a task of that phase worked before.</p>
-<p><strong>Reported.</strong> <code>reports/</code> is a projection of the store, which the <code>generate</code> action renders from
+<p><strong>Reported.</strong> <code>reports/</code> is a projection of the store, which <code>research_generate</code> renders from
 the store alone: a folder for each root flaw whose finding reports its scenarios as they stand,
 replaced as a whole when what renders changed, with a folder for each test the report states
 whose artifacts are copied only while they match the digest the test recorded, beside a
 hardening list of the confirmed flaws no finding’s scenario holds.</p>
-<p><strong>Permitted.</strong> The host capabilities gate the research tool’s actions: <code>security.research</code>
-recording research, with <code>security.verdict</code> a verdict; <code>security.verdict</code> with Write a report;
-<code>security.test</code> a test; <code>security.scheduled</code> beginning assigned work; and <code>security.coordinate</code>
-scheduling (<code>startable</code>) and report generation. The store refuses nothing but boundary parsing,
-unknown ids and integrity, so unwanted work is prevented by not scheduling it. Read-only tool
-actions, the host state and host events read beside the session’s one writer; an action whose
-work is mostly files (recording a test, generating reports) takes the session’s files turn
-rather than the writer’s.</p>
+<p><strong>Permitted.</strong> Each research action is a tool, and the host capabilities gate which an agent
+is offered: <code>security.research</code> recording research, with <code>security.verdict</code> a verdict;
+<code>security.verdict</code> with Write a report; <code>security.test</code> a test; <code>security.scheduled</code> beginning
+assigned work; and <code>security.coordinate</code> scheduling (<code>research_startable</code>) and report
+generation. The store refuses nothing but boundary parsing, unknown ids and integrity, so
+unwanted work is prevented by not scheduling it. Read-only tools, the host state and host
+events read beside the session’s one writer; a tool whose work is mostly files (recording a
+test, generating reports) takes the session’s files turn rather than the writer’s.</p>
 <h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
 <p><code>config</code> is the configuration a host parses from text it holds (<code>Config::from_yaml</code>), decodes
 from a tree (<code>config::process</code>) or builds in code (<code>Config::builder</code>); it admits it, resolves

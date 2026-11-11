@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-866cc1e1.js";
+            window.path_to_searchindex_js = "searchindex-70b06028.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26aae551.js"></script>
@@ -900,40 +900,41 @@ authentication, or routing settings. Targets with other names are retained. Repe
 required settings in the replacement entry.</p>
 <pre><code class="language-yaml">targets:
   bastion:
-    type: "ssh"
     host: "bastion.example.com"
-    ssh:
-      user: "gateway"
+    transport:
+      ssh:
+        user: "gateway"
 
   build:
-    type: "ssh"
     host: "build.internal"
     workspace: "/srv/project"
     via: "bastion"
-    ssh:
-      key: "~/.ssh/build_ed25519"
-      password: {env: "BUILD_KEY_PASSPHRASE"}
-      forward_agent: true
+    transport:
+      ssh:
+        key: "~/.ssh/build_ed25519"
+        password: {env: "BUILD_KEY_PASSPHRASE"}
+        forward_agent: true
 
   legacy:
-    type: "ssh"
     host: "legacy.internal"
-    ssh:
-      user: "deploy"
-      password: {command: ["pass", "show", "legacy"]}
+    transport:
+      ssh:
+        user: "deploy"
+        password: {command: ["pass", "show", "legacy"]}
 
   database:
-    type: "ssh"
     host: "db.internal"
     origin: "build"
-    ssh:
-      # Reach the host through a gateway using the deploy user's own SSH key on build.
-      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+    transport:
+      ssh:
+        # Reach the host through a gateway using the deploy user's own SSH key on build.
+        options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
 <p>The built-in <code>root</code> is the session host—the machine running the main Skyhook process. It is not
 configured as a target and always identifies that machine, including when an agent’s current
-target is remote. Named targets declare their transport with <code>type</code>: <code>"ssh"</code>, configured under
-<code>ssh</code>, or <code>"winrm"</code>, configured under <code>winrm</code> (see <a href="#winrm-targets">WinRM targets</a>). A target’s
+target is remote. Named targets give their transport and its settings under <code>transport</code>: <code>ssh</code>, or
+<code>winrm</code> (see <a href="#winrm-targets">WinRM targets</a>); an SSH target with no settings is written
+<code>transport: {ssh: {}}</code>. A target’s
 <code>os</code> declares its operating system, <code>"linux"</code> or <code>"windows"</code>, by default <code>"linux"</code> for <code>ssh</code> and
 <code>"windows"</code> for <code>winrm</code>; see <a href="#windows-targets">Windows targets</a>. Skyhook starts the target with
 the commands of the system declared, so declare it correctly. A target whose shell runs them and
@@ -961,11 +962,11 @@ configuration loads, with the names it could take instead.</li>
 <p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
 where <code>gateway</code> also has <code>origin: "build"</code>.</p>
 <p>Registering targets never connects to them; registrations are session-wide.</p>
-<pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
-  ssh: {key: "~/.ssh/database"}});
+<pre><code class="language-javascript">await tool.target_add({name: "database", host: "db.internal", origin: "build",
+  transport: {ssh: {key: "~/.ssh/database"}}});
 </code></pre>
 <h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
-<p>SSH settings live under <code>ssh</code>. Every setting is optional. <code>options</code> values must be strings;
+<p>SSH settings live under <code>transport.ssh</code>. Every setting is optional. <code>options</code> values must be strings;
 quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>. Each host is given 30
 seconds to connect, after which OpenSSH’s own error is the connection error, unless the
 target’s <code>options</code> set <code>ConnectTimeout</code>.</p>
@@ -989,7 +990,7 @@ target’s <code>options</code> set <code>ConnectTimeout</code>.</p>
 that allows only keyboard-interactive authentication, as some PAM setups do, cannot be reached
 with a password.</li>
 <li><code>key</code>, with an optional <code>password</code> for an encrypted key: that key alone.</li>
-<li>neither, including a target with no <code>ssh</code> settings at all: only keys already in the origin’s SSH
+<li>neither, including a target with no SSH settings at all: only keys already in the origin’s SSH
 agent: the one it inherited or was forwarded, otherwise Skyhook’s private agent there if an
 earlier connection started it, or on Windows the agent service. The connection fails if there
 is none; see <a href="#agents">agents</a>.</li>
@@ -1026,22 +1027,22 @@ Administrators, as for an OpenSSH private key there; see
 <p>A <code>winrm</code> target is a Windows host reached through Windows Remote Management.</p>
 <pre><code class="language-yaml">targets:
   winapp:
-    type: "winrm"
     host: "winapp.corp.example"
     workspace: 'C:\deploy'
-    winrm:
-      user: "deploy@CORP.EXAMPLE"
-      password: {command: ["pass", "show", "winapp"]}
-      auth: "kerberos"
+    transport:
+      winrm:
+        user: "deploy@CORP.EXAMPLE"
+        password: {command: ["pass", "show", "winapp"]}
+        auth: "kerberos"
 
   lab:
-    type: "winrm"
     host: "10.0.0.20"
     origin: "build"
-    winrm:
-      user: 'LAB\operator'
-      password: {env: "LAB_PASSWORD"}
-      tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
+    transport:
+      winrm:
+        user: 'LAB\operator'
+        password: {env: "LAB_PASSWORD"}
+        tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -1089,12 +1090,12 @@ runs OpenSSH Server with its default shell, cmd.exe; over <a href="#winrm-target
 service. Skyhook needs Windows PowerShell 5.1 there, which those releases include.</p>
 <pre><code class="language-yaml">targets:
   winbuild:
-    type: "ssh"
     os: "windows"
     host: "winbuild.internal"
     workspace: 'C:\src\project'
-    ssh:
-      user: "builder"
+    transport:
+      ssh:
+        user: "builder"
 </code></pre>
 <p>Paths on a Windows target are Windows paths, such as <code>C:\src\main.rs</code>, and tools accept <code>/</code> or
 <code>\</code> between their parts. A relative <code>workspace</code> is in the user’s profile directory
@@ -1753,32 +1754,35 @@ generation. An artifact, and <code>reports/</code> itself, is refused when reach
 but a link put in place between that check and the read or write is followed. Keep other
 programs out of a run’s session directory while it runs.</p>
 <h2 id="native-research-tools"><a class="header" href="#native-research-tools">Native research tools</a></h2>
-<p>Research tools are bound to the session’s run. Each call names an <code>action</code> and passes that
-action’s arguments beside it; the schema’s description of <code>action</code> lists each action’s
-arguments, marking optional ones with <code>?</code>. <code>upsert</code>, <code>set_status</code> and <code>list</code>, whose arguments
-depend on the kind of record, take them inside <code>record</code>, tagged by its <code>kind</code>; an <code>upsert</code> edit
-names the node’s <code>id</code> too:</p>
-<pre><code class="language-js">await tool.research({action: "upsert", record: {kind: "premise", title: "32-bit builds",
+<p>Research tools are bound to the session’s run, one tool per action. <code>research_upsert</code>,
+<code>research_set_status</code> and <code>research_list</code>, whose arguments depend on the kind of record, take
+them inside <code>record</code>, tagged by its <code>kind</code>; a <code>research_upsert</code> edit names the node’s <code>id</code> too:</p>
+<pre><code class="language-js">await tool.research_upsert({record: {kind: "premise", title: "32-bit builds",
   body: "the library is built for 32-bit platforms", scope: "deployment"}});
-await tool.research({action: "upsert", record: {kind: "premise", id: 7, title: "64-bit builds"}});
-await tool.research({action: "set_status", record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
-await tool.research({action: "begin", phase: "sweep", subjects: [3]});
-await tool.research_query({action: "list", record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
-await tool.research_query({action: "node", id: 7});
-await tool.research_query({action: "search", file: "c/dec/*.c", line: 1189, kinds: ["state", "flaw"]});
-await tool.research_query({action: "synthesis"});
+await tool.research_upsert({record: {kind: "premise", id: 7, title: "64-bit builds"}});
+await tool.research_set_status({record: {kind: "premise", id: 7, status: "holds"}, note: "set in the build"});
+await tool.research_begin({phase: "sweep", subjects: [3]});
+await tool.research_list({record: {kind: "candidate", state: "validated"}, page: {after: 0, limit: 50}});
+await tool.research_node({id: 7});
+await tool.research_search({file: "c/dec/*.c", line: 1189, kinds: ["state", "flaw"]});
+await tool.research_synthesis();
 </code></pre>
-<p>A tool offers only the actions the agent’s capabilities allow. Lists are cursor pages: follow
+<p>An agent is offered only the tools its capabilities allow. Lists are cursor pages: follow
 <code>next_after</code> until it is absent. CVSS input is a complete 4.0 base vector; the native scorer
 computes the CVSS-B score and severity.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Actions</th><th>Capabilities</th></tr>
+<tr><th>Tools</th><th>Do</th><th>Capabilities</th></tr>
 </thead>
 <tbody>
-<tr><td><code>research</code></td><td><code>begin</code> a task on its phase’s subjects; <code>upsert</code> a node of any kind but a finding (a path with its whole list of <code>steps</code>), <code>link</code> and <code>unlink</code> its edges, record <code>evidence</code>, <code>merge</code> a duplicate <code>node</code> into a node of its kind (one already merged into it is left as it is), <code>set_status</code> of a premise, flaw, path, state (<code>checked</code> too, resting on at least one premise) or component, <code>assess</code> a candidate and describe an <code>environment</code> and the interfaces it <code>serves</code>; with <code>security.verdict</code> too, a <code>verdict</code>; with <code>security.test</code>, a <code>test</code>; with <code>security.verdict</code> and <code>write</code>, a root’s <code>report</code>; and, for the orchestrator, <code>generate</code> the reports.</td><td><code>security.research</code>; <code>security.scheduled</code> to <code>begin</code></td></tr>
-<tr><td><code>research_query</code></td><td>Read a <code>node</code> with its neighbourhood and latest tasks, a <code>task</code> with its child’s brief, reply and records, <code>list</code> nodes of a kind (states by scope; or environments and tasks), <code>search</code> live nodes by a regex over their own text (not their events’ notes) or a code location’s file glob, line and function, each with where it matched, the event <code>history</code> of the run or a node, and the <code>synthesis</code> of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces; and, for the orchestrator, what is <code>startable</code> next.</td><td><code>read</code>; <code>security.coordinate</code> for what can start next</td></tr>
+<tr><td><code>research_begin</code></td><td>Begin a task on its phase’s subjects.</td><td><code>security.scheduled</code></td></tr>
+<tr><td><code>research_upsert</code>, <code>research_link</code>, <code>research_evidence</code>, <code>research_merge</code>, <code>research_set_status</code>, <code>research_assess</code>, <code>research_environment</code></td><td>Create or edit a node of any kind but a finding (a path with its whole list of <code>steps</code>), add and remove its edges, record evidence, merge a duplicate <code>node</code> into a node of its kind (one already merged into it is left as it is), set the status of a premise, flaw, path, state (<code>checked</code> too, resting on at least one premise) or component, assess a candidate, and describe an environment and the interfaces it <code>serves</code>.</td><td><code>security.research</code></td></tr>
+<tr><td><code>research_verdict</code></td><td>Record a candidate’s verdict.</td><td><code>security.research</code>, <code>security.verdict</code></td></tr>
+<tr><td><code>research_test</code></td><td>Record a candidate’s test.</td><td><code>security.test</code></td></tr>
+<tr><td><code>research_report</code></td><td>Record a root’s report.</td><td><code>security.verdict</code>, <code>write</code></td></tr>
+<tr><td><code>research_node</code>, <code>research_task</code>, <code>research_list</code>, <code>research_search</code>, <code>research_history</code>, <code>research_synthesis</code></td><td>Read a node with its neighbourhood and latest tasks, a task with its child’s brief, reply and records, the nodes of a kind (states by scope; or environments and tasks), live nodes by a regex over their own text (not their events’ notes) or a code location’s file glob, line and function, each with where it matched, the event history of the run or a node, and the synthesis of owed, running and exhausted work, each exhausted subject with the tasks that tried it, and the uncovered interfaces.</td><td><code>read</code></td></tr>
+<tr><td><code>research_startable</code>, <code>research_generate</code></td><td>For the orchestrator: what can start next, and writing the reports out.</td><td><code>security.coordinate</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -1835,15 +1839,15 @@ the configuration invalid rather than removing entries.</p>
 
 targets:
   bastion:
-    type: "ssh"
     host: "bastion.example.com"
+    transport: {ssh: {}}
 
   build:
-    type: "ssh"
     host: "old-build.internal"
     via: "bastion"
-    ssh:
-      key: "~/.ssh/old-build"
+    transport:
+      ssh:
+        key: "~/.ssh/old-build"
 </code></pre>
 <p>Then use this <code>&lt;workspace&gt;/.skyhook/config.yaml</code>:</p>
 <pre><code class="language-yaml">modes:
@@ -1852,8 +1856,8 @@ targets:
 
 targets:
   build:
-    type: "ssh"
     host: "new-build.example.com"
+    transport: {ssh: {}}
     workspace: "/srv/project"
 </code></pre>
 <p>The effective configuration retains <code>providers.openai</code>, with its <code>default</code> model, and <code>targets.bastion</code>.
@@ -2149,38 +2153,38 @@ providers:
 
 # targets:
 #   bastion:
-#     type: "ssh"
 #     host: "bastion.example.com"
-#     ssh:
-#       user: "gateway"
+#     transport:
+#       ssh:
+#         user: "gateway"
 #
 #   build:
-#     type: "ssh"
 #     host: "build.internal"
 #     workspace: "/srv/project"
 #     via: "bastion"
-#     ssh:
-#       user: "builder"
-#       key: "~/.ssh/build_ed25519"
-#       # The key's passphrase; without key, the target's password. Also {command: ...},
-#       # {file: ...} or a literal, read at each connection.
-#       password: {env: "BUILD_KEY_PASSPHRASE"}
+#     transport:
+#       ssh:
+#         user: "builder"
+#         key: "~/.ssh/build_ed25519"
+#         # The key's passphrase; without key, the target's password. Also {command: ...},
+#         # {file: ...} or a literal, read at each connection.
+#         password: {env: "BUILD_KEY_PASSPHRASE"}
 #
 #   # Start SSH on build's shim (using build's key paths and agents), with extra
 #   # ssh_config options. Any via jump must also use origin: "build".
 #   appliance:
-#     type: "ssh"
 #     host: "appliance.internal"
 #     origin: "build"
-#     ssh:
-#       # Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
-#       options:
-#         ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal"
-#         ServerAliveInterval: "15"
+#     transport:
+#       ssh:
+#         # Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
+#         options:
+#           ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal"
+#           ServerAliveInterval: "15"
 #
 #   # A Windows host running OpenSSH Server (os defaults to linux); its paths are Windows paths.
 #   winbuild:
-#     type: "ssh"
+#     transport: {ssh: {}}
 #     os: "windows"
 #     host: "winbuild.internal"
 #     workspace: 'C:\src\project'
@@ -2188,12 +2192,12 @@ providers:
 #   # A Windows host reached over WinRM (os defaults to windows), with a Kerberos ticket
 #   # from the user's realm over HTTPS. The password is read at each connection.
 #   winapp:
-#     type: "winrm"
 #     host: "winapp.corp.example"
-#     winrm:
-#       user: "deploy@CORP.EXAMPLE"
-#       password: {command: ["pass", "show", "winapp"]}
-#       auth: "kerberos"
+#     transport:
+#       winrm:
+#         user: "deploy@CORP.EXAMPLE"
+#         password: {command: ["pass", "show", "winapp"]}
+#         auth: "kerberos"
 
 # MCP servers are optional; an absent/empty mcp mapping adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,
@@ -2852,7 +2856,7 @@ tool’s description is the server’s own. Arguments
 may appear at the top level or under an <code>arguments</code> object so they do not conflict with common
 Skyhook arguments such as <code>bg</code>. Tools with invalid or unsupported input schemas are warned about
 and skipped individually.</p>
-<p>Call a tool with <code>tool[name](...)</code> or its fluent builder. Calls return the
+<p>Call a tool with <code>tool[name](...)</code>. Calls return the
 <a href="#jobview-response-contract">common JobView envelope</a>; the MCP payload
 (<code>content</code>, plus optional <code>structuredContent</code> and <code>isError</code>) is in <code>.result</code>. Images use the usual
 <a href="#saved-output-and-serialization">saved-output image handling</a>, and server-reported errors retain their
@@ -2870,8 +2874,7 @@ executes it once, while constructing an equivalent new builder creates a new cal
 const packageFile = (await tool.read({ path: "Cargo.toml" })).unwrap();
 const matches = (await tool.search({ pattern: "TODO", path: "src" })).unwrap();
 
-// Fluent setters accept the same arguments; each setter returns a new builder.
-const readme = (await tool.read().path("README.md")).unwrap();
+const readme = (await tool.read({ path: "README.md" })).unwrap();
 
 // Builders can be awaited independently (and can still be batched with Promise.all).
 return { packageFile, matches, readme };
@@ -3431,10 +3434,8 @@ kept as on any failure.</p>
 <code>undefined</code> properties are omitted, while <code>undefined</code> array elements, promises, builders and
 unpaired surrogates are problems too. The converted argument must be an object.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
-<p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
-normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
-<code>tool.read().set("path", "README.md")</code>. Unknown <code>.set</code> keys throw a <code>TypeError</code>; calling a
-nonexistent fluent setter produces the usual JavaScript method-call error.</p>
+<p>A builder takes its tool’s arguments as one object; omitted values receive the tool’s normal
+defaults.</p>
 <p>Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Only returned values expand: inside the body, <code>await {a: builder}</code>
 awaits the object, not its members, so await each builder or use <code>Promise.all</code>. Calls use the same capabilities, approvals, path access checks,
@@ -3510,7 +3511,7 @@ For example, an agent on a remote target can copy a file from the session host w
 <code>write({path: "tool.bin", source: {path: "/srv/tools/tool.bin", target: "root"}})</code>.</p>
 <h2 id="further-contracts"><a class="header" href="#further-contracts">Further contracts</a></h2>
 <ul>
-<li><a href="#javascript-runtime">JavaScript runtime</a>: fluent builders and native/script result shapes.</li>
+<li><a href="#javascript-runtime">JavaScript runtime</a>: builders and native/script result shapes.</li>
 <li><a href="#jobs-and-agents">Jobs and agents</a>: delegation, input, cancellation, and naming.</li>
 <li><a href="#http-requests-with-fetch">HTTP requests</a>: requests, downloads, failures, and security boundaries.</li>
 <li><a href="#saved-job-output">Saved job output</a>: file/search shapes, capture, previews, and pagination.</li>
@@ -3646,7 +3647,8 @@ server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures are ordinary failed jobs with no result: in scripts, a failed
 JobView rather than a rejected promise. The error names the operation in progress (for example
 <code>send HTTP GET https://example.com</code>, <code>receive HTTP response body</code>, or the download path), then the
-cause: an I/O kind with its OS error code when the failure carries one (such as <code>connection refused (OS error 111)</code>), or a fixed message such as <code>the TLS handshake failed</code> or <code>response exceeds max_bytes</code>. A failure after the request was sent notes that the request may have executed; a
+cause: an I/O kind (such as <code>connection refused</code>), with its OS error code when the system classified
+it no further, or a fixed message such as <code>the TLS handshake failed</code> or <code>response exceeds max_bytes</code>. A failure after the request was sent notes that the request may have executed; a
 <code>save_to</code> failure that left its destination untouched also reports that it is unchanged, unless it
 created directories to hold it, which remain.
 Failure messages never copy underlying error text, query strings, credentials, headers, or bodies;
@@ -3992,6 +3994,7 @@ live, unfinished, or abandoned output, even without a structured result:</p>
 <pre><code class="language-json">[{"field":"/result/console","complete":false}]
 </code></pre>
 <p><code>complete: false</code> means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+A finished job lists no capture that took nothing.
 Select a descriptor’s <code>field</code> to page or search its retained bytes as text. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.</p>
@@ -4029,9 +4032,7 @@ child’s runtime state before its first model request:</p>
   bg: true
 });
 </code></pre>
-<p>The child owns subsequent edits. Ancestors can inspect a descendant with <code>todo({job: childJobId})</code>,
-including after it finishes; <code>items</code>, <code>status</code> and <code>job</code> are exclusive. Inspection is available once
-the child has initialized; a queued launch may not have a list yet. Reads return <code>{items}</code>.
+<p>The child owns subsequent edits; <code>items</code> and <code>status</code> are exclusive. Reads return <code>{items}</code>.
 An agent without todos has an empty list. Inside the child, progress can be updated with the
 same tool:</p>
 <pre><code class="language-js">return tool.todo({items: [
@@ -4402,19 +4403,19 @@ to its subjects as a host event: one bounded digest for each changed subject, of
 the bearing relation after the task began and after the agent’s cursor, leaving out those the
 agent or one beneath it recorded. Nothing is stored for this: the subscription is the task log.
 Beginning a task returns the same digests for each subject a task of that phase worked before.</p>
-<p><strong>Reported.</strong> <code>reports/</code> is a projection of the store, which the <code>generate</code> action renders from
+<p><strong>Reported.</strong> <code>reports/</code> is a projection of the store, which <code>research_generate</code> renders from
 the store alone: a folder for each root flaw whose finding reports its scenarios as they stand,
 replaced as a whole when what renders changed, with a folder for each test the report states
 whose artifacts are copied only while they match the digest the test recorded, beside a
 hardening list of the confirmed flaws no finding’s scenario holds.</p>
-<p><strong>Permitted.</strong> The host capabilities gate the research tool’s actions: <code>security.research</code>
-recording research, with <code>security.verdict</code> a verdict; <code>security.verdict</code> with Write a report;
-<code>security.test</code> a test; <code>security.scheduled</code> beginning assigned work; and <code>security.coordinate</code>
-scheduling (<code>startable</code>) and report generation. The store refuses nothing but boundary parsing,
-unknown ids and integrity, so unwanted work is prevented by not scheduling it. Read-only tool
-actions, the host state and host events read beside the session’s one writer; an action whose
-work is mostly files (recording a test, generating reports) takes the session’s files turn
-rather than the writer’s.</p>
+<p><strong>Permitted.</strong> Each research action is a tool, and the host capabilities gate which an agent
+is offered: <code>security.research</code> recording research, with <code>security.verdict</code> a verdict;
+<code>security.verdict</code> with Write a report; <code>security.test</code> a test; <code>security.scheduled</code> beginning
+assigned work; and <code>security.coordinate</code> scheduling (<code>research_startable</code>) and report
+generation. The store refuses nothing but boundary parsing, unknown ids and integrity, so
+unwanted work is prevented by not scheduling it. Read-only tools, the host state and host
+events read beside the session’s one writer; a tool whose work is mostly files (recording a
+test, generating reports) takes the session’s files turn rather than the writer’s.</p>
 <h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
 <p><code>config</code> is the configuration a host parses from text it holds (<code>Config::from_yaml</code>), decodes
 from a tree (<code>config::process</code>) or builds in code (<code>Config::builder</code>); it admits it, resolves
