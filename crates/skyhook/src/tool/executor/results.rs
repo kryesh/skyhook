@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(
             response,
             json!({"state": "failed",
-                   "error": "validate tool `missing` failed: unknown tool `missing`"})
+                   "error": "validate tool `missing` failed: unknown tool"})
         );
     }
 

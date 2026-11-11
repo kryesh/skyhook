@@ -137,8 +137,8 @@ server-side effects, and requests are not automatically retried.
 Transport and processing failures are ordinary failed jobs with no result: in scripts, a failed
 JobView rather than a rejected promise. The error names the operation in progress (for example
 `send HTTP GET https://example.com`, `receive HTTP response body`, or the download path), then the
-cause: an I/O kind with its OS error code when the failure carries one (such as `connection refused
-(OS error 111)`), or a fixed message such as `the TLS handshake failed` or `response exceeds
+cause: an I/O kind (such as `connection refused`), with its OS error code when the system classified
+it no further, or a fixed message such as `the TLS handshake failed` or `response exceeds
 max_bytes`. A failure after the request was sent notes that the request may have executed; a
 `save_to` failure that left its destination untouched also reports that it is unchanged, unless it
 created directories to hold it, which remain.

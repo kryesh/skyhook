@@ -130,15 +130,24 @@ impl From<&OsError> for io::Error {
 
 impl std::error::Error for OsError {}
 
-/// The error by the kind its target classified it as, with its code there, or as
-/// what was wrapped in it.
+impl OsError {
+    /// The kind its target classified the error as; its code there only says more
+    /// when the target classified it no further.
+    pub fn classified(&self) -> String {
+        let kind = self.kind.as_str().replace('_', " ");
+        match (self.kind, self.code) {
+            (IoKind::Other, Some(code)) => format!("{kind} (OS error {code})"),
+            _ => kind,
+        }
+    }
+}
+
+/// The error as its target classified it, or as what was wrapped in it.
 impl std::fmt::Display for OsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = self.kind.as_str().replace('_', " ");
         match (self.code, &self.detail) {
-            (Some(code), _) => write!(f, "{kind} (OS error {code})"),
             (None, Some(detail)) => f.write_str(detail),
-            (None, None) => f.write_str(&kind),
+            _ => f.write_str(&self.classified()),
         }
     }
 }

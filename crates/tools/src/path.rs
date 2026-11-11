@@ -187,7 +187,7 @@ mod tests {
         // Preflight adds only what it knows: the site and the requested path. The
         // resolver's own facts stand, and nothing claims effects it cannot see.
         let facts = missing.context;
-        assert_eq!(facts.operation, Operation::Canonicalize);
+        assert_eq!(facts.operation, Operation::Resolve);
         let missing = crate::tests::text(root.path().join("missing"));
         assert_eq!(facts.subject, Subject::Path(missing));
         assert_eq!(
@@ -217,7 +217,7 @@ mod tests {
         let resolved = Resolved {
             spelled: r"C:\w\alias".into(),
             resolution: Err(Failure::at(
-                Operation::Canonicalize,
+                Operation::Resolve,
                 Subject::path("alias"),
                 fault,
             )),

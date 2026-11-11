@@ -308,7 +308,6 @@ impl JobManager {
                 annotations.shape = projected.shape;
                 annotations.truncated =
                     (!projected.truncated.is_empty()).then_some(projected.truncated);
-                annotations.notice = projected.notice;
             }
             Shown::Question => annotations.question = asked,
             Shown::File(_) | Shown::Held(..) => unreachable!("read on the job's target above"),
@@ -321,9 +320,10 @@ impl JobManager {
                 annotations.preview = Some(page);
             }
         }
-        // However it is shown, a finished job whose output was cut says so.
+        // However it is shown, a job says so of a capture that was cut, and of a
+        // result it completed with while its output was: a failure's error already does.
         let cut = (saved.product.as_ref()).is_some_and(|product| !product.captures_complete);
-        if incomplete_capture || terminal && cut {
+        if incomplete_capture || cut && envelope.state == crate::job::JobState::Completed {
             annotations.notice = Some(views::Notice::OutputIncomplete);
         }
         let acknowledges =

@@ -287,35 +287,51 @@ mod tests {
     async fn failures_before_spawn_report_their_stage_and_that_nothing_started() {
         let workspace = workspace(tokio::time::sleep);
         std::fs::write(workspace.path().join("file-cwd"), "not a directory").unwrap();
-        for (arguments, operation, argument) in [
+        let (started, unclaimed) = (Effects::NotStarted, Effects::Unknown);
+        for (arguments, operation, effects, argument) in [
             // A missing cwd fails path preflight; a file passes it and fails the handler.
             (
                 json!({"command":"touch started", "cwd":"missing-cwd"}),
-                Operation::Canonicalize,
+                Operation::Resolve,
+                started,
                 "cwd",
             ),
             (
                 json!({"command":"touch started", "cwd":"file-cwd"}),
                 Operation::Validate,
+                started,
                 "cwd",
             ),
-            // The schema's minLength and minItems refuse an empty command before the handler
-            // sees it.
-            (json!({"command":""}), Operation::Deserialize, "command"),
-            (json!({"command":[]}), Operation::Deserialize, "command"),
+            // The schema's bounds refuse these before the handler sees them, claiming
+            // no effects.
+            (
+                json!({"command":""}),
+                Operation::Validate,
+                unclaimed,
+                "command",
+            ),
+            (
+                json!({"command":[]}),
+                Operation::Validate,
+                unclaimed,
+                "command",
+            ),
             (
                 json!({"command":r#" ["touch", "started"] "#}),
                 Operation::Validate,
+                started,
                 "command",
             ),
             (
                 json!({"command":"true", "timeout":0}),
-                Operation::Deserialize,
+                Operation::Validate,
+                unclaimed,
                 "timeout",
             ),
             (
                 json!({"command":"true", "timeout":3601}),
-                Operation::Deserialize,
+                Operation::Validate,
+                unclaimed,
                 "timeout",
             ),
         ] {
@@ -331,10 +347,7 @@ mod tests {
                 assert_eq!(message.contains("as an array"), encoded, "{message}");
             }
             assert_eq!(context.operation, operation);
-            // Typed deserialization claims no effects.
-            if operation != Operation::Deserialize {
-                assert_eq!(context.effects, Effects::NotStarted);
-            }
+            assert_eq!(context.effects, effects, "{arguments}");
             match arguments["cwd"].as_str() {
                 Some(cwd) => {
                     assert_matches!(&context.subject, Subject::WorkingDirectory(path) if path.as_str().ends_with(cwd),

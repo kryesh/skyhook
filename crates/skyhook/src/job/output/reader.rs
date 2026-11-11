@@ -1012,7 +1012,7 @@ mod tests {
         writer.write_text(&line.repeat(300)).unwrap();
         let failed = writer.write_text(&line.repeat(200)).unwrap_err();
         let failed = ToolError::io(failed).to_string();
-        assert_eq!(failed, "execute failed: not a directory (OS error 20)");
+        assert_eq!(failed, "execute failed: not a directory");
         let held = output.test_bytes("/result/stderr").unwrap();
         assert!((300 * 1024..=400 * 1024).contains(&held.len()));
     }

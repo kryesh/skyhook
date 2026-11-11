@@ -37,7 +37,7 @@ impl<N: Actions> Input<N> {
         let fields = &catalog.fields[action];
         let refused = |name: &str, reason: String| {
             AdmissionError::invalid_arguments(reason)
-                .operation(Operation::Deserialize, Subject::argument([name]))
+                .operation(Operation::Validate, Subject::argument([name]))
         };
         if let Some(name) = (self.arguments.keys()).find(|name| !fields.contains_key(*name)) {
             let takes: Vec<_> = fields.keys().map(|name| format!("`{name}`")).collect();

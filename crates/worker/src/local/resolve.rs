@@ -53,7 +53,7 @@ fn resolve_one(
 ) -> Result<Resolution, Failure> {
     let workspace = std::path::absolute(workspace).map_err(|error| {
         let subject = Subject::WorkingDirectory(text(workspace));
-        Failure::at(Operation::Canonicalize, subject, error)
+        Failure::at(Operation::Resolve, subject, error)
     })?;
     if input.is_empty() {
         return Err(Fault::EmptyPath.into());
@@ -87,7 +87,7 @@ fn resolve_one(
 /// encoding, which the host never decodes.
 fn unspelled(input: &str, native: Vec<u8>) -> Failure {
     let fault = Fault::Unspelled { native };
-    Failure::at(Operation::Canonicalize, Subject::path(input), fault)
+    Failure::at(Operation::Resolve, Subject::path(input), fault)
 }
 
 /// `path` resolved, or its native bytes when it is not text.
@@ -183,7 +183,7 @@ fn resolve(
                 }
                 _ => Subject::Path(text(joined)),
             };
-            let error = Failure::at(Operation::Canonicalize, subject, error);
+            let error = Failure::at(Operation::Resolve, subject, error);
             return refuse(&trace.reached, trace.outside, error);
         }
     };
@@ -387,7 +387,7 @@ mod tests {
     fn lookup(result: &Result<Resolution, Failure>) -> Option<&OsError> {
         match result {
             Err(Failure {
-                operation: Some((Operation::Canonicalize, _)),
+                operation: Some((Operation::Resolve, _)),
                 fault: Fault::Os(error),
                 ..
             }) => Some(error),
@@ -570,7 +570,7 @@ mod tests {
         let Err(Failure { operation, .. }) = parent.await else {
             panic!("a missing parent resolves");
         };
-        assert_eq!(operation, Some((Operation::Canonicalize, expected)));
+        assert_eq!(operation, Some((Operation::Resolve, expected)));
     }
 
     /// A trailing separator or `.` requires a directory, as in the kernel,

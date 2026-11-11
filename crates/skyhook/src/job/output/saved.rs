@@ -736,10 +736,7 @@ mod tests {
             JobManager::spilling(runtime.store.clone(), Spill { root, bytes })
         };
         let unkept = [
-            (
-                Some(&*blocked),
-                "save failed: not a directory (OS error 20)",
-            ),
+            (Some(&*blocked), "save failed: not a directory"),
             (None, "save failed: this user has no cache directory"),
         ];
         for (root, told) in unkept {

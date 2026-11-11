@@ -11,7 +11,6 @@ pub(super) struct Projected {
     pub(super) result: Option<Value>,
     pub(super) shape: Option<Value>,
     pub(super) truncated: Vec<OutputTruncation>,
-    pub(super) notice: Option<views::Notice>,
 }
 
 /// Preview the saved result within the budget, showing its complete fields and
@@ -24,7 +23,6 @@ pub(super) fn project(
         .product
         .as_ref()
         .ok_or_else(|| ToolError::failed("saved output is missing"))?;
-    let notice = (!product.captures_complete).then_some(views::Notice::OutputIncomplete);
     let document = product.document();
     let root = FieldPointer::result();
     let presented = &saved.presented;
@@ -46,7 +44,6 @@ pub(super) fn project(
         result,
         shape,
         truncated,
-        notice,
     })
 }
 

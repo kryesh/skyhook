@@ -27,6 +27,8 @@ pub(crate) struct CaptureRow {
     /// Set once a finished capture its schema declares as JSON is classified.
     pub detection: Option<Detection>,
     pub bytes: CaptureBytes,
+    /// Nothing was captured: no chunk row, and no byte in a file.
+    pub empty: bool,
 }
 
 /// Where a capture's bytes are.
@@ -504,7 +506,8 @@ fn captures(db: &Db, key @ (job, generation): (u64, i64)) -> DbResult<Vec<Captur
            EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection, \
            s.path, s.bytes, s.newlines, s.ends_line, \
            w.path, w.bytes, w.newlines, w.ends_line, w.tail, \
-           n.path, n.bytes, n.newlines, n.ends_line \
+           n.path, n.bytes, n.newlines, n.ends_line, \
+           EXISTS (SELECT 1 FROM job_capture_chunk k WHERE k.capture = c.id) \
          FROM job_capture c \
            LEFT JOIN job_capture_spill s ON s.capture = c.id \
            LEFT JOIN job_capture_written w ON w.capture = c.id \
@@ -522,21 +525,22 @@ fn captures(db: &Db, key @ (job, generation): (u64, i64)) -> DbResult<Vec<Captur
                     ends_line: row.get(index + 2)?,
                 })
             };
-            let bytes = match (text(4)?, text(8)?, text(13)?) {
-                (None, None, None) => CaptureBytes::Rows,
-                (Some(path), None, None) => CaptureBytes::Spilled {
-                    path: path.into(),
-                    extent: extent(5)?,
-                },
-                (None, Some(path), None) => on_target(CaptureFile::Written(SpilledStream {
-                    path: TargetPath::new(path),
-                    extent: extent(9)?,
-                    tail: row.get(12)?,
-                })),
-                (None, None, Some(path)) => on_target(CaptureFile::Named {
-                    path: TargetPath::new(path),
-                    extent: extent(14)?,
-                }),
+            let (bytes, filed) = match (text(4)?, text(8)?, text(13)?) {
+                (None, None, None) => (CaptureBytes::Rows, 0),
+                (Some(path), None, None) => {
+                    let (path, extent) = (path.into(), extent(5)?);
+                    (CaptureBytes::Spilled { path, extent }, extent.bytes)
+                }
+                (None, Some(path), None) => {
+                    let (path, extent) = (TargetPath::new(path), extent(9)?);
+                    let tail = row.get(12)?;
+                    let written = SpilledStream { path, extent, tail };
+                    (on_target(CaptureFile::Written(written)), extent.bytes)
+                }
+                (None, None, Some(path)) => {
+                    let (path, extent) = (TargetPath::new(path), extent(14)?);
+                    (on_target(CaptureFile::Named { path, extent }), extent.bytes)
+                }
                 _ => return Err(corrupt("a capture is in more than one file")),
             };
             Ok(CaptureRow {
@@ -545,6 +549,7 @@ fn captures(db: &Db, key @ (job, generation): (u64, i64)) -> DbResult<Vec<Captur
                 referenced: row.get::<i64>(2)? != 0,
                 detection: optional_enum_column(row, 3)?,
                 bytes,
+                empty: filed == 0 && row.get::<i64>(17)? == 0,
             })
         },
     )

@@ -360,6 +360,7 @@ live, unfinished, or abandoned output, even without a structured result:
 ```
 
 `complete: false` means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+A finished job lists no capture that took nothing.
 Select a descriptor's `field` to page or search its retained bytes as text. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.

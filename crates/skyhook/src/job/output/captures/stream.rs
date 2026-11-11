@@ -498,7 +498,7 @@ mod tests {
             .open()
             .finish()
             .unwrap();
-        let descriptors = captures(&output, true);
+        let descriptors = captures(&output, false);
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors.iter().all(|capture| !capture.complete));
         let completed =

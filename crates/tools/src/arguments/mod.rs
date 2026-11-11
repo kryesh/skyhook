@@ -40,7 +40,7 @@ pub fn deserialize_arguments<T: serde::de::DeserializeOwned>(
             }),
         );
         AdmissionError::invalid_arguments(error.inner().to_string())
-            .operation(Operation::Deserialize, Subject::Argument(path))
+            .operation(Operation::Validate, Subject::Argument(path))
     })
 }
 
@@ -134,7 +134,7 @@ pub fn admit_arguments(
     if let Err(error) = validator.validate(&arguments) {
         let (path, expectation) = schema_argument_failure(schema, &arguments, &error);
         return Err(AdmissionError::invalid_arguments(expectation)
-            .operation(Operation::Deserialize, Subject::Argument(path)));
+            .operation(Operation::Validate, Subject::Argument(path)));
     }
     match arguments {
         Value::Object(arguments) => Ok(arguments),

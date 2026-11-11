@@ -17,7 +17,7 @@ pub enum Operation {
     Authorize,
     Connect,
     Inspect,
-    Canonicalize,
+    Resolve,
     Read,
     ReadDirectory,
     Create,
@@ -92,6 +92,22 @@ impl Subject {
     }
     pub fn working_directory(path: impl Into<TargetPath>) -> Self {
         Self::WorkingDirectory(path.into())
+    }
+    /// The path this subject names, when it names one.
+    pub fn target_path(&self) -> Option<&TargetPath> {
+        match self {
+            Self::Path(path)
+            | Self::WorkingDirectory(path)
+            | Self::StagingFile(path)
+            | Self::ParentDirectory(path)
+            | Self::DirectoryEntry(path) => Some(path),
+            Self::None
+            | Self::Argument(_)
+            | Self::Tool(_)
+            | Self::Job(_)
+            | Self::Process
+            | Self::Label(_) => None,
+        }
     }
     /// A JSON pointer into the tool arguments: the spelling schema validation reports.
     pub fn argument<S: AsRef<str>>(segments: impl IntoIterator<Item = S>) -> Self {

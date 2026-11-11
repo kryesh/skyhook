@@ -2,7 +2,9 @@
 
 use super::{Cause, Diagnostic, Effects, FailureSite, RequestEffects, Subject};
 use crate::target::{ExecutionLocation, TargetRef};
-use skyhook_worker::op::OsError;
+use skyhook_worker::diagnostic::{PathFact, PathRole};
+use skyhook_worker::op::TargetPath;
+use skyhook_worker::target::Os;
 
 /// Whether a viewer may learn which target something ran on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,17 +68,30 @@ impl Diagnostic {
                 format!(" parent directory {}", quoted(path.as_str()))
             }
             Subject::DirectoryEntry(path) => format!(" directory entry {}", quoted(path.as_str())),
+            Subject::Argument(root) if root.is_empty() => " arguments".into(),
             Subject::Argument(path) => format!(" argument {}", quoted(path)),
             Subject::Tool(tool) => format!(" tool {}", quoted(tool)),
             Subject::Job(job) => format!(" job {job}"),
             Subject::Process => " process".into(),
             Subject::Label(label) => format!(" {}", safe_text(label)),
         });
-        for path in &self.context.paths {
+        // A failure that names nothing of its own is placed by the call's paths: where
+        // they led, or what was requested when none resolved.
+        let subject = &self.context.subject;
+        let unnamed = matches!(subject, Subject::None | Subject::Tool(_));
+        let resolved = |fact: &PathFact| fact.role == PathRole::Resolved;
+        let role = match self.context.paths.iter().any(resolved) {
+            true => PathRole::Resolved,
+            false => PathRole::Requested,
+        };
+        let shown = (self.context.paths.iter()).filter(|fact| unnamed && fact.role == role);
+        let mut relative = subject.target_path().is_some_and(is_relative);
+        for fact in shown {
+            relative |= is_relative(&fact.path);
             text.push_str(&format!(
                 " ({} {})",
-                path.role.as_str(),
-                quoted(path.path.as_str())
+                fact.role.as_str(),
+                quoted(fact.path.as_str())
             ));
         }
         text.push_str(" failed");
@@ -90,29 +105,33 @@ impl Diagnostic {
                     text.push_str(" on session host");
                 }
             }
+            // An agent already knows its own location; elsewhere, the workspace says
+            // more than the target only for a path read from it.
             FailureSite::Execution(location) => {
-                match viewer.targets() {
-                    TargetView::Named => {
-                        text.push_str(&format!(" on target {}", quoted(location.target.as_str())))
-                    }
-                    TargetView::Hidden => text.push_str(" in execution workspace"),
+                let elsewhere = viewer.location() != Some(location);
+                let target = elsewhere && viewer.targets() == TargetView::Named;
+                let workspace = viewer.location().is_none() || (elsewhere && relative);
+                let workspace = workspace.then(|| quoted(location.workspace.as_str()));
+                if target {
+                    text.push_str(&format!(" on target {}", quoted(location.target.as_str())));
                 }
-                // The workspace is relevant even for an absolute requested path: cwd
-                // can fail before that requested operation starts.
-                text.push_str(&format!(
-                    " (workspace {})",
-                    quoted(location.workspace.as_str())
-                ));
+                match workspace {
+                    Some(workspace) if target => {
+                        text.push_str(&format!(" (workspace {workspace})"))
+                    }
+                    Some(workspace) => text.push_str(&format!(" in workspace {workspace}")),
+                    None => {}
+                }
             }
         }
         text.push_str(": ");
+        // A cause names its tool or job only where the subject has not.
+        let named = |tool: &String| matches!(subject, Subject::Tool(named) if named == tool);
+        let unless = |named: bool, name: String| if named { String::new() } else { name };
         match &self.cause {
-            Cause::Io(OsError { kind, code, detail }) => {
-                text.push_str(&kind.as_str().replace('_', " "));
-                if let Some(code) = code {
-                    text.push_str(&format!(" (OS error {code})"));
-                }
-                if let Some(detail) = detail {
+            Cause::Io(error) => {
+                text.push_str(&error.classified());
+                if let Some(detail) = &error.detail {
                     text.push_str(&format!(": {}", safe_text(detail)));
                 }
             }
@@ -132,18 +151,25 @@ impl Diagnostic {
             Cause::InputClosed => text.push_str("tool input channel is closed"),
             Cause::Json => text.push_str("invalid JSON data"),
             Cause::Unavailable { tool } => text.push_str(&safe_text(&format!(
-                "tool `{tool}` is unavailable in this context"
+                "{}unavailable in this context",
+                unless(named(tool), format!("tool `{tool}` is "))
             ))),
-            Cause::UnknownTool { tool } => {
-                text.push_str(&safe_text(&format!("unknown tool `{tool}`")))
-            }
+            Cause::UnknownTool { tool } => text.push_str(&safe_text(&format!(
+                "unknown tool{}",
+                unless(named(tool), format!(" `{tool}`"))
+            ))),
             Cause::ScriptUnavailable { tool } => text.push_str(&safe_text(&format!(
-                "tool `{tool}` is not available in scripts"
+                "{}not available in scripts",
+                unless(named(tool), format!("tool `{tool}` is "))
             ))),
-            Cause::UnknownJob { job } => text.push_str(&format!("unknown job {job}")),
-            Cause::JobAlreadyTerminal { job } => {
-                text.push_str(&format!("job {job} already has a terminal result"))
-            }
+            Cause::UnknownJob { job } => text.push_str(&format!(
+                "unknown job{}",
+                unless(*subject == Subject::Job(*job), format!(" {job}"))
+            )),
+            Cause::JobAlreadyTerminal { job } => text.push_str(&format!(
+                "{}already has a terminal result",
+                unless(*subject == Subject::Job(*job), format!("job {job} "))
+            )),
             Cause::Unspelled { native } => text.push_str(&format!(
                 "resolved path is not text (native bytes {})",
                 escaped_bytes(native)
@@ -210,6 +236,11 @@ pub(crate) fn safe_text(value: &str) -> String {
     text
 }
 
+/// Whether no target reads `path` from its root.
+fn is_relative(path: &TargetPath) -> bool {
+    !Os::ALL.iter().any(|os| path.is_absolute(*os))
+}
+
 /// Opaque bytes as escaped ASCII, never decoded.
 fn escaped_bytes(bytes: &[u8]) -> String {
     let escaped = bytes
@@ -273,6 +304,38 @@ mod tests {
         assert!(
             host.render_for(DiagnosticViewer::new(TargetView::Hidden, &remote))
                 .contains("on session host")
+        );
+    }
+
+    #[test]
+    fn agents_are_told_only_what_their_location_and_the_subject_leave_unsaid() {
+        let site = ExecutionLocation::named("bastion".parse().unwrap(), "/work".into());
+        let render = |subject: Subject, requested: &str, viewer: &ExecutionLocation| {
+            let context = PartialContext::new(Operation::Resolve, subject)
+                .at(FailureSite::Execution(site.clone()))
+                .path(PathRole::Requested, requested);
+            let cause = Cause::io(&std::io::Error::from_raw_os_error(2));
+            Diagnostic::new(context.resolve(), cause)
+                .render_for(DiagnosticViewer::new(TargetView::Named, viewer))
+        };
+        let parent = || Subject::ParentDirectory("/nonexistent".into());
+        let elsewhere = ExecutionLocation::root("/local".into());
+        assert_eq!(
+            render(parent(), "/nonexistent/missing", &site),
+            "resolve parent directory `/nonexistent` failed: not found"
+        );
+        assert_eq!(
+            render(parent(), "/nonexistent/missing", &elsewhere),
+            "resolve parent directory `/nonexistent` failed on target `bastion`: not found"
+        );
+        assert_eq!(
+            render(Subject::path("missing"), "missing", &elsewhere),
+            "resolve path `missing` failed on target `bastion` (workspace `/work`): not found"
+        );
+        assert_eq!(
+            render(Subject::Tool("read".into()), "missing", &elsewhere),
+            "resolve tool `read` (requested `missing`) failed on target `bastion` \
+             (workspace `/work`): not found"
         );
     }
 }

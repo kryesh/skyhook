@@ -76,9 +76,13 @@ pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDe
             .product
             .as_ref()
             .is_some_and(|product| product.captures_complete);
+    // A finished job's capture that took nothing and was never referenced leaves
+    // nothing to read.
+    let unused = |capture: &&CaptureRow| terminal && capture.empty && !capture.referenced;
     saved
         .captures
         .values()
+        .filter(|capture| !unused(capture))
         .map(|capture| CaptureDescriptor {
             output: None,
             field: capture.pointer.clone(),

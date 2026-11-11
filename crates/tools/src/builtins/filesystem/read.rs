@@ -177,9 +177,9 @@ fn unreadable(error: DecodeError, path: &op::TargetPath) -> CallError {
         }
         DecodeError::Unsupported => {
             CallError::failed("file is neither UTF-8 text nor a supported image")
-                .operation(Operation::Deserialize, Subject::path(path))
+                .operation(Operation::Read, Subject::path(path))
         }
-        error => CallError::failed(error).operation(Operation::Deserialize, Subject::path(path)),
+        error => CallError::failed(error).operation(Operation::Read, Subject::path(path)),
     }
 }
 

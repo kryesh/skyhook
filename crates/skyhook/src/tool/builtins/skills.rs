@@ -88,7 +88,7 @@ impl HostSkills {
             Ok(workspace) => workspace,
             Err(error) => {
                 warnings.push(host_warning(ToolError::from(error).operation(
-                    Operation::Canonicalize,
+                    Operation::Resolve,
                     Subject::WorkingDirectory(spelled(workspace)),
                 )));
                 workspace.to_path_buf()
@@ -258,13 +258,13 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
         .to_owned();
     let root = fs::canonicalize(path)
         .await
-        .map_err(ToolError::annotated(at(Operation::Canonicalize, path)))?;
+        .map_err(ToolError::annotated(at(Operation::Resolve, path)))?;
     let instruction_path = path.join(INSTRUCTIONS_FILE);
     let instruction_path =
         fs::canonicalize(&instruction_path)
             .await
             .map_err(ToolError::annotated(at(
-                Operation::Canonicalize,
+                Operation::Resolve,
                 &instruction_path,
             )))?;
     if !instruction_path.starts_with(&root) {
@@ -573,7 +573,7 @@ async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolE
     let source = entry.root.join(asset);
     let source = fs::canonicalize(&source)
         .await
-        .map_err(ToolError::annotated(at(Operation::Canonicalize, &source)))?;
+        .map_err(ToolError::annotated(at(Operation::Resolve, &source)))?;
     if !source.starts_with(&entry.root) {
         return Err(ToolError::failed("skill asset escapes its skill directory")
             .operation(Operation::Validate, Subject::Path(spelled(&source))));
@@ -688,7 +688,7 @@ mod tests {
         fs::create_dir_all(&missing).await.unwrap();
         let error = load_skill(&missing).await.err().unwrap();
         let diagnostic = error.diagnostic();
-        assert_eq!(diagnostic.context.operation, Operation::Canonicalize);
+        assert_eq!(diagnostic.context.operation, Operation::Resolve);
         assert_eq!(
             diagnostic.context.subject,
             Subject::Path(spelled(&missing.join("SKILL.md")))

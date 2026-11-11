@@ -54,8 +54,7 @@ where
     let runtime = tokio::runtime::Handle::current();
     let render = std::sync::Arc::new(render);
     let written = async move {
-        let mut output = CapturedOutput::new(capture, shape)
-            .map_err(|error| capture_error(error, Operation::WriteCapture))?;
+        let mut output = CapturedOutput::new(capture, shape);
         // The batches rendering on other threads, oldest first: each is written once it
         // and those before it are rendered. An event that waited alone while none is
         // rendering is rendered here, since handing it over takes longer than it does.
@@ -275,26 +274,24 @@ enum Shape {
 }
 
 impl CapturedOutput {
-    fn new(capture: PendingOutput, shape: Shape) -> std::io::Result<Self> {
-        use std::io::Write as _;
-        let mut file = capture.open();
-        file.write_all(match shape {
-            Shape::Array => b"[\n",
-            Shape::Object => b"{\n",
-        })?;
-        Ok(Self {
-            file,
+    fn new(capture: PendingOutput, shape: Shape) -> Self {
+        Self {
+            file: capture.open(),
             shape,
             empty: true,
-        })
+        }
     }
 
+    /// Open the container before its first entry, so one that takes none before its
+    /// call fails holds nothing.
     fn separate(&mut self) -> std::io::Result<()> {
         use std::io::Write as _;
-        if !std::mem::replace(&mut self.empty, false) {
-            self.file.write_all(b",\n")?;
-        }
-        Ok(())
+        let open: &[u8] = match self.shape {
+            Shape::Array => b"[\n",
+            Shape::Object => b"{\n",
+        };
+        let first = std::mem::replace(&mut self.empty, false);
+        self.file.write_all(if first { open } else { b",\n" })
     }
 
     /// Append `value` to the array.
@@ -312,6 +309,9 @@ impl CapturedOutput {
 
     fn finish(mut self) -> std::io::Result<FinishedOutput> {
         use std::io::Write as _;
+        if self.empty {
+            self.separate()?;
+        }
         self.file.write_all(match self.shape {
             Shape::Array => b"\n]",
             Shape::Object => b"\n}",
