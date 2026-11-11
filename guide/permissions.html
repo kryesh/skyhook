@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -254,7 +254,9 @@ built-ins. Only names declared by the application may be granted; ordinary Skyho
 none. A host capability name is <code>&lt;namespace&gt;.&lt;name&gt;</code> (lowercase ASCII letters, digits and
 underscores, each component starting with a letter).</p>
 <p>A capability list is exact; <code>[]</code> grants no policy capabilities. Undeclared names are errors in
-a mode and in <code>--capabilities</code>, and <code>interactive</code> in a mode. The host supplies <code>interactive</code>
+a mode, an MCP server’s <code>capabilities</code> and <code>--capabilities</code>, and <code>interactive</code> in a mode. A
+configuration naming a host capability the running application does not declare is refused
+when it loads, with every capability that application accepts. The host supplies <code>interactive</code>
 independently of the list: the terminal always has it and <code>skyhook batch</code> never does, so an
 empty list does not disable the terminal interface or root questions. Per-agent depth
 restrictions narrow the result. Enable target support by including <code>"targets"</code> in a mode.</p>

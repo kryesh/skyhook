@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -361,8 +361,9 @@ Debug builds (<code>just build</code>) read the directory live, so rebuilding sh
 applications; a running application keeps one read of each shim. A staged shim built from
 other sources than the application fails its connection at the first frame either end cannot
 decode, so rebuild the shims after changing the protocol. Release builds (<code>just build-release</code>)
-include the bytes at compile time and are self-contained. Debug shim artifacts are substantially
-larger than release artifacts.</p>
+include the bytes at compile time and are self-contained; they rebuild the applications when a
+staged shim’s bytes change or the set of staged shims does. Debug shim artifacts are
+substantially larger than release artifacts.</p>
 <p>Of the staged files named <code>*-*</code>, one with an extension is skipped, and any other must name a
 supported platform as <code>&lt;os&gt;-&lt;arch&gt;</code> or the catalog fails. A missing or empty staging directory yields
 an empty catalog; connecting to a remote target then reports an explicit missing-shim error,

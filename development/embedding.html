@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -194,25 +194,33 @@ and job identifiers, from <code>skyhook-worker</code>, and generic primitives, s
 seals with <code>into_runtime()</code>. The library reads no configuration file; where a configuration
 comes from is the host’s own.</p>
 <ul>
-<li><code>Config::from_yaml(text)</code> parses and admits one document the host holds, naming the field it
-refuses. Each section also deserializes on its own (<code>RawProviderConfig</code>, <code>Mode</code>,
-<code>TargetConfig</code>, <code>McpServerConfig</code>), from any serde format.</li>
+<li><code>Config::from_yaml(text)</code> parses one document the host holds and refuses every bad value
+in it, each at its line and column. Each section also parses on its own
+(<code>RawProviderConfig</code>, <code>Mode</code>, <code>TargetConfig</code>, <code>McpServerConfig</code>) with
+<code>skyhook::yaml::parse</code>.</li>
+<li>A host that layers or merges files reads each with <code>skyhook::yaml::read(text, file)</code> into a
+tree of nodes that remember where they were written, merges the trees, and decodes the
+result with <code>skyhook::config::process</code>, which reports each refusal at the file, line and
+column of the value it refuses. Its check is the host’s: <code>Config::refusals</code> is what
+<code>from_yaml</code> checks, and takes the host capabilities a product declares.</li>
 <li><code>Config::builder()</code> builds one in code from <code>Config::default()</code>, what an empty document
 configures. It declares the named entries (<code>provider</code>, <code>mode</code>, <code>target</code>) and selects among
-them (<code>default_model</code>, <code>default_mode</code>); <code>build()</code> admits the result as <code>from_yaml</code> admits a
-document. Every other setting (<code>mcp</code>, <code>max_child_depth</code>) is a public field.</li>
-<li><code>Config::validate()</code> runs the same admission on a configuration a host edited or merged.</li>
+them (<code>default_model</code>, <code>default_mode</code>); <code>build()</code> refuses what sealing would. Every other
+setting (<code>mcp</code>, <code>max_child_depth</code>) is a public field.</li>
+<li><code>Config::validate()</code> runs the same checks on a configuration a host edited or merged.</li>
 </ul>
+<p>The mode and model new sessions start with are checked when the configuration is sealed, not
+when a document is parsed, so a host may declare the mode or configure the model a document
+names before it seals.</p>
 <pre><code class="language-rust ignore">use skyhook::config::{Config, mode::Mode};
 use skyhook::provider::dialect::RawProviderConfig;
+use skyhook::yaml::parse;
 
-let local: RawProviderConfig = serde_json::from_value(serde_json::json!({
-    "dialect": "compatible",
-    "codec": "chat_completions",
-    "base_url": "http://127.0.0.1:8080/v1",
-    "models": {"main": {"model": "served-name", "max_context": 128000, "max_output": 4096}},
-}))?;
-let review: Mode = serde_json::from_value(serde_json::json!({"capabilities": ["read"]}))?;
+let local: RawProviderConfig = parse(
+    "{dialect: compatible, codec: chat_completions, base_url: 'http://127.0.0.1:8080/v1', \
+     models: {main: {model: served-name, max_context: 128000, max_output: 4096}}}",
+)?;
+let review: Mode = parse("{capabilities: [read]}")?;
 let mut config = Config::builder()
     .provider("local".parse()?, local)
     .mode("review".parse()?, review)
@@ -223,8 +231,8 @@ let runtime = config.into_runtime()?;</code></pre>
 <p>A provider entry’s public <code>home</code> (<code>ConfigHome</code>) says where it was defined: <code>File(path)</code> keeps
 its Skyhook-managed credentials in <code>credentials/</code> beside that file and names the file in login
 hints; <code>Unfiled</code>, what parsing and building leave, keeps them in the user’s Skyhook
-configuration directory. An MCP server’s relative <code>cwd</code> is the host’s to place, with
-<code>McpServerConfig::resolve_cwd(base)</code>.</p>
+configuration directory. An MCP server’s relative <code>cwd</code> resolves against the directory of the
+file its node was read from, and stays as written for a document read without one.</p>
 <p>Before sealing a <code>Config</code>, hosts can edit a configured model’s profile through
 <code>model_profile_mut(&amp;ModelRef)</code>, which returns <code>ConfigError::Model</code> for an unknown provider or
 model. Clearing a hint removes that model from the choices offered to agents, not from the

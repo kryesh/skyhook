@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -199,7 +199,8 @@
 </tbody>
 </table>
 </div>
-<p>A map names exactly one source. A command’s output and a file’s contents lose one trailing line
+<p>A map names exactly one source; any other key, or a second source, is refused with the
+sources a map can name. A command’s output and a file’s contents lose one trailing line
 ending (<code>\n</code>, then <code>\r</code>). A command runs with standard input closed and standard error
 discarded; its standard output is limited to 64 KiB, and it must exit successfully with UTF-8
 output that is not blank. A file path is absolute on the machine that reads it (<code>/</code> on Linux; a

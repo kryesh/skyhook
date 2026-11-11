@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -299,6 +299,27 @@ They apply defaults and applicable CLI policy overrides without requiring API cr
 starting MCP servers, or making network requests. Exit status is zero for a valid dump and
 nonzero if valid configuration cannot be produced. See <a href="../reference/cli.html#dump">dump</a>
 for selectors and incompatible options.</p>
+<h2 id="configuration-errors"><a class="header" href="#configuration-errors">Configuration errors</a></h2>
+<p>A refused configuration is reported in full: a line saying which stage of loading failed, then
+one line for each refused value, in the order the files write them. Each line starts with
+<code>file:line:column</code>, at the file that wrote the value, which for a merged configuration may be
+the user file or the workspace one, and names the value by its full path from the document
+root, such as <code>providers.openai.models.default.max_context</code> or
+<code>modes.readonly.capabilities[1]</code>.</p>
+<ul>
+<li>An unknown key is refused with every key valid in its place, and an unknown value with every
+value it could be.</li>
+<li>A mapping missing required keys is refused with every one it is missing.</li>
+<li>A name that selects nothing configured, such as a target’s <code>via</code> or <code>origin</code>, or a host
+capability the running application does not declare, is refused where it is written, with
+the names it could be instead. A user file may name what the workspace file defines; the
+merged configuration must define it.</li>
+<li>A <code>default_mode</code> or <code>default_model</code> that names nothing is refused once the application has
+finished configuring itself, with the names it could be instead and no file position: an
+application may add modes of its own, which <code>default_mode</code> may name.</li>
+</ul>
+<p>Diagnostics never quote the file, so they cannot reveal credentials written beside the
+refused value.</p>
 <h2 id="configuration-areas"><a class="header" href="#configuration-areas">Configuration areas</a></h2>
 <ul>
 <li><a href="providers-and-models.html">Providers and models</a>: named API connections, full model IDs,

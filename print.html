@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26aae551.js"></script>
@@ -204,23 +204,21 @@ and set up <a href="#authentication">authentication</a>.</li>
 Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/LICENSE">AGPL-3.0-only</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
-<p>Skyhook runs on Unix and is built from a source checkout with <a href="https://github.com/casey/just">just</a>.
-Rust 1.99 or newer is required. Release builds are made on Linux: static musl binaries that embed the
-shims remote targets run (Linux and Windows); both are cross-compiled with <a href="https://ziglang.org/download/">Zig</a>. Install Zig
-yourself and make <code>zig</code> available on <code>PATH</code> (or set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code>
-installs the remaining Rust-side tooling (<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, mdBook), the shim
-targets, and this machine’s release target.</p>
-<p>Release builds also compile the V8 JavaScript engine from source on their first run, which needs
-a recent system <code>clang</code>, <code>gn</code>, <code>ninja</code> and a nightly Rust toolchain; see
-<a href="#release-builds">release builds</a> for the exact requirements and costs.</p>
+<p>Skyhook runs on Unix and is built on Linux from a source checkout. It needs Rust 1.99 or newer,
+<a href="https://github.com/casey/just">just</a>, <a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code>, and the
+build tools listed under <a href="#release-builds">release builds</a>. <code>just setup</code>
+installs the Rust-side tooling and names anything else that is missing.</p>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
 just setup
 just install   # release shims and both applications, installed into ~/.local/bin
 </code></pre>
+<p>The first build compiles the V8 JavaScript engine from source, which takes several CPU-hours.</p>
 <p>This installs <code>skyhook</code>, the general-purpose coding agent, and <code>skyhook-security</code>, the
 <a href="#security-research">security research companion</a>. Both support the terminal interface and
 headless execution and embed the same shims. Make sure <code>~/.local/bin</code> is on <code>PATH</code>.</p>
+<p><code>just install</code> builds for this machine’s own target, against its C library.
+<code>just install x86_64-unknown-linux-musl</code> installs a static build instead.</p>
 <p>For a local-only build without Zig, run <code>cargo build --locked --release -p skyhook-apps</code>
 instead and use <code>target/release/skyhook</code> or <code>target/release/skyhook-security</code>.
 <code>just build</code> builds both applications in <code>target/debug</code>. Connecting to a remote target without an
@@ -823,7 +821,9 @@ built-ins. Only names declared by the application may be granted; ordinary Skyho
 none. A host capability name is <code>&lt;namespace&gt;.&lt;name&gt;</code> (lowercase ASCII letters, digits and
 underscores, each component starting with a letter).</p>
 <p>A capability list is exact; <code>[]</code> grants no policy capabilities. Undeclared names are errors in
-a mode and in <code>--capabilities</code>, and <code>interactive</code> in a mode. The host supplies <code>interactive</code>
+a mode, an MCP server’s <code>capabilities</code> and <code>--capabilities</code>, and <code>interactive</code> in a mode. A
+configuration naming a host capability the running application does not declare is refused
+when it loads, with every capability that application accepts. The host supplies <code>interactive</code>
 independently of the list: the terminal always has it and <code>skyhook batch</code> never does, so an
 empty list does not disable the terminal interface or root questions. Per-agent depth
 restrictions narrow the result. Enable target support by including <code>"targets"</code> in a mode.</p>
@@ -954,6 +954,9 @@ reaches through <code>via</code>, only one may set <code>password</code>. A rout
 target is configured or added. Use <code>origin</code> instead of <code>via</code> for the later of the two, or a
 target between them: every target can be an origin, and each origin starts SSH connections of
 its own.</li>
+<li>A configured <code>origin</code> or <code>via</code> names another configured target, from any configuration file
+merged into the effective configuration; one naming no configured target is refused when the
+configuration loads, with the names it could take instead.</li>
 </ul>
 <p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
 where <code>gateway</code> also has <code>origin: "build"</code>.</p>
@@ -1906,6 +1909,27 @@ They apply defaults and applicable CLI policy overrides without requiring API cr
 starting MCP servers, or making network requests. Exit status is zero for a valid dump and
 nonzero if valid configuration cannot be produced. See <a href="#dump">dump</a>
 for selectors and incompatible options.</p>
+<h2 id="configuration-errors"><a class="header" href="#configuration-errors">Configuration errors</a></h2>
+<p>A refused configuration is reported in full: a line saying which stage of loading failed, then
+one line for each refused value, in the order the files write them. Each line starts with
+<code>file:line:column</code>, at the file that wrote the value, which for a merged configuration may be
+the user file or the workspace one, and names the value by its full path from the document
+root, such as <code>providers.openai.models.default.max_context</code> or
+<code>modes.readonly.capabilities[1]</code>.</p>
+<ul>
+<li>An unknown key is refused with every key valid in its place, and an unknown value with every
+value it could be.</li>
+<li>A mapping missing required keys is refused with every one it is missing.</li>
+<li>A name that selects nothing configured, such as a target’s <code>via</code> or <code>origin</code>, or a host
+capability the running application does not declare, is refused where it is written, with
+the names it could be instead. A user file may name what the workspace file defines; the
+merged configuration must define it.</li>
+<li>A <code>default_mode</code> or <code>default_model</code> that names nothing is refused once the application has
+finished configuring itself, with the names it could be instead and no file position: an
+application may add modes of its own, which <code>default_mode</code> may name.</li>
+</ul>
+<p>Diagnostics never quote the file, so they cannot reveal credentials written beside the
+refused value.</p>
 <h2 id="configuration-areas"><a class="header" href="#configuration-areas">Configuration areas</a></h2>
 <ul>
 <li><a href="#providers-and-models">Providers and models</a>: named API connections, full model IDs,
@@ -2644,7 +2668,8 @@ context budgeting and compaction.</p>
 </tbody>
 </table>
 </div>
-<p>A map names exactly one source. A command’s output and a file’s contents lose one trailing line
+<p>A map names exactly one source; any other key, or a second source, is refused with the
+sources a map can name. A command’s output and a file’s contents lose one trailing line
 ending (<code>\n</code>, then <code>\r</code>). A command runs with standard input closed and standard error
 discarded; its standard output is limited to 64 KiB, and it must exit successfully with UTF-8
 output that is not blank. A file path is absolute on the machine that reads it (<code>/</code> on Linux; a
@@ -4090,32 +4115,34 @@ builds and the remote shims; debug builds and tests do not need it.</li>
 cd skyhook
 just setup
 </code></pre>
-<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components, every shim target, and this machine’s release
-target, and installs <code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. See
+<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components and every shim target, and installs
+<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. It then checks for Zig and what
+<a href="#release-builds">release builds</a> need, and names whatever is missing. See
 <a href="#remote-transport-and-shims">remote transport and shims</a> for shim profiles and artifacts.</p>
 <h2 id="release-builds"><a class="header" href="#release-builds">Release builds</a></h2>
-<p><code>just build-release</code> compiles V8 from source the first time it builds a <code>v8</code> version for a
-target, and reuses that build afterwards. It needs, on <code>PATH</code>:</p>
+<p><code>just build-release [target]</code> builds both applications into <code>target/&lt;target&gt;/release</code> on a Linux
+host; only x86_64 hosts have been tested.</p>
 <ul>
-<li><code>clang</code> (with <code>ld.lld</code>, <code>llvm-ar</code> and the compiler-rt builtins) at least as new as the clang major
-that V8 version’s Chromium build pins, and <code>llvm-config</code> for its libclang; the build stops with
-the required version if the installed one is older;</li>
-<li><code>gn</code>, <code>ninja</code>, <code>git</code>, <code>python3</code>, and <code>unshare</code> (util-linux); <code>ccache</code> is used when present;</li>
-<li>a nightly Rust toolchain as this repository’s active toolchain, since V8’s own build passes
-unstable flags to <code>rustc</code>.</li>
+<li>Without <code>target</code>, it builds for this machine’s own target (<code>just --evaluate native_target</code>
+prints it), using the host’s C library and name resolution.</li>
+<li><code>just build-release x86_64-unknown-linux-musl</code> or <code>aarch64-unknown-linux-musl</code> builds a static
+binary with musl’s own resolver.</li>
 </ul>
-<p>The first build for a version clones the rusty_v8 source with its submodules and
-fetches crates.io sources, then compiles without network access: nothing else is downloaded, and a
-build step that tries to fails. That first build takes several CPU-hours and a few gigabytes of
-disk under <code>target/v8</code>, and more for each further target; later builds of the same version and
-target reuse the archive. To build offline, keep <code>target/v8</code> and the cargo registry
-from an earlier build.</p>
+<p>Targets of other architectures fail before building.</p>
+<p>The first build for a <code>v8</code> version and target compiles V8 from source, taking several CPU-hours
+and a few gigabytes under <code>target/v8</code>; later builds reuse it. To build offline, keep <code>target/v8</code>
+and the cargo registry from an earlier build. The build needs, on <code>PATH</code>:</p>
+<ul>
+<li><code>clang</code> and <code>clang++</code> at least as new as the clang major that V8 version’s Chromium build pins,
+with their compiler-rt builtins; the build stops with the required version if the installed one
+is older;</li>
+<li>from the same LLVM, <code>ld.lld</code>, <code>llvm-ar</code>, <code>llvm-nm</code>, <code>llvm-readelf</code> and <code>llvm-objcopy</code>, and
+<code>llvm-config</code> for its <code>libclang.so</code>;</li>
+<li><code>gn</code>, <code>ninja</code>, <code>git</code>, <code>python3</code>, and <code>unshare</code> (util-linux); <code>ccache</code> is used when present;</li>
+<li>a nightly Rust toolchain as this repository’s active toolchain.</li>
+</ul>
 <p>To upgrade V8, bump <code>v8</code> in <code>crates/skyhook/Cargo.toml</code>, run <code>cargo update -p v8</code>, and run
 <code>just build-release</code> as usual.</p>
-<p>Release targets are the musl targets of the architectures <code>scripts/v8-archive.sh</code> maps to V8’s
-build names, <code>x86_64-unknown-linux-musl</code> and <code>aarch64-unknown-linux-musl</code>; a target of any other
-architecture fails before building. The build host can be any Linux host whose own architecture is
-mapped; only x86_64 hosts have been tested, not aarch64.</p>
 <h2 id="common-tasks"><a class="header" href="#common-tasks">Common tasks</a></h2>
 <p>Run these commands from the repository root:</p>
 <div class="table-wrapper">
@@ -4124,13 +4151,13 @@ mapped; only x86_64 hosts have been tested, not aarch64.</p>
 <tr><th>Command</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><code>just setup</code></td><td>Install the Rust-side tooling, shim targets, and this machine’s release target.</td></tr>
+<tr><td><code>just setup</code></td><td>Install the Rust-side tooling and shim targets, and check for the other build tools.</td></tr>
 <tr><td><code>just build-shims</code></td><td>Cross-compile debug shims for every Linux and Windows shim target into <code>target/shims</code>; requires Zig.</td></tr>
 <tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised shims into <code>target/shims</code>; requires Zig.</td></tr>
 <tr><td><code>just build</code></td><td>Debug builds of both applications; they read <code>target/shims</code> live at runtime.</td></tr>
-<tr><td><code>just build-release [target]</code></td><td>Release builds of both applications in <code>target/&lt;target&gt;/release</code>, embedding the current contents of <code>target/shims</code>; <code>target</code> defaults to the static musl target of this Linux machine’s architecture (<code>just --evaluate host_target</code> prints it).</td></tr>
+<tr><td><code>just build-release [target]</code></td><td>Release builds of both applications in <code>target/&lt;target&gt;/release</code>, embedding the current contents of <code>target/shims</code>; see <a href="#release-builds">release builds</a> for <code>target</code>.</td></tr>
 <tr><td><code>just build-full [target]</code></td><td>Release shims, then release applications for <code>target</code> that embed them.</td></tr>
-<tr><td><code>just install</code></td><td><code>build-full</code> for this machine, then install both applications into <code>~/.local/bin</code>.</td></tr>
+<tr><td><code>just install [target]</code></td><td><code>build-full</code> for <code>target</code>, then install both applications into <code>~/.local/bin</code>.</td></tr>
 <tr><td><code>just run [args]</code>, <code>just run-security [args]</code></td><td>Run a debug application.</td></tr>
 <tr><td><code>just test</code></td><td>Nextest suite over the workspace and all targets.</td></tr>
 <tr><td><code>just lint</code></td><td>Clippy over the workspace and all targets with warnings denied.</td></tr>
@@ -4296,13 +4323,18 @@ UI state, termination signals and the embedded shims. Its two binaries each disp
 command line, and the security binary adds its options, its <code>security.yaml</code>, its <code>runs</code> command
 and its look.</p>
 <p>Configuration files are the applications’ own (<code>skyhook_apps::config</code>): discovery of the user
-and workspace files or the one a command line names, their layering, the diagnostics of files
-passed over, and the values that follow a file. Typed <code>LayeredConfig</code> schemas share one loader
-for discovery, whole-entry merging and diagnostics: <code>config.yaml</code> is <code>HostConfig</code>, whose
-admission stamps every provider with its defining file (<code>ConfigHome</code>), beside which its
-Skyhook-managed credentials live, and a product’s file is a schema its binary declares. Any
-schema holding MCP servers resolves each server’s relative <code>cwd</code> against the file that declared
-it.</p>
+and workspace files or the one a command line names, their layering, and the diagnostics of
+files passed over. Typed <code>LayeredConfig</code> schemas share one loader: <code>config.yaml</code> is
+<code>HostConfig</code>, checked against the host capabilities of the product it is loaded to run, and a
+product’s file is a schema its binary declares.</p>
+<p>Each file is read into a tree of nodes (<code>skyhook_base::decode</code>) that places every value at its
+file, line and column, and layers merge on those trees. One pass then decodes the merged tree
+through the <code>Decode</code> trait and collects every refusal at the position of the value it refuses.
+A type’s own validation and the checks of what the parts say of each other (target routes,
+undeclared host capabilities) run in that same pass; the default mode and model are checked
+when the configuration is sealed, after the product’s edits. A type that also
+crosses a serde boundary, such as a target’s settings as a tool’s arguments, keeps its serde
+form for that boundary.</p>
 <p>Sessions carry the creating host’s name; another host’s session opens view-only, and the library
 refuses to activate it. All products share <code>.skyhook/sessions</code>, the shims and the capability
 rules; see <a href="#products-and-launching-their-sessions">products and launching their sessions</a>.</p>
@@ -4384,9 +4416,9 @@ actions, the host state and host events read beside the session’s one writer; 
 work is mostly files (recording a test, generating reports) takes the session’s files turn
 rather than the writer’s.</p>
 <h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
-<p><code>config</code> is the configuration a host parses from text it holds (<code>Config::from_yaml</code>) or builds
-in code (<code>Config::builder</code>); it admits it, resolves model selections, and builds the model
-catalog. It does not interpret provider entries. An entry’s
+<p><code>config</code> is the configuration a host parses from text it holds (<code>Config::from_yaml</code>), decodes
+from a tree (<code>config::process</code>) or builds in code (<code>Config::builder</code>); it admits it, resolves
+model selections, and builds the model catalog. It does not interpret provider entries. An entry’s
 <code>ConfigHome</code> is where the host says it was defined, beside which its Skyhook-managed
 credentials live; one a host leaves unfiled keeps them in the user’s Skyhook directory.
 <code>provider::dialect</code> owns the entries
@@ -4967,25 +4999,33 @@ and job identifiers, from <code>skyhook-worker</code>, and generic primitives, s
 seals with <code>into_runtime()</code>. The library reads no configuration file; where a configuration
 comes from is the host’s own.</p>
 <ul>
-<li><code>Config::from_yaml(text)</code> parses and admits one document the host holds, naming the field it
-refuses. Each section also deserializes on its own (<code>RawProviderConfig</code>, <code>Mode</code>,
-<code>TargetConfig</code>, <code>McpServerConfig</code>), from any serde format.</li>
+<li><code>Config::from_yaml(text)</code> parses one document the host holds and refuses every bad value
+in it, each at its line and column. Each section also parses on its own
+(<code>RawProviderConfig</code>, <code>Mode</code>, <code>TargetConfig</code>, <code>McpServerConfig</code>) with
+<code>skyhook::yaml::parse</code>.</li>
+<li>A host that layers or merges files reads each with <code>skyhook::yaml::read(text, file)</code> into a
+tree of nodes that remember where they were written, merges the trees, and decodes the
+result with <code>skyhook::config::process</code>, which reports each refusal at the file, line and
+column of the value it refuses. Its check is the host’s: <code>Config::refusals</code> is what
+<code>from_yaml</code> checks, and takes the host capabilities a product declares.</li>
 <li><code>Config::builder()</code> builds one in code from <code>Config::default()</code>, what an empty document
 configures. It declares the named entries (<code>provider</code>, <code>mode</code>, <code>target</code>) and selects among
-them (<code>default_model</code>, <code>default_mode</code>); <code>build()</code> admits the result as <code>from_yaml</code> admits a
-document. Every other setting (<code>mcp</code>, <code>max_child_depth</code>) is a public field.</li>
-<li><code>Config::validate()</code> runs the same admission on a configuration a host edited or merged.</li>
+them (<code>default_model</code>, <code>default_mode</code>); <code>build()</code> refuses what sealing would. Every other
+setting (<code>mcp</code>, <code>max_child_depth</code>) is a public field.</li>
+<li><code>Config::validate()</code> runs the same checks on a configuration a host edited or merged.</li>
 </ul>
+<p>The mode and model new sessions start with are checked when the configuration is sealed, not
+when a document is parsed, so a host may declare the mode or configure the model a document
+names before it seals.</p>
 <pre><code class="language-rust ignore">use skyhook::config::{Config, mode::Mode};
 use skyhook::provider::dialect::RawProviderConfig;
+use skyhook::yaml::parse;
 
-let local: RawProviderConfig = serde_json::from_value(serde_json::json!({
-    "dialect": "compatible",
-    "codec": "chat_completions",
-    "base_url": "http://127.0.0.1:8080/v1",
-    "models": {"main": {"model": "served-name", "max_context": 128000, "max_output": 4096}},
-}))?;
-let review: Mode = serde_json::from_value(serde_json::json!({"capabilities": ["read"]}))?;
+let local: RawProviderConfig = parse(
+    "{dialect: compatible, codec: chat_completions, base_url: 'http://127.0.0.1:8080/v1', \
+     models: {main: {model: served-name, max_context: 128000, max_output: 4096}}}",
+)?;
+let review: Mode = parse("{capabilities: [read]}")?;
 let mut config = Config::builder()
     .provider("local".parse()?, local)
     .mode("review".parse()?, review)
@@ -4996,8 +5036,8 @@ let runtime = config.into_runtime()?;</code></pre>
 <p>A provider entry’s public <code>home</code> (<code>ConfigHome</code>) says where it was defined: <code>File(path)</code> keeps
 its Skyhook-managed credentials in <code>credentials/</code> beside that file and names the file in login
 hints; <code>Unfiled</code>, what parsing and building leave, keeps them in the user’s Skyhook
-configuration directory. An MCP server’s relative <code>cwd</code> is the host’s to place, with
-<code>McpServerConfig::resolve_cwd(base)</code>.</p>
+configuration directory. An MCP server’s relative <code>cwd</code> resolves against the directory of the
+file its node was read from, and stays as written for a document read without one.</p>
 <p>Before sealing a <code>Config</code>, hosts can edit a configured model’s profile through
 <code>model_profile_mut(&amp;ModelRef)</code>, which returns <code>ConfigError::Model</code> for an unknown provider or
 model. Clearing a hint removes that model from the choices offered to agents, not from the
@@ -5697,8 +5737,9 @@ Debug builds (<code>just build</code>) read the directory live, so rebuilding sh
 applications; a running application keeps one read of each shim. A staged shim built from
 other sources than the application fails its connection at the first frame either end cannot
 decode, so rebuild the shims after changing the protocol. Release builds (<code>just build-release</code>)
-include the bytes at compile time and are self-contained. Debug shim artifacts are substantially
-larger than release artifacts.</p>
+include the bytes at compile time and are self-contained; they rebuild the applications when a
+staged shim’s bytes change or the set of staged shims does. Debug shim artifacts are
+substantially larger than release artifacts.</p>
 <p>Of the staged files named <code>*-*</code>, one with an extension is skipped, and any other must name a
 supported platform as <code>&lt;os&gt;-&lt;arch&gt;</code> or the catalog fails. A missing or empty staging directory yields
 an empty catalog; connecting to a remote target then reports an explicit missing-shim error,

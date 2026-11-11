@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e26b3df0.js";
+            window.path_to_searchindex_js = "../searchindex-866cc1e1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-26aae551.js"></script>
@@ -249,6 +249,9 @@ reaches through <code>via</code>, only one may set <code>password</code>. A rout
 target is configured or added. Use <code>origin</code> instead of <code>via</code> for the later of the two, or a
 target between them: every target can be an origin, and each origin starts SSH connections of
 its own.</li>
+<li>A configured <code>origin</code> or <code>via</code> names another configured target, from any configuration file
+merged into the effective configuration; one naming no configured target is refused when the
+configuration loads, with the names it could take instead.</li>
 </ul>
 <p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
 where <code>gateway</code> also has <code>origin: "build"</code>.</p>
