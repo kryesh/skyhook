@@ -102,9 +102,9 @@ preview:
   first lines left. The marker line is not part of the output and is not counted. A stream whose
   last line alone is over those bytes keeps only its start, like other text fields. An `exec`
   response a script returns keeps both ends of its streams in the script's result too.
-- **Everything else** shares one 8 KiB preview budget, which also counts the shape and truncation
-  records below. When it is exceeded, strings keep their first 256 bytes; if every element then
-  fits, all are kept. Otherwise arrays keep their first elements, with one count shared by every
+- **Everything else** shares one 16 KiB preview budget, which also counts the shape and truncation
+  records below. When it is exceeded, strings keep their first 256 bytes, unless cutting one would
+  save less than the record of its cut takes; if every element then fits, all are kept. Otherwise arrays keep their first elements, with one count shared by every
   array at any depth: the largest that fits, and at most 10. Objects with more than 100 members
   keep their first members in source order the same way; smaller objects keep all of theirs, or
   when that does not fit, none. When even a single sample does not fit, strings get shorter, then

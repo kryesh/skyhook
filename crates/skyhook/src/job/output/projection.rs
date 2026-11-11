@@ -410,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn text_fields_keep_their_limits_and_views_survive_resume() {
         let value = json!({"content":"line\n".repeat(250), "stdout":"é\\\"".repeat(TEXT_BYTES),
-            "stderr":"e".repeat(2 * TEXT_BYTES), "extra":["z".repeat(10000)],
+            "stderr":"e".repeat(2 * TEXT_BYTES), "extra":["z".repeat(2 * TEXT_BYTES)],
             "instructions":"i".repeat(2 * TEXT_BYTES), "exit":{"code":7}});
         let schema = json!({"type":"object","properties":{"instructions":{PREVIEW:"complete"}}});
         let error = "failure details ".repeat(2000);

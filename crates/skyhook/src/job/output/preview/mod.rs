@@ -27,7 +27,7 @@ use super::{
 };
 
 /// Budget for a preview's sampled content, its shape and its truncation records.
-const PREVIEW_BUDGET: usize = 8 * 1024;
+const PREVIEW_BUDGET: usize = 16 * 1024;
 /// Budget for everything one page shows.
 const PAGE_BUDGET: usize = CONTENT_BYTES;
 /// A text field keeps at most this many bytes and lines.
@@ -423,6 +423,18 @@ mod tests {
         assert!((1..=SAMPLES).contains(&shown), "{shown}");
     }
 
+    /// A string is cut only where that saves more than the cut's record takes.
+    #[test]
+    fn a_cut_saving_less_than_its_record_is_not_made() {
+        let near = "n".repeat(SAMPLE_TEXT_BYTES[0] + 40);
+        let far = "f".repeat(4 * SAMPLE_TEXT_BYTES[0]);
+        let preview = run(&json!({"items": vec![json!([near, far]); 100]}), &[]);
+        let shown = preview.value["items"][0].as_array().unwrap();
+        assert_eq!(shown[0], json!(near));
+        assert_eq!(shown[1].as_str().unwrap().len(), SAMPLE_TEXT_BYTES[0]);
+        assert!(budgeted(&preview) <= PREVIEW_BUDGET);
+    }
+
     #[test]
     fn earlier_candidates_never_crowd_out_a_later_first_sample() {
         let record: serde_json::Map<_, _> = (0..100)
@@ -449,10 +461,11 @@ mod tests {
         let collection: serde_json::Map<_, _> = (0..150)
             .map(|index| (format!("m{index:03}"), json!(member)))
             .collect();
-        let preview = run(&json!({"a": [collection], "b": [42, 43, 44]}), &[]);
+        let later = Vec::from_iter(42..42 + SAMPLES);
+        let preview = run(&json!({"a": [collection], "b": later}), &[]);
         let shown = preview.value["a"][0].as_object().unwrap().len();
         assert!(shown > 0);
-        assert_eq!(preview.value["b"], json!([42, 43, 44][..shown]));
+        assert_eq!(preview.value["b"], json!(later[..shown]));
     }
 
     #[test]

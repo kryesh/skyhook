@@ -312,7 +312,7 @@ mod tests {
         job: JobId,
     ) -> Vec<String> {
         let mut texts = Vec::new();
-        for index in 0..40 {
+        for index in 0..80 {
             let text = format!("reply {index} {}", "x".repeat(1024));
             commit(manager, child, job, &text).await;
             texts.push(text);

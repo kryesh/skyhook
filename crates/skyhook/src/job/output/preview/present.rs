@@ -116,7 +116,21 @@ impl Presenter<'_> {
                 }
                 TextRole::Sample => {
                     let clip = self.fit.clip.unwrap_or(text.limit);
-                    let (value, cut) = shorten(text, field, clip, None);
+                    let (value, cut) = match shorten(text, field, clip, None) {
+                        // A cut is made only where it saves more than its record takes.
+                        (kept, Some(record)) if clip < text.limit => {
+                            match shorten(text, field, text.limit, None) {
+                                (whole, None)
+                                    if json_bytes(&whole)
+                                        <= json_bytes(&kept) + json_bytes(&record) =>
+                                {
+                                    (whole, None)
+                                }
+                                _ => (kept, Some(record)),
+                            }
+                        }
+                        shortened => shortened,
+                    };
                     self.cuts.extend(cut);
                     value
                 }
