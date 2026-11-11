@@ -9,8 +9,7 @@ executes it once, while constructing an equivalent new builder creates a new cal
 const packageFile = (await tool.read({ path: "Cargo.toml" })).unwrap();
 const matches = (await tool.search({ pattern: "TODO", path: "src" })).unwrap();
 
-// Fluent setters accept the same arguments; each setter returns a new builder.
-const readme = (await tool.read().path("README.md")).unwrap();
+const readme = (await tool.read({ path: "README.md" })).unwrap();
 
 // Builders can be awaited independently (and can still be batched with Promise.all).
 return { packageFile, matches, readme };

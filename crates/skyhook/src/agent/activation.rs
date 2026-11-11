@@ -1651,7 +1651,7 @@ mod tests {
         let sessions = root.path().join("sessions");
         let build = |host: &str, password: Option<&str>| {
             let targets = serde_json::json!({
-                "build": {"type": "ssh", "host": host, "ssh": {"password": password}},
+                "build": {"host": host, "transport": {"ssh": {"password": password}}},
             });
             let provider = scripted_provider(&Requests::default(), [answer("done")]);
             test_builder(root.path(), &sessions, provider, false)

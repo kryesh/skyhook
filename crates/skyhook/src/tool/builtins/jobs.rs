@@ -164,7 +164,7 @@ struct JobsArgs {
     /// One-based first line of text, or element, member or query match of JSON; use returned next_start to continue
     #[schemars(range(min = 1), extend("default" = 1))]
     start: Option<usize>,
-    /// Required past start 1 on JSON
+    /// Required with start > 1 on a JSON field
     unit: Option<PageUnit>,
     /// Maximum returned lines (including match context), values or query matches; without job, the newest jobs listed
     #[schemars(extend("default" = DEFAULT_LIMIT))]

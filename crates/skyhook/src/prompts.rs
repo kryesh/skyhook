@@ -269,7 +269,7 @@ struct System {
     #[serde(flatten)]
     agent: PromptContext,
     persona: Option<String>,
-    mode_instructions: Option<String>,
+    /// The mode's instructions, then the workspace's files.
     instructions: Vec<String>,
 }
 
@@ -280,11 +280,15 @@ impl System {
         instructions: Option<&Prose>,
         files: &[String],
     ) -> Self {
+        let agent = PromptContext::new(agent);
+        let mode = instructions.map(|text| {
+            let name = serde_json::json!(agent.mode);
+            format!("<mode name={name}>\n{}\n</mode>", text.as_str().trim())
+        });
         Self {
-            agent: PromptContext::new(agent),
             persona: persona.map(|text| text.trim().to_owned()),
-            mode_instructions: instructions.map(|text| text.as_str().trim().to_owned()),
-            instructions: files.to_vec(),
+            instructions: mode.into_iter().chain(files.iter().cloned()).collect(),
+            agent,
         }
     }
 }

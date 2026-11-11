@@ -53,13 +53,6 @@ pub enum TargetError {
         transport: ConnectionKind,
         problem: skyhook_worker::secret::SourceProblem,
     },
-    #[error("a {0} target needs its connection settings; add a `{0}` mapping beside `type`")]
-    MissingSettings(ConnectionKind),
-    #[error("a {transport} target takes no {settings} settings")]
-    ForeignSettings {
-        transport: ConnectionKind,
-        settings: ConnectionKind,
-    },
     #[error(
         "target `{0}` connects with WinRM, which has no jumps; reach it from an origin instead of via"
     )]
@@ -117,15 +110,13 @@ impl TargetError {
             | Self::InvalidHostKeyChecking(_)
             | Self::InvalidHostKeyUpdates(_)
             | Self::DedicatedSshOption(..)
-            | Self::ProxyCommandWithVia(_) => return vec!["ssh", "options"],
+            | Self::ProxyCommandWithVia(_) => return vec!["transport", "ssh", "options"],
             Self::ViaIsOrigin(_) | Self::WinrmVia(_) | Self::WinrmJump { .. } => "via",
             Self::RootCannotBeJump => "via",
             Self::OriginMismatch { .. } => "origin",
             Self::InvalidPassword { transport, .. } => {
-                return vec![transport.as_str(), "password"];
+                return vec!["transport", transport.as_str(), "password"];
             }
-            Self::MissingSettings(transport) => transport.as_str(),
-            Self::ForeignSettings { settings, .. } => settings.as_str(),
             Self::InvalidReference { edge } | Self::UnknownReference { edge, .. } => edge.as_str(),
             Self::Name(_)
             | Self::Unknown(_)
@@ -177,8 +168,6 @@ impl<O> From<TargetError> for OperationError<O> {
                 "one SSH connection types only one password or key passphrase; reach the later target from the earlier, or a target after it, with origin instead of via",
             ),
             TargetError::Name(_)
-            | TargetError::MissingSettings(_)
-            | TargetError::ForeignSettings { .. }
             | TargetError::InvalidReference { .. }
             | TargetError::RootCannotBeJump => None,
         };

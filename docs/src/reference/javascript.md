@@ -234,10 +234,8 @@ unpaired surrogates are problems too. The converted argument must be an object.
 
 ## Builder execution and policy
 
-Builder setters and object arguments accept the same inputs; omitted values receive the tool's
-normal defaults. Use `.set(key, value)` to select an argument by name, for example
-`tool.read().set("path", "README.md")`. Unknown `.set` keys throw a `TypeError`; calling a
-nonexistent fluent setter produces the usual JavaScript method-call error.
+A builder takes its tool's arguments as one object; omitted values receive the tool's normal
+defaults.
 
 Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Only returned values expand: inside the body, `await {a: builder}`

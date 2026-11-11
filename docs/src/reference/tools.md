@@ -73,7 +73,7 @@ For example, an agent on a remote target can copy a file from the session host w
 
 ## Further contracts
 
-- [JavaScript runtime](javascript.md): fluent builders and native/script result shapes.
+- [JavaScript runtime](javascript.md): builders and native/script result shapes.
 - [Jobs and agents](../scripting/jobs-and-agents.md): delegation, input, cancellation, and naming.
 - [HTTP requests](http.md): requests, downloads, failures, and security boundaries.
 - [Saved job output](job-output.md): file/search shapes, capture, previews, and pagination.

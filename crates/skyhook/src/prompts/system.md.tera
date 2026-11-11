@@ -18,12 +18,6 @@
 
 {% include "skyhook/agents.md" %}
 {%- endif %}
-{%- if mode_instructions %}
-
-<mode name={{ mode | json }}>
-{{ mode_instructions }}
-</mode>
-{%- endif %}
 {%- for text in instructions %}
 
 {{ text }}

@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 use super::options::SshOption;
-use super::{Connection, ConnectionKind, SshOptions, TargetConfig};
+use super::{Connection, SshOptions, TargetConfig};
 use crate::target::{TargetEdge, TargetError};
 use crate::tool::policy::{Capability, PermissionUse, ResourceId};
 use skyhook_base::enums::NamedEnum;
@@ -56,26 +56,11 @@ impl TargetDefinition {
             Some(TargetRef::Root) => return Err(TargetError::RootCannotBeJump),
             via => via.and_then(|via| via.name().cloned()),
         };
-        let foreign = |settings| TargetError::ForeignSettings {
-            transport: config.r#type,
-            settings,
-        };
-        let connection = match (config.r#type, config.winrm) {
-            (ConnectionKind::Ssh, None) => Connection::Ssh(config.ssh),
-            (ConnectionKind::Ssh, Some(_)) => return Err(foreign(ConnectionKind::Winrm)),
-            (ConnectionKind::Winrm, _) if config.ssh != Default::default() => {
-                return Err(foreign(ConnectionKind::Ssh));
-            }
-            (ConnectionKind::Winrm, Some(winrm)) => Connection::Winrm(winrm),
-            (ConnectionKind::Winrm, None) => {
-                return Err(TargetError::MissingSettings(ConnectionKind::Winrm));
-            }
-        };
         let definition = Self {
             name: TargetName::try_from(name)?,
             host: config.host,
-            os: config.os.unwrap_or(config.r#type.default_os()),
-            connection,
+            os: config.os.unwrap_or(config.transport.kind().default_os()),
+            connection: config.transport,
             workspace: config.workspace,
             via,
             origin,

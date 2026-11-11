@@ -13,7 +13,7 @@ use skyhook_tools::output::{FieldPointer, FieldPresentation};
 
 #[derive(Serialize)]
 pub(super) struct Config {
-    pub(super) builders: Vec<ScriptManifest>,
+    pub(super) builders: Vec<String>,
     /// The states a job ends in, which a call's view unwraps to its result or error.
     pub(super) terminal: Vec<JobState>,
     /// The module name of the submitted body's frames.
@@ -65,22 +65,10 @@ pub(super) struct Failure {
     pub(super) details: Option<Map<String, Value>>,
 }
 
-/// A script's `tool.<name>` call and the arguments it accepts.
-#[derive(serde::Serialize)]
-pub(super) struct ScriptManifest {
-    name: String,
-    properties: Vec<String>,
-}
-
-/// The calls a script on `surface` may make.
-pub(super) fn script_manifests(surface: &ToolSurface) -> Vec<ScriptManifest> {
+/// The `tool.<name>` calls a script on `surface` may make.
+pub(super) fn script_calls(surface: &ToolSurface) -> Vec<String> {
     (surface.specs())
         .filter(|tool| tool.script_binding != ScriptBinding::Unavailable)
-        .map(|tool| ScriptManifest {
-            name: tool.name.clone(),
-            properties: (tool.input_schema["properties"].as_object().into_iter())
-                .flat_map(|properties| properties.keys().cloned())
-                .collect(),
-        })
+        .map(|tool| tool.name.clone())
         .collect()
 }

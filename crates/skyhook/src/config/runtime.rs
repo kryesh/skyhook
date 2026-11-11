@@ -356,7 +356,7 @@ mod tests {
 
         // Targets precede catalog checks.
         let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", "", "")).unwrap();
-        raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
+        raw.targets = crate::yaml::parse("root:\n  host: unused\n  transport: {ssh: {}}").unwrap();
         assert!(matches!(
             raw.clone().into_runtime(),
             Err(ConfigError::Refused(_))

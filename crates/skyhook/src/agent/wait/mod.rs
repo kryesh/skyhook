@@ -745,20 +745,14 @@ pub(super) mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// A script's wait, direct or built, times out rather than being woken by the
-    /// script's own job.
+    /// A script's wait times out rather than being woken by the script's own job.
     #[tokio::test]
     async fn script_waits_do_not_self_wake() {
         let (_root, session) = start(&tracking(vec![])).await;
-        let source = "const direct = (await tool.wait({timeout:1})).result.reason; const builder = (await tool.wait().timeout(1)).result.reason; return [direct, builder];";
-        let timeouts = async {
-            time_out(&session, &session.root, 1, 1).await;
-            time_out(&session, &session.root, 2, 1).await;
-        };
-        let (output, ()) = tokio::join!(bounded(session.run_script(source)), timeouts);
-        let output = output.unwrap();
-        let timeouts = json!(["timeout", "timeout"]);
-        assert_eq!(output.value, json!({"value":timeouts}));
+        let source = "return (await tool.wait({timeout:1})).result.reason;";
+        let timeout = time_out(&session, &session.root, 1, 1);
+        let (output, ()) = tokio::join!(bounded(session.run_script(source)), timeout);
+        assert_eq!(output.unwrap().value, json!({"value":"timeout"}));
         session.shutdown().await.unwrap();
     }
 

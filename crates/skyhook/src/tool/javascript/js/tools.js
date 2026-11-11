@@ -1,6 +1,5 @@
-import { IDENTIFIER, parse, stringify, argument, annotate } from "skyhook:values";
+import { parse, stringify, argument, annotate } from "skyhook:values";
 
-const RESERVED = new Set(["then", "catch", "finally", "set"]);
 const calls = new WeakMap();
 const executions = new WeakMap();
 let host, terminal;
@@ -38,44 +37,32 @@ function execute(call) {
   return execution;
 }
 
-// A builder is an immutable snapshot of converted arguments that executes once,
-// when first awaited; each setter derives a new builder.
-function builder(manifest, input) {
-  Object.freeze(input);
+// A builder is a snapshot of converted arguments that executes once, when first awaited.
+function builder(name, input) {
   const call = {};
-  const set = (key, value) => {
-    if (!manifest.properties.includes(key)) throw new TypeError(`unknown argument ${String(key)} for ${manifest.call}`);
-    return builder(manifest, argument({...input, [key]: value}, `${manifest.call} argument`));
-  };
   Object.defineProperties(call, {
     then: {value: (onFulfilled, onRejected) => execute(call).then(onFulfilled, onRejected)},
     catch: {value: onRejected => execute(call).catch(onRejected)},
     finally: {value: onFinally => execute(call).finally(onFinally)},
-    set: {value: set},
   });
-  for (const key of manifest.setters) Object.defineProperty(call, key, {value: value => set(key, value)});
-  calls.set(call, {name: manifest.name, input});
+  calls.set(call, {name, input: Object.freeze(input)});
   return Object.freeze(call);
 }
 
-function object(manifest, values) {
-  if (values.length > 1) throw new TypeError(`${manifest.call} accepts zero arguments or one argument object`);
-  const input = argument(values.length ? values[0] : {}, `${manifest.call} argument`);
+function object(call, values) {
+  if (values.length > 1) throw new TypeError(`${call} accepts zero arguments or one argument object`);
+  const input = argument(values.length ? values[0] : {}, `${call} argument`);
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
-    throw new TypeError(`${manifest.call} argument must be a plain object`);
+    throw new TypeError(`${call} argument must be a plain object`);
   }
   return input;
 }
 
-export function install(manifests, ended, call) {
+export function install(names, ended, call) {
   host = call;
   terminal = new Set(ended);
   const tool = Object.create(null);
-  for (const manifest of manifests) {
-    manifest.call = `tool.${manifest.name}`;
-    manifest.setters = manifest.properties.filter(key => IDENTIFIER.test(key) && !RESERVED.has(key));
-    tool[manifest.name] = (...values) => builder(manifest, object(manifest, values));
-  }
+  for (const name of names) tool[name] = (...values) => builder(name, object(`tool.${name}`, values));
   return {tool: Object.freeze(tool), receive: inbox()};
 }
 

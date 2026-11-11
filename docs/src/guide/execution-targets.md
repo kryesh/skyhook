@@ -18,41 +18,42 @@ required settings in the replacement entry.
 ```yaml
 targets:
   bastion:
-    type: "ssh"
     host: "bastion.example.com"
-    ssh:
-      user: "gateway"
+    transport:
+      ssh:
+        user: "gateway"
 
   build:
-    type: "ssh"
     host: "build.internal"
     workspace: "/srv/project"
     via: "bastion"
-    ssh:
-      key: "~/.ssh/build_ed25519"
-      password: {env: "BUILD_KEY_PASSPHRASE"}
-      forward_agent: true
+    transport:
+      ssh:
+        key: "~/.ssh/build_ed25519"
+        password: {env: "BUILD_KEY_PASSPHRASE"}
+        forward_agent: true
 
   legacy:
-    type: "ssh"
     host: "legacy.internal"
-    ssh:
-      user: "deploy"
-      password: {command: ["pass", "show", "legacy"]}
+    transport:
+      ssh:
+        user: "deploy"
+        password: {command: ["pass", "show", "legacy"]}
 
   database:
-    type: "ssh"
     host: "db.internal"
     origin: "build"
-    ssh:
-      # Reach the host through a gateway using the deploy user's own SSH key on build.
-      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+    transport:
+      ssh:
+        # Reach the host through a gateway using the deploy user's own SSH key on build.
+        options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 ```
 
 The built-in `root` is the session host—the machine running the main Skyhook process. It is not
 configured as a target and always identifies that machine, including when an agent's current
-target is remote. Named targets declare their transport with `type`: `"ssh"`, configured under
-`ssh`, or `"winrm"`, configured under `winrm` (see [WinRM targets](#winrm-targets)). A target's
+target is remote. Named targets give their transport and its settings under `transport`: `ssh`, or
+`winrm` (see [WinRM targets](#winrm-targets)); an SSH target with no settings is written
+`transport: {ssh: {}}`. A target's
 `os` declares its operating system, `"linux"` or `"windows"`, by default `"linux"` for `ssh` and
 `"windows"` for `winrm`; see [Windows targets](#windows-targets). Skyhook starts the target with
 the commands of the system declared, so declare it correctly. A target whose shell runs them and
@@ -84,13 +85,13 @@ where `gateway` also has `origin: "build"`.
 Registering targets never connects to them; registrations are session-wide.
 
 ```javascript
-await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
-  ssh: {key: "~/.ssh/database"}});
+await tool.target_add({name: "database", host: "db.internal", origin: "build",
+  transport: {ssh: {key: "~/.ssh/database"}}});
 ```
 
 ## SSH settings
 
-SSH settings live under `ssh`. Every setting is optional. `options` values must be strings;
+SSH settings live under `transport.ssh`. Every setting is optional. `options` values must be strings;
 quote numeric-looking values, for example `ServerAliveInterval: "15"`. Each host is given 30
 seconds to connect, after which OpenSSH's own error is the connection error, unless the
 target's `options` set `ConnectTimeout`.
@@ -109,7 +110,7 @@ How a target authenticates follows from `key` and `password`:
   that allows only keyboard-interactive authentication, as some PAM setups do, cannot be reached
   with a password.
 - `key`, with an optional `password` for an encrypted key: that key alone.
-- neither, including a target with no `ssh` settings at all: only keys already in the origin's SSH
+- neither, including a target with no SSH settings at all: only keys already in the origin's SSH
   agent: the one it inherited or was forwarded, otherwise Skyhook's private agent there if an
   earlier connection started it, or on Windows the agent service. The connection fails if there
   is none; see [agents](#agents).
@@ -158,22 +159,22 @@ A `winrm` target is a Windows host reached through Windows Remote Management.
 ```yaml
 targets:
   winapp:
-    type: "winrm"
     host: "winapp.corp.example"
     workspace: 'C:\deploy'
-    winrm:
-      user: "deploy@CORP.EXAMPLE"
-      password: {command: ["pass", "show", "winapp"]}
-      auth: "kerberos"
+    transport:
+      winrm:
+        user: "deploy@CORP.EXAMPLE"
+        password: {command: ["pass", "show", "winapp"]}
+        auth: "kerberos"
 
   lab:
-    type: "winrm"
     host: "10.0.0.20"
     origin: "build"
-    winrm:
-      user: 'LAB\operator'
-      password: {env: "LAB_PASSWORD"}
-      tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
+    transport:
+      winrm:
+        user: 'LAB\operator'
+        password: {env: "LAB_PASSWORD"}
+        tls: {fingerprint: "fb11438a193e3f75d8a64704f74e9554d3774fb17dcf44d868d320ae6ca5fb25"}
 ```
 
 | Setting | Meaning |
@@ -227,12 +228,12 @@ service. Skyhook needs Windows PowerShell 5.1 there, which those releases includ
 ```yaml
 targets:
   winbuild:
-    type: "ssh"
     os: "windows"
     host: "winbuild.internal"
     workspace: 'C:\src\project'
-    ssh:
-      user: "builder"
+    transport:
+      ssh:
+        user: "builder"
 ```
 
 Paths on a Windows target are Windows paths, such as `C:\src\main.rs`, and tools accept `/` or

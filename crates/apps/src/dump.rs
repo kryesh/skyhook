@@ -91,7 +91,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, {}]\ntargets:\n  hop:\n    type: ssh\n    host: hop.test\n  remote:\n    type: ssh\n    host: remote.test\n    via: hop\n",
+                "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    api_key: {{command: {}}}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, {}]\ntargets:\n  hop:\n    host: hop.test\n    transport: {{ssh: {{}}}}\n  remote:\n    host: remote.test\n    transport: {{ssh: {{}}}}\n    via: hop\n",
                 quoted(format!("{}; printf key", ran("CREDENTIAL_RAN"))),
                 quoted(ran("MCP_RAN")),
             ),

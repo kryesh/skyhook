@@ -145,7 +145,7 @@ async fn evaluate_inner(
     let surface = executor.surface_for_agent(context.agent());
     let source = SubmittedSource::new(&source);
     let config = Config {
-        builders: super::bridge::script_manifests(&surface),
+        builders: super::bridge::script_calls(&surface),
         terminal: (crate::job::JobState::ALL.into_iter())
             .filter(|state| state.is_terminal())
             .collect(),
@@ -1250,28 +1250,6 @@ return view;",
         let shown = &output.value["result"]["value"]["result"]["value"];
         assert!(shown.as_array().unwrap().len() < 5000, "{:#}", output.value);
         assert!(output.value["presentation"]["truncated"].is_array());
-    }
-
-    #[test]
-    fn builder_chains_are_immutable_and_execute_once() {
-        let result = evaluate_wrapper(
-            r#"
-const base = tool.echo();
-const first = base.value("first");
-const second = first.set("value", "second");
-await first;
-await first;
-await second;
-return __testCalls;
-"#,
-        );
-        assert_eq!(
-            result,
-            json!([
-                {"type":"call", "name":"echo", "arguments":{"value":"first"}},
-                {"type":"call", "name":"echo", "arguments":{"value":"second"}},
-            ])
-        );
     }
 
     /// What a script's calls report is acknowledged with the script's own

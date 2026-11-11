@@ -2,7 +2,7 @@ import { errorKeys, summary } from "skyhook:errors";
 
 export const parse = JSON.parse;
 export const stringify = JSON.stringify;
-export const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 // Counted from the converted root, leaving the stored result's and the host
 // envelopes' nesting inside the host parser's limit.

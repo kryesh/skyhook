@@ -216,7 +216,6 @@ fn route<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::ConnectionKind;
     use skyhook_tools::error::AdmissionError;
     use skyhook_worker::diagnostic::Subject;
     use std::assert_matches;
@@ -355,19 +354,21 @@ mod tests {
             TargetDefinition::from_config("h".into(), config)
         };
         let via_origin = from_config(
-            serde_json::json!({"type": "ssh", "host": "h", "via": "shim", "origin": "shim"}),
+            serde_json::json!({"host": "h", "transport": {"ssh": {}}, "via": "shim", "origin": "shim"}),
         );
         assert_matches!(via_origin, Err(TargetError::ViaIsOrigin(_)));
         // `origin: root` spells the default; root is never a jump.
-        let from_root =
-            from_config(serde_json::json!({"type": "ssh", "host": "h", "origin": "root"}));
+        let from_root = from_config(
+            serde_json::json!({"host": "h", "transport": {"ssh": {}}, "origin": "root"}),
+        );
         assert_eq!(from_root.unwrap().origin, None);
-        let via_root = from_config(serde_json::json!({"type": "ssh", "host": "h", "via": "root"}));
+        let via_root =
+            from_config(serde_json::json!({"host": "h", "transport": {"ssh": {}}, "via": "root"}));
         assert_matches!(via_root, Err(TargetError::RootCannotBeJump));
         // A bad link is the link's fault, not the valid name's.
         for edge in [TargetEdge::Origin, TargetEdge::Via] {
             let bad = from_config(
-                serde_json::json!({"type": "ssh", "host": "h", edge.to_string(): "bad target"}),
+                serde_json::json!({"host": "h", "transport": {"ssh": {}}, edge.to_string(): "bad target"}),
             );
             let error = bad.unwrap_err();
             assert_matches!(
@@ -383,7 +384,7 @@ mod tests {
     }
 
     /// A WinRM target connects straight from its origin, any target, and is never a
-    /// jump; its settings go with its type alone, and its password is admitted as SSH's.
+    /// jump; its password is admitted as SSH's.
     #[test]
     fn winrm_targets_connect_from_an_origin_and_are_never_jumps() {
         use crate::target::tests::winrm;
@@ -411,33 +412,12 @@ mod tests {
         };
         let settings =
             serde_json::json!({"user": "u", "password": " ", "auth": "basic", "tls": "off"});
-        assert_matches!(
-            config(serde_json::json!({"type": "winrm", "host": "h"})),
-            Err(TargetError::MissingSettings(ConnectionKind::Winrm))
-        );
-        assert_matches!(
-            config(serde_json::json!({"type": "ssh", "host": "h", "winrm": settings})),
-            Err(TargetError::ForeignSettings {
-                settings: ConnectionKind::Winrm,
-                ..
-            })
-        );
-        assert_matches!(
-            config(
-                serde_json::json!({"type": "winrm", "host": "h", "winrm": settings,
-                "ssh": {"user": "u"}})
-            ),
-            Err(TargetError::ForeignSettings {
-                settings: ConnectionKind::Ssh,
-                ..
-            })
-        );
-        let blank = config(serde_json::json!({"type": "winrm", "host": "h", "winrm": settings}));
+        let blank = config(serde_json::json!({"host": "h", "transport": {"winrm": settings}}));
         let error = registry.upsert(blank.unwrap()).unwrap_err();
         let diagnostic = AdmissionError::from(error).diagnostic();
         assert_eq!(
             diagnostic.context.subject,
-            Subject::argument(["winrm", "password"])
+            Subject::argument(["transport", "winrm", "password"])
         );
         let windows = winrm("w", None);
         assert_eq!(windows.os, skyhook_worker::target::Os::Windows);
@@ -452,11 +432,11 @@ mod tests {
             let config = serde_json::from_value(config).unwrap();
             TargetDefinition::from_config(name.into(), config).unwrap()
         };
-        let windows = serde_json::json!({"type": "ssh", "host": "w", "os": "windows"});
+        let windows = serde_json::json!({"host": "w", "transport": {"ssh": {}}, "os": "windows"});
         let registry = TargetRegistry::from_definitions([definition("windows", windows)]).unwrap();
         let reading = |origin: Option<&str>, file: &str| {
-            let target = serde_json::json!({"type": "ssh", "host": "h", "origin": origin,
-                "ssh": {"password": {"file": file}}});
+            let target = serde_json::json!({"host": "h", "origin": origin,
+                "transport": {"ssh": {"password": {"file": file}}}});
             registry.upsert(definition("t", target))
         };
         for (origin, file, admitted) in [

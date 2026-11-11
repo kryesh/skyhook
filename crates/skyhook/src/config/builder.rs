@@ -65,8 +65,8 @@ mod tests {
     fn a_built_configuration_is_its_documents() {
         const PROVIDER: &str = "{dialect: compatible, codec: chat_completions, base_url: 'http://127.0.0.1:1/v1', models: {main: {model: served, max_context: 4096, max_output: 512}}}";
         const MODE: &str = "{capabilities: [read], hint: Reads}";
-        const TARGET: &str = "{type: ssh, host: box.test, via: hop}";
-        const HOP: &str = "{type: ssh, host: hop.test}";
+        const TARGET: &str = "{host: box.test, transport: {ssh: {}}, via: hop}";
+        const HOP: &str = "{host: hop.test, transport: {ssh: {}}}";
         let review: ModeName = "review".parse().unwrap();
         let builder = || {
             Config::builder()
@@ -84,7 +84,7 @@ mod tests {
         let parsed = Config::from_yaml(&document).unwrap();
         assert_eq!(built.to_yaml().unwrap(), parsed.to_yaml().unwrap());
         built.into_runtime().unwrap();
-        let looped = parse("{type: ssh, host: hop.test, via: box}").unwrap();
+        let looped = parse("{host: hop.test, transport: {ssh: {}}, via: box}").unwrap();
         let refused = builder().target("hop", looped).build();
         assert!(matches!(refused, Err(ConfigError::Refused(_))));
     }

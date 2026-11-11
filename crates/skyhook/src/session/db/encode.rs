@@ -444,8 +444,8 @@ mod tests {
             images: Vec::new(),
         });
         // Every transport, authentication, trust and password form journals as given.
-        let ssh = |ssh| json!({"type": "ssh", "host": "h", "ssh": ssh});
-        let winrm = |winrm| json!({"type": "winrm", "host": "h", "winrm": winrm});
+        let ssh = |ssh| json!({"host": "h", "transport": {"ssh": ssh}});
+        let winrm = |winrm| json!({"host": "h", "transport": {"winrm": winrm}});
         let given = [
             ssh(json!({})),
             ssh(json!({"forward_agent": true, "password": "pw"})),

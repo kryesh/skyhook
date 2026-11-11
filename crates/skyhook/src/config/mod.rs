@@ -258,14 +258,15 @@ mod tests {
     #[test]
     fn config_omits_absent_connection_options() {
         let config = parse(
-            "targets:\n  remote:\n    type: ssh\n    host: host\nmcp:\n  local:\n    transport: stdio\n    start_command: [server]\n",
+            "targets:\n  remote:\n    host: host\n    transport: {ssh: {}}\nmcp:\n  local:\n    transport: stdio\n    start_command: [server]\n",
         )
         .unwrap();
         let value = crate::yaml::from_str(&config.to_yaml().unwrap()).unwrap();
         let target = &value["targets"]["remote"];
         assert!(target.get("via").is_none());
-        assert!(target["ssh"].get("user").is_none());
-        assert!(target["ssh"].get("port").is_none());
+        let ssh = &target["transport"]["ssh"];
+        assert!(ssh.get("user").is_none());
+        assert!(ssh.get("port").is_none());
         let server = &value["mcp"]["local"];
         assert!(server.get("url").is_none());
         assert!(server.get("cwd").is_none());
@@ -431,7 +432,7 @@ providers:
     fn a_document_is_refused_once_with_every_refusal_where_it_is_written() {
         let text = "providers:\n  p:\n    dialect: compatible\n    codec: chat\n    \
                     base_url: http://h/v1\n    models:\n      m: {model: x}\n      n: {model: x, \
-                    max_context: 2, max_output: 2}\ntargets:\n  t:\n    type: ssh\n    host: h\n    \
+                    max_context: 2, max_output: 2}\ntargets:\n  t:\n    host: h\n    transport: {ssh: {}}\n    \
                     via: nope\nmodes:\n  m:\n    capabilities: [wirte]\n";
         let refused = Config::from_yaml(text).unwrap_err().to_string();
         let lines = Vec::from_iter(refused.lines().skip(1));

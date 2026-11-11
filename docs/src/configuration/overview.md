@@ -54,15 +54,15 @@ providers:
 
 targets:
   bastion:
-    type: "ssh"
     host: "bastion.example.com"
+    transport: {ssh: {}}
 
   build:
-    type: "ssh"
     host: "old-build.internal"
     via: "bastion"
-    ssh:
-      key: "~/.ssh/old-build"
+    transport:
+      ssh:
+        key: "~/.ssh/old-build"
 ```
 
 Then use this `<workspace>/.skyhook/config.yaml`:
@@ -74,8 +74,8 @@ modes:
 
 targets:
   build:
-    type: "ssh"
     host: "new-build.example.com"
+    transport: {ssh: {}}
     workspace: "/srv/project"
 ```
 

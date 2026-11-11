@@ -34,7 +34,11 @@ pub fn deserialize_arguments<T: serde::de::DeserializeOwned>(
         let path = safe_argument_path(
             schema,
             segments.into_iter().map(|segment| match segment {
-                serde_path_to_error::Segment::Map { key } => ArgumentPathSegment::Property(key),
+                // A keyed variant is written as the key of its value.
+                serde_path_to_error::Segment::Map { key }
+                | serde_path_to_error::Segment::Enum { variant: key } => {
+                    ArgumentPathSegment::Property(key)
+                }
                 serde_path_to_error::Segment::Seq { index } => ArgumentPathSegment::Index(*index),
                 _ => ArgumentPathSegment::Unknown,
             }),

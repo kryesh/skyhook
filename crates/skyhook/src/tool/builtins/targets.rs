@@ -237,7 +237,7 @@ pub(super) fn register(
         "target_add",
         r#"Add or replace a session target without connecting to it or changing your current target.
 
-Example: `tool.target_add({name:"db", type:"ssh", host:"db.internal", via:"bastion"})`.
+Example: `tool.target_add({name:"db", host:"db.internal", transport:{ssh:{}}, via:"bastion"})`.
 ssh.options can run commands and a password env, file or command is read on the origin, so they also require exec"#,
         ToolOptions::new(vec![Capability::Write])
             .requires(Capability::Targets)
@@ -262,11 +262,13 @@ ssh.options can run commands and a password env, file or command is read on the 
 /// Options can run commands on the origin, and any password but a literal is read
 /// from it: its environment, a file there or a command it runs.
 fn add_permissions(config: &TargetConfig) -> Vec<PermissionUse> {
-    let winrm = config.winrm.as_ref().map(|winrm| winrm.auth.password());
-    let passwords = config.ssh.auth.password().into_iter().chain(winrm);
-    let mut passwords = passwords.filter_map(Password::given);
-    let read = passwords.any(|password| password.literal().is_none());
-    let reaches = read || !config.ssh.options.is_empty();
+    let password = config.transport.password().and_then(Password::given);
+    let read = password.is_some_and(|password| password.literal().is_none());
+    let options = config
+        .transport
+        .ssh()
+        .is_some_and(|ssh| !ssh.options.is_empty());
+    let reaches = read || options;
     (reaches.then(|| PermissionUse::new(Capability::Exec, ResourceId::session("targets"))))
         .into_iter()
         .collect()
@@ -297,11 +299,11 @@ mod tests {
         reduced.remove(&Capability::Targets);
         for (arguments, field) in [
             (
-                serde_json::json!({"name":"private-requested","type":"ssh","host":"host","via":"private-jump"}),
+                serde_json::json!({"name":"private-requested","host":"host","transport":{"ssh":{}},"via":"private-jump"}),
                 "via",
             ),
             (
-                serde_json::json!({"name":"private-requested","type":"ssh","host":"host","origin":"private-origin"}),
+                serde_json::json!({"name":"private-requested","host":"host","transport":{"ssh":{}},"origin":"private-origin"}),
                 "origin",
             ),
         ] {
@@ -339,7 +341,7 @@ mod tests {
         let executor = runtime.executor(builder).with_capabilities(capabilities);
         let add = async |ssh: serde_json::Value| {
             let arguments =
-                serde_json::json!({"name": "db", "type": "ssh", "host": "db", "ssh": ssh});
+                serde_json::json!({"name": "db", "host": "db", "transport": {"ssh": ssh}});
             let added = executor.run_model(&runtime.agent, "target_add", arguments);
             match added.await {
                 Ok(added) => {
@@ -349,9 +351,9 @@ mod tests {
                 Err(error) => Some(error.diagnostic().context.subject),
             }
         };
-        let user = Subject::argument(["ssh", "user"]);
+        let user = Subject::argument(["transport", "ssh", "user"]);
         // An option names no argument of its own, so its name is not quoted.
-        let options = Subject::argument(["ssh", "options", "*"]);
+        let options = Subject::argument(["transport", "ssh", "options", "*"]);
         for (ssh, refused) in [
             (serde_json::json!({"user": "a\u{7}b"}), Some(&user)),
             (serde_json::json!({"user": " "}), Some(&user)),
@@ -394,9 +396,9 @@ mod tests {
         assert!(!keyed.to_string().contains("secret"), "{keyed}");
         assert_eq!(keyed["auth"], "key");
         // WinRM shows its method and trust as SSH shows its method, without a CA path.
-        let config = serde_json::json!({"type": "winrm", "host": "win", "winrm": {
+        let config = serde_json::json!({"host": "win", "transport": {"winrm": {
             "user": "alice@CORP", "password": "secret-password", "auth": "kerberos",
-            "kdc": "dc.corp", "tls": {"ca": "~/secret-ca.pem"}, "port": 15986}});
+            "kdc": "dc.corp", "tls": {"ca": "~/secret-ca.pem"}, "port": 15986}}});
         let config = serde_json::from_value(config).unwrap();
         let win = TargetDefinition::from_config("win".into(), config).unwrap();
         let view = view(win);
@@ -417,10 +419,10 @@ mod tests {
                 .map(|permission| permission.capability)
                 .collect::<Vec<_>>()
         };
-        let ssh = |ssh| serde_json::json!({"type": "ssh", "host": "h", "ssh": ssh});
+        let ssh = |ssh| serde_json::json!({"host": "h", "transport": {"ssh": ssh}});
         let winrm = |password| {
-            serde_json::json!({"type": "winrm", "host": "h", "winrm": {"user": "u",
-                "password": password, "auth": "negotiate", "tls": "system"}})
+            serde_json::json!({"host": "h", "transport": {"winrm": {"user": "u",
+                "password": password, "auth": "negotiate", "tls": "system"}}})
         };
         for (config, expected) in [
             (ssh(serde_json::json!({})), Vec::new()),
@@ -464,7 +466,7 @@ mod tests {
     fn the_schema_takes_every_password_form_and_rejects_unknown_fields() {
         let schema = serde_json::to_value(schemars::schema_for!(TargetAddArgs)).unwrap();
         let valid = |ssh: serde_json::Value| {
-            let arguments = serde_json::json!({"name":"db","type":"ssh","host":"db","ssh":ssh});
+            let arguments = serde_json::json!({"name":"db","host":"db","transport":{"ssh":ssh}});
             jsonschema::is_valid(&schema, &arguments)
         };
         for password in [
@@ -479,7 +481,8 @@ mod tests {
                 "{password}"
             );
         }
-        let invalid = serde_json::json!({"name":"db","type":"ssh","host":"db","target":"root"});
+        let invalid =
+            serde_json::json!({"name":"db","host":"db","transport":{"ssh":{}},"target":"root"});
         assert!(!jsonschema::is_valid(&schema, &invalid), "{schema}");
     }
 }

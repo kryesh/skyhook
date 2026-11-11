@@ -25,7 +25,7 @@ pub(crate) use router::TargetRouter;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ConnectionKind, SshOptions, TargetConfig, TargetDefinition};
+    use super::{Connection, SshOptions, TargetConfig, TargetDefinition};
 
     /// The configured SSH target `name`, its workspace `workspace`, jumping through `via`.
     pub(crate) fn definition(
@@ -34,11 +34,9 @@ pub(crate) mod tests {
         via: Option<&str>,
     ) -> TargetDefinition {
         let config = TargetConfig {
-            r#type: ConnectionKind::Ssh,
             host: format!("{name}.example.com"),
             os: None,
-            ssh: SshOptions::default(),
-            winrm: None,
+            transport: Connection::Ssh(SshOptions::default()),
             workspace: workspace.into(),
             via: via.map(str::to_owned),
             origin: None,
@@ -49,8 +47,9 @@ pub(crate) mod tests {
     /// The configured WinRM target `name`, reached from `origin`.
     pub(crate) fn winrm(name: &str, origin: Option<&str>) -> TargetDefinition {
         let config = serde_json::json!({
-            "type": "winrm", "host": format!("{name}.example.com"), "origin": origin,
-            "winrm": {"user": "alice", "password": "pw", "auth": "negotiate", "tls": "system"},
+            "host": format!("{name}.example.com"), "origin": origin,
+            "transport": {"winrm":
+                {"user": "alice", "password": "pw", "auth": "negotiate", "tls": "system"}},
         });
         let config = serde_json::from_value(config).unwrap();
         TargetDefinition::from_config(name.to_owned(), config).unwrap()

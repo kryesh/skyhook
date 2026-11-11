@@ -89,7 +89,7 @@ may appear at the top level or under an `arguments` object so they do not confli
 Skyhook arguments such as `bg`. Tools with invalid or unsupported input schemas are warned about
 and skipped individually.
 
-Call a tool with `tool[name](...)` or its fluent builder. Calls return the
+Call a tool with `tool[name](...)`. Calls return the
 [common JobView envelope](../reference/javascript.md#jobview-response-contract); the MCP payload
 (`content`, plus optional `structuredContent` and `isError`) is in `.result`. Images use the usual
 [saved-output image handling](../reference/javascript.md#saved-output-and-serialization), and server-reported errors retain their

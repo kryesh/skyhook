@@ -63,8 +63,7 @@ impl From<Selectors> for Paging {
     }
 }
 
-/// What `start` counts: the values a page names, as the page a position
-/// continues named them
+/// What `start` counts; copy it from the page that returned next_start
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PageUnit {

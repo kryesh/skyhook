@@ -104,9 +104,7 @@ mod tests {
     }
 
     // Standalone wrapper regressions: no executor, jobs, or external processes are needed.
-    const BUILDERS: &str = r#"[
-    {"name":"echo","properties":["value"]}
-]"#;
+    const BUILDERS: &str = r#"["echo"]"#;
 
     const MOCK_HOST: &str = r#"
 const __testCalls = [];

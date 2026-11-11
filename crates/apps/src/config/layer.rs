@@ -97,7 +97,7 @@ mod tests {
                 "interactive",
             ),
             (
-                "targets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a",
+                "targets:\n  a:\n    host: a\n    transport: {ssh: {}}\n    via: b\n  b:\n    host: b\n    transport: {ssh: {}}\n    via: a",
                 CYCLE,
             ),
         ] {
@@ -124,12 +124,13 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_with_an_unresolved_route_is_still_checked() {
         let f = Fixture::new();
-        let target = "targets:\n  box:\n    type: ssh\n    host: box\n    via: jump\n";
-        write(
-            &f.xdg,
-            format!("{CONFIG}{target}    ssh:\n      password: ''\n"),
-        );
-        write(&f.home, format!("{CONFIG}{target}"));
+        let target = |ssh| {
+            format!(
+                "{CONFIG}targets:\n  box:\n    host: box\n    via: jump\n    transport: {{ssh: {ssh}}}\n"
+            )
+        };
+        write(&f.xdg, target("{password: ''}"));
+        write(&f.home, target("{}"));
         write(&f.local, targets(&[("jump", None)]));
         let resolved = f.resolve(None).await.unwrap();
         assert_eq!(resolved.report.sources, [f.home.clone(), f.local.clone()]);
@@ -139,7 +140,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
-                .contains("`targets.box.ssh.password`"),
+                .contains("`targets.box.transport.ssh.password`"),
             "{}",
             diagnostics[0].message
         );
@@ -189,7 +190,7 @@ mod tests {
             b"\xff",
             b"max_child_depth: wrong",
             b"providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n    models:\n      main:\n        model: test\n        max_context: 4096\n        max_output: 0",
-            b"targets:\n  bad:\n    type: ssh", // Atomic/incomplete target.
+            b"targets:\n  bad:\n    transport: {ssh: {}}", // Atomic/incomplete target.
             // Null neither deletes entries nor applies defaults.
             b"max_child_depth: null",
             b"providers: {local: {dialect: compatible, codec: chat_completions, base_url: 'https://example.com/v1', models: null}}",
@@ -269,12 +270,12 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  user-default:\n    transport: stdio\n    start_command: [old]\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      key: /old-key\n  retained:\n    type: ssh\n    host: other\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
+                "{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  user-default:\n    transport: stdio\n    start_command: [old]\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\ntargets:\n  changed:\n    host: old\n    transport:\n      ssh:\n        user: old-user\n        port: 2222\n        key: /old-key\n    workspace: /old\n    via: retained\n  retained:\n    host: other\n    transport: {{ssh: {{}}}}\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
             ),
         );
         write(
             &f.local,
-            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      key: origin-key\n  changed:\n    type: ssh\n    host: new\ndefault_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
+            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    host: host\n    transport:\n      ssh:\n        key: origin-key\n    workspace: remote-work\n  changed:\n    host: new\n    transport: {ssh: {}}\ndefault_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
         );
         let resolved = f.resolve(None).await.unwrap();
         assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
@@ -309,15 +310,16 @@ mod tests {
             path: "origin-key".into(),
             password: None,
         };
-        assert_eq!(remote.ssh.auth, origin_key);
+        assert_eq!(remote.transport.ssh().unwrap().auth, origin_key);
         assert!(config.targets.entries.contains_key("retained"));
         let changed = &config.targets.entries["changed"];
         assert_eq!(
             (&*changed.host, &changed.workspace, &changed.via),
             ("new", &".".into(), &None)
         );
+        let ssh = changed.transport.ssh().unwrap();
         assert_eq!(
-            (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
+            (&ssh.user, ssh.port, &ssh.auth),
             (&None, None, &SshAuth::Agent)
         );
         assert_eq!(
@@ -410,7 +412,9 @@ mod tests {
     fn targets(entries: &[(&str, Option<&str>)]) -> String {
         let mut text = String::from("targets:\n");
         for (name, via) in entries {
-            text.push_str(&format!("  {name}:\n    type: ssh\n    host: {name}\n"));
+            text.push_str(&format!(
+                "  {name}:\n    host: {name}\n    transport: {{ssh: {{}}}}\n"
+            ));
             if let Some(via) = via {
                 text.push_str(&format!("    via: {via}\n"));
             }

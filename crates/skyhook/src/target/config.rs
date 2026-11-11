@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use skyhook_base::enums::Kinds;
+use skyhook_base::enums::{Kinds, NamedEnum};
 use skyhook_worker::{op::TargetPath, secret::Credential, target::Os};
 
 use super::{SshAuth, SshOptions, TargetDefinition, TargetRegistry, WinrmOptions};
@@ -54,18 +54,15 @@ impl TargetsConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Decode)]
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Decode)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
-    pub r#type: ConnectionKind,
     /// Hostname or IP address
     pub host: String,
     /// The destination's operating system; defaults to linux for ssh and windows for winrm
     pub os: Option<Os>,
-    #[serde(default)]
-    #[schemars(extend("default" = {}))]
-    pub ssh: SshOptions,
-    pub winrm: Option<WinrmOptions>,
+    pub transport: Connection,
     /// Default directory on the destination; defaults to its login directory
     #[serde(default = "default_workspace")]
     pub workspace: TargetPath,
@@ -75,47 +72,34 @@ pub struct TargetConfig {
     pub origin: Option<String>,
 }
 
-/// Written with the effective settings of its own transport alone, defaults included.
-impl Serialize for TargetConfig {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[serde_with::skip_serializing_none]
-        #[derive(Serialize)]
-        struct Written<'a> {
-            r#type: ConnectionKind,
-            host: &'a str,
-            os: Option<Os>,
-            ssh: Option<&'a SshOptions>,
-            winrm: Option<&'a WinrmOptions>,
-            workspace: &'a TargetPath,
-            via: Option<&'a str>,
-            origin: Option<&'a str>,
-        }
-        Written {
-            r#type: self.r#type,
-            host: &self.host,
-            os: self.os,
-            ssh: (self.r#type == ConnectionKind::Ssh).then_some(&self.ssh),
-            winrm: self.winrm.as_ref(),
-            workspace: &self.workspace,
-            via: self.via.as_deref(),
-            origin: self.origin.as_deref(),
-        }
-        .serialize(serializer)
-    }
-}
-
-/// How a target is reached: its transport's settings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Kinds)]
-#[serde(rename_all = "snake_case")]
+/// How the target is reached: one transport and its settings
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, Kinds)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(rename = "Transport")]
 #[kinds(
     name = ConnectionKind,
     derive(JsonSchema),
-    schemars(rename = "Transport"),
+    schemars(rename = "TransportKind"),
     doc = "The transport of a named target; the session host is not a named target"
 )]
 pub enum Connection {
     Ssh(SshOptions),
     Winrm(WinrmOptions),
+}
+
+impl Decode for Connection {
+    fn decode(
+        node: &skyhook_base::decode::Node,
+        cx: &mut skyhook_base::decode::Context,
+    ) -> Option<Self> {
+        let names = ConnectionKind::ALL.map(ConnectionKind::as_str);
+        skyhook_base::decode::variant(node, cx, &names, |key, value, cx| {
+            match ConnectionKind::parse(key)? {
+                ConnectionKind::Ssh => SshOptions::decode(value, cx).map(Self::Ssh),
+                ConnectionKind::Winrm => WinrmOptions::decode(value, cx).map(Self::Winrm),
+            }
+        })
+    }
 }
 
 impl ConnectionKind {
@@ -323,19 +307,19 @@ mod tests {
     #[test]
     fn root_is_implicit() {
         for text in [
-            "root:\n  type: ssh\n  host: root",
-            "a:\n  type: ssh\n  host: a\n  via: root",
+            "root:\n  host: root\n  transport: {ssh: {}}",
+            "a:\n  host: a\n  transport: {ssh: {}}\n  via: root",
         ] {
             assert_eq!(refusals(text).len(), 1, "{text}");
         }
-        assert!(refusals("a:\n  type: ssh\n  host: a\n  origin: root").is_empty());
+        assert!(refusals("a:\n  host: a\n  transport: {ssh: {}}\n  origin: root").is_empty());
     }
 
     /// A refusal names the target's setting it refuses, and a reference refused lists
     /// what it could name instead.
     #[test]
     fn refusals_name_the_setting_and_references_name_configured_targets() {
-        let two = "a:\n  type: ssh\n  host: a\nb:\n  type: ssh\n  host: b\n";
+        let two = "a:\n  host: a\n  transport: {ssh: {}}\nb:\n  host: b\n  transport: {ssh: {}}\n";
         assert_eq!(
             refusals(&format!("{two}  via: c")),
             ["targets.b.via: target `b` references unknown via target `c`, expected one of `a`"]
@@ -350,16 +334,8 @@ mod tests {
         for valid in ["via: a", "origin: a", "origin: root"] {
             assert!(refusals(&format!("{two}  {valid}")).is_empty(), "{valid}");
         }
-        assert_eq!(
-            refusals("w:\n  type: winrm\n  host: w"),
-            [
-                "targets.w.winrm: a winrm target needs its connection settings; add a `winrm` \
-              mapping beside `type`"
-            ]
-        );
         // A route through another target's bad setting is that target's refusal alone.
-        let gateway =
-            "app:\n  type: ssh\n  host: app\n  origin: gateway\ngateway:\n  type: ssh\n  host: g\n";
+        let gateway = "app:\n  host: app\n  transport: {ssh: {}}\n  origin: gateway\ngateway:\n  host: g\n  transport: {ssh: {}}\n";
         assert_eq!(
             refusals(&format!("{gateway}  via: missing")),
             [
@@ -370,7 +346,7 @@ mod tests {
         let missing = crate::yaml::parse::<TargetsConfig>("w:\n  os: windows").unwrap_err();
         assert_eq!(
             missing.to_string(),
-            "2:3: `w`: missing required fields `type`, `host`"
+            "2:3: `w`: missing required fields `host`, `transport`"
         );
     }
 }
