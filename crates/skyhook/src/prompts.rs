@@ -307,8 +307,9 @@ struct PromptContext {
     /// Every built-in capability by name, whether granted.
     capabilities: BTreeMap<&'static str, bool>,
     mode: Option<ModeName>,
-    /// Its `context` lines: the workspace, the target where it may choose one, and
-    /// its machine's operating system, shell and time zone when they are known.
+    /// Its `context` lines: the workspace, the target where it may choose one, its
+    /// machine's operating system, shell and time zone when they are known, and how deep
+    /// its children may delegate where it may start them.
     context: String,
     /// The type every direct tool result follows.
     job_view: &'static str,
@@ -351,6 +352,10 @@ impl PromptContext {
                 seconds % 3600 / 60
             )
             .expect("strings take writes");
+        }
+        if agent.capabilities.contains(&Capability::Agents) {
+            write!(context, "\navailable_depth:{}", agent.available_depth)
+                .expect("strings take writes");
         }
         let granted = |capability: &'static Capability| {
             (capability.as_str(), agent.capabilities.contains(capability))
@@ -483,11 +488,12 @@ mod tests {
         }
         let positions = inputs.map(|part| text.find(part).unwrap_or_else(|| panic!("{part}")));
         assert!(positions.is_sorted());
-        // The context is plain lines: a visible target's, and its machine's platform and
-        // zone when known.
+        // The context is plain lines: a visible target's, its machine's platform and zone
+        // when known, and the delegation depth of an agent that may start children.
         let block = |lines: &str| format!("<context>\n{lines}\n</context>");
         let remote = "workspace:/remote/work\ntarget:box host=box.example via=jump\n\
-            os:windows shell=powershell-5.1\ntz:America/St_Johns -03:30";
+            os:windows shell=powershell-5.1\ntz:America/St_Johns -03:30\n\
+            available_depth:2";
         assert!(text.ends_with(&block(remote)));
         let bare = library.system(&bare, None, &[]).unwrap();
         assert!(bare.ends_with(&block("workspace:/workspace")));
